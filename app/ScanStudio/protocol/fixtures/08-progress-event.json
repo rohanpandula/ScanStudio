@@ -1,0 +1,1 @@
+{"event": "scan.progress", "payload": {"jobId": "job-1", "frameIndex": 2, "frameOrdinal": 2, "totalFrames": 3, "pass": 1, "totalPasses": 2, "framePercent": 42.5, "jobPercent": 47.5, "etaSeconds": 2.4}}

@@ -1,0 +1,73 @@
+# Operating-system and editor state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local AI/agent configuration and session state
+.agents/
+.claude/
+.codex/
+.opencode/
+.impeccable/
+.planning/
+CLAUDE.md
+
+# Swift and Rust build outputs
+app/ScanStudio/.build/
+app/ScanStudio/.swiftpm/
+app/ScanStudio/engine/target/
+DerivedData/
+**/DerivedData/
+xcuserdata/
+
+# Python environments, caches, and build products
+**/.venv/
+**/venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/*.egg-info/
+*.py[cod]
+build/
+dist/
+
+# Packaged artifacts
+*.app/
+*.dmg
+*.pkg
+*.xcarchive/
+
+# Local scanner state, capture data, and hardware transcripts
+.scanstudio/
+**/.scanstudio/
+*.scanstudio/
+**/hw-telemetry/
+**/capture-journals/
+**/capture-transcripts/
+**/scanstudio-attempts/
+*.scanstudio-journal.jsonl
+*.scanstudio-transcript.jsonl
+private-evidence/
+output/
+tmp/
+*.tif
+*.tiff
+*.nef
+*.pcap
+*.pcapng
+
+# Vendor software, local secrets, and packaging staging
+vendor/
+*.exe
+*.dll
+*.sys
+*.cat
+*.cab
+*.inf
+.env
+.env.*
+!.env.example
+.stage-driver/

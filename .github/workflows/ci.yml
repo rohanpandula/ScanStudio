@@ -1,0 +1,71 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  app-and-engine:
+    name: App and engine tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Swift app and Rust engine
+        working-directory: app/ScanStudio
+        run: make test
+
+  bridge:
+    name: Bridge tests
+    runs-on: macos-15
+    # only-managed keeps uv off the runner image's python.org framework
+    # build: the packaged bridge runtime relies on uv's standalone CPython
+    # (@executable_path linkage), and using the same interpreter family in
+    # every job keeps test and package environments interchangeable.
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install bridge dependencies
+        working-directory: bridge
+        run: uv sync --locked
+      - name: Test bridge
+        working-directory: bridge
+        run: uv run pytest
+
+  package:
+    name: Self-contained package check
+    runs-on: macos-15
+    # See the bridge job: the relocatable package requires uv's standalone
+    # CPython, not the runner image's framework Python.
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install system scanner prerequisites
+        run: brew install sane-backends libusb
+      - name: Point the compiler at Homebrew's headers and libraries
+        # GitHub Actions does not expand $(...) inside an `env:` block, and
+        # Homebrew's prefix varies by runner architecture (/opt/homebrew on
+        # Apple silicon, /usr/local on Intel), so resolve it here and export
+        # it through GITHUB_ENV for every later step in this job -- python-sane
+        # needs sane.h to build its C extension against.
+        run: |
+          echo "CPPFLAGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L$(brew --prefix)/lib" >> "$GITHUB_ENV"
+      - name: Install locked bridge dependencies (with scanner extra)
+        working-directory: bridge
+        run: uv sync --locked --extra scanner
+      - name: Build and verify the local package
+        working-directory: app/ScanStudio
+        run: make package

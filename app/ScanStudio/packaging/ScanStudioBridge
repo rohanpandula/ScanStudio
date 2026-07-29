@@ -1,0 +1,29 @@
+#!/bin/zsh
+# The bundled GPL hardware helper. Keep this a transparent launcher rather
+# than a one-file freezer: support and license inspection can use the shipped
+# CPython runtime, site-packages and corresponding-source directories directly.
+set -euo pipefail
+
+helper_dir="${0:A:h}"
+resources_dir="${helper_dir:h}/Resources"
+python="$resources_dir/BridgeRuntime/python/bin/python3.13"
+bridge_source="$resources_dir/CorrespondingSource/scanstudio-bridge/src"
+coolscanpy_source="$resources_dir/CorrespondingSource/coolscanpy/src"
+site_packages="$resources_dir/BridgeRuntime/site-packages"
+
+if [[ ! -x "$python" ]]; then
+    print -u2 "ScanStudio: bundled bridge runtime is incomplete (missing Python 3.13)."
+    exit 78
+fi
+if [[ ! -d "$bridge_source" || ! -d "$coolscanpy_source" || ! -d "$site_packages" ]]; then
+    print -u2 "ScanStudio: bundled bridge source or dependencies are incomplete."
+    exit 78
+fi
+
+# Never import a user-installed bridge or user site packages by accident. `-I`
+# ignores PYTHONHOME/PYTHONPATH, user site packages, and the current working
+# directory; the sealed bootstrap adds only the three bundle-owned locations.
+# Do not set SCANSTUDIO_HW_MOTION and do not create/touch the armed latch here;
+# SAFE-02 remains wholly inside the bridge for motion-capable operations.
+bootstrap='import runpy, sys; paths = sys.argv[1:4]; sys.path[:0] = paths; sys.argv = ["scanstudio-bridge", *sys.argv[4:]]; runpy.run_module("scanstudio_bridge.cli", run_name="__main__")'
+exec "$python" -I -B -c "$bootstrap" "$bridge_source" "$coolscanpy_source" "$site_packages" "$@"
