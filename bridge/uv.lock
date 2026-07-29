@@ -295,9 +295,14 @@ name = "scanstudio-bridge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "coolscanpy", extra = ["scanner"] },
+    { name = "coolscanpy" },
     { name = "numpy" },
     { name = "tifffile" },
+]
+
+[package.optional-dependencies]
+scanner = [
+    { name = "coolscanpy", extra = ["scanner"] },
 ]
 
 [package.dev-dependencies]
@@ -308,10 +313,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "coolscanpy", extras = ["scanner"], editable = "../coolscanpy" },
+    { name = "coolscanpy", editable = "../coolscanpy" },
+    { name = "coolscanpy", extras = ["scanner"], marker = "extra == 'scanner'", editable = "../coolscanpy" },
     { name = "numpy", specifier = ">=2.4,<3" },
     { name = "tifffile", specifier = ">=2026.6.1,<2027" },
 ]
+provides-extras = ["scanner"]
 
 [package.metadata.requires-dev]
 dev = [

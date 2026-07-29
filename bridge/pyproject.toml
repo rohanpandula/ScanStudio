@@ -16,13 +16,21 @@ authors = [{ name = "ScanStudio contributors" }]
 # floor exactly or `uv sync` fails resolution outright.
 requires-python = ">=3.13"
 dependencies = [
-    # The production hardware bridge includes CoolscanPy's scanner extra.
-    # python-sane is packaged, while a compatible OS SANE backend/libusb
-    # remains a documented system-driver prerequisite.
-    "coolscanpy[scanner]",
+    # coolscanpy's own scanner extra (python-sane) is intentionally left out
+    # of the base dependency set: the bridge's test suite doesn't touch
+    # hardware, and python-sane needs OS SANE headers to build, which the
+    # test/CI environment doesn't have. Install the production hardware
+    # bridge with the `scanner` extra below, which pulls it back in.
+    "coolscanpy",
     "numpy>=2.4,<3",
     "tifffile>=2026.6.1,<2027",
 ]
+
+[project.optional-dependencies]
+# The production hardware bridge is installed with `uv sync --extra scanner`.
+# python-sane is packaged as part of this extra; a compatible OS SANE
+# backend/libusb remains a documented system-driver prerequisite.
+scanner = ["coolscanpy[scanner]"]
 
 [dependency-groups]
 dev = [

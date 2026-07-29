@@ -13,9 +13,9 @@ public enum HardwareMotionReadiness: Equatable, Sendable {
     ) -> HardwareMotionReadiness {
         guard isRealDevice else { return .notApplicable }
         switch motionArmed {
-        case true: return .ready
-        case false: return .notEnabled
-        case nil: return .unknown
+        case .some(true): return .ready
+        case .some(false): return .notEnabled
+        case .none: return .unknown
         }
     }
 

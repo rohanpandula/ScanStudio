@@ -44,9 +44,18 @@ jobs:
           python-version: "3.13"
       - name: Install system scanner prerequisites
         run: brew install sane-backends libusb
-      - name: Install locked bridge dependencies
+      - name: Point the compiler at Homebrew's headers and libraries
+        # GitHub Actions does not expand $(...) inside an `env:` block, and
+        # Homebrew's prefix varies by runner architecture (/opt/homebrew on
+        # Apple silicon, /usr/local on Intel), so resolve it here and export
+        # it through GITHUB_ENV for every later step in this job -- python-sane
+        # needs sane.h to build its C extension against.
+        run: |
+          echo "CPPFLAGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L$(brew --prefix)/lib" >> "$GITHUB_ENV"
+      - name: Install locked bridge dependencies (with scanner extra)
         working-directory: bridge
-        run: uv sync --locked
+        run: uv sync --locked --extra scanner
       - name: Build and verify the local package
         working-directory: app/ScanStudio
         run: make package

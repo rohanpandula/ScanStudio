@@ -13,15 +13,15 @@ public enum HardwareFilmStatus: Equatable, Sendable {
         guard isConnected else { return .unknown }
         if isRealDevice {
             switch filmPresent {
-            case true: return .loaded
-            case false: return .notDetected
-            case nil: return .unknown
+            case .some(true): return .loaded
+            case .some(false): return .notDetected
+            case .none: return .unknown
             }
         }
         switch mediaLoaded {
-        case true: return .loaded
-        case false: return .notDetected
-        case nil: return .unknown
+        case .some(true): return .loaded
+        case .some(false): return .notDetected
+        case .none: return .unknown
         }
     }
 
