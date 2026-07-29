@@ -16,16 +16,23 @@ use crate::parity::types::ParityError;
 /// reference and a future Rust port of the *same* nikonlook algorithm,
 /// tight enough to catch a real logic bug. This measures Rust-port
 /// fidelity to the Python `nikonlook_core` reference render, not
-/// real-world accuracy against true Nikon Scan color — the nikonlook-v1
-/// bundle's own `manifest.json` documents a 3.55 ΔE00 gap against true
-/// Nikon color at best (see PARITY.md from plan 13-02), which is a
-/// separate, orthogonal quality question this threshold does not address.
+/// real-world accuracy against true Nikon Scan color — the nikonlook
+/// bundles' own `manifest.json` (Layer B: shared, unchanged across bundle
+/// versions) documents a 3.55 ΔE00 gap against true Nikon color at best
+/// (see PARITY.md from plan 13-02), which is a separate, orthogonal
+/// quality question this threshold does not address.
 pub const COLOR_PER_CHANNEL_TOLERANCE_U16: u16 = 8;
 
 /// Same port-fidelity framing as `COLOR_PER_CHANNEL_TOLERANCE_U16`; 0.5 is
 /// well under the ~1.0 "just noticeable difference" convention, appropriate
 /// when comparing two implementations of the same algorithm on the same
 /// input rather than measuring perceptual accuracy against ground truth.
+/// That framing only holds when candidate and reference actually ARE the
+/// same algorithm/bundle — `bin/parity.rs`'s `score_color` derives the
+/// reference filename from the loaded bundle's own `bundle_version` rather
+/// than a fixed literal specifically so this threshold can never end up
+/// silently comparing two different bundle versions' output against each
+/// other (see that function's own doc comment).
 pub const COLOR_DELTA_E76_TOLERANCE: f64 = 0.5;
 
 /// Validated against the real six-slot corpus by plan 15-02 (see

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """render_ice_references.py -- renders a fresh Legacy-only (classical, no
 Hybrid/ML) ICE defect-mask reference for Scan Studio's parity harness
-(nikon-coolscan4-software-archaeology, phase 16-legacy-ice, plan 16-03) by
-invoking the real, installed `portable_digital_ice` v0.3.1 package's own
-detection primitives directly against each corpus slot's own raw RGB+IR
-capture.
+(phase 16-legacy-ice, plan 16-03) by invoking the real, installed
+`portable_digital_ice` v0.3.1 package's own detection primitives directly
+against each corpus slot's own raw RGB+IR capture.
 
 WHY THIS SCRIPT EXISTS (read this before trusting a score). Phase 13's
 `bin/parity.rs` originally had `score_ice()` compare the Rust Legacy-ICE
@@ -27,16 +26,19 @@ neighborhood than the pixel-level defect footprint), the bundled disclosure
 mask is not a meaningful reference for scoring a Legacy-only port. This
 script generates the missing Legacy-only reference instead.
 
-WHY THIS SCRIPT LIVES OUTSIDE nikon-coolscan4-software-archaeology. Unlike
-`render_references.py`/`render_geometry_references.py` (which MUST live
-externally -- their upstream sources are GPL-labeled/unlicensed, and the
-target repo is MIT), `portable-digital-ice` is ALREADY MIT, same owner
-(Rohan Pandula) as nikon-coolscan4-software-archaeology. Keeping this
-script here too is a CONSISTENCY choice (every other reference-rendering
-script in this project already lives in this directory; keeping a one-off
-Python dependency out of the primary Swift/Rust app repo), NOT a licensing
-requirement -- do not mistake this for a GPL boundary. See
-app/ScanStudio/PARITY.md in nikon-coolscan4-software-archaeology for the
+WHY THIS SCRIPT NEVER NEEDED A GPL BOUNDARY. This script is vendored in this
+repository, at `bridge/tools/`, same as `render_references.py`/
+`render_geometry_references.py`. Those two depend on upstream sources
+(negfit, negpy-src) that are GPL-labeled and must stay external to this
+MIT-licensed repository -- callers pass a checkout path in via
+--negfit-path/--negpy-src-path, with no in-repo default, so this
+repository's MIT licence is not entangled. `portable-digital-ice` is ALREADY MIT,
+same owner (Rohan Pandula) as this repository, so this script never had
+that constraint -- it depends on portable_digital_ice being installed
+(pip), not on a separately-checked-out source tree. Living in this same
+directory alongside the other two reference-rendering scripts is a
+CONSISTENCY choice, not a licensing requirement -- do not mistake this for
+a GPL boundary. See this repository's own app/ScanStudio/PARITY.md for the
 full writeup.
 
 WHAT THIS SCRIPT DOES NOT DO. It only reproduces the DETECTION half of
@@ -369,10 +371,9 @@ def render_one_slot(
                 "using alpha=0.17 (the real algorithm's own documented "
                 "zero_denominator_alpha 'no usable prepass regression signal' "
                 "fallback) -- NOT a byte-exact reproduction of Nikon's "
-                "firmware prepass-register replay. See "
-                "processing/ICE-PROVENANCE.md's 'Handling: the "
-                "single-acquisition adaptation' section in "
-                "nikon-coolscan4-software-archaeology."
+                "firmware prepass-register replay. See this repository's "
+                "app/ScanStudio/engine/src/processing/ICE-PROVENANCE.md, "
+                "'Handling: the single-acquisition adaptation' section."
             ),
         },
         "confirmation_adaptation": {

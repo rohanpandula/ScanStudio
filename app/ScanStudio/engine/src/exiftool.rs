@@ -464,6 +464,7 @@ mod tests {
             storage_transform: None,
             meter_rgbi_path: None,
             hardware_telemetry: None,
+            nikonlook: None,
         });
         let targets = resolve_targets(&project, 1).expect("derivative-only receipt resolves");
         assert_eq!(targets, vec![

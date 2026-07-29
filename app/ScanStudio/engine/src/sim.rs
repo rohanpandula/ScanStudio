@@ -826,6 +826,7 @@ fn build_receipt(
         storage_transform: None,
         meter_rgbi_path: None,
         hardware_telemetry: None,
+        nikonlook: written.nikonlook.clone(),
     }
 }
 
@@ -1390,6 +1391,45 @@ mod tests {
             channels: Channels::Rgbi,
         };
         assert_eq!(settings_fingerprint(&recipe), "1a3d265e0b54bbd2");
+    }
+
+    #[test]
+    fn build_receipt_carries_written_nikonlook_provenance_through_unchanged() {
+        // The one line this test exists to guard: `build_receipt`'s
+        // `nikonlook: written.nikonlook.clone()` (unlike real_backend.rs's
+        // two-phase `None`-then-patch, the simulator has its
+        // `WrittenPaths` in hand before it ever constructs a receipt, so it
+        // wires the field directly). Deleting that line and replacing it
+        // with `None` would compile fine and, before this test, break
+        // nothing else.
+        let recipe = CaptureRecipe::default();
+        let processing = ProcessingRecipe {
+            film_process: FilmProcess::C41ColorNegative,
+            ..ProcessingRecipe::default()
+        };
+        let output = OutputRecipe::default();
+        let provenance = crate::domain::NikonlookProvenance {
+            bundle_version: "nikonlook-v2".to_string(),
+            layer_a_path: crate::domain::NikonlookLayerAPath::Blind,
+            gains: [0.7767985641162477, 0.49546023790785987, 0.2824666578885106],
+        };
+        let written = crate::render::WrittenPaths {
+            archive_path: None,
+            positive_path: None,
+            preview_path: None,
+            nikonlook: Some(provenance.clone()),
+        };
+
+        let receipt = build_receipt("job-1", 1, 1000, &recipe, &processing, &output, DEVICE_ID, &written);
+        assert_eq!(receipt.nikonlook, Some(provenance));
+
+        // The `None` side must also pass through unchanged -- a C41 render
+        // is not guaranteed to have provenance either (e.g. a legacy
+        // pre-Fix-2 written struct), and build_receipt must not fabricate one.
+        let written_none = crate::render::WrittenPaths { nikonlook: None, ..written };
+        let receipt_none =
+            build_receipt("job-1", 1, 1000, &recipe, &processing, &output, DEVICE_ID, &written_none);
+        assert_eq!(receipt_none.nikonlook, None);
     }
 
     #[test]

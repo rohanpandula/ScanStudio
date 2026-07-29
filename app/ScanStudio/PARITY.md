@@ -65,36 +65,67 @@ a completely different color pipeline than `nikonlook_core.py`'s
 `load_bundle` / `estimate_gains` / `apply` model that Phase 14 ports to
 Rust. **`_positive.tif` is therefore not usable as a nikonlook parity
 reference.** The real reference is
-`acceptance_slotNN_reference_color_nikonlook-v1.tif`, freshly rendered by
+`acceptance_slotNN_reference_color_{bundle_version}.tif`, freshly rendered by
 `render_references.py` (this plan, Task 3) by literally invoking
 `nikonlook_core.load_bundle` / `estimate_gains` / `apply` against each
 slot's own raw `.tif` capture — not copied or derived from `_positive.tif`.
 
-`render_references.py` lives in the separately managed bridge checkout's
-`tools/` directory (GPL reference code stays outside this repository). Run
-it with:
+**`{bundle_version}` is not a fixed literal.** `bin/parity.rs`'s `score_color`
+derives it from `processing::nikonlook::load_bundle().bundle_version` —
+whichever bundle version is actually compiled into the engine build running
+`make parity` — so a candidate rendered against bundle X is only ever
+compared to bundle X's own reference. As of the nikonlook-v2 switch,
+`load_bundle()` returns `nikonlook-v2` by default, so the filename `make
+parity` looks for today is `acceptance_slotNN_reference_color_nikonlook-v2.tif`,
+not `..._nikonlook-v1.tif`. The `nikonlook-v1`-named references described
+below in this section were generated and validated before that switch, on
+`load_bundle_v1()`'s bundle; they remain useful for `load_bundle_v1()`-based
+comparison tooling but are no longer what a default `make parity` run looks
+for. If the reference file `score_color` expects doesn't exist,
+`bin/parity.rs` reports `no_reference` with a message naming the exact
+expected filename and the command to produce it, rather than silently
+falling back to a differently-versioned reference.
+
+`render_references.py` lives in this repository's own `bridge/tools/`
+directory. Run it with:
 
 ```sh
-BRIDGE_REPO=/path/to/scanstudio-bridge
-python3 "$BRIDGE_REPO/tools/render_references.py" --corpus "$SCANSTUDIO_PARITY_CORPUS"
+python3 bridge/tools/render_references.py \
+  --corpus "$SCANSTUDIO_PARITY_CORPUS" \
+  --bundle /path/to/nikonlook-v2
 ```
 
-By default it writes the six reference TIFFs next to the corpus (exactly
-where `bin/parity.rs` looks for them: `{corpus}/acceptance_slotNN_reference_color_nikonlook-v1.tif`).
+`--bundle` defaults to this checkout's own vendored `nikonlook-v2`
+resources (`app/ScanStudio/engine/resources/nikonlook-v2/` — the exact
+model.json/layer_a.json/manifest.json bytes the Rust engine embeds via
+`include_str!`; see the script's own `--help`), so an unqualified run
+already matches whichever bundle version `load_bundle()` currently returns
+without pointing at any private, maintainer-specific checkout. Pass
+`--bundle` explicitly only to render against a *different* bundle version —
+e.g. a `nikonlook-v1` checkout, for `load_bundle_v1()`-based comparison
+tooling. `--negfit-path` has no default and must always be passed: negfit
+is GPL-labeled reference code that stays external to this repository (see
+the script's own module docstring). By default the script writes the
+reference TIFFs next to the corpus, named
+`acceptance_slotNN_reference_color_<bundle-directory-name>.tif` (exactly
+where `bin/parity.rs` looks for them).
 
 **Validation reference location.** The corpus used for the original
-validation was read-only, so the six generated TIFFs were written to an
-operator-chosen sibling directory rather than into the corpus. All six files
-were verified (`acceptance_slot01..06_reference_color_nikonlook-v1.tif`,
+(nikonlook-v1) validation was read-only, so the six generated TIFFs were
+written to an operator-chosen sibling directory rather than into the
+corpus. All six files were verified (`acceptance_slot01..06_reference_color_nikonlook-v1.tif`,
 each `(3946, 5959, 3)` uint16). **Because they are not colocated with that
 corpus, `make parity` reports `color` as `no_reference`, not
 `no_candidate`** — this is an honest, environment-driven gap, not a code
 bug: `bin/parity.rs` looks for the reference at
-`{SCANSTUDIO_PARITY_CORPUS}/acceptance_slotNN_reference_color_nikonlook-v1.tif`
+`{SCANSTUDIO_PARITY_CORPUS}/acceptance_slotNN_reference_color_{bundle_version}.tif`
 exactly, by design (see §6). To make `make parity` see external references,
 either re-run `render_references.py` without `--output-dir` once the corpus
 location is writable, copy the files into the corpus, or set `SCANSTUDIO_PARITY_REFS`
-to the directory containing the reference TIFFs (see §7).
+to the directory containing the reference TIFFs (see §7). A fresh
+nikonlook-v2 validation run needs its own `render_references.py --bundle
+.../nikonlook-v2` pass — the v1 references already on disk will not satisfy
+a v2 `make parity` run.
 
 **ICE.** The corpus's `acceptance_slotNN_repaired_SYNTH.png` disclosure
 mask was produced in `hybrid` (ML-assisted) mode (`digital-fauxice`
@@ -260,7 +291,7 @@ see them.
 
 | Module | Reference status | Notes |
 |--------|------------------|-------|
-| Color | Real reference rendered (`render_references.py`, bundle `nikonlook-v1`); real Rust candidate available via `make render-color-candidates` (Phase 14, `processing::nikonlook`) | Reference not colocated with this corpus snapshot in this environment — see §3's read-only caveat; set `SCANSTUDIO_PARITY_REFS`. With `SCANSTUDIO_PARITY_REFS` and `SCANSTUDIO_PARITY_CANDIDATES` (see §7) both set and candidates rendered, `make parity` reports `pass` for all six slots. |
+| Color | Real reference rendered (`render_references.py`, bundle-derived filename — see §3; production default is now `nikonlook-v2`); real Rust candidate available via `make render-color-candidates` (Phase 14, `processing::nikonlook`) | Reference not colocated with this corpus snapshot in this environment — see §3's read-only caveat; set `SCANSTUDIO_PARITY_REFS`. With `SCANSTUDIO_PARITY_REFS` and `SCANSTUDIO_PARITY_CANDIDATES` (see §7) both set and candidates rendered for the SAME bundle version, `make parity` reports `pass` for all six slots. |
 | Autocrop | Real reference rendered (`render_geometry_references.py`, Phase 15); real Rust candidate available via `make render-geometry-candidates` (`processing::geometry::autocrop_roi`) | `make parity`'s `autocrop` row reports **Image mode (AUTO_FRAME_EDGE)** only — NegPy's own default; `ModuleKind::Autocrop` (Phase 13's report schema) is not split into separate Film/Image variants for this. **Film mode (AUTO_FILM_BORDER) is fully ported and independently proven against the real corpus** via a corpus-gated `cargo test` (`film_mode_iou_matches_reference` in `engine/tests/geometry_candidates.rs`), not this table — both modes are implemented and both are proven, just through two different mechanisms. With `SCANSTUDIO_PARITY_REFS`/`SCANSTUDIO_PARITY_CANDIDATES` set and candidates rendered, all six slots report `pass` (`AUTOCROP_IOU_THRESHOLD = 0.93` — see §5). |
 | Deskew | Real reference rendered (`render_geometry_references.py`, Phase 15); real Rust candidate available via `make render-geometry-candidates` (`processing::geometry::apply_fine_rotation`) | `make parity`'s `deskew` row is a **rotation-matrix angle-provenance check**, not a full geometric-correctness proof: both sides decompose `rotation_matrix_2x3`'s own closed-form output (`atan2(m[0][1], m[0][0])`) at the same fixed, documented test angle (`1.75` degrees — see §3), so it verifies matrix-construction correctness (sign convention, degrees-to-radians conversion, center-point formula) but cannot by itself detect a resampling bug. **The real pixel-level regression protection for the bilinear-resample step lives in a separate corpus-gated `cargo test`** (`deskew_pixel_fidelity_within_tolerance` in `engine/tests/geometry_candidates.rs`), which compares actual candidate/reference rotated TIFFs pixel-by-pixel. With `SCANSTUDIO_PARITY_REFS`/`SCANSTUDIO_PARITY_CANDIDATES` set and candidates rendered, all six slots report `pass` (`DESKEW_ANGLE_EPSILON_DEGREES = 0.05`, unchanged — measured agreement is ~2.22e-16 on all six slots). |
 | ICE | Legacy-only reference freshly rendered (`render_ice_references.py`, external, real `portable_digital_ice` v0.3.1); real Rust candidate available via `make render-ice-candidates` (Phase 16, `processing::ice::repair_frame`) | Reference-mask investigation **resolved with real measured evidence** — see §3: the corpus-bundled hybrid mask is structurally unrepresentative (Jaccard ~0.000176 against the Legacy port on slot 1); `score_ice()` now prefers the Legacy-only reference, falling back to the hybrid mask only when no Legacy-only reference exists. With `SCANSTUDIO_PARITY_REFS`/`SCANSTUDIO_PARITY_CANDIDATES` set and candidates rendered, **all six slots report `pass`, Jaccard `1.000000` exactly** (`ICE_MASK_AGREEMENT_THRESHOLD = 0.85` — see §5), independently re-verified pixel-by-pixel outside the Rust binary. |
@@ -280,10 +311,17 @@ reader doesn't need to open the Rust source):
   is well under the ~1.0 "just noticeable difference" convention,
   appropriate when comparing two implementations of the same algorithm on
   the same input rather than measuring perceptual accuracy against ground
-  truth. Separately and importantly: the `nikonlook-v1` bundle's own
-  `manifest.json` documents that it does **not** numerically pass its own
-  skin ΔE00 quality gate — best oracle-gain holdout result is 3.55 ΔE00
-  against a ≤1.0 target. That is a known, owner-documented property of the
+  truth — which only holds when candidate and reference actually are the
+  same bundle version. `bin/parity.rs`'s `score_color` derives the
+  reference filename from the loaded bundle's own `bundle_version` (never a
+  fixed literal) specifically so this threshold can never end up silently
+  scoring one bundle version's candidate against another's reference; see
+  §3. Separately and importantly: the nikonlook bundles' own
+  `manifest.json` (Layer B — shared, unchanged across bundle versions)
+  documents that it does **not** numerically pass its own skin ΔE00 quality
+  gate — best oracle-gain holdout result is 3.55 ΔE00 against a ≤1.0
+  target, identical in both the `nikonlook-v1` and `nikonlook-v2`
+  manifests. That is a known, owner-documented property of the
   nikonlook algorithm itself (real-world color accuracy), completely
   orthogonal to `COLOR_DELTA_E76_TOLERANCE`, which only measures whether a
   Rust port reproduces the *same* (imperfect) Python algorithm faithfully.
@@ -368,8 +406,9 @@ fabricated pass or fail.
 
 Color reference TIFFs rendered by `render_references.py` can live in a
 separate directory from the corpus. When `bin/parity.rs` doesn't find
-`acceptance_slotNN_reference_color_nikonlook-v1.tif` colocated with the
-corpus, it falls back to `$SCANSTUDIO_PARITY_REFS/acceptance_slotNN_reference_color_nikonlook-v1.tif`.
+`acceptance_slotNN_reference_color_{bundle_version}.tif` (`{bundle_version}`
+per §3 — `nikonlook-v2` by default) colocated with the corpus, it falls back
+to `$SCANSTUDIO_PARITY_REFS/acceptance_slotNN_reference_color_{bundle_version}.tif`.
 Set the env var when references are stored elsewhere — for the
 read-only-corpus scenario described in §3:
 

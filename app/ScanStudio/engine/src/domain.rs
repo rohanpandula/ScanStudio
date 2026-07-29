@@ -552,6 +552,41 @@ pub struct WrittenOutputs {
     pub preview_path: Option<String>,
 }
 
+/// Which of nikonlook v2's Layer-A gain-estimation paths a rendered C41
+/// frame actually used. `Blind` covers both v1's only method
+/// (`percentile-stopgap-v1`, which never accepts exposure metadata at all)
+/// and v2's scored raw-feature fallback (`log-ridge-raw-features-v1`) --
+/// telling those two apart requires reading `NikonlookProvenance.bundle_version`
+/// alongside this field. `HardwareExposure` is only reachable on a v2
+/// bundle whose caller supplied a usable `exposure_10ns` (see
+/// `processing::nikonlook::estimate_gains`'s doc comment for exactly what
+/// "usable" means and why an unusable value is treated as absent rather
+/// than erroring or clamping a meaningless ratio).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NikonlookLayerAPath {
+    Blind,
+    HardwareExposure,
+}
+
+/// Per-frame nikonlook provenance for a rendered C41 positive: the bundle
+/// version, which Layer-A path ran, and the exact per-channel gains
+/// `processing::nikonlook::apply` actually used. These materially change
+/// the rendered output (see PARITY.md and
+/// `resources/nikonlook-v2/PROVENANCE.md`) but were previously
+/// unrecoverable from a receipt alone. `None` on every non-C41 frame
+/// (Positive/Kodachrome pass the raw pixels through unchanged; BwNegative
+/// inverts a neutral RGB average) -- nikonlook never runs for those.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NikonlookProvenance {
+    pub bundle_version: String,
+    pub layer_a_path: NikonlookLayerAPath,
+    /// R, G, B order -- the exact `k` `estimate_gains` returned and `apply`
+    /// multiplied into the raw pixels before the shared matrix+curves model.
+    pub gains: [f64; 3],
+}
+
 // ---------------------------------------------------------------------
 // Metadata (META-01)
 // ---------------------------------------------------------------------
@@ -886,6 +921,11 @@ pub struct ScanReceipt {
     pub meter_rgbi_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_telemetry: Option<HardwareTelemetry>,
+    /// `None` for every non-C41 frame and for any C41 frame rendered before
+    /// this field existed (legacy receipts predate it) -- never a
+    /// fabricated value. See `NikonlookProvenance`'s own doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nikonlook: Option<NikonlookProvenance>,
 }
 
 // ---------------------------------------------------------------------
@@ -1300,6 +1340,7 @@ mod tests {
             storage_transform: None,
             meter_rgbi_path: None,
             hardware_telemetry: None,
+            nikonlook: None,
         };
         round_trip(&ProjectFrame {
             index: 1,
@@ -1532,8 +1573,61 @@ mod tests {
             storage_transform: None,
             meter_rgbi_path: None,
             hardware_telemetry: None,
+            nikonlook: None,
         };
         round_trip(&receipt);
+    }
+
+    #[test]
+    fn scan_receipt_with_nikonlook_provenance_matches_documented_camelcase_shape() {
+        // Same base receipt literal as `scan_receipt_matches_golden_fixture_shape`
+        // above, but with `nikonlook: Some(...)` -- the one field neither
+        // existing ScanReceipt round-trip test exercises (both use `None`),
+        // so nothing previously proved this field's `Some` side reaches the
+        // wire in its documented camelCase shape (PROTOCOL.md) rather than
+        // being silently dropped by `skip_serializing_if`.
+        let receipt = ScanReceipt {
+            job_id: "job-1".into(),
+            frame_index: 1,
+            started_at: "2026-07-22T09:00:00Z".into(),
+            duration_ms: 1900,
+            passes: 2,
+            resolution_dpi: 4000,
+            bit_depth: 16,
+            channels: "rgbi".into(),
+            engine_version: "0.1.0".into(),
+            device_id: "sim-ls5000-0".into(),
+            simulated: true,
+            settings_fingerprint: "1a3d265e0b54bbd2".into(),
+            processing: None,
+            output: None,
+            outputs: None,
+            rgb_path: None,
+            ir_path: None,
+            storage_transform: None,
+            meter_rgbi_path: None,
+            hardware_telemetry: None,
+            nikonlook: Some(NikonlookProvenance {
+                bundle_version: "nikonlook-v2".into(),
+                layer_a_path: NikonlookLayerAPath::HardwareExposure,
+                gains: [0.5764822683598294, 0.22818411954519974, 0.2620541212542383],
+            }),
+        };
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(
+            value["nikonlook"],
+            json!({
+                "bundleVersion": "nikonlook-v2",
+                "layerAPath": "hardwareExposure",
+                "gains": [0.5764822683598294, 0.22818411954519974, 0.2620541212542383],
+            })
+        );
+        round_trip(&receipt);
+
+        // The fallback path's own wire value -- what a malformed or absent
+        // exposure_10ns labels (see processing::nikonlook::exposure_is_usable
+        // and render::render_positive).
+        assert_eq!(serde_json::to_value(NikonlookLayerAPath::Blind).unwrap(), json!("blind"));
     }
 
     #[test]

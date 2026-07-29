@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """render_geometry_references.py -- renders fresh autocrop + fine-deskew
-geometry reference files for Scan Studio's parity harness
-(nikon-coolscan4-software-archaeology, phase 15-geometry-port, plan 15-02)
-by invoking the real `negpy.features.geometry.logic` module directly
-against each corpus slot's own raw RGB capture.
+geometry reference files for Scan Studio's parity harness (phase
+15-geometry-port, plan 15-02) by invoking the real
+`negpy.features.geometry.logic` module directly against each corpus slot's
+own raw RGB capture.
 
-This script lives OUTSIDE the nikon-coolscan4-software-archaeology repo (GPL
-reference code stays external -- see that repo's CLAUDE.md licensing
-constraint) and is never copied into it. By default it writes reference
-files next to the corpus, which is what
+This script is vendored in this repository, at `bridge/tools/`. The GPL
+reference code it CALLS -- negpy-src -- is the thing that must stay
+external so this repository's MIT licence is not entangled; this script
+itself is MIT-licensed like the rest of this repository and has always been
+intended to ship with it. Point --negpy-src-path at a checkout of that
+external negpy-src (no default -- see that flag's own --help). By default
+it writes reference files next to the corpus, which is what
 app/ScanStudio/engine/src/bin/parity.rs looks for as the geometry modules'
 references. Pass --output-dir to write elsewhere instead (e.g. when the
 corpus directory itself must stay read-only) -- see PARITY.md for the
@@ -79,11 +82,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--negpy-src-path",
-        default="~/Downloads/digital-ice-2026/negpy-src",
+        default=None,
         help=(
             "Path to negpy-src's directory, added to sys.path so "
-            "negpy.features.geometry.logic can be imported (default: "
-            "~/Downloads/digital-ice-2026/negpy-src)"
+            "negpy.features.geometry.logic can be imported. Required -- "
+            "negpy-src is GPL-labeled reference code that stays external to "
+            "this repository (see this file's own module docstring), so "
+            "there is no in-checkout path to default to."
         ),
     )
     parser.add_argument(
@@ -102,6 +107,11 @@ def parse_args() -> argparse.Namespace:
     if not args.corpus:
         parser.error(
             "--corpus not given and SCANSTUDIO_PARITY_CORPUS is not set in the environment"
+        )
+    if not args.negpy_src_path:
+        parser.error(
+            "--negpy-src-path is required (no default -- see --help): point it at a checkout "
+            "of negpy-src's GPL-licensed source"
         )
     return args
 

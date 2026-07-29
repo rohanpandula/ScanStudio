@@ -145,6 +145,29 @@ const LAYER_A_V2_QUANTILES: [f64; 13] =
 /// to narrowest) — mirrors `LAYER_A_V2_SPAN_INDEX_PAIRS` (line 107) exactly.
 const LAYER_A_V2_SPAN_INDEX_PAIRS: [(usize, usize); 3] = [(0, 12), (1, 11), (2, 10)];
 
+/// The frozen v2 blind feature name schema, R then G then B, 13 quantile
+/// names then 3 span names per channel (48 total) — mirrors
+/// `nikonlook_core.py::_layer_a_v2_feature_names()`'s generated output
+/// exactly (verified against the vendored `resources/nikonlook-v2/layer_a.json`'s
+/// own `blind_fallback.feature_names` array). Hardcoded rather than
+/// generated from `LAYER_A_V2_QUANTILES` at validation time, consistent
+/// with this module's existing frozen-literal style for Layer-A schema tags
+/// (see the method/schema consts above) — a bundle's `feature_names` must
+/// match this list exactly or `_validate_layer_a`'s Rust port
+/// (`build_layer_a_v2`) rejects it, the same "fail loudly on schema drift"
+/// contract every other schema tag in this module already enforces.
+const LAYER_A_V2_FEATURE_NAMES: [&str; LAYER_A_V2_FEATURE_COUNT] = [
+    "log_R_q1", "log_R_q2", "log_R_q5", "log_R_q10", "log_R_q20", "log_R_q35", "log_R_q50",
+    "log_R_q65", "log_R_q80", "log_R_q90", "log_R_q95", "log_R_q98", "log_R_q99",
+    "log_R_span_q1_q99", "log_R_span_q2_q98", "log_R_span_q5_q95",
+    "log_G_q1", "log_G_q2", "log_G_q5", "log_G_q10", "log_G_q20", "log_G_q35", "log_G_q50",
+    "log_G_q65", "log_G_q80", "log_G_q90", "log_G_q95", "log_G_q98", "log_G_q99",
+    "log_G_span_q1_q99", "log_G_span_q2_q98", "log_G_span_q5_q95",
+    "log_B_q1", "log_B_q2", "log_B_q5", "log_B_q10", "log_B_q20", "log_B_q35", "log_B_q50",
+    "log_B_q65", "log_B_q80", "log_B_q90", "log_B_q95", "log_B_q98", "log_B_q99",
+    "log_B_span_q1_q99", "log_B_span_q2_q98", "log_B_span_q5_q95",
+];
+
 // ---------------------------------------------------------------------
 // Bundle
 // ---------------------------------------------------------------------
@@ -243,7 +266,14 @@ struct LayerADto {
     hi_pct: f64,
     rail_lo_fraction: f64,
     rail_hi_fraction: f64,
-    gain_bounds: Vec<f64>,
+    // `#[serde(default)]` (-> None) rather than a required field — mirrors
+    // `nikonlook_core.py`'s `layer_a.get("gain_bounds", GAIN_BOUNDS)`: an
+    // absent field defaults to `DEFAULT_GAIN_BOUNDS` rather than failing to
+    // parse (see `validated_gain_bounds_or_default`), while a
+    // present-but-malformed array must still fail validation, so `None`
+    // here means "key absent," never conflated with a present empty array.
+    #[serde(default)]
+    gain_bounds: Option<Vec<f64>>,
     reference_lo: Vec<f64>,
     reference_hi: Vec<f64>,
     reference_k: Vec<f64>,
@@ -270,17 +300,43 @@ struct MetadataEstimatorDto {
     method: String,
     reference_exposure_10ns: Vec<f64>,
     reference_gain: Vec<f64>,
-    gain_bounds: Vec<f64>,
+    // `#[serde(default)]` (-> None) — mirrors `nikonlook_core.py`'s
+    // `metadata.get("gain_bounds", GAIN_BOUNDS)`; see `LayerADto.gain_bounds`'s
+    // own doc comment for why `None` means "key absent," not "empty array."
+    #[serde(default)]
+    gain_bounds: Option<Vec<f64>>,
+    // Optional in both the real bundle's own schema and
+    // `nikonlook_core.py::_validate_layer_a` (only checked `if
+    // "gain_exposure_product" in metadata`) — absent entirely rather than
+    // defaulting to a placeholder, so `#[serde(default)]` (-> None) mirrors
+    // Python's `metadata.get(...)` returning `None` exactly.
+    #[serde(default)]
+    gain_exposure_product: Option<Vec<f64>>,
 }
 
 #[derive(Deserialize)]
 struct BlindFallbackDto {
     method: String,
     feature_schema: String,
+    // `#[serde(default)]` (-> empty Vec) rather than a required field: an
+    // absent `feature_names` must fail the same explicit, named
+    // schema-mismatch check a present-but-wrong array would (mirrors
+    // `nikonlook_core.py`'s `blind.get("feature_names") != ...` — `None !=
+    // [...]` is simply another mismatch to Python, not a separate
+    // missing-field error), not the generic `serde_json::Error` a required
+    // field's absence would raise here.
+    #[serde(default)]
+    feature_names: Vec<String>,
     sample_stride: usize,
     rail_lo_fraction: f64,
     rail_hi_fraction: f64,
-    gain_bounds: Vec<f64>,
+    alpha: f64,
+    target_kind: String,
+    // `#[serde(default)]` (-> None) — mirrors `nikonlook_core.py`'s
+    // `blind.get("gain_bounds", GAIN_BOUNDS)`; see `LayerADto.gain_bounds`'s
+    // own doc comment for why `None` means "key absent," not "empty array."
+    #[serde(default)]
+    gain_bounds: Option<Vec<f64>>,
     feature_mean: Vec<f64>,
     feature_scale: Vec<f64>,
     log_gain_intercept: Vec<f64>,
@@ -397,22 +453,7 @@ fn parse_bundle(
 
     let layer_a = if method == LAYER_A_V1_METHOD {
         let layer_a_dto: LayerADto = serde_json::from_str(layer_a_json)?;
-
-        let reference_lo = fixed3(&layer_a_dto.reference_lo, "layer_a.json:reference_lo")?;
-        let reference_hi = fixed3(&layer_a_dto.reference_hi, "layer_a.json:reference_hi")?;
-        let reference_k = fixed3(&layer_a_dto.reference_k, "layer_a.json:reference_k")?;
-        let gain_bounds = fixed2(&layer_a_dto.gain_bounds, "layer_a.json:gain_bounds")?;
-
-        LayerA::V1(LayerAV1 {
-            lo_pct: layer_a_dto.lo_pct,
-            hi_pct: layer_a_dto.hi_pct,
-            rail_lo_fraction: layer_a_dto.rail_lo_fraction,
-            rail_hi_fraction: layer_a_dto.rail_hi_fraction,
-            reference_lo,
-            reference_hi,
-            reference_k,
-            gain_bounds: (gain_bounds[0], gain_bounds[1]),
-        })
+        LayerA::V1(build_layer_a_v1(layer_a_dto)?)
     } else {
         let layer_a_dto: LayerAV2Dto = serde_json::from_str(layer_a_json)?;
         LayerA::V2(build_layer_a_v2(layer_a_dto)?)
@@ -425,30 +466,6 @@ fn parse_bundle(
         quality_tier: manifest.quality_tier,
         bundle_version: manifest.bundle_version,
     })
-}
-
-/// Validates a field's value slice has exactly 3 elements, converting into
-/// a fixed-size array — `NikonlookError::Invalid` with a clear message
-/// (naming the field) on any shape mismatch.
-fn fixed3(values: &[f64], field: &str) -> Result<[f64; 3], NikonlookError> {
-    if values.len() != 3 {
-        return Err(NikonlookError::Invalid(format!(
-            "{field}: expected 3 values, got {}",
-            values.len()
-        )));
-    }
-    Ok([values[0], values[1], values[2]])
-}
-
-/// Same as `fixed3` but for 2-element fields (e.g. `gain_bounds`).
-fn fixed2(values: &[f64], field: &str) -> Result<[f64; 2], NikonlookError> {
-    if values.len() != 2 {
-        return Err(NikonlookError::Invalid(format!(
-            "{field}: expected 2 values, got {}",
-            values.len()
-        )));
-    }
-    Ok([values[0], values[1]])
 }
 
 // ---------------------------------------------------------------------
@@ -497,6 +514,44 @@ fn validated_gain_bounds(values: &[f64], field: &str) -> Result<(f64, f64), Niko
     Ok((lo, hi))
 }
 
+/// Mirrors `nikonlook_core.py`'s own module-level `GAIN_BOUNDS = (0.02,
+/// 100.0)` — the value `layer_a.get("gain_bounds", GAIN_BOUNDS)` /
+/// `metadata.get("gain_bounds", GAIN_BOUNDS)` / `blind.get("gain_bounds",
+/// GAIN_BOUNDS)` (`_validate_layer_a`, lines 373/401/432) fall back to when
+/// a bundle omits the field entirely.
+const DEFAULT_GAIN_BOUNDS: (f64, f64) = (0.02, 100.0);
+
+/// `validated_gain_bounds`, but `None` (an omitted `gain_bounds` key —
+/// every caller passes `dto_field.as_deref()`, and `#[serde(default)]`
+/// makes an absent key deserialize to `None`, never a present empty array;
+/// see e.g. `LayerADto.gain_bounds`'s own doc comment) resolves to
+/// `DEFAULT_GAIN_BOUNDS` instead of erroring, exactly like Python's
+/// `.get(name, GAIN_BOUNDS)` default. A bundle that DOES include the key —
+/// even as `[]` or some other malformed shape — still has to pass
+/// `validated_gain_bounds`'s full check; only true absence gets the
+/// default, matching Python's `dict.get` semantics exactly (a present
+/// `null`/wrong-shape value is not the same as an absent key to `.get`
+/// either).
+fn validated_gain_bounds_or_default(values: Option<&[f64]>, field: &str) -> Result<(f64, f64), NikonlookError> {
+    match values {
+        None => Ok(DEFAULT_GAIN_BOUNDS),
+        Some(values) => validated_gain_bounds(values, field),
+    }
+}
+
+/// Mirrors `_finite_scalar`, itself `_finite_array([value], (1,), field)[0]`
+/// — a single finite value. Python's `_finite_scalar` never takes a
+/// `positive` flag (every one of its own call sites -- `lo_pct`, `hi_pct`,
+/// both rail fractions, `alpha` -- checks positivity, if at all, via a
+/// separate explicit comparison afterward, e.g. `if alpha <= 0.0: raise
+/// ...`), so this port doesn't carry one either -- see this function's own
+/// call sites in `build_layer_a_v1`/`build_layer_a_v2` for the same
+/// separate-comparison pattern.
+fn finite_scalar(value: f64, field: &str) -> Result<f64, NikonlookError> {
+    finite_slice(&[value], 1, field, false)?;
+    Ok(value)
+}
+
 /// Validates v2's `coefficients` field: exactly `rows` rows, each exactly 3
 /// finite values — mirrors `_finite_array`'s `(LAYER_A_V2_FEATURE_COUNT, 3)`
 /// shape check.
@@ -517,6 +572,58 @@ fn finite_matrix_rows3(values: &[Vec<f64>], rows: usize, field: &str) -> Result<
         out.push([row[0], row[1], row[2]]);
     }
     Ok(out)
+}
+
+/// Validates and constructs v1's Layer A from its parsed DTO — mirrors
+/// `nikonlook_core.py::_validate_layer_a`'s v1 branch (lines 362-374)
+/// field-for-field: `reference_lo`/`reference_hi`/`reference_k` finite
+/// (`reference_k` additionally positive, matching Python's
+/// `positive=name == "reference_k"`), `lo_pct`/`hi_pct`/both rail fractions
+/// finite scalars subject to the same two ordering constraints Python
+/// checks (`0 <= lo_pct < hi_pct <= 100`, `0 <= rail_lo_fraction <
+/// rail_hi_fraction <= 1`), and `gain_bounds` defaulting to
+/// `DEFAULT_GAIN_BOUNDS` when the bundle omits it. Shares the same
+/// validation primitives `build_layer_a_v2` below uses
+/// (`finite_array3`/`finite_scalar`/`validated_gain_bounds_or_default`) —
+/// this port previously validated v1 through separate, weaker,
+/// length-only helpers (`fixed3`/`fixed2`) that checked shape but not
+/// finiteness, positivity, or either ordering constraint; closing that gap
+/// is what makes v1 and v2 equally strict, as PARITY.md and this module's
+/// own doc comment already claimed.
+fn build_layer_a_v1(dto: LayerADto) -> Result<LayerAV1, NikonlookError> {
+    const PREFIX: &str = "layer_a.json";
+
+    let reference_lo = finite_array3(&dto.reference_lo, &format!("{PREFIX}:reference_lo"), false)?;
+    let reference_hi = finite_array3(&dto.reference_hi, &format!("{PREFIX}:reference_hi"), false)?;
+    let reference_k = finite_array3(&dto.reference_k, &format!("{PREFIX}:reference_k"), true)?;
+
+    let lo_pct = finite_scalar(dto.lo_pct, &format!("{PREFIX}:lo_pct"))?;
+    let hi_pct = finite_scalar(dto.hi_pct, &format!("{PREFIX}:hi_pct"))?;
+    let rail_lo_fraction = finite_scalar(dto.rail_lo_fraction, &format!("{PREFIX}:rail_lo_fraction"))?;
+    let rail_hi_fraction = finite_scalar(dto.rail_hi_fraction, &format!("{PREFIX}:rail_hi_fraction"))?;
+    if !(0.0 <= lo_pct && lo_pct < hi_pct && hi_pct <= 100.0) {
+        return Err(NikonlookError::Invalid(format!(
+            "{PREFIX}: expected 0 <= lo_pct < hi_pct <= 100"
+        )));
+    }
+    if !(0.0 <= rail_lo_fraction && rail_lo_fraction < rail_hi_fraction && rail_hi_fraction <= 1.0) {
+        return Err(NikonlookError::Invalid(format!(
+            "{PREFIX}: expected 0 <= rail_lo_fraction < rail_hi_fraction <= 1"
+        )));
+    }
+    let gain_bounds =
+        validated_gain_bounds_or_default(dto.gain_bounds.as_deref(), &format!("{PREFIX}:gain_bounds"))?;
+
+    Ok(LayerAV1 {
+        lo_pct,
+        hi_pct,
+        rail_lo_fraction,
+        rail_hi_fraction,
+        reference_lo,
+        reference_hi,
+        reference_k,
+        gain_bounds,
+    })
 }
 
 /// Validates and constructs v2's Layer A from its parsed DTO — mirrors
@@ -540,10 +647,34 @@ fn build_layer_a_v2(dto: LayerAV2Dto) -> Result<LayerAV2, NikonlookError> {
         &format!("{PREFIX}:metadata_estimator.reference_gain"),
         true,
     )?;
-    let metadata_gain_bounds = validated_gain_bounds(
-        &dto.metadata_estimator.gain_bounds,
+    let metadata_gain_bounds = validated_gain_bounds_or_default(
+        dto.metadata_estimator.gain_bounds.as_deref(),
         &format!("{PREFIX}:metadata_estimator.gain_bounds"),
     )?;
+    // Optional consistency check, only when the bundle carries the
+    // (optional) derived field at all — mirrors `_validate_layer_a`'s `if
+    // "gain_exposure_product" in metadata`. `np.allclose(product, ref_exp *
+    // ref_gain, rtol=1e-12, atol=1e-9)` is `|a - b| <= atol + rtol*|b|`
+    // elementwise; replicated per-channel below so a mismatch names the
+    // offending index instead of Python's single blanket message.
+    if let Some(product_field) = &dto.metadata_estimator.gain_exposure_product {
+        let product = finite_array3(
+            product_field,
+            &format!("{PREFIX}:metadata_estimator.gain_exposure_product"),
+            true,
+        )?;
+        for c in 0..3 {
+            let expected = reference_exposure_10ns[c] * reference_gain[c];
+            let tolerance = 1e-9 + 1e-12 * expected.abs();
+            if (product[c] - expected).abs() > tolerance {
+                return Err(NikonlookError::Invalid(format!(
+                    "{PREFIX}:metadata_estimator.gain_exposure_product: inconsistent with \
+                     reference_gain * reference_exposure_10ns at index {c} (got {}, expected {expected})",
+                    product[c]
+                )));
+            }
+        }
+    }
 
     if dto.blind_fallback.method != LAYER_A_V2_BLIND_METHOD {
         return Err(NikonlookError::Invalid(format!(
@@ -555,6 +686,16 @@ fn build_layer_a_v2(dto: LayerAV2Dto) -> Result<LayerAV2, NikonlookError> {
         return Err(NikonlookError::Invalid(format!(
             "{PREFIX}: unsupported blind feature schema {:?}",
             dto.blind_fallback.feature_schema
+        )));
+    }
+    // `!=` against the frozen 48-name list mirrors `_validate_layer_a`
+    // treating a missing `feature_names` the same as a wrong one (both
+    // become "does not match" here) — see `BlindFallbackDto.feature_names`'s
+    // own `#[serde(default)]` doc comment for why absence doesn't fail
+    // earlier, as a bare deserialize error, instead.
+    if dto.blind_fallback.feature_names.iter().map(String::as_str).ne(LAYER_A_V2_FEATURE_NAMES) {
+        return Err(NikonlookError::Invalid(format!(
+            "{PREFIX}: blind feature_names do not match the frozen feature schema"
         )));
     }
     if dto.blind_fallback.sample_stride < 1 {
@@ -569,8 +710,26 @@ fn build_layer_a_v2(dto: LayerAV2Dto) -> Result<LayerAV2, NikonlookError> {
             "{PREFIX}: expected blind rail fractions to satisfy 0 <= lo < hi <= 1"
         )));
     }
-    let blind_gain_bounds = validated_gain_bounds(
-        &dto.blind_fallback.gain_bounds,
+    // `alpha` (the training-time ridge regularization strength) and
+    // `target_kind` (the training target convention) are training metadata
+    // carried into the bundle for provenance/debugging; frozen-schema
+    // agreement on `feature_names` above proves the FEATURE side matches,
+    // these two prove the TRAINING side is present and not obviously
+    // corrupt, matching `_validate_layer_a`'s own `alpha`/`target_kind`
+    // checks exactly.
+    let alpha = finite_scalar(dto.blind_fallback.alpha, &format!("{PREFIX}:blind_fallback.alpha"))?;
+    if alpha <= 0.0 {
+        return Err(NikonlookError::Invalid(format!(
+            "{PREFIX}:blind_fallback.alpha: must be finite and positive, got {alpha}"
+        )));
+    }
+    if dto.blind_fallback.target_kind.is_empty() {
+        return Err(NikonlookError::Invalid(format!(
+            "{PREFIX}:blind_fallback.target_kind: must be a non-empty string"
+        )));
+    }
+    let blind_gain_bounds = validated_gain_bounds_or_default(
+        dto.blind_fallback.gain_bounds.as_deref(),
         &format!("{PREFIX}:blind_fallback.gain_bounds"),
     )?;
     finite_slice(
@@ -744,6 +903,20 @@ fn layer_a_v2_features(raw: &[[f64; 3]], width: usize, blind: &BlindFallbackV1) 
 // hybrid-exposure-ridge-v2)
 // ---------------------------------------------------------------------
 
+/// True if every component of a candidate hardware-exposure triple is
+/// finite and strictly positive — the bar `estimate_gains` requires before
+/// its `LayerA::V2` branch will trust `exposure_10ns` rather than falling
+/// back to the blind estimator (see that function's own doc comment for
+/// the fail-closed rationale). No magnitude/plausibility bound beyond
+/// finite-and-positive is imposed here: this module has no principled
+/// source for a "too large"/"too small" exposure threshold, and the
+/// resulting gain is clamped to the bundle's own `gain_bounds` regardless,
+/// so an implausible-but-finite-and-positive value cannot escape that
+/// clamp even when this check accepts it.
+pub fn exposure_is_usable(exposure_10ns: [f64; 3]) -> bool {
+    exposure_10ns.iter().all(|&value| value.is_finite() && value > 0.0)
+}
+
 /// Per-frame exposure gain estimate ("Layer A"), dispatched by the loaded
 /// bundle's method (see this module's doc comment). `raw` is scanner-linear
 /// RGB in [0,1] (16-bit raw counts / 65535), one [R,G,B] triple per pixel,
@@ -752,15 +925,32 @@ fn layer_a_v2_features(raw: &[[f64; 3]], width: usize, blind: &BlindFallbackV1) 
 ///
 /// `exposure_10ns` is the caller's per-channel hardware exposure duration
 /// in 10ns ticks (mirrors nikonlook_core.py's `meta["exposure_10ns"]`),
-/// `None` when unavailable. `LayerA::V2` uses it when present (the
-/// `inverse-hardware-exposure-v1` path — the caller must guarantee each
-/// component is finite and > 0; only `debug_assert!`-checked, since this is
-/// a hot per-frame call and the bundle's own gain_bounds clamp already
-/// contains a bad ratio's blast radius); otherwise v2 falls back to
-/// `log-ridge-raw-features-v1`, its scored blind estimator, which is the
-/// only path that can return `Err` (a degenerate `raw`/`width` pairing —
-/// see `layer_a_v2_features` — unreachable for real engine data, which is
-/// always an exact (H,W,3) raster).
+/// `None` when unavailable. `LayerA::V2` uses it only when
+/// [`exposure_is_usable`] accepts it (the `inverse-hardware-exposure-v1`
+/// path); any other value — non-finite, zero, negative — is treated
+/// exactly like `None` and routed to `log-ridge-raw-features-v1`, v2's
+/// scored blind estimator, instead. This is a deliberate design choice, not
+/// an oversight: a bad exposure value silently divided into the gain ratio
+/// and then clamped to `gain_bounds` would still land inside a "plausible"
+/// range and pass every downstream sanity check while being numerically
+/// meaningless — exactly the failure this function must not produce. The
+/// blind estimator never reads `exposure_10ns` at all, so it cannot inherit
+/// the bad value's error, and this bundle's own measured evidence (see
+/// `resources/nikonlook-v2/PROVENANCE.md`) is that the blind path is
+/// generally the stronger estimator anyway, so falling back to it is not a
+/// degraded result. `real_backend.rs`'s `nikonlook_exposure_10ns_from_receipt`
+/// already declines to build an `exposure_10ns` argument at all from a
+/// degenerate bridge receipt (defense in depth, checked before this
+/// function ever sees the value); this function enforces the same
+/// finite-and-positive bar unconditionally so every other caller — tests,
+/// parity tooling, future integrations — gets the same guarantee without
+/// having to duplicate the check. A caller that needs to know in advance
+/// which path a given call will take (e.g. render provenance) can call
+/// [`exposure_is_usable`] itself rather than requiring this function to
+/// fail loudly or report it out-of-band. Only the blind path can return
+/// `Err` (a degenerate `raw`/`width` pairing — see `layer_a_v2_features` —
+/// unreachable for real engine data, which is always an exact (H,W,3)
+/// raster).
 ///
 /// Returns (3,) gain, clamped to the active method's own gain_bounds.
 pub fn estimate_gains(
@@ -792,11 +982,7 @@ pub fn estimate_gains(
             Ok(k)
         }
         LayerA::V2(la) => {
-            if let Some(exposure) = exposure_10ns {
-                debug_assert!(
-                    exposure.iter().all(|&value| value.is_finite() && value > 0.0),
-                    "exposure_10ns components must be finite and positive"
-                );
+            if let Some(exposure) = exposure_10ns.filter(|&value| exposure_is_usable(value)) {
                 let mut gain = [0.0f64; 3];
                 for c in 0..3 {
                     gain[c] =
@@ -1351,15 +1537,31 @@ mod tests {
 
     // Group O -- v2 validation failures (Group-G style, tamper one field) --
 
+    /// The frozen 48-name list, JSON-array-element-formatted -- shared by
+    /// the baseline fixture below and the missing-feature_names tamper test,
+    /// so the two can never accidentally drift apart.
+    fn feature_names_json_array() -> String {
+        LAYER_A_V2_FEATURE_NAMES
+            .iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// A minimal, otherwise-valid v2 layer_a.json fixture, so each test
     /// below tampers exactly one field via a single targeted string
     /// replacement -- mirrors Group G's `.replacen(...)` style.
     /// `feature_mean_len` lets the length-mismatch test build a
     /// structurally different array without a second bespoke literal.
+    /// `gain_exposure_product` ([10.0, 20.0, 30.0]) is self-consistent with
+    /// `reference_exposure_10ns * reference_gain` ([10,20,30] * [1,1,1]) so
+    /// the baseline stays valid with the optional field present -- the
+    /// dedicated tamper test below replaces it with an inconsistent value.
     fn minimal_v2_layer_a_json(feature_mean_len: usize) -> String {
         let feature_mean = vec!["0.0".to_string(); feature_mean_len].join(", ");
         let feature_scale = vec!["1.0".to_string(); LAYER_A_V2_FEATURE_COUNT].join(", ");
         let coefficients = vec!["[0.01, 0.02, 0.03]".to_string(); LAYER_A_V2_FEATURE_COUNT].join(", ");
+        let feature_names = feature_names_json_array();
         format!(
             r#"{{
                 "method": "hybrid-exposure-ridge-v2",
@@ -1367,14 +1569,18 @@ mod tests {
                     "method": "inverse-hardware-exposure-v1",
                     "reference_exposure_10ns": [10.0, 20.0, 30.0],
                     "reference_gain": [1.0, 1.0, 1.0],
+                    "gain_exposure_product": [10.0, 20.0, 30.0],
                     "gain_bounds": [0.02, 100.0]
                 }},
                 "blind_fallback": {{
                     "method": "log-ridge-raw-features-v1",
                     "feature_schema": "raw-rail-quantiles-log-v1",
+                    "feature_names": [{feature_names}],
                     "sample_stride": 16,
                     "rail_lo_fraction": 0.003,
                     "rail_hi_fraction": 0.99,
+                    "alpha": 1.0,
+                    "target_kind": "test-target",
                     "gain_bounds": [0.02, 100.0],
                     "feature_mean": [{feature_mean}],
                     "feature_scale": [{feature_scale}],
@@ -1439,5 +1645,313 @@ mod tests {
         let json = minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT)
             .replacen("\"reference_gain\": [1.0, 1.0, 1.0]", "\"reference_gain\": [1.0, -1.0, 1.0]", 1);
         assert_v2_fixture_invalid(&json, "reference_gain");
+    }
+
+    // Group O continued -- Finding 4's missing v2 validations: feature-name
+    // schema agreement, blind alpha/target_kind training metadata, and the
+    // gain_exposure_product consistency check (nikonlook_core.py's
+    // _validate_layer_a, lines 404-431).
+
+    #[test]
+    fn group_o_rejects_wrong_feature_names() {
+        let json = minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT)
+            .replacen("\"log_R_q1\"", "\"totally_wrong_feature\"", 1);
+        assert_v2_fixture_invalid(&json, "feature_names");
+    }
+
+    #[test]
+    fn group_o_rejects_missing_feature_names() {
+        let json = minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT)
+            .replacen(&format!("\"feature_names\": [{}],", feature_names_json_array()), "", 1);
+        assert_v2_fixture_invalid(&json, "feature_names");
+    }
+
+    #[test]
+    fn group_o_rejects_non_positive_alpha() {
+        let json = minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT)
+            .replacen("\"alpha\": 1.0", "\"alpha\": -1.0", 1);
+        assert_v2_fixture_invalid(&json, "alpha");
+    }
+
+    #[test]
+    fn group_o_rejects_non_finite_alpha() {
+        // Unlike the sign check above, this can't be driven through a JSON
+        // fixture: `serde_json` itself rejects both a bare `NaN`/`Infinity`
+        // token and an out-of-range numeric literal (e.g. `1e400`) as a
+        // parse error, so a non-finite `f64` can never reach this module's
+        // own validation via real JSON text -- confirmed empirically (an
+        // earlier version of this test tried `"alpha": 1e400` and got
+        // `Json(Error("number out of range"))`, not `Invalid`). This calls
+        // `finite_scalar` directly instead, unit-testing the primitive
+        // `build_layer_a_v2` relies on rather than the unreachable
+        // JSON-round-trip path.
+        let result = finite_scalar(f64::NAN, "layer_a.json:blind_fallback.alpha");
+        match result {
+            Ok(_) => panic!("expected Err(NikonlookError::Invalid) for a NaN alpha, got Ok(_)"),
+            Err(NikonlookError::Invalid(message)) => {
+                assert!(message.contains("alpha"), "error message should name the field: {message}");
+            }
+            Err(other) => panic!("expected NikonlookError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_o_rejects_empty_target_kind() {
+        let json = minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT)
+            .replacen("\"target_kind\": \"test-target\"", "\"target_kind\": \"\"", 1);
+        assert_v2_fixture_invalid(&json, "target_kind");
+    }
+
+    #[test]
+    fn group_o_rejects_inconsistent_gain_exposure_product() {
+        let json = minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT)
+            .replacen("\"gain_exposure_product\": [10.0, 20.0, 30.0]", "\"gain_exposure_product\": [10.0, 20.0, 999.0]", 1);
+        assert_v2_fixture_invalid(&json, "gain_exposure_product");
+    }
+
+    // Group O continued -- Finding 4's other missing v2 validation: a bundle
+    // that OMITS gain_bounds entirely (nikonlook_core.py's
+    // `metadata.get("gain_bounds", GAIN_BOUNDS)` / `blind.get("gain_bounds",
+    // GAIN_BOUNDS)`, lines 401/432) must default to DEFAULT_GAIN_BOUNDS, not
+    // fail to parse. `remove_key` edits real parsed JSON rather than
+    // text-surgering the fixture string, so this doesn't depend on getting
+    // brace/comma whitespace exactly right by hand.
+
+    /// Removes `key` from the named top-level sub-object (`"metadata_estimator"`
+    /// or `"blind_fallback"`) of a `minimal_v2_layer_a_json`-shaped fixture --
+    /// via real JSON parsing, not text surgery, so the result is guaranteed
+    /// syntactically valid even though (unlike every other Group O tamper,
+    /// which replaces a VALUE) this removes a KEY.
+    fn remove_key(json: &str, object_path: &str, key: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(json).expect("fixture must be valid JSON");
+        value[object_path]
+            .as_object_mut()
+            .expect("expected an object at this path")
+            .remove(key);
+        serde_json::to_string(&value).expect("re-serialize")
+    }
+
+    #[test]
+    fn group_o_v2_metadata_estimator_gain_bounds_defaults_when_omitted() {
+        let json = remove_key(&minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT), "metadata_estimator", "gain_bounds");
+        let bundle = parse_bundle(MODEL_JSON_V2, &json, MANIFEST_JSON_V2)
+            .expect("an omitted gain_bounds must default, not fail to parse");
+        let la = match &bundle.layer_a {
+            LayerA::V2(la) => la,
+            LayerA::V1(_) => panic!("expected LayerA::V2"),
+        };
+        assert_eq!(la.metadata.gain_bounds, DEFAULT_GAIN_BOUNDS);
+    }
+
+    #[test]
+    fn group_o_v2_blind_fallback_gain_bounds_defaults_when_omitted() {
+        let json = remove_key(&minimal_v2_layer_a_json(LAYER_A_V2_FEATURE_COUNT), "blind_fallback", "gain_bounds");
+        let bundle = parse_bundle(MODEL_JSON_V2, &json, MANIFEST_JSON_V2)
+            .expect("an omitted gain_bounds must default, not fail to parse");
+        let la = match &bundle.layer_a {
+            LayerA::V2(la) => la,
+            LayerA::V1(_) => panic!("expected LayerA::V2"),
+        };
+        assert_eq!(la.blind.gain_bounds, DEFAULT_GAIN_BOUNDS);
+    }
+
+    // Group P -- Finding 5: a malformed exposure_10ns must fall back to the
+    // blind estimator, never panic and never silently clamp a meaningless
+    // ratio into something that merely looks like a valid gain.
+
+    #[test]
+    fn group_p_exposure_is_usable_accepts_only_finite_positive_triples() {
+        assert!(exposure_is_usable([127992.0, 312892.0, 259345.0]));
+        assert!(!exposure_is_usable([f64::NAN, 312892.0, 259345.0]));
+        assert!(!exposure_is_usable([127992.0, f64::INFINITY, 259345.0]));
+        assert!(!exposure_is_usable([127992.0, 312892.0, f64::NEG_INFINITY]));
+        assert!(!exposure_is_usable([0.0, 312892.0, 259345.0]));
+        assert!(!exposure_is_usable([127992.0, -312892.0, 259345.0]));
+        assert!(!exposure_is_usable([-0.0, 312892.0, 259345.0]), "-0.0 is not > 0.0");
+    }
+
+    #[test]
+    fn group_p_v2_malformed_exposure_falls_back_to_blind_not_panic_not_clamped_nonsense() {
+        let bundle = load_bundle().expect("real v2 bundle must load");
+        let large = synthetic_image(640, 528);
+        let k_blind = estimate_gains(&large, 528, None, &bundle).expect("blind path never fails on real data");
+
+        let malformed_cases: [[f64; 3]; 6] = [
+            [f64::NAN, 312892.0, 259345.0],
+            [127992.0, f64::INFINITY, 259345.0],
+            [127992.0, 312892.0, f64::NEG_INFINITY],
+            [0.0, 312892.0, 259345.0],
+            [127992.0, -312892.0, 259345.0],
+            [-0.0, 312892.0, 259345.0],
+        ];
+        for exposure in malformed_cases {
+            let k = estimate_gains(&large, 528, Some(exposure), &bundle)
+                .expect("a malformed exposure_10ns must fall back to the blind estimator, never fail");
+            assert_eq!(
+                k, k_blind,
+                "malformed exposure {exposure:?} must fall back to exactly the blind gain, \
+                 proving the bad value was never divided into the ratio"
+            );
+        }
+    }
+
+    #[test]
+    fn group_p_v2_usable_exposure_still_takes_the_hardware_exposure_path() {
+        // Regression guard for the fallback logic itself: a genuinely
+        // usable exposure must NOT be routed to blind -- same exposure
+        // literal and expected gain as Group J.
+        let bundle = load_bundle().expect("real v2 bundle must load");
+        let zeros = vec![[0.0f64; 3]; 16];
+        let k = estimate_gains(&zeros, 4, Some([127992.0, 312892.0, 259345.0]), &bundle)
+            .expect("exposure path never fails");
+        assert_triple_close(k, [0.5764822683598294, 0.22818411954519974, 0.2620541212542383], "group P usable exposure");
+    }
+
+    // Group Q -- Finding 4: v1's validation was length-only (`fixed3`/`fixed2`)
+    // where Python's `_validate_layer_a` (lines 362-374) also checks
+    // finiteness, `reference_k`'s positivity, and two ordering constraints
+    // (`0 <= lo_pct < hi_pct <= 100`, `0 <= rail_lo_fraction <
+    // rail_hi_fraction <= 1`). `build_layer_a_v1` now shares v2's own
+    // validation primitives instead of those separate, weaker helpers --
+    // this group proves each newly-enforced constraint independently,
+    // Group-G/-O style (tamper one field in an otherwise-minimal fixture).
+
+    /// A minimal, otherwise-valid v1 layer_a.json fixture -- mirrors
+    /// `minimal_v2_layer_a_json`'s "one field, one targeted tamper" style.
+    /// Values are not the real bundle's own (only the shape/domain
+    /// constraints `build_layer_a_v1` checks matter here) but do satisfy
+    /// every one of them, so `group_q_minimal_v1_fixture_is_actually_valid`
+    /// below passes before any test tampers it.
+    fn minimal_v1_layer_a_json() -> String {
+        r#"{
+            "method": "percentile-stopgap-v1",
+            "lo_pct": 1.0,
+            "hi_pct": 99.0,
+            "rail_lo_fraction": 0.003,
+            "rail_hi_fraction": 0.99,
+            "gain_bounds": [0.02, 100.0],
+            "reference_lo": [0.1, 0.1, 0.1],
+            "reference_hi": [0.5, 0.5, 0.5],
+            "reference_k": [1.0, 1.0, 1.0]
+        }"#
+        .to_string()
+    }
+
+    /// Removes a top-level key from a `minimal_v1_layer_a_json`-shaped
+    /// fixture via real JSON parsing -- see Group O's own `remove_key`,
+    /// this is that same technique for v1's flat (non-nested) shape.
+    fn remove_top_level_key(json: &str, key: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(json).expect("fixture must be valid JSON");
+        value.as_object_mut().expect("expected a JSON object").remove(key);
+        serde_json::to_string(&value).expect("re-serialize")
+    }
+
+    fn assert_v1_fixture_invalid(json: &str, needle: &str) {
+        match parse_bundle(MODEL_JSON_V1, json, MANIFEST_JSON_V1) {
+            Ok(_) => panic!("expected Err(NikonlookError::Invalid) naming {needle:?}, got Ok(_)"),
+            Err(NikonlookError::Invalid(message)) => {
+                assert!(
+                    message.contains(needle),
+                    "expected message to contain {needle:?}, got {message:?}"
+                );
+            }
+            Err(other) => panic!("expected NikonlookError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_q_minimal_v1_fixture_is_actually_valid() {
+        // Sanity check for the tamper tests below -- see
+        // group_o_minimal_v2_fixture_is_actually_valid's own rationale.
+        parse_bundle(MODEL_JSON_V1, &minimal_v1_layer_a_json(), MANIFEST_JSON_V1)
+            .expect("untampered minimal v1 fixture must load");
+    }
+
+    #[test]
+    fn group_q_rejects_non_positive_reference_k() {
+        let json = minimal_v1_layer_a_json()
+            .replacen("\"reference_k\": [1.0, 1.0, 1.0]", "\"reference_k\": [1.0, -1.0, 1.0]", 1);
+        assert_v1_fixture_invalid(&json, "reference_k");
+    }
+
+    #[test]
+    fn group_q_rejects_wrong_length_reference_lo() {
+        // reference_lo/reference_hi are NOT positive=true in Python (only
+        // reference_k is), so this exercises the shape check alone --
+        // proving finite_array3 kept the length coverage fixed3 used to
+        // provide, not just added strictness on top.
+        let json = minimal_v1_layer_a_json()
+            .replacen("\"reference_lo\": [0.1, 0.1, 0.1]", "\"reference_lo\": [0.1, 0.1]", 1);
+        assert_v1_fixture_invalid(&json, "reference_lo");
+    }
+
+    #[test]
+    fn group_q_rejects_lo_pct_hi_pct_out_of_order() {
+        let json = minimal_v1_layer_a_json().replacen("\"lo_pct\": 1.0", "\"lo_pct\": 99.5", 1);
+        assert_v1_fixture_invalid(&json, "lo_pct");
+    }
+
+    #[test]
+    fn group_q_rejects_hi_pct_above_100() {
+        let json = minimal_v1_layer_a_json().replacen("\"hi_pct\": 99.0", "\"hi_pct\": 100.5", 1);
+        assert_v1_fixture_invalid(&json, "hi_pct");
+    }
+
+    #[test]
+    fn group_q_rejects_rail_fractions_out_of_order() {
+        let json = minimal_v1_layer_a_json()
+            .replacen("\"rail_lo_fraction\": 0.003", "\"rail_lo_fraction\": 0.995", 1);
+        assert_v1_fixture_invalid(&json, "rail_lo_fraction");
+    }
+
+    #[test]
+    fn group_q_accepts_omitted_gain_bounds_and_applies_the_default() {
+        let json = remove_top_level_key(&minimal_v1_layer_a_json(), "gain_bounds");
+        let bundle = parse_bundle(MODEL_JSON_V1, &json, MANIFEST_JSON_V1)
+            .expect("an omitted gain_bounds must default, not fail to parse");
+        let la = match &bundle.layer_a {
+            LayerA::V1(la) => la,
+            LayerA::V2(_) => panic!("expected LayerA::V1"),
+        };
+        assert_eq!(la.gain_bounds, DEFAULT_GAIN_BOUNDS);
+    }
+
+    #[test]
+    fn group_q_rejects_present_but_empty_gain_bounds() {
+        // The Some(vec![])-vs-None distinction actually matters: an
+        // EXPLICIT empty array must still fail validation, exactly like
+        // Python's `.get("gain_bounds", GAIN_BOUNDS)` only supplies the
+        // default when the KEY itself is absent, never when it's present
+        // with a wrong-shape value.
+        let json = minimal_v1_layer_a_json().replacen("\"gain_bounds\": [0.02, 100.0]", "\"gain_bounds\": []", 1);
+        assert_v1_fixture_invalid(&json, "gain_bounds");
+    }
+
+    #[test]
+    fn group_q_finite_array3_rejects_non_finite_and_non_positive_values() {
+        // NaN/Infinity can't be driven through real JSON text (serde_json
+        // itself rejects both as a parse error before this module's own
+        // validation ever runs -- see group_o_rejects_non_finite_alpha's
+        // own rationale for the identical constraint), so this unit-tests
+        // the shared primitive build_layer_a_v1's reference_lo/reference_hi/
+        // reference_k checks (and several of build_layer_a_v2's) all rely
+        // on, directly.
+        let non_finite = finite_array3(&[1.0, f64::NAN, 1.0], "test:field", false);
+        assert!(
+            matches!(non_finite, Err(NikonlookError::Invalid(_))),
+            "NaN must be rejected regardless of `positive`: {non_finite:?}"
+        );
+
+        let non_positive = finite_array3(&[1.0, -1.0, 1.0], "test:field", true);
+        assert!(
+            matches!(non_positive, Err(NikonlookError::Invalid(_))),
+            "a negative value must be rejected when positive=true: {non_positive:?}"
+        );
+
+        let negative_allowed = finite_array3(&[1.0, -1.0, 1.0], "test:field", false);
+        assert!(
+            negative_allowed.is_ok(),
+            "a negative value must be accepted when positive=false (reference_lo/reference_hi's own case): {negative_allowed:?}"
+        );
     }
 }

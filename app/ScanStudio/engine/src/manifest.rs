@@ -627,6 +627,7 @@ mod tests {
             storage_transform: None,
             meter_rgbi_path: None,
             hardware_telemetry: None,
+            nikonlook: None,
         };
         let project = ScanProject {
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -1123,6 +1124,7 @@ mod tests {
             storage_transform: None,
             meter_rgbi_path: None,
             hardware_telemetry: None,
+            nikonlook: None,
         }
     }
 
@@ -1145,6 +1147,45 @@ mod tests {
         assert_eq!(read_back.frames[0].receipts.len(), 1);
         assert_eq!(read_back.frames[0].receipts[0], receipt);
         assert!(read_back.frames[1].receipts.is_empty());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn persist_frame_receipt_round_trips_nikonlook_provenance_through_disk() {
+        // Backend-level proof that a written receipt actually carries the
+        // nikonlook field: `sample_receipt` (used by most tests in this
+        // module) always sets `nikonlook: None`, so nothing else exercises
+        // this field through the real write-to-JSON-then-read-back path
+        // both the sim and real backends funnel through via
+        // `persist_frame_receipt`.
+        let dir = temp_project_dir();
+        let (project, _dir) = create_project(
+            "Nikonlook Receipt Persistence",
+            MediaCarrier::Strip6,
+            2,
+            FilmProcess::C41ColorNegative,
+            Some(&dir),
+        )
+        .expect("create_project should succeed");
+
+        let receipt = ScanReceipt {
+            nikonlook: Some(crate::domain::NikonlookProvenance {
+                bundle_version: "nikonlook-v2".to_string(),
+                layer_a_path: crate::domain::NikonlookLayerAPath::HardwareExposure,
+                gains: [0.5764822683598294, 0.22818411954519974, 0.2620541212542383],
+            }),
+            ..sample_receipt(&project.id, 1)
+        };
+        persist_frame_receipt(&dir, 1, &receipt).expect("persist frame 1 receipt");
+
+        let read_back = read_manifest(&dir).expect("read back manifest");
+        assert_eq!(read_back.frames[0].receipts.len(), 1);
+        assert_eq!(
+            read_back.frames[0].receipts[0].nikonlook, receipt.nikonlook,
+            "nikonlook provenance must survive a real write-to-disk/read-back round trip"
+        );
+        assert_eq!(read_back.frames[0].receipts[0], receipt);
 
         cleanup(&dir);
     }
