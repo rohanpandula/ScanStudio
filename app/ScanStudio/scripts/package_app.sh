@@ -277,9 +277,18 @@ fi
 # engine graph. Cargo's registry source manifests are copied too, preserving
 # each package's declared SPDX/license context without silently choosing a
 # license alternative on the distributor's behalf.
+#
+# The lockfile is a union over every target, so crates locked only for
+# foreign platforms (wasm-only dependencies and the like) are never
+# extracted into registry/src by a host build. `cargo fetch --locked`
+# guarantees every locked crate's archive is at least present in
+# registry/cache, and the collector below falls back to reading notices
+# straight out of that archive when no extracted source exists. Both paths
+# still fail closed when license material cannot be found.
+cargo fetch --locked --manifest-path "$package_root/engine/Cargo.toml"
 mkdir -p "$staged_app/Contents/Resources/Licenses/rust-crates"
 "$bridge_python" - "$package_root/engine/Cargo.lock" \
-    "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+    "${CARGO_HOME:-$HOME/.cargo}/registry" \
     "$staged_app/Contents/Resources/Licenses/rust-crates" <<'PYTHON'
 from __future__ import annotations
 
@@ -287,32 +296,77 @@ import glob
 from pathlib import Path
 import shutil
 import sys
+import tarfile
 import tomllib
 
 lock_path, registry_root, destination = map(Path, sys.argv[1:])
 packages = tomllib.loads(lock_path.read_text()).get("package", [])
-for package in packages:
-    name = package["name"]
-    version = package["version"]
-    if name == "scanstudio-engine":
-        continue
-    matches = glob.glob(str(registry_root / "*" / f"{name}-{version}"))
-    if len(matches) != 1:
-        raise SystemExit(f"missing or ambiguous Cargo registry source for {name} {version}")
-    source = Path(matches[0])
-    target = destination / f"{name}-{version}"
-    target.mkdir(parents=True, exist_ok=True)
+
+
+def is_notice_name(name: str) -> bool:
+    return name.upper().startswith(("LICENSE", "COPYING", "NOTICE", "AUTHORS"))
+
+
+def copy_from_source_dir(source: Path, target: Path) -> int:
     manifest = source / "Cargo.toml"
     if manifest.exists():
         shutil.copy2(manifest, target / "Cargo.toml")
     notices = [
         candidate for candidate in source.iterdir()
-        if candidate.is_file() and candidate.name.upper().startswith(("LICENSE", "COPYING", "NOTICE", "AUTHORS"))
+        if candidate.is_file() and is_notice_name(candidate.name)
     ]
-    if not notices:
-        raise SystemExit(f"missing license/notice material for {name} {version}")
     for notice in notices:
         shutil.copy2(notice, target / notice.name)
+    return len(notices)
+
+
+def copy_from_crate_archive(archive: Path, prefix: str, target: Path) -> int:
+    copied = 0
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+            parts = member.name.split("/")
+            # Crate archives contain exactly one top-level directory,
+            # "<name>-<version>/"; only its top-level files are of interest.
+            if len(parts) != 2 or parts[0] != prefix:
+                continue
+            filename = parts[1]
+            if filename != "Cargo.toml" and not is_notice_name(filename):
+                continue
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            (target / filename).write_bytes(extracted.read())
+            if filename != "Cargo.toml":
+                copied += 1
+    return copied
+
+
+for package in packages:
+    name = package["name"]
+    version = package["version"]
+    if name == "scanstudio-engine":
+        continue
+    prefix = f"{name}-{version}"
+    target = destination / prefix
+    target.mkdir(parents=True, exist_ok=True)
+
+    src_matches = glob.glob(str(registry_root / "src" / "*" / prefix))
+    if len(src_matches) > 1:
+        raise SystemExit(f"ambiguous Cargo registry source for {name} {version}")
+    if len(src_matches) == 1:
+        notice_count = copy_from_source_dir(Path(src_matches[0]), target)
+    else:
+        cache_matches = glob.glob(str(registry_root / "cache" / "*" / f"{prefix}.crate"))
+        if len(cache_matches) != 1:
+            raise SystemExit(
+                f"missing or ambiguous Cargo registry source for {name} {version} "
+                f"(no extracted source, {len(cache_matches)} cached archives)"
+            )
+        notice_count = copy_from_crate_archive(Path(cache_matches[0]), prefix, target)
+    if notice_count == 0:
+        raise SystemExit(f"missing license/notice material for {name} {version}")
 PYTHON
 cat > "$staged_app/Contents/Resources/Licenses/README.txt" <<'LICENSES'
 ScanStudio.app contains mixed-license components.
