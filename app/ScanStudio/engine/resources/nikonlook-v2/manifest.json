@@ -1,0 +1,722 @@
+{
+  "bundle_version": "nikonlook-v2",
+  "generated_at_utc": "2026-07-14T07:07:15.176443+00:00",
+  "quality_tier": "beta",
+  "quality_note": "BETA: Layer A v2 is scored and materially better than v1, but it does not yet match Nikon Scan. On five legacy face-heavy frames excluded from training, the raw-only path measures automatic skin-color-proxy median/p95 DeltaE00 11.42/14.36 and global median/p95 8.62/20.89; shipping gates are skin <=1.0 median and <=3.0 p95. The skin slice is a Lab color-box proxy, not hand-drawn masks, and the repeatedly inspected frames are not a blind final test. Hardware exposure metadata is supported, but its inverse-exposure anchor currently has one same-film validation frame only. The calibration roll is required before either path can be called parity-quality.",
+  "model_source": "fit37/models/directpf_neutral.json (Gate-7 iteration 3, neutral variant)",
+  "layer_a_method": "hybrid-exposure-ridge-v2",
+  "layer_a_status": {
+    "blind_fallback": "scored-five-frame-excluded-from-training-legacy-evaluation",
+    "hardware_exposure": "experimental-one-frame"
+  },
+  "icc_source": "negfit/data/nikon-adobe-rgb.icc",
+  "training_provenance": {
+    "layer_b_training_frames": [
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      35,
+      36,
+      37
+    ],
+    "layer_a_training_frames": [
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      35,
+      36,
+      37
+    ],
+    "holdout_frames": [
+      5,
+      22,
+      23,
+      33,
+      34
+    ],
+    "layer_a_target": "block32_de00_refined",
+    "ridge_alpha": 5.623413251903491,
+    "selection_policy": "alpha by training-only LOO log-gain RMSE within target family; target family by training-only LOO skin then global block32 DE00; freeze before holdout",
+    "raw_feature_population": {
+      "source": "/Volumes/appdata/coolscan3-dev/roll/frameNNN.pnm",
+      "frames": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37
+      ],
+      "geometry": "full 3946x5959 raw RGB payload; deterministic 16x16 grid",
+      "not_used": [
+        "curated corpus pixels",
+        "Nikon target",
+        "registration mask",
+        "skin mask",
+        "frame index"
+      ],
+      "runtime_match": "extract_raw_features uses the same raw array passed to estimate_gains"
+    }
+  },
+  "gates": {
+    "thresholds": {
+      "skin_median_de00_max": 1.0,
+      "skin_p95_de00_max": 3.0
+    },
+    "v2_blind_end_to_end": {
+      "skin_median_de00": 11.417486743883615,
+      "skin_p95_de00": 14.358332758379976,
+      "global_median_de00": 8.615888711807507,
+      "global_p95_de00": 20.88827978003799,
+      "all_gates_pass": false
+    },
+    "v1_stopgap_end_to_end_comparison": {
+      "skin_median_de00": 29.000624747820247,
+      "skin_p95_de00": 34.62808950395195,
+      "global_median_de00": 26.656837541186786,
+      "global_p95_de00": 42.916297377425614,
+      "all_gates_pass": false
+    },
+    "best_layer_b_oracle_ceiling": {
+      "skin_median_de00": 3.551444764755,
+      "skin_p95_de00": 6.303133861861272,
+      "global_median_de00": 3.3447398253887117,
+      "global_p95_de00": 15.668375913510497,
+      "all_gates_pass": false,
+      "note": "oracle gains use each holdout's Nikon target and are not available at inference"
+    }
+  },
+  "hardware_exposure_evidence": {
+    "same_film_frame": 7,
+    "block32_unadjusted_median_de00": 17.197352311128498,
+    "block32_inverse_exposure_median_de00": 2.331095784396343,
+    "note": "acquisition consistency only, not target accuracy or cross-scene generalization"
+  },
+  "artifact_sources": {
+    "layer_a": "negfit/layer_a_v2/artifacts/layer_a_v2_candidate.json",
+    "evaluation": "negfit/layer_a_v2/artifacts/EVALUATION.json",
+    "binding": {
+      "schema_version": 2,
+      "layer_b_model": {
+        "source": "negfit/fit37/models/directpf_neutral.json",
+        "sha256": "60d7f99b750ad6e012d354d695fc28714d0a6d629ef65874ae8639d64c649448"
+      },
+      "layer_a_candidate": {
+        "source": "negfit/layer_a_v2/artifacts/layer_a_v2_candidate.json",
+        "sha256": "4ea99ff985cf3fff943a48bb61b9dd557f83441de71a60754f1df297b7236c0c"
+      },
+      "score_provenance": {
+        "schema_version": 1,
+        "scoring_code": [
+          {
+            "role": "color",
+            "source": "negfit/color.py",
+            "bytes": 16748,
+            "sha256": "22bcc1f08ef28f2ece65a24f751eaf555f5de890382ed328f8e118e1850eb96f"
+          },
+          {
+            "role": "dataset",
+            "source": "negfit/fit37/dataset.py",
+            "bytes": 9268,
+            "sha256": "04b97d7f147b27a8ff3dc493cee2b62c71d5c29a9bf90551750618c73db7b268"
+          },
+          {
+            "role": "estimators",
+            "source": "negfit/layer_a_v2/estimators.py",
+            "bytes": 11761,
+            "sha256": "c6ae2121e84fed62e6b27a5a26c8407ff13300a28625fba508f8dcbf4b1653fd"
+          },
+          {
+            "role": "evaluate",
+            "source": "negfit/fit37/evaluate.py",
+            "bytes": 3950,
+            "sha256": "abeaac0a62ace253406673de75516391ad30b34ac0c4c4099a7cd8d7d8e45237"
+          },
+          {
+            "role": "evaluate_prototype",
+            "source": "negfit/layer_a_v2/evaluate_prototype.py",
+            "bytes": 14744,
+            "sha256": "3b504107640e7c8e4157ab97f4a7eea130e9dc87b17bba536570fca691b6a7a5"
+          },
+          {
+            "role": "features",
+            "source": "negfit/layer_a_v2/features.py",
+            "bytes": 6760,
+            "sha256": "5b4d7865a30bf1c2fedde0a9a3b5074b84612e689787833f5e8c2896a8f16ed9"
+          },
+          {
+            "role": "fit_gate7",
+            "source": "negfit/fit37/fit_gate7.py",
+            "bytes": 25152,
+            "sha256": "b5ebf5315913fe0e1394888fc6115e7fd5e6d39cbb7404041d5f0904a448ace6"
+          },
+          {
+            "role": "gate7_common",
+            "source": "negfit/fit37/gate7_common.py",
+            "bytes": 7170,
+            "sha256": "29ae444143ca8b48cef81eea541e6e1b3e74f49d6a1a09cebad57207473c1406"
+          },
+          {
+            "role": "model_directpf",
+            "source": "negfit/fit37/model_directpf.py",
+            "bytes": 42431,
+            "sha256": "ca90806386969610ae6558c68e0836e0a354da699657e50a1e6e94471f3785ad"
+          }
+        ],
+        "scoring_inputs": [
+          {
+            "role": "corpus_frame_001",
+            "source": "negfit/data/corpus/frame001-corpus.npz",
+            "bytes": 8681408,
+            "sha256": "c81991298db34fc09e519e1e97951bd9a5904d2a8c4cfc1142740dc80c45d51a"
+          },
+          {
+            "role": "corpus_frame_002",
+            "source": "negfit/data/corpus/frame002-corpus.npz",
+            "bytes": 9349905,
+            "sha256": "7db14d27a9454d7597ae43fcc5556c839a1fc64c3dc1dd0c4dd45947a32739b6"
+          },
+          {
+            "role": "corpus_frame_003",
+            "source": "negfit/data/corpus/frame003-corpus.npz",
+            "bytes": 9416281,
+            "sha256": "eaf92594bcc9cdc54982eb8bc17b3d4e2fdaa8609fe0ae4496bcab98591e573a"
+          },
+          {
+            "role": "corpus_frame_004",
+            "source": "negfit/data/corpus/frame004-corpus.npz",
+            "bytes": 9963728,
+            "sha256": "3b232232a69e6937aa55bc5ba1f992a7bce8edcf8d0cb5c48f47b943db411a10"
+          },
+          {
+            "role": "corpus_frame_005",
+            "source": "negfit/data/corpus/frame005-corpus.npz",
+            "bytes": 9584749,
+            "sha256": "cd704314ad74d4bfcc829de05812d61b703443b1881e33437967646466eddbac"
+          },
+          {
+            "role": "corpus_frame_006",
+            "source": "negfit/data/corpus/frame006-corpus.npz",
+            "bytes": 9796510,
+            "sha256": "0d7119cef3099e85d90a0250650cdc3e583f06d9b1f4134d3b1753997861aca0"
+          },
+          {
+            "role": "corpus_frame_007",
+            "source": "negfit/data/corpus/frame007-corpus.npz",
+            "bytes": 10103183,
+            "sha256": "3286e85e23d86049f4ab08a0587df3d12b74031d9571164a87e636cc70e2adb4"
+          },
+          {
+            "role": "corpus_frame_008",
+            "source": "negfit/data/corpus/frame008-corpus.npz",
+            "bytes": 9993198,
+            "sha256": "161b1fe67afb067fb34cf873564a0f68d76da734490b1f1cefe2e71b15b2529f"
+          },
+          {
+            "role": "corpus_frame_009",
+            "source": "negfit/data/corpus/frame009-corpus.npz",
+            "bytes": 10241342,
+            "sha256": "86ed467ed81edbdfe57ba6af7741d76e608278d0287197cad1d3bbd2b67edf69"
+          },
+          {
+            "role": "corpus_frame_010",
+            "source": "negfit/data/corpus/frame010-corpus.npz",
+            "bytes": 10185032,
+            "sha256": "5a2ad0be58cbfdf58f230538bf0ad1a20b071d95f0a91b7e0ab7490e4a81cd80"
+          },
+          {
+            "role": "corpus_frame_011",
+            "source": "negfit/data/corpus/frame011-corpus.npz",
+            "bytes": 9026907,
+            "sha256": "38de2d66360838d5524c34c478269c44fd43ca6b0f4b0a50138066aeeb783307"
+          },
+          {
+            "role": "corpus_frame_012",
+            "source": "negfit/data/corpus/frame012-corpus.npz",
+            "bytes": 8598294,
+            "sha256": "efdbf392579e03ecc6202b0ecb99e89aefb98fc24c9885d56a93546c566d927d"
+          },
+          {
+            "role": "corpus_frame_013",
+            "source": "negfit/data/corpus/frame013-corpus.npz",
+            "bytes": 7889768,
+            "sha256": "9aa1350a9b221c86021f0890a0e81bae7d36224ca5d91a858fb0af071f8ac6e9"
+          },
+          {
+            "role": "corpus_frame_014",
+            "source": "negfit/data/corpus/frame014-corpus.npz",
+            "bytes": 9743096,
+            "sha256": "2043994ae40ee96a9f6c904f1a8238954c6cc945f25d08d1edeeef803f531ccb"
+          },
+          {
+            "role": "corpus_frame_015",
+            "source": "negfit/data/corpus/frame015-corpus.npz",
+            "bytes": 8373438,
+            "sha256": "c0a88a58c278b3ce43c62d2b2defafe33fd79295558fe2b12641266483af53e6"
+          },
+          {
+            "role": "corpus_frame_016",
+            "source": "negfit/data/corpus/frame016-corpus.npz",
+            "bytes": 9704131,
+            "sha256": "f69b39db66841844e1ac9271703d767ecfdd7d2282b5f0acc7965aba1ec8b4c1"
+          },
+          {
+            "role": "corpus_frame_017",
+            "source": "negfit/data/corpus/frame017-corpus.npz",
+            "bytes": 9110734,
+            "sha256": "46df85e5cabea27307b18ebcdb7c46e420cc520dcff664abbb0a8dc02ae6d82f"
+          },
+          {
+            "role": "corpus_frame_018",
+            "source": "negfit/data/corpus/frame018-corpus.npz",
+            "bytes": 8176185,
+            "sha256": "6a437e6dff8032a3365a17890f5b716f9785077211efcd589f397406a6efdeb0"
+          },
+          {
+            "role": "corpus_frame_019",
+            "source": "negfit/data/corpus/frame019-corpus.npz",
+            "bytes": 7015099,
+            "sha256": "e684c421c5063ec804b24b1b32e6afaf8005fed8593eeade823dfe4cbf6d63ac"
+          },
+          {
+            "role": "corpus_frame_020",
+            "source": "negfit/data/corpus/frame020-corpus.npz",
+            "bytes": 8250820,
+            "sha256": "63d3d09eb92e1762905bcf9e97a5091d6941d9dfa87002e6cf9cc263b8e39585"
+          },
+          {
+            "role": "corpus_frame_021",
+            "source": "negfit/data/corpus/frame021-corpus.npz",
+            "bytes": 7858263,
+            "sha256": "7c9cf018576ebcb5a4a7fdbceb03a4b5e35953cf492974bdf09bf59f65746f3a"
+          },
+          {
+            "role": "corpus_frame_022",
+            "source": "negfit/data/corpus/frame022-corpus.npz",
+            "bytes": 10340737,
+            "sha256": "630a403cc1f68c41713577990368ee2781d1dab70f29ccb3132e995ea8ca5efe"
+          },
+          {
+            "role": "corpus_frame_023",
+            "source": "negfit/data/corpus/frame023-corpus.npz",
+            "bytes": 9870849,
+            "sha256": "19c4ed22339abb8c7fb17e3d58758c47490df808802fe2d62321d0f9303f2a45"
+          },
+          {
+            "role": "corpus_frame_024",
+            "source": "negfit/data/corpus/frame024-corpus.npz",
+            "bytes": 7802671,
+            "sha256": "402089f167a992d65025611671c74c82d45c47aaf163755a8034aa902dd61c4d"
+          },
+          {
+            "role": "corpus_frame_025",
+            "source": "negfit/data/corpus/frame025-corpus.npz",
+            "bytes": 10373582,
+            "sha256": "6d2721cd77b92120e5f46e8e6116c4d8b7e8f58f5851d65476484bdb83d0699d"
+          },
+          {
+            "role": "corpus_frame_026",
+            "source": "negfit/data/corpus/frame026-corpus.npz",
+            "bytes": 10264715,
+            "sha256": "bb44aacf95ba2cc941083dddfca8b9c3717504c4b5fe778565eafde862a02f26"
+          },
+          {
+            "role": "corpus_frame_027",
+            "source": "negfit/data/corpus/frame027-corpus.npz",
+            "bytes": 10353568,
+            "sha256": "951575b51d58c19c817cf2a1a92e49fb8ac06d14ad4fa6616244f66a15a59ad1"
+          },
+          {
+            "role": "corpus_frame_028",
+            "source": "negfit/data/corpus/frame028-corpus.npz",
+            "bytes": 10151028,
+            "sha256": "97fe7aad14daa1de2f10253d4859ff9833b882c4219fe1ce6ca17f92ab5bba8e"
+          },
+          {
+            "role": "corpus_frame_029",
+            "source": "negfit/data/corpus/frame029-corpus.npz",
+            "bytes": 9094792,
+            "sha256": "16ac6b8979eaaf533f6ccb865844cbe7a12a968875af2b767c7325dcdaeb27a9"
+          },
+          {
+            "role": "corpus_frame_030",
+            "source": "negfit/data/corpus/frame030-corpus.npz",
+            "bytes": 9001256,
+            "sha256": "89f97038df1992dd6884d8da1fa953568fcd95d60d6e829ee9d56cd63ddb8b08"
+          },
+          {
+            "role": "corpus_frame_031",
+            "source": "negfit/data/corpus/frame031-corpus.npz",
+            "bytes": 9346916,
+            "sha256": "473900d1d5d5ff43d951b571aa15029173cac0957cd1e0b424da9a8f6276902b"
+          },
+          {
+            "role": "corpus_frame_032",
+            "source": "negfit/data/corpus/frame032-corpus.npz",
+            "bytes": 10145894,
+            "sha256": "f6c10195d5b8daf6f21eae22561f347e43e06cc716fcb23f623009b1289b1046"
+          },
+          {
+            "role": "corpus_frame_033",
+            "source": "negfit/data/corpus/frame033-corpus.npz",
+            "bytes": 10044034,
+            "sha256": "a8f6b42db573e85b102e50a6369072cfe833d7939b30a2f64281fdb93e068d12"
+          },
+          {
+            "role": "corpus_frame_034",
+            "source": "negfit/data/corpus/frame034-corpus.npz",
+            "bytes": 9526941,
+            "sha256": "68299107cd7ae20e4f74ef76e105e1d4b5dcecdf132112ef1c2287b4de7b08dc"
+          },
+          {
+            "role": "corpus_frame_035",
+            "source": "negfit/data/corpus/frame035-corpus.npz",
+            "bytes": 8738728,
+            "sha256": "e51582df796bad99952ee5f07b260db19179c378e9fe4de9f61e088f12a5e067"
+          },
+          {
+            "role": "corpus_frame_036",
+            "source": "negfit/data/corpus/frame036-corpus.npz",
+            "bytes": 9795290,
+            "sha256": "677eeb8942b836ebba4158081437cdb95200d2b78c97c82d34a531d9e31e97ad"
+          },
+          {
+            "role": "corpus_frame_037",
+            "source": "negfit/data/corpus/frame037-corpus.npz",
+            "bytes": 9153358,
+            "sha256": "d289ed3acf19db412ed8c668479bac03d1fbbc81c5af4aa363dd677db5faf32e"
+          },
+          {
+            "role": "gate7_results",
+            "source": "negfit/fit37/GATE7-RESULTS.json",
+            "bytes": 24736,
+            "sha256": "bb5e8a4482973fe47db956a84f1de9f3a6684faa1bd0418b128e11c892b57ba1"
+          },
+          {
+            "role": "holdout_partition",
+            "source": "negfit/fit37/HOLDOUT.json",
+            "bytes": 4417,
+            "sha256": "201d79eda31be3c1240fe19e7897a20abfb05a0ea84db99f07e09ee069422df0"
+          },
+          {
+            "role": "live_frame7_exposure",
+            "source": "negfit/layer_a_v2/artifacts/live_frame7_exposure.json",
+            "bytes": 5276,
+            "sha256": "b4aae27e7ff1638fb96b47efcea03133ba627fba7715b0c9602c266f699195eb"
+          },
+          {
+            "role": "raw_pnm_frame_001",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame001.pnm",
+            "bytes": 188113751,
+            "sha256": "5387e221940fc5a3a3a06ebd4805fe5772ac44797083a0beef08035fdc3856d4"
+          },
+          {
+            "role": "raw_pnm_frame_002",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame002.pnm",
+            "bytes": 188113751,
+            "sha256": "b8dc6ebd8ded3f55bc33b240e716ac36b1c1e837b5988d1d7fe5a3d880a7e2b7"
+          },
+          {
+            "role": "raw_pnm_frame_003",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame003.pnm",
+            "bytes": 188113751,
+            "sha256": "3806f3d69e81aaf94179974348919ed59fca24be015085ea93986d8f7a88e1c6"
+          },
+          {
+            "role": "raw_pnm_frame_004",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame004.pnm",
+            "bytes": 188113751,
+            "sha256": "45f40468ec0e8344a97080a6b5dae3b975e6e426608c153e17b3b0afc33db71d"
+          },
+          {
+            "role": "raw_pnm_frame_005",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame005.pnm",
+            "bytes": 188113751,
+            "sha256": "4a8e324720c7150b7819d9a1b5c4971d289f30169dc9b7fc0872b3cf613593c2"
+          },
+          {
+            "role": "raw_pnm_frame_006",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame006.pnm",
+            "bytes": 188113751,
+            "sha256": "600f28eea388e45eb09e4f5b4a705963103e32e471e39cd48761aa95385dd871"
+          },
+          {
+            "role": "raw_pnm_frame_007",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame007.pnm",
+            "bytes": 188113751,
+            "sha256": "ccdea641b0468bd1ea6d24dfbef60d86d7d1327262c2369e12e72e9cd8e6f88e"
+          },
+          {
+            "role": "raw_pnm_frame_008",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame008.pnm",
+            "bytes": 188113751,
+            "sha256": "9aa923f880d8bf58fec0ef15b53f12a6dec080036229594a84eba2cb011e2ff0"
+          },
+          {
+            "role": "raw_pnm_frame_009",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame009.pnm",
+            "bytes": 188113751,
+            "sha256": "e0748806e53338d643764c1374000be2ace895f9dcdce47f6f5903f78bca2250"
+          },
+          {
+            "role": "raw_pnm_frame_010",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame010.pnm",
+            "bytes": 188113751,
+            "sha256": "e072964f4bc159548765e4746e4997bcb01f5f12866f4ce3e2c464a678413af8"
+          },
+          {
+            "role": "raw_pnm_frame_011",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame011.pnm",
+            "bytes": 188113751,
+            "sha256": "b4ac400c7665af72484b59d4fb18daa907d2f5f5719bb95eb4a85c042719ffb0"
+          },
+          {
+            "role": "raw_pnm_frame_012",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame012.pnm",
+            "bytes": 188113751,
+            "sha256": "7decdcfbfbbb05bffddaa1ac2499aa6cb528c4190c5c15bd7a6a057763ac8fd3"
+          },
+          {
+            "role": "raw_pnm_frame_013",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame013.pnm",
+            "bytes": 188113751,
+            "sha256": "7c140273706bea0742f3fea7af892a22fad24e4314716d9821470d56220d6dcf"
+          },
+          {
+            "role": "raw_pnm_frame_014",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame014.pnm",
+            "bytes": 188113751,
+            "sha256": "f627982575c1116cf3819e5e8c5f8299ac727ba46d737b417f8eca62416a152d"
+          },
+          {
+            "role": "raw_pnm_frame_015",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame015.pnm",
+            "bytes": 188113751,
+            "sha256": "9a5a54774feb09a0d9ea475aae203464b6f396b187ced46cea6ab9e4551e6b9f"
+          },
+          {
+            "role": "raw_pnm_frame_016",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame016.pnm",
+            "bytes": 188113751,
+            "sha256": "7219e63369c9d5eeeaa3ea5196009eaaa22b2950f5ff05e38119d87f6d6ab52e"
+          },
+          {
+            "role": "raw_pnm_frame_017",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame017.pnm",
+            "bytes": 188113751,
+            "sha256": "f2d5daeb74a2c58fefd13b419b16905fd8ed44098ae6f2c4863c359354a0f15b"
+          },
+          {
+            "role": "raw_pnm_frame_018",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame018.pnm",
+            "bytes": 188113751,
+            "sha256": "97b9ce0f270469636993dacbf1dcb1d488c15c36914468e5736934231204e9a8"
+          },
+          {
+            "role": "raw_pnm_frame_019",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame019.pnm",
+            "bytes": 188113751,
+            "sha256": "866ed8e5b78cdd1b1391fbec803a1c76a8c3611df50249a99690b5bf17653e3f"
+          },
+          {
+            "role": "raw_pnm_frame_020",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame020.pnm",
+            "bytes": 188113751,
+            "sha256": "9e248a23f61164ceface5d87646d59ac4f0419ef814e7a388ba04af47db5a18c"
+          },
+          {
+            "role": "raw_pnm_frame_021",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame021.pnm",
+            "bytes": 188113751,
+            "sha256": "f2bf1694d6790b163461f784a60f05871f98227510ac2d38431fffc33036f5b3"
+          },
+          {
+            "role": "raw_pnm_frame_022",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame022.pnm",
+            "bytes": 188113751,
+            "sha256": "c7baeae7e7a49d76e4fb5f2be197be5df7a80deff265a46e5242ffd789a6cdaa"
+          },
+          {
+            "role": "raw_pnm_frame_023",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame023.pnm",
+            "bytes": 188113751,
+            "sha256": "6bbf8dfee30e428bbf221f9d4133fd95206b57dbcf4e1e3503e9d48b82fba162"
+          },
+          {
+            "role": "raw_pnm_frame_024",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame024.pnm",
+            "bytes": 188113751,
+            "sha256": "4fe5ffe8ba1c8fe2a84ab8b9a0f76ace70b8654b3d59740036a9b9250c90f4c4"
+          },
+          {
+            "role": "raw_pnm_frame_025",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame025.pnm",
+            "bytes": 188113751,
+            "sha256": "776c04da45f2e6b6e7ec0abfa08d3e39c9f92e8d78909d2d9bc278e8bbb7f32f"
+          },
+          {
+            "role": "raw_pnm_frame_026",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame026.pnm",
+            "bytes": 188113751,
+            "sha256": "596f2ba8186d3a888972dde1a77af3a06162ed9704d1b388c8fdfcc8c8a36749"
+          },
+          {
+            "role": "raw_pnm_frame_027",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame027.pnm",
+            "bytes": 188113751,
+            "sha256": "22a3210aa5f5cceaf1ce44f5935fe381c8c76a27d7d41c0e84046b0b475ca0ed"
+          },
+          {
+            "role": "raw_pnm_frame_028",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame028.pnm",
+            "bytes": 188113751,
+            "sha256": "75ff68a10a795a4e70ef007ea9aa54bd5ad6a4f2f38451373d47a827301d9b9d"
+          },
+          {
+            "role": "raw_pnm_frame_029",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame029.pnm",
+            "bytes": 188113751,
+            "sha256": "5b578e75b32f036117985ad23c72887a624eb5074fc85dea1eda3f2bb61011ef"
+          },
+          {
+            "role": "raw_pnm_frame_030",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame030.pnm",
+            "bytes": 188113751,
+            "sha256": "d6f40ea0c8c1dcd9e3c8c0af2b14a91b31313f6fcb0814bfc5dcddddef40404a"
+          },
+          {
+            "role": "raw_pnm_frame_031",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame031.pnm",
+            "bytes": 188113751,
+            "sha256": "73c2cde7172b41ea092e9599f74b2c722414fdf8b9ae3e52a491356750649d15"
+          },
+          {
+            "role": "raw_pnm_frame_032",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame032.pnm",
+            "bytes": 188113751,
+            "sha256": "e5d8c069d1ac2472d4437b2d2a395dcac027b2cb4cc9ceb608d7dee94e88ce2a"
+          },
+          {
+            "role": "raw_pnm_frame_033",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame033.pnm",
+            "bytes": 188113751,
+            "sha256": "2537bc6c1bc983b9099fc644437a56c61fac0c16135efeb1b4d6b7cdabac63a5"
+          },
+          {
+            "role": "raw_pnm_frame_034",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame034.pnm",
+            "bytes": 188113751,
+            "sha256": "88204b1caacb2fd8869c2964d495c30744f61689012d1b62e4d8e074e3476e2a"
+          },
+          {
+            "role": "raw_pnm_frame_035",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame035.pnm",
+            "bytes": 188113751,
+            "sha256": "a9926858db3cae7e61dfd1c9e884bce71b1452abb43beeea60d8536901026c29"
+          },
+          {
+            "role": "raw_pnm_frame_036",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame036.pnm",
+            "bytes": 188113751,
+            "sha256": "2f9f3e6b687ce68b03ff44d3cc9dd1c9a7559155b14e7a9c6dec36b3eed131c0"
+          },
+          {
+            "role": "raw_pnm_frame_037",
+            "source": "/Volumes/appdata/coolscan3-dev/roll/frame037.pnm",
+            "bytes": 188113751,
+            "sha256": "460e80a7b8e839153986080a3f7466fd404ded5c46fadcc33d05f98993d95369"
+          },
+          {
+            "role": "v1_layer_a",
+            "source": "negfit/bundles/nikonlook-v1/layer_a.json",
+            "bytes": 1052,
+            "sha256": "eafc948ba75faebe11dd0f11a62227b9fa12fc4b494338c9ed26f751bcd134d4"
+          }
+        ]
+      }
+    }
+  }
+}

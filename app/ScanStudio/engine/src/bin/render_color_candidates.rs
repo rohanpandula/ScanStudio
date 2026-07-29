@@ -85,6 +85,8 @@ fn main() {
         Err(err) => fatal(&err.to_string()),
     };
 
+    // load_bundle() now returns nikonlook-v2 (production default); these
+    // candidates exercise v2's blind fallback the same way render_color_candidate does.
     let bundle = match nikonlook::load_bundle() {
         Ok(bundle) => bundle,
         Err(err) => fatal(&format!("failed to load nikonlook bundle: {err}")),

@@ -1613,9 +1613,19 @@ fn metadata_date_tokens(date: Option<&domain::PartialDate>) -> (String, String, 
 /// positive and pass through unchanged. B&W negatives use a neutral RGB
 /// average followed by inversion, while C-41 alone uses nikonlook because
 /// its matrix+curves are dye-specific.
+///
+/// `width` is the decoded raster's width (`raw.len() / width` is its
+/// height) — nikonlook v2's blind gain estimator samples on a 2D grid and
+/// needs it; `exposure_10ns` is the frame's hardware exposure in 10ns
+/// ticks when the caller has it (real backend only, env-gated — see
+/// `real_backend.rs`), `None` otherwise (simulator, or the exposure path
+/// opted out), which routes v2 to its blind fallback instead of the
+/// hardware-exposure inverse.
 fn render_positive(
     film_process: domain::FilmProcess,
     raw: &[[f64; 3]],
+    width: usize,
+    exposure_10ns: Option<[f64; 3]>,
 ) -> Result<Vec<[f64; 3]>, domain::EngineError> {
     match film_process {
         domain::FilmProcess::C41ColorNegative => {
@@ -1625,7 +1635,13 @@ fn render_positive(
                     format!("nikonlook bundle failed to load: {err}"),
                 )
             })?;
-            let k = crate::processing::nikonlook::estimate_gains(raw, &bundle);
+            let k = crate::processing::nikonlook::estimate_gains(raw, width, exposure_10ns, &bundle)
+                .map_err(|err| {
+                    domain::EngineError::new(
+                        protocol::ErrorCode::Internal,
+                        format!("nikonlook gain estimation failed: {err}"),
+                    )
+                })?;
             Ok(crate::processing::nikonlook::apply(raw, k, &bundle))
         }
         domain::FilmProcess::BwNegative => Ok(raw
@@ -1851,12 +1867,19 @@ pub fn render_derivative_from_archive(
     render_derivative_from_archive_with_processing(
         archive_rgb_path, frame_index, &processing, recipes, storage_transform,
         storage_transform_override, detected_boundary, alignment,
+        // This convenience wrapper has no hardware-exposure metadata to
+        // pass through — callers that have it use the _with_processing
+        // form directly (see real_backend.rs).
+        None,
     )
 }
 
 /// Processing-aware real derivative path. The RGB archive is only read and
 /// never rewritten; optional B&W dust cleanup is applied after inversion to
-/// the regenerable positive/preview buffers.
+/// the regenerable positive/preview buffers. `exposure_10ns` is the frame's
+/// hardware exposure (10ns ticks, RGB order) when the caller has it and has
+/// opted into the exposure path — see `render_positive` and
+/// `real_backend.rs`.
 pub fn render_derivative_from_archive_with_processing(
     archive_rgb_path: &std::path::Path,
     frame_index: u32,
@@ -1866,6 +1889,7 @@ pub fn render_derivative_from_archive_with_processing(
     storage_transform_override: Option<&str>,
     detected_boundary: Option<(u32, u32)>,
     alignment: Option<&domain::FrameAlignment>,
+    exposure_10ns: Option<[f64; 3]>,
 ) -> Result<WrittenPaths, domain::EngineError> {
     if !recipes.positive.enabled && !recipes.preview.enabled {
         return Ok(WrittenPaths {
@@ -1942,7 +1966,7 @@ pub fn render_derivative_from_archive_with_processing(
         .collect();
     drop(raw_image);
 
-    let positive_full = render_positive(processing.film_process, &raw_linear)?;
+    let positive_full = render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?;
     drop(raw_linear);
     let positive_full = if processing.film_process == domain::FilmProcess::BwNegative
         && processing.software_dust_removal_bw
@@ -2417,8 +2441,9 @@ pub fn render_and_write_frame_with_processing(
     if recipes.positive.enabled || recipes.preview.enabled {
         // Computed once -- both derivatives share it rather than each
         // calling render_positive (and thus reloading/re-estimating
-        // nikonlook) independently.
-        let positive_raw_full = render_positive(processing.film_process, &raw)?;
+        // nikonlook) independently. The simulator has no hardware exposure
+        // to report, so nikonlook v2 always uses its blind fallback here.
+        let positive_raw_full = render_positive(processing.film_process, &raw, width as usize, None)?;
         let positive_raw_full = if processing.film_process == domain::FilmProcess::BwNegative
             && processing.software_dust_removal_bw
         {
@@ -3227,7 +3252,7 @@ mod tests {
     #[test]
     fn render_positive_actually_transforms_c41_color_negative() {
         let raw = generate_sim_frame("sim-ls5000-0", 1, 8, 6);
-        let out = render_positive(domain::FilmProcess::C41ColorNegative, &raw)
+        let out = render_positive(domain::FilmProcess::C41ColorNegative, &raw, 8, None)
             .expect("nikonlook bundle must load and apply");
         assert_ne!(out, raw, "nikonlook must actually transform the data");
     }
@@ -3236,10 +3261,10 @@ mod tests {
     fn render_positive_passthroughs_positive_kodachrome_and_neutral_inverts_bw_negative() {
         let raw = generate_sim_frame("sim-ls5000-0", 1, 8, 6);
         for process in [domain::FilmProcess::Positive, domain::FilmProcess::Kodachrome] {
-            let out = render_positive(process, &raw).expect("passthrough never fails");
+            let out = render_positive(process, &raw, 8, None).expect("passthrough never fails");
             assert_eq!(out, raw, "{process:?} must be an exact passthrough");
         }
-        let bw = render_positive(domain::FilmProcess::BwNegative, &raw).unwrap();
+        let bw = render_positive(domain::FilmProcess::BwNegative, &raw, 8, None).unwrap();
         for (source, rendered) in raw.iter().zip(bw) {
             let expected = 1.0 - (source[0] + source[1] + source[2]) / 3.0;
             assert_eq!(rendered, [expected; 3]);
@@ -3319,17 +3344,17 @@ mod tests {
         recipes.preview.enabled = false;
         recipes.positive.destination = dir.join("Off").display().to_string();
         let default_off = domain::ProcessingRecipe { film_process: domain::FilmProcess::BwNegative, ..domain::ProcessingRecipe::default() };
-        let written_off = render_derivative_from_archive_with_processing(&archive_path, 1, &default_off, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None).unwrap();
+        let written_off = render_derivative_from_archive_with_processing(&archive_path, 1, &default_off, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None).unwrap();
         let off_bytes = std::fs::read(written_off.positive_path.unwrap()).unwrap();
 
         recipes.positive.destination = dir.join("ExplicitFalse").display().to_string();
         let explicit_false = domain::ProcessingRecipe { film_process: domain::FilmProcess::BwNegative, software_dust_removal_bw: false, ..domain::ProcessingRecipe::default() };
-        let written_false = render_derivative_from_archive_with_processing(&archive_path, 1, &explicit_false, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None).unwrap();
+        let written_false = render_derivative_from_archive_with_processing(&archive_path, 1, &explicit_false, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None).unwrap();
         assert_eq!(off_bytes, std::fs::read(written_false.positive_path.unwrap()).unwrap());
 
         recipes.positive.destination = dir.join("On").display().to_string();
         let enabled = domain::ProcessingRecipe { film_process: domain::FilmProcess::BwNegative, software_dust_removal_bw: true, ..domain::ProcessingRecipe::default() };
-        let written_on = render_derivative_from_archive_with_processing(&archive_path, 1, &enabled, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None).unwrap();
+        let written_on = render_derivative_from_archive_with_processing(&archive_path, 1, &enabled, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None).unwrap();
         assert_ne!(off_bytes, std::fs::read(written_on.positive_path.unwrap()).unwrap());
         assert_eq!(std::fs::read(&archive_path).unwrap(), archive_before);
 

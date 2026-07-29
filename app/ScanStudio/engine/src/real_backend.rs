@@ -2863,6 +2863,45 @@ fn map_exposure_vector(exposure: &BridgeExposureVector) -> domain::ExposureVecto
     }
 }
 
+/// Gates nikonlook v2's optional hardware-exposure path (see
+/// `processing::nikonlook::estimate_gains`'s `LayerA::V2` branch). Default
+/// off: measured 2026-07-28 on a live frame, the blind fallback's median
+/// |Delta| vs the registered Nikon Scan reference was [3565, 6682, 3340] DN
+/// per channel vs [9560, 8064, 3454] DN for the exposure path, and the
+/// exposure anchor is "experimental-one-frame" per the v2 bundle manifest —
+/// so production stays on the blind path until a validation roll lands. Set
+/// SCANSTUDIO_NIKONLOOK_EXPOSURE_META=1 (or "true") to opt in.
+fn nikonlook_exposure_meta_enabled() -> bool {
+    matches!(
+        std::env::var("SCANSTUDIO_NIKONLOOK_EXPOSURE_META").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Builds nikonlook v2's `exposure_10ns` argument from the bridge receipt's
+/// own exposure telemetry (µs -> 10ns ticks, RGB order), gated by
+/// `nikonlook_exposure_meta_enabled`. `None` whenever the gate is off, or
+/// whenever any of the three channels isn't a finite positive value —
+/// `estimate_gains`'s exposure path requires all three (see its own
+/// `debug_assert!`), and a partially-populated or degenerate receipt should
+/// fall back to the blind estimator rather than feed it a bad ratio.
+fn nikonlook_exposure_10ns_from_receipt(exposure: &BridgeExposureVector) -> Option<[f64; 3]> {
+    if !nikonlook_exposure_meta_enabled() {
+        return None;
+    }
+    let (r, g, b) = (
+        exposure.red_exposure_us,
+        exposure.green_exposure_us,
+        exposure.blue_exposure_us,
+    );
+    let finite_positive = |value: f64| value.is_finite() && value > 0.0;
+    if finite_positive(r) && finite_positive(g) && finite_positive(b) {
+        Some([r * 100.0, g * 100.0, b * 100.0])
+    } else {
+        None
+    }
+}
+
 /// Mirrors `bridge_protocol::BridgeClippingTelemetry` field-for-field.
 fn map_clipping_telemetry(clipping: &BridgeClippingTelemetry) -> domain::ClippingTelemetry {
     domain::ClippingTelemetry {
@@ -4517,6 +4556,7 @@ fn run_real_scan_job_inner(
                             // crop would shift the completed raster twice.
                             None,
                             None,
+                            nikonlook_exposure_10ns_from_receipt(&frame_completed.receipt.exposure),
                         );
 
                         match derivative {

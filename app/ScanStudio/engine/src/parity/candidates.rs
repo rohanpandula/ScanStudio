@@ -57,6 +57,11 @@ pub fn candidate_dir_conflicts_with_corpus(corpus_root: &Path, candidate_dir: &P
 /// candidate: read-only load of slot.rgb_path, convert to scanner-linear
 /// RGB (u16 / 65535.0), estimate_gains + apply, quantize back to u16.
 /// Never writes any file — returns the image; the caller decides the path.
+///
+/// `bundle` is whatever the caller's `load_bundle()` returned — now
+/// `nikonlook-v2` by default, so this candidate generation exercises v2's
+/// blind fallback (`None` exposure metadata: no hardware-exposure telemetry
+/// exists in a corpus slot).
 pub fn render_color_candidate(
     slot: &CorpusSlot,
     bundle: &Bundle,
@@ -78,7 +83,8 @@ pub fn render_color_candidate(
         })
         .collect();
 
-    let k = nikonlook::estimate_gains(&raw_linear, bundle);
+    let k = nikonlook::estimate_gains(&raw_linear, raw_image.width as usize, None, bundle)
+        .map_err(|err| ParityError::Decode(format!("nikonlook estimate_gains: {err}")))?;
     let applied = nikonlook::apply(&raw_linear, k, bundle);
 
     let pixels: Vec<[u16; 3]> = applied
