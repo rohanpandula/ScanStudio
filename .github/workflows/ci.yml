@@ -21,6 +21,12 @@ jobs:
   bridge:
     name: Bridge tests
     runs-on: macos-15
+    # only-managed keeps uv off the runner image's python.org framework
+    # build: the packaged bridge runtime relies on uv's standalone CPython
+    # (@executable_path linkage), and using the same interpreter family in
+    # every job keeps test and package environments interchangeable.
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -36,6 +42,10 @@ jobs:
   package:
     name: Self-contained package check
     runs-on: macos-15
+    # See the bridge job: the relocatable package requires uv's standalone
+    # CPython, not the runner image's framework Python.
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

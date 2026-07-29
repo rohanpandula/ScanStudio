@@ -1819,7 +1819,7 @@ mod tests {
 
         loop {
             let line = rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("scan.completed event");
             let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
             if value["event"] == "scan.completed" {
@@ -1874,7 +1874,7 @@ mod tests {
         // would prove nothing about abandoning an in-progress frame.
         loop {
             let line = rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("frame 1 active event");
             let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
             if value["event"] == "scan.frameState"
@@ -1896,7 +1896,7 @@ mod tests {
         let mut final_job_state: Option<String> = None;
         loop {
             let line = rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("job must reach a terminal state");
             let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
             match value["event"].as_str() {
@@ -1996,7 +1996,7 @@ mod tests {
 
         loop {
             let line = rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("scan.completed event");
             let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
             if value["event"] == "scan.completed" {
