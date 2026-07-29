@@ -178,8 +178,8 @@ framework, this real evidence (not a forced or assumed conclusion) means
 the bundled mask is not usable as a reference for this port, and a
 Legacy-only reference was generated instead.
 
-`render_ice_references.py` lives in the separately managed bridge checkout's
-`tools/` directory, mirroring `render_references.py`/
+`render_ice_references.py` lives in this repository's own `bridge/tools/`
+directory, mirroring `render_references.py`/
 `render_geometry_references.py`'s exact shape — argparse
 `--corpus`/`--output-dir`, `sys.executable`-based dependency probe,
 `.expanduser().resolve()` on path-like defaults. It invokes
@@ -209,8 +209,7 @@ needs.
 Run it via the scratchpad venv that has the real package installed:
 
 ```sh
-BRIDGE_REPO=/path/to/scanstudio-bridge
-/path/to/ice-venv/bin/python3 "$BRIDGE_REPO/tools/render_ice_references.py" \
+/path/to/ice-venv/bin/python3 bridge/tools/render_ice_references.py \
   --corpus "$SCANSTUDIO_PARITY_CORPUS" \
   --output-dir /path/to/reference-output/ice-refs
 ```
@@ -257,13 +256,11 @@ by `render_geometry_references.py` (plan 15-02), by literally invoking the
 real `negpy.features.geometry.logic.get_autocrop_coords` (both Film and
 Image modes) and `apply_fine_rotation` against each slot's own raw `.tif`
 capture, exactly mirroring how `render_references.py` produced the color
-reference. `render_geometry_references.py` lives in the separately managed
-bridge checkout's `tools/` directory (GPL reference code stays external).
-Run it with:
+reference. `render_geometry_references.py` lives in this repository's own
+`bridge/tools/` directory. Run it with:
 
 ```sh
-BRIDGE_REPO=/path/to/scanstudio-bridge
-python3 "$BRIDGE_REPO/tools/render_geometry_references.py" --corpus "$SCANSTUDIO_PARITY_CORPUS"
+python3 bridge/tools/render_geometry_references.py --corpus "$SCANSTUDIO_PARITY_CORPUS"
 ```
 
 Unlike color, deskew has no automatic-detection ground truth to reproduce:
@@ -294,7 +291,7 @@ see them.
 | Color | Real reference rendered (`render_references.py`, bundle-derived filename — see §3; production default is now `nikonlook-v2`); real Rust candidate available via `make render-color-candidates` (Phase 14, `processing::nikonlook`) | Reference not colocated with this corpus snapshot in this environment — see §3's read-only caveat; set `SCANSTUDIO_PARITY_REFS`. With `SCANSTUDIO_PARITY_REFS` and `SCANSTUDIO_PARITY_CANDIDATES` (see §7) both set and candidates rendered for the SAME bundle version, `make parity` reports `pass` for all six slots. |
 | Autocrop | Real reference rendered (`render_geometry_references.py`, Phase 15); real Rust candidate available via `make render-geometry-candidates` (`processing::geometry::autocrop_roi`) | `make parity`'s `autocrop` row reports **Image mode (AUTO_FRAME_EDGE)** only — NegPy's own default; `ModuleKind::Autocrop` (Phase 13's report schema) is not split into separate Film/Image variants for this. **Film mode (AUTO_FILM_BORDER) is fully ported and independently proven against the real corpus** via a corpus-gated `cargo test` (`film_mode_iou_matches_reference` in `engine/tests/geometry_candidates.rs`), not this table — both modes are implemented and both are proven, just through two different mechanisms. With `SCANSTUDIO_PARITY_REFS`/`SCANSTUDIO_PARITY_CANDIDATES` set and candidates rendered, all six slots report `pass` (`AUTOCROP_IOU_THRESHOLD = 0.93` — see §5). |
 | Deskew | Real reference rendered (`render_geometry_references.py`, Phase 15); real Rust candidate available via `make render-geometry-candidates` (`processing::geometry::apply_fine_rotation`) | `make parity`'s `deskew` row is a **rotation-matrix angle-provenance check**, not a full geometric-correctness proof: both sides decompose `rotation_matrix_2x3`'s own closed-form output (`atan2(m[0][1], m[0][0])`) at the same fixed, documented test angle (`1.75` degrees — see §3), so it verifies matrix-construction correctness (sign convention, degrees-to-radians conversion, center-point formula) but cannot by itself detect a resampling bug. **The real pixel-level regression protection for the bilinear-resample step lives in a separate corpus-gated `cargo test`** (`deskew_pixel_fidelity_within_tolerance` in `engine/tests/geometry_candidates.rs`), which compares actual candidate/reference rotated TIFFs pixel-by-pixel. With `SCANSTUDIO_PARITY_REFS`/`SCANSTUDIO_PARITY_CANDIDATES` set and candidates rendered, all six slots report `pass` (`DESKEW_ANGLE_EPSILON_DEGREES = 0.05`, unchanged — measured agreement is ~2.22e-16 on all six slots). |
-| ICE | Legacy-only reference freshly rendered (`render_ice_references.py`, external, real `portable_digital_ice` v0.3.1); real Rust candidate available via `make render-ice-candidates` (Phase 16, `processing::ice::repair_frame`) | Reference-mask investigation **resolved with real measured evidence** — see §3: the corpus-bundled hybrid mask is structurally unrepresentative (Jaccard ~0.000176 against the Legacy port on slot 1); `score_ice()` now prefers the Legacy-only reference, falling back to the hybrid mask only when no Legacy-only reference exists. With `SCANSTUDIO_PARITY_REFS`/`SCANSTUDIO_PARITY_CANDIDATES` set and candidates rendered, **all six slots report `pass`, Jaccard `1.000000` exactly** (`ICE_MASK_AGREEMENT_THRESHOLD = 0.85` — see §5), independently re-verified pixel-by-pixel outside the Rust binary. |
+| ICE | Legacy-only reference freshly rendered (`render_ice_references.py`, real `portable_digital_ice` v0.3.1); real Rust candidate available via `make render-ice-candidates` (Phase 16, `processing::ice::repair_frame`) | Reference-mask investigation **resolved with real measured evidence** — see §3: the corpus-bundled hybrid mask is structurally unrepresentative (Jaccard ~0.000176 against the Legacy port on slot 1); `score_ice()` now prefers the Legacy-only reference, falling back to the hybrid mask only when no Legacy-only reference exists. With `SCANSTUDIO_PARITY_REFS`/`SCANSTUDIO_PARITY_CANDIDATES` set and candidates rendered, **all six slots report `pass`, Jaccard `1.000000` exactly** (`ICE_MASK_AGREEMENT_THRESHOLD = 0.85` — see §5), independently re-verified pixel-by-pixel outside the Rust binary. |
 
 ## 5. Threshold rationale
 
