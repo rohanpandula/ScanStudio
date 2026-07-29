@@ -1,0 +1,61 @@
+#!/bin/zsh
+set -euo pipefail
+
+launcher_dir="${0:A:h}"
+config_file=""
+config_hint='~/Library/Application Support/ScanStudio/bridge-command'
+if [[ -n "${HOME:-}" ]]; then
+    config_file="$HOME/Library/Application Support/ScanStudio/bridge-command"
+fi
+bridge_cmd="${SCANSTUDIO_BRIDGE_CMD:-}"
+bridge_source=""
+
+# Resolution is deliberately ordered: explicit environment configuration,
+# then a one-line user config file, then the signed app's bundled helper, and
+# finally PATH. `bridge-command` is a literal bridge command (path plus
+# optional arguments), not shell code, and is passed to the engine unchanged.
+#
+# This launcher *only* selects a command. It never enables motion and never
+# reads, creates, or changes the bridge's armed latch.
+if [[ -n "${bridge_cmd//[[:space:]]/}" ]]; then
+    bridge_source="SCANSTUDIO_BRIDGE_CMD"
+elif [[ -n "$config_file" && -r "$config_file" ]]; then
+    IFS= read -r bridge_cmd < "$config_file" || true
+    if [[ -n "${bridge_cmd//[[:space:]]/}" ]]; then
+        bridge_source="$config_file"
+    fi
+fi
+
+if [[ -z "${bridge_cmd//[[:space:]]/}" ]]; then
+    bundled_bridge="$launcher_dir/scanstudio-bridge"
+    if [[ -x "$bundled_bridge" ]]; then
+        # Keep the command token free of the app's parent path. This is
+        # important when a user moves ScanStudio.app into a folder with spaces:
+        # the engine can resolve the signed helper through its inherited PATH
+        # without treating one executable path as several arguments.
+        export PATH="$launcher_dir${PATH:+:$PATH}"
+        bridge_cmd="scanstudio-bridge"
+        bridge_source="bundled helper"
+    fi
+fi
+
+if [[ -z "${bridge_cmd//[[:space:]]/}" ]]; then
+    bridge_cmd="$(command -v scanstudio-bridge 2>/dev/null || true)"
+    if [[ -n "$bridge_cmd" ]]; then
+        bridge_source="PATH"
+    fi
+fi
+
+if [[ -n "${bridge_cmd//[[:space:]]/}" ]]; then
+    export SCANSTUDIO_BRIDGE_CMD="$bridge_cmd"
+    print -u2 "ScanStudio: hardware bridge configured from $bridge_source."
+else
+    unset SCANSTUDIO_BRIDGE_CMD || true
+    print -u2 "ScanStudio: no hardware bridge found; launching simulator-only. Set SCANSTUDIO_BRIDGE_CMD, add a command to $config_hint, install scanstudio-bridge on PATH, or use an app bundle with its helper included."
+fi
+
+# Do not arm motion here. A real bridge still requires the operator's explicit
+# SCANSTUDIO_HW_MOTION=1 plus its own pre-existing non-empty armed latch before
+# it moves. In particular, this launcher neither creates nor modifies that
+# latch.
+exec "$launcher_dir/ScanStudio"

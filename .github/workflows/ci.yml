@@ -1,0 +1,52 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  app-and-engine:
+    name: App and engine tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Swift app and Rust engine
+        working-directory: app/ScanStudio
+        run: make test
+
+  bridge:
+    name: Bridge tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install bridge dependencies
+        working-directory: bridge
+        run: uv sync --locked
+      - name: Test bridge
+        working-directory: bridge
+        run: uv run pytest
+
+  package:
+    name: Self-contained package check
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install system scanner prerequisites
+        run: brew install sane-backends libusb
+      - name: Install locked bridge dependencies
+        working-directory: bridge
+        run: uv sync --locked
+      - name: Build and verify the local package
+        working-directory: app/ScanStudio
+        run: make package

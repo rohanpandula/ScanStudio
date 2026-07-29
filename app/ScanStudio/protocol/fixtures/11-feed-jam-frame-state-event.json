@@ -1,0 +1,1 @@
+{"event": "scan.frameState", "payload": {"jobId": "job-1", "frameIndex": 13, "state": "failed", "attempt": 1, "error": {"code": "FEED_JAM", "message": "Simulated feed jam on frame 13", "recoverable": true}}}

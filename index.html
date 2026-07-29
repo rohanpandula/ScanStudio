@@ -1,561 +1,243 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Scan Studio: a modern driver and app for the Nikon Coolscan 5000 ED</title>
-<meta name="description" content="An open USB driver and a native macOS app that bring the Nikon Super Coolscan 5000 ED back to life on current hardware, with a from-scratch reimplementation of Nikon's own color and dust-repair pipeline.">
-<meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#121518">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23121518'/%3E%3Crect x='7' y='9' width='18' height='14' rx='1.5' fill='none' stroke='%23ECAA35' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='3.2' fill='none' stroke='%23ECAA35' stroke-width='2'/%3E%3C/svg%3E">
-<style>
-  /* ---------- tokens ---------- */
-  :root{
-    --bg: #121518;
-    --bg-raised: #181c1f;
-    --bg-inset: #0d0f11;
-    --line: rgba(255,255,255,0.10);
-    --line-strong: rgba(255,255,255,0.18);
-    --ink: #eef1f2;
-    --ink-muted: #9aa3a8;
-    --ink-faint: #6a7176;
-    --amber: #ecaa35;
-    --amber-ink: #2a1d05;
-    --cyan: #58d5e3;
-    --red: #e36a59;
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="ScanStudio is a native macOS alpha for scanning 35 mm film with a Nikon SUPER COOLSCAN 5000 ED or LS-5000."
+    />
+    <meta name="theme-color" content="#141618" />
+    <title>ScanStudio for Nikon Coolscan</title>
+    <link rel="icon" href="assets/scanstudio-app-icon.png" type="image/png" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="script.js" defer></script>
+  </head>
 
-    --font-display: "Futura", "Century Gothic", "AppleGothic", ui-sans-serif, sans-serif;
-    --font-body: "Charter", "Georgia", ui-serif, serif;
-    --font-mono: ui-monospace, "SF Mono", Menlo, "Cascadia Code", "Courier New", monospace;
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
 
-    --measure: 62ch;
-    --edge: clamp(20px, 5vw, 64px);
-    --radius: 3px;
-  }
+    <header class="site-header" id="top">
+      <a class="brand" href="#top" aria-label="ScanStudio, back to top">
+        <img src="assets/scanstudio-app-icon.png" alt="" width="48" height="48" />
+        <span>ScanStudio</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="#workflow">Workflow</a>
+        <a href="#archive">Archive bundle</a>
+        <a href="#scope">Alpha scope</a>
+        <a href="https://github.com/rohanpandula/ScanStudio/issues" target="_blank" rel="noreferrer">Issues</a>
+      </nav>
+      <span class="alpha-chip">Alpha <span aria-hidden="true">·</span> tested on one setup</span>
+    </header>
 
-  *, *::before, *::after{ box-sizing: border-box; }
-  html{ background: var(--bg); color-scheme: dark; }
-  body{
-    margin: 0;
-    background: var(--bg);
-    color: var(--ink);
-    font-family: var(--font-body);
-    font-size: 1.0625rem;
-    line-height: 1.65;
-    -webkit-font-smoothing: antialiased;
-    text-rendering: optimizeLegibility;
-    overflow-x: hidden;
-  }
-
-  img{ max-width: 100%; display: block; }
-
-  a{ color: var(--cyan); text-decoration-thickness: 1px; text-underline-offset: 3px; }
-  a:hover{ color: var(--amber); }
-  a:focus-visible, button:focus-visible, summary:focus-visible{
-    outline: 2px solid var(--cyan);
-    outline-offset: 3px;
-  }
-
-  h1, h2, h3{
-    font-family: var(--font-display);
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    text-wrap: balance;
-    margin: 0;
-  }
-
-  p{ margin: 0; }
-  p + p{ margin-top: 1em; }
-
-  section p, .lede{ max-width: var(--measure); }
-
-  .wrap{
-    max-width: 1180px;
-    margin-inline: auto;
-    padding-inline: var(--edge);
-  }
-
-  .mono{
-    font-family: var(--font-mono);
-    letter-spacing: 0.01em;
-  }
-
-  /* film-perforation divider: quiet, not literal */
-  .sprockets{
-    height: 10px;
-    margin-block: 0;
-    background-image: repeating-linear-gradient(
-      to right,
-      var(--line) 0 6px,
-      transparent 6px 26px
-    );
-    background-position: center;
-    opacity: 0.7;
-  }
-
-  /* ---------- reveal (progressive enhancement; content is visible with no JS) ---------- */
-  html.js .reveal{
-    opacity: 0;
-    transform: translateY(14px);
-    transition: opacity 0.7s cubic-bezier(0.16,1,0.3,1), transform 0.7s cubic-bezier(0.16,1,0.3,1);
-  }
-  html.js .reveal.is-visible{
-    opacity: 1;
-    transform: none;
-  }
-  @media (prefers-reduced-motion: reduce){
-    html.js .reveal{ transition: none; opacity: 1; transform: none; }
-  }
-
-  /* ---------- header / hero ---------- */
-  header.hero{
-    padding-block: clamp(48px, 8vh, 96px) clamp(40px, 6vh, 72px);
-    border-bottom: 1px solid var(--line);
-    position: relative;
-  }
-
-  .nameplate{
-    display: inline-flex;
-    align-items: center;
-    gap: 0.6em;
-    font-family: var(--font-mono);
-    font-size: 0.78rem;
-    letter-spacing: 0.08em;
-    color: var(--ink-muted);
-    border: 1px solid var(--line-strong);
-    padding: 0.35em 0.75em;
-    border-radius: var(--radius);
-    margin-bottom: 1.75rem;
-  }
-
-  h1.title{
-    font-size: clamp(2.75rem, 7vw, 5.25rem);
-    line-height: 0.98;
-    margin-bottom: 0.5em;
-  }
-
-  .subhead{
-    font-family: var(--font-body);
-    font-size: clamp(1.125rem, 2.2vw, 1.375rem);
-    color: var(--ink-muted);
-    max-width: 42ch;
-    margin-bottom: 2.25rem;
-  }
-
-  .era{
-    font-family: var(--font-display);
-    font-size: clamp(1.75rem, 4.4vw, 3.15rem);
-    letter-spacing: -0.02em;
-    line-height: 1.1;
-    margin-bottom: 2rem;
-  }
-  .era .old{ color: var(--ink-faint); }
-  .era .arrow{ color: var(--ink-faint); padding-inline: 0.2em; }
-  .era .new{ color: var(--amber); }
-
-  .hero-copy{ max-width: 58ch; color: var(--ink-muted); margin-bottom: 2.5rem; }
-  .hero-copy strong{ color: var(--ink); font-weight: 600; }
-
-  .hero-links{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 1.75rem;
-    font-family: var(--font-mono);
-    font-size: 0.92rem;
-  }
-  .hero-links a{ white-space: nowrap; }
-
-  /* ---------- section scaffolding ---------- */
-  section.feature{
-    padding-block: clamp(56px, 10vh, 104px);
-    border-bottom: 1px solid var(--line);
-  }
-  section.feature .grid{
-    display: grid;
-    gap: clamp(28px, 5vw, 56px);
-    align-items: center;
-  }
-  section.feature.split .grid{
-    grid-template-columns: minmax(0, 1fr);
-  }
-  @media (min-width: 860px){
-    section.feature.split .grid{
-      grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
-    }
-    section.feature.split.mirror .grid{
-      grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
-    }
-    section.feature.split.mirror .grid > *:first-child{ order: 2; }
-  }
-
-  h2.h2{
-    font-size: clamp(1.65rem, 3vw, 2.5rem);
-    margin-bottom: 0.85rem;
-  }
-
-  .feature-media{
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    overflow: hidden;
-    background: var(--bg-inset);
-  }
-  .feature-media img{ width: 100%; height: auto; }
-  figcaption{
-    padding: 0.85rem 1rem;
-    font-size: 0.85rem;
-    color: var(--ink-muted);
-    border-top: 1px solid var(--line);
-    line-height: 1.55;
-  }
-  figcaption .tag{
-    display: inline-block;
-    font-family: var(--font-mono);
-    font-size: 0.7rem;
-    letter-spacing: 0.05em;
-    color: var(--amber);
-    border: 1px solid rgba(236,170,53,0.4);
-    border-radius: var(--radius);
-    padding: 0.1em 0.45em;
-    margin-right: 0.5em;
-  }
-
-  /* infrared diagram (feature 2) */
-  .ir-diagram{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 1px;
-    background: var(--line);
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    overflow: hidden;
-  }
-  .ir-diagram .pane{
-    background: var(--bg-inset);
-    padding: 1.5rem 1.25rem 1.1rem;
-    position: relative;
-    min-height: 190px;
-  }
-  .ir-diagram svg{ width: 100%; height: 110px; display: block; }
-  .ir-diagram .pane-label{
-    font-family: var(--font-mono);
-    font-size: 0.72rem;
-    letter-spacing: 0.06em;
-    color: var(--ink-muted);
-    margin-top: 0.75rem;
-  }
-
-  /* noise-floor bars (feature 3) */
-  .noise-floor{ margin-top: 1.75rem; }
-  .nf-row{ display: flex; align-items: center; gap: 1rem; margin-bottom: 0.6rem; }
-  .nf-label{ font-family: var(--font-mono); font-size: 0.75rem; color: var(--ink-muted); width: 8.5em; flex: none; }
-  .nf-bar{ flex: 1; height: 10px; border-radius: 2px; background: var(--bg-inset); border: 1px solid var(--line); overflow: hidden; }
-  .nf-fill{ height: 100%; }
-  .nf-fill.reference{ width: 86%; background: var(--cyan); opacity: 0.85; }
-  .nf-fill.replica{ width: 84%; background: var(--amber); opacity: 0.9; }
-  .nf-note{ font-size: 0.85rem; color: var(--ink-muted); margin-top: 0.9rem; }
-
-  /* ---------- architecture strip ---------- */
-  section.arch{ padding-block: clamp(56px, 10vh, 104px); border-bottom: 1px solid var(--line); }
-  .arch-steps{
-    display: grid;
-    gap: 0;
-    margin-top: 2.5rem;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--radius);
-    overflow: hidden;
-  }
-  @media (min-width: 860px){
-    .arch-steps{ grid-template-columns: repeat(4, 1fr); }
-  }
-  .arch-step{
-    padding: 1.5rem 1.4rem;
-    border-bottom: 1px solid var(--line);
-    position: relative;
-  }
-  @media (min-width: 860px){
-    .arch-step{ border-bottom: none; border-right: 1px solid var(--line); }
-    .arch-step:last-child{ border-right: none; }
-  }
-  .arch-step:last-child{ border-bottom: none; }
-  .arch-step:not(:first-child)::before{
-    content: "\2193";
-    display: block;
-    font-family: var(--font-mono);
-    color: var(--amber);
-    font-size: 0.85rem;
-    margin-bottom: 0.75rem;
-  }
-  @media (min-width: 860px){
-    .arch-step:not(:first-child)::before{
-      content: "\2192";
-      position: absolute;
-      left: -0.7rem;
-      top: 1.6rem;
-      margin-bottom: 0;
-      background: var(--bg);
-      line-height: 1;
-      padding: 0.15rem;
-    }
-  }
-  .arch-name{ font-family: var(--font-display); font-size: 1.05rem; margin-bottom: 0.5rem; }
-  .arch-desc{ font-size: 0.88rem; color: var(--ink-muted); line-height: 1.55; }
-  .arch-license{
-    display: inline-block;
-    margin-top: 0.85rem;
-    font-family: var(--font-mono);
-    font-size: 0.68rem;
-    letter-spacing: 0.04em;
-    color: var(--ink-faint);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 0.15em 0.5em;
-  }
-  .arch-note{ margin-top: 1.75rem; color: var(--ink-muted); font-size: 0.95rem; max-width: var(--measure); }
-
-  /* ---------- faq ---------- */
-  section.faq{ padding-block: clamp(56px, 10vh, 104px); border-bottom: 1px solid var(--line); }
-  .faq-list{ margin-top: 2rem; border-top: 1px solid var(--line); }
-  details{ border-bottom: 1px solid var(--line); }
-  summary{
-    cursor: pointer;
-    list-style: none;
-    padding: 1.25rem 0;
-    font-family: var(--font-display);
-    font-size: 1.05rem;
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 1rem;
-  }
-  summary::-webkit-details-marker{ display: none; }
-  summary::after{
-    content: "+";
-    font-family: var(--font-mono);
-    color: var(--amber);
-    flex: none;
-  }
-  details[open] summary::after{ content: "\2212"; }
-  .faq-answer{ padding-bottom: 1.4rem; color: var(--ink-muted); max-width: var(--measure); }
-  .faq-answer p + p{ margin-top: 0.85em; }
-
-  /* ---------- footer ---------- */
-  footer{ padding-block: clamp(40px, 7vh, 72px); }
-  footer .foot-line{ color: var(--ink-muted); font-size: 0.92rem; max-width: 52ch; margin-bottom: 1.25rem; }
-  footer .copyright{ font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-faint); }
-
-  ::selection{ background: rgba(236,170,53,0.28); color: var(--ink); }
-</style>
-</head>
-<body>
-
-<header class="hero wrap">
-  <div class="nameplate">SUPER COOLSCAN 5000&nbsp;ED &middot; LS-5000</div>
-  <h1 class="title">Scan Studio</h1>
-  <p class="subhead">A native Mac app that drives a Nikon film scanner without any Nikon software.</p>
-
-  <p class="era"><span class="old">2003 scanner.</span><span class="arrow">&rarr;</span><span class="new">2026 software.</span></p>
-
-  <nav class="hero-links" aria-label="Project links">
-    <a href="https://github.com/rohanpandula/ScanStudio">View the app on GitHub &rarr;</a>
-    <a href="https://github.com/rohanpandula/coolscanpy">View the driver (coolscanpy) &rarr;</a>
-  </nav>
-</header>
-
-<div class="sprockets" role="presentation"></div>
-
-<main>
-
-  <section class="feature split reveal wrap">
-    <div class="grid">
-      <div>
-        <h2 class="h2">No Windows VM. No vendor drivers.</h2>
-        <p>Nikon's own software for this scanner is Nikon Scan 4, an app that barely limps along on current machines and generally needs an old Windows install to run at all. Most people keeping a Coolscan alive today are doing it through a virtual machine and a shrinking pool of driver installers.</p>
-        <p>Scan Studio skips that whole chain. <a href="https://github.com/rohanpandula/coolscanpy">coolscanpy</a> is an open USB driver for the LS-5000, built by reverse-engineering the scanner's own command set rather than wrapping Nikon's SDK. It's published on PyPI and the source is public. Scan Studio's Rust engine talks to it through a small bridge process, so the Mac app itself never touches USB directly.</p>
-      </div>
-      <figure class="feature-media">
-        <img src="device-connect.jpg" alt="Scan Studio's device bar showing the Super Coolscan 5000 ED connected and ready, with a SIMULATED badge next to the device name." loading="lazy" width="1600" height="981">
-        <figcaption><span class="tag">simulated</span>Scan Studio always shows whether it's talking to real hardware or not. This is the built-in simulator, not a real scanner, which is exactly why the badge is there.</figcaption>
-      </figure>
-    </div>
-  </section>
-
-  <section class="feature reveal wrap">
-    <div style="max-width: var(--measure)">
-      <h2 class="h2">Digital ICE, rebuilt, plus an honest AI pass</h2>
-      <p>Dust and scratches block infrared light even though they're barely visible in the normal RGB scan. That's the whole trick behind Nikon's Digital ICE, and it's still the right one. Scan Studio's default repair pass is a byte-exact reimplementation of that idea: read the infrared channel, repair only what it actually flagged, and leave everything else alone instead of guessing at what the image should look like.</p>
-      <p>For frames with damage heavy enough that the exact pass can't fully clear it, an optional deep-repair pass can step in and synthesize the missing pixels using inpainting. I wanted that part disclosed rather than buried: it tracks exactly which pixels it invented, and it's built to refuse past a fixed synthesis budget rather than confidently overwrite more of a frame than it should. A frame that's too far gone gets flagged for manual review instead of a convincing-looking guess.</p>
-    </div>
-    <div class="ir-diagram" role="img" aria-label="Schematic comparing a visible-light scan, which shows no visible defects, against an infrared scan of the same frame, which reveals dust and scratch positions as marks invisible in the visible-light image.">
-      <div class="pane">
-        <svg viewBox="0 0 220 110" aria-hidden="true">
-          <rect x="4" y="4" width="212" height="102" rx="2" fill="none" stroke="var(--line-strong)"/>
-          <line x1="20" y1="30" x2="200" y2="30" stroke="var(--ink-faint)" stroke-width="1"/>
-          <line x1="20" y1="55" x2="200" y2="55" stroke="var(--ink-faint)" stroke-width="1"/>
-          <line x1="20" y1="80" x2="200" y2="80" stroke="var(--ink-faint)" stroke-width="1"/>
-        </svg>
-        <div class="pane-label">visible &middot; clean-looking</div>
-      </div>
-      <div class="pane">
-        <svg viewBox="0 0 220 110" aria-hidden="true">
-          <rect x="4" y="4" width="212" height="102" rx="2" fill="none" stroke="var(--line-strong)"/>
-          <line x1="20" y1="30" x2="200" y2="30" stroke="var(--ink-faint)" stroke-width="1"/>
-          <line x1="20" y1="55" x2="200" y2="55" stroke="var(--ink-faint)" stroke-width="1"/>
-          <line x1="20" y1="80" x2="200" y2="80" stroke="var(--ink-faint)" stroke-width="1"/>
-          <circle cx="52" cy="30" r="3.4" fill="var(--amber)"/>
-          <circle cx="121" cy="55" r="2.6" fill="var(--amber)"/>
-          <circle cx="168" cy="80" r="4" fill="var(--amber)"/>
-          <circle cx="90" cy="80" r="2.2" fill="var(--amber)"/>
-          <circle cx="150" cy="30" r="2.4" fill="var(--amber)"/>
-        </svg>
-        <div class="pane-label"><span style="color:var(--amber)">infrared</span> &middot; defects found here, repaired only here</div>
-      </div>
-    </div>
-  </section>
-
-  <section class="feature split mirror reveal wrap">
-    <div>
-      <h2 class="h2">Color matched to Nikon's own engine</h2>
-      <p>Nikon Scan's color pipeline for a C-41 negative is a specific, undocumented chain: histogram-driven exposure measurement, per-channel builder curves, a fixed output tone table, then an ICC profile transform. Scan Studio's Rust engine reimplements that chain end to end, checked frame by frame against Nikon Scan's own output on the same scanner.</p>
-      <p>The remaining differences sit inside the noise you'd get scanning the very same frame on the very same machine twice. That's the actual ceiling here: LS-5000 hardware isn't perfectly repeatable pass to pass either, so matching past that point isn't a meaningful target.</p>
-      <div class="noise-floor" aria-hidden="true">
-        <div class="nf-row">
-          <span class="nf-label">Nikon Scan</span>
-          <span class="nf-bar"><span class="nf-fill reference"></span></span>
+    <main id="main">
+      <section class="hero section-shell" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="kicker">A current home for a dedicated film scanner</p>
+          <h1 id="hero-title">Your Nikon film scanner, on a current Mac.</h1>
+          <p class="hero-lede">
+            ScanStudio is a native macOS app for the Nikon SUPER COOLSCAN 5000 ED,
+            also called the LS-5000. It detects the loaded holder, previews the
+            film, and keeps a 35 mm scanning job in one place.
+          </p>
+          <p class="tested-line">
+            This is alpha software tested on one Mac and one scanner setup. A
+            connected scanner can move film, so stay nearby and supervise every
+            real job.
+          </p>
+          <div class="actions" role="group" aria-label="ScanStudio links">
+            <a class="button button-primary" href="https://github.com/rohanpandula/ScanStudio" target="_blank" rel="noreferrer">View the source</a>
+            <a class="button button-secondary" href="#scope">Read the tested scope</a>
+          </div>
         </div>
-        <div class="nf-row">
-          <span class="nf-label">Scan Studio</span>
-          <span class="nf-bar"><span class="nf-fill replica"></span></span>
-        </div>
-        <p class="nf-note">Same frame, same scanner, two engines. The gap between them is the same size as the gap between two scans from Nikon Scan itself.</p>
-      </div>
-    </div>
-    <div>
-      <div class="feature-media" style="border-style: dashed;">
-        <div style="padding: 2.25rem 1.5rem; color: var(--ink-muted); font-size: 0.95rem;">
-          <p style="font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-faint); letter-spacing: 0.04em; margin-bottom: 1rem;">nikon_md3_curve &middot; replay_ls5000_color_path</p>
-          <p>Prescan histogram &rarr; per-channel builder LUT &rarr; fixed output tone curve &rarr; ICC replay to Adobe&nbsp;RGB. Every stage is checked against captured reference output instead of tuned by eye against a color chart.</p>
-        </div>
-      </div>
-    </div>
-  </section>
 
-  <section class="feature reveal wrap">
-    <h2 class="h2">Load once, scan the whole roll</h2>
-    <p style="max-width: var(--measure); margin-bottom: 2.25rem;">Feed a roll once. Scan Studio previews and detects every frame, up to 36 on a full roll, and lays them out as a contact sheet you can select, exclude, and rotate before anything gets scanned. Batch capture then runs frame by frame with pause-after-frame, skip, and stop controls, writing a receipt to disk as each frame finishes, so quitting mid-roll never loses the frames already done. Every capture keeps the raw negative, the infrared pass, and its receipt. Nothing about how the positive gets rendered is baked in for good, so a better rendering pipeline later can redo old rolls without feeding the film through the scanner again.</p>
-
-    <div style="display:grid; gap: clamp(20px, 3vw, 32px); grid-template-columns: minmax(0,1fr);" >
-      <div style="display:grid; gap: clamp(20px, 3vw, 32px); grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));">
-        <figure class="feature-media">
-          <img src="contact-sheet.jpg" alt="Scan Studio contact sheet showing a 36-exposure roll as a grid of thumbnails, all frames selected, with batch settings in the right-hand inspector." loading="lazy" width="1600" height="981">
-          <figcaption><span class="tag">simulated</span>Every thumbnail here is the simulator's placeholder art, not real film. Loading the built-in simulated adapter is how this page could show the workflow without a real roll in the scanner.</figcaption>
+        <figure class="product-stage product-stage-screenshot" aria-labelledby="stage-caption">
+          <div class="stage-topline">
+            <span>Verified installed alpha</span>
+            <span>LS-5000 detected · offline</span>
+          </div>
+          <div class="stage-body">
+            <img src="assets/scanstudio-ls5000-offline.jpeg" alt="ScanStudio running on macOS with an LS-5000 ED offered by the bridge as a Connect target. No scanner is selected, the status is OFFLINE, the simulator is absent, and no media or preview data is shown." width="1252" height="768" />
+          </div>
+          <figcaption id="stage-caption">
+            Current installed app, checked with the LS-5000 ED detected through the bridge but not connected. No simulator, media, preview image, or invented scan is shown.
+          </figcaption>
         </figure>
-        <figure class="feature-media">
-          <img src="capture-monitor.jpg" alt="Scan Studio's capture monitor mid-batch, showing frame 12 of 36 scanning, pass 2 of 2, with a filmstrip of completed frames and pause, skip, and stop controls." loading="lazy" width="1600" height="981">
-          <figcaption><span class="tag">simulated</span>Batch capture in progress, frame 12 of 36. The preview crop is simulated art too. Scan Studio labels it as such directly under the frame, not just in this caption.</figcaption>
-        </figure>
-      </div>
-    </div>
-  </section>
+      </section>
 
-  <section class="arch reveal wrap">
-    <h2 class="h2">Four layers between your Mac and a 2003 scanner</h2>
-    <p style="max-width: var(--measure); color: var(--ink-muted);">Each piece does one job and stays replaceable. The GPL sidecar lives outside the app on purpose, so the Mac app and the Rust engine stay clean of it.</p>
-
-    <div class="arch-steps">
-      <div class="arch-step">
-        <div class="arch-name">Scan Studio</div>
-        <div class="arch-desc">SwiftUI Mac app. Contact sheet, batch controls, receipts, hardware state, always visible.</div>
-        <span class="arch-license mono">MIT</span>
-      </div>
-      <div class="arch-step">
-        <div class="arch-name">Rust engine</div>
-        <div class="arch-desc">Headless. Owns session state, the color pipeline, and the ICE and deep-repair passes.</div>
-        <span class="arch-license mono">MIT</span>
-      </div>
-      <div class="arch-step">
-        <div class="arch-name">scanstudio&#8209;bridge</div>
-        <div class="arch-desc">Small Python sidecar. Speaks NDJSON over stdio to the engine and wraps coolscanpy.</div>
-        <span class="arch-license mono">GPL-3.0 &middot; external</span>
-      </div>
-      <div class="arch-step">
-        <div class="arch-name"><a href="https://github.com/rohanpandula/coolscanpy">coolscanpy</a></div>
-        <div class="arch-desc">The open driver. Talks USB to the LS-5000 directly. Published on PyPI.</div>
-        <span class="arch-license mono">open source</span>
-      </div>
-    </div>
-    <p class="arch-note">The app repo is at <a href="https://github.com/rohanpandula/ScanStudio">github.com/rohanpandula/ScanStudio</a>. The driver is at <a href="https://github.com/rohanpandula/coolscanpy">github.com/rohanpandula/coolscanpy</a>.</p>
-  </section>
-
-  <section class="faq reveal wrap">
-    <h2 class="h2">What works today, what doesn't yet</h2>
-
-    <div class="faq-list">
-      <details>
-        <summary>Do I need Nikon Scan or a Windows VM?</summary>
-        <div class="faq-answer"><p>No. coolscanpy talks to the LS-5000 over USB directly, and Scan Studio never calls any Nikon software.</p></div>
-      </details>
-
-      <details>
-        <summary>What film works today?</summary>
-        <div class="faq-answer"><p>C-41 color negative is the one fully working path right now: 36-exposure rolls and 6-frame strips through the one-feed workflow. Mounted slides exist in the app's data model and simulator, but the live mounted-slide path hasn't been proven on real hardware yet.</p></div>
-      </details>
-
-      <details>
-        <summary>What about black-and-white, E-6 slide film, or Kodachrome?</summary>
-        <div class="faq-answer">
-          <p>Designed, not shipped. The black-and-white material type already exists in the driver's data model but isn't wired into the driver or the bridge yet: asking for it today returns an explicit "not implemented" error rather than a wrong scan.</p>
-          <p>E-6 and Kodachrome need their own capture recipes and a hardware session with real film to establish parity against Nikon's own output before either one ships. All three are coming, roughly in that order.</p>
+      <section class="introduction section-shell" aria-labelledby="coolscan-title">
+        <div class="section-intro">
+          <p class="kicker">What is a Coolscan?</p>
+          <h2 id="coolscan-title">A Coolscan is a dedicated scanner for 35 mm film.</h2>
         </div>
-      </details>
+        <div class="reading-copy">
+          <p>
+            It reads a negative or slide directly instead of photographing it with
+            a camera. The LS-5000 is older hardware, still useful for sharp 4000
+            dpi film scans and an infrared channel on many color films.
+          </p>
+          <p>
+            The scanner is only half the job. You also need software that can
+            identify the holder, let you inspect the frames, and make clear what
+            will happen before transport starts. ScanStudio is a replacement for
+            the practical Nikon Scan workflow on the tested setup.
+          </p>
+        </div>
+      </section>
 
-      <details>
-        <summary>Is the AI dust repair going to invent parts of my photo?</summary>
-        <div class="faq-answer"><p>Only on frames damaged heavily enough that the exact infrared pass can't fully clear them, and only if you turn that pass on. It tracks exactly which pixels it synthesized, and it refuses to run past a fixed synthesis budget. Past that point it sends the frame to manual review, so a badly damaged frame never comes back looking more confident than it should.</p></div>
-      </details>
+      <section class="workflow-section" id="workflow" aria-labelledby="workflow-title">
+        <div class="section-shell workflow-layout">
+          <div class="section-intro">
+            <p class="kicker">The working screen</p>
+            <h2 id="workflow-title">Preview first. Then make the scan you mean to make.</h2>
+            <p>
+              The main workspace puts the current action, film state, and selected
+              frames ahead of the settings that support them.
+            </p>
+          </div>
+          <ol class="workflow-list">
+            <li>
+              <span class="step-mark" aria-hidden="true">1</span>
+              <div>
+                <h3>Connect and identify the holder</h3>
+                <p>The scanner reports its carrier and media when it can. The simulator remains visibly labeled.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-mark" aria-hidden="true">2</span>
+              <div>
+                <h3>Preview the roll or strip</h3>
+                <p>Review the contact sheet and align individual frames before a full capture begins.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-mark" aria-hidden="true">3</span>
+              <div>
+                <h3>Choose frames and settings</h3>
+                <p>Set film treatment, recipe, outputs, destination, and adaptive names for the selected batch.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-mark" aria-hidden="true">4</span>
+              <div>
+                <h3>Scan with a Stop control</h3>
+                <p>Follow per-frame progress, stop safely when needed, then review the saved outputs and receipts.</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
 
-      <details>
-        <summary>Is this made or endorsed by Nikon?</summary>
-        <div class="faq-answer"><p>No. This is an independent project, not affiliated with or sponsored by Nikon. Nikon, Coolscan, and Digital ICE may be trademarks of their respective owners.</p></div>
-      </details>
+      <section class="outputs-section" aria-labelledby="outputs-title">
+        <div class="section-shell outputs-layout">
+          <div class="section-intro">
+            <p class="kicker">One capture, the files you need</p>
+            <h2 id="outputs-title">Archive the master when you need it. Make a positive when you want one.</h2>
+          </div>
+          <div class="output-list">
+            <div class="output-row"><strong>Master TIFF</strong><span>Optional high-bit-depth archival output, kept separately from rendered files.</span></div>
+            <div class="output-row"><strong>Positive TIFF</strong><span>Optional rendered positive for photographic work.</span></div>
+            <div class="output-row"><strong>Positive JPEG</strong><span>Optional smaller positive for sharing and reference.</span></div>
+            <div class="output-row"><strong>Naming and metadata</strong><span>Film stock, camera, lens, box speed, recipe, and file naming stay with the project.</span></div>
+          </div>
+        </div>
+      </section>
 
-      <details>
-        <summary>What scanner does this support?</summary>
-        <div class="faq-answer"><p>The Nikon Super Coolscan 5000 ED, also known as the LS-5000, today.</p></div>
-      </details>
+      <section class="package-section section-shell" id="archive" aria-labelledby="archive-title">
+        <div class="package-heading">
+          <p class="kicker">The 1:1 archive bundle</p>
+          <h2 id="archive-title">Keep the capture evidence with the image.</h2>
+          <p>
+            An optional archive bundle is a practical record of a completed frame.
+            It keeps the separately saved RGB master, conditional infrared and
+            meter or prepass evidence, the effective settings and alignment, and
+            the receipt trail that describes the attempt.
+          </p>
+        </div>
 
-      <details>
-        <summary>Where's the code?</summary>
-        <div class="faq-answer"><p>The app is at <a href="https://github.com/rohanpandula/ScanStudio">github.com/rohanpandula/ScanStudio</a>. The USB driver is at <a href="https://github.com/rohanpandula/coolscanpy">github.com/rohanpandula/coolscanpy</a>.</p></div>
-      </details>
-    </div>
-  </section>
+        <div class="package-register" aria-label="1 to 1 archive bundle contents">
+          <div class="package-row">
+            <div class="package-symbol" aria-hidden="true">RGB</div>
+            <div><h3>RGB master</h3><p>The high-bit-depth source scan when archival output is selected.</p></div>
+            <p class="condition">It remains a separate capture file. The bundle records what it contains instead of replacing it.</p>
+          </div>
+          <div class="package-row">
+            <div class="package-symbol" aria-hidden="true">IR</div>
+            <div><h3>Conditional infrared</h3><p>Infrared evidence for compatible film where the scanner captured it.</p></div>
+            <p class="condition">Digital ICE can use this channel on supported material. Traditional silver black-and-white film does not provide usable infrared here.</p>
+          </div>
+          <div class="package-row">
+            <div class="package-symbol" aria-hidden="true">MET</div>
+            <div><h3>Meter and prepass evidence</h3><p>Exposure and preview information available before final capture.</p></div>
+            <p class="condition">The bundle includes it when the job produced it.</p>
+          </div>
+          <div class="package-row">
+            <div class="package-symbol" aria-hidden="true">SET</div>
+            <div><h3>Settings and alignment</h3><p>The effective scan recipe, output choices, and per-frame alignment.</p></div>
+            <p class="condition">These values make a later review less dependent on memory.</p>
+          </div>
+          <div class="package-row">
+            <div class="package-symbol" aria-hidden="true">LOG</div>
+            <div><h3>Engine and bridge receipts</h3><p>Machine-readable results from the app engine and hardware bridge.</p></div>
+            <p class="condition">Attempt journals are included only when the bridge reports their exact evidence root.</p>
+          </div>
+          <div class="package-row">
+            <div class="package-symbol" aria-hidden="true">SHA</div>
+            <div><h3>Manifest and checksums</h3><p>A manifest identifies the included files; checksums help check whether they changed.</p></div>
+            <p class="condition">Absent evidence stays absent and is recorded as such.</p>
+          </div>
+        </div>
+        <p class="package-afterword">
+          For black-and-white film, ScanStudio keeps infrared-based ICE off and
+          can use a separate software dust-cleanup option. That cleanup is a
+          rendering choice, not a claim that an infrared dust map exists.
+        </p>
+      </section>
 
-</main>
+      <section class="limits-section section-shell" id="scope" aria-labelledby="scope-title">
+        <div class="limits-callout">
+          <p class="kicker">Scope before promises</p>
+          <h2 id="scope-title">This is alpha software for one tested setup.</h2>
+          <p>
+            The current workflow has been tested on one Mac and one Nikon SUPER
+            COOLSCAN 5000 ED or LS-5000 setup. It does not establish support for
+            other Coolscan models, adapters, Macs, operating systems, or film
+            holders.
+          </p>
+        </div>
+        <dl class="limits-list">
+          <div><dt>Hardware and film</dt><dd>The separate hardware bridge can move physical film. Confirm the detected carrier, preview after a refeed or ejection, and supervise live work.</dd></div>
+          <div><dt>Dust treatment</dt><dd>Digital ICE requires suitable infrared material. It is disabled for traditional silver black-and-white film; software dust cleanup is a separate option.</dd></div>
+          <div><dt>Release state</dt><dd>There is no promise of a signed download, notarized installer, support plan, or release schedule.</dd></div>
+          <div><dt>Names and marks</dt><dd>ScanStudio is independent software. Nikon and Coolscan are trademarks of Nikon Corporation. No affiliation or endorsement is claimed.</dd></div>
+        </dl>
+      </section>
 
-<footer class="wrap">
-  <p class="foot-line">Built by one person who didn't see a reason to let a working scanner turn into e-waste.</p>
-  <p class="copyright">&copy; Rohan Pandula 2026</p>
-</footer>
+      <section class="closing-section" aria-labelledby="closing-title">
+        <div class="section-shell closing-layout">
+          <div>
+            <p class="kicker">Source and feedback</p>
+            <h2 id="closing-title">Try it carefully. Tell us what the scanner did.</h2>
+            <p>
+              The source, current limits, and issue tracker live together. When a
+              real job goes wrong, report the device state and the human-facing
+              error without posting scans, private paths, serial numbers, or
+              capture journals.
+            </p>
+          </div>
+          <div class="closing-actions">
+            <a class="button button-primary" href="https://github.com/rohanpandula/ScanStudio" target="_blank" rel="noreferrer">View the source</a>
+            <a class="button button-secondary" href="https://github.com/rohanpandula/ScanStudio/issues/new/choose" target="_blank" rel="noreferrer">Open an issue</a>
+          </div>
+        </div>
+      </section>
+    </main>
 
-<script>
-  (function(){
-    document.documentElement.classList.add('js');
-    var els = document.querySelectorAll('.reveal');
-    if(!('IntersectionObserver' in window) || !els.length){
-      els.forEach(function(el){ el.classList.add('is-visible'); });
-      return;
-    }
-    var io = new IntersectionObserver(function(entries){
-      entries.forEach(function(entry){
-        if(entry.isIntersecting){
-          entry.target.classList.add('is-visible');
-          io.unobserve(entry.target);
-        }
-      });
-    }, { threshold: 0.08, rootMargin: '0px 0px -8% 0px' });
-    els.forEach(function(el){ io.observe(el); });
-  })();
-</script>
-
-</body>
+    <footer class="site-footer section-shell">
+      <a class="brand" href="#top"><img src="assets/scanstudio-app-icon.png" alt="" width="32" height="32" /><span>ScanStudio</span></a>
+      <p>Alpha macOS software for a tested Nikon LS-5000 setup.</p>
+      <a href="#top">Back to top</a>
+    </footer>
+  </body>
 </html>

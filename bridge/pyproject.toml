@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanstudio-bridge"
+version = "0.1.0"
+description = "Headless NDJSON-over-stdio service wrapping CoolscanPy's LS-5000 roll-feeder engine for the Scan Studio Rust engine"
+readme = "README.md"
+# SPDX string field, no `License ::` trove classifier -- setuptools>=80 rejects
+# that combination (see CoolscanPy's own pyproject.toml for the same note).
+license = "GPL-3.0-only"
+authors = [{ name = "ScanStudio contributors" }]
+# CoolscanPy itself requires >=3.13; uv's resolver needs a solution valid
+# across the whole declared range, so requires-python has to match that
+# floor exactly or `uv sync` fails resolution outright.
+requires-python = ">=3.13"
+dependencies = [
+    # The production hardware bridge includes CoolscanPy's scanner extra.
+    # python-sane is packaged, while a compatible OS SANE backend/libusb
+    # remains a documented system-driver prerequisite.
+    "coolscanpy[scanner]",
+    "numpy>=2.4,<3",
+    "tifffile>=2026.6.1,<2027",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.14,<1",
+]
+
+[tool.uv.sources]
+# Checkout-relative on purpose: this keeps development locking reproducible
+# without embedding a maintainer's home directory. The app packager preserves
+# this same sibling relationship in the shipped corresponding source tree.
+coolscanpy = { path = "../coolscanpy", editable = true }
+
+[project.scripts]
+# cli.py doesn't exist until Plan 08-03; fine, `uv sync` only needs this
+# string to resolve when the console script actually runs.
+scanstudio-bridge = "scanstudio_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
