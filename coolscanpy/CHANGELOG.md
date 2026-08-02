@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Transparent macOS app bundles can now pin PyUSB to an app-owned libusb
+without pretending the interpreter is PyInstaller-frozen. The resolver accepts
+only the fixed `*.app/Contents/Resources/BridgeRuntime/python/bin` interpreter
+layout when this CoolscanPy source is inside the same signed app, loads only a
+regular library under that app's `Contents/Frameworks`, and fails closed if it
+is missing. Ordinary source installs retain normal host-library lookup.
+
 C-41 fine scans now expose RGB the way Nikon Scan would. The meter loop's
 own converged solve consistently landed 6–9 % brighter than Nikon's
 rendering of the same physical frame, and matched-pair analysis against

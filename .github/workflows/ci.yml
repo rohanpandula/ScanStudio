@@ -39,9 +39,26 @@ jobs:
         working-directory: bridge
         run: uv run pytest
 
-  package:
-    name: Self-contained package check
+  coolscanpy:
+    name: CoolscanPy tests
     runs-on: macos-15
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Test direct-USB library and packaging logic
+        working-directory: coolscanpy
+        run: uv run pytest
+
+  package:
+    name: Self-contained package check (macOS 14 floor)
+    # This job runs the packaged Python and loads the app-owned libusb on the
+    # oldest macOS version ScanStudio declares, not merely a newer SDK with a
+    # deployment-target load command.
+    runs-on: macos-14
     # See the bridge job: the relocatable package requires uv's standalone
     # CPython, not the runner image's framework Python.
     env:
@@ -52,8 +69,12 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
-      - name: Install system scanner prerequisites
-        run: brew install sane-backends libusb
+      - name: Install optional SANE binding build prerequisite
+        # The release does not copy Homebrew's libusb: package_app.sh builds
+        # the signed app-owned copy from hash-pinned source at the declared
+        # deployment target. sane-backends is needed only to compile the
+        # optional python-sane compatibility binding included in the bundle.
+        run: brew install sane-backends
       - name: Point the compiler at Homebrew's headers and libraries
         # GitHub Actions does not expand $(...) inside an `env:` block, and
         # Homebrew's prefix varies by runner architecture (/opt/homebrew on

@@ -19,8 +19,10 @@ dependencies = [
     # coolscanpy's own scanner extra (python-sane) is intentionally left out
     # of the base dependency set: the bridge's test suite doesn't touch
     # hardware, and python-sane needs OS SANE headers to build, which the
-    # test/CI environment doesn't have. Install the production hardware
-    # bridge with the `scanner` extra below, which pulls it back in.
+    # test/CI environment doesn't have. Package builds install the `scanner`
+    # extra below so the optional plain-scan/eject compatibility path remains
+    # available when a host SANE backend exists; color-roll capture does not
+    # use it.
     "coolscanpy",
     "numpy>=2.4,<3",
     "tifffile>=2026.6.1,<2027",
@@ -28,8 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # The production hardware bridge is installed with `uv sync --extra scanner`.
-# python-sane is packaged as part of this extra; a compatible OS SANE
-# backend/libusb remains a documented system-driver prerequisite.
+# python-sane is packaged as part of this extra, and a compatible OS SANE
+# backend remains a host prerequisite only for plain scan and software eject.
+# ScanStudio packages its own libusb for CoolscanPy's direct color-roll path.
 scanner = ["coolscanpy[scanner]"]
 
 [dependency-groups]

@@ -19,7 +19,24 @@ alone.
 
 Do not label a bundle that includes the bridge as MIT-only. The package script places the bridge and CoolscanPy GPL texts under `Contents/Resources/Licenses`, and complete source snapshots under `Contents/Resources/CorrespondingSource`. CPython 3.13's license and the visible metadata/license material for every included Python wheel live in the same `Licenses` directory. Preserve those locations in any copied or redistributed app.
 
-The bundle includes `python-sane` to provide the Python scanner binding. It deliberately does **not** include the operating-system SANE backend or libusb stack. On the tested Apple Silicon setup, the required host components are installed with `brew install sane-backends libusb`; the bundled `_sane` extension expects Homebrew's `libsane.1.dylib`. A missing or unloadable backend must remain a bridge startup/operation failure, never a simulated successful connection.
+The bundle dynamically loads libusb 1.0.30 from
+`Contents/Frameworks/coolscanpy/_native`. It is licensed
+LGPL-2.1-or-later; the exact license and build notice are under
+`Contents/Resources/Licenses`, and the complete hash-pinned upstream source
+archive, exact build script, and rebuild instructions are under
+`Contents/Resources/CorrespondingSource/libusb`. The library
+is built for the app's declared macOS deployment target before signing, and
+the package check proves a relocated bundled Python process resolves that
+exact app-owned file rather than a Homebrew copy.
+
+The bundle also includes `python-sane` for CoolscanPy's optional plain-scan
+and software-eject paths. It deliberately does **not** include an operating-
+system SANE backend; the bundled `_sane` extension expects a compatible host
+`libsane.1.dylib` when one of those optional paths is used. The supported
+LS-5000 color-roll workflow does not require SANE: discovery and connection
+fall back to direct USB when SANE is absent, while status, preview, and color
+capture use direct USB. A missing optional backend must remain a clear
+operation failure, never a simulated successful connection.
 
 ## Rust engine dependencies
 
@@ -57,7 +74,7 @@ Before distributing `ScanStudio.app`, a DMG, or any other binary artifact:
 1. Regenerate the resolved dependency inventory from the exact `Cargo.lock` used to build the release.
 2. Include the full text of every selected Rust dependency license and the required copyright notices in the shipped archive or app bundle.
 3. Include the MIT license for this project.
-4. A `make package` bundle includes `scanstudio-bridge`: verify its GPL-3.0-only license, CoolscanPy source, CPython license, and Python wheel metadata/licenses are present in `Contents/Resources/Licenses` and `Contents/Resources/CorrespondingSource`.
+4. A `make package` bundle includes `scanstudio-bridge`: verify its GPL-3.0-only license, CoolscanPy source, CPython license, Python wheel metadata/licenses, and libusb license, notice, binary, complete pinned source archive, exact build script, and rebuild instructions are present in `Contents/Resources/Licenses`, `Contents/Resources/CorrespondingSource`, and `Contents/Frameworks`.
 5. Keep Nikon software and private evidence out of the release.
 6. Recheck this document after every dependency or packaging change.
 

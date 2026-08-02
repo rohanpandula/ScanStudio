@@ -30,7 +30,7 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "capture_process.py": "76c11a67c19ec5921e630b90540e42458176f36156eb2ca4a15c36adcf9ab56e",
     "worker.py": "63d5529b7faf1982fab85fe480cb58d591943228f977df5d8470e49aa7c0610a",
-    "usb_backend.py": "a1cee3db705afa0067e5866b3efe520c743b09f444f2b8024b72b84ac0cd6932",
+    "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "6a3fc1aa962efd9b06058aa22eb1d3d2968726826d8417d222c3247cfc85f0f7",
     "packed.py": "7380c8685c77be1234ad17bfd265cb6efc16efd05204ff56f55faf811f14cb9d",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
