@@ -1785,6 +1785,127 @@ struct SessionEventPolicyTests {
         #expect(model.scanFilmProcess == .positive)
     }
 
+    @Test("a new project adopts its destinations without replacing pre-Save output choices")
+    @MainActor
+    func newProjectPreservesDraftOutputChoices() async {
+        let project = ScanProject(
+            schemaVersion: 1,
+            id: "tiff-only-roll",
+            name: "TIFF-only roll",
+            carrier: .mounted,
+            frameCount: 1,
+            filmProcess: .positive,
+            recipes: OutputRecipe(
+                archive: ArchiveRecipe(
+                    filenameTemplate: "Archive_####",
+                    destination: "/tmp/project/archive"
+                ),
+                positive: PositiveRecipe(
+                    enabled: true,
+                    fileFormat: .jpeg,
+                    colorProfile: .sRgb,
+                    filenameTemplate: "Positive_####",
+                    destination: "/tmp/project/positive"
+                ),
+                preview: PreviewRecipe(
+                    enabled: true,
+                    fileFormat: .tiff,
+                    maxLongEdgePx: 1_024,
+                    filenameTemplate: "Preview_####",
+                    destination: "/tmp/project/preview"
+                )
+            ),
+            rollMetadata: MetadataSet(),
+            createdAt: "2026-08-02T00:00:00Z",
+            frames: [ProjectFrame(index: 1, excluded: false, receipts: [])]
+        )
+        let model = SessionModel(engineClient: ProjectFlowEngineStub(project: project))
+        model.setMasterTIFFEnabled(false)
+        model.setPreviewEnabled(false)
+        model.positiveFileFormat = .tiff
+        model.positiveColorProfile = .proPhotoRgb
+        model.setAutoCropEnabled(true)
+        model.saveEachOutputInOwnFolder = false
+        model.masterFolderName = "Originals"
+        model.positiveTiffFolderName = "TIFF"
+        model.positiveJPEGFolderName = "JPEG"
+
+        await model.createProject(
+            name: "TIFF-only roll",
+            carrier: .mounted,
+            frameCount: 1,
+            filmProcess: .positive
+        )
+
+        #expect(!model.masterTIFFEnabled)
+        #expect(!model.fullCapturePackageEnabled)
+        #expect(model.positiveEnabled)
+        #expect(model.positiveFileFormat == .tiff)
+        #expect(model.positiveColorProfile == .proPhotoRgb)
+        #expect(!model.previewEnabled)
+        #expect(model.autoCropEnabled)
+        #expect(!model.saveEachOutputInOwnFolder)
+        #expect(model.masterFolderName == "Originals")
+        #expect(model.positiveTiffFolderName == "TIFF")
+        #expect(model.positiveJPEGFolderName == "JPEG")
+        #expect(model.outputRecipe.archive.destination == "/tmp/project/archive")
+        #expect(model.outputRecipe.positive.destination == "/tmp/project/positive")
+        #expect(model.outputRecipe.preview.destination == "/tmp/project/preview")
+    }
+
+    @Test("opening a project still replaces session output choices with its saved recipe")
+    @MainActor
+    func openProjectStillAppliesPersistedOutputChoices() async {
+        let project = ScanProject(
+            schemaVersion: 1,
+            id: "saved-preview-roll",
+            name: "Saved preview roll",
+            carrier: .mounted,
+            frameCount: 1,
+            filmProcess: .positive,
+            recipes: OutputRecipe(
+                archive: ArchiveRecipe(
+                    enabled: false,
+                    filenameTemplate: "Saved-Archive_####",
+                    destination: "/tmp/saved/archive",
+                    fullCapturePackage: false
+                ),
+                positive: PositiveRecipe(
+                    enabled: false,
+                    fileFormat: .jpeg,
+                    colorProfile: .sRgb,
+                    filenameTemplate: "Saved-Positive_####",
+                    destination: "/tmp/saved/positive"
+                ),
+                preview: PreviewRecipe(
+                    enabled: true,
+                    fileFormat: .tiff,
+                    maxLongEdgePx: 2_048,
+                    filenameTemplate: "Saved-Preview_####",
+                    destination: "/tmp/saved/preview"
+                ),
+                autoCrop: true
+            ),
+            rollMetadata: MetadataSet(),
+            createdAt: "2026-08-02T00:00:00Z",
+            frames: [ProjectFrame(index: 1, excluded: false, receipts: [])]
+        )
+        let model = SessionModel(engineClient: ProjectFlowEngineStub(project: project))
+
+        await model.openProject(directory: "/tmp/saved-preview-roll")
+
+        #expect(!model.masterTIFFEnabled)
+        #expect(!model.fullCapturePackageEnabled)
+        #expect(!model.positiveEnabled)
+        #expect(model.previewEnabled)
+        #expect(model.previewFileFormat == .tiff)
+        #expect(model.previewMaxLongEdgePx == 2_048)
+        #expect(model.autoCropEnabled)
+        #expect(model.archiveDestination == "/tmp/saved/archive")
+        #expect(model.positiveDestination == "/tmp/saved/positive")
+        #expect(model.previewDestination == "/tmp/saved/preview")
+    }
+
     @Test("a saved naming default survives new-project creation while an opened recipe remains authoritative")
     @MainActor
     func namingDefaultOnlySeedsNewProjects() async throws {

@@ -14,6 +14,13 @@ struct ScanTelemetryHonestyTests {
     private let real = ScanTelemetryHonesty(isRealDevice: true)
     private let simulated = ScanTelemetryHonesty(isRealDevice: false)
 
+    @Test("Completed scan count uses user-facing frame wording and correct plurality")
+    func scannedFramesLabelUsesCorrectPlurality() {
+        #expect(ScanTelemetryHonesty.scannedFramesLabel(0) == "0 frames scanned")
+        #expect(ScanTelemetryHonesty.scannedFramesLabel(1) == "1 frame scanned")
+        #expect(ScanTelemetryHonesty.scannedFramesLabel(2) == "2 frames scanned")
+    }
+
     @Test("Simulator surfaces its genuine per-frame fraction on the in-flight frame")
     func simulatorShowsLiveFramePercent() {
         #expect(simulated.liveFramePercent(reported: 42, isInFlightFrame: true) == 42)

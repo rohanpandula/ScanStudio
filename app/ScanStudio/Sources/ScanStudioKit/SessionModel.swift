@@ -1934,6 +1934,18 @@ public final class SessionModel {
         guard beginProjectLifecycleChange() else { return }
         defer { isChangingProject = false }
         lastErrorMessage = nil
+        // Batch Settings is intentionally editable before Save Roll. Capture
+        // those choices before awaiting the engine: the fresh manifest owns
+        // its project-rooted destinations, but its all-enabled recipe defaults
+        // must never silently replace an explicit TIFF-only (or other)
+        // selection the user already made in this session.
+        let draftOutput = outputRecipe
+        let draftOutputOrganization = (
+            separateFolders: saveEachOutputInOwnFolder,
+            masterFolder: masterFolderName,
+            positiveFolder: positiveTiffFolderName,
+            jpegFolder: positiveJPEGFolderName
+        )
         do {
             let params = ProjectCreateParams(
                 name: name,
@@ -1950,11 +1962,30 @@ public final class SessionModel {
             rollMetadataDraft = result.project.rollMetadata
             isCustomFilmStockSelected = false
             projectDirectory = result.directory
-            // Keep the engine-created, project-rooted destinations and all
-            // recipe fields authoritative. Only the per-user naming default
-            // is intentionally seeded into a new roll; opening a project
-            // continues to use its saved recipe unchanged.
+            // Keep the engine-created, project-rooted destinations
+            // authoritative, then restore the pre-Save output choices
+            // captured above. Only the per-user naming default is seeded
+            // separately; opening a project still uses its saved recipe
+            // unchanged.
             applyRecipes(result.project.recipes)
+            if draftOutput.archive.enabled
+                || draftOutput.positive.enabled
+                || draftOutput.preview.enabled {
+                masterTIFFEnabled = draftOutput.archive.enabled
+                fullCapturePackageEnabled = draftOutput.archive.enabled
+                    && draftOutput.archive.fullCapturePackage
+                positiveEnabled = draftOutput.positive.enabled
+                positiveFileFormat = draftOutput.positive.fileFormat
+                positiveColorProfile = draftOutput.positive.colorProfile
+                previewEnabled = draftOutput.preview.enabled
+                previewFileFormat = draftOutput.preview.fileFormat
+                previewMaxLongEdgePx = draftOutput.preview.maxLongEdgePx
+                autoCropEnabled = draftOutput.autoCrop
+                saveEachOutputInOwnFolder = draftOutputOrganization.separateFolders
+                masterFolderName = draftOutputOrganization.masterFolder
+                positiveTiffFolderName = draftOutputOrganization.positiveFolder
+                positiveJPEGFolderName = draftOutputOrganization.jpegFolder
+            }
             let template = preferences.string(forKey: Self.filenameTemplateDefaultKey)
                 .flatMap { $0.isEmpty ? nil : $0 }
                 ?? FilenameTemplate.defaultTemplate

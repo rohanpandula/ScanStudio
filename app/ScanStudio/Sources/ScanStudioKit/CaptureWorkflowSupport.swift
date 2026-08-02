@@ -206,6 +206,30 @@ public enum OutputDestination {
     }
 }
 
+/// Presents the output location as an already-valid part of a saved roll,
+/// while keeping a custom base folder an optional override. Project creation
+/// and output redirection are separate concepts; the interface must not imply
+/// that a second save-location choice is required before scanning.
+public enum OutputLocationPresentation {
+    public static func summary(
+        hasOpenProject: Bool,
+        customLocation: String
+    ) -> String {
+        guard hasOpenProject else {
+            return "Save Roll creates the project and sets up default output locations automatically."
+        }
+        let customLocation = customLocation.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !customLocation.isEmpty else {
+            return "Ready: every enabled output already has a save location. Changing it is optional."
+        }
+        return "Custom output location:\n\(customLocation)"
+    }
+
+    public static func showsChangeAction(hasOpenProject: Bool) -> Bool {
+        hasOpenProject
+    }
+}
+
 /// A single folder needs distinct master/derivative stems. Separate output
 /// folders can intentionally share the user's template without a collision.
 public enum OutputNamingTemplate {

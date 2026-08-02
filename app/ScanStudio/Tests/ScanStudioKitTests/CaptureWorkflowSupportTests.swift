@@ -53,6 +53,26 @@ struct CaptureWorkflowSupportTests {
         #expect(OutputNamingTemplate.template("Film-Master", roleSuffix: "Master", separateFolders: false) == "Film-Master")
     }
 
+    @Test("output location is presented as ready by default and custom only when deliberately changed")
+    func outputLocationPresentation() {
+        #expect(OutputLocationPresentation.summary(
+            hasOpenProject: false,
+            customLocation: ""
+        ) == "Save Roll creates the project and sets up default output locations automatically.")
+        #expect(!OutputLocationPresentation.showsChangeAction(hasOpenProject: false))
+
+        #expect(OutputLocationPresentation.summary(
+            hasOpenProject: true,
+            customLocation: ""
+        ) == "Ready: every enabled output already has a save location. Changing it is optional.")
+        #expect(OutputLocationPresentation.showsChangeAction(hasOpenProject: true))
+
+        #expect(OutputLocationPresentation.summary(
+            hasOpenProject: true,
+            customLocation: "  /Volumes/Film Scans  "
+        ) == "Custom output location:\n/Volumes/Film Scans")
+    }
+
     @Test("output retention allows enabling any output but never disabling the last one")
     func outputRetentionPolicy() {
         #expect(OutputRetentionPolicy.allowsChange(
