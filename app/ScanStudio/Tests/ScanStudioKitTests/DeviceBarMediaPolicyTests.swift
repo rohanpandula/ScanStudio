@@ -10,7 +10,8 @@ struct DeviceBarMediaPolicyTests {
             isAcquiringPreviews: true,
             mediaLoaded: false,
             carrierDisplayName: "35 mm roll",
-            filmPresent: nil
+            filmPresent: nil,
+            refeedRequired: false
         ) == "Detecting film")
     }
 
@@ -18,11 +19,35 @@ struct DeviceBarMediaPolicyTests {
     func presenceClaimsAreAuthoritativeOnly() {
         #expect(DeviceBarMediaPolicy.label(
             isAcquiringPreviews: false, mediaLoaded: false,
-            carrierDisplayName: "35 mm roll", filmPresent: nil
+            carrierDisplayName: "35 mm roll", filmPresent: nil,
+            refeedRequired: false
         ) == "35 mm roll identified")
         #expect(DeviceBarMediaPolicy.label(
             isAcquiringPreviews: false, mediaLoaded: false,
-            carrierDisplayName: "35 mm roll", filmPresent: true
+            carrierDisplayName: "35 mm roll", filmPresent: true,
+            refeedRequired: false
         ) == "Film present; preview needed")
+    }
+
+    @Test("a transport slip overrides stale loaded media copy")
+    func refeedRequiredOverridesStaleLoadedState() {
+        #expect(DeviceBarMediaPolicy.label(
+            isAcquiringPreviews: false,
+            mediaLoaded: true,
+            carrierDisplayName: "35 mm strip (6 frames)",
+            filmPresent: false,
+            refeedRequired: true
+        ) == "Refeed required")
+    }
+
+    @Test("an explicit no-film sensor reading overrides stale loaded media copy")
+    func noFilmOverridesStaleLoadedState() {
+        #expect(DeviceBarMediaPolicy.label(
+            isAcquiringPreviews: false,
+            mediaLoaded: true,
+            carrierDisplayName: "35 mm strip (6 frames)",
+            filmPresent: false,
+            refeedRequired: false
+        ) == "No film detected")
     }
 }

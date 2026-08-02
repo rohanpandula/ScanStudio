@@ -74,7 +74,7 @@ struct DeviceBarView: View {
                 .foregroundStyle(Color.scanStudioSecondaryText)
             Text(mediaLabel)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(hasMedia ? Color.scanStudioPrimaryText : Color.scanStudioSecondaryText)
+                .foregroundStyle(mediaLabelColor)
                 .fixedSize()
                 .layoutPriority(1)
                 .help(mediaLabel)
@@ -156,8 +156,14 @@ struct DeviceBarView: View {
             isAcquiringPreviews: sessionModel.isAcquiringThumbnails,
             mediaLoaded: hasMedia,
             carrierDisplayName: sessionModel.loadedCarrier?.displayName,
-            filmPresent: sessionModel.status?.filmPresent
+            filmPresent: sessionModel.status?.filmPresent,
+            refeedRequired: sessionModel.refeedRequired
         )
+    }
+
+    private var mediaLabelColor: Color {
+        if sessionModel.refeedRequired { return .scanStudioAmber }
+        return hasMedia ? .scanStudioPrimaryText : .scanStudioSecondaryText
     }
 }
 

@@ -5,6 +5,35 @@ import Testing
 
 @Suite("Error presentation policy")
 struct ErrorPresentationPolicyTests {
+    @Test("diagnosed scan-time transport slips require a refeed and retain the raw diagnostic")
+    func scanTimeTransportSlip() {
+        let diagnostics = [
+            "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): SynchronizedProtocolError: command 124: sense 045300 not in accepted ['000000']",
+            "INTERNAL: bridge scan.frameFailed (FINGERPRINT_REFUSED): ProtocolError: fresh live index does not match the reviewed roll fingerprint: slot-count-mismatch",
+            "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): IndexDecodeError: transport anchor residual is inconsistent with one affine preview traversal (MAE 3.813 rows, max 7.554 rows)",
+        ]
+
+        for rawMessage in diagnostics {
+            let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+            #expect(presentation.title == "Film shifted—refeed required")
+            #expect(
+                presentation.guidance
+                    == "The scanner lost the film’s position. Remove and firmly reinsert the strip, then acquire a fresh preview. Do not retry Capture with the current preview."
+            )
+            #expect(presentation.technicalDetails == rawMessage)
+        }
+    }
+
+    @Test("an unrelated roll mismatch does not claim a physical transport slip")
+    func unrelatedRollMismatchUsesFallback() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): calibration signature changed"
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "ScanStudio could not complete that action")
+        #expect(presentation.technicalDetails == rawMessage)
+    }
+
     @Test("a preview readiness timeout explains what stopped and preserves the full diagnostic")
     func previewReadinessTimeout() throws {
         let rawMessage = """

@@ -6,9 +6,12 @@ public enum DeviceBarMediaPolicy {
         isAcquiringPreviews: Bool,
         mediaLoaded: Bool,
         carrierDisplayName: String?,
-        filmPresent: Bool?
+        filmPresent: Bool?,
+        refeedRequired: Bool
     ) -> String {
         if isAcquiringPreviews { return "Detecting film" }
+        if refeedRequired { return "Refeed required" }
+        if filmPresent == false { return "No film detected" }
         if mediaLoaded { return carrierDisplayName ?? "Previewed film" }
         if filmPresent == true { return "Film present; preview needed" }
         if let carrierDisplayName { return "\(carrierDisplayName) identified" }
