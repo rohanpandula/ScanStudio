@@ -183,7 +183,8 @@ struct CarrierLoadingWorkspaceView: View {
                     thumbnail: sessionModel.thumbnails[frameIndex],
                     isCurrent: frameIndex == inFlightFrame,
                     orientationDegrees: sessionModel.frameOrientation(frameIndex),
-                    mirrored: sessionModel.frameMirror(frameIndex)
+                    mirrored: sessionModel.frameMirror(frameIndex),
+                    verticallyMirrored: sessionModel.frameVerticalMirror(frameIndex)
                 )
             }
         }
@@ -238,6 +239,8 @@ private struct RollLoadingFrameCell: View {
     let orientationDegrees: Int
     /// Session-local horizontal mirror, kept in sync with the contact sheet.
     let mirrored: Bool
+    /// Session-local vertical mirror, kept in sync with the contact sheet.
+    let verticallyMirrored: Bool
 
     /// Whether the engine has reported ANY preview for this frame yet —
     /// real or simulated. This carries no real-vs-simulated meaning on its
@@ -266,7 +269,13 @@ private struct RollLoadingFrameCell: View {
             // a neutral placeholder otherwise — so it's reused here instead
             // of re-deriving that same real-vs-simulated distinction a
             // second, easy-to-drift-out-of-sync time.
-            ThumbnailTileImage(frameIndex: frameIndex, thumbnail: thumbnail, orientationDegrees: orientationDegrees, mirrored: mirrored)
+            ThumbnailTileImage(
+                frameIndex: frameIndex,
+                thumbnail: thumbnail,
+                orientationDegrees: orientationDegrees,
+                mirrored: mirrored,
+                verticallyMirrored: verticallyMirrored
+            )
 
             LinearGradient(
                 colors: [.black.opacity(0.56), .clear],
@@ -302,7 +311,10 @@ private struct RollLoadingFrameCell: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .aspectRatio(3.0 / 2.0, contentMode: .fit)
+        .aspectRatio(
+            FrameOrientation.displayAspectRatio(orientationDegrees),
+            contentMode: .fit
+        )
         .background(Color.black.opacity(0.34))
         .clipShape(RoundedRectangle(cornerRadius: ScanStudioMetrics.thumbnailCornerRadius))
         .overlay {

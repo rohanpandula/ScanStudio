@@ -258,6 +258,7 @@ struct FrameDetailWorkspaceView: View {
         let isAvailable = sessionModel.thumbnails[frameIndex].map { $0.isSimulatorShaped } ?? false
         let orientationDegrees = sessionModel.frameOrientation(frameIndex)
         let mirrored = sessionModel.frameMirror(frameIndex)
+        let verticallyMirrored = sessionModel.frameVerticalMirror(frameIndex)
 
         return VStack(alignment: .leading, spacing: 6) {
             viewingModeSwitcher
@@ -286,10 +287,17 @@ struct FrameDetailWorkspaceView: View {
                         SimulatedFrameImage(frameIndex: frameIndex, isAvailable: isAvailable)
                     }
                 }
-                .scaleEffect(x: mirrored ? -1 : 1, y: 1)
+                .scaleEffect(
+                    x: mirrored ? -1 : 1,
+                    y: verticallyMirrored ? -1 : 1
+                )
                 .rotationEffect(.degrees(Double(orientationDegrees)))
                 if viewingMode == .defectMap {
-                    defectMapOverlayContent(orientationDegrees: orientationDegrees, mirrored: mirrored)
+                    defectMapOverlayContent(
+                        orientationDegrees: orientationDegrees,
+                        mirrored: mirrored,
+                        verticallyMirrored: verticallyMirrored
+                    )
                 }
             }
             .scaleEffect(zoomState.scale)
@@ -297,7 +305,10 @@ struct FrameDetailWorkspaceView: View {
             // Swap to portrait (2:3) at 90/270 so the rotated frame fits instead
             // of being clipped to the landscape box (rotationEffect does not
             // resize layout bounds).
-            .aspectRatio(orientationDegrees % 180 == 0 ? 3.0 / 2.0 : 2.0 / 3.0, contentMode: .fit)
+            .aspectRatio(
+                FrameOrientation.displayAspectRatio(orientationDegrees),
+                contentMode: .fit
+            )
             .frame(maxWidth: .infinity, minHeight: 360, maxHeight: 480)
             .background(.black)
             .clipShape(RoundedRectangle(cornerRadius: 5))
@@ -402,6 +413,7 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .keyboardShortcut("l", modifiers: .command)
             .help("Rotate counter-clockwise—display only; saved output is unchanged")
 
             Button {
@@ -411,6 +423,7 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .keyboardShortcut("r", modifiers: .command)
             .help("Rotate clockwise—display only; saved output is unchanged")
 
             Button {
@@ -427,23 +440,34 @@ struct FrameDetailWorkspaceView: View {
             Button {
                 sessionModel.toggleFrameMirror(frameIndex)
             } label: {
-                Label(
-                    sessionModel.frameMirror(frameIndex) ? "Mirror On" : "Mirror Off",
-                    systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right"
-                )
+                Label("Flip Left to Right", systemImage: "arrow.left.and.right")
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Toggle horizontal mirror—display only; saved output is unchanged")
+            .keyboardShortcut("h", modifiers: [.command, .shift])
+            .help("Flip left to right—display only; saved output is unchanged")
 
             Button {
-                sessionModel.resetFrameMirror(frameIndex)
+                sessionModel.toggleFrameVerticalMirror(frameIndex)
             } label: {
-                Label("Reset Mirror", systemImage: "arrow.left.and.right")
+                Label("Flip Top to Bottom", systemImage: "arrow.up.and.down")
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(!sessionModel.frameMirror(frameIndex))
+            .keyboardShortcut("v", modifiers: [.command, .shift])
+            .help("Flip top to bottom—display only; saved output is unchanged")
+
+            Button {
+                sessionModel.resetFrameMirrors(frameIndex)
+            } label: {
+                Label("Reset Flips", systemImage: "arrow.uturn.backward")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(
+                !sessionModel.frameMirror(frameIndex)
+                    && !sessionModel.frameVerticalMirror(frameIndex)
+            )
 
             Spacer(minLength: 12)
 
@@ -453,7 +477,7 @@ struct FrameDetailWorkspaceView: View {
                 .fixedSize()
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Frame orientation and mirror, display only")
+        .accessibilityLabel("Frame orientation and flips, display only")
     }
 
     /// Defect Map mode's overlay content, layered inside the same
@@ -466,7 +490,11 @@ struct FrameDetailWorkspaceView: View {
     /// keys the empty states off the authoritative wire boolean, never
     /// `defects.isEmpty` alone.
     @ViewBuilder
-    private func defectMapOverlayContent(orientationDegrees: Int, mirrored: Bool) -> some View {
+    private func defectMapOverlayContent(
+        orientationDegrees: Int,
+        mirrored: Bool,
+        verticallyMirrored: Bool
+    ) -> some View {
         if let analysis = currentDefectAnalysis {
             if analysis.digitalIceEnabled == false {
                 DigitalIceOffNotice()
@@ -474,7 +502,10 @@ struct FrameDetailWorkspaceView: View {
                 CleanFrameNotice(simulated: analysis.simulated)
             } else {
                 DefectOverlayCanvas(defects: visibleDefectsForFrame, opacity: overlayOpacity)
-                    .scaleEffect(x: mirrored ? -1 : 1, y: 1)
+                    .scaleEffect(
+                        x: mirrored ? -1 : 1,
+                        y: verticallyMirrored ? -1 : 1
+                    )
                     // Track the image rotation so markers stay on their defects.
                     // Scoped to the canvas only so the centered empty-state notices
                     // above stay upright.
@@ -521,6 +552,9 @@ struct FrameDetailWorkspaceView: View {
         }
         if sessionModel.frameMirror(frameIndex) {
             label += ", mirrored horizontally"
+        }
+        if sessionModel.frameVerticalMirror(frameIndex) {
+            label += ", mirrored vertically"
         }
         if viewingMode == .defectMap, let defects = currentDefectAnalysis?.defects, !defects.isEmpty {
             let provenance = currentDefectAnalysis?.simulated ?? true ? "simulated" : "real"
@@ -710,7 +744,8 @@ struct FrameDetailWorkspaceView: View {
                                 isCurrent: otherFrameIndex == frameIndex,
                                 thumbnail: sessionModel.thumbnails[otherFrameIndex],
                                 orientationDegrees: sessionModel.frameOrientation(otherFrameIndex),
-                                mirrored: sessionModel.frameMirror(otherFrameIndex)
+                                mirrored: sessionModel.frameMirror(otherFrameIndex),
+                                verticallyMirrored: sessionModel.frameVerticalMirror(otherFrameIndex)
                             ) {
                                 sessionModel.openFrameDetail(otherFrameIndex)
                             }
@@ -1648,12 +1683,19 @@ private struct FilmstripTile: View {
     /// — see `ThumbnailTileImage.orientationDegrees`.
     let orientationDegrees: Int
     let mirrored: Bool
+    let verticallyMirrored: Bool
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             ZStack(alignment: .bottomLeading) {
-                ThumbnailTileImage(frameIndex: frameIndex, thumbnail: thumbnail, orientationDegrees: orientationDegrees, mirrored: mirrored)
+                ThumbnailTileImage(
+                    frameIndex: frameIndex,
+                    thumbnail: thumbnail,
+                    orientationDegrees: orientationDegrees,
+                    mirrored: mirrored,
+                    verticallyMirrored: verticallyMirrored
+                )
 
                 Text(String(format: "%02d", frameIndex))
                     .font(.system(size: 8, weight: .medium, design: .monospaced))
@@ -1661,7 +1703,10 @@ private struct FilmstripTile: View {
                     .padding(3)
                     .background(Color.black.opacity(0.64))
             }
-            .frame(width: 64, height: 44)
+            .frame(
+                width: swapsLayoutAxes ? 44 : 64,
+                height: swapsLayoutAxes ? 64 : 44
+            )
             .clipShape(RoundedRectangle(cornerRadius: 4))
             .overlay {
                 RoundedRectangle(cornerRadius: 4)
@@ -1682,7 +1727,14 @@ private struct FilmstripTile: View {
         if mirrored {
             label += ", mirrored horizontally"
         }
+        if verticallyMirrored {
+            label += ", mirrored vertically"
+        }
         return label
+    }
+
+    private var swapsLayoutAxes: Bool {
+        FrameOrientation.swapsLayoutAxes(orientationDegrees)
     }
 }
 

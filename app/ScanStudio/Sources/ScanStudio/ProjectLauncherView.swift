@@ -6,6 +6,11 @@ private enum LauncherTab: Hashable {
     case openRecent
 }
 
+enum ProjectLauncherPurpose: Equatable {
+    case manageProjects
+    case saveRollAndScan
+}
+
 /// New Project / Open Recent flow, presented as a sheet from
 /// `SessionSidebarView`. Takes the app's single `SessionModel` instance as
 /// an explicit `@Bindable` parameter (rather than `@Environment`) so this
@@ -16,6 +21,7 @@ struct ProjectLauncherView: View {
     @Bindable var session: SessionModel
     @Environment(\.dismiss) private var dismiss
 
+    let purpose: ProjectLauncherPurpose
     var onProjectSaved: (() -> Void)? = nil
 
     @State private var name = ""
@@ -23,9 +29,15 @@ struct ProjectLauncherView: View {
     @State private var selectedTab: LauncherTab = .newProject
     @State private var createAttemptError: String?
     @State private var openRecentAttemptError: String?
+    @State private var isSubmitting = false
 
-    init(session: SessionModel, onProjectSaved: (() -> Void)? = nil) {
+    init(
+        session: SessionModel,
+        purpose: ProjectLauncherPurpose = .manageProjects,
+        onProjectSaved: (() -> Void)? = nil
+    ) {
         self.session = session
+        self.purpose = purpose
         self.onProjectSaved = onProjectSaved
         let detectedCarrier = ProjectLaunchPolicy.initialCarrier(loadedCarrier: session.loadedCarrier)
         _carrier = State(initialValue: detectedCarrier)
@@ -33,25 +45,45 @@ struct ProjectLauncherView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $selectedTab) {
-                Text("New Project").tag(LauncherTab.newProject)
-                Text("Open Recent").tag(LauncherTab.openRecent)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding([.horizontal, .top])
-            .accessibilityLabel("Project launcher tab")
+            if purpose == .saveRollAndScan {
+                saveRollHeader
+                newProjectForm
+            } else {
+                Picker("", selection: $selectedTab) {
+                    Text("New Project").tag(LauncherTab.newProject)
+                    Text("Open Recent").tag(LauncherTab.openRecent)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding([.horizontal, .top])
+                .accessibilityLabel("Project launcher tab")
 
-            Group {
-                if selectedTab == .newProject {
-                    newProjectForm
-                } else {
-                    openRecentSection
+                Group {
+                    if selectedTab == .newProject {
+                        newProjectForm
+                    } else {
+                        openRecentSection
+                    }
                 }
             }
         }
         .frame(width: 420, height: 460)
         .padding(20)
+        .interactiveDismissDisabled(isSubmitting)
+    }
+
+    private var saveRollHeader: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Save Roll & Scan")
+                .font(.system(size: 20, weight: .semibold))
+            Text(saveRollGuidance)
+                .font(.system(size: 12))
+                .foregroundStyle(Color.scanStudioSecondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+        .padding(.top, 8)
     }
 
     private var newProjectForm: some View {
@@ -123,7 +155,7 @@ struct ProjectLauncherView: View {
                     .foregroundStyle(Color.scanStudioSecondaryText)
             }
 
-            Button("Create") {
+            Button(submitButtonTitle) {
                 Task {
                     guard let carrier,
                           let frameCount = confirmedFrameCount,
@@ -131,24 +163,49 @@ struct ProjectLauncherView: View {
                           registeredPreviewFrameCount != nil
                     else { return }
                     createAttemptError = nil
-                    await session.createProject(
-                        name: name,
-                        carrier: carrier,
-                        frameCount: frameCount,
-                        filmProcess: previewProcess
-                    )
-                    if session.lastErrorMessage == nil {
-                        onProjectSaved?()
+                    isSubmitting = true
+                    let completed: Bool
+                    switch purpose {
+                    case .manageProjects:
+                        await session.createProject(
+                            name: name,
+                            carrier: carrier,
+                            frameCount: frameCount,
+                            filmProcess: previewProcess
+                        )
+                        completed = session.lastErrorMessage == nil
+                    case .saveRollAndScan:
+                        completed = await session.saveRollAndScanSelectedFrames(
+                            name: name,
+                            carrier: carrier,
+                            frameCount: frameCount,
+                            filmProcess: previewProcess
+                        )
+                    }
+                    isSubmitting = false
+
+                    if completed {
+                        if purpose == .manageProjects {
+                            onProjectSaved?()
+                        }
+                        dismiss()
+                    } else if purpose == .saveRollAndScan,
+                              session.project != nil {
+                        // The roll is safely saved, but scan startup failed.
+                        // Return to the project and leave its error banner
+                        // intact; retrying project creation would be wrong.
                         dismiss()
                     } else {
                         // Curated title, not the raw `lastErrorMessage` --
                         // this sheet is the primary new-project flow, not a
                         // developer pane.
                         createAttemptError = session.errorPresentation?.title
+                            ?? "Couldn’t save this roll."
                     }
                 }
             }
-            .disabled(disabledReason != nil)
+            .disabled(disabledReason != nil || isSubmitting)
+            .keyboardShortcut(.defaultAction)
         }
         .padding(.top, 12)
     }
@@ -169,9 +226,45 @@ struct ProjectLauncherView: View {
         )
     }
 
+    private var selectedFrameCount: Int {
+        session.selectedFrameCount
+    }
+
+    private var selectedReviewCount: Int {
+        session.selectedFrames.filter { frameIndex in
+            session.thumbnails[frameIndex]?.needsApproval == true
+                && session.manualReviewDecision(for: frameIndex) != .useFrameAnyway
+        }.count
+    }
+
+    private var submitButtonTitle: String {
+        if isSubmitting {
+            return purpose == .saveRollAndScan ? "Saving Roll…" : "Creating…"
+        }
+        guard purpose == .saveRollAndScan else { return "Create" }
+        let noun = selectedFrameCount == 1 ? "Frame" : "Frames"
+        return selectedReviewCount > 0
+            ? "Save & Review \(selectedFrameCount) \(noun)"
+            : "Save & Scan \(selectedFrameCount) \(noun)"
+    }
+
+    private var saveRollGuidance: String {
+        let noun = selectedFrameCount == 1 ? "frame" : "frames"
+        if selectedReviewCount > 0 {
+            let reviewNoun = selectedReviewCount == 1
+                ? "boundary check"
+                : "boundary checks"
+            return "\(selectedReviewCount) of the \(selectedFrameCount) selected \(noun) need \(reviewNoun). Save the roll now; ScanStudio will show those reviews next, then scan the selection once."
+        }
+        return "The \(selectedFrameCount) selected \(noun) will start scanning as soon as this roll is saved."
+    }
+
     private var disabledReason: String? {
         if session.isJobActive || session.jobId != nil {
             return "Finish or stop the current scan before changing projects."
+        }
+        if purpose == .saveRollAndScan, selectedFrameCount == 0 {
+            return "Select at least one frame before saving and scanning."
         }
         return ProjectLaunchPolicy.createDisabledReason(
             name: name,

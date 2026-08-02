@@ -276,9 +276,17 @@ private struct ManualReviewScanSheet: View {
                 orientationDegrees: sessionModel.frameOrientation(
                     requirement.frameIndex
                 ),
-                mirrored: sessionModel.frameMirror(requirement.frameIndex)
+                mirrored: sessionModel.frameMirror(requirement.frameIndex),
+                verticallyMirrored: sessionModel.frameVerticalMirror(
+                    requirement.frameIndex
+                )
             )
-            .aspectRatio(3.0 / 2.0, contentMode: .fit)
+            .aspectRatio(
+                FrameOrientation.displayAspectRatio(
+                    sessionModel.frameOrientation(requirement.frameIndex)
+                ),
+                contentMode: .fit
+            )
             .frame(width: 190)
             .background(Color.black.opacity(0.35))
             .clipShape(
@@ -604,7 +612,10 @@ private struct PreProjectPreviewWorkspaceView: View {
         }
         .background(Color.scanStudioWorkspace)
         .sheet(isPresented: $isShowingProjectLauncher) {
-            ProjectLauncherView(session: sessionModel)
+            ProjectLauncherView(
+                session: sessionModel,
+                purpose: .saveRollAndScan
+            )
         }
         .sheet(item: $processPreviewToken) { token in
             RePreviewProcessSheet(session: sessionModel, intentToken: token)
@@ -632,7 +643,7 @@ private struct PreProjectPreviewWorkspaceView: View {
 
     private var calloutCopy: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("\(sessionModel.thumbnailCount) previews ready")
+            Text("\(sessionModel.thumbnailCount) previews ready · \(sessionModel.selectedFrameCount) selected")
                 .font(.system(size: 15, weight: .semibold))
             Text(calloutGuidance)
                 .font(.system(size: 11))
@@ -643,20 +654,20 @@ private struct PreProjectPreviewWorkspaceView: View {
     }
 
     private var unresolvedReviewCount: Int {
-        sessionModel.thumbnails.filter { entry in
-            entry.value.needsApproval
-                && sessionModel.manualReviewDecision(for: entry.key) == nil
+        sessionModel.selectedFrames.filter { frameIndex in
+            sessionModel.thumbnails[frameIndex]?.needsApproval == true
+                && sessionModel.manualReviewDecision(for: frameIndex) != .useFrameAnyway
         }.count
     }
 
     private var calloutGuidance: String {
         if unresolvedReviewCount == 1 {
-            return "One frame needs a boundary choice. Click its Review button to use it, skip it, or preview again."
+            return "One selected frame needs a boundary check. Save now; its review opens next, before any scan starts."
         }
         if unresolvedReviewCount > 1 {
-            return "\(unresolvedReviewCount) frames need boundary choices. Click each Review button to use it, skip it, or preview again."
+            return "\(unresolvedReviewCount) selected frames need boundary checks. Save now; those reviews open next, before any scan starts."
         }
-        return "Save Roll names this roll, creates its resumable project, sets up default output locations, and enables scanning."
+        return "Save once to name this roll and start scanning the selected frames."
     }
 
     private var calloutActions: some View {
@@ -670,13 +681,26 @@ private struct PreProjectPreviewWorkspaceView: View {
             Button {
                 isShowingProjectLauncher = true
             } label: {
-                Label("Save Roll…", systemImage: "folder.badge.plus")
+                Label(saveAndScanButtonLabel, systemImage: "folder.badge.plus")
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
             .foregroundStyle(.black)
             .controlSize(.regular)
+            .disabled(sessionModel.selectedFrameCount == 0)
+            .help(
+                sessionModel.selectedFrameCount == 0
+                    ? "Select at least one frame to scan."
+                    : "Save the roll and continue into review or scanning."
+            )
         }
+    }
+
+    private var saveAndScanButtonLabel: String {
+        let count = sessionModel.selectedFrameCount
+        return unresolvedReviewCount > 0
+            ? "Save & Review \(count)…"
+            : "Save & Scan \(count)…"
     }
 }
 
