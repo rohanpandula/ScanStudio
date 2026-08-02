@@ -101,7 +101,9 @@ public enum ErrorPresentationPolicy {
         Copy(
             code: "HW_MOTION_NOT_ARMED",
             title: "Scanner isn’t ready yet",
-            guidance: "Restart ScanStudio, check the scanner status, then try again."
+            // Matches HardwareMotionReadiness.guidance: a plain restart does
+            // not enable movement, so promising one is a dead end.
+            guidance: "Moving film has to be enabled when ScanStudio starts, and it was not this time. Starting it again the usual way will not change that."
         ),
         Copy(
             code: "NOT_CONNECTED",

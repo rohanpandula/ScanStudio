@@ -179,6 +179,26 @@ def _journal(
             },
             "wire_colors_raw_10ns": exposures,
         },
+        # Guarded nikon-parity is the RGB command authority; this fixture's
+        # parity solve happens to equal the active solve (legal, unclamped).
+        "active_exposure_authority": {
+            "rgb_source": "nikon-parity-guarded-v2",
+            "ir_source": "active-controller",
+            "commanded_channels_raw_10ns": {
+                "R": exposures["1"],
+                "G": exposures["2"],
+                "B": exposures["3"],
+                "IR": exposures["9"],
+            },
+            "active_controller_channels_raw_10ns": {
+                "R": exposures["1"],
+                "G": exposures["2"],
+                "B": exposures["3"],
+                "IR": exposures["9"],
+            },
+            "device_bound_clamped_channels_raw_10ns": {},
+            "device_exposure_bounds_raw_10ns": [50_000, 400_000],
+        },
     }
 
 
@@ -803,6 +823,28 @@ def test_smear_qc_receives_scanner_native_rgb_before_rotation(tmp_path: Path) ->
             ].__setitem__("9", 1),
             "exposure echo",
         ),
+        (
+            lambda journal: journal.__delitem__("active_exposure_authority"),
+            "parity authority",
+        ),
+        (
+            lambda journal: journal["active_exposure_authority"][
+                "commanded_channels_raw_10ns"
+            ].__setitem__("G", 1),
+            "parity authority",
+        ),
+        (
+            lambda journal: journal["active_exposure_authority"][
+                "active_controller_channels_raw_10ns"
+            ].__setitem__("R", 1),
+            "parity authority",
+        ),
+        (
+            lambda journal: journal["meter_controller_final_result"][
+                "final_exposures_raw_10ns"
+            ].__setitem__("IR", 1),
+            "parity authority",
+        ),
     ],
 )
 def test_invalid_worker_journal_retains_scratch_and_commits_nothing(
@@ -823,6 +865,49 @@ def test_invalid_worker_journal_retains_scratch_and_commits_nothing(
     final_dir = attempt.directory / "final"
     if final_dir.exists():
         assert not list(final_dir.glob("*.tif"))
+
+
+def test_parity_commanded_exposures_differing_from_active_solve_finalize(
+    tmp_path: Path,
+) -> None:
+    """The real armed state: guarded parity RGB commands differ from the
+    active controller's solve (IR identical), bound through the authority
+    record. Finalization must accept this — it is the shipping default."""
+
+    attempt, _stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    active = dict(
+        journal["meter_controller_final_result"]["final_exposures_raw_10ns"]
+    )
+    # Parity commanded ~10% above the active solve on RGB, IR untouched, and
+    # the wire echo (fine windows + preflight + accepted contract) carries
+    # the commanded values, exactly as the worker writes them.
+    commanded = {
+        "R": active["R"] + 10_000,
+        "G": active["G"] + 30_000,
+        "B": active["B"] + 33_000,
+        "IR": active["IR"],
+    }
+    wire = {"1": commanded["R"], "2": commanded["G"], "3": commanded["B"], "9": commanded["IR"]}
+    journal["meter_final_exposures"] = {
+        "controller_channels_raw_10ns": dict(commanded),
+        "wire_colors_raw_10ns": dict(wire),
+    }
+    journal["active_exposure_authority"]["commanded_channels_raw_10ns"] = dict(commanded)
+    journal["active_exposure_authority"]["active_controller_channels_raw_10ns"] = dict(active)
+    for windows_key in ("fine_set_windows_preflight", "fine_windows"):
+        for window in journal[windows_key]:
+            window["exposure_raw_10ns"] = wire[str(window["color_id"])]
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    result = _workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    accepted = manifest["exposure_evidence"]["accepted_contract"]
+    assert accepted["controller_channels_raw_10ns"] == commanded
+    authority = manifest["exposure_evidence"]["active_exposure_authority"]
+    assert authority["commanded_channels_raw_10ns"] == commanded
+    assert authority["active_controller_channels_raw_10ns"] == active
 
 
 def test_stream_hash_mismatch_retains_scratch_before_decode(tmp_path: Path) -> None:

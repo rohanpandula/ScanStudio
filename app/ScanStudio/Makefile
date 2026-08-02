@@ -1,4 +1,4 @@
-.PHONY: engine app package package-check test run smoke launcher-check parity render-color-candidates render-geometry-candidates render-ice-candidates clean check-cargo check-swift check-tools
+.PHONY: engine app package package-check dmg test run smoke launcher-check parity render-color-candidates render-geometry-candidates render-ice-candidates clean check-cargo check-swift check-tools
 
 # Tool paths are discovered from the caller's PATH. Override CARGO or SWIFT
 # explicitly when using a non-standard toolchain installation.
@@ -38,6 +38,12 @@ package: check-tools
 # It never opens a scanner, enables motion, or writes the armed latch.
 package-check:
 	./scripts/test_packaged_bridge.sh .build/ScanStudio.app
+
+# Builds the self-contained app, verifies it, creates a compressed DMG, mounts
+# that image read-only, and repeats the relocation-safe bridge check from the
+# mounted release artifact.
+dmg: package
+	./scripts/package_dmg.sh
 
 # Both suites must pass: the Rust engine's own cargo tests, then the Swift
 # package's tests (fixture decoding, line framing, unknown-event tolerance,

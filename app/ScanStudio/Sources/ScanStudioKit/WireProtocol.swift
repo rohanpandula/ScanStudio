@@ -605,11 +605,31 @@ public struct OutputRecipe: Codable, Equatable, Sendable {
     public let archive: ArchiveRecipe
     public let positive: PositiveRecipe
     public let preview: PreviewRecipe
+    /// Non-destructive scan-time auto-crop of derived outputs; the archive
+    /// master is never cropped. Missing key keeps older projects and engines
+    /// on their historic uncropped behavior. Mirrors
+    /// `domain.rs::OutputRecipe.auto_crop`.
+    public let autoCrop: Bool
 
-    public init(archive: ArchiveRecipe, positive: PositiveRecipe, preview: PreviewRecipe) {
+    public init(
+        archive: ArchiveRecipe,
+        positive: PositiveRecipe,
+        preview: PreviewRecipe,
+        autoCrop: Bool = false
+    ) {
         self.archive = archive
         self.positive = positive
         self.preview = preview
+        self.autoCrop = autoCrop
+    }
+
+    private enum CodingKeys: String, CodingKey { case archive, positive, preview, autoCrop }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        archive = try values.decode(ArchiveRecipe.self, forKey: .archive)
+        positive = try values.decode(PositiveRecipe.self, forKey: .positive)
+        preview = try values.decode(PreviewRecipe.self, forKey: .preview)
+        autoCrop = try values.decodeIfPresent(Bool.self, forKey: .autoCrop) ?? false
     }
 }
 

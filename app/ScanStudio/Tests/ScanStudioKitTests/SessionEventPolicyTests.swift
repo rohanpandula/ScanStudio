@@ -8,6 +8,17 @@ private enum ProjectFlowStubError: Error {
     case unexpectedResultType
 }
 
+private struct EventEnvelopeFixture<Payload: Encodable>: Encodable {
+    let event: String
+    let payload: Payload
+}
+
+private struct FrameCompletedPayloadFixture: Encodable {
+    let jobId: String
+    let frameIndex: Int
+    let receipt: ScanReceipt
+}
+
 private actor ProjectFlowEngineStub: EngineClientProtocol {
     nonisolated let events: AsyncStream<EngineEvent>
     var engineVersion: String? = "project-flow-stub"
@@ -27,7 +38,95 @@ private actor ProjectFlowEngineStub: EngineClientProtocol {
         case "scanner.list": value = ScannerListResult(devices: [])
         case "project.create": value = ProjectCreateResult(project: project, directory: "/tmp/positive-roll")
         case "project.open": value = ProjectOpenResult(project: project, directory: "/tmp/positive-roll")
+        case "sim.loadMedia":
+            value = ScannerStatus(
+                connected: true,
+                adapter: "SA-21 (simulated)",
+                mediaLoaded: true,
+                carrier: "strip6",
+                frameCount: 6,
+                lamp: "stable",
+                transport: "idle",
+                activeJobId: nil
+            )
         default: throw ProjectFlowStubError.unexpectedMethod(method)
+        }
+        guard let result = value as? Result else {
+            throw ProjectFlowStubError.unexpectedResultType
+        }
+        return result
+    }
+}
+
+private actor SequencedProjectFlowEngineStub: EngineClientProtocol {
+    nonisolated let events: AsyncStream<EngineEvent>
+    var engineVersion: String? = "sequenced-project-flow-stub"
+    private var projects: [ScanProject]
+
+    init(projects: [ScanProject]) {
+        self.projects = projects
+        self.events = AsyncStream { _ in }
+    }
+
+    func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
+        _ method: String,
+        params: Params
+    ) async throws -> Result {
+        let value: any Sendable
+        switch method {
+        case "scanner.list":
+            value = ScannerListResult(devices: [])
+        case "project.create":
+            guard !projects.isEmpty else {
+                throw ProjectFlowStubError.unexpectedMethod(
+                    "project.create with an exhausted fixture queue"
+                )
+            }
+            let project = projects.removeFirst()
+            value = ProjectCreateResult(
+                project: project,
+                directory: "/tmp/\(project.id)"
+            )
+        case "project.open":
+            guard !projects.isEmpty else {
+                throw ProjectFlowStubError.unexpectedMethod(
+                    "project.open with an exhausted fixture queue"
+                )
+            }
+            let project = projects.removeFirst()
+            value = ProjectOpenResult(
+                project: project,
+                directory: "/tmp/\(project.id)"
+            )
+        case "project.analyzeFrameDefects":
+            value = AnalyzeFrameDefectsResult(
+                frameIndex: 2,
+                defects: [],
+                simulated: true,
+                digitalIceEnabled: true,
+                transportSmearFlagged: false,
+                transportSmearReason: nil
+            )
+        case "project.previewMetadataCommand":
+            value = PreviewMetadataCommandResult(
+                available: true,
+                exiftoolPath: "/usr/bin/exiftool",
+                targets: ["/tmp/first-project/Preview_0002.jpg"],
+                arguments: ["-Title=First Project"]
+            )
+        case "sim.loadMedia":
+            value = ScannerStatus(
+                connected: true,
+                adapter: "SA-21 (simulated)",
+                mediaLoaded: true,
+                carrier: "strip6",
+                frameCount: 6,
+                lamp: "stable",
+                transport: "idle",
+                activeJobId: nil
+            )
+        default:
+            throw ProjectFlowStubError.unexpectedMethod(method)
         }
         guard let result = value as? Result else {
             throw ProjectFlowStubError.unexpectedResultType
@@ -1060,6 +1159,448 @@ struct SessionEventPolicyTests {
         )
     }
 
+    private func projectLifecycleFixture(
+        id: String,
+        completedFrames: Set<Int>
+    ) throws -> ScanProject {
+        let frames = try (1...6).map { frameIndex in
+            ProjectFrame(
+                index: frameIndex,
+                excluded: false,
+                receipts: completedFrames.contains(frameIndex)
+                    ? [try fixtureReceipt(
+                        jobId: "persisted-\(id)",
+                        frameIndex: frameIndex
+                    )]
+                    : []
+            )
+        }
+        return ScanProject(
+            schemaVersion: 1,
+            id: id,
+            name: id,
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive,
+            recipes: OutputRecipe(
+                archive: ArchiveRecipe(
+                    filenameTemplate: "Archive_####",
+                    destination: "/tmp/\(id)/Archive"
+                ),
+                positive: PositiveRecipe(
+                    enabled: true,
+                    fileFormat: .tiff,
+                    colorProfile: .adobeRgb1998,
+                    filenameTemplate: "Positive_####",
+                    destination: "/tmp/\(id)/Positive"
+                ),
+                preview: PreviewRecipe(
+                    enabled: true,
+                    fileFormat: .jpeg,
+                    maxLongEdgePx: 1_024,
+                    filenameTemplate: "Preview_####",
+                    destination: "/tmp/\(id)/Preview"
+                )
+            ),
+            rollMetadata: MetadataSet(),
+            createdAt: "2026-07-29T00:00:00Z",
+            frames: frames
+        )
+    }
+
+    private func fixtureReceipt(
+        jobId: String,
+        frameIndex: Int
+    ) throws -> ScanReceipt {
+        try JSONDecoder().decode(
+            ScanReceipt.self,
+            from: Data(
+                """
+                {
+                  "jobId":"\(jobId)",
+                  "frameIndex":\(frameIndex),
+                  "startedAt":"2026-07-29T00:00:00Z",
+                  "durationMs":100,
+                  "passes":1,
+                  "resolutionDpi":4000,
+                  "bitDepth":16,
+                  "channels":"rgb",
+                  "engineVersion":"0.1.0",
+                  "deviceId":"sim-ls5000-0",
+                  "simulated":true,
+                  "settingsFingerprint":"fixture-\(frameIndex)"
+                }
+                """.utf8
+            )
+        )
+    }
+
+    private func completedFrameEvent(
+        jobId: String,
+        frameIndex: Int
+    ) throws -> EngineEvent {
+        let receipt = try fixtureReceipt(jobId: jobId, frameIndex: frameIndex)
+        let payload = FrameCompletedPayloadFixture(
+            jobId: jobId,
+            frameIndex: frameIndex,
+            receipt: receipt
+        )
+        return EngineEvent(
+            name: "scan.frameCompleted",
+            rawLine: try JSONEncoder().encode(
+                EventEnvelopeFixture(
+                    event: "scan.frameCompleted",
+                    payload: payload
+                )
+            )
+        )
+    }
+
+    @Test("project changes clear the previous selection and last-batch state while new jobs retain other persisted completions")
+    @MainActor
+    func projectChangesIsolateSessionStateAndJobsPreservePriorReceipts() async throws {
+        let first = try projectLifecycleFixture(
+            id: "first-project",
+            completedFrames: [4]
+        )
+        let second = try projectLifecycleFixture(
+            id: "second-project",
+            completedFrames: []
+        )
+        let model = SessionModel(
+            engineClient: SequencedProjectFlowEngineStub(
+                projects: [first, second]
+            )
+        )
+
+        await model.loadCarrier(.strip6)
+        await model.createProject(
+            name: first.name,
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+        #expect(model.pendingFrames == [1, 2, 3, 5, 6])
+        #expect(model.completedFrameCount == 1)
+        model.toggleFrameSelection(2)
+        model.beginJob(id: "live-job", frames: [2])
+
+        #expect(model.frameStates[4] == .completed)
+        #expect(model.frameStates[2] == nil)
+        #expect(model.pendingFrames == [1, 2, 3, 5, 6])
+        #expect(model.completedFrameCount == 1)
+
+        model.handle(
+            event: try completedFrameEvent(jobId: "live-job", frameIndex: 2)
+        )
+        #expect(model.pendingFrames == [1, 3, 5, 6])
+        #expect(model.completedFrameCount == 2)
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                #"{"event":"scan.completed","payload":{"jobId":"live-job","summary":{"completed":[2],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
+            )
+        ))
+        #expect(model.receiptCount == 1)
+        #expect(model.scanSummary != nil)
+        #expect(model.frameStates[4] == .completed)
+
+        await model.createProject(
+            name: second.name,
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+
+        #expect(model.project?.id == second.id)
+        #expect(model.selectedFrameIndices.isEmpty)
+        #expect(model.receipts.isEmpty)
+        #expect(model.scanSummary == nil)
+        #expect(model.frameStates.isEmpty)
+        #expect(model.pendingFrames == [1, 2, 3, 4, 5, 6])
+        #expect(model.completedFrameCount == 0)
+    }
+
+    @Test("opening another project clears every project-scoped audit surface before restoring its receipts")
+    @MainActor
+    func openProjectClearsAllProjectScopedAuditState() async throws {
+        let first = try projectLifecycleFixture(
+            id: "first-project",
+            completedFrames: [4]
+        )
+        let second = try projectLifecycleFixture(
+            id: "second-project",
+            completedFrames: [6]
+        )
+        let model = SessionModel(
+            engineClient: SequencedProjectFlowEngineStub(
+                projects: [first, second]
+            )
+        )
+
+        await model.loadCarrier(.strip6)
+        await model.createProject(
+            name: first.name,
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+        model.toggleFrameSelection(2)
+        model.openFrameDetail(2)
+        await model.analyzeFrameDefects(2)
+        await model.previewMetadataCommand(2)
+        model.beginJob(id: "first-live-job", frames: [2])
+        model.handle(event: EngineEvent(
+            name: "scan.progress",
+            rawLine: Data(
+                #"{"event":"scan.progress","payload":{"jobId":"first-live-job","frameIndex":2,"frameOrdinal":1,"totalFrames":1,"pass":1,"totalPasses":1,"framePercent":50,"jobPercent":50,"etaSeconds":1}}"#.utf8
+            )
+        ))
+        model.handle(event: EngineEvent(
+            name: "scan.frameState",
+            rawLine: Data(
+                #"{"event":"scan.frameState","payload":{"jobId":"first-live-job","frameIndex":2,"state":"failed","attempt":1,"error":{"code":"FEED_JAM","message":"fixture failure","recoverable":true}}}"#.utf8
+            )
+        ))
+        model.handle(
+            event: try completedFrameEvent(
+                jobId: "first-live-job",
+                frameIndex: 2
+            )
+        )
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                #"{"event":"scan.completed","payload":{"jobId":"first-live-job","summary":{"completed":[2],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
+            )
+        ))
+        await model.scanSingleFrame(99)
+
+        #expect(model.selectedFrameIndices == [2])
+        #expect(!model.receipts.isEmpty)
+        #expect(model.jobState != nil)
+        #expect(model.progress != nil)
+        #expect(model.scanSummary != nil)
+        #expect(!model.frameErrors.isEmpty)
+        #expect(model.lastErrorMessage != nil)
+        #expect(model.frameDefects[2] != nil)
+        #expect(model.metadataPreview != nil)
+        #expect(model.detailFrameIndex == 2)
+
+        await model.openProject(directory: "/tmp/second-project")
+
+        #expect(model.project?.id == second.id)
+        #expect(model.selectedFrameIndices.isEmpty)
+        #expect(model.receipts.isEmpty)
+        #expect(model.jobId == nil)
+        #expect(model.jobState == nil)
+        #expect(model.progress == nil)
+        #expect(model.scanSummary == nil)
+        #expect(model.frameErrors.isEmpty)
+        #expect(model.lastErrorMessage == nil)
+        #expect(model.errorPresentation == nil)
+        #expect(model.frameDefects.isEmpty)
+        #expect(model.metadataPreview == nil)
+        #expect(model.detailFrameIndex == nil)
+        #expect(model.frameStates == [6: .completed])
+        #expect(model.pendingFrames == [1, 2, 3, 4, 5])
+        #expect(model.completedFrameCount == 1)
+    }
+
+    @Test("loading a carrier after reopening a partial project preserves durable completion and exposes resume immediately")
+    @MainActor
+    func mediaLoadPreservesReopenedProjectProgress() async throws {
+        let partial = try projectLifecycleFixture(
+            id: "partial-project",
+            completedFrames: [4, 5, 6]
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: partial)
+        )
+
+        await model.openProject(directory: "/tmp/partial-project")
+        #expect(model.pendingFrames == [1, 2, 3])
+        #expect(model.completedFrameCount == 3)
+        #expect(
+            ResumeBatchPolicy.shouldShowResumeBatch(
+                completedCount: model.completedFrameCount,
+                pendingCount: model.pendingFrameCount
+            )
+        )
+
+        await model.loadCarrier(.strip6)
+
+        #expect(model.frameStates[4] == .completed)
+        #expect(model.frameStates[5] == .completed)
+        #expect(model.frameStates[6] == .completed)
+        #expect(model.pendingFrames == [1, 2, 3])
+        #expect(model.completedFrameCount == 3)
+    }
+
+    @Test("project lifecycle changes are rejected until an active scan reaches its terminal completion")
+    @MainActor
+    func projectChangesAreBlockedDuringActiveScan() async throws {
+        let first = try projectLifecycleFixture(
+            id: "first-project",
+            completedFrames: [4]
+        )
+        let second = try projectLifecycleFixture(
+            id: "second-project",
+            completedFrames: []
+        )
+        let model = SessionModel(
+            engineClient: SequencedProjectFlowEngineStub(
+                projects: [first, second]
+            )
+        )
+
+        await model.createProject(
+            name: first.name,
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+        model.beginJob(id: "active-job", frames: [2])
+
+        await model.openProject(directory: "/tmp/second-project")
+
+        #expect(model.project?.id == first.id)
+        #expect(model.jobId == "active-job")
+        #expect(model.isJobActive)
+        #expect(
+            model.lastErrorMessage
+                == "A scan is still in progress. Wait for it to finish or stop it before changing projects."
+        )
+
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                #"{"event":"scan.completed","payload":{"jobId":"active-job","summary":{"completed":[],"failed":[],"skipped":[],"stopped":true}}}"#.utf8
+            )
+        ))
+        await model.openProject(directory: "/tmp/second-project")
+
+        #expect(model.project?.id == second.id)
+        #expect(model.jobId == nil)
+    }
+
+    @Test(
+        "a completed frame stays durably completed when its re-scan stops or fails before a replacement receipt",
+        arguments: [
+            (failed: false, stopped: true),
+            (failed: true, stopped: false),
+        ]
+    )
+    @MainActor
+    func rescanWithoutReceiptPreservesDurableCompletion(
+        failed: Bool,
+        stopped: Bool
+    ) async throws {
+        let partial = try projectLifecycleFixture(
+            id: "partial-project",
+            completedFrames: [4]
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: partial)
+        )
+
+        await model.openProject(directory: "/tmp/partial-project")
+        model.beginJob(id: "rescan-job", frames: [4])
+        model.handle(event: EngineEvent(
+            name: "scan.frameState",
+            rawLine: Data(
+                #"{"event":"scan.frameState","payload":{"jobId":"rescan-job","frameIndex":4,"state":"active","attempt":1}}"#.utf8
+            )
+        ))
+        if failed {
+            model.handle(event: EngineEvent(
+                name: "scan.frameState",
+                rawLine: Data(
+                    #"{"event":"scan.frameState","payload":{"jobId":"rescan-job","frameIndex":4,"state":"failed","attempt":1,"error":{"code":"CAPTURE_FAILED","message":"fixture failure","recoverable":true}}}"#.utf8
+                )
+            ))
+        }
+
+        #expect(model.frameStates[4] == (failed ? .failed : .active))
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                """
+                {"event":"scan.completed","payload":{"jobId":"rescan-job","summary":{"completed":[],"failed":\(failed ? "[4]" : "[]"),"skipped":[],"stopped":\(stopped)}}}
+                """.utf8
+            )
+        ))
+
+        #expect(model.frameStates[4] == .completed)
+        #expect(model.completedFrameCount == 1)
+        #expect(!model.pendingFrames.contains(4))
+        #expect(model.receipts.isEmpty)
+    }
+
+    @Test(
+        "a receipt earned live this session stays durable when the same frame's next attempt stops or fails",
+        arguments: [
+            (failed: false, stopped: true),
+            (failed: true, stopped: false),
+        ]
+    )
+    @MainActor
+    func liveReceiptSurvivesLaterRescanWithoutReceipt(
+        failed: Bool,
+        stopped: Bool
+    ) async throws {
+        let fresh = try projectLifecycleFixture(
+            id: "fresh-project",
+            completedFrames: []
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: fresh)
+        )
+
+        await model.openProject(directory: "/tmp/fresh-project")
+        model.beginJob(id: "first-job", frames: [4])
+        model.handle(
+            event: try completedFrameEvent(jobId: "first-job", frameIndex: 4)
+        )
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                #"{"event":"scan.completed","payload":{"jobId":"first-job","summary":{"completed":[4],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
+            )
+        ))
+        #expect(model.frameStates[4] == .completed)
+        #expect(model.completedFrameCount == 1)
+
+        model.beginJob(id: "rescan-job", frames: [4])
+        model.handle(event: EngineEvent(
+            name: "scan.frameState",
+            rawLine: Data(
+                #"{"event":"scan.frameState","payload":{"jobId":"rescan-job","frameIndex":4,"state":"active","attempt":1}}"#.utf8
+            )
+        ))
+        if failed {
+            model.handle(event: EngineEvent(
+                name: "scan.frameState",
+                rawLine: Data(
+                    #"{"event":"scan.frameState","payload":{"jobId":"rescan-job","frameIndex":4,"state":"failed","attempt":1,"error":{"code":"CAPTURE_FAILED","message":"fixture failure","recoverable":true}}}"#.utf8
+                )
+            ))
+        }
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                """
+                {"event":"scan.completed","payload":{"jobId":"rescan-job","summary":{"completed":[],"failed":\(failed ? "[4]" : "[]"),"skipped":[],"stopped":\(stopped)}}}
+                """.utf8
+            )
+        ))
+
+        #expect(model.frameStates[4] == .completed)
+        #expect(model.completedFrameCount == 1)
+        #expect(!model.pendingFrames.contains(4))
+        #expect(model.receiptCount == 0)
+    }
+
     @Test("a synchronous preview request failure never establishes a film process")
     @MainActor
     func synchronousPreviewFailureClearsPendingProcess() async {
@@ -1533,6 +2074,22 @@ struct SessionEventPolicyTests {
                 destination: "/Scans/Preview"
             )
         ))
+        await client.terminate()
+    }
+
+    @Test("the auto-crop toggle flows into the roll-wide output recipe")
+    @MainActor
+    func autoCropToggleFlowsIntoOutputRecipe() async throws {
+        let client = try EngineClient(engineURL: URL(fileURLWithPath: "/bin/cat"))
+        let model = SessionModel(engineClient: client)
+
+        #expect(!model.outputRecipe.autoCrop, "auto-crop is off by default")
+
+        model.setAutoCropEnabled(true)
+        #expect(model.outputRecipe.autoCrop)
+
+        model.setAutoCropEnabled(false)
+        #expect(!model.outputRecipe.autoCrop)
         await client.terminate()
     }
 

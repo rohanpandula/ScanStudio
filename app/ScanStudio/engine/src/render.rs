@@ -55,6 +55,84 @@ pub fn resolve_aligned_crop(
     (shifted_top, shifted_bottom, new_height)
 }
 
+/// Detects one frame's film ROI on its raw archive raster (stored
+/// orientation) using the parity-proven NegPy AUTO_FRAME_EDGE port and the
+/// exact parameters validated by the parity harness. Detection only reads
+/// the buffer; a degenerate or out-of-bounds result fails open to the full
+/// derivative and is recorded in the receipt.
+fn detect_auto_crop(
+    raw: &[[f64; 3]],
+    width: u32,
+    height: u32,
+) -> domain::AutoCropOutcome {
+    let pixels: Vec<[f32; 3]> = raw
+        .iter()
+        .map(|pixel| [pixel[0] as f32, pixel[1] as f32, pixel[2] as f32])
+        .collect();
+    let image = crate::processing::geometry::GeometryImage { width, height, pixels };
+    let roi = crate::processing::geometry::autocrop_roi(
+        &image,
+        crate::processing::geometry::AutocropMode::Image,
+        0,
+        1.0,
+        "3:2",
+        crate::processing::geometry::AUTOCROP_DETECT_RES,
+        None,
+    );
+    let usable = roi.y1 < roi.y2 && roi.x1 < roi.x2 && roi.y2 <= height && roi.x2 <= width;
+    if usable {
+        domain::AutoCropOutcome {
+            mode: "image".to_string(),
+            applied: true,
+            roi: Some(domain::AutoCropRoi { y1: roi.y1, y2: roi.y2, x1: roi.x1, x2: roi.x2 }),
+            source_width: width,
+            source_height: height,
+            reason: None,
+        }
+    } else {
+        domain::AutoCropOutcome {
+            mode: "image".to_string(),
+            applied: false,
+            roi: None,
+            source_width: width,
+            source_height: height,
+            reason: Some(format!(
+                "detected ROI y{}..{} x{}..{} is not a usable region of the {}x{} raster; derivatives left uncropped",
+                roi.y1, roi.y2, roi.x1, roi.x2, width, height
+            )),
+        }
+    }
+}
+
+fn auto_crop_deferred_to_alignment(width: u32, height: u32) -> domain::AutoCropOutcome {
+    domain::AutoCropOutcome {
+        mode: "image".to_string(),
+        applied: false,
+        roi: None,
+        source_width: width,
+        source_height: height,
+        reason: Some(
+            "approved manual frame alignment supersedes auto-crop for this frame".to_string(),
+        ),
+    }
+}
+
+/// Extracts a half-open ROI from a row-major `[0,1]` float buffer.
+fn crop_to_roi(
+    buffer: &[[f64; 3]],
+    width: u32,
+    roi: &domain::AutoCropRoi,
+) -> (Vec<[f64; 3]>, u32, u32) {
+    let new_width = roi.x2 - roi.x1;
+    let new_height = roi.y2 - roi.y1;
+    let mut cropped = Vec::with_capacity((new_width as usize) * (new_height as usize));
+    for row in roi.y1..roi.y2 {
+        let start = (row * width + roi.x1) as usize;
+        cropped.extend_from_slice(&buffer[start..start + new_width as usize]);
+    }
+    (cropped, new_width, new_height)
+}
+
 /// Applies an approved vertical crop to a row-major `[0,1]` float buffer.
 /// Unapproved alignments and missing boundaries are treated as no-ops:
 /// the full buffer is returned unchanged. This is the render-side half of
@@ -1921,6 +1999,7 @@ pub fn render_derivative_from_archive_with_processing(
             positive_path: None,
             preview_path: None,
             nikonlook: None,
+            auto_crop: None,
         });
     }
 
@@ -1991,6 +2070,19 @@ pub fn render_derivative_from_archive_with_processing(
         .collect();
     drop(raw_image);
 
+    // Detection reads the raw archive domain. An approved manual alignment
+    // owns the crop, so detection is skipped rather than merely ignored.
+    let alignment_owns_crop = alignment.is_some_and(|value| value.approved);
+    let auto_crop_outcome = if recipes.auto_crop {
+        if alignment_owns_crop {
+            Some(auto_crop_deferred_to_alignment(width, height))
+        } else {
+            Some(detect_auto_crop(&raw_linear, width, height))
+        }
+    } else {
+        None
+    };
+
     let (positive_full, nikonlook) =
         render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?;
     drop(raw_linear);
@@ -2006,7 +2098,13 @@ pub fn render_derivative_from_archive_with_processing(
         Some(value) if value.approved => {
             apply_alignment_crop(&positive_full, width, height, detected_boundary, Some(value))
         }
-        _ => (positive_full, width, height),
+        _ => match &auto_crop_outcome {
+            Some(outcome) if outcome.applied => {
+                let roi = outcome.roi.as_ref().expect("applied auto-crop outcome carries its ROI");
+                crop_to_roi(&positive_full, width, roi)
+            }
+            _ => (positive_full, width, height),
+        },
     };
 
     let archive_path = recipes.archive.enabled.then(|| archive_rgb_path.to_path_buf());
@@ -2060,6 +2158,7 @@ pub fn render_derivative_from_archive_with_processing(
         positive_path,
         preview_path,
         nikonlook,
+        auto_crop: auto_crop_outcome,
     })
 }
 
@@ -2416,6 +2515,9 @@ pub struct WrittenPaths {
     /// positive/preview was rendered this call, or the rendered frame
     /// wasn't C41.
     pub nikonlook: Option<domain::NikonlookProvenance>,
+    /// Scan-time non-destructive auto-crop decision. `None` when the recipe
+    /// did not request auto-crop or no derivative rendered.
+    pub auto_crop: Option<domain::AutoCropOutcome>,
 }
 
 /// Renders one frame's deterministic simulated pixel data and writes the
@@ -2469,8 +2571,16 @@ pub fn render_and_write_frame_with_processing(
     let mut positive_path: Option<std::path::PathBuf> = None;
     let mut preview_path: Option<std::path::PathBuf> = None;
     let mut nikonlook_provenance: Option<domain::NikonlookProvenance> = None;
+    let mut auto_crop_outcome: Option<domain::AutoCropOutcome> = None;
 
     if recipes.positive.enabled || recipes.preview.enabled {
+        if recipes.auto_crop {
+            auto_crop_outcome = Some(if alignment.is_some_and(|value| value.approved) {
+                auto_crop_deferred_to_alignment(width, height)
+            } else {
+                detect_auto_crop(&raw, width, height)
+            });
+        }
         // Computed once -- both derivatives share it rather than each
         // calling render_positive (and thus reloading/re-estimating
         // nikonlook) independently. The simulator has no hardware exposure
@@ -2485,8 +2595,13 @@ pub fn render_and_write_frame_with_processing(
         } else {
             positive_raw_full
         };
-        let (positive_raw, positive_width, positive_height) =
-            apply_alignment_crop(&positive_raw_full, width, height, detected_boundary, alignment);
+        let (positive_raw, positive_width, positive_height) = match &auto_crop_outcome {
+            Some(outcome) if outcome.applied => {
+                let roi = outcome.roi.as_ref().expect("applied auto-crop outcome carries its ROI");
+                crop_to_roi(&positive_raw_full, width, roi)
+            }
+            _ => apply_alignment_crop(&positive_raw_full, width, height, detected_boundary, alignment),
+        };
 
         if recipes.positive.enabled {
             let path = preflight_positive_path.clone().expect("enabled positive has preflight path");
@@ -2524,6 +2639,7 @@ pub fn render_and_write_frame_with_processing(
         positive_path,
         preview_path,
         nikonlook: nikonlook_provenance,
+        auto_crop: auto_crop_outcome,
     })
 }
 
@@ -3502,6 +3618,141 @@ mod tests {
         assert_eq!(malformed_provenance.layer_a_path, domain::NikonlookLayerAPath::Blind);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_autocrop_pattern_archive(path: &std::path::Path) -> (u32, u32) {
+        let width = 480u32;
+        let height = 320u32;
+        let mut raw = vec![[0.95f64; 3]; (width * height) as usize];
+        for y in 40..280u32 {
+            for x in 40..440u32 {
+                raw[(y * width + x) as usize] = [0.55; 3];
+            }
+        }
+        for y in 58..262u32 {
+            for x in 58..422u32 {
+                let base = 0.15
+                    + 0.20 * ((x - 58) as f64 / (422 - 58) as f64)
+                    + 0.025 * ((y as f64) * 0.3).sin()
+                    + 0.05;
+                raw[(y * width + x) as usize] = [base * 0.8, base * 0.9, base];
+            }
+        }
+        write_tiff_create_only(path, &raw, width, height, 16).expect("write autocrop archive");
+        (width, height)
+    }
+
+    #[test]
+    fn real_auto_crop_crops_derivatives_reports_roi_and_preserves_archive() {
+        let dir = unique_test_dir();
+        let archive_path = dir.join("Archive").join("Archive_0001.tif");
+        let (width, height) = write_autocrop_pattern_archive(&archive_path);
+        let archive_before = std::fs::read(&archive_path).unwrap();
+
+        let mut recipes = domain::OutputRecipe::default();
+        recipes.auto_crop = true;
+        recipes.positive.destination = dir.join("Positive").display().to_string();
+        recipes.positive.file_format = domain::OutputFileFormat::Tiff;
+        recipes.preview.destination = dir.join("Preview").display().to_string();
+        recipes.preview.file_format = domain::OutputFileFormat::Tiff;
+        recipes.preview.max_long_edge_px = 100;
+
+        let written = render_derivative_from_archive(
+            &archive_path,
+            1,
+            domain::FilmProcess::Positive,
+            &recipes,
+            Some(STORAGE_TRANSFORM_SWAPAXES01),
+            None,
+            None,
+            None,
+        )
+        .expect("auto-cropped derivatives render");
+
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_before);
+        let outcome = written.auto_crop.expect("auto-crop outcome");
+        assert!(outcome.applied);
+        assert_eq!((outcome.source_width, outcome.source_height), (width, height));
+        let roi = outcome.roi.expect("applied outcome carries ROI");
+        assert!(roi.y1 > 0 && roi.x1 > 0 && roi.y2 < height && roi.x2 < width);
+
+        let positive = image_io::read_rgb16(written.positive_path.as_ref().unwrap()).unwrap();
+        assert_eq!((positive.width, positive.height), (roi.x2 - roi.x1, roi.y2 - roi.y1));
+        let preview = image_io::read_rgb16(written.preview_path.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            (preview.width, preview.height),
+            downsample_dimensions(roi.x2 - roi.x1, roi.y2 - roi.y1, 100)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_auto_crop_off_keeps_full_frame_and_reports_nothing() {
+        let dir = unique_test_dir();
+        let archive_path = dir.join("Archive").join("Archive_0001.tif");
+        let (width, height) = write_autocrop_pattern_archive(&archive_path);
+        let mut recipes = domain::OutputRecipe::default();
+        recipes.positive.destination = dir.join("Positive").display().to_string();
+        recipes.positive.file_format = domain::OutputFileFormat::Tiff;
+        recipes.preview.enabled = false;
+
+        let written = render_derivative_from_archive(
+            &archive_path,
+            1,
+            domain::FilmProcess::Positive,
+            &recipes,
+            Some(STORAGE_TRANSFORM_SWAPAXES01),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(written.auto_crop.is_none());
+        let positive = image_io::read_rgb16(written.positive_path.as_ref().unwrap()).unwrap();
+        assert_eq!((positive.width, positive.height), (width, height));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_auto_crop_defers_to_approved_alignment() {
+        let dir = unique_test_dir();
+        let archive_path = dir.join("Archive").join("Archive_0001.tif");
+        let (width, _) = write_autocrop_pattern_archive(&archive_path);
+        let mut recipes = domain::OutputRecipe::default();
+        recipes.auto_crop = true;
+        recipes.positive.destination = dir.join("Positive").display().to_string();
+        recipes.positive.file_format = domain::OutputFileFormat::Tiff;
+        recipes.preview.enabled = false;
+        let alignment = domain::FrameAlignment { offset_rows: 0, approved: true };
+
+        let written = render_derivative_from_archive(
+            &archive_path,
+            1,
+            domain::FilmProcess::Positive,
+            &recipes,
+            Some(STORAGE_TRANSFORM_SWAPAXES01),
+            None,
+            Some((40, 280)),
+            Some(&alignment),
+        )
+        .unwrap();
+        let outcome = written.auto_crop.expect("deferred outcome");
+        assert!(!outcome.applied);
+        assert!(outcome.reason.as_deref().is_some_and(|reason| reason.contains("alignment")));
+        let positive = image_io::read_rgb16(written.positive_path.as_ref().unwrap()).unwrap();
+        assert_eq!((positive.width, positive.height), (width, 241));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_recipe_auto_crop_defaults_false_and_round_trips_camel_case() {
+        let parsed: domain::OutputRecipe = serde_json::from_str("{}").unwrap();
+        assert!(!parsed.auto_crop);
+        let mut recipes = domain::OutputRecipe::default();
+        recipes.auto_crop = true;
+        let json = serde_json::to_string(&recipes).unwrap();
+        assert!(json.contains("\"autoCrop\":true"));
+        assert!(serde_json::from_str::<domain::OutputRecipe>(&json).unwrap().auto_crop);
     }
 
     #[test]

@@ -1315,8 +1315,28 @@ class LS5000SinglePassWorkflow:
             "B": observed["3"],
             "IR": observed["9"],
         }
-        if controller_exposures != expected_controller or controller.get("final_exposures_raw_10ns") != expected_controller:
+        if controller_exposures != expected_controller:
             raise SinglePassIntegrityError("meter controller exposure echo is inconsistent")
+        # Guarded nikon-parity is the RGB command authority: the commanded
+        # contract is bound to the active controller's accepted solve THROUGH
+        # the journaled authority record (active solve -> authority ->
+        # commanded wire echo), with infrared passing through unchanged.
+        # Mirrors the roll publication consumer's binding check.
+        authority = journal.get("active_exposure_authority")
+        active_solve = controller.get("final_exposures_raw_10ns")
+        if (
+            not isinstance(authority, dict)
+            or authority.get("rgb_source") != "nikon-parity-guarded-v2"
+            or authority.get("ir_source") != "active-controller"
+            or authority.get("commanded_channels_raw_10ns") != expected_controller
+            or not isinstance(active_solve, dict)
+            or authority.get("active_controller_channels_raw_10ns") != active_solve
+            or expected_controller.get("IR") != active_solve.get("IR")
+        ):
+            raise SinglePassIntegrityError(
+                "commanded exposure contract is not bound to the parity authority "
+                "and the accepted controller result"
+            )
 
         frame_evidence: dict[str, object] = {
             "requested_slot": attempt.selected_slot,
@@ -1333,6 +1353,7 @@ class LS5000SinglePassWorkflow:
         exposure_evidence: dict[str, object] = {
             "controller_final": deepcopy(controller),
             "accepted_contract": deepcopy(final_exposures),
+            "active_exposure_authority": deepcopy(authority),
             "fine_set_windows_preflight": [deepcopy(preflight[color]) for color in sorted(preflight)],
             "fine_get_windows": [deepcopy(fine[color]) for color in sorted(fine)],
         }

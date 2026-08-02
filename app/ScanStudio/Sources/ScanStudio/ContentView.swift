@@ -197,8 +197,11 @@ private struct ManualReviewScanSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
 
-            if let message = sessionModel.lastErrorMessage, !message.isEmpty {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
+            // Curated title, not the raw `lastErrorMessage` -- an operator
+            // confirming physical scanner motion needs true, calm
+            // information here, not an echoed engine diagnostic.
+            if let title = sessionModel.errorPresentation?.title {
+                Label(title, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.scanStudioRed)
                     .fixedSize(horizontal: false, vertical: true)

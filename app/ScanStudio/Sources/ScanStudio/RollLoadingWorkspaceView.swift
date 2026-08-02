@@ -15,11 +15,55 @@ struct CarrierLoadingWorkspaceView: View {
     }
     private var frameCount: Int { knownFrameCount ?? max(sessionModel.thumbnailCount, 1) }
     private var hasKnownFrameCount: Bool { knownFrameCount != nil }
-    private var columns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 8), count: frameCount == 1 ? 1 : min(frameCount, 6))
+    /// Height claimed by the status card, rail, explanation, and padding
+    /// before `ContactSheetLayout` judges whether the tiles fit unscrolled.
+    private static let nonGridChromeHeight: Double = 210
+
+    private func columns(forPaneSize size: CGSize) -> [GridItem] {
+        let count = ContactSheetLayout.columnCount(
+            frameCount: tileCount,
+            availableWidth: Double(size.width) - 40,
+            availableHeight: Double(size.height) - Self.nonGridChromeHeight,
+            spacing: 8
+        )
+        return Array(repeating: GridItem(.flexible(), spacing: 8), count: count)
+    }
+
+    private func gridMaxWidth(forPaneSize size: CGSize) -> Double {
+        let count = Double(columns(forPaneSize: size).count)
+        return count * ContactSheetLayout.defaultMaxTileWidth + (count - 1) * 8
     }
     private var loadedCount: Int { min(sessionModel.thumbnailCount, frameCount) }
     private var currentFrame: Int { hasKnownFrameCount ? min(loadedCount + 1, frameCount) : 0 }
+
+    /// The frame the scanner is working on right now, or `nil` once every
+    /// known frame has arrived.
+    ///
+    /// A real preview reports no total until its final status, so
+    /// `currentFrame` is 0 for the whole pass and `frameCount` collapses to
+    /// the frames already delivered. Before 2026-07-28 that combination left
+    /// this screen with no moving element at all for the entire acquisition
+    /// — a single static "01" tile while the transport was audibly running.
+    /// Carrying the in-flight frame separately fixes that without inventing a
+    /// total: this view only renders while `isAcquiringThumbnails`, so one
+    /// unfinished frame after the delivered ones is exactly what is true.
+    private var inFlightFrame: Int? {
+        guard sessionModel.isAcquiringThumbnails else { return nil }
+        if hasKnownFrameCount {
+            return loadedCount < frameCount ? min(loadedCount + 1, frameCount) : nil
+        }
+        return loadedCount + 1
+    }
+
+    /// Delivered frames plus the in-flight one, so the grid and the rail
+    /// agree on how many cells exist.
+    private var tileCount: Int { max(frameCount, inFlightFrame ?? 0) }
+    /// 1-based frame indices for the grid/rail. A `Range`, not
+    /// `1...tileCount` -- that `ClosedRange` traps if `tileCount` is ever
+    /// non-positive, and this stays an empty `Range` in that case instead.
+    private var tileIndices: Range<Int> {
+        tileCount > 0 ? 1..<(tileCount + 1) : 1..<1
+    }
     private var percentComplete: Int {
         Int((Double(loadedCount) / Double(frameCount) * 100).rounded())
     }
@@ -29,10 +73,11 @@ struct CarrierLoadingWorkspaceView: View {
             workspaceHeader
             Rectangle().fill(Color.scanStudioDivider).frame(height: 1)
 
+            GeometryReader { paneProxy in
             ScrollView {
                 VStack(spacing: 16) {
                     loadingStatusCard
-                    frameGrid
+                    frameGrid(paneSize: paneProxy.size)
                     frameRail
 
                     Text(loadingExplanation)
@@ -43,6 +88,7 @@ struct CarrierLoadingWorkspaceView: View {
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 18)
+            }
             }
         }
         .background(Color.scanStudioWorkspace)
@@ -129,29 +175,30 @@ struct CarrierLoadingWorkspaceView: View {
             : "Loading roll, \(loadedCount) frames found so far; total not established")
     }
 
-    private var frameGrid: some View {
-        LazyVGrid(columns: columns, spacing: 8) {
-            ForEach(1...frameCount, id: \.self) { frameIndex in
+    private func frameGrid(paneSize: CGSize) -> some View {
+        LazyVGrid(columns: columns(forPaneSize: paneSize), spacing: 8) {
+            ForEach(tileIndices, id: \.self) { frameIndex in
                 RollLoadingFrameCell(
                     frameIndex: frameIndex,
                     thumbnail: sessionModel.thumbnails[frameIndex],
-                    isCurrent: currentFrame > 0 && frameIndex == currentFrame && loadedCount < frameCount,
+                    isCurrent: frameIndex == inFlightFrame,
                     orientationDegrees: sessionModel.frameOrientation(frameIndex),
                     mirrored: sessionModel.frameMirror(frameIndex)
                 )
             }
         }
-        .frame(maxWidth: frameCount == 1 ? 420 : .infinity)
+        .frame(maxWidth: gridMaxWidth(forPaneSize: paneSize))
+        .frame(maxWidth: .infinity)
         .animation(.easeOut(duration: 0.2), value: loadedCount)
     }
 
     private var frameRail: some View {
         GeometryReader { proxy in
             let spacing = CGFloat(2)
-            let segmentWidth = max(4, (proxy.size.width - spacing * CGFloat(frameCount - 1)) / CGFloat(frameCount))
+            let segmentWidth = max(4, (proxy.size.width - spacing * CGFloat(tileCount - 1)) / CGFloat(tileCount))
 
             HStack(spacing: spacing) {
-                ForEach(1...frameCount, id: \.self) { frameIndex in
+                ForEach(tileIndices, id: \.self) { frameIndex in
                     Capsule()
                         .fill(railColor(for: frameIndex))
                         .frame(width: segmentWidth)
@@ -164,7 +211,7 @@ struct CarrierLoadingWorkspaceView: View {
 
     private func railColor(for frameIndex: Int) -> Color {
         if sessionModel.thumbnails[frameIndex] != nil { return .scanStudioCyan }
-        if currentFrame > 0 && frameIndex == currentFrame { return .scanStudioAmber }
+        if frameIndex == inFlightFrame { return .scanStudioAmber }
         return Color.white.opacity(0.10)
     }
 
@@ -242,14 +289,15 @@ private struct RollLoadingFrameCell: View {
                     .padding(5)
                     .transition(.opacity.combined(with: .scale(scale: 0.25)))
             } else if isCurrent {
-                VStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.scanStudioAmber)
+                ZStack {
+                    FilmScanSweep()
                     Text("READING")
                         .font(.system(size: 8, weight: .bold, design: .monospaced))
                         .tracking(0.6)
                         .foregroundStyle(Color.scanStudioAmber)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.black.opacity(0.42), in: Capsule())
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -264,5 +312,74 @@ private struct RollLoadingFrameCell: View {
         .animation(.easeOut(duration: 0.2), value: isLoaded)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Frame \(frameIndex), \(isLoaded ? "ready" : (isCurrent ? "reading" : "waiting"))")
+    }
+}
+
+/// The activity affordance for a frame the scanner is reading right now: a
+/// light bar travelling down the tile, standing in for the sensor's own
+/// traverse, over faint sensor rows.
+///
+/// Deliberately abstract. The tile has no pixels yet, and the previous
+/// occupant of this space — bundled mockup crop art — is exactly the "fake
+/// imagery on a real device" this project rejects. A sweep claims only that
+/// something is moving, which is the one thing that is true here.
+///
+/// Driven by `TimelineView(.animation)` rather than a `@State` +
+/// `repeatForever` pair so the phase is derived from the clock: a
+/// `LazyVGrid` recycling this view mid-pass cannot leave it parked.
+struct FilmScanSweep: View {
+    var accent: Color = .scanStudioAmber
+
+    /// One head traverse. Slow enough to read as deliberate mechanical
+    /// motion rather than a spinner's idle churn.
+    private let period: Double = 2.1
+
+    /// Sensor-row pitch, in points. Fixed rather than proportional so the
+    /// texture reads the same on a 40-frame roll's small tiles as on a
+    /// single mounted slide.
+    private let rowPitch: Double = 3
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let phase = context.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: period) / period
+
+            GeometryReader { proxy in
+                let height = proxy.size.height
+                let band = max(16, height * 0.34)
+
+                ZStack {
+                    sensorRows
+
+                    LinearGradient(
+                        colors: [accent.opacity(0), accent.opacity(0.5), accent.opacity(0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: band)
+                    .blur(radius: 4)
+                    .blendMode(.plusLighter)
+                    // Travels from fully clear of the top edge to fully clear
+                    // of the bottom one, so the bar is never parked at a
+                    // boundary looking like a static rule.
+                    .offset(y: -band + (height + band * 2) * phase)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var sensorRows: some View {
+        Canvas { context, size in
+            var rows = Path()
+            var y = 0.0
+            while y < size.height {
+                rows.move(to: CGPoint(x: 0, y: y))
+                rows.addLine(to: CGPoint(x: size.width, y: y))
+                y += rowPitch
+            }
+            context.stroke(rows, with: .color(.white.opacity(0.05)), lineWidth: 0.5)
+        }
     }
 }

@@ -1882,12 +1882,12 @@ mod tests {
         let rotated = apply_fine_rotation(&img, 1.75);
         let w = img.width;
         assert_pixel_close(
-            rotated.pixels[(0 * w + 0) as usize],
+            rotated.pixels[0_usize],
             [0.08209199458360672, 0.1492551863193512, 0.22462759912014008],
             "[0,0] at 1.75deg",
         );
         assert_pixel_close(
-            rotated.pixels[(0 * w + 7) as usize],
+            rotated.pixels[7_usize],
             [0.6574079394340515, 0.49444475769996643, 0.3972223699092865],
             "[0,7] at 1.75deg",
         );
@@ -1909,7 +1909,7 @@ mod tests {
         let rotated = apply_fine_rotation(&img, -3.2);
         let w = img.width;
         assert_pixel_close(
-            rotated.pixels[(0 * w + 0) as usize],
+            rotated.pixels[0_usize],
             [0.060575637966394424, 0.13634537160396576, 0.21817269921302795],
             "[0,0] at -3.2deg",
         );

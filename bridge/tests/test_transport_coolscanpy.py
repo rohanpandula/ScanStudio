@@ -1424,6 +1424,42 @@ def test_start_scan_receipt_forwards_the_exact_current_roll_attempts_root(
     assert frames[0].attempts_root == str(caller_owned_root)
 
 
+def test_start_scan_receipt_forwards_best_effort_exposure_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = domain.ExposureAuthority(
+        rgb_source="nikon-parity-guarded-v2",
+        ir_source="active-controller",
+        commanded_channels_raw_10ns={"R": 1, "G": 2, "B": 3, "IR": 4},
+        active_controller_channels_raw_10ns={"R": 5, "G": 6, "B": 7, "IR": 4},
+        device_bound_clamped_channels_raw_10ns={},
+        device_exposure_bounds_raw_10ns=(50_000, 400_000),
+    )
+    seen: list[tuple[Path | None, int]] = []
+
+    def fake_build(*, attempts_root: Path | None, slot: int):
+        seen.append((attempts_root, slot))
+        return authority
+
+    monkeypatch.setattr(coolscanpy_transport_module, "build_exposure_authority", fake_build)
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)], scan_results={1: [_fake_frame(1)]})
+    transport, device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    frames: list[domain.ScanReceipt] = []
+
+    transport.start_scan(
+        slots=[1],
+        recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        output=_output(tmp_path),
+        on_progress=lambda _p: None,
+        on_retry=lambda *a: None,
+        on_frame=lambda _slot, receipt: frames.append(receipt),
+    )
+
+    assert seen == [(device.roll_calls[0], 1)]
+    assert frames[0].exposure_authority == authority
+
+
 def test_start_scan_leaves_meter_rgbi_path_none_when_coolscanpy_omits_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

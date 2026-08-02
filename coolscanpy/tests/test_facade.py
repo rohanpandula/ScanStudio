@@ -848,6 +848,27 @@ class _FakeBatchProcess:
                     "9": 100_009,
                 },
             },
+            # The guarded nikon-parity solve is the RGB command authority;
+            # this fixture's parity solve happens to equal the active solve,
+            # which is a legal (unclamped, unguarded) state.
+            "active_exposure_authority": {
+                "rgb_source": "nikon-parity-guarded-v2",
+                "ir_source": "active-controller",
+                "commanded_channels_raw_10ns": {
+                    "R": 100_001,
+                    "G": 100_002,
+                    "B": 100_003,
+                    "IR": 100_009,
+                },
+                "active_controller_channels_raw_10ns": {
+                    "R": 100_001,
+                    "G": 100_002,
+                    "B": 100_003,
+                    "IR": 100_009,
+                },
+                "device_bound_clamped_channels_raw_10ns": {},
+                "device_exposure_bounds_raw_10ns": [50_000, 400_000],
+            },
         }
         journal_path.write_text(json.dumps(journal), encoding="utf-8")
         self.events.append(f"ready-{frame['slot']}")

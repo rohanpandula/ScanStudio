@@ -28,6 +28,11 @@ def _e9ea_prefixed_counter_train(words: np.ndarray) -> None:
     _counter_train(words[4:], 0xD895)
 
 
+def _e004_prefixed_counter_train(words: np.ndarray) -> None:
+    words[:4] = (0xE004, 0xE004, 0xE004, 0xD894)
+    _counter_train(words[4:], 0xD895)
+
+
 def _synthetic_full_records(height: int = 3) -> tuple[np.ndarray, np.ndarray]:
     records = (height + 1) // 2
     base = (np.arange(records * 2 * WIDTH * 4, dtype=np.uint32).reshape(records * 2, WIDTH, 4) % 20_000).astype(np.uint16)
@@ -132,6 +137,65 @@ def test_full_decoder_rejects_mixed_padding_counter_dialects(tmp_path: Path) -> 
     for record in full:
         _e9ea_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
     path = tmp_path / "mixed-padding-dialects.bin"
+    path.write_bytes(full.astype(">u2").tobytes())
+
+    with pytest.raises(ValueError, match="padding 3 counter train mismatch"):
+        decode_full_records(path, height=3)
+
+
+def test_full_decoder_accepts_e004_prefixed_padding_counter_dialect(tmp_path: Path) -> None:
+    base, full = _synthetic_full_records()
+    for record in full:
+        _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+        _e004_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+    path = tmp_path / "e004-prefixed.bin"
+    path.write_bytes(full.astype(">u2").tobytes())
+
+    decoded, report = decode_full_records(path, height=3)
+
+    expected = base.copy()
+    expected[..., :3] += 2
+    np.testing.assert_array_equal(expected, decoded)
+    assert report["padding_1_3_counter_dialect"] == "e004-prefixed"
+
+
+@pytest.mark.parametrize(
+    "corrupt_word_offset",
+    [110_840 // 2, 110_840 // 2 + 3, 110_840 // 2 + 4, 111_616 // 2 - 1],
+    ids=["sentinel", "d894", "train-head", "train-tail"],
+)
+def test_full_decoder_rejects_corrupt_e004_prefixed_padding(
+    tmp_path: Path, corrupt_word_offset: int
+) -> None:
+    _base, full = _synthetic_full_records()
+    for record in full:
+        _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+        _e004_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+    full[1, corrupt_word_offset] ^= 1
+    path = tmp_path / "corrupt-e004-prefixed.bin"
+    path.write_bytes(full.astype(">u2").tobytes())
+
+    with pytest.raises(ValueError, match="padding 1 counter train mismatch"):
+        decode_full_records(path, height=3)
+
+
+def test_full_decoder_rejects_e004_padding_1_with_canonical_padding_3(tmp_path: Path) -> None:
+    _base, full = _synthetic_full_records()
+    for record in full:
+        _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+    path = tmp_path / "mixed-e004-canonical.bin"
+    path.write_bytes(full.astype(">u2").tobytes())
+
+    with pytest.raises(ValueError, match="padding 3 counter train mismatch"):
+        decode_full_records(path, height=3)
+
+
+def test_full_decoder_rejects_e004_padding_1_with_e9ea_padding_3(tmp_path: Path) -> None:
+    _base, full = _synthetic_full_records()
+    for record in full:
+        _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+        _e9ea_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+    path = tmp_path / "mixed-e004-e9ea.bin"
     path.write_bytes(full.astype(">u2").tobytes())
 
     with pytest.raises(ValueError, match="padding 3 counter train mismatch"):

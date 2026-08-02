@@ -64,11 +64,24 @@ struct FileDigest {
 /// Finalizes evidence only after the job's terminal bridge event. The package
 /// directory is reserved create-only and its manifest is written last; an
 /// existing package is therefore a hard collision.
+///
+/// `terminal_error`, when the caller's own job ended in failure (a bridge
+/// `scan.error` such as `BATCH_INTEGRITY_ERROR`, or any other terminal
+/// closure that isn't a clean completion), is folded into `base_error`
+/// alongside whatever `expected_attempts_root()` itself reports — the same
+/// mechanism `finalize_into` already uses to mark a package `incomplete`
+/// and explain why. Before this parameter existed, a failed job's package
+/// (when one was written at all) recorded every frame's own individually
+/// observed outcome but never the reason the *job* itself ended, so a
+/// human auditing the package later had no record of it short of engine
+/// stderr, which this package outlives. `None` for the ordinary successful-
+/// completion path leaves behavior exactly as it was.
 pub fn finalize(
     master_destination: &Path,
     job_id: &str,
     frames: &[EvidenceFrame],
     effective_settings: &serde_json::Value,
+    terminal_error: Option<&str>,
 ) -> Result<EvidencePackageResult, String> {
     match expected_attempts_root() {
         Ok(expected_root) => finalize_with_optional_expected_root(
@@ -77,7 +90,7 @@ pub fn finalize(
             frames,
             effective_settings,
             Some(&expected_root),
-            None,
+            terminal_error.map(str::to_string),
         ),
         Err(error) => finalize_with_optional_expected_root(
             master_destination,
@@ -85,7 +98,10 @@ pub fn finalize(
             frames,
             effective_settings,
             None,
-            Some(error),
+            Some(match terminal_error {
+                Some(terminal) => format!("{terminal}; {error}"),
+                None => error,
+            }),
         ),
     }
 }
@@ -525,6 +541,49 @@ mod tests {
             .is_err(),
             "existing final package is never overwritten"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A job that ends in failure (e.g. a bridge `scan.error` such as
+    /// `BATCH_INTEGRITY_ERROR`) must leave the terminal reason somewhere in
+    /// the evidence package itself, not only in engine stderr. Exercises
+    /// `finalize_with_optional_expected_root`'s `base_error` plumbing
+    /// directly -- the same seam `finalize`'s new `terminal_error` parameter
+    /// feeds into -- without needing the full bridge/mock_bridge subprocess
+    /// harness real_backend.rs's own job-failure paths require.
+    #[test]
+    fn a_terminal_job_error_is_recorded_in_the_manifest_and_forces_incomplete() {
+        let root = temp_root();
+        let attempts = root.join("attempts");
+        let destination = root.join("destination");
+        let evidence = frame(&attempts);
+        let result = finalize_with_optional_expected_root(
+            &destination,
+            "job-terminal-error",
+            &[evidence],
+            &serde_json::json!({"dpi": 4000}),
+            Some(&attempts),
+            Some("bridge scan.error (BATCH_INTEGRITY_ERROR): slot count mismatch".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            result.status, "incomplete",
+            "a terminal job error must force the package incomplete even if every attempted frame's own artifacts were fine"
+        );
+        assert!(
+            result.detail.contains("BATCH_INTEGRITY_ERROR"),
+            "detail must name the terminal error: {}",
+            result.detail
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(PathBuf::from(result.path.unwrap()).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["status"], "incomplete");
+        assert!(manifest["detail"]
+            .as_str()
+            .unwrap()
+            .contains("BATCH_INTEGRITY_ERROR"));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -337,6 +337,12 @@ struct BatchInspectorView: View {
                 Text("JPEG quality is fixed by the current engine.")
             }
 
+            InspectorToggleRow(label: "Auto crop derived outputs", isOn: autoCropEnabledBinding)
+            Text("Each frame's positive and JPEG are cropped to that frame's own detected image area at scan time. The master TIFF always keeps the full frame, and every crop is recorded in the frame's receipt, so this is reversible by re-rendering.")
+                .font(.system(size: 10))
+                .foregroundStyle(Color.scanStudioSecondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
             InspectorTextFieldRow(label: "File naming", text: sharedFilenameTemplateBinding)
             Text(FilenameTemplate.expand(sessionModel.archiveFilenameTemplate, metadata: sessionModel.rollMetadataDraft, frameIndex: 1))
                 .font(.system(size: 10, design: .monospaced))
@@ -638,8 +644,13 @@ struct BatchInspectorView: View {
         sessionModel.status?.transport == "idle" ? "checkmark.circle.fill" : "lock.fill"
     }
 
+    /// Curated title, not the raw `lastErrorMessage` -- this pill sits in the
+    /// always-visible inspector, not behind a "technical details" disclosure
+    /// like `WorkspaceErrorBanner`, so it never gets to show engine text
+    /// verbatim. `errorPresentation` is `nil` exactly when `lastErrorMessage`
+    /// is, so the fallback stays in sync automatically.
     private var errorStatusLabel: String {
-        sessionModel.lastErrorMessage.map { "Error: \($0)" } ?? "No errors"
+        sessionModel.errorPresentation.map { "Error: \($0.title)" } ?? "No errors"
     }
 
     private var errorStatusColor: Color {
@@ -837,6 +848,10 @@ struct BatchInspectorView: View {
 
     private var positiveJPEGFolderNameBinding: Binding<String> {
         Binding(get: { sessionModel.positiveJPEGFolderName }, set: { sessionModel.positiveJPEGFolderName = $0 })
+    }
+
+    private var autoCropEnabledBinding: Binding<Bool> {
+        Binding(get: { sessionModel.autoCropEnabled }, set: { sessionModel.setAutoCropEnabled($0) })
     }
 
     private var sharedFilenameTemplateBinding: Binding<String> {

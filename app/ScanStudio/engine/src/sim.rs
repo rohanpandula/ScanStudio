@@ -791,6 +791,8 @@ fn build_receipt(
     let now = now_unix_secs();
     let started_at_secs = now - (duration_ms as i64 / 1000).max(0);
     ScanReceipt {
+        exposure_authority: None,
+        auto_crop: written.auto_crop.clone(),
         job_id: job_id.to_string(),
         frame_index,
         started_at: format_iso8601(started_at_secs),
@@ -1022,20 +1024,20 @@ fn run_scan_job(
             .and_then(|o| o.processing.clone())
             .unwrap_or_else(|| processing.clone())
             .effective();
-        let effective_recipe = effective_recipe.effective_for_process(effective_processing.film_process);
+        let effective_recipe =
+            effective_recipe.effective_for_process(effective_processing.film_process);
         let effective_output = overrides
             .get(&frame_index)
             .and_then(|o| o.output.clone())
             .unwrap_or_else(|| output.clone());
         let (width, height) =
             crate::render::frame_dimensions(carrier, effective_recipe.resolution_dpi);
-        let preparation_ms = 500
-            + if effective_processing.autofocus_each_frame {
+        let preparation_ms =
+            500 + if effective_processing.autofocus_each_frame {
                 350
             } else {
                 0
-            }
-            + if effective_processing.auto_exposure_each_frame {
+            } + if effective_processing.auto_exposure_each_frame {
                 250
             } else {
                 0
@@ -1212,12 +1214,37 @@ fn run_scan_job(
                             &device_id,
                             &written,
                         );
-                        let _ = set_frame_state(
-                            &backend,
-                            &job_id,
-                            frame_index,
-                            FrameState::Completed,
-                        );
+                        // A receipt persistence failure here does not mean
+                        // the frame failed -- the master (and any
+                        // derivatives) are already durably written to disk,
+                        // so reporting FrameState::Failed would be its own
+                        // dishonesty (this mirrors real_backend.rs's
+                        // identical fix). What didn't happen is the
+                        // provenance record landing in the project
+                        // manifest, and that gap must not be visible only
+                        // in stderr. sim.rs has no shared_evidence/
+                        // EvidenceFrame package to fold this into the way
+                        // real_backend.rs does, so the frameState event
+                        // below -- already emitted for this same
+                        // transition -- is the honest, available carrier
+                        // instead. That's why persistence now happens
+                        // BEFORE that emit rather than after: the event has
+                        // to carry the outcome it describes, not a second
+                        // event nobody asked for.
+                        let manifest_persist_error = match &project_directory {
+                            Some(directory) => crate::manifest::persist_frame_receipt(
+                                directory,
+                                frame_index,
+                                &receipt,
+                            )
+                            .err(),
+                            None => None,
+                        };
+                        if let Some(err) = &manifest_persist_error {
+                            eprintln!("scanstudio-engine: failed to persist frame receipt to manifest: {err}");
+                        }
+                        let _ =
+                            set_frame_state(&backend, &job_id, frame_index, FrameState::Completed);
                         emit(
                             &event_tx,
                             "scan.frameState",
@@ -1226,16 +1253,9 @@ fn run_scan_job(
                                 frame_index,
                                 state: FrameState::Completed,
                                 attempt,
-                                error: None,
+                                error: manifest_persist_error.as_ref().map(ErrorPayload::from),
                             },
                         );
-                        if let Some(directory) = &project_directory {
-                            if let Err(err) =
-                                crate::manifest::persist_frame_receipt(directory, frame_index, &receipt)
-                            {
-                                eprintln!("scanstudio-engine: failed to persist frame receipt to manifest: {err}");
-                            }
-                        }
                         emit(
                             &event_tx,
                             "scan.frameCompleted",
@@ -1251,8 +1271,7 @@ fn run_scan_job(
                         // A single frame's write failure (e.g. ARCHIVE_COLLISION)
                         // must not abort the rest of the batch -- mirrors how
                         // AttemptOutcome::Faulted already behaves above.
-                        let _ =
-                            set_frame_state(&backend, &job_id, frame_index, FrameState::Failed);
+                        let _ = set_frame_state(&backend, &job_id, frame_index, FrameState::Failed);
                         emit(
                             &event_tx,
                             "scan.frameState",
@@ -1367,8 +1386,7 @@ mod tests {
         ] {
             let t = thumbnail_for(DEVICE_ID, frame_index);
             assert!(
-                (t.brightness.expect("simulator always sets brightness") - brightness).abs()
-                    < 1e-9,
+                (t.brightness.expect("simulator always sets brightness") - brightness).abs() < 1e-9,
                 "frame {frame_index} brightness"
             );
             assert!(
@@ -1418,17 +1436,38 @@ mod tests {
             positive_path: None,
             preview_path: None,
             nikonlook: Some(provenance.clone()),
+            auto_crop: None,
         };
 
-        let receipt = build_receipt("job-1", 1, 1000, &recipe, &processing, &output, DEVICE_ID, &written);
+        let receipt = build_receipt(
+            "job-1",
+            1,
+            1000,
+            &recipe,
+            &processing,
+            &output,
+            DEVICE_ID,
+            &written,
+        );
         assert_eq!(receipt.nikonlook, Some(provenance));
 
         // The `None` side must also pass through unchanged -- a C41 render
         // is not guaranteed to have provenance either (e.g. a legacy
         // pre-Fix-2 written struct), and build_receipt must not fabricate one.
-        let written_none = crate::render::WrittenPaths { nikonlook: None, ..written };
-        let receipt_none =
-            build_receipt("job-1", 1, 1000, &recipe, &processing, &output, DEVICE_ID, &written_none);
+        let written_none = crate::render::WrittenPaths {
+            nikonlook: None,
+            ..written
+        };
+        let receipt_none = build_receipt(
+            "job-1",
+            1,
+            1000,
+            &recipe,
+            &processing,
+            &output,
+            DEVICE_ID,
+            &written_none,
+        );
         assert_eq!(receipt_none.nikonlook, None);
     }
 
@@ -2056,9 +2095,96 @@ mod tests {
             "frame 2 receipt must be persisted"
         );
         assert_eq!(
-            read_back.frames[0].receipts[0].job_id,
-            read_back.frames[1].receipts[0].job_id,
+            read_back.frames[0].receipts[0].job_id, read_back.frames[1].receipts[0].job_id,
             "both persisted receipts must belong to the same job"
+        );
+
+        let _ = std::fs::remove_dir_all(&project_dir);
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    /// A master without provenance must not be silent (mirrors
+    /// real_backend.rs's identical fix). Seeds a project directory whose
+    /// `manifest.json` is already a directory instead of a file -- the
+    /// simplest reliable way to make every `read_manifest` call inside
+    /// `persist_frame_receipt` fail with `ManifestInvalid`, without
+    /// reaching into `manifest.rs`'s own private atomic-write internals
+    /// (its temp-file name is a module-private implementation detail, not
+    /// a stable target for a test in a different module). The frame's
+    /// render+write still succeeds, so this must surface as a Completed
+    /// frameState carrying an error -- never as a Failed frame, which
+    /// would be its own lie.
+    #[test]
+    fn scan_frame_completion_surfaces_manifest_persistence_failure_without_marking_the_frame_failed(
+    ) {
+        let project_dir = std::env::temp_dir().join(format!(
+            "scanstudio-sim-persist-failure-test-{}",
+            crate::manifest::generate_project_id()
+        ));
+        std::fs::create_dir_all(project_dir.join("manifest.json"))
+            .expect("seed manifest.json as a directory so persist_frame_receipt's read fails");
+
+        let sim = Arc::new(SimulatedLs5000::new());
+        let options = ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+        };
+        sim.connect(DEVICE_ID, &options).expect("connect");
+        sim.load_media(MediaCarrier::Mounted).expect("load media");
+
+        let (output, output_dir) =
+            isolated_output_recipe("persist-failure-surfaces-on-frame-state");
+
+        let (tx, rx) = mpsc::channel();
+        SimulatedLs5000::scan_start(
+            &sim,
+            vec![1],
+            CaptureRecipe::default(),
+            ProcessingRecipe::default(),
+            output,
+            HashMap::new(),
+            Some(project_dir.clone()),
+            tx,
+        )
+        .expect("scan start");
+
+        let mut completed_frame_state_error: Option<serde_json::Value> = None;
+        let mut saw_failed_frame_state = false;
+        loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("scan.completed event");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if value["event"] == "scan.frameState" && value["payload"]["frameIndex"] == 1 {
+                match value["payload"]["state"].as_str() {
+                    Some("completed") => {
+                        completed_frame_state_error = Some(value["payload"]["error"].clone())
+                    }
+                    Some("failed") => saw_failed_frame_state = true,
+                    _ => {}
+                }
+            }
+            if value["event"] == "scan.completed" {
+                break;
+            }
+        }
+
+        assert!(
+            !saw_failed_frame_state,
+            "a manifest persistence failure must never be reported as a failed frame -- \
+             the master already wrote to disk fine"
+        );
+        let error = completed_frame_state_error
+            .expect("frame 1 must reach a Completed scan.frameState event");
+        assert!(
+            !error.is_null(),
+            "the Completed frameState's error field must surface the manifest persistence \
+             failure instead of staying None"
+        );
+        assert_eq!(
+            error["code"], "MANIFEST_INVALID",
+            "persist_frame_receipt's read_manifest failure (manifest.json is a directory) \
+             maps to ErrorCode::ManifestInvalid"
         );
 
         let _ = std::fs::remove_dir_all(&project_dir);

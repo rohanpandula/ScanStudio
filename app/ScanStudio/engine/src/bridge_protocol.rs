@@ -326,6 +326,20 @@ pub struct BridgeApprovalReceipt {
     pub review_reasons: Vec<String>,
 }
 
+/// Bridge-facing mirror of `domain::ExposureAuthority`. This protocol
+/// module stays independent of the domain module, so the two shapes are
+/// mapped explicitly in `real_backend.rs`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeExposureAuthority {
+    pub rgb_source: String,
+    pub ir_source: String,
+    pub commanded_channels_raw_10ns: std::collections::BTreeMap<String, u32>,
+    pub active_controller_channels_raw_10ns: std::collections::BTreeMap<String, u32>,
+    pub device_bound_clamped_channels_raw_10ns: std::collections::BTreeMap<String, u32>,
+    pub device_exposure_bounds_raw_10ns: [u32; 2],
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeScanReceipt {
@@ -365,6 +379,30 @@ pub struct BridgeScanReceipt {
     pub meter_rgbi_path: Option<String>,
     #[serde(default)]
     pub attempts_root: Option<String>,
+    /// Best-effort exposure provenance forwarded from CoolscanPy's
+    /// per-frame journal. Malformed or absent values must not invalidate an
+    /// otherwise complete frame receipt.
+    #[serde(default, deserialize_with = "deserialize_exposure_authority_fail_soft")]
+    pub exposure_authority: Option<BridgeExposureAuthority>,
+}
+
+fn deserialize_exposure_authority_fail_soft<'de, D>(
+    deserializer: D,
+) -> Result<Option<BridgeExposureAuthority>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| match serde_json::from_value(value) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            eprintln!(
+                "scanstudio-engine: malformed exposureAuthority on a bridge receipt, \
+                 treating as absent rather than failing the whole frame-completed event: {err}"
+            );
+            None
+        }
+    }))
 }
 
 // ---------------------------------------------------------------------
@@ -614,7 +652,10 @@ mod tests {
             (BridgeErrorCode::EjectFailed, "EJECT_FAILED"),
             (BridgeErrorCode::FeederParked, "FEEDER_PARKED"),
             (BridgeErrorCode::FingerprintRefused, "FINGERPRINT_REFUSED"),
-            (BridgeErrorCode::ManualReviewRequired, "MANUAL_REVIEW_REQUIRED"),
+            (
+                BridgeErrorCode::ManualReviewRequired,
+                "MANUAL_REVIEW_REQUIRED",
+            ),
             (BridgeErrorCode::RefeedRequired, "REFEED_REQUIRED"),
             (
                 BridgeErrorCode::TransportSmearDetected,
@@ -624,8 +665,14 @@ mod tests {
                 BridgeErrorCode::GeometryValidationError,
                 "GEOMETRY_VALIDATION_ERROR",
             ),
-            (BridgeErrorCode::SplitAlignmentError, "SPLIT_ALIGNMENT_ERROR"),
-            (BridgeErrorCode::BatchIntegrityError, "BATCH_INTEGRITY_ERROR"),
+            (
+                BridgeErrorCode::SplitAlignmentError,
+                "SPLIT_ALIGNMENT_ERROR",
+            ),
+            (
+                BridgeErrorCode::BatchIntegrityError,
+                "BATCH_INTEGRITY_ERROR",
+            ),
             (BridgeErrorCode::NotImplemented, "NOT_IMPLEMENTED"),
             (BridgeErrorCode::Internal, "INTERNAL"),
         ] {
@@ -750,12 +797,12 @@ mod tests {
                 reason: "no repeated tail rows detected".into(),
             },
             artifacts,
-            storage_transform:
-                "swapaxes01-scanner-native-to-nikon-render-parity-v2".into(),
+            storage_transform: "swapaxes01-scanner-native-to-nikon-render-parity-v2".into(),
             rgb_path: "/tmp/scanstudio-test-output/roll-042/frame-0001.tif".into(),
             ir_path: None,
             meter_rgbi_path: None,
             attempts_root: None,
+            exposure_authority: None,
         };
 
         let value = serde_json::to_value(&receipt).unwrap();
@@ -781,6 +828,59 @@ mod tests {
         assert!(
             legacy.storage_transform.is_empty(),
             "a missing legacy storageTransform must become an explicit unsupported value"
+        );
+    }
+
+    #[test]
+    fn bridge_scan_receipt_exposure_authority_is_camelcase_legacy_safe_and_fail_soft() {
+        let authority = BridgeExposureAuthority {
+            rgb_source: "nikon-parity-guarded-v2".into(),
+            ir_source: "active-controller".into(),
+            commanded_channels_raw_10ns: std::collections::BTreeMap::from([
+                ("R".into(), 107262),
+                ("G".into(), 276334),
+                ("B".into(), 336777),
+                ("IR".into(), 311725),
+            ]),
+            active_controller_channels_raw_10ns: std::collections::BTreeMap::from([
+                ("R".into(), 121500),
+                ("G".into(), 276334),
+                ("B".into(), 340200),
+                ("IR".into(), 311725),
+            ]),
+            device_bound_clamped_channels_raw_10ns: std::collections::BTreeMap::from([(
+                "B".into(),
+                340200,
+            )]),
+            device_exposure_bounds_raw_10ns: [50_000, 400_000],
+        };
+        let block = serde_json::to_value(&authority).unwrap();
+        assert_eq!(block["rgbSource"], json!("nikon-parity-guarded-v2"));
+        assert_eq!(block["commandedChannelsRaw10ns"]["IR"], json!(311725));
+        assert_eq!(
+            block["deviceBoundClampedChannelsRaw10ns"],
+            json!({"B": 340200})
+        );
+        round_trip(&authority);
+
+        // Exercise the receipt field's custom deserializer directly: both
+        // an omitted legacy key and malformed additive telemetry become
+        // absence rather than losing the completed frame.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wrapper {
+            #[serde(default, deserialize_with = "deserialize_exposure_authority_fail_soft")]
+            exposure_authority: Option<BridgeExposureAuthority>,
+        }
+        assert!(serde_json::from_value::<Wrapper>(json!({}))
+            .unwrap()
+            .exposure_authority
+            .is_none());
+        assert!(
+            serde_json::from_value::<Wrapper>(json!({"exposureAuthority": "bad"}))
+                .unwrap()
+                .exposure_authority
+                .is_none()
         );
     }
 

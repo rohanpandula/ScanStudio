@@ -83,6 +83,29 @@ struct FixtureDecodingTests {
         #expect(envelope.params.recipe.channels == "rgbi")
     }
 
+    @Test("an output recipe without autoCrop decodes to false; an explicit true round-trips")
+    func outputRecipeAutoCropDefaultsAndRoundTrips() throws {
+        let legacy = Data("""
+        {
+          "archive": {"enabled": true, "filenameTemplate": "A_####", "destination": "/tmp/a", "fullCapturePackage": true},
+          "positive": {"enabled": true, "fileFormat": "tiff", "colorProfile": "adobeRgb1998", "filenameTemplate": "P_####", "destination": "/tmp/p"},
+          "preview": {"enabled": true, "fileFormat": "jpeg", "maxLongEdgePx": 1024, "filenameTemplate": "J_####", "destination": "/tmp/j"}
+        }
+        """.utf8)
+        let decoded = try JSONDecoder().decode(OutputRecipe.self, from: legacy)
+        #expect(!decoded.autoCrop, "older recipes without the key stay uncropped")
+
+        let enabled = OutputRecipe(
+            archive: decoded.archive,
+            positive: decoded.positive,
+            preview: decoded.preview,
+            autoCrop: true
+        )
+        let encoded = try JSONEncoder().encode(enabled)
+        let back = try JSONDecoder().decode(OutputRecipe.self, from: encoded)
+        #expect(back.autoCrop)
+    }
+
     @Test("08: scan.progress event decodes")
     func progressEvent() throws {
         let envelope: EventEnvelope<ScanProgressPayload> = try decodeFixture("08-progress-event.json")

@@ -665,6 +665,11 @@ public final class SessionModel {
     public var previewFileFormat: OutputFileFormat = .jpeg
     /// A zero cap is an existing engine-supported full-resolution export.
     public var previewMaxLongEdgePx = 0
+    /// Non-destructive scan-time auto-crop of derived outputs (positive and
+    /// preview) to each frame's own detected film ROI. The retained master
+    /// TIFF is never cropped, and every frame's receipt records the decision,
+    /// so the choice is reversible by re-rendering. Off by default.
+    public var autoCropEnabled = false
     public var previewFilenameTemplate = FilenameTemplate.defaultTemplate
     public var previewDestination = SessionModel.defaultOutputDestination(subfolder: "Preview")
     /// User-facing output organization. The legacy per-output destination
@@ -716,6 +721,11 @@ public final class SessionModel {
     /// from a genuinely partial one. See `ResumeBatchPolicy` below for why
     /// this can never be derived from `pendingFrameCount` alone.
     public private(set) var completedFrameCount: Int = 0
+    /// Every frame whose completion is backed by a receipt, whether that
+    /// receipt came from the project snapshot or arrived live in this
+    /// session. Unlike `frameStates`, this durable set is never cleared just
+    /// to display a fresh re-scan attempt.
+    private var durableCompletedFrameIndices: Set<Int> = []
 
     /// Selection is a user choice, deliberately separate from engine frame
     /// states so completed/failed overlays never change the next batch.
@@ -834,7 +844,8 @@ public final class SessionModel {
                     separateFolders: saveEachOutputInOwnFolder
                 ),
                 destination: jpegDestination
-            )
+            ),
+            autoCrop: autoCropEnabled
         )
     }
 
@@ -1488,7 +1499,7 @@ public final class SessionModel {
             // flight; returning here would orphan a physically running job
             // and hide its stop controls.
             clearPendingManualReviewScan(requestId: marker.requestId)
-            beginJob(id: result.jobId)
+            beginJob(id: result.jobId, frames: authorization.frames)
             return true
         } catch {
             guard manualReviewApprovalIsCurrent(marker) else {
@@ -1600,7 +1611,7 @@ public final class SessionModel {
             guard let result = try await dispatchScanStart(frames: frames) else {
                 return false
             }
-            beginJob(id: result.jobId)
+            beginJob(id: result.jobId, frames: frames)
             return true
         } catch {
             recordOperationFailure(error, operation: "scan.start")
@@ -1845,6 +1856,12 @@ public final class SessionModel {
         previewEnabled = enabled
     }
 
+    /// Auto-crop shapes derived outputs; it never retains or discards one,
+    /// so it is exempt from `OutputRetentionPolicy` by construction.
+    public func setAutoCropEnabled(_ enabled: Bool) {
+        autoCropEnabled = enabled
+    }
+
     public func beginCustomFilmStock() {
         isCustomFilmStockSelected = true
         if FilmStock.matching(metadataName: rollMetadataDraft.filmStock) != nil {
@@ -1924,8 +1941,9 @@ public final class SessionModel {
                 filmProcess: filmProcess
             )
             let result: ProjectCreateResult = try await engineClient.request("project.create", params: params)
+            resetProjectScopedScanState()
             project = result.project
-            applyReceiptDerivedFrameStates(result.project.frames)
+            restoreProjectProgress(from: result.project.frames)
             scanFilmProcess = result.project.filmProcess
             canonicalizeFilmProcessDisplayState()
             rollMetadataDraft = result.project.rollMetadata
@@ -2031,8 +2049,9 @@ public final class SessionModel {
             // matching frame counts nor pre-project drafts can authorize a
             // scan with inert alignment state.
             invalidatePreviewRegistrationForProjectOpen()
+            resetProjectScopedScanState()
             project = result.project
-            applyReceiptDerivedFrameStates(result.project.frames)
+            restoreProjectProgress(from: result.project.frames)
             scanFilmProcess = result.project.filmProcess
             canonicalizeFilmProcessDisplayState()
             rollMetadataDraft = result.project.rollMetadata
@@ -2066,6 +2085,11 @@ public final class SessionModel {
         guard !isChangingProject else {
             lastErrorMessage =
                 "Another project action is still in progress. Wait for it to finish and try again."
+            return false
+        }
+        guard pendingScanStart == nil, jobId == nil, !isJobActive else {
+            lastErrorMessage =
+                "A scan is still in progress. Wait for it to finish or stop it before changing projects."
             return false
         }
         guard pendingFrameAlignmentAdjustment == nil,
@@ -2304,6 +2328,7 @@ public final class SessionModel {
         previewMaxLongEdgePx = recipes.preview.maxLongEdgePx
         previewFilenameTemplate = recipes.preview.filenameTemplate
         previewDestination = recipes.preview.destination
+        autoCropEnabled = recipes.autoCrop
     }
 
     private func canonicalizeFilmProcessDisplayState() {
@@ -2312,22 +2337,55 @@ public final class SessionModel {
         digitalIceEnabled = false
     }
 
-    /// Restores `frameStates` from a reopened project's own persisted
-    /// receipts, so a partially-completed roll's contact sheet is honest
-    /// immediately on reopen — before any job runs in the new session. A
-    /// fresh `frameStates = [:]` first (never merge with whatever was in
-    /// memory from a previous project); then every frame with at least one
-    /// receipt is marked `.completed`. No other `FrameState` case is ever
-    /// synthesized here: `.active`/`.failed`/`.skipped` are genuinely
-    /// unknowable after a quit (04-02's `Skipped` state, like a mid-attempt
-    /// `Failed` state, was never persisted, by design) and a frame absent
-    /// from this dictionary already renders correctly as the default
-    /// "waiting" visual state.
-    private func applyReceiptDerivedFrameStates(_ frames: [ProjectFrame]) {
+    /// Clears state whose meaning belongs to the previously active project.
+    ///
+    /// Preview imagery and unsaved frame-alignment drafts deliberately remain:
+    /// `createProject` is the Save Roll transition that attaches those drafts
+    /// to a manifest. Job receipts, summaries, selection, analysis, and
+    /// metadata preview must never cross that boundary.
+    private func resetProjectScopedScanState() {
+        jobId = nil
+        jobState = nil
+        progress = nil
         frameStates = [:]
-        for frame in frames where !frame.receipts.isEmpty {
-            frameStates[frame.index] = .completed
-        }
+        receipts = []
+        frameErrors.removeAll()
+        frameAttempts.removeAll()
+        frameTransportSmearReasons.removeAll()
+        scanSummary = nil
+        pendingFrames = []
+        completedFrameCount = 0
+        durableCompletedFrameIndices.removeAll()
+        metadataPreview = nil
+        frameDefects.removeAll()
+        selectedFrameIndices.removeAll()
+        selectionAnchorFrameIndex = nil
+        detailFrameIndex = nil
+        bufferedJobEvents.removeAll()
+    }
+
+    /// Restores durable completion and resume state from a project's receipts.
+    /// `additionallyCompleted` carries receipts observed live by this session
+    /// before the immutable `ScanProject` value has been refreshed.
+    private func restoreProjectProgress(
+        from frames: [ProjectFrame],
+        additionallyCompleted: Set<Int> = []
+    ) {
+        let validIndices = Set(frames.map(\.index))
+        let persistedCompleted = Set(
+            frames.filter { !$0.receipts.isEmpty }.map(\.index)
+        )
+        let completed = persistedCompleted
+            .union(durableCompletedFrameIndices.intersection(validIndices))
+            .union(additionallyCompleted.intersection(validIndices))
+        durableCompletedFrameIndices = completed
+        frameStates = Dictionary(
+            uniqueKeysWithValues: completed.map { ($0, FrameState.completed) }
+        )
+        pendingFrames = frames
+            .filter { !$0.excluded && !completed.contains($0.index) }
+            .map(\.index)
+        completedFrameCount = completed.count
     }
 
     // MARK: - Frame alignment
@@ -3125,6 +3183,11 @@ public final class SessionModel {
         preservingPreviewAuthorization: Bool = false,
         preservingActiveJob: Bool = false
     ) {
+        let sessionCompletedFrames = Set(
+            frameStates.compactMap { index, state in
+                state == .completed ? index : nil
+            }
+        )
         let preserveActivePreview =
             preservingPreviewAuthorization
                 && previewIntentStateMachine.hasActiveOperation
@@ -3163,6 +3226,15 @@ public final class SessionModel {
         frameMirrors.removeAll()
         if !preservingActiveJob {
             bufferedJobEvents.removeAll()
+            if let project {
+                restoreProjectProgress(
+                    from: project.frames,
+                    additionallyCompleted: sessionCompletedFrames
+                )
+            } else {
+                pendingFrames = []
+                completedFrameCount = 0
+            }
         }
     }
 
@@ -3182,12 +3254,29 @@ public final class SessionModel {
 
     /// Internal for lifecycle tests that verify a bridge-reused job id cannot
     /// consume terminal events buffered for a prior connection.
-    func beginJob(id: String) {
+    func beginJob(id: String, frames: [Int] = []) {
+        let previouslyCompleted = Set(
+            frameStates.compactMap { index, state in
+                state == .completed ? index : nil
+            }
+        ).subtracting(frames)
         clearPendingManualReviewScan()
         jobId = id
         jobState = .queued
         progress = nil
-        frameStates = [:]
+        if let project {
+            restoreProjectProgress(
+                from: project.frames,
+                additionallyCompleted: previouslyCompleted
+            )
+            for frameIndex in frames {
+                frameStates.removeValue(forKey: frameIndex)
+            }
+        } else {
+            frameStates = [:]
+            pendingFrames = []
+            completedFrameCount = 0
+        }
         receipts = []
         frameErrors.removeAll()
         frameAttempts.removeAll()
@@ -3318,7 +3407,14 @@ public final class SessionModel {
     private func applyReceipt(_ payload: FrameCompletedPayload, source: EngineEvent) {
         guard eventIsRelevant(payload.jobId, source: source), !receipts.contains(where: { $0.id == payload.receipt.id }) else { return }
         receipts.append(payload.receipt)
+        durableCompletedFrameIndices.insert(payload.frameIndex)
         frameStates[payload.frameIndex] = .completed
+        pendingFrames.removeAll { $0 == payload.frameIndex }
+        completedFrameCount = Set(
+            frameStates.compactMap { index, state in
+                state == .completed ? index : nil
+            }
+        ).count
         if let smear = payload.receipt.hardwareTelemetry?.transportSmear, smear.verdict != "clean" {
             frameTransportSmearReasons[payload.frameIndex] = smear.reason
         } else {
@@ -3329,6 +3425,26 @@ public final class SessionModel {
     private func applyCompleted(_ payload: ScanCompletedPayload, source: EngineEvent) {
         guard eventIsRelevant(payload.jobId, source: source) else { return }
         scanSummary = payload.summary
+        // A re-scan is allowed to replace a persisted frame's live display
+        // state with waiting/active/failed while the attempt is in flight.
+        // If that attempt stops or fails before a new receipt arrives, the
+        // older manifest receipt is still durable truth. Restore only those
+        // persisted completions here; never synthesize completion for a
+        // previously-pending frame that failed in this job.
+        if let project {
+            for frameIndex in durableCompletedFrameIndices {
+                frameStates[frameIndex] = .completed
+            }
+            let completed = Set(
+                frameStates.compactMap { index, state in
+                    state == .completed ? index : nil
+                }
+            )
+            pendingFrames = project.frames
+                .filter { !$0.excluded && !completed.contains($0.index) }
+                .map(\.index)
+            completedFrameCount = completed.count
+        }
         if payload.summary.stopped {
             selectedFrameIndices.subtract(payload.summary.completed)
         }

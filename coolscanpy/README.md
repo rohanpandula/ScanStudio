@@ -50,6 +50,24 @@ exposure) is decoded and attached to the `Frame`. Downstream tools that
 need a dual-capture (prepass + main) can use it directly. See the
 [downstream pipeline](#downstream-pipeline) section.
 
+C-41 fine scans expose RGB to Nikon Scan's rendering intent by default.
+The auto-exposure loop still converges exactly as before, but the commanded
+fine-scan RGB exposures are now a guarded Nikon-like target derived from
+the settled meter pass. Live v3 validation used fine-scan fractions
+R 0.950337, G 0.987481, and B 0.983639. Across three matched physical
+frames, the Nikon-referenced full-scale channel biases were R +0.823…+2.086
+%, G +0.146…+1.033 %, and B -0.391…+0.822 %, with a 0.9129 % mean absolute
+bias. Under the explicitly defined complement statistic (100 % minus mean
+absolute full-scale channel bias), that is 99.0871 % average full-scale
+RGB-channel agreement. Mean 8x8-smoothed ΔE00 improved from 2.8469 to
+2.1413 (-24.8 %). These figures describe this three-frame validation set;
+they are neither a byte-identity claim nor a universal perceptual-accuracy
+percentage. Highlights are capped at a reviewed q99.99 threshold and the
+device exposure bounds, both journaled; infrared metering is unchanged; and
+each frame's journal carries an `active_exposure_authority` record binding
+the active solve, the guarded candidate, and the exact commanded contract,
+so the receipt trail proves which numbers reached the scanner and why.
+
 For the proven LS-5000 full-record geometry, fine-scan decoding now starts
 while the raw capture is still arriving. This is an advisory fast path: the
 raw capture remains the oracle, and an absent, slow, malformed, or failed

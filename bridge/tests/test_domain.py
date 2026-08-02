@@ -22,6 +22,7 @@ from scanstudio_bridge.domain import (
     Channels,
     ClippingTelemetry,
     DeviceStatus,
+    ExposureAuthority,
     ExposureVector,
     FocusDetailTelemetry,
     Material,
@@ -137,6 +138,41 @@ def test_scan_receipt_accepts_an_older_wire_payload_without_attempts_root() -> N
     restored = from_wire(wire, ScanReceipt)
 
     assert restored.attempts_root is None
+
+
+def _make_exposure_authority() -> ExposureAuthority:
+    return ExposureAuthority(
+        rgb_source="nikon-parity-guarded-v2",
+        ir_source="active-controller",
+        commanded_channels_raw_10ns={"R": 107262, "G": 276334, "B": 336777, "IR": 311725},
+        active_controller_channels_raw_10ns={
+            "R": 121500,
+            "G": 276334,
+            "B": 340200,
+            "IR": 311725,
+        },
+        device_bound_clamped_channels_raw_10ns={"B": 340200},
+        device_exposure_bounds_raw_10ns=(50_000, 400_000),
+    )
+
+
+def test_exposure_authority_round_trips_with_documented_camel_case_shape() -> None:
+    original = dataclasses.replace(
+        _make_scan_receipt(), exposure_authority=_make_exposure_authority()
+    )
+    wire = to_wire(original)
+    block = wire["exposureAuthority"]
+    assert block["rgbSource"] == "nikon-parity-guarded-v2"
+    assert block["commandedChannelsRaw10ns"]["IR"] == 311725
+    assert block["deviceBoundClampedChannelsRaw10ns"] == {"B": 340200}
+    assert block["deviceExposureBoundsRaw10ns"] == [50_000, 400_000]
+    assert from_wire(wire, ScanReceipt) == original
+
+
+def test_scan_receipt_accepts_legacy_wire_without_exposure_authority() -> None:
+    wire = to_wire(_make_scan_receipt())
+    del wire["exposureAuthority"]
+    assert from_wire(wire, ScanReceipt).exposure_authority is None
 
 
 def test_manual_approval_round_trips_when_present() -> None:

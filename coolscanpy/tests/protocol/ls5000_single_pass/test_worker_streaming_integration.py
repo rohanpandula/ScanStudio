@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from coolscanpy import _roll as roll_module
@@ -125,6 +126,35 @@ def _records_and_mapping() -> tuple[tuple[TransportRecord, ...], TransportMappin
     return records, TransportMapping(6_000, 168.0, 42.0, 0.0, 0.0, origins)
 
 
+def _synthetic_meter_observation() -> object:
+    meter = worker_module.meter_module
+    yy, xx = np.mgrid[0 : meter.METER_ROWS, 0 : meter.METER_WIDTH]
+    field = 0.08 + 0.82 * (
+        0.55 * xx / (meter.METER_WIDTH - 1)
+        + 0.45 * yy / (meter.METER_ROWS - 1)
+    )
+    image = np.empty(
+        (meter.METER_ROWS, meter.METER_WIDTH, 4),
+        dtype=np.uint16,
+    )
+    for channel_index, peak in enumerate(
+        (28_000, 31_000, 34_000, 29_000)
+    ):
+        image[:, :, channel_index] = np.round(
+            900 + peak * field
+        ).astype(np.uint16)
+    return meter.observe_meter_pass(
+        meter.DecodedMeterPass(
+            image=image,
+            row_tail=np.zeros(
+                (meter.METER_ROWS, meter.METER_TAIL_SAMPLES),
+                dtype=">u2",
+            ),
+        ),
+        worker_module.DEFAULT_EXPOSURES,
+    )
+
+
 class RecordingStreamSession:
     """Stand-in FineStreamSession that records every hook invocation."""
 
@@ -203,7 +233,11 @@ def _patch_continuation_common(
             ],
         },
     )
-    monkeypatch.setattr(worker_module, "observe_meter_pass", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        worker_module,
+        "observe_meter_pass",
+        lambda *_a, **_k: _synthetic_meter_observation(),
+    )
     monkeypatch.setattr(
         worker_module, "propose_next_exposures", lambda *_a, **_k: accepted_proposal
     )
@@ -411,7 +445,12 @@ def test_continuation_meter_evidence_is_accepted_by_publication_consumer(
 
     assert meter_rgbi.shape == (425, 281, 4)
     assert int(meter_rgbi[0, 0, 0]) == 0x1234
-    assert final_rgb == (
+    # The published final RGB is the commanded contract, which is now the
+    # guarded nikon-parity authority (device-bound clamped), not the active
+    # controller's solve.
+    commanded = journal["active_exposure_authority"]["commanded_channels_raw_10ns"]
+    assert final_rgb == (commanded["R"], commanded["G"], commanded["B"])
+    assert final_rgb != (
         worker_module.DEFAULT_EXPOSURES["R"],
         worker_module.DEFAULT_EXPOSURES["G"],
         worker_module.DEFAULT_EXPOSURES["B"],
