@@ -2536,6 +2536,7 @@ mod tests {
                     texture_span: Some(0.15),
                 },
             }),
+            nikonlook: None,
         }
     }
 
@@ -2653,6 +2654,7 @@ mod tests {
             storage_transform: None,
             meter_rgbi_path: None,
             hardware_telemetry: None,
+            nikonlook: None,
         }
     }
 
@@ -3068,6 +3070,7 @@ mod tests {
             storage_transform: None,
             meter_rgbi_path: None,
             hardware_telemetry: None,
+            nikonlook: None,
         };
         // Attach the receipt both to the on-disk manifest (the production
         // path) and to the in-memory project state so the subsequent

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """render_references.py -- renders fresh nikonlook color reference TIFFs for
-Scan Studio's parity harness (nikon-coolscan4-software-archaeology, phase
-13-parity-harness, plan 13-02) by invoking negfit's frozen nikonlook_core.py
-API (load_bundle / estimate_gains / apply) directly against each corpus
-slot's own raw RGB capture.
+Scan Studio's parity harness (phase 13-parity-harness, plan 13-02) by
+invoking negfit's frozen nikonlook_core.py API (load_bundle / estimate_gains
+/ apply) directly against each corpus slot's own raw RGB capture.
 
-This script lives OUTSIDE the nikon-coolscan4-software-archaeology repo (GPL
-reference code stays external -- see that repo's CLAUDE.md licensing
-constraint) and is never copied into it. By default it writes
-`acceptance_slotNN_reference_color_<bundle>.tif` next to the corpus, which
-is what app/ScanStudio/engine/src/bin/parity.rs looks for as the color
-module's reference. Pass --output-dir to write elsewhere instead (e.g. when
-the corpus directory itself must stay read-only) -- see PARITY.md for the
-current run's chosen path if --output-dir was used.
+This script is vendored in this repository, at `bridge/tools/`. The GPL
+reference code it CALLS -- negfit's nikonlook_core.py -- is the thing that
+must stay external so this repository's MIT licence is not entangled; this
+script itself is MIT-licensed like the rest of this repository and has
+always been intended to ship with it. Point --negfit-path at a checkout of
+that external negfit source (no default -- see that flag's own --help).
+By default it writes `acceptance_slotNN_reference_color_<bundle>.tif` next
+to the corpus, which is what app/ScanStudio/engine/src/bin/parity.rs looks
+for as the color module's reference. Pass --output-dir to write elsewhere
+instead (e.g. when the corpus directory itself must stay read-only) -- see
+PARITY.md for the current run's chosen path if --output-dir was used.
 """
 
 from __future__ import annotations
@@ -34,6 +36,20 @@ SLOT_COUNT = 6
 # these renders for Phase 14 -- if it differs, fix this divisor and re-run.
 FULL_SCALE = 65535.0
 
+# This checkout's own vendored nikonlook-v2 resources -- the exact
+# model.json/layer_a.json/manifest.json bytes the Rust engine embeds via
+# include_str! (see app/ScanStudio/engine/src/processing/nikonlook.rs and
+# that directory's own PROVENANCE.md). Computed from this script's own path
+# rather than hardcoded, so it resolves correctly in any checkout, not just
+# the one it was written on. Used as --bundle's default: a reference
+# rendered without --bundle is then guaranteed to match the bundle version
+# app/ScanStudio/engine/src/bin/parity.rs actually scores candidates
+# against, and no maintainer-specific path needs to appear here at all
+# (this used to default to a maintainer's home directory).
+DEFAULT_BUNDLE_DIR = (
+    Path(__file__).resolve().parents[2] / "app/ScanStudio/engine/resources/nikonlook-v2"
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -46,13 +62,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--bundle",
-        default="~/Downloads/digital-ice-2026/negfit/bundles/nikonlook-v1",
-        help="Path to the negfit bundle directory (default: nikonlook-v1)",
+        default=str(DEFAULT_BUNDLE_DIR),
+        help=(
+            "Path to the negfit bundle directory (default: this checkout's "
+            "own vendored nikonlook-v2 resources -- see DEFAULT_BUNDLE_DIR "
+            "above). Pass this explicitly to render against a different "
+            "bundle version, e.g. a nikonlook-v1 checkout for "
+            "load_bundle_v1()-based comparison tooling."
+        ),
     )
     parser.add_argument(
         "--negfit-path",
-        default="~/Downloads/digital-ice-2026/negfit",
-        help="Path to negfit's directory, added to sys.path so nikonlook_core can be imported",
+        default=None,
+        help=(
+            "Path to negfit's directory, added to sys.path so nikonlook_core "
+            "can be imported. Required -- negfit is GPL-labeled reference "
+            "code that stays external to this repository (see this file's "
+            "own module docstring), so there is no in-checkout path to "
+            "default to."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -70,6 +98,11 @@ def parse_args() -> argparse.Namespace:
     if not args.corpus:
         parser.error(
             "--corpus not given and SCANSTUDIO_PARITY_CORPUS is not set in the environment"
+        )
+    if not args.negfit_path:
+        parser.error(
+            "--negfit-path is required (no default -- see --help): point it at a checkout "
+            "of negfit's GPL-licensed source"
         )
     return args
 
@@ -121,7 +154,7 @@ def main() -> int:
         out_u16 = np.clip(nikon_rgb_device * FULL_SCALE + 0.5, 0, 65535).astype(np.uint16)
 
         # 7. Write using the exact filename bin/parity.rs looks for.
-        bundle_tag = Path(args.bundle).name  # e.g. "nikonlook-v1"
+        bundle_tag = Path(args.bundle).name  # e.g. "nikonlook-v2"
         out_path = output_dir / f"{base}_reference_color_{bundle_tag}.tif"
         tifffile.imwrite(str(out_path), out_u16, photometric="rgb")
         written += 1

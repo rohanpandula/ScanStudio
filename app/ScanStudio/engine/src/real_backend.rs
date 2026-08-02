@@ -2882,9 +2882,12 @@ fn nikonlook_exposure_meta_enabled() -> bool {
 /// own exposure telemetry (µs -> 10ns ticks, RGB order), gated by
 /// `nikonlook_exposure_meta_enabled`. `None` whenever the gate is off, or
 /// whenever any of the three channels isn't a finite positive value —
-/// `estimate_gains`'s exposure path requires all three (see its own
-/// `debug_assert!`), and a partially-populated or degenerate receipt should
-/// fall back to the blind estimator rather than feed it a bad ratio.
+/// `estimate_gains`'s exposure path only trusts a value that passes
+/// `processing::nikonlook::exposure_is_usable` (finite and > 0 on every
+/// channel), routing anything else to its blind fallback instead of
+/// asserting or erroring (see that function's own doc comment), so a
+/// partially-populated or degenerate receipt is caught here too rather than
+/// relying solely on that downstream fallback.
 fn nikonlook_exposure_10ns_from_receipt(exposure: &BridgeExposureVector) -> Option<[f64; 3]> {
     if !nikonlook_exposure_meta_enabled() {
         return None;
@@ -2996,6 +2999,11 @@ fn build_real_receipt(
             focus_detail: map_focus_detail_telemetry(&bridge_receipt.focus_detail),
             transport_smear: map_transport_smear_assessment(&bridge_receipt.transport_smear),
         }),
+        // Derivative rendering (and thus nikonlook) hasn't run yet at this
+        // point -- mirrors `outputs: None` above. Patched in alongside
+        // `outputs` once `render_derivative_from_archive_with_processing`
+        // actually completes, from its own `WrittenPaths.nikonlook`.
+        nikonlook: None,
     }
 }
 
@@ -4574,6 +4582,10 @@ fn run_real_scan_job_inner(
                                         .preview_path
                                         .map(|path| path.display().to_string()),
                                 });
+                                // Which nikonlook bundle/path/gains actually
+                                // rendered this frame -- see build_real_receipt's
+                                // own `nikonlook: None` comment above.
+                                receipt.nikonlook = written.nikonlook;
                                 if let Ok(mut evidence) = shared_evidence.lock() {
                                     if let Some(frame) = evidence.iter_mut().rev().find(|value| value.frame_index == frame_completed.slot) {
                                         frame.engine_receipt["receipt"] = serde_json::to_value(&receipt)

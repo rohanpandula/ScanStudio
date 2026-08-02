@@ -14,6 +14,7 @@ use scanstudio_engine::parity::image_io;
 use scanstudio_engine::parity::scoring;
 use scanstudio_engine::parity::{CorpusSlot, ModuleKind, ModuleScore, ModuleStatus, ParityReport};
 use scanstudio_engine::processing::geometry;
+use scanstudio_engine::processing::nikonlook;
 
 struct Args {
     json: bool,
@@ -84,9 +85,21 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Load once: the color module's reference filename is derived from
+    // whichever bundle version is actually loaded here, not hardcoded, so
+    // this harness can never compare a candidate against a different
+    // model's reference render (Finding 1 -- see score_color's own doc
+    // comment). This is the exact same `load_bundle()` call
+    // `render_color_candidates`/`parity::candidates::render_color_candidate`
+    // use to render the candidates being scored.
+    let bundle = match nikonlook::load_bundle() {
+        Ok(bundle) => bundle,
+        Err(err) => fatal(&format!("failed to load nikonlook bundle: {err}")),
+    };
+
     let mut scores = Vec::new();
     for slot in &manifest.slots {
-        scores.push(score_color(slot, &root, args.candidate_dir.as_deref()));
+        scores.push(score_color(slot, &root, args.candidate_dir.as_deref(), &bundle.bundle_version));
         scores.push(score_ice(slot, &root, args.candidate_dir.as_deref()));
         scores.push(score_autocrop(slot, &root, args.candidate_dir.as_deref()));
         scores.push(score_deskew(slot, &root, args.candidate_dir.as_deref()));
@@ -109,29 +122,44 @@ fn main() {
     std::process::exit(if report.has_any_failure() { 1 } else { 0 });
 }
 
-/// Color module: reference is `{root}/acceptance_slot{NN}_reference_color_nikonlook-v1.tif`
-/// (the naming convention Task 3's `render_references.py` writes), with a
-/// fallback to `$SCANSTUDIO_PARITY_REFS/acceptance_slot{NN}_reference_color_nikonlook-v1.tif`
-/// when the colocated file doesn't exist.
-fn score_color(slot: &CorpusSlot, root: &Path, candidate_dir: Option<&Path>) -> ModuleScore {
-    let reference_path = resolve_reference_path(
-        root,
-        &format!("acceptance_slot{:02}_reference_color_nikonlook-v1.tif", slot.slot),
-    );
+/// Color module: reference is
+/// `{root}/acceptance_slot{NN}_reference_color_{bundle_version}.tif`, with a
+/// fallback to
+/// `$SCANSTUDIO_PARITY_REFS/acceptance_slot{NN}_reference_color_{bundle_version}.tif`
+/// when the colocated file doesn't exist. `bundle_version` is
+/// `main`'s own loaded `nikonlook::load_bundle().bundle_version` —
+/// never hardcoded — because `render_color_candidates`/
+/// `parity::candidates::render_color_candidate` render the candidate this
+/// row scores with that exact same `load_bundle()` call. `COLOR_DELTA_E76_TOLERANCE`
+/// (`scoring.rs`) is a port-fidelity tolerance: it exists to prove the Rust
+/// port reproduces the Python reference of the SAME bundle, not to compare
+/// two different models' output. Deriving the filename from the bundle
+/// actually in use, instead of a fixed `nikonlook-v1` literal, is what
+/// keeps that guarantee true after a bundle upgrade (e.g. `load_bundle()`
+/// switching from `nikonlook-v1` to `nikonlook-v2`): a v2 candidate now
+/// only ever looks for a v2 reference, and reports `no_reference` — not a
+/// mismatched pass or fail — when that reference doesn't exist yet.
+fn score_color(slot: &CorpusSlot, root: &Path, candidate_dir: Option<&Path>, bundle_version: &str) -> ModuleScore {
+    let reference_filename = format!("acceptance_slot{:02}_reference_color_{bundle_version}.tif", slot.slot);
+    let reference_path = resolve_reference_path(root, &reference_filename);
 
     let Some(reference_path) = reference_path else {
         return no_reference_score(
             ModuleKind::Color,
             slot.slot,
             "delta_e76",
-            "no nikonlook reference render found; run render_references.py (see PARITY.md)",
+            &format!(
+                "no {bundle_version} reference render found (expected {reference_filename:?}, \
+                 colocated with the corpus or under $SCANSTUDIO_PARITY_REFS); produce it with \
+                 `bridge/tools/render_references.py --bundle <path-to-{bundle_version}-bundle> \
+                 --corpus <corpus>` — see PARITY.md"
+            ),
         );
     };
 
-    let reference_provenance = Some(
-        "freshly rendered via render_references.py from nikonlook_core.py (bundle nikonlook-v1) — see PARITY.md"
-            .to_string(),
-    );
+    let reference_provenance = Some(format!(
+        "freshly rendered via render_references.py from nikonlook_core.py (bundle {bundle_version}) — see PARITY.md"
+    ));
 
     let candidate_path = candidate_dir
         .map(|dir| dir.join("color").join(format!("acceptance_slot{:02}.tif", slot.slot)))
@@ -551,6 +579,30 @@ fn print_human_table(report: &ParityReport) {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             score.module, score.slot, status_str, score.metric_name, metric_value, threshold, note
+        );
+    }
+
+    // A per-row `no_reference`/`fail` in a long table is easy to scan past.
+    // `report.has_any_failure()` is what actually decides this run's exit
+    // code (see its own doc comment — `no_reference` counts), so the
+    // summary below must count exactly the same statuses it does, or a
+    // human reading this table could see "FAILED" without the row that
+    // caused it, or see silence and miss a nonzero exit.
+    if report.has_any_failure() {
+        let fail_count = report
+            .scores
+            .iter()
+            .filter(|score| matches!(score.status, ModuleStatus::Fail))
+            .count();
+        let no_reference_count = report
+            .scores
+            .iter()
+            .filter(|score| matches!(score.status, ModuleStatus::NoReference { .. }))
+            .count();
+        println!(
+            "\nFAILED: {fail_count} fail, {no_reference_count} no_reference (a module reporting \
+             no_reference was never actually compared — see PARITY.md §3/§7 for how to render \
+             the missing reference)"
         );
     }
 }

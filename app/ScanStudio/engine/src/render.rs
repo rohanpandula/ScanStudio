@@ -1621,12 +1621,23 @@ fn metadata_date_tokens(date: Option<&domain::PartialDate>) -> (String, String, 
 /// `real_backend.rs`), `None` otherwise (simulator, or the exposure path
 /// opted out), which routes v2 to its blind fallback instead of the
 /// hardware-exposure inverse.
+///
+/// Returns the rendered positive plus, for a C41 frame, the nikonlook
+/// provenance (bundle version, which Layer-A path actually ran, the exact
+/// gains applied) so a caller can surface it in the frame's receipt — see
+/// `domain::NikonlookProvenance`. `None` for every non-C41 process, which
+/// never touches nikonlook at all. `exposure_10ns.is_some()` alone is NOT
+/// enough to determine which path ran: `estimate_gains` silently falls
+/// back to blind on an unusable exposure value (Finding 5), so the actual
+/// path is derived here via `nikonlook::exposure_is_usable` — the same
+/// predicate `estimate_gains` itself gates on — rather than assumed from
+/// the caller's input.
 fn render_positive(
     film_process: domain::FilmProcess,
     raw: &[[f64; 3]],
     width: usize,
     exposure_10ns: Option<[f64; 3]>,
-) -> Result<Vec<[f64; 3]>, domain::EngineError> {
+) -> Result<(Vec<[f64; 3]>, Option<domain::NikonlookProvenance>), domain::EngineError> {
     match film_process {
         domain::FilmProcess::C41ColorNegative => {
             let bundle = crate::processing::nikonlook::load_bundle().map_err(|err| {
@@ -1642,16 +1653,29 @@ fn render_positive(
                         format!("nikonlook gain estimation failed: {err}"),
                     )
                 })?;
-            Ok(crate::processing::nikonlook::apply(raw, k, &bundle))
+            let positive = crate::processing::nikonlook::apply(raw, k, &bundle);
+            let layer_a_path = if exposure_10ns.is_some_and(crate::processing::nikonlook::exposure_is_usable) {
+                domain::NikonlookLayerAPath::HardwareExposure
+            } else {
+                domain::NikonlookLayerAPath::Blind
+            };
+            let provenance = domain::NikonlookProvenance {
+                bundle_version: bundle.bundle_version.clone(),
+                layer_a_path,
+                gains: k,
+            };
+            Ok((positive, Some(provenance)))
         }
-        domain::FilmProcess::BwNegative => Ok(raw
-            .iter()
-            .map(|pixel| {
-                let inverted = 1.0 - (pixel[0] + pixel[1] + pixel[2]) / 3.0;
-                [inverted, inverted, inverted]
-            })
-            .collect()),
-        domain::FilmProcess::Positive | domain::FilmProcess::Kodachrome => Ok(raw.to_vec()),
+        domain::FilmProcess::BwNegative => Ok((
+            raw.iter()
+                .map(|pixel| {
+                    let inverted = 1.0 - (pixel[0] + pixel[1] + pixel[2]) / 3.0;
+                    [inverted, inverted, inverted]
+                })
+                .collect(),
+            None,
+        )),
+        domain::FilmProcess::Positive | domain::FilmProcess::Kodachrome => Ok((raw.to_vec(), None)),
     }
 }
 
@@ -1896,6 +1920,7 @@ pub fn render_derivative_from_archive_with_processing(
             archive_path: recipes.archive.enabled.then(|| archive_rgb_path.to_path_buf()),
             positive_path: None,
             preview_path: None,
+            nikonlook: None,
         });
     }
 
@@ -1966,7 +1991,8 @@ pub fn render_derivative_from_archive_with_processing(
         .collect();
     drop(raw_image);
 
-    let positive_full = render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?;
+    let (positive_full, nikonlook) =
+        render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?;
     drop(raw_linear);
     let positive_full = if processing.film_process == domain::FilmProcess::BwNegative
         && processing.software_dust_removal_bw
@@ -2033,6 +2059,7 @@ pub fn render_derivative_from_archive_with_processing(
         archive_path,
         positive_path,
         preview_path,
+        nikonlook,
     })
 }
 
@@ -2385,6 +2412,10 @@ pub struct WrittenPaths {
     pub archive_path: Option<std::path::PathBuf>,
     pub positive_path: Option<std::path::PathBuf>,
     pub preview_path: Option<std::path::PathBuf>,
+    /// See `render_positive`'s own doc comment. `None` whenever no
+    /// positive/preview was rendered this call, or the rendered frame
+    /// wasn't C41.
+    pub nikonlook: Option<domain::NikonlookProvenance>,
 }
 
 /// Renders one frame's deterministic simulated pixel data and writes the
@@ -2437,13 +2468,16 @@ pub fn render_and_write_frame_with_processing(
 
     let mut positive_path: Option<std::path::PathBuf> = None;
     let mut preview_path: Option<std::path::PathBuf> = None;
+    let mut nikonlook_provenance: Option<domain::NikonlookProvenance> = None;
 
     if recipes.positive.enabled || recipes.preview.enabled {
         // Computed once -- both derivatives share it rather than each
         // calling render_positive (and thus reloading/re-estimating
         // nikonlook) independently. The simulator has no hardware exposure
         // to report, so nikonlook v2 always uses its blind fallback here.
-        let positive_raw_full = render_positive(processing.film_process, &raw, width as usize, None)?;
+        let (positive_raw_full, provenance) =
+            render_positive(processing.film_process, &raw, width as usize, None)?;
+        nikonlook_provenance = provenance;
         let positive_raw_full = if processing.film_process == domain::FilmProcess::BwNegative
             && processing.software_dust_removal_bw
         {
@@ -2489,6 +2523,7 @@ pub fn render_and_write_frame_with_processing(
         archive_path,
         positive_path,
         preview_path,
+        nikonlook: nikonlook_provenance,
     })
 }
 
@@ -3252,19 +3287,99 @@ mod tests {
     #[test]
     fn render_positive_actually_transforms_c41_color_negative() {
         let raw = generate_sim_frame("sim-ls5000-0", 1, 8, 6);
-        let out = render_positive(domain::FilmProcess::C41ColorNegative, &raw, 8, None)
+        let (out, provenance) = render_positive(domain::FilmProcess::C41ColorNegative, &raw, 8, None)
             .expect("nikonlook bundle must load and apply");
         assert_ne!(out, raw, "nikonlook must actually transform the data");
+
+        // Finding 2: a C41 render must surface its nikonlook provenance --
+        // no exposure metadata supplied, so the blind path must have run.
+        let provenance = provenance.expect("a C41 render must report nikonlook provenance");
+        assert_eq!(provenance.bundle_version, "nikonlook-v2");
+        assert_eq!(provenance.layer_a_path, domain::NikonlookLayerAPath::Blind);
+        assert!(
+            provenance.gains.iter().all(|value| value.is_finite() && *value > 0.0),
+            "reported gains must be the real, finite, positive values estimate_gains returned: {:?}",
+            provenance.gains
+        );
+
+        // The reported gains must be exactly what produced `out`, not a
+        // separately-computed or stale value: re-applying them from scratch
+        // against a freshly loaded bundle must reproduce the actual render.
+        let bundle = crate::processing::nikonlook::load_bundle().expect("real v2 bundle must load");
+        let reapplied = crate::processing::nikonlook::apply(&raw, provenance.gains, &bundle);
+        assert_eq!(
+            reapplied, out,
+            "apply()'d output using the reported gains must equal the actual render"
+        );
+    }
+
+    /// Same literal as `processing::nikonlook`'s own Group J/N tests and
+    /// `tests/nikonlook_v2_fixture.rs`'s `EXPOSURE_10NS_FRAME5` -- a real,
+    /// usable exposure triple.
+    const USABLE_EXPOSURE_10NS: [f64; 3] = [127992.0, 312892.0, 259345.0];
+
+    #[test]
+    fn render_positive_c41_with_usable_exposure_labels_hardware_exposure() {
+        let raw = generate_sim_frame("sim-ls5000-0", 1, 8, 6);
+        let (out, provenance) = render_positive(
+            domain::FilmProcess::C41ColorNegative,
+            &raw,
+            8,
+            Some(USABLE_EXPOSURE_10NS),
+        )
+        .expect("nikonlook bundle must load and apply");
+
+        let provenance = provenance.expect("a C41 render must report nikonlook provenance");
+        assert_eq!(provenance.bundle_version, "nikonlook-v2");
+        assert_eq!(
+            provenance.layer_a_path,
+            domain::NikonlookLayerAPath::HardwareExposure,
+            "a usable exposure_10ns must route to the hardware-exposure path, not fall back to blind"
+        );
+
+        let bundle = crate::processing::nikonlook::load_bundle().expect("real v2 bundle must load");
+        let expected_gains =
+            crate::processing::nikonlook::estimate_gains(&raw, 8, Some(USABLE_EXPOSURE_10NS), &bundle)
+                .expect("exposure path never fails");
+        assert_eq!(
+            provenance.gains, expected_gains,
+            "reported gains must equal estimate_gains' own output for this exposure"
+        );
+        let reapplied = crate::processing::nikonlook::apply(&raw, provenance.gains, &bundle);
+        assert_eq!(reapplied, out, "apply()'d output using the reported gains must equal the actual render");
+    }
+
+    #[test]
+    fn render_positive_c41_with_malformed_exposure_falls_back_to_blind() {
+        let raw = generate_sim_frame("sim-ls5000-0", 1, 8, 6);
+        // Non-finite, zero, and negative components are all "unusable" --
+        // see processing::nikonlook::exposure_is_usable. One representative
+        // case here; that predicate's own exhaustive cases are covered by
+        // Group P in processing/nikonlook.rs.
+        let malformed = [f64::NAN, 312892.0, 259345.0];
+
+        let (_, provenance) =
+            render_positive(domain::FilmProcess::C41ColorNegative, &raw, 8, Some(malformed))
+                .expect("a malformed exposure must fall back to blind, never fail");
+
+        let provenance = provenance.expect("a C41 render must report nikonlook provenance");
+        assert_eq!(
+            provenance.layer_a_path,
+            domain::NikonlookLayerAPath::Blind,
+            "a malformed exposure_10ns must be treated like None, not silently divided into a gain"
+        );
     }
 
     #[test]
     fn render_positive_passthroughs_positive_kodachrome_and_neutral_inverts_bw_negative() {
         let raw = generate_sim_frame("sim-ls5000-0", 1, 8, 6);
         for process in [domain::FilmProcess::Positive, domain::FilmProcess::Kodachrome] {
-            let out = render_positive(process, &raw, 8, None).expect("passthrough never fails");
+            let (out, provenance) = render_positive(process, &raw, 8, None).expect("passthrough never fails");
             assert_eq!(out, raw, "{process:?} must be an exact passthrough");
+            assert!(provenance.is_none(), "{process:?} never runs nikonlook, so provenance must be None");
         }
-        let bw = render_positive(domain::FilmProcess::BwNegative, &raw, 8, None).unwrap();
+        let (bw, bw_provenance) = render_positive(domain::FilmProcess::BwNegative, &raw, 8, None).unwrap();
+        assert!(bw_provenance.is_none(), "BwNegative never runs nikonlook, so provenance must be None");
         for (source, rendered) in raw.iter().zip(bw) {
             let expected = 1.0 - (source[0] + source[1] + source[2]) / 3.0;
             assert_eq!(rendered, [expected; 3]);
@@ -3327,6 +3442,64 @@ mod tests {
         let positive = image_io::read_rgb16(written.positive_path.as_ref().unwrap())
             .expect("positive is a readable RGB16 TIFF");
         assert_eq!((positive.width, positive.height), (8, 6));
+
+        // This is the exact function real_backend.rs's `run_real_scan_job_inner`
+        // calls (`render_derivative_from_archive` is a thin exposure_10ns=None
+        // wrapper around `render_derivative_from_archive_with_processing`) --
+        // its `WrittenPaths.nikonlook` is copied verbatim into
+        // `ScanReceipt.nikonlook` there (`receipt.nikonlook = written.nikonlook;`).
+        // Proving it here, written for a real archive file on disk, is the
+        // closest feasible proof of that patch-in short of standing up a
+        // fake bridge subprocess to drive `run_real_scan_job_inner` itself.
+        let provenance = written.nikonlook.expect("a C41 archive render must report nikonlook provenance");
+        assert_eq!(provenance.bundle_version, "nikonlook-v2");
+        assert_eq!(
+            provenance.layer_a_path,
+            domain::NikonlookLayerAPath::Blind,
+            "render_derivative_from_archive supplies no exposure_10ns, so blind must have run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_archive_derivative_nikonlook_provenance_tracks_exposure_usability() {
+        let dir = unique_test_dir();
+        let archive_path = dir.join("Archive").join("Archive_0001.tif");
+        write_small_rgb16_tiff(&archive_path, 8, 6);
+
+        let mut recipes = domain::OutputRecipe::default();
+        recipes.preview.enabled = false;
+        let processing = domain::ProcessingRecipe {
+            film_process: domain::FilmProcess::C41ColorNegative,
+            ..domain::ProcessingRecipe::default()
+        };
+
+        // A usable exposure -- the real_backend.rs path opted into it and
+        // the bridge supplied a finite, positive triple.
+        recipes.positive.destination = dir.join("Hardware").display().to_string();
+        let written_hardware = render_derivative_from_archive_with_processing(
+            &archive_path, 1, &processing, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01),
+            None, None, None, Some(USABLE_EXPOSURE_10NS),
+        )
+        .expect("render real derivatives");
+        let hardware_provenance = written_hardware
+            .nikonlook
+            .expect("a C41 archive render must report nikonlook provenance");
+        assert_eq!(hardware_provenance.layer_a_path, domain::NikonlookLayerAPath::HardwareExposure);
+
+        // A malformed exposure -- must fall back to blind, never fail or
+        // silently divide a meaningless ratio into the gain.
+        recipes.positive.destination = dir.join("Malformed").display().to_string();
+        let written_malformed = render_derivative_from_archive_with_processing(
+            &archive_path, 1, &processing, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01),
+            None, None, None, Some([f64::NAN, 312892.0, 259345.0]),
+        )
+        .expect("a malformed exposure must fall back to blind, never fail");
+        let malformed_provenance = written_malformed
+            .nikonlook
+            .expect("a C41 archive render must report nikonlook provenance");
+        assert_eq!(malformed_provenance.layer_a_path, domain::NikonlookLayerAPath::Blind);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -77,6 +77,22 @@ unsafe impl GlobalAlloc for CountingAllocator {
 /// the counter is only ever read as a clean baseline.
 static SERIALIZE: Mutex<()> = Mutex::new(());
 
+/// Acquires `SERIALIZE`, recovering the guard even if a previous holder
+/// panicked while it was held, instead of propagating that as a
+/// `PoisonError` here. `SERIALIZE` protects mutual exclusion between these
+/// two tests' bodies only (see its own doc comment) -- it guards no shared
+/// data of its own (`Mutex<()>`, not e.g. `Mutex<Vec<...>>`), so a poisoned
+/// lock here reflects a previous TEST failing its own assertions, never
+/// data left in an inconsistent state by a panic mid-mutation. Propagating
+/// the poison anyway is exactly how one test's panic used to cascade into
+/// a second, unrelated failure for whichever test happened to run next in
+/// the same process (confirmed empirically: `cargo test --release
+/// --test-threads=1` before this fix failed BOTH tests, the second one
+/// only on `PoisonError`, never reaching its own logic at all).
+fn acquire_serialize() -> std::sync::MutexGuard<'static, ()> {
+    SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// How often to sample `CURRENT` while waiting for it to go quiet.
 const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -135,7 +151,7 @@ fn wait_for_allocator_quiescence() {
 
 #[test]
 fn counting_allocator_tracks_a_known_allocation() {
-    let _guard = SERIALIZE.lock().unwrap();
+    let _guard = acquire_serialize();
 
     // Whichever test acquires SERIALIZE first, treat the shared counter as
     // untrustworthy until it has held still for a while -- see the
@@ -148,6 +164,20 @@ fn counting_allocator_tracks_a_known_allocation() {
     let layout = Layout::from_size_align(known_size, 1).unwrap();
     let ptr = unsafe { std::alloc::alloc(layout) };
     assert!(!ptr.is_null(), "known-size allocation should succeed");
+
+    // In `--release`, a raw alloc/dealloc pair with nothing observably done
+    // to the memory in between is exactly the "dead allocation" pattern
+    // LLVM is free to remove outright, regardless of what the registered
+    // `#[global_allocator]` does on the side -- confirmed empirically: this
+    // probe's 10 MB `alloc` produced zero movement in `CURRENT` under
+    // `--release` before this write/read existed (`baseline == current`).
+    // A volatile write followed by a `black_box`ed volatile read is a real,
+    // non-elidable use of `ptr` sitting between the alloc and dealloc
+    // calls, so the compiler can no longer prove the pair has no effect --
+    // in both profiles, not just debug.
+    unsafe { std::ptr::write_volatile(ptr, 0xABu8) };
+    let observed = std::hint::black_box(unsafe { std::ptr::read_volatile(ptr) });
+    assert_eq!(observed, 0xAB, "the volatile probe write must read back before the counter check below");
 
     let current = CURRENT.load(Ordering::SeqCst);
     assert!(
@@ -165,7 +195,7 @@ fn counting_allocator_tracks_a_known_allocation() {
 
 #[test]
 fn sim_batch_scan_peak_memory_stays_within_a_few_frames_worth_not_the_whole_roll() {
-    let _guard = SERIALIZE.lock().unwrap();
+    let _guard = acquire_serialize();
 
     let dir = std::env::temp_dir().join(format!(
         "scanstudio-memtest-{}-{}",
