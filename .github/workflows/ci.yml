@@ -54,11 +54,8 @@ jobs:
         run: uv run pytest
 
   package:
-    name: Self-contained package check (macOS 14 floor)
-    # This job runs the packaged Python and loads the app-owned libusb on the
-    # oldest macOS version ScanStudio declares, not merely a newer SDK with a
-    # deployment-target load command.
-    runs-on: macos-14
+    name: Self-contained package build
+    runs-on: macos-15
     # See the bridge job: the relocatable package requires uv's standalone
     # CPython, not the runner image's framework Python.
     env:
@@ -90,3 +87,39 @@ jobs:
       - name: Build and verify the local package
         working-directory: app/ScanStudio
         run: make package
+      - name: Preserve the exact signed app for the macOS 14 runtime gate
+        working-directory: app/ScanStudio/.build
+        run: ditto -c -k --sequesterRsrc --keepParent ScanStudio.app ScanStudio-app.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScanStudio-app
+          path: app/ScanStudio/.build/ScanStudio-app.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  package-macos-14:
+    name: Self-contained package check (macOS 14 floor)
+    # Swift 6 is not available in the macOS 14 runner's Xcode. Build and sign
+    # once in the package job, then execute that exact arm64 app on the oldest
+    # supported OS. The relocated package check loads the app-owned libusb and
+    # exercises the bundled launchers without enumerating or moving hardware.
+    runs-on: macos-14
+    needs: package
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Warm the locked dependency cache for offline source verification
+        working-directory: bridge
+        run: uv sync --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-app
+          path: ${{ runner.temp }}/scanstudio-package
+      - name: Unpack and verify the exact signed app on macOS 14
+        run: |
+          ditto -x -k "$RUNNER_TEMP/scanstudio-package/ScanStudio-app.zip" "$RUNNER_TEMP/scanstudio-package/unpacked"
+          app/ScanStudio/scripts/test_packaged_bridge.sh "$RUNNER_TEMP/scanstudio-package/unpacked/ScanStudio.app"
