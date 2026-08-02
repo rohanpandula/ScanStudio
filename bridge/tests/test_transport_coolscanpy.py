@@ -1156,6 +1156,7 @@ def test_service_scan_start_pre_frame_roll_mismatch_names_the_first_slot_not_the
     svc.dispatch({"id": 3, "method": "roll.preview", "params": {"material": "colorNegative"}}, emit)
     _wait_for(lambda: emit.has("roll.previewComplete"))
     _wait_for(lambda: not svc._lane_held)
+    _wait_for(lambda: not svc._motion_op_active)
 
     svc.dispatch(
         {
