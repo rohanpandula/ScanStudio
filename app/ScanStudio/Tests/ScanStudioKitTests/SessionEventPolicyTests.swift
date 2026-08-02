@@ -2929,6 +2929,42 @@ struct SessionEventPolicyTests {
         #expect(model.frameOrientation(6) == 0)
     }
 
+    @Test("global photo shortcuts target focus while all six remain selected")
+    @MainActor
+    func globalPhotoShortcutsUseFocusedFrame() async throws {
+        let project = try projectLifecycleFixture(
+            id: "global-shortcut-project",
+            completedFrames: []
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: project)
+        )
+        await model.loadCarrier(.strip6)
+        #expect(model.performFrameTransformCommand(.rotateRight) == false)
+        model.selectAllFrames()
+        model.focusFrame(3)
+
+        #expect(model.performFrameTransformCommand(.rotateRight))
+        #expect(model.performFrameTransformCommand(.flipTopToBottom))
+        #expect(model.performFrameTransformCommand(.flipLeftToRight))
+
+        #expect(model.selectedFrames == [1, 2, 3, 4, 5, 6])
+        #expect(model.frameOrientation(3) == 90)
+        #expect(model.frameVerticalMirror(3))
+        #expect(model.frameMirror(3))
+        #expect(model.frameOrientation(2) == 0)
+        #expect(model.frameVerticalMirror(2) == false)
+        #expect(model.frameMirror(2) == false)
+
+        #expect(model.performFrameTransformCommand(.rotateRight, for: 2))
+        #expect(model.frameOrientation(2) == 90)
+        #expect(model.performFrameTransformCommand(.rotateRight, for: 99) == false)
+
+        model.focusFrame(99)
+        #expect(model.performFrameTransformCommand(.rotateLeft))
+        #expect(model.frameOrientation(3) == 0)
+    }
+
     @Test("invalid focus is ignored and a real media change clears focus")
     @MainActor
     func frameFocusIsValidatedAndClearsWithMedia() async throws {

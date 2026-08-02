@@ -275,13 +275,11 @@ struct ThumbnailGridView: View {
     private var rotationMenu: some View {
         Menu("Rotate", systemImage: "rotate.right") {
             Button(transformActionLabel("Rotate Left")) {
-                _ = sessionModel.rotateFocusedFrame(by: -90)
+                sessionModel.performFrameTransformCommand(.rotateLeft)
             }
-            .keyboardShortcut("l", modifiers: .command)
             Button(transformActionLabel("Rotate Right")) {
-                _ = sessionModel.rotateFocusedFrame(by: 90)
+                sessionModel.performFrameTransformCommand(.rotateRight)
             }
-            .keyboardShortcut("r", modifiers: .command)
             Button(transformActionLabel("Reset Rotation")) {
                 if let frameIndex = sessionModel.frameTransformTargetIndex {
                     sessionModel.resetFrameOrientation(frameIndex)
@@ -320,17 +318,11 @@ struct ThumbnailGridView: View {
     private var mirrorMenu: some View {
         Menu("Mirror", systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right") {
             Button(transformActionLabel("Flip Left to Right")) {
-                if let frameIndex = sessionModel.frameTransformTargetIndex {
-                    sessionModel.toggleFrameMirror(frameIndex)
-                }
+                sessionModel.performFrameTransformCommand(.flipLeftToRight)
             }
-            .keyboardShortcut("h", modifiers: [.command, .shift])
             Button(transformActionLabel("Flip Top to Bottom")) {
-                if let frameIndex = sessionModel.frameTransformTargetIndex {
-                    sessionModel.toggleFrameVerticalMirror(frameIndex)
-                }
+                sessionModel.performFrameTransformCommand(.flipTopToBottom)
             }
-            .keyboardShortcut("v", modifiers: [.command, .shift])
             Button(transformActionLabel("Reset Flips")) {
                 if let frameIndex = sessionModel.frameTransformTargetIndex {
                     sessionModel.resetFrameMirrors(frameIndex)
@@ -363,7 +355,7 @@ struct ThumbnailGridView: View {
         .disabled(sessionModel.frameTransformTargetIndex == nil)
         .help(sessionModel.frameTransformTargetIndex == nil
             ? "Click a frame to focus it, then flip it."
-            : "Flips the focused frame for display in this session only. Shift-Command-H flips left to right; Shift-Command-V flips top to bottom.")
+            : "Flips the focused frame for display in this session only. Shift-Command-H flips left to right; Option-Command-V flips top to bottom.")
     }
 
     private func transformActionLabel(_ action: String) -> String {

@@ -3145,6 +3145,40 @@ public final class SessionModel {
         return true
     }
 
+    /// One tested dispatch point for the app-wide Photo menu and its
+    /// keyboard shortcuts. Keeping this in the model means the global
+    /// commands and the on-screen menus cannot drift into different focus
+    /// or selection behavior.
+    @discardableResult
+    public func performFrameTransformCommand(
+        _ command: FrameTransformCommand
+    ) -> Bool {
+        guard let frameIndex = frameTransformTargetIndex else { return false }
+        return performFrameTransformCommand(command, for: frameIndex)
+    }
+
+    /// Applies a transform to the frame focused in the active app window.
+    /// The explicit target prevents a command from one window mutating the
+    /// frame focused in another window that shares this session model.
+    @discardableResult
+    public func performFrameTransformCommand(
+        _ command: FrameTransformCommand,
+        for frameIndex: Int
+    ) -> Bool {
+        guard validFrameIndices.contains(frameIndex) else { return false }
+        switch command {
+        case .rotateLeft:
+            rotateFrame(frameIndex, by: -90)
+        case .rotateRight:
+            rotateFrame(frameIndex, by: 90)
+        case .flipLeftToRight:
+            toggleFrameMirror(frameIndex)
+        case .flipTopToBottom:
+            toggleFrameVerticalMirror(frameIndex)
+        }
+        return true
+    }
+
     public func resetFrameOrientation(_ frameIndex: Int) {
         frameOrientations.removeValue(forKey: frameIndex)
     }
@@ -4074,6 +4108,15 @@ public enum FrameOrientation {
     public static func swapsLayoutAxes(_ degrees: Int) -> Bool {
         !normalized(degrees).isMultiple(of: 180)
     }
+}
+
+/// App-wide commands that change only the currently focused photo. Scan
+/// selection is deliberately not part of this type.
+public enum FrameTransformCommand: Sendable {
+    case rotateLeft
+    case rotateRight
+    case flipLeftToRight
+    case flipTopToBottom
 }
 
 /// Whether the "Resume Batch" action should be offered, given the engine's

@@ -413,7 +413,6 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .keyboardShortcut("l", modifiers: .command)
             .help("Rotate counter-clockwise—display only; saved output is unchanged")
 
             Button {
@@ -423,7 +422,6 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .keyboardShortcut("r", modifiers: .command)
             .help("Rotate clockwise—display only; saved output is unchanged")
 
             Button {
@@ -444,7 +442,6 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .keyboardShortcut("h", modifiers: [.command, .shift])
             .help("Flip left to right—display only; saved output is unchanged")
 
             Button {
@@ -454,7 +451,6 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .keyboardShortcut("v", modifiers: [.command, .shift])
             .help("Flip top to bottom—display only; saved output is unchanged")
 
             Button {

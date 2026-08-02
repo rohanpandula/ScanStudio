@@ -124,6 +124,10 @@ struct ContentView: View {
         .sheet(item: manualReviewRequestBinding) { request in
             ManualReviewScanSheet(request: request)
         }
+        .focusedSceneValue(
+            \.scanStudioFrameIndex,
+            sessionModel.frameTransformTargetIndex
+        )
     }
 
     private var manualReviewRequestBinding: Binding<ManualReviewScanRequest?> {
