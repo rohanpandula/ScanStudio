@@ -86,13 +86,14 @@ def _encode_index(rgb16: np.ndarray) -> bytes:
 def _synthetic_index(
     *,
     height: int = 6_104,
+    frame_count: int = 40,
     content_frames: int = 40,
+    leader: int = 128,
 ) -> np.ndarray:
-    """Make 40 textured cells separated by physical clear-film gaps."""
+    """Make textured cells separated by physical clear-film gaps."""
 
     pitch = 143
-    leader = 128
-    boundaries = [leader + index * pitch for index in range(41)]
+    boundaries = [leader + index * pitch for index in range(frame_count + 1)]
     y = np.arange(height, dtype=np.int64)[:, None]
     x = np.arange(90, dtype=np.int64)[None, :]
     texture = (x * 173 + y * 71 + (x * y) % 997) % 7_000
@@ -104,10 +105,10 @@ def _synthetic_index(
     aperture[: boundaries[0]] = clear_base + clear_noise[: boundaries[0]]
     aperture[boundaries[-1] :] = clear_base + clear_noise[boundaries[-1] :]
     for boundary in boundaries:
-        aperture[boundary - 3 : boundary + 3] = (
-            clear_base + clear_noise[boundary - 3 : boundary + 3]
-        )
-    if content_frames < 40:
+        start = max(0, boundary - 3)
+        end = min(height, boundary + 3)
+        aperture[start:end] = clear_base + clear_noise[start:end]
+    if content_frames < frame_count:
         clear_start = boundaries[content_frames]
         aperture[clear_start:] = clear_base + clear_noise[clear_start:]
     rgb = np.empty((height, 96, 3), dtype=np.int64)
@@ -136,6 +137,7 @@ def _preview_fixture(
     *,
     content_frames: int = 40,
     slot_capacity_hint: int = 40,
+    active_rgb: np.ndarray | None = None,
     density_capture_attempt_id: str | None = None,
     density_scan_identity: str | None = None,
 ) -> PreviewFixture:
@@ -156,12 +158,28 @@ def _preview_fixture(
     preview_path = attempt / "capture-preview.bin"
     table_path = attempt / "capture-008e.bin"
     mapping_path = attempt / "capture-frame-map.json"
-    rgb = _synthetic_index(
-        height=decoded_height,
-        content_frames=content_frames,
-    )
-    preview = _encode_index(rgb)
-    table = _transport_table(len(rgb))
+    if active_rgb is None:
+        rgb = _synthetic_index(
+            height=decoded_height,
+            content_frames=content_frames,
+        )
+        usable_rows = len(rgb)
+        preview = _encode_index(rgb)
+    else:
+        if active_rgb.ndim != 3 or active_rgb.shape[1:] != (96, 3):
+            raise ValueError("active preview RGB must have shape (rows, 96, 3)")
+        if not 0 < len(active_rgb) < decoded_height:
+            raise ValueError("active preview RGB must fit inside the allocation")
+        usable_rows = len(active_rgb)
+        rgb = np.zeros((decoded_height, 96, 3), dtype=np.uint16)
+        rgb[:usable_rows] = active_rgb
+        rows = np.frombuffer(_encode_index(rgb), dtype=">u2").copy().reshape(
+            decoded_height,
+            roll_index.INDEX_ROW_WORDS,
+        )
+        rows[usable_rows:] = rows[usable_rows]
+        preview = rows.astype(">u2", copy=False).tobytes()
+    table = _transport_table(usable_rows)
     preview_path.write_bytes(preview)
     table_path.write_bytes(table)
     density_session_id = "single-reservation-roll-preview"
@@ -479,6 +497,63 @@ def test_preview_session_accepts_the_observed_six_record_short_strip(
     assert len(session.slots) == 6
     assert fixture.result.density_evidence is not None
     assert fixture.result.density_evidence.source_binding.height == 1_162
+
+
+def test_preview_session_keeps_one_row_clipped_first_frame_for_review(
+    tmp_path: Path,
+) -> None:
+    complete = _synthetic_index(
+        height=882,
+        frame_count=6,
+        content_frames=6,
+        leader=0,
+    )
+    fixture = _preview_fixture(
+        tmp_path,
+        slot_capacity_hint=6,
+        active_rgb=complete[1:],
+    )
+
+    session = build_roll_preview_session(
+        fixture.result,
+        material=ScanMaterial.COLOR_NEGATIVE,
+    )
+
+    assert session.preview.usable_rows == 881
+    assert [slot.slot_id for slot in session.slots] == [1, 2, 3, 4, 5, 6]
+    assert [
+        (slot.start_boundary_row, slot.end_boundary_row) for slot in session.slots
+    ] == [
+        (0, 142),
+        (142, 285),
+        (285, 428),
+        (428, 571),
+        (571, 714),
+        (714, 857),
+    ]
+    leading = session.slots[0]
+    assert leading.manual_review
+    assert {
+        "start-outside-index-raster",
+        "partial-index-coverage",
+        "outside-index-raster",
+        "transport-origin-inferred",
+    }.issubset(leading.warnings)
+    assert leading.base_origin.method == "affine-guided-local-lookup"
+    assert leading.base_origin.manual_review
+    assert not leading.base_origin.automatic
+    np.testing.assert_array_equal(leading.thumbnail, fixture.rgb[:142])
+    assert all(
+        first.base_origin.native_origin < second.base_origin.native_origin
+        for first, second in zip(session.slots, session.slots[1:])
+    )
+
+    approval = session.approve_manual_origin(1, 0)
+    assert session.validate_manual_approval(
+        approval,
+        slot_id=1,
+        boundary_offset_rows=0,
+    )
 
 
 def test_preview_refuses_density_source_geometry_from_another_startup_count(

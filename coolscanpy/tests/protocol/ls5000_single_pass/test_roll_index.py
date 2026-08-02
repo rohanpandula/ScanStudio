@@ -246,22 +246,50 @@ def test_scanner_addressable_interval_count_keeps_interior_manual_cells() -> Non
     assert roll.scanner_addressable_interval_count(detection.intervals) == 6
 
 
-def test_clipped_leading_cell_remains_excluded_fail_closed() -> None:
+def test_one_row_clipped_leading_cell_is_exposed_for_manual_review() -> None:
     complete_rgb, _boundaries = _synthetic_roll(6, leader=0, tail=24)
     clipped_rgb = complete_rgb[1:]
 
     detection = _detect(clipped_rgb)
 
-    # Cropping even one row moves the fitted leading boundary outside the
-    # captured raster.  The near-complete leading cell must not be promoted
-    # ahead of the first wholly scanner-addressable lattice start.
+    # A one-row feed variation retains 99% of the first frame and the whole
+    # physical lattice. Expose that frame without silently treating its
+    # inferred leading boundary as automatic.
+    leading = detection.intervals[0]
+    assert leading.start_row == 0
+    assert leading.coverage_fraction == pytest.approx(142 / 143)
+    assert leading.count_supported
+    assert leading.manual_review
+    assert "start-outside-index-raster" in leading.review_reasons
+    assert "partial-index-coverage" in leading.review_reasons
+    scanner_frame_count = roll.scanner_addressable_interval_count(detection.intervals)
+    assert scanner_frame_count == 6
+
+    records = roll.parse_live_transport_records_bytes(
+        _live_extent(len(clipped_rgb)), maximum_rows=len(clipped_rgb)
+    )
+    mapping = roll.derive_transport_mapping(
+        detection.boundaries, scanner_frame_count, records
+    )
+    assert len(mapping.origins) == 6
+    assert mapping.origins[0].manual_review
+    assert not mapping.origins[0].automatic
+    assert "outside-index-raster" in mapping.origins[0].review_reasons
+    assert "transport-origin-inferred" in mapping.origins[0].review_reasons
+    assert all(
+        first.native_origin < second.native_origin
+        for first, second in zip(mapping.origins, mapping.origins[1:])
+    )
+
+
+def test_two_row_clipped_leading_cell_remains_excluded_fail_closed() -> None:
+    complete_rgb, _boundaries = _synthetic_roll(6, leader=0, tail=24)
+    clipped_rgb = complete_rgb[2:]
+
+    detection = _detect(clipped_rgb)
+
     assert detection.frame_starts[0] > 100
-    complete = [
-        interval
-        for interval in detection.intervals
-        if interval.coverage_fraction == 1.0 and interval.count_supported
-    ]
-    assert len(complete) == 5
+    assert roll.scanner_addressable_interval_count(detection.intervals) == 5
 
 
 def test_channel_gain_changes_do_not_move_detected_boundaries() -> None:

@@ -946,8 +946,9 @@ def detect_roll_frames(
     # local evidence window needs neighbours on both sides.  The extended
     # lattice used here has already been fitted, so applying that margin again
     # silently drops a complete first cell whose rounded boundary is row 0 or
-    # row 1.  Admit those fully in-raster starts.  A genuinely clipped leading
-    # cell still has a negative start and remains excluded fail-closed.
+    # row 1. Admit those fully in-raster starts. A content-supported cell that
+    # starts exactly one row before the raster remains visible for manual
+    # review below; larger leading clips remain excluded fail-closed.
     lattice_starts = [
         index
         for index, row in enumerate(all_positions[:-1])
@@ -956,6 +957,20 @@ def detect_roll_frames(
     if not lattice_starts:
         raise IndexDecodeError("roll detector found no in-raster lattice origin")
     cell_start = lattice_starts[0]
+    preceding_cell = cell_start - 1
+    if (
+        preceding_cell >= 0
+        and int(all_positions[preceding_cell]) == -1
+        and float(cell_coverage[preceding_cell]) >= 0.99
+        and bool(cell_supported[preceding_cell])
+    ):
+        # A normal feed can place the fitted leading boundary one preview row
+        # before the saved raster while retaining more than 99% of a real
+        # first frame. Keep that frame visible for explicit manual review;
+        # ``make_boundary`` clamps its thumbnail to row zero and the transport
+        # mapper independently infers a same-capture origin. Larger clips stay
+        # excluded because they no longer meet this exact one-row contract.
+        cell_start = preceding_cell
     in_raster_starts = np.flatnonzero(
         (all_positions[:-1] >= all_positions[cell_start])
         & (all_positions[:-1] < len(evidence))

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Whole-roll preview now keeps a content-supported leading frame when an
+otherwise valid feed places its fitted start exactly one 97-dpi preview row
+before the captured raster. The thumbnail is clamped to row zero, its
+same-capture transport origin is inferred from the validated interior mapping,
+and the frame remains blocked on explicit manual review; clips of two or more
+rows are still excluded fail-closed. This prevents a six-exposure strip from
+being silently presented as five after a one-row feed variation.
+
 Transparent macOS app bundles can now pin PyUSB to an app-owned libusb
 without pretending the interpreter is PyInstaller-frozen. The resolver accepts
 only the fixed `*.app/Contents/Resources/BridgeRuntime/python/bin` interpreter
