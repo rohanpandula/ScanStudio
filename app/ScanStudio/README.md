@@ -115,6 +115,12 @@ SCANSTUDIO_BRIDGE_CMD=/path/to/scanstudio-bridge make run
 - **Broken or incompatible bridge:** the engine reports the startup problem
   and remains simulator-only; it does not create a half-connected device.
 
+When the packaged launcher selects any working bridge, it automatically
+prepares that app session for film movement. Launch itself performs no scanner
+operation; only explicit Preview, Scan, and Eject actions can move film. Direct
+bridge and developer launches still need to provide the two-part authorization
+described in `protocol/BRIDGE.md`.
+
 `python-sane` is the bundled Python binding only. A compatible system SANE
 backend and libusb driver remain external prerequisites for the tested
 LS-5000 path. On the tested Apple Silicon configuration, install them with

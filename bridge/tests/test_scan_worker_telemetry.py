@@ -62,13 +62,15 @@ def _wait_for(predicate, timeout: float = 3.0) -> None:
 def _wait_for_preview_complete_and_lane_free(
     svc: service.BridgeService, emit: "_RecordingEmit"
 ) -> None:
-    """roll.previewComplete is emitted before that same worker's `finally`
-    block actually releases the lane -- waiting for the event alone risks
-    a following scan.start's own HardwareLane.__enter__() spuriously
-    observing HARDWARE_LANE_BUSY (see test_service_dispatch.py's identical
-    helper/comment)."""
+    """Wait until the preview worker has released both motion gates.
+
+    The terminal callback runs after the lane is released but just before
+    `_motion_op_active` is cleared. Waiting only for the event and lane can
+    therefore race a following scan.start on a fast CI runner.
+    """
     _wait_for(lambda: emit.has("roll.previewComplete"))
     _wait_for(lambda: not svc._lane_held)
+    _wait_for(lambda: not svc._motion_op_active)
 
 
 def _read_telemetry(base_dir: Path, session_id: str) -> list[dict]:

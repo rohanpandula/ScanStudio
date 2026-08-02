@@ -10,13 +10,62 @@ fi
 bridge_cmd="${SCANSTUDIO_BRIDGE_CMD:-}"
 bridge_source=""
 
+arm_packaged_motion() {
+    if [[ -z "${HOME:-}" || "$HOME" != /* ]]; then
+        print -u2 "ScanStudio: cannot enable film movement because HOME is unavailable."
+        return 78
+    fi
+    # A single per-user base keeps every packaged app instance on the same
+    # advisory hardware lane. Developer-only bridge launches may override
+    # their base separately, but the packaged app must never split the lock.
+    local base_dir="$HOME/.scanstudio"
+
+    local latch="$base_dir/hw-motion-armed"
+    local temporary_latch=""
+
+    if ! mkdir -p "$base_dir"; then
+        print -u2 "ScanStudio: could not prepare its scanner safety directory."
+        return 78
+    fi
+    if [[ -e "$latch" || -L "$latch" ]]; then
+        if [[ ! -f "$latch" || -L "$latch" ]]; then
+            print -u2 "ScanStudio: the film-movement authorization is not a regular file."
+            return 78
+        fi
+    fi
+
+    if ! temporary_latch="$(umask 077; mktemp "$base_dir/.hw-motion-armed.XXXXXX")"; then
+        print -u2 "ScanStudio: could not create a private film-movement authorization."
+        return 78
+    fi
+    if ! (
+        umask 077
+        print -r -- "scanstudio-app-session" > "$temporary_latch"
+        chmod 600 "$temporary_latch"
+        mv -f "$temporary_latch" "$latch"
+    ); then
+        rm -f "$temporary_latch"
+        print -u2 "ScanStudio: could not enable film movement for this app session."
+        return 78
+    fi
+
+    if [[ ! -f "$latch" || -L "$latch" || ! -s "$latch" ]]; then
+        print -u2 "ScanStudio: film-movement authorization could not be verified."
+        return 78
+    fi
+
+    export SCANSTUDIO_BRIDGE_BASE_DIR="$base_dir"
+    export SCANSTUDIO_HW_MOTION=1
+}
+
 # Resolution is deliberately ordered: explicit environment configuration,
 # then a one-line user config file, then the signed app's bundled helper, and
 # finally PATH. `bridge-command` is a literal bridge command (path plus
 # optional arguments), not shell code, and is passed to the engine unchanged.
 #
-# This launcher *only* selects a command. It never enables motion and never
-# reads, creates, or changes the bridge's armed latch.
+# Once a bridge is selected, this launcher also prepares the two-part motion
+# authorization inherited by that one app session. It never sends a preview,
+# scan, eject, or any other hardware command itself.
 if [[ -n "${bridge_cmd//[[:space:]]/}" ]]; then
     bridge_source="SCANSTUDIO_BRIDGE_CMD"
 elif [[ -n "$config_file" && -r "$config_file" ]]; then
@@ -48,14 +97,15 @@ fi
 
 if [[ -n "${bridge_cmd//[[:space:]]/}" ]]; then
     export SCANSTUDIO_BRIDGE_CMD="$bridge_cmd"
+    # Opening the packaged hardware app is the operator's authorization for
+    # later explicit Preview, Scan, and Eject actions. Launching alone sends
+    # no motion command. The bridge still re-checks this session-scoped
+    # environment value and the shared on-disk latch before every action.
+    arm_packaged_motion || exit $?
     print -u2 "ScanStudio: hardware bridge configured from $bridge_source."
 else
     unset SCANSTUDIO_BRIDGE_CMD || true
     print -u2 "ScanStudio: no hardware bridge found; launching simulator-only. Set SCANSTUDIO_BRIDGE_CMD, add a command to $config_hint, install scanstudio-bridge on PATH, or use an app bundle with its helper included."
 fi
 
-# Do not arm motion here. A real bridge still requires the operator's explicit
-# SCANSTUDIO_HW_MOTION=1 plus its own pre-existing non-empty armed latch before
-# it moves. In particular, this launcher neither creates nor modifies that
-# latch.
 exec "$launcher_dir/ScanStudio"

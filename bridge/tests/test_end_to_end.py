@@ -78,13 +78,9 @@ class _RecordingEmit:
 
 
 def _wait_for_idle(svc: service.BridgeService) -> None:
-    """Waits until BridgeService's own bookkeeping shows the hardware lane
-    free -- roll.previewComplete/scan.completed are emitted from inside a
-    worker's `try` block, strictly before that same worker's `finally`
-    actually releases the HardwareLane, so a following motion-capable
-    dispatch must wait for this, not just the event, to avoid a spurious
-    HARDWARE_LANE_BUSY race against the still-finishing prior worker."""
+    """Wait until BridgeService has released the lane and reporting gate."""
     _wait_for(lambda: not svc._lane_held)
+    _wait_for(lambda: not svc._motion_op_active)
 
 
 def _hello_open_service(

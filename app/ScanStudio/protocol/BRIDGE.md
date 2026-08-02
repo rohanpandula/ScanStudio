@@ -291,7 +291,7 @@ CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanRece
 
 Three methods are MOTION-CAPABLE: `roll.preview`, `scan.start`, `device.eject`.
 
-**Armed latch.** Re-checked live — never cached — on every motion-capable request: env `SCANSTUDIO_HW_MOTION == "1"` AND file `~/.scanstudio/hw-motion-armed` exists with non-empty stripped content (the content names the loaded media, e.g. `junk-roll`). Either condition failing is `HW_MOTION_NOT_ARMED`. There is no method literally named `feed` — `roll.preview` stands in for it, since a preview requires the same physical roll motion as a feed.
+**Armed latch.** Re-checked live — never cached — on every motion-capable request: env `SCANSTUDIO_HW_MOTION == "1"` AND file `~/.scanstudio/hw-motion-armed` exists as a regular file with non-empty stripped authorization text. Either condition failing is `HW_MOTION_NOT_ARMED`. The packaged `ScanStudioLauncher` prepares both halves automatically when it selects a hardware bridge; its environment half ends with that app process, so a persistent latch alone cannot authorize later motion. Launching sends no hardware command — `roll.preview`, `scan.start`, and `device.eject` remain explicit actions. Direct bridge/developer launches must prepare their own authorization. There is no method literally named `feed` — `roll.preview` stands in for it, since a preview requires the same physical roll motion as a feed.
 
 **Single hardware lane.** An advisory lock file, `~/.scanstudio/hw-lane.lock`, is held for the duration of any motion-capable operation. A second process contending for it gets `HARDWARE_LANE_BUSY`.
 

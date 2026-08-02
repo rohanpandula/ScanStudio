@@ -18,5 +18,8 @@ uv run pytest
 This project uses the checkout-local `../coolscanpy` source through the locked
 `uv` configuration. It does not require a sibling archaeology checkout.
 
-Motion is refused unless both `SCANSTUDIO_HW_MOTION=1` is set and an armed-latch
-file is present — see BRIDGE.md's SAFE-02 guardrails section for the full policy.
+Motion is refused unless both `SCANSTUDIO_HW_MOTION=1` is set and a non-empty
+regular authorization-latch file is present. The packaged ScanStudio launcher
+prepares both for its own app session; direct bridge/developer launches must do
+so themselves. Opening the app sends no motion command. See BRIDGE.md's SAFE-02
+guardrails section for the full policy.
