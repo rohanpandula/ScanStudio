@@ -2123,7 +2123,96 @@ struct SessionEventPolicyTests {
             #expect(model.refeedRequired)
             #expect(model.errorPresentation?.title == "Film shifted—refeed required")
             #expect(!model.hasCompletePreviewRegistration)
+            let statusDetails = try? #require(model.errorPresentation?.technicalDetails)
+            #expect(statusDetails?.contains("filmPresent=false") == true)
+            #expect(statusDetails?.contains("mediaLoaded=false") == true)
         }
+    }
+
+    @Test("medium-not-present during positioning reports one clear batch diagnostic and keeps terminal state")
+    @MainActor
+    func filmFeedInterruptedIsTypedAndDeduplicated() async throws {
+        let partial = try projectLifecycleFixture(
+            id: "film-feed-interrupted-project",
+            completedFrames: [1, 2, 3]
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: partial)
+        )
+        let jobId = "film-feed-interrupted-job"
+        await model.openProject(directory: "/tmp/film-feed-interrupted-project")
+        #expect(model.completedFrameCount == 3)
+        #expect(model.pendingFrames == [4, 5, 6])
+        model.beginJob(id: jobId, frames: [4, 5, 6])
+        model.handle(event: EngineEvent(
+            name: "scan.jobState",
+            rawLine: Data(
+                #"{"event":"scan.jobState","payload":{"jobId":"\#(jobId)","state":"scanning"}}"#.utf8
+            )
+        ))
+
+        let reason = "Film feed interrupted while positioning frame 4; "
+            + "SynchronizedProtocolError: ready group 233-496: untraced sense 023a00; "
+            + "terminal 000000"
+        for frameIndex in 4...6 {
+            model.handle(event: EngineEvent(
+                name: "scan.frameState",
+                rawLine: Data(
+                    #"{"event":"scan.frameState","payload":{"jobId":"\#(jobId)","frameIndex":\#(frameIndex),"state":"failed","attempt":1,"error":{"code":"FILM_FEED_INTERRUPTED","message":"\#(reason)","recoverable":false}}}"#.utf8
+                )
+            ))
+        }
+        model.handle(event: EngineEvent(
+            name: "scan.jobState",
+            rawLine: Data(
+                #"{"event":"scan.jobState","payload":{"jobId":"\#(jobId)","state":"failed"}}"#.utf8
+            )
+        ))
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                #"{"event":"scan.completed","payload":{"jobId":"\#(jobId)","summary":{"completed":[1,2,3],"failed":[4,5,6],"skipped":[],"stopped":false}}}"#.utf8
+            )
+        ))
+        // The real backend emits a fresh terminal status after scan.completed.
+        // Its live no-film verdict must retire preview coordinates without
+        // erasing the durable completion/resume evidence established above.
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":true,"carrier":"strip6","frameCount":6,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":false,"motionArmed":true}}}"#.utf8
+            )
+        ))
+
+        #expect(model.refeedRequired)
+        #expect(model.status?.filmPresent == false)
+        #expect(model.status?.mediaLoaded == false)
+        #expect(model.status?.frameCount == nil)
+        #expect(model.jobState == .failed)
+        #expect(model.scanSummary?.completed == [1, 2, 3])
+        #expect(model.scanSummary?.failed == [4, 5, 6])
+        #expect(model.frameErrors.count == 3)
+        #expect(model.lastErrorMessage == "FILM_FEED_INTERRUPTED: \(reason)")
+        #expect(model.errorPresentation?.title == "Film feed interrupted")
+        #expect(model.completedFrameCount == 3)
+        #expect(model.frameStates[1] == .completed)
+        #expect(model.frameStates[2] == .completed)
+        #expect(model.frameStates[3] == .completed)
+        #expect(model.pendingFrames == [4, 5, 6])
+        #expect(
+            ResumeBatchPolicy.shouldShowResumeBatch(
+                completedCount: model.completedFrameCount,
+                pendingCount: model.pendingFrameCount
+            )
+        )
+
+        let technicalDetails = try #require(model.errorPresentation?.technicalDetails)
+        #expect(
+            technicalDetails.components(separatedBy: "scan.frame.failed").count - 1
+                == 1
+        )
+        #expect(technicalDetails.contains("frameIndex=4"))
+        #expect(technicalDetails.contains("code=FILM_FEED_INTERRUPTED"))
     }
 
     @Test("a FEEDER_PARKED preview failure surfaces typed but does NOT arm eject")
@@ -2824,11 +2913,9 @@ struct SessionEventPolicyTests {
         await client.terminate()
     }
 
-    // MARK: - Frame rotation (display-only; root cause: the grid's Rotate
-    // control was unwired. No field in the wire protocol's
-    // `FrameOverrides`/project manifest carries an orientation value today
-    // — see `SessionModel.frameOrientations`'s own doc comment — so this
-    // stays session-local rather than round-tripping to the engine.)
+    // MARK: - Frame rotation (saved derivative geometry; root cause: the
+    // grid's Rotate control was originally unwired. FrameAlignment now
+    // persists the transform for the engine's derivative render path.)
 
     @Test("FrameOrientation.normalized wraps any integer into the canonical 0..<360 range, including negative input")
     func frameOrientationNormalizesAnyInteger() {

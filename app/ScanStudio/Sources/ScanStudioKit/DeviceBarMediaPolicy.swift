@@ -18,3 +18,29 @@ public enum DeviceBarMediaPolicy {
         return "Media unknown"
     }
 }
+
+/// Visibility policy for the destructive Eject action. A legacy
+/// REFEED_REQUIRED refusal explicitly permits ejecting the still-held film,
+/// while FILM_FEED_INTERRUPTED proves the scanner no longer detects film and
+/// must never expose an eject action based on stale preview state. A fresh
+/// hardware no-film reading is authoritative even after the error is dismissed.
+public enum DeviceBarEjectPolicy {
+    public static func canOffer(
+        isConnected: Bool,
+        transportIsIdle: Bool,
+        isJobActive: Bool,
+        mediaLoaded: Bool,
+        filmPresent: Bool?,
+        refeedRequired: Bool,
+        lastErrorMessage: String?
+    ) -> Bool {
+        guard isConnected, transportIsIdle, !isJobActive else { return false }
+        guard filmPresent != false else { return false }
+        if FilmTransportFailurePolicy.isFilmFeedInterrupted(
+            message: lastErrorMessage ?? ""
+        ) {
+            return false
+        }
+        return mediaLoaded || refeedRequired
+    }
+}

@@ -359,6 +359,28 @@ def test_status_degrades_a_film_present_probe_failure_to_unknown(
     assert transport.status().film_present is None
 
 
+def test_status_invalidates_preview_when_fresh_probe_reports_no_film(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed preview is registration evidence, not live media truth.
+
+    The scanner's verified MEDIUM NOT PRESENT verdict must retire that stale
+    registration so a subsequent capture cannot reuse its coordinates.
+    """
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
+    transport, device = _opened_transport(monkeypatch, roll)
+    device.film_present = lambda: True  # type: ignore[attr-defined]
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert transport.status().preview_established is True
+
+    device.film_present = lambda: False  # type: ignore[attr-defined]
+    status = transport.status()
+
+    assert status.film_present is False
+    assert status.preview_established is False
+    assert status.slot_count is None
+
+
 def test_open_device_raises_device_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coolscanpy, "get_devices", lambda: [])
 
@@ -924,6 +946,90 @@ def test_start_scan_maps_base_roll_mismatch(
         )
     assert excinfo.value.code == ErrorCode.ROLL_MISMATCH
     assert "untraced sense 063f03" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    (
+        "SynchronizedProtocolError: ready group 233-496: untraced sense 023a00; terminal 000000",
+        "SynchronizedProtocolError: ready group 233-496: untraced sense 02/3A/00; terminal 00/00/00",
+    ),
+)
+def test_start_scan_maps_medium_not_present_roll_mismatch_to_film_feed_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic: str,
+) -> None:
+    """Live 2026-08-02: positioning frame 4 returned SCSI 02/3A/00.
+
+    That is a verified medium-not-present transport interruption, not an
+    unclassified ROLL_MISMATCH and never an INTERNAL application fault.
+    """
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1)],
+        scan_results={1: [coolscanpy.RollMismatch(diagnostic)]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.start_scan(
+            slots=[1],
+            recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            output=_output(tmp_path),
+            on_progress=lambda _p: None,
+            on_retry=lambda *a: None,
+            on_frame=lambda *_a: None,
+        )
+
+    assert excinfo.value.code == ErrorCode.FILM_FEED_INTERRUPTED
+    assert "023a00" in str(excinfo.value).lower().replace("/", "")
+
+
+def test_film_feed_interrupted_immediately_invalidates_preview_before_another_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminal error itself retires registration; no status poll is
+    required before a second scan.start is rejected without transport I/O.
+    """
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1)],
+        scan_results={
+            1: [
+                coolscanpy.RollMismatch(
+                    "SynchronizedProtocolError: ready group 233-496: "
+                    "untraced sense 023a00; terminal 000000"
+                )
+            ]
+        },
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as interrupted:
+        transport.start_scan(
+            slots=[1],
+            recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            output=_output(tmp_path / "first"),
+            on_progress=lambda _p: None,
+            on_retry=lambda *a: None,
+            on_frame=lambda *_a: None,
+        )
+    assert interrupted.value.code == ErrorCode.FILM_FEED_INTERRUPTED
+    assert roll.scan_many_calls == [(1,)]
+
+    with pytest.raises(BridgeError) as no_preview:
+        transport.start_scan(
+            slots=[1],
+            recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            output=_output(tmp_path / "second"),
+            on_progress=lambda _p: None,
+            on_retry=lambda *a: None,
+            on_frame=lambda *_a: None,
+        )
+    assert no_preview.value.code == ErrorCode.NO_PREVIEW
+    assert roll.scan_many_calls == [(1,)]
 
 
 def test_trim_out_of_table_slots_drops_slots_above_the_parsed_bound() -> None:

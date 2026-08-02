@@ -26,7 +26,7 @@ private actor ManualReviewApprovalEngineStub: EngineClientProtocol {
         connection: "USB",
         supportedMultisamplePasses: [4]
     )
-    private let project = ScanProject(
+    private var project = ScanProject(
         schemaVersion: 1,
         id: "manual-review-project",
         name: "Manual review approval",
@@ -134,9 +134,33 @@ private actor ManualReviewApprovalEngineStub: EngineClientProtocol {
                 )
             )
         case "project.setFrameAlignment":
-            guard params is SetFrameAlignmentParams else {
+            guard let params = params as? SetFrameAlignmentParams else {
                 throw ManualReviewApprovalStubError.unexpectedParams(method)
             }
+            project = ScanProject(
+                schemaVersion: project.schemaVersion,
+                id: project.id,
+                name: project.name,
+                carrier: project.carrier,
+                frameCount: project.frameCount,
+                filmProcess: project.filmProcess,
+                recipes: project.recipes,
+                rollMetadata: project.rollMetadata,
+                createdAt: project.createdAt,
+                frames: project.frames.map { frame in
+                    guard frame.index == params.frameIndex else { return frame }
+                    return ProjectFrame(
+                        index: frame.index,
+                        excluded: frame.excluded,
+                        captureOverride: frame.captureOverride,
+                        processingOverride: frame.processingOverride,
+                        outputOverride: frame.outputOverride,
+                        alignment: params.alignment,
+                        metadataOverride: frame.metadataOverride,
+                        receipts: frame.receipts
+                    )
+                }
+            )
             value = SetFrameResult(project: project)
         case "roll.approve":
             guard let params = params as? RollApproveParams else {

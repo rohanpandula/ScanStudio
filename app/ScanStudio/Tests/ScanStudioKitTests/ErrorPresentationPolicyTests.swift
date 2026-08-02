@@ -5,6 +5,23 @@ import Testing
 
 @Suite("Error presentation policy")
 struct ErrorPresentationPolicyTests {
+    @Test("medium-not-present during batch positioning is a clear feed interruption")
+    func filmFeedInterrupted() {
+        let rawMessage = "FILM_FEED_INTERRUPTED: bridge scan.frameFailed "
+            + "(FILM_FEED_INTERRUPTED): Film feed interrupted while positioning frame 4; "
+            + "SynchronizedProtocolError: ready group 233-496: untraced sense 023a00; "
+            + "terminal 000000"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "Film feed interrupted")
+        #expect(
+            presentation.guidance
+                == "The scanner stopped detecting the film while moving to the next frame. Your finished frames are safe. Reinsert the film, acquire a fresh preview, then resume the remaining frames."
+        )
+        #expect(presentation.technicalDetails == rawMessage)
+    }
+
     @Test("diagnosed scan-time transport slips require a refeed and retain the raw diagnostic")
     func scanTimeTransportSlip() {
         let diagnostics = [

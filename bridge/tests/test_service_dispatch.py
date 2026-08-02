@@ -54,6 +54,58 @@ def _thumbnail(slot: int) -> domain.Thumbnail:
     )
 
 
+def _stub_receipt(slot: int) -> domain.ScanReceipt:
+    """Minimal valid receipt for a transport double's on_frame callback."""
+    return domain.ScanReceipt(
+        version=1,
+        slot=slot,
+        spacing_offset=0,
+        dpi=4000,
+        depth=16,
+        device_id=_DEVICE_ID,
+        device_model="SUPER COOLSCAN 5000 ED (stub)",
+        reviewed_fingerprint_sha256="0" * 64,
+        fresh_fingerprint_sha256="0" * 64,
+        manual_approval=None,
+        exposure=domain.ExposureVector(
+            focus_position=0,
+            exposure_multiplier=1.0,
+            red_exposure_us=0.0,
+            green_exposure_us=0.0,
+            blue_exposure_us=0.0,
+        ),
+        split_alignment=None,
+        clipping=domain.ClippingTelemetry(
+            fractions=(0.0, 0.0, 0.0),
+            clip_level=0.995,
+            warning_fraction=0.02,
+            warning=False,
+        ),
+        focus_detail=domain.FocusDetailTelemetry(
+            method="laplacian-variance",
+            verdict="measured",
+            score=0.0,
+            texture_span=0.0,
+        ),
+        transport_smear=domain.TransportSmearAssessment(
+            verdict="clean",
+            start_row=None,
+            suffix_rows=0,
+            minimum_matches=0,
+            tail_median_rms=None,
+            tail_min_corr=None,
+            pre_tail_median_rms=None,
+            texture_span=None,
+            reason="stub frame, no transport read performed",
+        ),
+        artifacts={},
+        storage_transform="swapaxes01-scanner-native-to-nikon-render-parity-v2",
+        rgb_path=f"/tmp/stub-out/frame-{slot:04d}.tif",
+        ir_path=None,
+        meter_rgbi_path=None,
+    )
+
+
 class _StubTransport:
     """Hand-written Transport double: deterministic, no I/O, scriptable
     start_scan outcome. Satisfies transport.Transport structurally."""
@@ -228,6 +280,10 @@ class _RecordingEmit:
         with self._lock:
             return next(p for e, p in self._events if e == event)
 
+    def payloads_of(self, event: str) -> list[dict]:
+        with self._lock:
+            return [p for e, p in self._events if e == event]
+
     def has(self, event: str) -> bool:
         return event in self.names()
 
@@ -292,6 +348,58 @@ def test_device_status_before_open_raises_not_connected(tmp_path: Path) -> None:
     with pytest.raises(BridgeError) as excinfo:
         svc.dispatch({"id": 1, "method": "device.status"}, lambda *_a: None)
     assert excinfo.value.code == ErrorCode.NOT_CONNECTED
+
+
+def test_no_film_status_retires_service_preview_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The service must not keep its cached preview material after the
+    transport's fresh no-film verdict has invalidated physical registration.
+    """
+
+    class _NoFilmAfterPreviewTransport(_StubTransport):
+        def status(self) -> domain.DeviceStatus:
+            return domain.DeviceStatus(
+                connected=self.device_open,
+                device_id=_DEVICE_ID if self.device_open else None,
+                preview_established=True,
+                slot_count=1,
+                active_job_id=None,
+                lane_held=False,
+                motion_armed=False,
+                film_present=False,
+            )
+
+    transport = _NoFilmAfterPreviewTransport(preview_thumbnails=1)
+    svc = _opened_service(tmp_path, transport)
+    _arm(monkeypatch, tmp_path)
+    emit = _RecordingEmit()
+    svc.dispatch(
+        {"id": 2, "method": "roll.preview", "params": {"material": "colorNegative"}}, emit
+    )
+    _wait_for_preview_complete_and_lane_free(svc, emit)
+
+    status = svc.dispatch({"id": 3, "method": "device.status"}, emit)
+    assert status["filmPresent"] is False
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {
+                "id": 4,
+                "method": "scan.start",
+                "params": {
+                    "slots": [1],
+                    "recipe": _wire_recipe(),
+                    "output": {
+                        "destination": str(tmp_path / "out"),
+                        "filenameTemplate": "frame-####.tif",
+                    },
+                },
+            },
+            emit,
+        )
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
 
 
 def test_device_close_emits_connected_false_status(tmp_path: Path) -> None:
@@ -964,6 +1072,140 @@ def test_scan_start_bridge_error_from_transport_emits_scan_error_then_completed_
     assert completed_summary["completed"] == []
     assert completed_summary["failed"] == [1]
     assert completed_summary["stopped"] is False
+
+
+def test_film_feed_interrupted_retires_service_preview_before_a_second_scan_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal dropout is sufficient to close the preview gate; the UI
+    must not need to poll device.status before its next scan.start is refused.
+    """
+
+    class _FilmFeedInterruptedTransport(_StubTransport):
+        def __init__(self) -> None:
+            super().__init__(preview_thumbnails=1)
+            self.start_scan_calls = 0
+
+        def start_scan(
+            self, slots, recipe, output, on_progress, on_retry, on_frame, on_call=None
+        ):
+            self.start_scan_calls += 1
+            raise BridgeError(
+                ErrorCode.FILM_FEED_INTERRUPTED,
+                "film feed interrupted: scanner stopped detecting film (02/3A/00)",
+            )
+
+    _arm(monkeypatch, tmp_path)
+    transport = _FilmFeedInterruptedTransport()
+    svc = _opened_service(tmp_path, transport)
+    scan_params = {
+        "slots": [1],
+        "recipe": _wire_recipe(),
+        "output": {
+            "destination": str(tmp_path / "out"),
+            "filenameTemplate": "frame-####.tif",
+        },
+    }
+    terminal_refusals: list[ErrorCode] = []
+
+    class _TerminalReentrantEmit(_RecordingEmit):
+        def __call__(self, event: str, payload: dict) -> None:
+            if event == "scan.completed" and not terminal_refusals:
+                try:
+                    svc.dispatch(
+                        {"id": 4, "method": "scan.start", "params": scan_params}, self
+                    )
+                except BridgeError as exc:
+                    terminal_refusals.append(exc.code)
+            super().__call__(event, payload)
+
+    emit = _TerminalReentrantEmit()
+    svc.dispatch(
+        {"id": 2, "method": "roll.preview", "params": {"material": "colorNegative"}}, emit
+    )
+    _wait_for_preview_complete_and_lane_free(svc, emit)
+
+    svc.dispatch({"id": 3, "method": "scan.start", "params": scan_params}, emit)
+    _wait_for(lambda: emit.has("scan.completed"))
+
+    assert terminal_refusals == [ErrorCode.NO_PREVIEW]
+    assert transport.start_scan_calls == 1
+
+
+def test_film_feed_interrupted_summary_preserves_completed_frames_and_fails_only_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typed terminal error after three callbacks must not rewrite those
+    durable completions as failures in the terminal batch summary.
+    """
+
+    class _ThreeFramesThenDropoutTransport(_StubTransport):
+        def start_scan(
+            self, slots, recipe, output, on_progress, on_retry, on_frame, on_call=None
+        ):
+            for slot in slots[:3]:
+                on_frame(slot, _stub_receipt(slot))
+            raise BridgeError(
+                ErrorCode.FILM_FEED_INTERRUPTED,
+                "film feed interrupted while positioning frame 4 (02/3A/00)",
+            )
+
+    _arm(monkeypatch, tmp_path)
+    svc = _opened_service(
+        tmp_path, _ThreeFramesThenDropoutTransport(preview_thumbnails=6)
+    )
+    emit = _RecordingEmit()
+    svc.dispatch(
+        {"id": 2, "method": "roll.preview", "params": {"material": "colorNegative"}}, emit
+    )
+    _wait_for_preview_complete_and_lane_free(svc, emit)
+
+    svc.dispatch(
+        {
+            "id": 3,
+            "method": "scan.start",
+            "params": {
+                "slots": [1, 2, 3, 4, 5, 6],
+                "recipe": _wire_recipe(),
+                "output": {
+                    "destination": str(tmp_path / "out"),
+                    "filenameTemplate": "frame-####.tif",
+                },
+            },
+        },
+        emit,
+    )
+    _wait_for(lambda: emit.has("scan.completed"))
+
+    summary = emit.payload_of("scan.completed")["summary"]
+    assert summary["completed"] == [1, 2, 3]
+    assert summary["failed"] == [4, 5, 6]
+    assert summary["stopped"] is False
+    assert [payload["slot"] for payload in emit.payloads_of("scan.frameCompleted")] == [
+        1,
+        2,
+        3,
+    ]
+    assert [payload["slot"] for payload in emit.payloads_of("scan.frameFailed")] == [4]
+    terminal_order = [
+        name
+        for name in emit.names()
+        if name
+        in {
+            "scan.frameCompleted",
+            "scan.frameFailed",
+            "scan.error",
+            "scan.completed",
+        }
+    ]
+    assert terminal_order == [
+        "scan.frameCompleted",
+        "scan.frameCompleted",
+        "scan.frameCompleted",
+        "scan.frameFailed",
+        "scan.error",
+        "scan.completed",
+    ]
 
 
 def test_scan_start_unexpected_exception_from_transport_emits_internal_scan_error_then_completed(

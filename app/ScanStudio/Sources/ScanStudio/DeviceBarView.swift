@@ -24,11 +24,20 @@ struct DeviceBarView: View {
     /// showed while no eject affordance existed anywhere in the app). On a
     /// real backend `hasMedia` is `previewEstablished`, which is exactly
     /// false in the refeed-required state, so the second arm is not
-    /// redundant. Never offered mid-motion (`transportIsIdle`,
-    /// `isJobActive`) — and never auto-invoked from anywhere.
+    /// redundant. A typed FILM_FEED_INTERRUPTED means the scanner no longer
+    /// detects film, so stale `hasMedia` must not expose Eject. Never offered
+    /// mid-motion (`transportIsIdle`, `isJobActive`) — and never auto-invoked
+    /// from anywhere.
     private var canOfferEject: Bool {
-        isConnected && transportIsIdle && !sessionModel.isJobActive
-            && (hasMedia || sessionModel.refeedRequired)
+        DeviceBarEjectPolicy.canOffer(
+            isConnected: isConnected,
+            transportIsIdle: transportIsIdle,
+            isJobActive: sessionModel.isJobActive,
+            mediaLoaded: hasMedia,
+            filmPresent: sessionModel.status?.filmPresent,
+            refeedRequired: sessionModel.refeedRequired,
+            lastErrorMessage: sessionModel.lastErrorMessage
+        )
     }
 
     var body: some View {

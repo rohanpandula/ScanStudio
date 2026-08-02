@@ -254,6 +254,17 @@ class BridgeService:
         those three fields are Transport-layer placeholders (always
         False/None) that only `BridgeService` can compute correctly."""
         status = self._transport.status()
+        if status.film_present is False:
+            # Physical absence is fresher and stronger than either cached
+            # preview flag. Retire both service- and transport-facing preview
+            # claims so status reports mediaLoaded=false and the next
+            # scan.start is synchronously gated on NO_PREVIEW.
+            self._preview_material = None
+            status = dataclasses.replace(
+                status,
+                preview_established=False,
+                slot_count=None,
+            )
         return dataclasses.replace(
             status,
             active_job_id=(
@@ -791,10 +802,18 @@ class BridgeService:
             original coolscanpy exception, recovered via Python's own
             exception-chaining), falling back to the `BridgeError` itself
             when it was raised bridge-natively (no chained cause)."""
+            reason_message = str(reason_exc)
+            if code == ErrorCode.FILM_FEED_INTERRUPTED.value:
+                reason_message = (
+                    f"Film feed interrupted while positioning frame {slot}. "
+                    "The scanner no longer detected film (02/3A/00). Refeed "
+                    "the film and acquire a fresh preview before resuming. "
+                    f"Scanner diagnostic: {reason_message}"
+                )
             emit_frame_failed(
                 slot,
                 reason_class=type(reason_exc).__name__,
-                reason_message=str(reason_exc),
+                reason_message=reason_message,
                 code=code,
                 extra_attributes=_coolscanpy_error_attributes(reason_exc),
                 attribution=attribution,
@@ -832,7 +851,7 @@ class BridgeService:
             codebase (coolscanpy_transport.py's start_scan). `(None,
             False)` only for the degenerate case of an empty `slots`
             list."""
-            pending = [slot for slot in sorted(slots) if slot not in resolved_slots]
+            pending = [slot for slot in slots if slot not in resolved_slots]
             if not pending:
                 return None, False
             return pending[0], len(pending) > 1
@@ -1025,6 +1044,8 @@ class BridgeService:
                     # scan.frameFailed useful (still names a slot) without
                     # implying a confirmed per-slot cause the bridge cannot
                     # actually vouch for.
+                    if exc.code is ErrorCode.FILM_FEED_INTERRUPTED:
+                        self._preview_material = None
                     fail_slot, ambiguous = first_pending_slot()
                     if fail_slot is not None:
                         report_frame_failure(
@@ -1046,7 +1067,9 @@ class BridgeService:
                         "jobId": job_id, "code": exc.code.value, "message": str(exc)
                     }
                     summary = domain.ScanSummary(
-                        completed=(), failed=tuple(slots), stopped=False
+                        completed=tuple(slot for slot in slots if slot in resolved_slots),
+                        failed=tuple(slot for slot in slots if slot not in resolved_slots),
+                        stopped=False,
                     )
                 except Exception as exc:  # noqa: BLE001 -- boundary: every failure must reach the wire
                     # Plan 10-09 deliverable 1: same first_pending_slot()

@@ -893,13 +893,28 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
             .expect("archive test filename must have a UTF-8 stem")
     ));
     let (tx, rx) = mpsc::channel();
+    let overrides = std::collections::HashMap::from([(
+        1,
+        domain::FrameOverrides {
+            alignment: Some(domain::FrameAlignment {
+                offset_rows: 0,
+                approved: false,
+                derivative_transform: domain::DerivativeTransform {
+                    rotation_degrees: 90,
+                    horizontal_mirror: true,
+                    vertical_mirror: false,
+                },
+            }),
+            ..domain::FrameOverrides::default()
+        },
+    )]);
     RealLs5000::scan_start(
         &backend,
         vec![1],
         valid_capture_recipe(),
         domain::ProcessingRecipe::default(),
         output,
-        std::collections::HashMap::new(),
+        overrides,
         None,
         tx,
     )
@@ -943,6 +958,25 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
             "{output_key} must name a rendered derivative: {receipt:#?}"
         );
     }
+    assert_eq!(
+        receipt["outputs"]["derivativeTransform"],
+        serde_json::json!({
+            "rotationDegrees": 90,
+            "horizontalMirror": true,
+            "verticalMirror": false,
+        }),
+        "the receipt must make derivative rerender geometry reproducible: {receipt:#?}"
+    );
+    let archive_dimensions = image::image_dimensions(rgb_path).unwrap();
+    let positive_dimensions = image::image_dimensions(
+        receipt["outputs"]["positivePath"].as_str().unwrap()
+    )
+    .unwrap();
+    assert_eq!(
+        positive_dimensions,
+        (archive_dimensions.1, archive_dimensions.0),
+        "a 90-degree finished output must swap axes while the archive keeps scanner-native dimensions"
+    );
     assert_eq!(
         receipt["irPath"].as_str().map(std::path::Path::new),
         Some(expected_ir_path.as_path()),

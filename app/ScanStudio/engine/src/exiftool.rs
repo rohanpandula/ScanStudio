@@ -460,6 +460,7 @@ mod tests {
                 archive_path: None,
                 positive_path: Some("/Scans/Positive/ScanStudio1.tif".into()),
                 preview_path: Some("/Scans/Preview/ScanStudio1.jpg".into()),
+                derivative_transform: crate::domain::DerivativeTransform::default(),
             }),
             rgb_path: None,
             ir_path: None,

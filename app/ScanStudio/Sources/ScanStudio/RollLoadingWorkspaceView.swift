@@ -234,12 +234,12 @@ private struct RollLoadingFrameCell: View {
     let frameIndex: Int
     let thumbnail: Thumbnail?
     let isCurrent: Bool
-    /// Session-local display rotation, kept in sync with the contact sheet
+    /// Derivative rotation preview, kept in sync with the contact sheet
     /// — see `ThumbnailTileImage.orientationDegrees`.
     let orientationDegrees: Int
-    /// Session-local horizontal mirror, kept in sync with the contact sheet.
+    /// Derivative horizontal-mirror preview, kept in sync with the contact sheet.
     let mirrored: Bool
-    /// Session-local vertical mirror, kept in sync with the contact sheet.
+    /// Derivative vertical-mirror preview, kept in sync with the contact sheet.
     let verticallyMirrored: Bool
 
     /// Whether the engine has reported ANY preview for this frame yet —

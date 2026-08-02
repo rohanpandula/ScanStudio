@@ -1993,6 +1993,10 @@ pub fn render_derivative_from_archive_with_processing(
     alignment: Option<&domain::FrameAlignment>,
     exposure_10ns: Option<[f64; 3]>,
 ) -> Result<WrittenPaths, domain::EngineError> {
+    let derivative_transform = alignment
+        .map(|value| value.derivative_transform)
+        .unwrap_or_default();
+    validate_derivative_transform(derivative_transform)?;
     if !recipes.positive.enabled && !recipes.preview.enabled {
         return Ok(WrittenPaths {
             archive_path: recipes.archive.enabled.then(|| archive_rgb_path.to_path_buf()),
@@ -2000,6 +2004,7 @@ pub fn render_derivative_from_archive_with_processing(
             preview_path: None,
             nikonlook: None,
             auto_crop: None,
+            derivative_transform,
         });
     }
 
@@ -2094,7 +2099,7 @@ pub fn render_derivative_from_archive_with_processing(
         positive_full
     };
 
-    let (positive_raw, positive_width, positive_height) = match alignment {
+    let (mut positive_raw, mut positive_width, mut positive_height) = match alignment {
         Some(value) if value.approved => {
             apply_alignment_crop(&positive_full, width, height, detected_boundary, Some(value))
         }
@@ -2106,6 +2111,12 @@ pub fn render_derivative_from_archive_with_processing(
             _ => (positive_full, width, height),
         },
     };
+    (positive_width, positive_height) = apply_derivative_transform_in_place(
+        &mut positive_raw,
+        positive_width,
+        positive_height,
+        derivative_transform,
+    )?;
 
     let archive_path = recipes.archive.enabled.then(|| archive_rgb_path.to_path_buf());
     let mut positive_path = None;
@@ -2159,6 +2170,92 @@ pub fn render_derivative_from_archive_with_processing(
         preview_path,
         nikonlook,
         auto_crop: auto_crop_outcome,
+        derivative_transform,
+    })
+}
+
+fn validate_derivative_transform(
+    transform: domain::DerivativeTransform,
+) -> Result<(), domain::EngineError> {
+    if transform.is_supported() {
+        Ok(())
+    } else {
+        Err(domain::EngineError::new(
+            protocol::ErrorCode::InvalidParams,
+            format!(
+                "unsupported derivative rotation {}: expected 0, 90, 180, or 270 degrees",
+                transform.rotation_degrees
+            ),
+        ))
+    }
+}
+
+/// Applies mirror(s) in the source axes followed by a clockwise quarter-turn.
+/// The permutation is performed in place with one bit per pixel of cycle
+/// bookkeeping, avoiding a second full-size floating-point frame buffer.
+fn apply_derivative_transform_in_place(
+    raw: &mut [[f64; 3]],
+    width: u32,
+    height: u32,
+    transform: domain::DerivativeTransform,
+) -> Result<(u32, u32), domain::EngineError> {
+    validate_derivative_transform(transform)?;
+    let expected_len = width as usize * height as usize;
+    if raw.len() != expected_len {
+        return Err(domain::EngineError::new(
+            protocol::ErrorCode::Internal,
+            "derivative transform pixel buffer size does not match width*height".to_string(),
+        ));
+    }
+    if expected_len <= 1 || transform == domain::DerivativeTransform::default() {
+        return Ok((width, height));
+    }
+
+    let destination_index = |source_index: usize| -> usize {
+        let x = source_index as u32 % width;
+        let y = source_index as u32 / width;
+        let mirrored_x = if transform.horizontal_mirror {
+            width - 1 - x
+        } else {
+            x
+        };
+        let mirrored_y = if transform.vertical_mirror {
+            height - 1 - y
+        } else {
+            y
+        };
+        let (destination_x, destination_y, destination_width) =
+            match transform.rotation_degrees {
+                0 => (mirrored_x, mirrored_y, width),
+                90 => (height - 1 - mirrored_y, mirrored_x, height),
+                180 => (width - 1 - mirrored_x, height - 1 - mirrored_y, width),
+                270 => (mirrored_y, width - 1 - mirrored_x, height),
+                _ => unreachable!("validated quarter-turn"),
+            };
+        (destination_y * destination_width + destination_x) as usize
+    };
+
+    let mut visited = vec![false; expected_len];
+    for start in 0..expected_len {
+        if visited[start] {
+            continue;
+        }
+        let mut source = start;
+        let mut carried = raw[source];
+        loop {
+            visited[source] = true;
+            let destination = destination_index(source);
+            std::mem::swap(&mut carried, &mut raw[destination]);
+            source = destination;
+            if source == start {
+                break;
+            }
+        }
+    }
+
+    Ok(match transform.rotation_degrees {
+        90 | 270 => (height, width),
+        _ => (width, height),
     })
 }
 
@@ -2518,6 +2615,7 @@ pub struct WrittenPaths {
     /// Scan-time non-destructive auto-crop decision. `None` when the recipe
     /// did not request auto-crop or no derivative rendered.
     pub auto_crop: Option<domain::AutoCropOutcome>,
+    pub derivative_transform: domain::DerivativeTransform,
 }
 
 /// Renders one frame's deterministic simulated pixel data and writes the
@@ -2560,6 +2658,10 @@ pub fn render_and_write_frame_with_processing(
     detected_boundary: Option<(u32, u32)>,
     alignment: Option<&domain::FrameAlignment>,
 ) -> Result<WrittenPaths, domain::EngineError> {
+    let derivative_transform = alignment
+        .map(|value| value.derivative_transform)
+        .unwrap_or_default();
+    validate_derivative_transform(derivative_transform)?;
     validate_output_recipe_paths(recipes)?;
     let (archive_path, preflight_positive_path, preflight_preview_path) =
         validate_frame_output_paths(recipes, frame_index)?;
@@ -2595,13 +2697,19 @@ pub fn render_and_write_frame_with_processing(
         } else {
             positive_raw_full
         };
-        let (positive_raw, positive_width, positive_height) = match &auto_crop_outcome {
+        let (mut positive_raw, mut positive_width, mut positive_height) = match &auto_crop_outcome {
             Some(outcome) if outcome.applied => {
                 let roi = outcome.roi.as_ref().expect("applied auto-crop outcome carries its ROI");
                 crop_to_roi(&positive_raw_full, width, roi)
             }
             _ => apply_alignment_crop(&positive_raw_full, width, height, detected_boundary, alignment),
         };
+        (positive_width, positive_height) = apply_derivative_transform_in_place(
+            &mut positive_raw,
+            positive_width,
+            positive_height,
+            derivative_transform,
+        )?;
 
         if recipes.positive.enabled {
             let path = preflight_positive_path.clone().expect("enabled positive has preflight path");
@@ -2640,6 +2748,7 @@ pub fn render_and_write_frame_with_processing(
         preview_path,
         nikonlook: nikonlook_provenance,
         auto_crop: auto_crop_outcome,
+        derivative_transform,
     })
 }
 
@@ -3579,6 +3688,128 @@ mod tests {
     }
 
     #[test]
+    fn real_archive_derivative_transform_rotates_and_flips_both_outputs_without_mutating_master() {
+        let dir = unique_test_dir();
+        let archive_path = dir.join("Archive").join("Archive_0001.tif");
+        std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        let source_pixels = vec![
+            [1_000, 1_000, 1_000],
+            [2_000, 2_000, 2_000],
+            [3_000, 3_000, 3_000],
+            [4_000, 4_000, 4_000],
+            [5_000, 5_000, 5_000],
+            [6_000, 6_000, 6_000],
+        ];
+        image_io::write_rgb16(
+            &archive_path,
+            &image_io::Rgb16Image {
+                width: 3,
+                height: 2,
+                pixels: source_pixels,
+            },
+        )
+        .unwrap();
+        let archive_before = std::fs::read(&archive_path).unwrap();
+
+        let mut recipes = domain::OutputRecipe::default();
+        recipes.positive.destination = dir.join("Positive").display().to_string();
+        recipes.positive.file_format = domain::OutputFileFormat::Tiff;
+        recipes.preview.destination = dir.join("Preview").display().to_string();
+        recipes.preview.file_format = domain::OutputFileFormat::Tiff;
+        recipes.preview.max_long_edge_px = 100;
+        let alignment = domain::FrameAlignment {
+            offset_rows: 0,
+            approved: false,
+            derivative_transform: domain::DerivativeTransform {
+                rotation_degrees: 90,
+                horizontal_mirror: true,
+                vertical_mirror: false,
+            },
+        };
+
+        let written = render_derivative_from_archive(
+            &archive_path,
+            1,
+            domain::FilmProcess::Positive,
+            &recipes,
+            Some(STORAGE_TRANSFORM_SWAPAXES01),
+            None,
+            None,
+            Some(&alignment),
+        )
+        .expect("render transformed derivatives");
+
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_before);
+        assert_eq!(written.derivative_transform, domain::DerivativeTransform {
+            rotation_degrees: 90,
+            horizontal_mirror: true,
+            vertical_mirror: false,
+        });
+        for path in [written.positive_path, written.preview_path] {
+            let image = image_io::read_rgb16(path.as_ref().unwrap()).unwrap();
+            assert_eq!((image.width, image.height), (2, 3));
+            assert_eq!(
+                image.pixels,
+                vec![
+                    [6_000, 6_000, 6_000],
+                    [3_000, 3_000, 3_000],
+                    [5_000, 5_000, 5_000],
+                    [2_000, 2_000, 2_000],
+                    [4_000, 4_000, 4_000],
+                    [1_000, 1_000, 1_000],
+                ]
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derivative_transform_permutation_is_exact_for_every_rotation_and_mirror_combination() {
+        let cases: &[(u16, bool, bool, (u32, u32), &[u16])] = &[
+            (0, false, false, (3, 2), &[1, 2, 3, 4, 5, 6]),
+            (0, true, false, (3, 2), &[3, 2, 1, 6, 5, 4]),
+            (0, false, true, (3, 2), &[4, 5, 6, 1, 2, 3]),
+            (0, true, true, (3, 2), &[6, 5, 4, 3, 2, 1]),
+            (90, false, false, (2, 3), &[4, 1, 5, 2, 6, 3]),
+            (90, true, false, (2, 3), &[6, 3, 5, 2, 4, 1]),
+            (90, false, true, (2, 3), &[1, 4, 2, 5, 3, 6]),
+            (90, true, true, (2, 3), &[3, 6, 2, 5, 1, 4]),
+            (180, false, false, (3, 2), &[6, 5, 4, 3, 2, 1]),
+            (180, true, false, (3, 2), &[4, 5, 6, 1, 2, 3]),
+            (180, false, true, (3, 2), &[3, 2, 1, 6, 5, 4]),
+            (180, true, true, (3, 2), &[1, 2, 3, 4, 5, 6]),
+            (270, false, false, (2, 3), &[3, 6, 2, 5, 1, 4]),
+            (270, true, false, (2, 3), &[1, 4, 2, 5, 3, 6]),
+            (270, false, true, (2, 3), &[6, 3, 5, 2, 4, 1]),
+            (270, true, true, (2, 3), &[4, 1, 5, 2, 6, 3]),
+        ];
+
+        for &(rotation_degrees, horizontal_mirror, vertical_mirror, dimensions, expected) in cases {
+            let mut raw: Vec<[f64; 3]> = (1..=6)
+                .map(|value| [value as f64; 3])
+                .collect();
+            let actual_dimensions = apply_derivative_transform_in_place(
+                &mut raw,
+                3,
+                2,
+                domain::DerivativeTransform {
+                    rotation_degrees,
+                    horizontal_mirror,
+                    vertical_mirror,
+                },
+            )
+            .unwrap();
+            assert_eq!(actual_dimensions, dimensions);
+            assert_eq!(
+                raw.iter().map(|pixel| pixel[0] as u16).collect::<Vec<_>>(),
+                expected,
+                "rotation={rotation_degrees}, horizontalMirror={horizontal_mirror}, verticalMirror={vertical_mirror}"
+            );
+        }
+    }
+
+    #[test]
     fn real_archive_derivative_nikonlook_provenance_tracks_exposure_usability() {
         let dir = unique_test_dir();
         let archive_path = dir.join("Archive").join("Archive_0001.tif");
@@ -3723,7 +3954,11 @@ mod tests {
         recipes.positive.destination = dir.join("Positive").display().to_string();
         recipes.positive.file_format = domain::OutputFileFormat::Tiff;
         recipes.preview.enabled = false;
-        let alignment = domain::FrameAlignment { offset_rows: 0, approved: true };
+        let alignment = domain::FrameAlignment {
+            offset_rows: 0,
+            approved: true,
+            derivative_transform: domain::DerivativeTransform::default(),
+        };
 
         let written = render_derivative_from_archive(
             &archive_path,

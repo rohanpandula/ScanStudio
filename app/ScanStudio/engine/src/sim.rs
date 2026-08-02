@@ -820,6 +820,7 @@ fn build_receipt(
                 .preview_path
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            derivative_transform: written.derivative_transform,
         }),
         // Bridge-only concepts — the simulator has no bridge subprocess to
         // source a capture-file location or hardware telemetry from.
@@ -1437,6 +1438,7 @@ mod tests {
             preview_path: None,
             nikonlook: Some(provenance.clone()),
             auto_crop: None,
+            derivative_transform: crate::domain::DerivativeTransform::default(),
         };
 
         let receipt = build_receipt(
@@ -2139,7 +2141,14 @@ mod tests {
         SimulatedLs5000::scan_start(
             &sim,
             vec![1],
-            CaptureRecipe::default(),
+            // This assertion covers receipt-persistence semantics, not
+            // full-resolution rendering. Keep the synthetic frame small so
+            // parallel CPU-heavy tests cannot consume this test's terminal
+            // event timeout before the worker reports scan.completed.
+            CaptureRecipe {
+                resolution_dpi: 40,
+                ..CaptureRecipe::default()
+            },
             ProcessingRecipe::default(),
             output,
             HashMap::new(),

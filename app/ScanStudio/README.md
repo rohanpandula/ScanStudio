@@ -26,7 +26,11 @@ film where it is not appropriate.
    generated previews and labels them accordingly.
 3. **Select the frames to capture.** Choose one or more tiles, review their
    preview, and adjust orientation, mirroring, crop, or alignment where those
-   controls are available.
+   controls are available. Rotation and mirroring are saved into the finished
+   Positive/Preview files; the archival Master TIFF and its RGB, IR, and meter
+   capture layers remain untouched. On an already-saved project, a new
+   transform remains a session draft until the next scan starts; existing
+   files are never silently rewritten.
 4. **Set up the scan.** Choose negative or positive handling, film stock,
    recipe, output formats, naming, and destination. Keep the archival master
    TIFF, positive TIFF, positive JPEG, or any combination, but retain at

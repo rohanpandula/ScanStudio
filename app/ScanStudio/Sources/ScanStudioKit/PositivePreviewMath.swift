@@ -1,4 +1,4 @@
-// Pure, DISPLAY-ONLY negative-to-positive approximation math for the
+// Pure, CONTACT-SHEET-ONLY negative-to-positive approximation math for the
 // contact sheet's "Show as positive" toggle (`ThumbnailGridView`). Never
 // touches capture data or written outputs -- this only affects what a tile
 // looks like on screen. Kept pure and Foundation-only (no AppKit/CGImage

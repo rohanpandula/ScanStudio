@@ -75,6 +75,38 @@ struct ProjectWireProtocolTests {
         )
         #expect(outputs.archivePath == nil)
         #expect(outputs.positivePath?.hasSuffix(".tif") == true)
+        #expect(outputs.derivativeTransform == .identity)
+    }
+
+    @Test("frame geometry and receipts decode exact derivative transforms while legacy values default to identity")
+    func derivativeTransformWireCompatibilityAndReceiptProvenance() throws {
+        let legacyAlignment = try JSONDecoder().decode(
+            FrameAlignment.self,
+            from: Data(#"{"offsetRows":7,"approved":false}"#.utf8)
+        )
+        #expect(legacyAlignment.derivativeTransform == .identity)
+
+        let alignment = try JSONDecoder().decode(
+            FrameAlignment.self,
+            from: Data(
+                #"{"offsetRows":-3,"approved":true,"derivativeTransform":{"rotationDegrees":270,"horizontalMirror":true,"verticalMirror":false}}"#.utf8
+            )
+        )
+        let expected = DerivativeTransform(
+            rotationDegrees: 270,
+            horizontalMirror: true,
+            verticalMirror: false
+        )
+        #expect(alignment.derivativeTransform == expected)
+
+        let outputs = try JSONDecoder().decode(
+            WrittenOutputs.self,
+            from: Data(
+                #"{"archivePath":"/Archive/frame.tif","positivePath":"/Positive/frame.tif","previewPath":"/Preview/frame.jpg","derivativeTransform":{"rotationDegrees":270,"horizontalMirror":true,"verticalMirror":false}}"#.utf8
+            )
+        )
+        #expect(outputs.archivePath == "/Archive/frame.tif")
+        #expect(outputs.derivativeTransform == expected)
     }
     @Test("ProjectCreateParams omits the directory key entirely when nil")
     func createParamsOmitsDirectoryWhenNil() throws {

@@ -24,6 +24,7 @@ public enum ScanReadinessPolicy {
         public let transportIsIdle: Bool
         public let isAcquiringPreviews: Bool
         public let hasActiveJob: Bool
+        public let isAdjustingFrameAlignment: Bool
 
         public init(
             isConnected: Bool,
@@ -36,7 +37,8 @@ public enum ScanReadinessPolicy {
             hasTargetPreviews: Bool,
             transportIsIdle: Bool,
             isAcquiringPreviews: Bool,
-            hasActiveJob: Bool
+            hasActiveJob: Bool,
+            isAdjustingFrameAlignment: Bool = false
         ) {
             self.isConnected = isConnected
             self.hasPreviewedMedia = hasPreviewedMedia
@@ -49,6 +51,7 @@ public enum ScanReadinessPolicy {
             self.transportIsIdle = transportIsIdle
             self.isAcquiringPreviews = isAcquiringPreviews
             self.hasActiveJob = hasActiveJob
+            self.isAdjustingFrameAlignment = isAdjustingFrameAlignment
         }
     }
 
@@ -63,6 +66,7 @@ public enum ScanReadinessPolicy {
         case targetRequired
         case targetPreviewsUnavailable
         case previewsInProgress
+        case alignmentInProgress
         case scanInProgress
         case transportBusy
 
@@ -82,6 +86,7 @@ public enum ScanReadinessPolicy {
             case .targetRequired: "Select a frame to scan."
             case .targetPreviewsUnavailable: "Preview every selected frame before scanning."
             case .previewsInProgress: "Wait for previews to finish."
+            case .alignmentInProgress: "Wait for the frame alignment to finish."
             case .scanInProgress: "A scan is already in progress."
             case .transportBusy: "Wait for the scanner to become idle."
             }
@@ -100,6 +105,9 @@ public enum ScanReadinessPolicy {
         guard input.hasValidTarget else { return .targetRequired }
         guard input.hasTargetPreviews else { return .targetPreviewsUnavailable }
         guard !input.isAcquiringPreviews else { return .previewsInProgress }
+        guard !input.isAdjustingFrameAlignment else {
+            return .alignmentInProgress
+        }
         guard !input.hasActiveJob else { return .scanInProgress }
         guard input.transportIsIdle else { return .transportBusy }
         return .ready

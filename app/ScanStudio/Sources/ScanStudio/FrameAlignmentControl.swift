@@ -1,8 +1,8 @@
 import ScanStudioKit
 import SwiftUI
 
-/// A live scanner-position control, deliberately separate from display-only
-/// zoom, pan, rotation, and mirroring. Each nudge asks the active preview
+/// A live scanner-position control, deliberately separate from preview-only
+/// zoom/pan and saved derivative rotation/mirroring. Each nudge asks the active preview
 /// session for a freshly re-cropped thumbnail, so the image above this row is
 /// evidence of the position that the scanner will use rather than a cosmetic
 /// SwiftUI offset.

@@ -140,7 +140,8 @@ public enum ErrorPresentationPolicy {
         context: ErrorPresentationContext = .init()
     ) -> ErrorPresentation {
         let normalizedMessage = lastErrorMessage.uppercased()
-        let copy = filmTransportSlipCopy(in: lastErrorMessage)
+        let copy = filmFeedInterruptedCopy(in: lastErrorMessage)
+            ?? filmTransportSlipCopy(in: lastErrorMessage)
             ?? previewReadinessTimeoutCopy(in: lastErrorMessage)
             ?? knownCopy.first { containsCode($0.code, in: normalizedMessage) }
             ?? Copy(
@@ -161,6 +162,19 @@ public enum ErrorPresentationPolicy {
                 lastErrorMessage: lastErrorMessage,
                 context: context
             )
+        )
+    }
+
+    private static func filmFeedInterruptedCopy(in message: String) -> Copy? {
+        guard FilmTransportFailurePolicy.isFilmFeedInterrupted(message: message) else {
+            return nil
+        }
+        return Copy(
+            code: "FILM_FEED_INTERRUPTED",
+            title: "Film feed interrupted",
+            guidance: "The scanner stopped detecting the film while moving to the next frame. "
+                + "Your finished frames are safe. Reinsert the film, acquire a fresh preview, "
+                + "then resume the remaining frames."
         )
     }
 

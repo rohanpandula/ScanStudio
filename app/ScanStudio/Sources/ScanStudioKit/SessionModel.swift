@@ -600,27 +600,20 @@ public final class SessionModel {
     /// describes). Cleared when a new preview starts, on a successful
     /// eject, and on connect/disconnect/engine-termination.
     public private(set) var refeedRequired = false
-    /// Session-local per-frame display rotation intent, in degrees
+    /// Per-frame derivative rotation intent, in degrees
     /// (0/90/180/270). Read/written by `rotateFrame(_:by:)`/
     /// `resetFrameOrientation(_:)`; frames absent from this dictionary are
-    /// unrotated (0°). Contact-sheet-display-only: no field in the wire
-    /// protocol's `FrameOverrides`/project manifest carries an orientation
-    /// value yet (`domain.rs::FrameOverrides` has `capture`/`processing`/
-    /// `output`/`alignment` only, and `alignment.offsetRows` is a vertical
-    /// crop nudge, not a rotation) — this state is never persisted to the
-    /// project manifest and never sent with `scan.start`, and resets
-    /// whenever media changes, exactly like `selectedFrameIndices`.
+    /// unrotated (0°). The model persists this inside the frame's alignment
+    /// geometry before scanning; the engine applies it only to finished
+    /// Positive/Preview derivatives and receipts the exact transform.
     public private(set) var frameOrientations: [Int: Int] = [:]
-    /// Session-local per-frame horizontal mirror intent. Read/written by
+    /// Per-frame horizontal mirror intent. Read/written by
     /// `toggleFrameMirror(_:)`/`setFrameMirror(_:for:)`/`resetFrameMirror(_:)`;
     /// frames absent from this dictionary are unmirrored (`false`). Symmetric
-    /// with `frameOrientations` and exactly as session-local: no field in the
-    /// wire protocol's `FrameOverrides`/project manifest carries a mirror value
-    /// yet, so this state is never persisted to the project manifest and never
-    /// sent with `scan.start`, and resets whenever media changes, exactly like
-    /// `selectedFrameIndices` and `frameOrientations`.
+    /// with `frameOrientations`; persisted in the same derivative-only frame
+    /// geometry record before scan dispatch.
     public private(set) var frameMirrors: [Int: Bool] = [:]
-    /// Session-local per-frame top-to-bottom flip intent. Kept independent
+    /// Per-frame top-to-bottom flip intent. Kept independent
     /// from `frameMirrors` so either axis can be toggled or reset without
     /// changing the other.
     public private(set) var frameVerticalMirrors: [Int: Bool] = [:]
@@ -988,7 +981,8 @@ public final class SessionModel {
             ),
             transportIsIdle: status?.transport == "idle",
             isAcquiringPreviews: isAcquiringThumbnails,
-            hasActiveJob: isJobActive
+            hasActiveJob: isJobActive,
+            isAdjustingFrameAlignment: pendingFrameAlignmentAdjustment != nil
         ))
     }
 
@@ -1096,9 +1090,17 @@ public final class SessionModel {
                 )
                 return
             }
-            status = refreshed
-            if !refreshed.mediaLoaded || refreshed.filmPresent == false {
-                clearMediaState(preservingPreviewAuthorization: true)
+            let reconciled = refreshed.invalidatingPreviewWhenFilmIsAbsent()
+            status = reconciled
+            recordDiagnostic(
+                event: "scanner.status",
+                fields: Self.scannerStatusDiagnosticFields(reconciled)
+            )
+            if !reconciled.mediaLoaded || reconciled.filmPresent == false {
+                clearMediaState(
+                    preservingPreviewAuthorization: true,
+                    preservingActiveJob: refeedRequired
+                )
             }
             if !refeedRequired {
                 lastErrorMessage = nil
@@ -2092,23 +2094,32 @@ public final class SessionModel {
         return started || pendingManualReviewScan?.frames == requestedFrames
     }
 
-    /// Moves any contact-sheet nudges made before Save Roll into the newly
-    /// created project. Drafts remain explicitly unapproved until a separate
-    /// review action approves them.
+    /// Moves contact-sheet crop and presentation geometry chosen before Save
+    /// Roll into the newly created project. Crop drafts remain unapproved;
+    /// explicit rotation/flips become derivative-authoritative at this
+    /// Save Roll boundary.
     private func persistFrameAlignmentDrafts() async {
         guard let project else { return }
-        let projectFrameIndices = Set(project.frames.map(\.index))
-        let targets = frameAlignmentDrafts.sorted(
-            by: { $0.key < $1.key }
-        ).filter { projectFrameIndices.contains($0.key) }
-        for (position, target) in targets.enumerated() {
-            let (frameIndex, draft) = target
+        let targets = project.frames.compactMap { frame in
+            frame.alignment == desiredFrameGeometry(
+                for: frame.index,
+                persistedFrame: frame
+            ) ? nil : frame.index
+        }.sorted()
+        for (position, frameIndex) in targets.enumerated() {
+            guard let currentProject = self.project,
+                  let persistedFrame = currentProject.frames.first(
+                    where: { $0.index == frameIndex }
+                  )
+            else { continue }
+            let desired = desiredFrameGeometry(
+                for: frameIndex,
+                persistedFrame: persistedFrame
+            )
+            guard persistedFrame.alignment != desired else { continue }
             let params = SetFrameAlignmentParams(
                 frameIndex: frameIndex,
-                alignment: FrameAlignment(
-                    offsetRows: draft.offsetRows,
-                    approved: false
-                )
+                alignment: desired
             )
             do {
                 let result: SetFrameResult = try await engineClient.request(
@@ -2129,7 +2140,7 @@ public final class SessionModel {
                 failedFrameAlignmentRestoreIndices.remove(frameIndex)
             } catch {
                 let unresolved = Set(
-                    targets[position...].map(\.key)
+                    targets[position...]
                 )
                 failedFrameAlignmentRestoreIndices.formUnion(unresolved)
                 recordOperationFailure(
@@ -2137,7 +2148,7 @@ public final class SessionModel {
                     operation: "frame.alignment.migrate"
                 )
                 lastErrorMessage =
-                    "The project was created, but the alignment for frame "
+                    "The project was created, but the crop/rotation settings for frame "
                     + "\(frameIndex) could not be saved: \(Self.describe(error)). "
                     + frameAlignmentRestoreRecoveryGuidance()
                 return
@@ -2168,6 +2179,7 @@ public final class SessionModel {
             isCustomFilmStockSelected = false
             projectDirectory = result.directory
             applyRecipes(result.project.recipes)
+            restoreDerivativeTransforms(from: result.project.frames)
         } catch {
             lastErrorMessage = Self.describe(error)
         }
@@ -2514,6 +2526,7 @@ public final class SessionModel {
             finishCompletedPreview(frameCount: previewFrameCount)
             return
         }
+        restoreDerivativeTransforms(from: project.frames)
         let targets = project.frames.compactMap { frame -> PersistedFrameAlignmentTarget? in
             guard let alignment = frame.alignment,
                   alignment.offsetRows != 0
@@ -2604,7 +2617,10 @@ public final class SessionModel {
                 thumbnails[target.frameIndex] = result.thumbnail
                 frameAlignmentDrafts[target.frameIndex] = FrameAlignment(
                     offsetRows: target.offsetRows,
-                    approved: false
+                    approved: false,
+                    derivativeTransform: derivativeTransform(
+                        for: target.frameIndex
+                    )
                 )
                 failedFrameAlignmentRestoreIndices.remove(target.frameIndex)
                 manualReviewDecisions.removeValue(forKey: target.frameIndex)
@@ -2712,6 +2728,8 @@ public final class SessionModel {
         guard delta != 0,
               !isChangingProject,
               !isRestoringFrameAlignments,
+              pendingScanStart == nil,
+              !isJobActive,
               pendingFrameAlignmentAdjustment == nil,
               latestCompletedPreviewOperationId != nil,
               thumbnails[frameIndex] != nil,
@@ -2774,7 +2792,8 @@ public final class SessionModel {
             let appliedOffset = result.thumbnail.spacingOffset ?? targetOffset
             frameAlignmentDrafts[frameIndex] = FrameAlignment(
                 offsetRows: appliedOffset,
-                approved: false
+                approved: false,
+                derivativeTransform: derivativeTransform(for: frameIndex)
             )
             installedLiveAlignment = true
             manualReviewDecisions.removeValue(forKey: frameIndex)
@@ -2784,7 +2803,10 @@ public final class SessionModel {
                     frameIndex: frameIndex,
                     alignment: FrameAlignment(
                         offsetRows: appliedOffset,
-                        approved: false
+                        approved: false,
+                        derivativeTransform: derivativeTransform(
+                            for: frameIndex
+                        )
                     )
                 )
                 let persistenceResult: SetFrameResult = try await engineClient.request(
@@ -2829,6 +2851,8 @@ public final class SessionModel {
         guard failedFrameAlignmentRestoreIndices.contains(frameIndex),
               !isChangingProject,
               !isRestoringFrameAlignments,
+              pendingScanStart == nil,
+              !isJobActive,
               pendingFrameAlignmentAdjustment == nil
         else {
             return
@@ -2855,7 +2879,8 @@ public final class SessionModel {
 
         let targetAlignment = FrameAlignment(
             offsetRows: savedAlignment.offsetRows,
-            approved: false
+            approved: false,
+            derivativeTransform: derivativeTransform(for: frameIndex)
         )
         let marker = PendingFrameAlignmentAdjustment(
             id: UUID(),
@@ -3128,19 +3153,32 @@ public final class SessionModel {
         lastErrorMessage = nil
     }
 
-    // MARK: - Frame rotation (display-only)
-    //
-    // See `frameOrientations`'s own doc comment for why this is session-
-    // local rather than a project-manifest field.
+    // MARK: - Frame derivative transform
+
+    /// One UI/model contract for every rotation and flip affordance. The
+    /// value becomes false as soon as scan startup owns the request and stays
+    /// false until the resulting job reaches a terminal state.
+    public var frameTransformsAreEditable: Bool {
+        pendingScanStart == nil && !isJobActive
+    }
 
     public func rotateFrame(_ frameIndex: Int, by degrees: Int) {
+        guard frameTransformsAreEditable else { return }
         let current = frameOrientations[frameIndex] ?? 0
-        frameOrientations[frameIndex] = FrameOrientation.normalized(current + degrees)
+        let normalized = FrameOrientation.normalized(current + degrees)
+        guard normalized.isMultiple(of: 90) else { return }
+        if normalized == 0 {
+            frameOrientations.removeValue(forKey: frameIndex)
+        } else {
+            frameOrientations[frameIndex] = normalized
+        }
     }
 
     @discardableResult
     public func rotateFocusedFrame(by degrees: Int) -> Bool {
-        guard let frameIndex = frameTransformTargetIndex else { return false }
+        guard frameTransformsAreEditable,
+              let frameIndex = frameTransformTargetIndex
+        else { return false }
         rotateFrame(frameIndex, by: degrees)
         return true
     }
@@ -3165,7 +3203,9 @@ public final class SessionModel {
         _ command: FrameTransformCommand,
         for frameIndex: Int
     ) -> Bool {
-        guard validFrameIndices.contains(frameIndex) else { return false }
+        guard frameTransformsAreEditable,
+              validFrameIndices.contains(frameIndex)
+        else { return false }
         switch command {
         case .rotateLeft:
             rotateFrame(frameIndex, by: -90)
@@ -3180,6 +3220,7 @@ public final class SessionModel {
     }
 
     public func resetFrameOrientation(_ frameIndex: Int) {
+        guard frameTransformsAreEditable else { return }
         frameOrientations.removeValue(forKey: frameIndex)
     }
 
@@ -3187,17 +3228,14 @@ public final class SessionModel {
         frameOrientations[frameIndex] ?? 0
     }
 
-    // MARK: - Frame horizontal mirror (display-only)
-    //
-    // See `frameMirrors`'s own doc comment for why this is session-local
-    // rather than a project-manifest field. Symmetric with the rotation
-    // methods above.
+    // MARK: - Frame horizontal/vertical mirror
 
     public func toggleFrameMirror(_ frameIndex: Int) {
         setFrameMirror(!frameMirror(frameIndex), for: frameIndex)
     }
 
     public func setFrameMirror(_ mirrored: Bool, for frameIndex: Int) {
+        guard frameTransformsAreEditable else { return }
         if mirrored {
             frameMirrors[frameIndex] = true
         } else {
@@ -3206,6 +3244,7 @@ public final class SessionModel {
     }
 
     public func resetFrameMirror(_ frameIndex: Int) {
+        guard frameTransformsAreEditable else { return }
         frameMirrors.removeValue(forKey: frameIndex)
     }
 
@@ -3218,6 +3257,7 @@ public final class SessionModel {
     }
 
     public func setFrameVerticalMirror(_ mirrored: Bool, for frameIndex: Int) {
+        guard frameTransformsAreEditable else { return }
         if mirrored {
             frameVerticalMirrors[frameIndex] = true
         } else {
@@ -3230,8 +3270,57 @@ public final class SessionModel {
     }
 
     public func resetFrameMirrors(_ frameIndex: Int) {
+        guard frameTransformsAreEditable else { return }
         frameMirrors.removeValue(forKey: frameIndex)
         frameVerticalMirrors.removeValue(forKey: frameIndex)
+    }
+
+    private func derivativeTransform(for frameIndex: Int) -> DerivativeTransform {
+        DerivativeTransform(
+            rotationDegrees: FrameOrientation.normalized(
+                frameOrientation(frameIndex)
+            ),
+            horizontalMirror: frameMirror(frameIndex),
+            verticalMirror: frameVerticalMirror(frameIndex)
+        )
+    }
+
+    private func restoreDerivativeTransforms(from frames: [ProjectFrame]) {
+        frameOrientations.removeAll()
+        frameMirrors.removeAll()
+        frameVerticalMirrors.removeAll()
+        for frame in frames {
+            guard let transform = frame.alignment?.derivativeTransform else {
+                continue
+            }
+            let rotation = FrameOrientation.normalized(
+                transform.rotationDegrees
+            )
+            if rotation != 0 {
+                frameOrientations[frame.index] = rotation
+            }
+            if transform.horizontalMirror {
+                frameMirrors[frame.index] = true
+            }
+            if transform.verticalMirror {
+                frameVerticalMirrors[frame.index] = true
+            }
+        }
+    }
+
+    private func desiredFrameGeometry(
+        for frameIndex: Int,
+        persistedFrame: ProjectFrame
+    ) -> FrameAlignment? {
+        let base = frameAlignmentDrafts[frameIndex]
+            ?? persistedFrame.alignment
+        let transform = derivativeTransform(for: frameIndex)
+        guard base != nil || transform != .identity else { return nil }
+        return FrameAlignment(
+            offsetRows: base?.offsetRows ?? 0,
+            approved: base?.approved ?? false,
+            derivativeTransform: transform
+        )
     }
 
     // MARK: - Event subscription
@@ -3249,24 +3338,24 @@ public final class SessionModel {
                 guard self.previewIntentStateMachine.admitsStatusEvent(
                     operationID: $0.operationId
                 ) else { return }
+                let reconciled = $0.status.invalidatingPreviewWhenFilmIsAbsent()
                 self.recordDiagnostic(
                     event: "scanner.status",
-                    fields: [
-                        "connected": String($0.status.connected),
-                        "mediaLoaded": String($0.status.mediaLoaded),
-                        "transport": $0.status.transport,
-                    ]
+                    fields: Self.scannerStatusDiagnosticFields(reconciled)
                 )
-                if !$0.status.connected {
+                if !reconciled.connected {
                     self.invalidateConnection(
                         source: "scanner.status",
                         uiConnectedBefore: self.diagnosticUIConnected
                     )
                     return
                 }
-                self.status = $0.status
-                if !$0.status.mediaLoaded || $0.status.filmPresent == false {
-                    self.clearMediaState(preservingPreviewAuthorization: true)
+                self.status = reconciled
+                if !reconciled.mediaLoaded || reconciled.filmPresent == false {
+                    self.clearMediaState(
+                        preservingPreviewAuthorization: true,
+                        preservingActiveJob: self.refeedRequired
+                    )
                 }
             }
         case "scanner.thumbnail":
@@ -3534,6 +3623,18 @@ public final class SessionModel {
             }
         }
 
+        guard try await persistFrameGeometryBeforeScan(
+            frames: frames,
+            scanStartMarker: marker
+        ), scanStartRequestIsCurrent(marker, frames: frames) else {
+            bufferedJobEvents.removeAll()
+            recordDiagnostic(
+                event: "scan.start.discarded",
+                fields: ["reason": "authorizationChangedBeforeRequest"]
+            )
+            return nil
+        }
+
         let params = ScanStartParams(
             frames: frames,
             recipe: captureRecipe,
@@ -3564,6 +3665,111 @@ public final class SessionModel {
         return result
     }
 
+    /// Makes the active manifest authoritative for the exact crop/rotation/
+    /// flip geometry visible in the UI before the engine is allowed to
+    /// resolve its per-frame overrides. A bounded convergence check handles
+    /// a last-moment edit during an awaited manifest write without ever
+    /// starting with stale geometry.
+    private func persistFrameGeometryBeforeScan(
+        frames: [Int],
+        scanStartMarker: PendingScanStart
+    ) async throws -> Bool {
+        guard let project else { return true }
+        let requested = Set(frames)
+        for _ in 0..<3 {
+            var wroteAny = false
+            for frameIndex in requested.sorted() {
+                guard let currentProject = self.project,
+                      currentProject.id == project.id,
+                      let persistedFrame = currentProject.frames.first(
+                        where: { $0.index == frameIndex }
+                      )
+                else {
+                    throw EngineRequestError(
+                        code: "TRANSFORM_PROJECT_CHANGED",
+                        message:
+                            "the frame transform no longer belongs to the active project",
+                        recoverable: true
+                    )
+                }
+                let desired = desiredFrameGeometry(
+                    for: frameIndex,
+                    persistedFrame: persistedFrame
+                )
+                guard persistedFrame.alignment != desired else { continue }
+                wroteAny = true
+                let result: SetFrameResult = try await engineClient.request(
+                    "project.setFrameAlignment",
+                    params: SetFrameAlignmentParams(
+                        frameIndex: frameIndex,
+                        alignment: desired
+                    )
+                )
+                guard scanStartRequestIsCurrent(
+                    scanStartMarker,
+                    frames: frames
+                ) else {
+                    return false
+                }
+                guard result.project.id == project.id else {
+                    throw EngineRequestError(
+                        code: "TRANSFORM_PROJECT_CHANGED",
+                        message:
+                            "the frame transform response belongs to a different project",
+                        recoverable: true
+                    )
+                }
+                self.project = result.project
+            }
+
+            guard let currentProject = self.project,
+                  currentProject.id == project.id
+            else {
+                throw EngineRequestError(
+                    code: "TRANSFORM_PROJECT_CHANGED",
+                    message: "the active project changed before scan start",
+                    recoverable: true
+                )
+            }
+            let converged = requested.allSatisfy { frameIndex in
+                guard let persistedFrame = currentProject.frames.first(
+                    where: { $0.index == frameIndex }
+                ) else { return false }
+                return persistedFrame.alignment == desiredFrameGeometry(
+                    for: frameIndex,
+                    persistedFrame: persistedFrame
+                )
+            }
+            if converged { return true }
+            if !wroteAny { break }
+        }
+        throw EngineRequestError(
+            code: "TRANSFORM_CHANGED_DURING_SAVE",
+            message:
+                "rotation or flip settings changed while the roll was being saved; review them and start the scan again",
+            recoverable: true
+        )
+    }
+
+    /// Revalidates the exact owner and all motion preconditions at every
+    /// suspension point between accepting a Scan action and sending the
+    /// motion-capable `scan.start` request. A reconnect retires the marker
+    /// even when a previous manifest write later resumes successfully.
+    private func scanStartRequestIsCurrent(
+        _ marker: PendingScanStart,
+        frames: [Int]
+    ) -> Bool {
+        guard let pendingScanStart,
+              pendingScanStart.id == marker.id,
+              pendingScanStart.connectionEpoch == marker.connectionEpoch,
+              connectionEpoch == marker.connectionEpoch,
+              diagnosticUIConnected
+        else {
+            return false
+        }
+        return scanReadiness(for: frames).isReady
+    }
+
     private func applyJobState(_ payload: JobStatePayload, source: EngineEvent) {
         guard eventIsRelevant(payload.jobId, source: source) else { return }
         guard let current = jobState else { jobState = payload.state; return }
@@ -3588,20 +3794,34 @@ public final class SessionModel {
         frameStates[payload.frameIndex] = payload.state
         frameAttempts[payload.frameIndex] = payload.attempt
         if let error = payload.error {
+            let isFilmFeedInterrupted = FilmTransportFailurePolicy.isFilmFeedInterrupted(
+                errorCode: error.code,
+                message: error.message
+            )
+            let duplicateBatchFeedDiagnostic = isFilmFeedInterrupted
+                && frameErrors.values.contains {
+                    FilmTransportFailurePolicy.isFilmFeedInterrupted(
+                        errorCode: $0.code,
+                        message: $0.message
+                    )
+                }
             frameErrors[payload.frameIndex] = error
             let diagnosticCode = Self.diagnosticErrorCode(
                 code: error.code,
                 message: error.message
             )
             let wasConnected = diagnosticUIConnected
-            recordDiagnostic(
-                event: "scan.frame.failed",
-                fields: [
-                    "attempt": String(payload.attempt),
-                    "code": diagnosticCode,
-                    "uiConnectedBefore": String(wasConnected),
-                ]
-            )
+            if !duplicateBatchFeedDiagnostic {
+                recordDiagnostic(
+                    event: "scan.frame.failed",
+                    fields: [
+                        "attempt": String(payload.attempt),
+                        "code": diagnosticCode,
+                        "frameIndex": String(payload.frameIndex),
+                        "uiConnectedBefore": String(wasConnected),
+                    ]
+                )
+            }
             if diagnosticCode == "NOT_CONNECTED" {
                 lastErrorMessage = "\(error.code): \(error.message)"
                 invalidateConnection(
@@ -3844,6 +4064,12 @@ public final class SessionModel {
         code: String,
         message: String
     ) -> String {
+        if FilmTransportFailurePolicy.isFilmFeedInterrupted(
+            errorCode: code,
+            message: message
+        ) {
+            return "FILM_FEED_INTERRUPTED"
+        }
         if FilmTransportFailurePolicy.requiresPhysicalRefeed(
             errorCode: code,
             message: message
@@ -3858,6 +4084,17 @@ public final class SessionModel {
             return "NOT_CONNECTED"
         }
         return code
+    }
+
+    private static func scannerStatusDiagnosticFields(
+        _ status: ScannerStatus
+    ) -> [String: String] {
+        [
+            "connected": String(status.connected),
+            "filmPresent": status.filmPresent.map(String.init) ?? "unknown",
+            "mediaLoaded": String(status.mediaLoaded),
+            "transport": status.transport,
+        ]
     }
 
     private static func describe(_ error: Error) -> String {
@@ -4082,13 +4319,13 @@ public enum SessionActivitySummary: Equatable, Sendable {
 ///
 /// `public` (with `ResumeBatchPolicy`'s precedent): the `ScanStudio`
 /// executable target's tiles read `accessibilityText(_:)` across the module
-/// boundary to announce a session-local rotation honestly to VoiceOver.
+/// boundary to announce the selected derivative rotation honestly to VoiceOver.
 public enum FrameOrientation {
     static func normalized(_ degrees: Int) -> Int {
         ((degrees % 360) + 360) % 360
     }
 
-    /// Honest VoiceOver text for a display-only rotation — `nil` for an
+    /// Honest VoiceOver text for a derivative rotation — `nil` for an
     /// unrotated frame, so callers append nothing rather than announce a
     /// pointless "rotated 0 degrees".
     public static func accessibilityText(_ degrees: Int) -> String? {
