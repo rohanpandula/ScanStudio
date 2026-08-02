@@ -169,7 +169,8 @@ ProcessingRecipe {filmProcess: "positive"|"c41ColorNegative"|"bwNegative"|"kodac
                   autofocusEachFrame: bool, autoExposureEachFrame: bool,
                   digitalIceEnabled: bool, digitalIceMode: "legacy"|"hybrid",
                   softwareDustRemovalBw: bool (default false)}
-OutputRecipe    {archive: ArchiveRecipe, positive: PositiveRecipe, preview: PreviewRecipe}
+OutputRecipe    {archive: ArchiveRecipe, positive: PositiveRecipe, preview: PreviewRecipe,
+                 autoCrop: bool}
 ArchiveRecipe   {enabled: bool (default true), filenameTemplate: string, destination: string,
                  fullCapturePackage: bool (default true; requires enabled)}
 PositiveRecipe  {enabled: bool, fileFormat: "tiff"|"jpeg",
@@ -196,13 +197,21 @@ FrameIdleSample      {frameIndex: u32, idleMs: u64}
 DutyCycleReport      {perFrameIdleMs: [FrameIdleSample], meanIdleMs: number, maxIdleMs: u64}
 NikonlookProvenance  {bundleVersion: string, layerAPath: "blind"|"hardwareExposure",
                       gains: [number, number, number]}
+AutoCropOutcome      {mode: "image", applied: bool, roi?: {y1,y2,x1,x2},
+                      sourceWidth: u32, sourceHeight: u32, reason?: string}
+ExposureAuthority    {rgbSource: string, irSource: string,
+                      commandedChannelsRaw10ns: {R,G,B,IR: u32},
+                      activeControllerChannelsRaw10ns: {R,G,B,IR: u32},
+                      deviceBoundClampedChannelsRaw10ns: {R?,G?,B?: u32},
+                      deviceExposureBoundsRaw10ns: [u32, u32]}
 ScanReceipt     {jobId, frameIndex, startedAt: ISO-8601 UTC string, durationMs: u64,
                  passes: u32, resolutionDpi: u32, bitDepth: u32, channels: string,
                  engineVersion: string, deviceId: string, simulated: true,
                  settingsFingerprint: 16-hex-char string,
                  processing?: ProcessingRecipe, output?: OutputRecipe, outputs?: WrittenOutputs,
                  rgbPath?: string, irPath?: string, meterRgbiPath?: string,
-                 hardwareTelemetry?: HardwareTelemetry, nikonlook?: NikonlookProvenance}
+                 hardwareTelemetry?: HardwareTelemetry, nikonlook?: NikonlookProvenance,
+                 autoCrop?: AutoCropOutcome, exposureAuthority?: ExposureAuthority}
 FrameAlignment  {offsetRows: i64, approved: bool}
 MetadataSet     {camera?: string, lens?: string, filmStock?: string,
                  process?: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome",
@@ -244,11 +253,15 @@ ApplyMetadataResult {success: bool, exitCode: i32, stdout: string, stderr: strin
 
 `ScannerStatus.motionArmed` is present only for a real bridge session and mirrors BRIDGE.md's live, no-motion `DeviceStatus.motionArmed` observation. It is informative, not authority: ScanStudio never creates or fills the latch, and the bridge still re-checks its safety gate at every motion-capable request. The simulator omits the field rather than fabricating a hardware-ready state.
 
+`OutputRecipe.autoCrop` defaults to `false` when omitted. When enabled, each frame's derived positive and preview are cropped independently to the detected image area. The retained archive master remains full-frame. `ScanReceipt.autoCrop` records the half-open ROI or the reason the crop was not applied; an approved manual `FrameAlignment` takes precedence, and an unusable detection falls back to the uncropped derivative.
+
 `ArchiveRecipe.enabled` defaults to `true` when omitted, preserving older projects. At least one retained output (`archive`, positive TIFF, or positive JPEG) is required for every effective frame recipe. When archive retention is disabled, `WrittenOutputs.archivePath` is absent; the real backend still reports bridge provenance in `rgbPath`/`irPath` while routing the mandatory physical capture into an engine-owned private working directory. That temporary capture is cleaned only after the observed bridge terminal closure and successful derivative completion; otherwise it is recovery-held and never represented as a user output.
 
 `ScanReceipt.rgbPath`/`irPath`/`meterRgbiPath`/`hardwareTelemetry` are populated only by a real backend, forwarding BRIDGE.md's `ScanReceipt.rgbPath`/`irPath`/`meterRgbiPath` and `exposure`/`clipping`/`focusDetail`/`transportSmear` telemetry verbatim (mirrored field-for-field under `HardwareTelemetry`'s `ExposureVector`/`ClippingTelemetry`/`FocusDetailTelemetry`/`TransportSmearAssessment`). `rgbPath`/`irPath` are bridge-written capture-file locations, deliberately distinct from `outputs`/`WrittenOutputs` (engine-rendered retained files) — the two are never merged. The simulator omits all four (it has no bridge-sourced capture-file locations or hardware telemetry to report).
 
 `ScanReceipt.nikonlook` records which nikonlook color pipeline actually rendered a C41 frame's positive: `bundleVersion` (the loaded bundle's own version string, e.g. `"nikonlook-v2"`), `layerAPath` (`"blind"` or `"hardwareExposure"` — which Layer-A gain estimator ran; see PARITY.md and `resources/nikonlook-v2/PROVENANCE.md` for why these can render materially different output on the same frame), and `gains` (the exact per-channel `[R, G, B]` multiplier `apply()` used). Present on both real and simulated receipts for a C41 frame once its positive/preview has rendered — this is engine-rendering provenance, not bridge-sourced hardware telemetry, so it is not restricted to real backends the way `hardwareTelemetry` is. Absent (not `null`) for every non-C41 frame (nikonlook never runs for Positive/Kodachrome/BwNegative) and for any receipt written before this field existed.
+
+`ScanReceipt.exposureAuthority` is populated only by the real backend and forwarded verbatim from CoolscanPy's per-frame `active_exposure_authority` journal. It records the guarded RGB command source, the active controller's accepted solve (including its unchanged IR command), the device exposure bounds, and the sparse set of RGB channels clamped into those bounds. It is absent for simulated and legacy receipts and whenever the bridge cannot read a valid journal block; absence is never replaced with invented values.
 
 `settingsFingerprint` = lowercase hex of FNV-1a 64 over the ASCII string `"{resolutionDpi}:{bitDepth}:{multisamplePasses}:{channels}"`. Golden value: `"4000:16:2:rgbi"` → `1a3d265e0b54bbd2` (as in fixture 09).
 

@@ -440,6 +440,8 @@ mod tests {
     fn derivative_only_receipt_targets_no_archive_xmp() {
         let mut project = project_with_one_frame();
         project.frames[0].receipts.push(ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-derivative-only".into(),
             frame_index: 1,
             started_at: "2026-07-27T00:00:00Z".into(),

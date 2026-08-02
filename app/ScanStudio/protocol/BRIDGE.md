@@ -229,6 +229,14 @@ ApprovalReceipt
   reviewedNativeOrigin: number
   reviewReasons: string[]
 
+ExposureAuthority
+  rgbSource: string
+  irSource: string
+  commandedChannelsRaw10ns: {R: number, G: number, B: number, IR: number}
+  activeControllerChannelsRaw10ns: {R: number, G: number, B: number, IR: number}
+  deviceBoundClampedChannelsRaw10ns: {R?: number, G?: number, B?: number}
+  deviceExposureBoundsRaw10ns: [number, number]
+
 ScanReceipt
   version: number
   slot: number
@@ -250,6 +258,7 @@ ScanReceipt
   rgbPath: string
   irPath: string|null
   meterRgbiPath: string|null
+  exposureAuthority: ExposureAuthority|null
 ```
 
 `$ScanStudioSequence(N)` is an additive engine-to-bridge, job-local exact-name marker (`N` is a positive decimal integer). It resolves to just `N`, with no slot substitution. The engine uses it only after reserving a single-`#` automatic sequence before dispatch; it is not a user template token and must never be persisted in a project manifest, output recipe, or receipt.
@@ -263,6 +272,8 @@ ScanReceipt
 `DeviceStatus.filmPresent` is a live, no-motion film-presence read, distinct from `previewEstablished` (which only means "a preview has run this session," never "film is physically loaded right now"). The bundled CoolScanPy asks the exact opened LS-5000 with TEST UNIT READY: `true` means the scanner reports medium gripped, `false` means its verified MEDIUM NOT PRESENT sense was observed, and `null` means no trustworthy verdict was available (for example, an active capture owns the interface, an older dependency lacks the method, or the scanner returned an unrecognised/malformed reply). `null` is never interpreted as absence. Presence is not motion readiness: a short strip parked at the transport end-stop can still report `true`.
 
 CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanReceipt` as `meterRgbiPath` starting this phase (Phase 10): the bridge writes `frame.meter_rgbi` (an HxWx4 uint16 array) to `{stem}_METER.tif` alongside the RGB/IR files, unconditionally whenever CoolscanPy supplies it — never fabricated; `null` only if absent.
+
+`exposureAuthority` is a best-effort, additive copy of CoolscanPy's per-frame `active_exposure_authority` journal block. It distinguishes the guarded Nikon-parity RGB command from the active controller's accepted solve, preserves the controller-owned IR command, and records any RGB channels clamped to the device exposure window. It is `null` when the journal block is absent, malformed, or cannot be read; that telemetry failure never invalidates an otherwise completed frame receipt.
 
 ## Events
 

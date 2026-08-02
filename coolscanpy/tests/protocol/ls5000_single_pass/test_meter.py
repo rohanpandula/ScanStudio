@@ -12,6 +12,10 @@ from coolscanpy.protocol.ls5000_single_pass.meter import (
     METER_ROWS,
     METER_TAIL_SAMPLES,
     METER_WIDTH,
+    NIKON_PARITY_REVIEWED_HIGH_THRESHOLD,
+    NIKON_PARITY_TARGET_FRACTIONS,
+    NikonParityShadowResult,
+    calculate_nikon_parity_shadow,
     decode_meter_pass,
     evaluate_meter_sequence,
     observe_meter_pass,
@@ -65,6 +69,89 @@ def test_meter_decode_preserves_channel_order_and_opaque_row_tail() -> None:
     assert decoded.row_tail.shape == (METER_ROWS, METER_TAIL_SAMPLES)
     assert decoded.channels == CHANNELS
     assert decoded.to_bytes() == payload
+
+
+def test_nikon_parity_shadow_is_rgb_only_and_has_no_scanner_route() -> None:
+    observation = observe_meter_pass(
+        _payload(_textured(), tail_seed=321),
+        DEFAULT_EXPOSURES,
+    )
+    active_metered = {"R": 97_000, "G": 194_000, "B": 177_000, "IR": 283_000}
+
+    shadow = calculate_nikon_parity_shadow(
+        observation,
+        current_metered_exposures=active_metered,
+    )
+
+    assert isinstance(shadow, NikonParityShadowResult)
+    record = shadow.to_journal_dict(routing="journal-only")
+    assert record["profile"] == "nikon-parity"
+    assert record["armed"] is False
+    assert record["scanner_route"] == "none"
+    assert tuple(record["channels"]) == ("R", "G", "B")
+    assert record["infrared"] == {
+        "policy": "active-controller-unchanged",
+        "current_metered_exposure_raw_10ns": active_metered["IR"],
+        "candidate_exposure_raw_10ns": None,
+    }
+    for channel in ("R", "G", "B"):
+        assert record["channels"][channel]["target_fraction"] == pytest.approx(
+            NIKON_PARITY_TARGET_FRACTIONS[channel]
+        )
+        assert (
+            record["channels"][channel]["predicted_full_high_q99_99"]
+            <= NIKON_PARITY_REVIEWED_HIGH_THRESHOLD
+        )
+    assert not hasattr(shadow, "proposed_exposures")
+    assert not hasattr(shadow, "final_exposures")
+
+
+def test_nikon_parity_journal_routing_literal_is_mandatory_and_closed() -> None:
+    observation = observe_meter_pass(
+        _payload(_textured(), tail_seed=321),
+        DEFAULT_EXPOSURES,
+    )
+    shadow = calculate_nikon_parity_shadow(
+        observation,
+        current_metered_exposures={
+            "R": 97_000,
+            "G": 194_000,
+            "B": 177_000,
+            "IR": 283_000,
+        },
+    )
+
+    with pytest.raises(TypeError):
+        shadow.to_journal_dict()  # routing intent must be stated explicitly
+    with pytest.raises(ValueError, match="routing"):
+        shadow.to_journal_dict(routing="armed")  # only the two known literals
+
+
+def test_nikon_parity_active_authority_routing_is_truthful() -> None:
+    observation = observe_meter_pass(
+        _payload(_textured(), tail_seed=321),
+        DEFAULT_EXPOSURES,
+    )
+    shadow = calculate_nikon_parity_shadow(
+        observation,
+        current_metered_exposures={
+            "R": 97_000,
+            "G": 194_000,
+            "B": 177_000,
+            "IR": 283_000,
+        },
+    )
+
+    record = shadow.to_journal_dict(routing="active-rgb-authority")
+    assert record["mode"] == "active-rgb-authority"
+    assert record["armed"] is True
+    assert record["scanner_route"] == "fine-rgb-set-window"
+    # The higher diagnostic value stays journal-only under BOTH routings.
+    for channel in ("R", "G", "B"):
+        assert record["channels"][channel]["uncapped_candidate_is_journal_only"] is True
+    # Infrared remains the active controller's, with no parity candidate.
+    assert record["infrared"]["policy"] == "active-controller-unchanged"
+    assert record["infrared"]["candidate_exposure_raw_10ns"] is None
 
 
 @pytest.mark.parametrize("delta", [-2, -1, 2])

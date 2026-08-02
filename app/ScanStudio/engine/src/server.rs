@@ -37,6 +37,26 @@ impl ProjectState {
         self.active = Some(project);
         self.directory = Some(directory);
     }
+
+    /// Refreshes the active manifest from its durable copy. Scan workers
+    /// persist receipts directly to disk, so receipt-dependent endpoints
+    /// must cross this boundary before reading the request loop's snapshot.
+    fn refresh_from_disk(&mut self) -> Result<(), EngineError> {
+        if self.active.is_none() {
+            return Err(EngineError::new(
+                ErrorCode::ProjectNotFound,
+                "no project is currently open",
+            ));
+        }
+        let directory = self.directory.clone().ok_or_else(|| {
+            EngineError::new(
+                ErrorCode::ProjectNotFound,
+                "the active project has no manifest directory",
+            )
+        })?;
+        self.active = Some(crate::manifest::read_manifest(&directory)?);
+        Ok(())
+    }
 }
 
 /// Which backend currently owns the connection, if any. `Copy` so
@@ -460,7 +480,10 @@ impl Backends {
 fn post_dispatch_status_is_safe(active: Option<ActiveDevice>, method: &str) -> bool {
     !matches!(
         (active, method),
-        (Some(ActiveDevice::Real), "scan.start" | "scanner.acquireThumbnails")
+        (
+            Some(ActiveDevice::Real),
+            "scan.start" | "scanner.acquireThumbnails"
+        )
     )
 }
 
@@ -844,13 +867,28 @@ fn handle_request(
             // -- token templates remain editable and reopenable. A separate
             // effective clone is materialized below solely for this job.
             // Best-effort: a persistence failure must never block the scan.
+            //
+            // Routes through persist_project_update rather than a direct
+            // write (PERSIST-02): project_state.active has been sitting
+            // stale in memory since project.create/open, and carries none
+            // of the receipts the scan worker thread has been durably
+            // attaching straight to disk since -- a direct write here used
+            // to overwrite every one of them at the start of every
+            // subsequent scan. persist_project_update reads disk fresh,
+            // keeps whatever receipts are already there, and the merged
+            // result is folded back into project_state.active so it
+            // converges toward disk truth on every call instead of
+            // drifting further from it.
             if let Some(project) = project_state.active.as_mut() {
                 project.recipes = params.output.clone();
                 let directory = project_state.directory.as_ref().expect(
                     "directory is always Some whenever active is Some — ProjectState::set sets both together",
                 );
-                if let Err(err) = crate::manifest::write_manifest_atomically(directory, project) {
-                    eprintln!("scanstudio-engine: failed to persist recipes to manifest: {err}");
+                match crate::manifest::persist_project_update(directory, project) {
+                    Ok(merged) => project_state.active = Some(merged),
+                    Err(err) => {
+                        eprintln!("scanstudio-engine: failed to persist recipes to manifest: {err}")
+                    }
                 }
             }
             let roll_metadata = project_state
@@ -859,14 +897,22 @@ fn handle_request(
                 .map(|project| project.roll_metadata.clone())
                 .unwrap_or_default();
             let mut effective_output = params.output.clone();
-            crate::render::materialize_output_filename_tokens(&mut effective_output, &roll_metadata);
+            crate::render::materialize_output_filename_tokens(
+                &mut effective_output,
+                &roll_metadata,
+            );
             crate::render::validate_user_output_recipe_paths(&effective_output)?;
             for (frame_index, override_values) in overrides.iter_mut() {
                 if let Some(output) = override_values.output.as_mut() {
                     let metadata = project_state
                         .active
                         .as_ref()
-                        .and_then(|project| project.frames.iter().find(|frame| frame.index == *frame_index))
+                        .and_then(|project| {
+                            project
+                                .frames
+                                .iter()
+                                .find(|frame| frame.index == *frame_index)
+                        })
                         .and_then(|frame| frame.metadata_override.as_ref())
                         .unwrap_or(&roll_metadata);
                     crate::render::materialize_output_filename_tokens(output, metadata);
@@ -879,15 +925,22 @@ fn handle_request(
             // the manifest retains the raw token template above.
             if let Some(project) = project_state.active.as_ref() {
                 for frame_index in &params.frames {
-                    let Some(metadata) = project.frames.iter()
+                    let Some(metadata) = project
+                        .frames
+                        .iter()
                         .find(|frame| frame.index == *frame_index)
                         .and_then(|frame| frame.metadata_override.as_ref())
-                    else { continue };
+                    else {
+                        continue;
+                    };
                     let frame_values = overrides.entry(*frame_index).or_default();
                     // Start with the raw token template, not the roll-level
                     // materialized output above; otherwise per-frame Camera/
                     // Lens/date metadata has no tokens left to replace.
-                    let mut frame_output = frame_values.output.clone().unwrap_or_else(|| params.output.clone());
+                    let mut frame_output = frame_values
+                        .output
+                        .clone()
+                        .unwrap_or_else(|| params.output.clone());
                     crate::render::materialize_output_filename_tokens(&mut frame_output, metadata);
                     crate::render::validate_user_output_recipe_paths(&frame_output)?;
                     frame_values.output = Some(frame_output);
@@ -1050,9 +1103,16 @@ fn handle_request(
             let directory = project_state.directory.clone().expect(
                 "directory is always Some whenever active is Some — ProjectState::set sets both together",
             );
-            let updated = project_state.active.clone().unwrap();
-            crate::manifest::write_manifest_atomically(&directory, &updated)?;
-            to_json(&protocol::SetFrameResult { project: updated })
+            // persist_project_update (PERSIST-02), not a direct write: this
+            // mutated in-memory project is otherwise exactly the stale
+            // snapshot that used to clobber every receipt the scan worker
+            // thread had durably attached to disk since this project was
+            // last loaded. The merge preserves them; propagating any
+            // persistence error here (via `?`) is unchanged from before.
+            let mutated = project_state.active.clone().unwrap();
+            let merged = crate::manifest::persist_project_update(&directory, &mutated)?;
+            project_state.active = Some(merged.clone());
+            to_json(&protocol::SetFrameResult { project: merged })
         }
         "project.setFrameMetadataOverride" => {
             let params: protocol::SetFrameMetadataOverrideParams = parse_params(&request.params)?;
@@ -1062,16 +1122,11 @@ fn handle_request(
             to_json(&protocol::SetFrameResult { project })
         }
         "project.pendingFrames" => {
-            if project_state.active.is_none() {
-                return Err(EngineError::new(
-                    ErrorCode::ProjectNotFound,
-                    "no project is currently open",
-                ));
-            }
-            let directory = project_state.directory.clone().expect(
-                "directory is always Some whenever active is Some — ProjectState::set sets both together",
-            );
-            let project = crate::manifest::read_manifest(&directory)?;
+            project_state.refresh_from_disk()?;
+            let project = project_state
+                .active
+                .as_ref()
+                .expect("refresh_from_disk sets active after reading the manifest");
             let frames = crate::manifest::pending_frames(&project);
             to_json(&protocol::PendingFramesResult {
                 frames,
@@ -1081,15 +1136,12 @@ fn handle_request(
                     .iter()
                     .filter(|f| !f.receipts.is_empty())
                     .count() as u32,
-                excluded_count: project
-                    .frames
-                    .iter()
-                    .filter(|f| f.excluded)
-                    .count() as u32,
+                excluded_count: project.frames.iter().filter(|f| f.excluded).count() as u32,
             })
         }
         "project.analyzeFrameDefects" => {
             let params: protocol::AnalyzeFrameDefectsParams = parse_params(&request.params)?;
+            project_state.refresh_from_disk()?;
             let project = project_state.active.as_ref().ok_or_else(|| {
                 EngineError::new(ErrorCode::ProjectNotFound, "no project is currently open")
             })?;
@@ -1195,6 +1247,7 @@ fn handle_request(
         "exiftool.detect" => to_json(&crate::exiftool::detect_exiftool()),
         "project.previewMetadataCommand" => {
             let params: protocol::PreviewMetadataCommandParams = parse_params(&request.params)?;
+            project_state.refresh_from_disk()?;
             let project = project_state.active.as_ref().ok_or_else(|| {
                 EngineError::new(ErrorCode::ProjectNotFound, "no project is currently open")
             })?;
@@ -1212,7 +1265,8 @@ fn handle_request(
                     )
                 })?;
 
-            let metadata = crate::exiftool::resolve_effective_metadata(project, params.frame_index)?;
+            let metadata =
+                crate::exiftool::resolve_effective_metadata(project, params.frame_index)?;
             let targets = crate::exiftool::resolve_targets(project, params.frame_index)?;
             let archive_path = frame
                 .receipts
@@ -1224,15 +1278,20 @@ fn handle_request(
                 crate::exiftool::assert_no_archive_target(&targets, archive_path)?;
             }
 
-            let detection = crate::exiftool::detect_exiftool();
             let mut arguments = crate::exiftool::build_exiftool_arguments(&metadata);
-            arguments.push("-overwrite_original".to_string());
             let target_strings: Vec<String> =
                 targets.iter().map(|t| t.display().to_string()).collect();
-            arguments.extend(target_strings.iter().cloned());
+            let detection = crate::exiftool::detect_exiftool();
+            let available = if arguments.is_empty() {
+                true
+            } else {
+                arguments.push("-overwrite_original".to_string());
+                arguments.extend(target_strings.iter().cloned());
+                detection.available
+            };
 
             to_json(&protocol::PreviewMetadataCommandResult {
-                available: detection.available,
+                available,
                 exiftool_path: detection.path,
                 targets: target_strings,
                 arguments,
@@ -1240,6 +1299,7 @@ fn handle_request(
         }
         "project.applyMetadata" => {
             let params: protocol::ApplyMetadataParams = parse_params(&request.params)?;
+            project_state.refresh_from_disk()?;
             let project = project_state.active.as_ref().ok_or_else(|| {
                 EngineError::new(ErrorCode::ProjectNotFound, "no project is currently open")
             })?;
@@ -1261,7 +1321,8 @@ fn handle_request(
             // "override map built from project_state alone" precedent) —
             // every argument and target below is rebuilt server-side from
             // the active project's own resolved metadata and receipts.
-            let metadata = crate::exiftool::resolve_effective_metadata(project, params.frame_index)?;
+            let metadata =
+                crate::exiftool::resolve_effective_metadata(project, params.frame_index)?;
             let targets = crate::exiftool::resolve_targets(project, params.frame_index)?;
             let archive_path = frame
                 .receipts
@@ -1273,13 +1334,6 @@ fn handle_request(
                 crate::exiftool::assert_no_archive_target(&targets, archive_path)?;
             }
 
-            let detection = crate::exiftool::detect_exiftool();
-            if !detection.available {
-                return Err(EngineError::new(
-                    ErrorCode::InvalidParams,
-                    "ExifTool is not available — install it or set SCANSTUDIO_EXIFTOOL_PATH",
-                ));
-            }
             if targets.is_empty() {
                 return Err(EngineError::new(
                     ErrorCode::InvalidParams,
@@ -1290,10 +1344,29 @@ fn handle_request(
                 ));
             }
 
-            let mut arguments = crate::exiftool::build_exiftool_arguments(&metadata);
-            arguments.push("-overwrite_original".to_string());
             let target_strings: Vec<String> =
                 targets.iter().map(|t| t.display().to_string()).collect();
+            let mut arguments = crate::exiftool::build_exiftool_arguments(&metadata);
+            if arguments.is_empty() {
+                return to_json(&protocol::ApplyMetadataResult {
+                    success: true,
+                    exit_code: 0,
+                    stdout: "No metadata fields are set; scanned outputs were left unchanged."
+                        .to_string(),
+                    stderr: String::new(),
+                    targets: target_strings,
+                });
+            }
+
+            let detection = crate::exiftool::detect_exiftool();
+            if !detection.available {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "ExifTool is not available — install it or set SCANSTUDIO_EXIFTOOL_PATH",
+                ));
+            }
+
+            arguments.push("-overwrite_original".to_string());
             arguments.extend(target_strings.iter().cloned());
 
             let exiftool_path = detection
@@ -1356,14 +1429,23 @@ fn to_json<T: Serialize>(value: &T) -> Result<serde_json::Value, EngineError> {
 /// Shared by every `project.setFrame*` handler: finds the active project's
 /// frame at `frame_index`, applies `mutate` to it via `manifest::mutate_frame`
 /// (`InvalidParams` if no such frame exists — T-04-01), persists the whole
-/// project atomically, and returns the updated project.
+/// project, and returns the updated project.
 ///
 /// Persistence-failure behavior deliberately differs from `scan.start`'s
-/// best-effort recipe persistence: here, `write_manifest_atomically`'s error
-/// propagates via `?` (a real error to the caller), because durably
-/// persisting the mutation is this method's entire point — silently
-/// swallowing that failure would let the UI believe an exclude/override took
-/// effect when it didn't.
+/// best-effort recipe persistence: here, the persistence error propagates
+/// via `?` (a real error to the caller), because durably persisting the
+/// mutation is this method's entire point — silently swallowing that
+/// failure would let the UI believe an exclude/override took effect when it
+/// didn't.
+///
+/// Persists through `manifest::persist_project_update` rather than a direct
+/// `write_manifest_atomically` (PERSIST-02): `project_state.active` can be
+/// missing receipts the scan worker thread has durably attached straight to
+/// disk since this project was last loaded, and a direct write here used to
+/// silently overwrite them. The merged project persist_project_update
+/// returns is folded back into `project_state.active`, so in-memory state
+/// converges toward disk truth on every mutation instead of drifting
+/// further from it.
 fn apply_frame_mutation(
     project_state: &mut ProjectState,
     frame_index: u32,
@@ -1376,9 +1458,10 @@ fn apply_frame_mutation(
     let directory = project_state.directory.clone().expect(
         "directory is always Some whenever active is Some — ProjectState::set sets both together",
     );
-    let updated = project_state.active.clone().unwrap();
-    crate::manifest::write_manifest_atomically(&directory, &updated)?;
-    Ok(updated)
+    let mutated = project_state.active.clone().unwrap();
+    let merged = crate::manifest::persist_project_update(&directory, &mutated)?;
+    project_state.active = Some(merged.clone());
+    Ok(merged)
 }
 
 fn most_recent_real_capture_receipt(frame: &domain::ProjectFrame) -> Option<&domain::ScanReceipt> {
@@ -1450,25 +1533,40 @@ mod tests {
     #[test]
     fn post_dispatch_status_is_safe_table() {
         // Simulator: all three methods are safe (in-process, no bridge to restart).
-        assert!(post_dispatch_status_is_safe(Some(ActiveDevice::Sim), "scan.start"));
+        assert!(post_dispatch_status_is_safe(
+            Some(ActiveDevice::Sim),
+            "scan.start"
+        ));
         assert!(post_dispatch_status_is_safe(
             Some(ActiveDevice::Sim),
             "scanner.acquireThumbnails"
         ));
-        assert!(post_dispatch_status_is_safe(Some(ActiveDevice::Sim), "scan.stop"));
+        assert!(post_dispatch_status_is_safe(
+            Some(ActiveDevice::Sim),
+            "scan.stop"
+        ));
 
         // Real: scan.start and scanner.acquireThumbnails are hazardous; scan.stop is not.
-        assert!(!post_dispatch_status_is_safe(Some(ActiveDevice::Real), "scan.start"));
+        assert!(!post_dispatch_status_is_safe(
+            Some(ActiveDevice::Real),
+            "scan.start"
+        ));
         assert!(!post_dispatch_status_is_safe(
             Some(ActiveDevice::Real),
             "scanner.acquireThumbnails"
         ));
-        assert!(post_dispatch_status_is_safe(Some(ActiveDevice::Real), "scan.stop"));
+        assert!(post_dispatch_status_is_safe(
+            Some(ActiveDevice::Real),
+            "scan.stop"
+        ));
 
         // No active device: the status call itself returns NotConnected cheaply,
         // so the hook is safe regardless of method.
         assert!(post_dispatch_status_is_safe(None, "scan.start"));
-        assert!(post_dispatch_status_is_safe(None, "scanner.acquireThumbnails"));
+        assert!(post_dispatch_status_is_safe(
+            None,
+            "scanner.acquireThumbnails"
+        ));
         assert!(post_dispatch_status_is_safe(None, "scan.stop"));
     }
 
@@ -2028,7 +2126,9 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::InvalidParams);
         assert!(error.message.contains("reserved"));
-        assert!(project_state.active.as_ref().unwrap().frames[0].output_override.is_none());
+        assert!(project_state.active.as_ref().unwrap().frames[0]
+            .output_override
+            .is_none());
         let manifest = std::fs::read_to_string(directory.join("manifest.json")).unwrap();
         assert!(!manifest.contains("ScanStudioSequence"));
         let _ = std::fs::remove_dir_all(directory);
@@ -2115,7 +2215,10 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::InvalidParams);
         assert!(error.message.contains("reserved"));
-        assert!(backends.active.is_none(), "no backend may be dispatched or connected");
+        assert!(
+            backends.active.is_none(),
+            "no backend may be dispatched or connected"
+        );
     }
 
     #[test]
@@ -2153,7 +2256,9 @@ mod tests {
             .expect_err("a new mixed-material frame override must never persist");
         assert_eq!(err.code, ErrorCode::InvalidParams);
         assert!(err.message.contains("must match"));
-        assert!(project_state.active.as_ref().unwrap().frames[0].processing_override.is_none());
+        assert!(project_state.active.as_ref().unwrap().frames[0]
+            .processing_override
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2293,11 +2398,15 @@ mod tests {
         // ProjectState directly to prove scan.start remains the defensive
         // boundary for existing persisted projects, even though new writes
         // are rejected by project.setFrameProcessingOverride.
-        project_state.active.as_mut().expect("active project").frames[0].processing_override =
-            Some(domain::ProcessingRecipe {
-                film_process: domain::FilmProcess::BwNegative,
-                ..domain::ProcessingRecipe::default()
-            });
+        project_state
+            .active
+            .as_mut()
+            .expect("active project")
+            .frames[0]
+            .processing_override = Some(domain::ProcessingRecipe {
+            film_process: domain::FilmProcess::BwNegative,
+            ..domain::ProcessingRecipe::default()
+        });
 
         let scan = Request {
             id: 3,
@@ -2481,12 +2590,15 @@ mod tests {
     }
 
     fn scan_receipt_with_transport_smear_verdict(
+        frame_index: u32,
         verdict: &str,
         reason: &str,
     ) -> domain::ScanReceipt {
         domain::ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-smear-1".into(),
-            frame_index: 1,
+            frame_index,
             started_at: "2026-07-23T09:00:00Z".into(),
             duration_ms: 1200,
             passes: 1,
@@ -2565,22 +2677,26 @@ mod tests {
         handle_request(&mut backends, &tx, &create_request, &mut project_state)
             .expect("project.create");
 
-        let project = project_state
-            .active
-            .as_mut()
-            .expect("project.create sets active");
-        project.frames[0]
-            .receipts
-            .push(scan_receipt_with_transport_smear_verdict(
+        crate::manifest::persist_frame_receipt(
+            &directory,
+            1,
+            &scan_receipt_with_transport_smear_verdict(
+                1,
                 "smear",
                 "repeated tail rows detected past row 1200",
-            ));
-        project.frames[1]
-            .receipts
-            .push(scan_receipt_with_transport_smear_verdict(
+            ),
+        )
+        .expect("persist smear receipt");
+        crate::manifest::persist_frame_receipt(
+            &directory,
+            2,
+            &scan_receipt_with_transport_smear_verdict(
+                2,
                 "clean",
                 "no repeated tail rows detected",
-            ));
+            ),
+        )
+        .expect("persist clean receipt");
 
         let smear_request = Request {
             id: 2,
@@ -2634,6 +2750,8 @@ mod tests {
         slot: &crate::parity::types::CorpusSlot,
     ) -> domain::ScanReceipt {
         domain::ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-real-1".into(),
             frame_index: 1,
             started_at: "2026-07-23T09:00:00Z".into(),
@@ -2893,8 +3011,14 @@ mod tests {
         };
         let set_result = handle_request(&mut backends, &tx, &set_request, &mut project_state)
             .expect("project.setRollMetadata");
-        assert_eq!(set_result["project"]["rollMetadata"]["camera"], "Nikon F100");
-        assert_eq!(set_result["project"]["rollMetadata"]["date"]["kind"], "yearOnly");
+        assert_eq!(
+            set_result["project"]["rollMetadata"]["camera"],
+            "Nikon F100"
+        );
+        assert_eq!(
+            set_result["project"]["rollMetadata"]["date"]["kind"],
+            "yearOnly"
+        );
 
         let mut reopened_state = ProjectState::default();
         let open_request = Request {
@@ -3050,6 +3174,8 @@ mod tests {
             .expect("project.create");
 
         let completed_receipt = domain::ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-resume-1".into(),
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
@@ -3112,6 +3238,208 @@ mod tests {
         assert_eq!(pending_result["totalFrames"], 3);
         assert_eq!(pending_result["completedCount"], 1);
         assert_eq!(pending_result["excludedCount"], 1);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    fn sample_receipt(job_id: &str, frame_index: u32) -> domain::ScanReceipt {
+        domain::ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
+            job_id: job_id.into(),
+            frame_index,
+            started_at: "2026-07-22T09:00:00Z".into(),
+            duration_ms: 1000,
+            passes: 1,
+            resolution_dpi: 4000,
+            bit_depth: 16,
+            channels: "rgbi".into(),
+            engine_version: "0.1.0".into(),
+            device_id: "sim-ls5000-0".into(),
+            simulated: true,
+            settings_fingerprint: "1a3d265e0b54bbd2".into(),
+            processing: None,
+            output: None,
+            outputs: None,
+            rgb_path: None,
+            ir_path: None,
+            storage_transform: None,
+            meter_rgbi_path: None,
+            hardware_telemetry: None,
+            nikonlook: None,
+        }
+    }
+
+    /// PERSIST-02 regression: replays the exact live loss table from the
+    /// 2026-07-29 incident report end to end at the manifest+server layer.
+    /// Frame 3 scans at "10:46" (persist_frame_receipt, the scan worker
+    /// thread's own durable write), then the frame 5 scan starts at "10:58"
+    /// (scan.start's best-effort recipe-persistence block, server.rs:
+    /// pre-fix, this is the exact write that clobbered project_state.active
+    /// -- stale since project.create, zero receipts -- straight over
+    /// whatever the worker thread had just attached), then frame 5 itself
+    /// completes, then frame 3 is rescanned at "11:13" (another scan.start,
+    /// clobbering again pre-fix) and completes a second time. Live evidence
+    /// was: after the frame 5 scan, the manifest held ONLY frame 5's
+    /// receipt (frame 3's was gone); after the frame 3 rescan, the manifest
+    /// held ONLY frame 3's newest receipt (frame 5's was gone). Post-fix,
+    /// the manifest must hold all three receipts, and project_state.active
+    /// must agree with disk.
+    ///
+    /// No scanner is ever connected in this test: scan.start's own backend
+    /// dispatch (`backends.scan_start`) sits after its recipe-persistence
+    /// block (server.rs's `"scan.start"` arm) and is left to fail with
+    /// NotConnected, which is irrelevant here -- the clobber this test
+    /// guards against happens earlier in that same arm, unconditionally on
+    /// whether the scan that follows ever actually runs. This isolates the
+    /// exact defect site without needing a real (or simulated) capture.
+    #[test]
+    fn scan_start_recipe_persistence_never_drops_previously_persisted_receipts() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let directory = temp_test_dir("scan-start-receipt-loss");
+
+        let create_request = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Receipt Loss Regression",
+                "carrier": "strip6",
+                "frameCount": 6,
+                "filmProcess": "positive",
+                "directory": directory.display().to_string(),
+            }),
+        };
+        handle_request(&mut backends, &tx, &create_request, &mut project_state)
+            .expect("project.create");
+
+        let (output_recipe, _output_dir) = isolated_output_recipe("scan-start-receipt-loss");
+        let scan_start_request = |id: u64, frame_index: u32| Request {
+            id,
+            method: "scan.start".into(),
+            params: serde_json::json!({
+                "frames": [frame_index],
+                "recipe": { "resolutionDpi": 200 },
+                "output": serde_json::to_value(&output_recipe).expect("serialize output recipe"),
+            }),
+        };
+
+        // 10:46 -- frame 3 completes; the scan worker thread durably
+        // attaches its receipt straight to the on-disk manifest, exactly
+        // like real_backend.rs's/sim.rs's own post-completion call.
+        let receipt_3a = sample_receipt("job-frame-3-first", 3);
+        crate::manifest::persist_frame_receipt(&directory, 3, &receipt_3a)
+            .expect("persist frame 3's first receipt");
+
+        // 10:58 -- starting the frame 5 scan. Pre-fix, this call's own
+        // best-effort recipe persistence clobbers the manifest with
+        // project_state.active as it stood since project.create (zero
+        // receipts), destroying frame 3's receipt before frame 5 is ever
+        // touched. The backend dispatch that follows is expected to fail
+        // (no scanner connected) and is deliberately ignored.
+        let _ = handle_request(
+            &mut backends,
+            &tx,
+            &scan_start_request(2, 5),
+            &mut project_state,
+        );
+
+        let receipt_5 = sample_receipt("job-frame-5", 5);
+        crate::manifest::persist_frame_receipt(&directory, 5, &receipt_5)
+            .expect("persist frame 5's receipt");
+
+        // 11:13 -- starting a rescan of frame 3. Pre-fix, this clobbers
+        // again, this time destroying frame 5's just-persisted receipt.
+        let _ = handle_request(
+            &mut backends,
+            &tx,
+            &scan_start_request(3, 3),
+            &mut project_state,
+        );
+
+        let receipt_3b = sample_receipt("job-frame-3-second", 3);
+        crate::manifest::persist_frame_receipt(&directory, 3, &receipt_3b)
+            .expect("persist frame 3's second receipt");
+
+        let on_disk = crate::manifest::read_manifest(&directory).expect("read final manifest");
+        let frame3 = on_disk
+            .frames
+            .iter()
+            .find(|f| f.index == 3)
+            .expect("frame 3 exists");
+        let frame5 = on_disk
+            .frames
+            .iter()
+            .find(|f| f.index == 5)
+            .expect("frame 5 exists");
+        assert_eq!(
+            frame3.receipts,
+            vec![receipt_3a.clone(), receipt_3b.clone()],
+            "frame 3 must retain both its receipts on disk, not just the most recent scan.start's stale overwrite"
+        );
+        assert_eq!(
+            frame5.receipts,
+            vec![receipt_5.clone()],
+            "frame 5's receipt must survive the later frame 3 rescan's scan.start"
+        );
+
+        // persist_frame_receipt (the scan worker thread's own write path)
+        // never touches project_state -- by design, only a server-thread
+        // operation does. So project_state.active is only obliged to agree
+        // with disk as of the last such operation it actually ran; assert
+        // that first, matching what scan.start's own merge left behind
+        // after the frame 5 scan's receipt was folded in above:
+        let in_memory = project_state
+            .active
+            .as_ref()
+            .expect("project.create sets active");
+        assert_eq!(
+            in_memory.frames.iter().find(|f| f.index == 3).unwrap().receipts,
+            vec![receipt_3a.clone()],
+            "project_state.active reflects disk as of the last server-thread sync, not the worker-thread-only rescan receipt that follows it"
+        );
+
+        // Then drive one more server-thread operation (project.setRollMetadata,
+        // a second of the three fixed call sites) and confirm THAT converges
+        // project_state.active with everything now on disk, including the
+        // frame 3 rescan receipt persist_frame_receipt just attached above.
+        let set_roll_metadata_request = Request {
+            id: 4,
+            method: "project.setRollMetadata".into(),
+            params: serde_json::json!({ "metadata": { "camera": "Nikon F3" } }),
+        };
+        handle_request(
+            &mut backends,
+            &tx,
+            &set_roll_metadata_request,
+            &mut project_state,
+        )
+        .expect("project.setRollMetadata");
+
+        let in_memory = project_state
+            .active
+            .as_ref()
+            .expect("project.create sets active");
+        let frame3_mem = in_memory
+            .frames
+            .iter()
+            .find(|f| f.index == 3)
+            .expect("frame 3 exists");
+        let frame5_mem = in_memory
+            .frames
+            .iter()
+            .find(|f| f.index == 5)
+            .expect("frame 5 exists");
+        assert_eq!(
+            frame3_mem.receipts, frame3.receipts,
+            "setRollMetadata's own merge must converge project_state.active with disk, picking up the rescan receipt"
+        );
+        assert_eq!(frame5_mem.receipts, frame5.receipts);
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -3202,8 +3530,9 @@ mod tests {
                 "output": domain::OutputRecipe::default(),
             }),
         };
-        let error = handle_request(&mut backends, &tx, &request, &mut project_state)
-            .expect_err("effective all-off override must fail before the disconnected backend could run");
+        let error = handle_request(&mut backends, &tx, &request, &mut project_state).expect_err(
+            "effective all-off override must fail before the disconnected backend could run",
+        );
         assert_eq!(error.code, ErrorCode::InvalidParams);
         assert!(error.message.contains("frame 1") && error.message.contains("at least one"));
         let _ = std::fs::remove_dir_all(directory);
@@ -3224,8 +3553,8 @@ mod tests {
             method: "exiftool.detect".into(),
             params: serde_json::json!({}),
         };
-        let result =
-            handle_request(&mut backends, &tx, &request, &mut project_state).expect("exiftool.detect");
+        let result = handle_request(&mut backends, &tx, &request, &mut project_state)
+            .expect("exiftool.detect");
 
         if result["available"] != true {
             eprintln!(
@@ -3234,7 +3563,10 @@ mod tests {
             return;
         }
         assert_eq!(result["available"], true);
-        assert!(result["path"].is_string(), "expected a resolved path: {result}");
+        assert!(
+            result["path"].is_string(),
+            "expected a resolved path: {result}"
+        );
         assert!(
             result["version"].is_string(),
             "expected a captured version string: {result}"
@@ -3305,8 +3637,7 @@ mod tests {
                 "output": serde_json::to_value(&output_recipe).expect("serialize output recipe"),
             }),
         };
-        handle_request(&mut backends, &tx, &scan_request, &mut project_state)
-            .expect("scan.start");
+        handle_request(&mut backends, &tx, &scan_request, &mut project_state).expect("scan.start");
 
         // Drain events (scanner.status from connect/loadMedia, then the
         // job's own scan.jobState/scan.progress/scan.frameState/
@@ -3323,22 +3654,21 @@ mod tests {
             }
         }
 
-        // The scan worker thread persisted the frame's receipt straight to
-        // the on-disk manifest (06-02's design: it never touches this
-        // thread's in-memory ProjectState) -- reopen to refresh
-        // project_state.active from what was actually written.
-        let reopen_request = Request {
+        // The worker persisted the receipt directly to disk. Metadata
+        // preview must refresh that durable truth itself.
+        let preview_request = Request {
             id: 5,
-            method: "project.open".into(),
-            params: serde_json::json!({ "directory": directory.display().to_string() }),
+            method: "project.previewMetadataCommand".into(),
+            params: serde_json::json!({ "frameIndex": 1 }),
         };
-        handle_request(&mut backends, &tx, &reopen_request, &mut project_state)
-            .expect("project.open (reopen after scan)");
+        let preview_result =
+            handle_request(&mut backends, &tx, &preview_request, &mut project_state)
+                .expect("project.previewMetadataCommand immediately after scan");
 
         let archive_path = project_state
             .active
             .as_ref()
-            .expect("reopen sets active")
+            .expect("metadata preview refreshes active")
             .frames[0]
             .receipts
             .last()
@@ -3350,14 +3680,6 @@ mod tests {
             .clone();
         let archive_path = archive_path.expect("this archive-retaining fixture writes a master");
 
-        let preview_request = Request {
-            id: 6,
-            method: "project.previewMetadataCommand".into(),
-            params: serde_json::json!({ "frameIndex": 1 }),
-        };
-        let preview_result =
-            handle_request(&mut backends, &tx, &preview_request, &mut project_state)
-                .expect("project.previewMetadataCommand");
         let targets = preview_result["targets"].as_array().expect("targets array");
         assert!(
             !targets.is_empty(),
@@ -3369,6 +3691,21 @@ mod tests {
                 .any(|t| t.as_str() == Some(archive_path.as_str())),
             "the archive path must never appear among previewMetadataCommand's targets: {targets:?}"
         );
+        assert_eq!(preview_result["available"], true);
+        assert_eq!(preview_result["arguments"], serde_json::json!([]));
+
+        let apply_request = Request {
+            id: 6,
+            method: "project.applyMetadata".into(),
+            params: serde_json::json!({ "frameIndex": 1 }),
+        };
+        let apply_result = handle_request(&mut backends, &tx, &apply_request, &mut project_state)
+            .expect("project.applyMetadata immediately after scan");
+        assert_eq!(apply_result["success"], true);
+        assert_eq!(apply_result["exitCode"], 0);
+        assert!(apply_result["stdout"]
+            .as_str()
+            .is_some_and(|text| text.contains("left unchanged")));
 
         let _ = std::fs::remove_dir_all(&directory);
         let _ = std::fs::remove_dir_all(&output_dir);
@@ -3407,7 +3744,8 @@ mod tests {
             method: "project.applyMetadata".into(),
             params: serde_json::json!({ "frameIndex": 1 }),
         };
-        let err = handle_request(&mut backends, &tx, &apply_request, &mut project_state).unwrap_err();
+        let err =
+            handle_request(&mut backends, &tx, &apply_request, &mut project_state).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
 
         let _ = std::fs::remove_dir_all(&directory);

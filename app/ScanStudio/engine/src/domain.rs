@@ -315,7 +315,10 @@ fn fallback_unfiled_root() -> std::path::PathBuf {
 }
 
 fn default_archive_destination() -> String {
-    fallback_unfiled_root().join("Archive").display().to_string()
+    fallback_unfiled_root()
+        .join("Archive")
+        .display()
+        .to_string()
 }
 
 /// An optional, never-touched capture master ("archive-grade capture
@@ -354,7 +357,10 @@ fn default_positive_filename_template() -> String {
 }
 
 fn default_positive_destination() -> String {
-    fallback_unfiled_root().join("Positive").display().to_string()
+    fallback_unfiled_root()
+        .join("Positive")
+        .display()
+        .to_string()
 }
 
 /// A regenerable derivative: format/profile choices here never touch
@@ -399,7 +405,10 @@ fn default_preview_filename_template() -> String {
 }
 
 fn default_preview_destination() -> String {
-    fallback_unfiled_root().join("Preview").display().to_string()
+    fallback_unfiled_root()
+        .join("Preview")
+        .display()
+        .to_string()
 }
 
 /// A regenerable derivative like `PositiveRecipe`, but defaults to the
@@ -443,6 +452,16 @@ pub struct OutputRecipe {
     pub positive: PositiveRecipe,
     #[serde(default)]
     pub preview: PreviewRecipe,
+    /// Non-destructive scan-time auto-crop. When true, each frame's derived
+    /// outputs (positive/preview) are cropped to that frame's own detected
+    /// film ROI via the parity-proven NegPy AUTO_FRAME_EDGE port. The
+    /// retained archive master is never cropped; the decision and ROI are
+    /// recorded per frame in `ScanReceipt.auto_crop`. An approved manual
+    /// frame alignment takes precedence, and a detection failure falls back
+    /// to the uncropped derivative with the outcome recorded. Missing key
+    /// keeps older projects and clients uncropped.
+    #[serde(default)]
+    pub auto_crop: bool,
 }
 
 impl Default for OutputRecipe {
@@ -451,6 +470,7 @@ impl Default for OutputRecipe {
             archive: ArchiveRecipe::default(),
             positive: PositiveRecipe::default(),
             preview: PreviewRecipe::default(),
+            auto_crop: false,
         }
     }
 }
@@ -480,8 +500,7 @@ impl OutputRecipe {
     /// Full capture packages copy a retained master and its sidecars; they
     /// have no honest meaning when the master itself is disabled.
     pub fn retention_is_valid(&self) -> bool {
-        self.has_retained_output()
-            && (!self.archive.full_capture_package || self.archive.enabled)
+        self.has_retained_output() && (!self.archive.full_capture_package || self.archive.enabled)
     }
 }
 
@@ -926,6 +945,58 @@ pub struct ScanReceipt {
     /// fabricated value. See `NikonlookProvenance`'s own doc comment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nikonlook: Option<NikonlookProvenance>,
+    /// Scan-time non-destructive auto-crop decision for this frame's
+    /// derived outputs. `None` whenever the recipe did not request
+    /// auto-crop or no derivative rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_crop: Option<AutoCropOutcome>,
+    /// Which RGB source commanded this frame's hardware exposure and what
+    /// the active auto-exposure controller accepted. Forwarded verbatim
+    /// from CoolscanPy's per-frame journal by the bridge. `None` for
+    /// simulated and legacy receipts, or when the journal read failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_authority: Option<ExposureAuthority>,
+}
+
+/// Result of the non-destructive auto-crop decision for one frame's
+/// derived outputs. The retained archive master is never affected.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCropOutcome {
+    pub mode: String,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roi: Option<AutoCropRoi>,
+    pub source_width: u32,
+    pub source_height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Half-open pixel ROI (`y1 <= row < y2`, `x1 <= col < x2`) in the archive
+/// raster's stored orientation.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCropRoi {
+    pub y1: u32,
+    pub y2: u32,
+    pub x1: u32,
+    pub x2: u32,
+}
+
+/// Hardware exposure authority for one fine scan. Channel maps retain the
+/// raw journal keys (`R`, `G`, `B`, and `IR`); the device-clamped map is
+/// sparse by construction.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposureAuthority {
+    pub rgb_source: String,
+    pub ir_source: String,
+    pub commanded_channels_raw_10ns: std::collections::BTreeMap<String, u32>,
+    pub active_controller_channels_raw_10ns: std::collections::BTreeMap<String, u32>,
+    pub device_bound_clamped_channels_raw_10ns: std::collections::BTreeMap<String, u32>,
+    /// `[min, max]` raw 10ns-tick bounds enforced by the device.
+    pub device_exposure_bounds_raw_10ns: [u32; 2],
 }
 
 // ---------------------------------------------------------------------
@@ -1114,6 +1185,7 @@ mod tests {
     #[test]
     fn output_recipe_round_trips() {
         round_trip(&OutputRecipe {
+            auto_crop: false,
             archive: ArchiveRecipe {
                 enabled: true,
                 filename_template: "Archive_####".into(),
@@ -1320,6 +1392,8 @@ mod tests {
         // below, attached to a frame — a frame with recorded receipts must
         // round trip exactly, including the nested receipt.
         let receipt = ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-1".into(),
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
@@ -1553,6 +1627,8 @@ mod tests {
     #[test]
     fn scan_receipt_matches_golden_fixture_shape() {
         let receipt = ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-1".into(),
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
@@ -1587,6 +1663,8 @@ mod tests {
         // wire in its documented camelCase shape (PROTOCOL.md) rather than
         // being silently dropped by `skip_serializing_if`.
         let receipt = ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-1".into(),
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
@@ -1627,7 +1705,43 @@ mod tests {
         // The fallback path's own wire value -- what a malformed or absent
         // exposure_10ns labels (see processing::nikonlook::exposure_is_usable
         // and render::render_positive).
-        assert_eq!(serde_json::to_value(NikonlookLayerAPath::Blind).unwrap(), json!("blind"));
+        assert_eq!(
+            serde_json::to_value(NikonlookLayerAPath::Blind).unwrap(),
+            json!("blind")
+        );
+
+        let mut with_exposure_authority = receipt.clone();
+        with_exposure_authority.exposure_authority = Some(ExposureAuthority {
+            rgb_source: "nikon-parity-guarded-v2".into(),
+            ir_source: "active-controller".into(),
+            commanded_channels_raw_10ns: std::collections::BTreeMap::from([
+                ("R".into(), 107262),
+                ("G".into(), 276334),
+                ("B".into(), 336777),
+                ("IR".into(), 311725),
+            ]),
+            active_controller_channels_raw_10ns: std::collections::BTreeMap::from([
+                ("R".into(), 121500),
+                ("G".into(), 276334),
+                ("B".into(), 340200),
+                ("IR".into(), 311725),
+            ]),
+            device_bound_clamped_channels_raw_10ns: std::collections::BTreeMap::from([(
+                "B".into(),
+                340200,
+            )]),
+            device_exposure_bounds_raw_10ns: [50_000, 400_000],
+        });
+        let authority_value = serde_json::to_value(&with_exposure_authority).unwrap();
+        assert_eq!(
+            authority_value["exposureAuthority"]["rgbSource"],
+            json!("nikon-parity-guarded-v2")
+        );
+        assert_eq!(
+            authority_value["exposureAuthority"]["deviceBoundClampedChannelsRaw10ns"],
+            json!({"B": 340200})
+        );
+        round_trip(&with_exposure_authority);
     }
 
     #[test]
@@ -1752,7 +1866,10 @@ mod tests {
     #[test]
     fn engine_error_recoverable_override_is_backward_compatible() {
         let err = EngineError::new(ErrorCode::Internal, "x");
-        assert!(!err.recoverable(), "default Internal must not be recoverable");
+        assert!(
+            !err.recoverable(),
+            "default Internal must not be recoverable"
+        );
 
         let overridden = EngineError::new(ErrorCode::Internal, "x").with_recoverable(true);
         assert!(overridden.recoverable(), "explicit override true must win");
@@ -1764,6 +1881,9 @@ mod tests {
         );
 
         let feed_jam = EngineError::new(ErrorCode::FeedJam, "x");
-        assert!(feed_jam.recoverable(), "FeedJam default must still be recoverable");
+        assert!(
+            feed_jam.recoverable(),
+            "FeedJam default must still be recoverable"
+        );
     }
 }

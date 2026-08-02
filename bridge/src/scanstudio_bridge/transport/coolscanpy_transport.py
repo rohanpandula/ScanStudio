@@ -41,6 +41,7 @@ from coolscanpy.roll.preview_session import (
 )
 
 from scanstudio_bridge import domain, safety
+from scanstudio_bridge.exposure_authority import build_exposure_authority
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
 from scanstudio_bridge.transport import FrameRetryExhausted, OnCall, phased_call
 from scanstudio_bridge.transport.output_reservation import OutputReservations, write_tiff
@@ -295,6 +296,7 @@ def _scan_receipt_from_coolscanpy(
     meter_rgbi_path: str | None,
     attempts_root: Path | None,
 ) -> domain.ScanReceipt:
+    exposure_authority = build_exposure_authority(attempts_root=attempts_root, slot=receipt.slot)
     exposure = receipt.exposure
     clipping = receipt.clipping
     focus_detail = receipt.focus_detail
@@ -364,6 +366,7 @@ def _scan_receipt_from_coolscanpy(
         # The current Roll's caller-owned persistent evidence directory;
         # never inferred by looking at unrelated filesystem state.
         attempts_root=str(attempts_root) if attempts_root is not None else None,
+        exposure_authority=exposure_authority,
     )
 
 

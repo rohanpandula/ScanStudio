@@ -4,7 +4,12 @@
 //! `ProjectSummary`); this module owns *how* that shape gets to and from
 //! disk: atomic writes (temp file + rename, so a crash mid-write can never
 //! leave a corrupt `manifest.json`), strict schema-version validation on
-//! read, and project create/open/list over the local filesystem.
+//! read, project create/open/list over the local filesystem, and -- since
+//! the scan worker thread and the server's request-dispatch thread can
+//! both want to mutate the same project's manifest at once (PERSIST-02) --
+//! a single process-wide lock plus a receipt-preserving merge every
+//! multi-field write routes through, with a fail-closed guard on the
+//! underlying write itself as a structural backstop.
 //!
 //! No new crates: `SystemTime`/`std::env` for ids and default paths
 //! (matching `sim.rs`'s dependency-free approach), and plain
@@ -13,6 +18,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{
@@ -95,13 +101,116 @@ fn io_err_to_internal(err: io::Error) -> EngineError {
     EngineError::new(ErrorCode::Internal, format!("manifest I/O error: {err}"))
 }
 
+/// The one process-wide gate a manifest read-modify-write cycle must hold
+/// for its *full* extent, not just its final write. `write_manifest_
+/// atomically`'s rename is atomic per call, but "read the current file,
+/// decide what the new one should say" is not a single atomic operation —
+/// the window between one thread's read and its write is exactly where
+/// another thread's own write can land and then be silently discarded the
+/// moment the first thread's write lands on top of it (PERSIST-02: this is
+/// how a scan's completed-frame receipt used to get destroyed by the very
+/// next scan's own best-effort recipe save). Exactly two threads ever write
+/// a given project's manifest in this process — the server's single
+/// request-dispatch thread and a scan job's worker thread (via
+/// `persist_frame_receipt`) — so a plain `Mutex` scoped to this process is
+/// sufficient; there is no other process ever writing this file.
+/// `persist_project_update` and `persist_frame_receipt` are the only two
+/// functions that acquire it; `write_manifest_atomically` deliberately does
+/// not, so those two can call it while already holding the lock without
+/// deadlocking on themselves.
+static MANIFEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquires `MANIFEST_LOCK`, recovering from poisoning rather than
+/// propagating it. A panic while some *other* caller held the lock is not
+/// evidence that the manifest on disk is corrupt, and refusing every future
+/// read/write for the rest of the process over one past panic would be a
+/// self-inflicted, permanent denial of service — `write_manifest_
+/// atomically`'s own guard is what actually protects the data; this lock
+/// only orders access to it.
+fn manifest_lock() -> std::sync::MutexGuard<'static, ()> {
+    MANIFEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Writes `project` to `directory/manifest.json`, atomically: serialize to
 /// a sibling temp file inside the same directory, then `fs::rename` it
 /// into place. `fs::rename` within a single filesystem is atomic, so a
 /// crash or kill mid-write can never leave a partially-written
 /// `manifest.json` — readers see either the old file or the fully-written
 /// new one, never a torn write.
-pub fn write_manifest_atomically(directory: &Path, project: &ScanProject) -> Result<(), EngineError> {
+///
+/// Fail-closed provenance guard (PERSIST-02): before writing anything,
+/// every frame currently on disk has its receipts compared against
+/// `project`'s own — if disk holds so much as one receipt `project` does
+/// not, this write would destroy a durable scan record and is refused
+/// outright instead of performed. `persist_project_update` and
+/// `persist_frame_receipt` read-merge-write under `MANIFEST_LOCK`, so by
+/// construction their own writes are always supersets of whatever they just
+/// read and this guard should never fire against them in normal operation;
+/// it exists as the structural backstop for a write that reaches here some
+/// other way — a future caller that skips the lock, or a lock-holder racing
+/// one of the two callers that don't take it (`create_project`, whose fresh
+/// directory has nothing to race; `open_project`'s destination-migration
+/// write, which touches `recipes` only and carries forward whatever
+/// receipts it just read) — in which case refusing the write outright is
+/// still strictly safer than the silent overwrite this guard exists to
+/// make impossible. A missing manifest has nothing to compare against and
+/// is always allowed (a brand new project's first save); an existing
+/// manifest that cannot be read or parsed is refused rather than trusted or
+/// blindly overwritten — that corruption needs a human, not this function,
+/// to resolve.
+pub fn write_manifest_atomically(
+    directory: &Path,
+    project: &ScanProject,
+) -> Result<(), EngineError> {
+    match read_manifest(directory) {
+        Ok(on_disk) => {
+            for on_disk_frame in &on_disk.frames {
+                let incoming_receipts = project
+                    .frames
+                    .iter()
+                    .find(|frame| frame.index == on_disk_frame.index)
+                    .map(|frame| frame.receipts.as_slice())
+                    .unwrap_or(&[]);
+                if let Some(lost) = on_disk_frame
+                    .receipts
+                    .iter()
+                    .find(|receipt| !incoming_receipts.contains(receipt))
+                {
+                    return Err(EngineError::new(
+                        ErrorCode::ManifestInvalid,
+                        format!(
+                            "refusing to write manifest at {}: frame {} would lose its on-disk receipt from job {} (started {}) — this write was not derived from the manifest currently on disk; read, merge, and retry through persist_project_update instead of overwriting",
+                            directory.display(),
+                            on_disk_frame.index,
+                            lost.job_id,
+                            lost.started_at,
+                        ),
+                    ));
+                }
+            }
+        }
+        Err(err) if err.code == ErrorCode::ProjectNotFound => {}
+        Err(err) => {
+            return Err(EngineError::new(
+                ErrorCode::ManifestInvalid,
+                format!(
+                    "refusing to write manifest at {}: the existing manifest cannot be read ({err}) — manual recovery is needed before this project can be written to again",
+                    directory.display(),
+                ),
+            ));
+        }
+    }
+    write_manifest_bytes(directory, project)
+}
+
+/// The actual bytes-to-disk half of `write_manifest_atomically`, split out
+/// so the guard above it has a single unconditional place to delegate to
+/// once it has decided the write is safe. Never call this directly outside
+/// that guard — it is the one thing `write_manifest_atomically` exists to
+/// wrap.
+fn write_manifest_bytes(directory: &Path, project: &ScanProject) -> Result<(), EngineError> {
     fs::create_dir_all(directory).map_err(io_err_to_internal)?;
 
     let json = serde_json::to_string_pretty(project).map_err(|err| {
@@ -240,6 +349,7 @@ pub fn create_project(
     // three output destinations under *this* project's own `directory`,
     // computed just above — never a shared, project-unaware location.
     let recipes = OutputRecipe {
+        auto_crop: false,
         archive: ArchiveRecipe {
             destination: directory.join("Archive").display().to_string(),
             ..ArchiveRecipe::default()
@@ -406,17 +516,96 @@ where
     Ok(())
 }
 
+/// Single choke point for every manifest mutation that isn't a bare receipt
+/// append (`persist_frame_receipt`, below, is the other one — they share
+/// `MANIFEST_LOCK`). Reads whatever is on disk right now and folds its
+/// receipts into `incoming` frame by frame: any on-disk receipt `incoming`
+/// doesn't already have (by value equality — a `ScanReceipt` carries no id,
+/// so "the same receipt" means every field matches) is retained ahead of
+/// `incoming`'s own, producing disk-first chronological order per frame.
+/// Every other field — recipes, roll metadata, per-frame overrides,
+/// exclusion — comes from `incoming` untouched: those are this call's
+/// actual payload, and `incoming` is authoritative for them. Receipts are
+/// the one field a concurrent scan-worker-thread `persist_frame_receipt`
+/// call can also be changing at this exact moment, which is the entire
+/// reason this function re-reads disk instead of trusting `incoming` for
+/// that field too. The merged project is what actually gets written, and
+/// is returned so a caller that stores it back into its own in-memory state
+/// (`server.rs`'s `project_state.active`) converges toward disk truth on
+/// every call instead of drifting further from it.
+///
+/// Held under `MANIFEST_LOCK` for the full read-merge-write extent, not
+/// just the final write — see `write_manifest_atomically`'s own guard for
+/// the backstop that catches a write that reaches disk some other way. A
+/// missing manifest has nothing to merge against, so `incoming` is written
+/// as-is (mirrors a brand new project's first save); an existing manifest
+/// that fails to read is propagated rather than silently paved over with
+/// `incoming`.
+pub fn persist_project_update(
+    directory: &Path,
+    incoming: &ScanProject,
+) -> Result<ScanProject, EngineError> {
+    let _guard = manifest_lock();
+    let merged = match read_manifest(directory) {
+        Ok(on_disk) => merge_receipts(on_disk, incoming.clone()),
+        Err(err) if err.code == ErrorCode::ProjectNotFound => incoming.clone(),
+        Err(err) => return Err(err),
+    };
+    write_manifest_atomically(directory, &merged)?;
+    Ok(merged)
+}
+
+/// Per frame, `on_disk`'s receipts survive ahead of `into`'s own: any of
+/// `into`'s receipts not already present (by equality) are appended after,
+/// so the result is their union in disk-first chronological order. Every
+/// other field of `into` — recipes, roll metadata, per-frame overrides,
+/// exclusion, alignment — passes through unchanged; `on_disk` contributes
+/// receipts only. A frame present on disk but absent from `into` (frame
+/// counts are fixed at project creation, so this should never happen in
+/// practice) has nothing to merge into and is skipped here — the caller's
+/// own `write_manifest_atomically` guard still catches that case and
+/// refuses the write, rather than this function silently dropping it.
+fn merge_receipts(on_disk: ScanProject, mut into: ScanProject) -> ScanProject {
+    for on_disk_frame in on_disk.frames {
+        let Some(target) = into
+            .frames
+            .iter_mut()
+            .find(|frame| frame.index == on_disk_frame.index)
+        else {
+            continue;
+        };
+        let mut merged_receipts = on_disk_frame.receipts;
+        for receipt in target.receipts.drain(..) {
+            if !merged_receipts.contains(&receipt) {
+                merged_receipts.push(receipt);
+            }
+        }
+        target.receipts = merged_receipts;
+    }
+    into
+}
+
 /// Reads the manifest, pushes `receipt` onto `frame_index`'s `receipts`
-/// list, and writes the manifest back atomically. Used by the scan worker
-/// thread to durably attach each completed frame's receipt to the project
-/// file independent of `server.rs`'s in-memory project state.
+/// list, and writes the manifest back atomically — all under
+/// `MANIFEST_LOCK`, so this read-modify-write cycle can never interleave
+/// with a concurrent `persist_project_update` call from the server thread
+/// (or with another concurrent call to this same function). Used by the
+/// scan worker thread to durably attach each completed frame's receipt to
+/// the project file independent of `server.rs`'s in-memory project state.
+/// Unlike `persist_project_update`, this function's caller never has an
+/// in-memory `ScanProject` of its own to merge against — only a directory
+/// and one new receipt — so it must read fresh, mutate, and write back
+/// before releasing the lock, not just wrap the final write.
 pub fn persist_frame_receipt(
     directory: &Path,
     frame_index: u32,
     receipt: &crate::domain::ScanReceipt,
 ) -> Result<(), EngineError> {
+    let _guard = manifest_lock();
     let mut project = read_manifest(directory)?;
-    mutate_frame(&mut project, frame_index, |f| f.receipts.push(receipt.clone()))?;
+    mutate_frame(&mut project, frame_index, |f| {
+        f.receipts.push(receipt.clone())
+    })?;
     write_manifest_atomically(directory, &project)?;
     Ok(())
 }
@@ -607,6 +796,8 @@ mod tests {
     fn write_then_read_manifest_round_trips_a_frame_with_a_receipt_attached() {
         let dir = temp_project_dir();
         let receipt = ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: "job-1".into(),
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
@@ -765,8 +956,8 @@ mod tests {
         )
         .expect("write manifest");
 
-        let project = read_manifest(&dir)
-            .expect("a schema v1 manifest with no recipes key must still open");
+        let project =
+            read_manifest(&dir).expect("a schema v1 manifest with no recipes key must still open");
         assert_eq!(project.recipes, OutputRecipe::default());
         assert!(project.frames[0].output_override.is_none());
 
@@ -977,7 +1168,8 @@ mod tests {
         )
         .expect("write manifest");
 
-        let opened = open_project(&dir).expect("a manifest with temp-dir destinations must still open");
+        let opened =
+            open_project(&dir).expect("a manifest with temp-dir destinations must still open");
 
         assert_eq!(
             opened.recipes.archive.destination,
@@ -997,7 +1189,10 @@ mod tests {
         // show the corrected destinations, proving the migration
         // persisted rather than only patching the in-memory value.
         let reread = read_manifest(&dir).expect("re-read migrated manifest");
-        assert_eq!(reread.recipes.archive.destination, opened.recipes.archive.destination);
+        assert_eq!(
+            reread.recipes.archive.destination,
+            opened.recipes.archive.destination
+        );
         assert!(
             !is_under_os_temp_dir(&reread.recipes.archive.destination),
             "the persisted destination must no longer match the stale <temp>/ScanStudio/Archive shape"
@@ -1104,6 +1299,8 @@ mod tests {
 
     fn sample_receipt(job_id: &str, frame_index: u32) -> ScanReceipt {
         ScanReceipt {
+            exposure_authority: None,
+            auto_crop: None,
             job_id: job_id.into(),
             frame_index,
             started_at: "2026-07-22T09:00:00Z".into(),
@@ -1206,6 +1403,151 @@ mod tests {
         let err = persist_frame_receipt(&dir, 99, &receipt).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
 
+        cleanup(&dir);
+    }
+
+    /// PERSIST-02 core fix: a caller's stale in-memory `incoming` (no
+    /// receipts, exactly like `project_state.active` right after
+    /// `project.create`) must never blow away a receipt `persist_frame_
+    /// receipt` already attached straight to disk. Before this function
+    /// existed, `server.rs` wrote `project_state.active` over the manifest
+    /// directly and destroyed it every time.
+    #[test]
+    fn persist_project_update_retains_a_disk_receipt_incoming_does_not_know_about() {
+        let dir = temp_project_dir();
+        let (project, _dir) = create_project(
+            "Merge Retains Disk Receipt",
+            MediaCarrier::Strip6,
+            2,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create_project should succeed");
+
+        let receipt = sample_receipt("job-1", 1);
+        persist_frame_receipt(&dir, 1, &receipt).expect("persist frame 1 receipt");
+
+        // `incoming` reflects a project_state.active that has never heard
+        // about that receipt — only a recipe edit unrelated to frame 1.
+        let mut incoming = project.clone();
+        incoming.recipes.archive.filename_template = "Renamed_####".into();
+
+        let merged = persist_project_update(&dir, &incoming).expect("persist_project_update");
+        assert_eq!(merged.frames[0].receipts, vec![receipt.clone()]);
+        assert_eq!(merged.recipes.archive.filename_template, "Renamed_####");
+
+        let on_disk = read_manifest(&dir).expect("read back manifest");
+        assert_eq!(
+            on_disk.frames[0].receipts,
+            vec![receipt],
+            "the merged write must durably retain the disk-only receipt"
+        );
+        assert_eq!(on_disk.recipes.archive.filename_template, "Renamed_####");
+
+        cleanup(&dir);
+    }
+
+    /// Every field besides receipts is `incoming`'s to decide — merging
+    /// must never resurrect a stale roll_metadata or recipe from disk over
+    /// a caller's deliberate edit.
+    #[test]
+    fn persist_project_update_prefers_incoming_for_every_non_receipt_field() {
+        let dir = temp_project_dir();
+        let (project, _dir) = create_project(
+            "Merge Prefers Incoming",
+            MediaCarrier::Strip6,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create_project should succeed");
+
+        let mut incoming = project;
+        incoming.roll_metadata.camera = Some("Nikon F3".into());
+
+        let merged = persist_project_update(&dir, &incoming).expect("persist_project_update");
+        assert_eq!(merged.roll_metadata.camera, Some("Nikon F3".into()));
+
+        cleanup(&dir);
+    }
+
+    /// A missing manifest has nothing to merge against — `persist_project_
+    /// update` must still succeed and simply write `incoming` as-is (the
+    /// same shape a brand new project's first save already produces).
+    #[test]
+    fn persist_project_update_writes_incoming_as_is_when_no_manifest_exists_yet() {
+        let dir = temp_project_dir(); // never created
+        let project = n_frame_project_for_mutate_frame_tests(2);
+
+        let merged = persist_project_update(&dir, &project).expect("persist_project_update");
+        assert_eq!(merged, project);
+        assert_eq!(read_manifest(&dir).expect("read back manifest"), project);
+
+        cleanup(&dir);
+    }
+
+    /// The structural backstop: `write_manifest_atomically` must refuse —
+    /// not silently accept — any write whose incoming frame receipts are
+    /// not a superset of what is already durably on disk. This is what
+    /// `persist_project_update`/`persist_frame_receipt` are relied on to
+    /// never trip; this test proves the backstop itself actually holds.
+    #[test]
+    fn write_manifest_atomically_refuses_a_write_that_would_drop_an_on_disk_receipt() {
+        let dir = temp_project_dir();
+        let (project, _dir) = create_project(
+            "Guard Refuses Receipt Loss",
+            MediaCarrier::Strip6,
+            2,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create_project should succeed");
+
+        let receipt = sample_receipt("job-1", 1);
+        persist_frame_receipt(&dir, 1, &receipt).expect("persist frame 1 receipt");
+
+        // A stale copy of the project, taken before the receipt existed —
+        // exactly the shape of the pre-fix defect's stale project_state.active.
+        let stale = project;
+        let err = write_manifest_atomically(&dir, &stale).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ManifestInvalid);
+        assert!(err.message.contains("frame 1"));
+
+        // The refusal must be enforced before any write — the receipt is
+        // still exactly there, not clobbered by a half-applied attempt.
+        let on_disk = read_manifest(&dir).expect("read back manifest");
+        assert_eq!(on_disk.frames[0].receipts, vec![receipt]);
+
+        cleanup(&dir);
+    }
+
+    /// A manifest that exists but cannot be parsed must refuse the write
+    /// rather than pave over the corruption with whatever the caller
+    /// happened to be holding.
+    #[test]
+    fn write_manifest_atomically_refuses_when_the_existing_manifest_is_corrupt() {
+        let dir = temp_project_dir();
+        fs::create_dir_all(&dir).expect("create dir");
+        fs::write(dir.join(MANIFEST_FILE_NAME), "not valid json{{{")
+            .expect("write corrupt manifest");
+
+        let project = n_frame_project_for_mutate_frame_tests(1);
+        let err = write_manifest_atomically(&dir, &project).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ManifestInvalid);
+        assert!(err.message.contains("manual recovery"));
+
+        cleanup(&dir);
+    }
+
+    /// No manifest at all (a brand new project directory) has nothing to
+    /// compare against, so the guard must allow the write through exactly
+    /// as it always has.
+    #[test]
+    fn write_manifest_atomically_allows_the_first_write_to_a_fresh_directory() {
+        let dir = temp_project_dir(); // never created
+        let project = n_frame_project_for_mutate_frame_tests(1);
+        write_manifest_atomically(&dir, &project).expect("first write to a fresh directory");
+        assert_eq!(read_manifest(&dir).expect("read back manifest"), project);
         cleanup(&dir);
     }
 

@@ -31,6 +31,7 @@ __all__ = [
     "TransportSmearAssessment",
     "ArtifactEvidence",
     "ApprovalReceipt",
+    "ExposureAuthority",
     "ScanReceipt",
     "PreviewResult",
     "ScanSummary",
@@ -188,6 +189,18 @@ class ApprovalReceipt:
 
 
 @dataclass(frozen=True)
+class ExposureAuthority:
+    """Verbatim hardware exposure provenance from CoolscanPy's journal."""
+
+    rgb_source: str
+    ir_source: str
+    commanded_channels_raw_10ns: dict[str, int]
+    active_controller_channels_raw_10ns: dict[str, int]
+    device_bound_clamped_channels_raw_10ns: dict[str, int]
+    device_exposure_bounds_raw_10ns: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class ScanReceipt:
     version: int
     slot: int
@@ -225,6 +238,9 @@ class ScanReceipt:
     # Defaulted so existing in-process ScanReceipt construction and older
     # wire payloads remain compatible.
     attempts_root: str | None = None
+    # Best-effort copy of CoolscanPy's active_exposure_authority journal
+    # block. Defaulted for older persisted and in-process receipts.
+    exposure_authority: ExposureAuthority | None = None
 
 
 # --- internal (non-wire) types Plan 08-02 needs ---

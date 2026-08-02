@@ -48,7 +48,14 @@ public enum HardwareMotionReadiness: Equatable, Sendable {
         case .notApplicable: ""
         case .ready: "The scanner can accept preview, scan, and eject commands."
         case .notEnabled:
-            "Restart ScanStudio, then check the scanner again."
+            // Film motion is armed out of band, at launch, and deliberately
+            // cannot be switched on by a click in this window. The old copy
+            // said "Restart ScanStudio", which is a dead end: a Finder
+            // launch inherits no environment, so restarting that way lands
+            // right back here, forever. This says what is true and what the
+            // operator can act on without naming the mechanism — the plain
+            // language rule this type's tests enforce.
+            "Moving film has to be enabled when ScanStudio starts, and it was not this time. Starting it again the usual way will not change that."
         case .unknown:
             "Check the scanner before previewing, scanning, or ejecting film."
         }

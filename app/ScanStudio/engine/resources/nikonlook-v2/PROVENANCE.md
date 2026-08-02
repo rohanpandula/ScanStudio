@@ -20,8 +20,7 @@ directory and match the source repo's own copies.
 
 ## Licensing
 
-Same grant as `nikonlook-v1` (see that bundle's `PROVENANCE.md`): the
-repository owner licenses these numeric model files and the associated
+The repository owner licenses these numeric model files and the associated
 `nikonlook_core.py` algorithm for use in this MIT-licensed repository. That
 authorization covers vendoring the three JSON files as data under
 `app/ScanStudio/engine/resources/nikonlook-v2/` and porting

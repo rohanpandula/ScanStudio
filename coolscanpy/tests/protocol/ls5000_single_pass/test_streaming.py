@@ -50,6 +50,16 @@ def _e9ea_prefixed_counter_train(words: np.ndarray) -> None:
     _counter_train(words[4:], 0xD895)
 
 
+def _e004_prefixed_counter_train(words: np.ndarray) -> None:
+    words[:4] = (0xE004, 0xE004, 0xE004, 0xD894)
+    _counter_train(words[4:], 0xD895)
+
+
+def _dc4c_prefixed_counter_train(words: np.ndarray) -> None:
+    words[:4] = (0xDC4C, 0xDC4C, 0xDC4C, 0xD894)
+    _counter_train(words[4:], 0xD895)
+
+
 def _synthetic_full_records(height: int = 3) -> tuple[np.ndarray, np.ndarray]:
     records = (height + 1) // 2
     base = (
@@ -163,6 +173,91 @@ class TestStreamingFrameDecoder:
         expected[..., :3] += 2
         np.testing.assert_array_equal(expected, decoded)
         assert layout["padding_validated_records"] == 2
+
+    def test_e004_prefixed_padding_counter_dialect_is_accepted(self) -> None:
+        base, full = _synthetic_full_records(height=3)
+        for record in full:
+            _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _e004_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        decoder = StreamingFrameDecoder(height=3)
+
+        _feed(decoder, full.astype(">u2").tobytes(), 65_535)
+        decoded, layout = decoder.finish()
+
+        expected = base.copy()
+        expected[..., :3] += 2
+        np.testing.assert_array_equal(expected, decoded)
+        assert layout["padding_validated_records"] == 2
+
+    def test_e004_prefixed_stream_matches_offline_decode_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        for record in full:
+            _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _e004_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        stream = full.astype(">u2").tobytes()
+        path = tmp_path / "e004-capture.bin"
+        path.write_bytes(stream)
+        offline, offline_report = decode_full_records(path, height=3)
+
+        decoder = StreamingFrameDecoder(height=3)
+        _feed(decoder, stream, 4_096)
+        decoded, _ = decoder.finish()
+
+        np.testing.assert_array_equal(offline, decoded)
+        assert offline_report["padding_1_3_counter_dialect"] == "e004-prefixed"
+
+    def test_dc4c_prefixed_stream_matches_offline_decode_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        for record in full:
+            _dc4c_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _dc4c_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        stream = full.astype(">u2").tobytes()
+        path = tmp_path / "dc4c-capture.bin"
+        path.write_bytes(stream)
+        offline, offline_report = decode_full_records(path, height=3)
+
+        decoder = StreamingFrameDecoder(height=3)
+        _feed(decoder, stream, 4_096)
+        decoded, _ = decoder.finish()
+
+        np.testing.assert_array_equal(offline, decoded)
+        assert offline_report["padding_1_3_counter_dialect"] == "dc4c-prefixed"
+
+    @pytest.mark.parametrize(
+        "corrupt_word_offset,match",
+        [
+            (110_840 // 2, "padding 1 counter train mismatch"),
+            (110_840 // 2 + 4, "padding 1 counter train mismatch"),
+            (207_096 // 2, "padding 3 counter train mismatch"),
+            (207_872 // 2 - 1, "padding 3 counter train mismatch"),
+        ],
+        ids=["pad1-sentinel", "pad1-train-head", "pad3-sentinel", "pad3-train-tail"],
+    )
+    def test_corrupt_e004_prefixed_padding_fails_closed(
+        self, corrupt_word_offset: int, match: str
+    ) -> None:
+        _base, full = _synthetic_full_records(height=5)  # 3 records
+        for record in full:
+            _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _e004_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        full[1, corrupt_word_offset] ^= 1
+        stream = full.astype(">u2").tobytes()
+        decoder = StreamingFrameDecoder(height=5)
+        with pytest.raises(ValueError, match=match):
+            _feed(decoder, stream, 65_535)
+
+    def test_mixed_e004_and_e9ea_padding_dialects_fail_closed(self) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        for record in full:
+            _e004_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _e9ea_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        decoder = StreamingFrameDecoder(height=3)
+        with pytest.raises(ValueError, match="padding 3 counter train mismatch"):
+            _feed(decoder, full.astype(">u2").tobytes(), 65_535)
 
     def test_empty_pushes_are_no_ops(self, tmp_path: Path) -> None:
         _base, stream = _stream_bytes(height=3)

@@ -52,6 +52,7 @@ struct SessionSidebarView: View {
                 .buttonStyle(.borderless)
                 .font(.system(size: 11))
                 .foregroundStyle(Color.scanStudioSecondaryText)
+                .disabled(sessionModel.isJobActive || sessionModel.jobId != nil)
                 .padding(.leading, 30)
             } else {
                 Button {

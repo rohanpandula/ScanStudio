@@ -58,6 +58,20 @@ was built and verified against:
 
 ## 3. Reference provenance mismatch — read this before trusting a score
 
+**2026-07-29 update: every `nikonlook-v1` filename below is historical.**
+`nikonlook.rs` removed the v1 bundle entirely that day (dead since v2
+shipped hours earlier); `bin/parity.rs`'s `score_color` now derives its
+expected reference filename from whichever bundle `nikonlook::load_bundle()`
+actually returns, not a hardcoded literal — in this repo, always
+`nikonlook-v2`. `render_references.py`'s own `--bundle` default was
+updated to match. The `nikonlook-v1` filenames and the "original
+validation" described in this section are kept as-written below because
+they accurately describe what was verified AT THE TIME; do not run any
+command in this section literally expecting a `-v1` file to be what
+`make parity` looks for today — substitute `-v2` throughout, or (for
+`render_references.py`) simply omit `--bundle` and let its now-current
+default apply.
+
 **Color.** The corpus's bundled `acceptance_slotNN_positive.tif` was
 produced by a *native per-acquisition builder* (`ls5000-md3-prescan-to-pref-v1`)
 plus a `cml4-captured-optimized-stage1-stage2-v1` color-management stage —
@@ -77,11 +91,10 @@ whichever bundle version is actually compiled into the engine build running
 compared to bundle X's own reference. As of the nikonlook-v2 switch,
 `load_bundle()` returns `nikonlook-v2` by default, so the filename `make
 parity` looks for today is `acceptance_slotNN_reference_color_nikonlook-v2.tif`,
-not `..._nikonlook-v1.tif`. The `nikonlook-v1`-named references described
-below in this section were generated and validated before that switch, on
-`load_bundle_v1()`'s bundle; they remain useful for `load_bundle_v1()`-based
-comparison tooling but are no longer what a default `make parity` run looks
-for. If the reference file `score_color` expects doesn't exist,
+not `..._nikonlook-v1.tif`. Historical `nikonlook-v1`-named references may
+still be used by external comparison tooling, but the v1 bundle and loader
+are no longer compiled or distributed here. If the reference file
+`score_color` expects doesn't exist,
 `bin/parity.rs` reports `no_reference` with a message naming the exact
 expected filename and the command to produce it, rather than silently
 falling back to a differently-versioned reference.
@@ -102,8 +115,8 @@ model.json/layer_a.json/manifest.json bytes the Rust engine embeds via
 already matches whichever bundle version `load_bundle()` currently returns
 without pointing at any private, maintainer-specific checkout. Pass
 `--bundle` explicitly only to render against a *different* bundle version —
-e.g. a `nikonlook-v1` checkout, for `load_bundle_v1()`-based comparison
-tooling. `--negfit-path` has no default and must always be passed: negfit
+for example, an independently held historical bundle used by external
+comparison tooling. `--negfit-path` has no default and must always be passed: negfit
 is GPL-labeled reference code that stays external to this repository (see
 the script's own module docstring). By default the script writes the
 reference TIFFs next to the corpus, named

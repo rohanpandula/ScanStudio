@@ -58,7 +58,11 @@ from .capture_process import (
 )
 from .meter import (
     DEFAULT_EXPOSURES,
+    EXPOSURE_MAX,
+    EXPOSURE_MIN,
+    NIKON_PARITY_PROFILE,
     MeterObservation,
+    calculate_nikon_parity_shadow,
     observe_meter_pass,
     propose_next_exposures,
     verify_final_convergence,
@@ -2504,6 +2508,94 @@ def _patch_exposure_contract(
     return wire_exposures
 
 
+def _resolve_parity_active_exposures(
+    journal: dict[str, Any],
+    *,
+    observation: MeterObservation,
+    final_result: Any,
+) -> dict[str, int]:
+    """Form the fine-scan exposure commands: guarded nikon-parity RGB, active IR.
+
+    This is the ONLY place a nikon-parity value may become a scanner command,
+    and it reads exactly one field per channel — the guarded
+    ``candidate_exposure_raw_10ns``.  The higher uncapped diagnostic value is
+    journaled beside it and can never be commanded (the fail-closed tests pin
+    this).  Infrared always passes through from the active controller's final
+    solve, unchanged.
+
+    Fail-closed policy: a parity calculation error refuses the fine scan with
+    a named error — never a silent fallback to the active RGB solve, which
+    would silently reintroduce the +6-9% brightness family this authority
+    exists to close (RESULT-FINE-EXPOSURE-DOMAIN-20260731).  A guarded
+    candidate outside the scanner's [EXPOSURE_MIN, EXPOSURE_MAX] contract is
+    clamped to the device bound — one more named, journaled guard, matching
+    the ceiling the scanner itself enforces — so thin or dim frames stay
+    scannable exactly as they were under the active controller.
+    """
+
+    if "meter_shadow_profiles" in journal:
+        raise ProtocolError("meter shadow profile was already journaled")
+    active = dict(final_result.final_exposures)
+    try:
+        shadow = calculate_nikon_parity_shadow(
+            observation,
+            current_metered_exposures=active,
+        )
+    except (TypeError, ValueError) as error:
+        journal["meter_shadow_profiles"] = {
+            NIKON_PARITY_PROFILE: {
+                "profile": NIKON_PARITY_PROFILE,
+                "status": "calculation-error",
+                "armed": False,
+                "scanner_route": "none",
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+            }
+        }
+        raise SynchronizedProtocolError(
+            "nikon-parity active exposure calculation refused: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    guarded = {
+        channel.channel: int(channel.candidate_exposure_raw_10ns)
+        for channel in shadow.channels
+    }
+    if sorted(guarded) != ["B", "G", "R"]:
+        raise ProtocolError(
+            f"nikon-parity calculation returned channels {sorted(guarded)!r}, "
+            "expected exactly R/G/B"
+        )
+    journal["meter_shadow_profiles"] = {
+        NIKON_PARITY_PROFILE: shadow.to_journal_dict(routing="active-rgb-authority")
+    }
+    device_bound_clamped = {
+        channel: exposure
+        for channel, exposure in guarded.items()
+        if not EXPOSURE_MIN <= exposure <= EXPOSURE_MAX
+    }
+    bounded = {
+        channel: min(max(exposure, EXPOSURE_MIN), EXPOSURE_MAX)
+        for channel, exposure in guarded.items()
+    }
+    commanded = {
+        "R": bounded["R"],
+        "G": bounded["G"],
+        "B": bounded["B"],
+        "IR": int(active["IR"]),
+    }
+    journal["active_exposure_authority"] = {
+        "rgb_source": "nikon-parity-guarded-v2",
+        "ir_source": "active-controller",
+        "commanded_channels_raw_10ns": dict(commanded),
+        "active_controller_channels_raw_10ns": dict(active),
+        "device_bound_clamped_channels_raw_10ns": dict(device_bound_clamped),
+        "device_exposure_bounds_raw_10ns": [EXPOSURE_MIN, EXPOSURE_MAX],
+    }
+    return commanded
+
+
 def _validate_live_meter_windows(
     payloads: list[bytes],
     *,
@@ -3018,11 +3110,46 @@ def _validate_short_preview_frame_table_records(
             "no preview window was sent"
         )
 
-    first_selector = records[0][1]
+    selectors = tuple(record[1] for record in records)
+    # A 2026-07-31 full-roll observation after Nikon Scan had traversed the
+    # same loaded film used one further bounded edge representation.  Its
+    # first two selectors are 0 and 10, every interior selector advances by
+    # eight, and the final film-end selector remains the canonical 289.  After
+    # a completed fine capture and a fresh ScanStudio session, the same film
+    # returned the identity-valid companion with only the first selector
+    # advanced to 2.  Keep these as two exact 37-record families; the
+    # per-record transport identity, origin ordering, and native-height bound
+    # below remain mandatory.
+    edge_adjusted_full_roll = (
+        record_count == SHORT_FULL_ROLL_FRAME_TABLE_RECORDS
+        and selectors
+        in (
+            (0, *range(10, 283, 8), 289),
+            (2, *range(10, 283, 8), 289),
+        )
+    )
+
+    first_selector = selectors[0]
     previous_origin = -1
     for index, (native_origin, selector, code) in enumerate(records):
+        # After capture activity the scanner's table window slides and its
+        # FINAL record may be a film-end terminal whose selector advances by
+        # exactly one instead of eight (observed identically in three
+        # independent 2026-07-28/30 sessions; every other property of a
+        # terminal record — the transport-coordinate identity, strict
+        # monotonicity, and the height bound — still holds and is still
+        # enforced below. Only that exact final-position +1 form is
+        # admitted; any other cadence break stays refused.
+        cadence_ok = edge_adjusted_full_roll or (
+            selector == first_selector + 8 * index
+            or (
+                index == len(records) - 1
+                and index > 0
+                and selector == first_selector + 8 * (index - 1) + 1
+            )
+        )
         if (
-            selector != first_selector + 8 * index
+            not cadence_ok
             or native_origin <= previous_origin
             or native_origin >= native_height
             or transport_native_origin(code, selector) != native_origin
@@ -4027,16 +4154,21 @@ def _run_live_continuation_frame(
                                 raise SynchronizedProtocolError(
                                     f"meter pass 3 final controller refused: {codes}"
                                 )
+                            commanded_exposures = _resolve_parity_active_exposures(
+                                journal,
+                                observation=observation,
+                                final_result=final_result,
+                            )
                             final_wire = _patch_exposure_contract(
                                 active_plan,
                                 DYNAMIC_WINDOW_GROUPS[-1],
                                 FINE_GET_WINDOW_SEQUENCES,
-                                final_result.final_exposures,
+                                commanded_exposures,
                             )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
-                                    final_result.final_exposures
+                                    commanded_exposures
                                 ),
                                 "wire_colors_raw_10ns": {
                                     str(color): exposure
@@ -5103,16 +5235,21 @@ def run_live_capture(
                                 raise SynchronizedProtocolError(
                                     f"meter pass 3 final controller refused: {codes}"
                                 )
+                            commanded_exposures = _resolve_parity_active_exposures(
+                                journal,
+                                observation=observation,
+                                final_result=final_result,
+                            )
                             final_wire = _patch_exposure_contract(
                                 active_plan,
                                 DYNAMIC_WINDOW_GROUPS[-1],
                                 FINE_GET_WINDOW_SEQUENCES,
-                                final_result.final_exposures,
+                                commanded_exposures,
                             )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
-                                    final_result.final_exposures
+                                    commanded_exposures
                                 ),
                                 "wire_colors_raw_10ns": {
                                     str(color): exposure

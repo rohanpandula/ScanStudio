@@ -1123,6 +1123,7 @@ fn fixed_scan_receipt(
         ir_path: ir_path.map(|path| path.display().to_string()),
         meter_rgbi_path: Some(meter_path.display().to_string()),
         attempts_root: None,
+        exposure_authority: None,
     }
 }
 

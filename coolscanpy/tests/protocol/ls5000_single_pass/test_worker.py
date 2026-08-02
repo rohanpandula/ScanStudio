@@ -106,9 +106,61 @@ LIVE37_STARTUP_FRAME_TABLE_HEX = (
     "0101001600030f3c01090102000326ea0111001a00033e7c01190018000356460121"
     "001e"
 )
+# Live 2026-07-31 matched-pair session after three Nikon Scan captures.  The
+# scanner retained the same 37-frame capacity but represented the two film
+# edges differently: the first boundary is selector 0, the second is selector
+# 10, interior boundaries keep the normal +8 cadence, and the terminal record
+# lands on the canonical final selector 289.  Every record independently
+# satisfies Nikon's transport-coordinate identity.
+LIVE37_EDGE_ADJUSTED_STARTUP_FRAME_TABLE_HEX = (
+    "8f000000012c012a2500000000540000000c00001e06000a0012000035ec0012001c"
+    "00004d62001a0016000065100022001800007ccc002a001c0000947a0032001e0000"
+    "ac1a003a001e0000c3ac0042001c0000db5a004a001e0000f2ec0052001c00010a"
+    "70005a00180001222c0062001c000139be006a001a0001517a0072001e000168f0"
+    "007a0018000180820082001600019868008a00200001afde0092001a0001c79a009a"
+    "001e0001df3a00a2001e0001f6da00aa001e00020e7a00b2001e0002261a00ba001e"
+    "00023d9e00c2001a0002554c00ca001c00026cec00d2001c000284a800da00200002"
+    "9c4800e200200002b3da00ea001e0002cb8800f200200002e31a00fa001e0002faba"
+    "0102001e00031222010a0016000329ec0112001c00034170011a0018000358680121"
+    "032a"
+)
+# Live 2026-07-31 ScanStudio restart after a completed fine capture of frame
+# 12.  The scanner retained the same edge-adjusted full-roll table, but its
+# first selector advanced from 0 to 2.  All 37 records independently satisfy
+# Nikon's transport-coordinate identity and remain strictly ordered/in-bounds.
+LIVE37_POST_FINE_SELECTOR2_STARTUP_FRAME_TABLE_HEX = (
+    "8f000000012c012a2500000006ac0002001c00001e4c000a001c000035d000120018"
+    "00004d7e001a001a0000653a0022001e00007ccc002a001c0000946c0032001c0000"
+    "abfe003a001a0000c3ac0042001c0000db3e004a001a0000f3080052002000010a"
+    "70005a00180001222c0062001c000139b0006a00180001516c0072001c0001690c"
+    "007a001c000180820082001600019830008a00180001afde0092001a0001c77e009a"
+    "001a0001df3a00a2001e0001f6da00aa001e00020e6c00b2001c000225f000ba0018"
+    "00023d8200c200160002557600ca002200026cde00d2001a0002849a00da001e0002"
+    "9c1e00e2001a0002b3da00ea001e0002cb7a00f2001e0002e30c00fa001c0002fa9e"
+    "0102001a00031222010a0016000329de0112001a0003417e011a001a000356460121"
+    "001e"
+)
 LIVE6_SHORT_STRIP_STARTUP_FRAME_TABLE_HEX = (
     "8f0000000034003206000000000000000000000017470008000000002e8e0010"
     "0000000045d50018000000005d1c002000000000746300280000"
+)
+# Three independent live observations of the parked-forward startup table:
+# after capture activity the scanner's six-slot window slides (the from-zero
+# record is gone, selectors start at 0x08) and the final record is a
+# film-end terminal whose selector advances by ONE instead of eight. Every
+# record — terminal included — satisfies the exact transport-coordinate
+# identity; the film-end origin 31,206 is stable across all three sessions
+# while the measured frame boundaries drift with re-registration.
+LIVE6_PARKED_FORWARD_TERMINAL_TABLE_HEXES = (
+    # 2026-07-28 03:24 fine-capture startup (batch-slot05 roh4gd65, failed)
+    "8f000000003400320600000018640008001c00002fe80010001800004"
+    "7b20018001e00005f520020001e000076e40028001c000079e60029001e",
+    # 2026-07-30 14:04 preview startup (preview-pk0cv8qv, failed)
+    "8f0000000034003206000000183a0008001600002fda001000160000473400"
+    "18000c00005f1a00200016000076ba00280016000079e60029001e",
+    # 2026-07-30 23:14 preview startup (preview-owwur7z9, failed)
+    "8f0000000034003206000000182c0008001400002fda001000160000475000"
+    "18001000005f360020001a0000769e00280012000079e60029001e",
 )
 
 
@@ -449,6 +501,138 @@ def test_preview_binds_live_37_record_transport_table_before_set_window() -> Non
     assert binding.startup_records == 37
     assert binding.geometry.native_height == 232_401
     assert binding.geometry.expected_stream_bytes == 5_804_032
+
+
+def test_preview_binds_live_37_record_edge_adjusted_transport_table() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+
+    binding = worker_module._bind_preview_to_startup_table(
+        plan,
+        bytes.fromhex(LIVE37_EDGE_ADJUSTED_STARTUP_FRAME_TABLE_HEX),
+        worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+        canonical_geometry,
+    )
+
+    assert binding.mode == "canonical-prefix-37-record"
+    assert binding.startup_records == 37
+    assert binding.geometry.native_height == 232_401
+    assert binding.geometry.expected_stream_bytes == 5_804_032
+
+
+def test_preview_binds_live_37_record_post_fine_selector2_transport_table() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+
+    binding = worker_module._bind_preview_to_startup_table(
+        plan,
+        bytes.fromhex(LIVE37_POST_FINE_SELECTOR2_STARTUP_FRAME_TABLE_HEX),
+        worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+        canonical_geometry,
+    )
+
+    assert binding.mode == "canonical-prefix-37-record"
+    assert binding.startup_records == 37
+    assert binding.geometry.native_height == 232_401
+    assert binding.geometry.expected_stream_bytes == 5_804_032
+
+
+@pytest.mark.parametrize(
+    "payload_hex",
+    LIVE6_PARKED_FORWARD_TERMINAL_TABLE_HEXES,
+    ids=["fine-20260728", "preview-20260730-1404", "preview-20260730-2314"],
+)
+def test_preview_binds_live_parked_forward_table_with_terminal_record(
+    payload_hex: str,
+) -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+
+    binding = worker_module._bind_preview_to_startup_table(
+        plan,
+        bytes.fromhex(payload_hex),
+        worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+        canonical_geometry,
+    )
+
+    assert binding.mode == "scanner-derived-6-record"
+    assert binding.startup_records == 6
+
+
+def _parked_forward_records() -> list[tuple[int, int, int]]:
+    payload = bytes.fromhex(LIVE6_PARKED_FORWARD_TERMINAL_TABLE_HEXES[1])
+    return [
+        tuple(record)
+        for record in struct.iter_unpack(">IHH", payload[10:])
+    ]
+
+
+def _rebuild_parked_forward_payload(records: list[tuple[int, int, int]]) -> bytes:
+    header = bytes.fromhex(LIVE6_PARKED_FORWARD_TERMINAL_TABLE_HEXES[1])[:10]
+    return header + b"".join(
+        struct.pack(">IHH", origin, selector, code)
+        for origin, selector, code in records
+    )
+
+
+def test_preview_refuses_terminal_record_before_the_final_position() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    records = _parked_forward_records()
+    records[3], records[5] = records[5], records[3]
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="not a valid Nikon transport record table",
+    ):
+        worker_module._bind_preview_to_startup_table(
+            plan,
+            _rebuild_parked_forward_payload(records),
+            worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            canonical_geometry,
+        )
+
+
+def test_preview_refuses_terminal_record_with_wrong_selector_step() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    records = _parked_forward_records()
+    origin, selector, code = records[-1]
+    # +2 instead of the observed +1: identity-consistent origin for the
+    # shifted selector so only the cadence discriminates.
+    new_selector = selector + 1
+    new_origin = 756 * new_selector + 7 * ((code & 0xFF) + 22 * (code >> 8))
+    records[-1] = (new_origin, new_selector, code)
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="not a valid Nikon transport record table",
+    ):
+        worker_module._bind_preview_to_startup_table(
+            plan,
+            _rebuild_parked_forward_payload(records),
+            worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            canonical_geometry,
+        )
+
+
+def test_preview_refuses_terminal_record_identity_mismatch() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    records = _parked_forward_records()
+    origin, selector, code = records[-1]
+    records[-1] = (origin + 7, selector, code)
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="not a valid Nikon transport record table",
+    ):
+        worker_module._bind_preview_to_startup_table(
+            plan,
+            _rebuild_parked_forward_payload(records),
+            worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            canonical_geometry,
+        )
 
 
 @pytest.mark.parametrize("record_count", range(2, 41))
@@ -861,6 +1045,62 @@ def test_preview_refuses_irregular_37_record_selector_ramp() -> None:
     selector += 1
     origin = worker_module.transport_native_origin(code, selector)
     struct.pack_into(">IHH", payload, final_record, origin, selector, code)
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="not a valid Nikon transport record table",
+    ):
+        worker_module._bind_preview_to_startup_table(
+            plan,
+            bytes(payload),
+            worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            canonical_geometry,
+        )
+
+
+@pytest.mark.parametrize("record_index", (1, 36), ids=("leading-edge", "terminal"))
+def test_preview_refuses_near_miss_37_record_edge_adjusted_selector_ramp(
+    record_index: int,
+) -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    payload = bytearray(
+        bytes.fromhex(LIVE37_EDGE_ADJUSTED_STARTUP_FRAME_TABLE_HEX)
+    )
+    record_offset = 10 + record_index * 8
+    _origin, selector, code = struct.unpack_from(">IHH", payload, record_offset)
+    selector += 1
+    origin = worker_module.transport_native_origin(code, selector)
+    struct.pack_into(">IHH", payload, record_offset, origin, selector, code)
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="not a valid Nikon transport record table",
+    ):
+        worker_module._bind_preview_to_startup_table(
+            plan,
+            bytes(payload),
+            worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            canonical_geometry,
+        )
+
+
+@pytest.mark.parametrize(
+    "record_index", (0, 1, 36), ids=("first", "leading-edge", "terminal")
+)
+def test_preview_refuses_near_miss_37_record_post_fine_selector2_ramp(
+    record_index: int,
+) -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    payload = bytearray(
+        bytes.fromhex(LIVE37_POST_FINE_SELECTOR2_STARTUP_FRAME_TABLE_HEX)
+    )
+    record_offset = 10 + record_index * 8
+    _origin, selector, code = struct.unpack_from(">IHH", payload, record_offset)
+    selector += -1 if record_index == 36 else 1
+    origin = worker_module.transport_native_origin(code, selector)
+    struct.pack_into(">IHH", payload, record_offset, origin, selector, code)
 
     with pytest.raises(
         worker_module.SynchronizedProtocolError,
@@ -1309,7 +1549,7 @@ def test_parent_ack_is_bound_to_session_frame_slot_and_fresh_nonce(
     assert action == "continue"
 
     assert _meter_controller_sha256() == (
-        "c7d00c9c8796b7264a553848106a1fe075ab4a25315fbe5a05d05bc35515ca10"
+        "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c"
     )
 
 
@@ -3087,6 +3327,78 @@ def test_batch_selections_accept_a_live_count_several_frames_below_reviewed(
     assert bound_frames == [3, 20]
 
 
+def _synthetic_meter_observation() -> object:
+    meter = worker_module.meter_module
+    yy, xx = np.mgrid[0 : meter.METER_ROWS, 0 : meter.METER_WIDTH]
+    field = 0.08 + 0.82 * (
+        0.55 * xx / (meter.METER_WIDTH - 1)
+        + 0.45 * yy / (meter.METER_ROWS - 1)
+    )
+    image = np.empty(
+        (meter.METER_ROWS, meter.METER_WIDTH, 4),
+        dtype=np.uint16,
+    )
+    for channel_index, peak in enumerate(
+        (28_000, 31_000, 34_000, 29_000)
+    ):
+        image[:, :, channel_index] = np.round(
+            900 + peak * field
+        ).astype(np.uint16)
+    return meter.observe_meter_pass(
+        meter.DecodedMeterPass(
+            image=image,
+            row_tail=np.zeros(
+                (meter.METER_ROWS, meter.METER_TAIL_SAMPLES),
+                dtype=">u2",
+            ),
+        ),
+        worker_module.DEFAULT_EXPOSURES,
+    )
+
+
+def test_nikon_parity_calculation_failure_refuses_the_fine_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Since the guarded parity solve became the RGB command authority, a
+    calculation failure must refuse the fine scan — never fall back silently
+    to the active solve — and must journal exactly what refused."""
+
+    journal: dict[str, object] = {}
+    monkeypatch.setattr(
+        worker_module,
+        "calculate_nikon_parity_shadow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("diagnostic fixture failure")
+        ),
+    )
+
+    final_result = SimpleNamespace(
+        final_exposures=dict(worker_module.DEFAULT_EXPOSURES)
+    )
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError, match="nikon-parity"
+    ):
+        worker_module._resolve_parity_active_exposures(
+            journal,
+            observation=_synthetic_meter_observation(),
+            final_result=final_result,
+        )
+
+    assert journal["meter_shadow_profiles"] == {
+        "nikon-parity": {
+            "profile": "nikon-parity",
+            "status": "calculation-error",
+            "armed": False,
+            "scanner_route": "none",
+            "error": {
+                "type": "ValueError",
+                "message": "diagnostic fixture failure",
+            },
+        }
+    }
+    assert "active_exposure_authority" not in journal
+
+
 def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3237,7 +3549,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     monkeypatch.setattr(
         worker_module,
         "observe_meter_pass",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: _synthetic_meter_observation(),
     )
     monkeypatch.setattr(
         worker_module,
@@ -3313,6 +3625,39 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     assert journal["session_reservation_retained"] is True
     assert journal["unit_released"] is False
     assert journal["density_calibration_session_id"] == batch.session_id
+    shadow = journal["meter_shadow_profiles"]["nikon-parity"]
+    assert shadow["armed"] is True
+    assert shadow["scanner_route"] == "fine-rgb-set-window"
+    assert (
+        shadow["infrared"]["current_metered_exposure_raw_10ns"]
+        == worker_module.DEFAULT_EXPOSURES["IR"]
+    )
+    candidate_rgb = shadow["candidate_rgb_exposures_raw_10ns"]
+    assert candidate_rgb != {
+        channel: worker_module.DEFAULT_EXPOSURES[channel]
+        for channel in ("R", "G", "B")
+    }
+    # The guarded parity candidates (after the journaled device-bound clamp)
+    # ARE the commanded fine RGB exposures; infrared stays with the active
+    # controller.
+    authority = journal["active_exposure_authority"]
+    assert authority["rgb_source"] == "nikon-parity-guarded-v2"
+    assert authority["ir_source"] == "active-controller"
+    commanded = authority["commanded_channels_raw_10ns"]
+    for channel in ("R", "G", "B"):
+        assert commanded[channel] == min(
+            max(candidate_rgb[channel], worker_module.EXPOSURE_MIN),
+            worker_module.EXPOSURE_MAX,
+        )
+    assert {
+        window["color_id"]: window["exposure_raw_10ns"]
+        for window in journal["fine_windows"]
+    } == {
+        1: commanded["R"],
+        2: commanded["G"],
+        3: commanded["B"],
+        9: worker_module.DEFAULT_EXPOSURES["IR"],
+    }
     assert second.output.read_bytes() == b"x"
     assert second.journal.read_text(encoding="utf-8") == (
         json.dumps(journal, indent=2, sort_keys=True) + "\n"
@@ -3685,7 +4030,9 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         worker_module, "_wait_post_scan_ready", lambda *_args, **_kwargs: (1, 0)
     )
     monkeypatch.setattr(
-        worker_module, "observe_meter_pass", lambda *_args, **_kwargs: object()
+        worker_module,
+        "observe_meter_pass",
+        lambda *_args, **_kwargs: _synthetic_meter_observation(),
     )
     monkeypatch.setattr(
         worker_module,
@@ -3771,6 +4118,9 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         batch.session_id
     )
     assert first_receipt["density_calibration_session_id"] == batch.session_id
+    first_shadow = first_receipt["meter_shadow_profiles"]["nikon-parity"]
+    assert first_shadow["armed"] is True
+    assert first_shadow["scanner_route"] == "fine-rgb-set-window"
     second_receipt = json.loads(second.journal.read_text(encoding="utf-8"))
     assert second_receipt["status"] == "frame-complete"
     assert second_receipt["batch_session"] == {
@@ -3789,6 +4139,43 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         == first_receipt["nikon_density_calibration"]
     )
     assert second_receipt["density_calibration_session_id"] == batch.session_id
+    second_shadow = second_receipt["meter_shadow_profiles"]["nikon-parity"]
+    assert second_shadow["armed"] is True
+    assert second_shadow["scanner_route"] == "fine-rgb-set-window"
+    assert (
+        first_shadow["candidate_rgb_exposures_raw_10ns"]
+        == second_shadow["candidate_rgb_exposures_raw_10ns"]
+    )
+    for receipt, shadow in (
+        (first_receipt, first_shadow),
+        (second_receipt, second_shadow),
+    ):
+        candidate_rgb = shadow["candidate_rgb_exposures_raw_10ns"]
+        assert candidate_rgb != {
+            channel: worker_module.DEFAULT_EXPOSURES[channel]
+            for channel in ("R", "G", "B")
+        }
+        # Guarded parity candidates (after the journaled device-bound clamp)
+        # command the fine RGB windows; infrared stays with the active
+        # controller's solve.
+        authority = receipt["active_exposure_authority"]
+        assert authority["rgb_source"] == "nikon-parity-guarded-v2"
+        assert authority["ir_source"] == "active-controller"
+        commanded = authority["commanded_channels_raw_10ns"]
+        for channel in ("R", "G", "B"):
+            assert commanded[channel] == min(
+                max(candidate_rgb[channel], worker_module.EXPOSURE_MIN),
+                worker_module.EXPOSURE_MAX,
+            )
+        assert {
+            window["color_id"]: window["exposure_raw_10ns"]
+            for window in receipt["fine_windows"]
+        } == {
+            1: commanded["R"],
+            2: commanded["G"],
+            3: commanded["B"],
+            9: worker_module.DEFAULT_EXPOSURES["IR"],
+        }
     assert second.output.read_bytes() == b"f"
     session = json.loads(session_journal_path.read_text(encoding="utf-8"))
     assert session["status"] == "complete"
@@ -3806,3 +4193,177 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     )
     assert session["density_calibration_session_id"] == batch.session_id
     assert usb_events == ["interface-released", "resources-disposed"]
+
+
+# ---------------------------------------------------------------------------
+# Active RGB exposure authority: guarded nikon-parity candidates command the
+# fine scan; infrared stays with the active controller; nothing but the
+# guarded per-channel value can ever reach a scanner window.
+# ---------------------------------------------------------------------------
+
+from coolscanpy.protocol.ls5000_single_pass.meter import (  # noqa: E402
+    DEFAULT_EXPOSURES as _PARITY_DEFAULT_EXPOSURES,
+    METER_ROWS as _PARITY_METER_ROWS,
+    METER_TAIL_SAMPLES as _PARITY_METER_TAIL_SAMPLES,
+    METER_WIDTH as _PARITY_METER_WIDTH,
+    EXPOSURE_MAX as _PARITY_EXPOSURE_MAX,
+    NikonParityShadowChannel,
+    NikonParityShadowResult,
+    observe_meter_pass as _parity_observe_meter_pass,
+)
+
+
+def _parity_meter_payload() -> bytes:
+    # Near-converged brightness: high enough that the reviewed-high guard cap
+    # stays inside the scanner's exposure bounds, like a real pass-3 raster.
+    yy, xx = np.mgrid[0:_PARITY_METER_ROWS, 0:_PARITY_METER_WIDTH]
+    field = 0.06 + 0.94 * (
+        0.53 * xx / (_PARITY_METER_WIDTH - 1) + 0.47 * yy / (_PARITY_METER_ROWS - 1)
+    )
+    image = np.empty((_PARITY_METER_ROWS, _PARITY_METER_WIDTH, 4), dtype=np.uint16)
+    for channel, peak in enumerate((60_000, 59_000, 61_500, 55_000)):
+        image[:, :, channel] = np.round(900 + peak * field).astype(np.uint16)
+    rows = np.zeros((_PARITY_METER_ROWS, 1280), dtype=">u2")
+    rows[:, :1124] = image.transpose(0, 2, 1).reshape(_PARITY_METER_ROWS, 1124)
+    tails = (
+        np.arange(_PARITY_METER_ROWS * _PARITY_METER_TAIL_SAMPLES, dtype=np.uint32)
+        % 65536
+    )
+    rows[:, 1124:] = tails.reshape(_PARITY_METER_ROWS, _PARITY_METER_TAIL_SAMPLES)
+    return rows.tobytes()
+
+
+def _parity_final_result(exposures: dict[str, int]):
+    return SimpleNamespace(final_exposures=dict(exposures))
+
+
+def _crafted_parity_channel(
+    channel: str, *, guarded: int, uncapped: int, active: int
+) -> NikonParityShadowChannel:
+    return NikonParityShadowChannel(
+        channel=channel,
+        target_fraction=0.95,
+        observed_central_fraction=0.9,
+        pass_3_exposure_raw_10ns=active,
+        current_metered_exposure_raw_10ns=active,
+        candidate_exposure_raw_10ns=guarded,
+        uncapped_candidate_exposure_raw_10ns=uncapped,
+        reviewed_high_guard_cap_raw_10ns=guarded,
+        uncapped_update_ratio=uncapped / active,
+        update_ratio=guarded / active,
+        uncapped_predicted_full_high=67_000.0,
+        predicted_full_high=64_000.0,
+        limiting_reason="reviewed-high-q99_99-64880-guard",
+        active_controller_limiting_reason="none-active-controller-limit",
+    )
+
+
+def _crafted_parity_result(
+    *, guarded: dict[str, int], uncapped: dict[str, int], active: dict[str, int]
+) -> NikonParityShadowResult:
+    return NikonParityShadowResult(
+        current_metered_exposures=tuple(
+            (channel, active[channel]) for channel in ("R", "G", "B", "IR")
+        ),
+        channels=tuple(
+            _crafted_parity_channel(
+                channel,
+                guarded=guarded[channel],
+                uncapped=uncapped[channel],
+                active=active[channel],
+            )
+            for channel in ("R", "G", "B")
+        ),
+        source_observation_hashes=(("meter_pass_sha256", "0" * 64),),
+    )
+
+
+def test_active_rgb_commands_are_guarded_parity_and_ir_is_active() -> None:
+    observation = _parity_observe_meter_pass(
+        _parity_meter_payload(), _PARITY_DEFAULT_EXPOSURES
+    )
+    active = {"R": 97_000, "G": 194_000, "B": 177_000, "IR": 283_000}
+    journal: dict = {}
+
+    commanded = worker_module._resolve_parity_active_exposures(
+        journal,
+        observation=observation,
+        final_result=_parity_final_result(active),
+    )
+
+    profile = journal["meter_shadow_profiles"]["nikon-parity"]
+    assert profile["armed"] is True
+    assert profile["mode"] == "active-rgb-authority"
+    assert profile["scanner_route"] == "fine-rgb-set-window"
+    for channel in ("R", "G", "B"):
+        assert commanded[channel] == profile["candidate_rgb_exposures_raw_10ns"][channel]
+    assert commanded["IR"] == active["IR"]
+    authority = journal["active_exposure_authority"]
+    assert authority["rgb_source"] == "nikon-parity-guarded-v2"
+    assert authority["ir_source"] == "active-controller"
+    assert authority["commanded_channels_raw_10ns"] == commanded
+    assert authority["active_controller_channels_raw_10ns"] == active
+
+
+def test_active_rgb_commands_never_use_the_uncapped_diagnostic(monkeypatch) -> None:
+    guarded = {"R": 110_000, "G": 300_000, "B": 350_000}
+    uncapped = {"R": 130_000, "G": 340_000, "B": 397_000}
+    active = {"R": 100_000, "G": 280_000, "B": 330_000, "IR": 283_000}
+    crafted = _crafted_parity_result(guarded=guarded, uncapped=uncapped, active=active)
+    monkeypatch.setattr(
+        worker_module, "calculate_nikon_parity_shadow", lambda *a, **k: crafted
+    )
+    journal: dict = {}
+
+    commanded = worker_module._resolve_parity_active_exposures(
+        journal,
+        observation=object(),
+        final_result=_parity_final_result(active),
+    )
+
+    for channel in ("R", "G", "B"):
+        assert commanded[channel] == guarded[channel]
+        assert commanded[channel] != uncapped[channel]
+    assert commanded["IR"] == active["IR"]
+    profile = journal["meter_shadow_profiles"]["nikon-parity"]
+    assert (
+        profile["uncapped_nikon_like_rgb_exposures_raw_10ns"]["B"] == uncapped["B"]
+    )  # journaled for diagnostics, never commanded
+
+
+def test_guarded_candidate_outside_scanner_bounds_is_clamped_and_journaled(
+    monkeypatch,
+) -> None:
+    """A guarded candidate past the device contract clamps to the bound —
+    one more named guard, so dim frames stay scannable — and the clamp is
+    journaled.  The uncapped diagnostic still never reaches the command."""
+
+    guarded = {"R": 110_000, "G": 300_000, "B": _PARITY_EXPOSURE_MAX + 1}
+    uncapped = {"R": 130_000, "G": 340_000, "B": _PARITY_EXPOSURE_MAX + 5_000}
+    active = {"R": 100_000, "G": 280_000, "B": 330_000, "IR": 283_000}
+    crafted = _crafted_parity_result(guarded=guarded, uncapped=uncapped, active=active)
+    monkeypatch.setattr(
+        worker_module, "calculate_nikon_parity_shadow", lambda *a, **k: crafted
+    )
+    journal: dict = {}
+
+    commanded = worker_module._resolve_parity_active_exposures(
+        journal,
+        observation=object(),
+        final_result=_parity_final_result(active),
+    )
+
+    assert commanded["B"] == _PARITY_EXPOSURE_MAX
+    assert commanded["R"] == guarded["R"]
+    assert commanded["G"] == guarded["G"]
+    assert commanded["IR"] == active["IR"]
+    for channel in ("R", "G", "B"):
+        assert commanded[channel] != uncapped[channel]
+    authority = journal["active_exposure_authority"]
+    assert authority["device_bound_clamped_channels_raw_10ns"] == {
+        "B": _PARITY_EXPOSURE_MAX + 1
+    }
+    assert authority["device_exposure_bounds_raw_10ns"] == [
+        worker_module.EXPOSURE_MIN,
+        worker_module.EXPOSURE_MAX,
+    ]

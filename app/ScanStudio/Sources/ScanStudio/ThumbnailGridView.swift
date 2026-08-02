@@ -19,8 +19,34 @@ struct ThumbnailGridView: View {
     private var frameCount: Int {
         sessionModel.status?.frameCount ?? max(sessionModel.thumbnails.keys.max() ?? 0, 1)
     }
-    private var columns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 9), count: frameCount == 1 ? 1 : min(frameCount, 6))
+    /// 1-based frame indices to draw. A `ClosedRange` (`1...frameCount`)
+    /// traps when `frameCount` is `0` -- reachable whenever the engine
+    /// reports media loaded with zero frames -- so this stays a `Range`,
+    /// which is simply empty instead.
+    private var frameIndices: Range<Int> {
+        frameCount > 0 ? 1..<(frameCount + 1) : 1..<1
+    }
+    /// Height the sheet gives up to the scrubber and its own padding before
+    /// `ContactSheetLayout` decides whether the frames fit without scrolling.
+    private static let nonGridChromeHeight: Double = 118
+
+    private func columns(forPaneSize size: CGSize) -> [GridItem] {
+        let interiorWidth = Double(size.width) - 40
+        let count = ContactSheetLayout.columnCount(
+            frameCount: frameCount,
+            availableWidth: interiorWidth,
+            availableHeight: Double(size.height) - Self.nonGridChromeHeight
+        )
+        return Array(repeating: GridItem(.flexible(), spacing: 9), count: count)
+    }
+
+    /// Widest the sheet itself may grow. Without this a one- or two-frame
+    /// holder stretches its tiles across the whole pane and upscales a
+    /// preview into blur; `ContactSheetLayout` caps the tile, this caps the
+    /// row so the capped tiles stay centred rather than left-hugging.
+    private func sheetMaxWidth(forPaneSize size: CGSize) -> Double {
+        let count = Double(columns(forPaneSize: size).count)
+        return count * ContactSheetLayout.defaultMaxTileWidth + (count - 1) * 9
     }
 
     /// True whenever a batch is running. Read here (not just inline at each
@@ -40,9 +66,10 @@ struct ThumbnailGridView: View {
             Rectangle().fill(Color.scanStudioDivider).frame(height: 1)
 
             if hasMedia {
+                GeometryReader { paneProxy in
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 9) {
-                        ForEach(1...frameCount, id: \.self) { frameIndex in
+                    LazyVGrid(columns: columns(forPaneSize: paneProxy.size), spacing: 9) {
+                        ForEach(frameIndices, id: \.self) { frameIndex in
                             ThumbnailTile(
                                 frameIndex: frameIndex,
                                 thumbnail: sessionModel.thumbnails[frameIndex],
@@ -72,7 +99,8 @@ struct ThumbnailGridView: View {
                             )
                         }
                     }
-                    .frame(maxWidth: frameCount == 1 ? 420 : .infinity)
+                    .frame(maxWidth: sheetMaxWidth(forPaneSize: paneProxy.size))
+                    .frame(maxWidth: .infinity)
                     .padding(.horizontal, 20)
                     .padding(.top, 18)
                     .padding(.bottom, 16)
@@ -94,6 +122,7 @@ struct ThumbnailGridView: View {
                     )
                     .padding(.horizontal, 20)
                     .padding(.bottom, 20)
+                }
                 }
             } else {
                 emptyState
@@ -331,6 +360,14 @@ struct ThumbnailGridView: View {
         return "Needs a real scanner preview for the selected frame."
     }
 
+    /// Mirrors the roll-wide toggle in the batch inspector so this status
+    /// stays honest about what a scan of the selected frame would do.
+    private var autoCropStateDescription: String {
+        sessionModel.autoCropEnabled
+            ? "On — derived outputs crop to the detected image area at scan time."
+            : "Off — enable in Batch settings to crop derived outputs at scan time."
+    }
+
     /// Auto crop has no immediate preview command: it is only evaluated when
     /// a derived scan output is made. This is deliberately a status, not a
     /// menu, toggle, or disabled control that would imply an action exists.
@@ -342,7 +379,7 @@ struct ThumbnailGridView: View {
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
             Text(autoCropOffered
-                ? "Available for this real preview at scan time."
+                ? autoCropStateDescription
                 : autoCropUnavailableReason)
                 .font(.system(size: 9))
                 .foregroundStyle(Color.scanStudioSecondaryText)
@@ -350,7 +387,7 @@ struct ThumbnailGridView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(autoCropOffered
-            ? "Auto Crop on Scan. Available for this real preview at scan time."
+            ? "Auto Crop on Scan. \(autoCropStateDescription)"
             : "Auto Crop on Scan unavailable. \(autoCropUnavailableReason)")
     }
 
@@ -1084,16 +1121,7 @@ private struct ThumbnailTile: View {
                         state: frameState,
                         errorCode: frameState == .failed
                             ? sessionModel.frameErrors[frameIndex]?.code
-                            : nil,
-                        // The engine's own per-frame failure detail
-                        // (`scan.frameState`'s `error` field, PROTOCOL.md —
-                        // `sim.rs`/`real_backend.rs` both attach one for
-                        // every `Failed` transition) surfaced here instead
-                        // of leaving the generic "Failed" label as the only
-                        // information available — "do not silently render
-                        // a failure as not done" cuts both ways: the state
-                        // AND the reason.
-                        detail: frameState == .failed ? sessionModel.frameErrors[frameIndex]?.message : nil
+                            : nil
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                     .padding(5)
@@ -1342,15 +1370,6 @@ private struct ThumbnailTile: View {
 struct FrameStateBadge: View {
     let state: FrameState
     var errorCode: String? = nil
-    /// Extra detail folded into the tooltip/VoiceOver text alongside the
-    /// generic state label — used for `.failed` to surface the engine's own
-    /// per-frame error message (`scan.frameState`'s `error` field,
-    /// PROTOCOL.md; both `sim.rs` and `real_backend.rs` attach one on every
-    /// `Failed` transition) instead of leaving "Failed" as the only
-    /// information ever available. `nil` (every other state, or a failure
-    /// this session never saw an error payload for) falls back to the
-    /// plain label exactly as before.
-    var detail: String? = nil
 
     var body: some View {
         HStack(spacing: 3) {
@@ -1367,12 +1386,19 @@ struct FrameStateBadge: View {
             .accessibilityLabel(helpText)
     }
 
+    /// Never the raw engine diagnostic (`scan.frameState`'s `error.message`,
+    /// PROTOCOL.md) -- that text is written for whoever is debugging the
+    /// bridge, not for the person running the scanner. A known code gets its
+    /// curated copy (`FrameFailureLabel`); an unrecognized one still gets a
+    /// calm sentence plus the code itself, so a report at least names what
+    /// happened. The raw message stays reachable through `frameErrors` for
+    /// logs and evidence -- it just never renders here.
     private var helpText: String {
         if let help = FrameFailureLabel.help(forErrorCode: errorCode) {
             return "\(label): \(help)"
         }
-        guard let detail else { return label }
-        return "\(label): \(detail)"
+        guard let errorCode else { return label }
+        return "Scan failed (\(errorCode)). Try this frame again."
     }
 
     private var label: String {
@@ -1496,8 +1522,16 @@ struct FilmStripScrubberView: View {
 
     private let sprocketCount = 16
 
+    /// 1-based frame indices for the tinted band. A `Range`, not
+    /// `1...frameCount` -- that `ClosedRange` traps for a zero-frame roll,
+    /// and this view renders whenever the parent grid does, including that
+    /// case.
+    private var frameIndices: Range<Int> {
+        frameCount > 0 ? 1..<(frameCount + 1) : 1..<1
+    }
+
     private var markers: [Int] {
-        if frameCount <= 6 { return Array(1...frameCount) }
+        if frameCount <= 6 { return Array(frameIndices) }
         return [1, 6, 12, 18, 24, 30, frameCount]
     }
 
@@ -1512,7 +1546,7 @@ struct FilmStripScrubberView: View {
                         .frame(height: 28)
 
                     HStack(spacing: 0) {
-                        ForEach(1...frameCount, id: \.self) { frameIndex in
+                        ForEach(frameIndices, id: \.self) { frameIndex in
                             frameTint(for: frameIndex)
                         }
                     }

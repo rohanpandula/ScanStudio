@@ -19,10 +19,7 @@ struct FrameDetailWorkspaceView: View {
 
     @Environment(SessionModel.self) private var sessionModel
 
-    @State private var zoomScale: CGFloat = 1
-    @State private var steadyZoomScale: CGFloat = 1
-    @State private var panOffset: CGSize = .zero
-    @State private var steadyPanOffset: CGSize = .zero
+    @State private var zoomState = FrameDetailZoomState()
 
     /// Deliberately NOT reset inside `.task(id: frameIndex)` — unlike
     /// `zoomScale`/`panOffset` (a per-image viewport that must reset), a
@@ -70,11 +67,15 @@ struct FrameDetailWorkspaceView: View {
     @State private var metadataPreviewFrameIndex: Int?
     @State private var metadataApplyResult: ApplyMetadataResult?
 
-    private let minZoom: CGFloat = 1
-    private let maxZoom: CGFloat = 4
-
     private var frameCount: Int {
         max(sessionModel.status?.frameCount ?? 0, sessionModel.thumbnails.keys.max() ?? 0, frameIndex)
+    }
+    /// 1-based frame indices for the filmstrip row. A `Range`, not
+    /// `1...frameCount` -- that `ClosedRange` traps whenever `frameCount`
+    /// is non-positive, and this stays an empty `Range` in that case
+    /// instead.
+    private var frameIndices: Range<Int> {
+        frameCount > 0 ? 1..<(frameCount + 1) : 1..<1
     }
 
     /// The exact same readiness decision as the contact sheet's batch Scan.
@@ -291,8 +292,8 @@ struct FrameDetailWorkspaceView: View {
                     defectMapOverlayContent(orientationDegrees: orientationDegrees, mirrored: mirrored)
                 }
             }
-            .scaleEffect(zoomScale)
-            .offset(panOffset)
+            .scaleEffect(zoomState.scale)
+            .offset(zoomState.panOffset)
             // Swap to portrait (2:3) at 90/270 so the rotated frame fits instead
             // of being clipped to the landscape box (rotationEffect does not
             // resize layout bounds).
@@ -301,6 +302,11 @@ struct FrameDetailWorkspaceView: View {
             .background(.black)
             .clipShape(RoundedRectangle(cornerRadius: 5))
             .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.12)))
+            // Keep the preview's changing description scoped to the image
+            // before adding interactive overlays. Applying this label after
+            // `zoomControls` causes SwiftUI to replace each button's own
+            // accessible name with the preview description.
+            .accessibilityLabel(previewAccessibilityLabel(usesRealImage: realImage != nil))
             .overlay(alignment: .topTrailing) { zoomControls }
             .overlay(alignment: .bottomLeading) {
                 if viewingMode == .defectMap {
@@ -351,7 +357,6 @@ struct FrameDetailWorkspaceView: View {
             }
             .contentShape(Rectangle())
             .gesture(SimultaneousGesture(magnifyGesture, panGesture))
-            .accessibilityLabel(previewAccessibilityLabel(usesRealImage: realImage != nil))
 
             if FrameAlignmentAvailabilityPolicy.isVisible(
                 deviceKind: sessionModel.device?.kind
@@ -510,7 +515,7 @@ struct FrameDetailWorkspaceView: View {
         let base = usesRealImage
             ? "Real scanner preview for frame \(frameIndex)"
             : "Simulated preview for frame \(frameIndex), same preview crop shown elsewhere in the app"
-        var label = "\(base), zoomed to \(Int(zoomScale * 100)) percent"
+        var label = "\(base), zoomed to \(Int(zoomState.scale * 100)) percent"
         if let orientationText = FrameOrientation.accessibilityText(sessionModel.frameOrientation(frameIndex)) {
             label += ", \(orientationText)"
         }
@@ -526,14 +531,41 @@ struct FrameDetailWorkspaceView: View {
 
     private var zoomControls: some View {
         HStack(spacing: 8) {
-            Text("\(Int(zoomScale * 100))%")
+            Button {
+                zoomState.step(by: -FrameDetailZoomState.controlStep)
+            } label: {
+                Image(systemName: "minus.magnifyingglass")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+            .accessibilityLabel("Zoom Out")
+            .accessibilityHint("Decreases the frame preview magnification")
+            .keyboardShortcut("-", modifiers: .command)
+            .disabled(!zoomState.canZoomOut)
+
+            Text("\(Int(zoomState.scale * 100))%")
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .monospacedDigit()
                 .foregroundStyle(Color.scanStudioPrimaryText)
-            Button("Fit") { resetZoomAndPan() }
+
+            Button {
+                zoomState.step(by: FrameDetailZoomState.controlStep)
+            } label: {
+                Image(systemName: "plus.magnifyingglass")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+            .accessibilityLabel("Zoom In")
+            .accessibilityHint("Increases the frame preview magnification")
+            .keyboardShortcut("+", modifiers: .command)
+            .disabled(!zoomState.canZoomIn)
+
+            Button("Fit") { zoomState.reset() }
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
-                .disabled(zoomScale == minZoom && panOffset == .zero)
+                .accessibilityHint("Fits the entire frame preview and resets its position")
+                .keyboardShortcut("0", modifiers: .command)
+                .disabled(zoomState.isFitted)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
@@ -544,31 +576,21 @@ struct FrameDetailWorkspaceView: View {
     private var magnifyGesture: some Gesture {
         MagnificationGesture()
             .onChanged { value in
-                zoomScale = min(maxZoom, max(minZoom, steadyZoomScale * value))
+                zoomState.updateMagnification(value)
             }
-            .onEnded { _ in
-                steadyZoomScale = zoomScale
-                if zoomScale <= minZoom { resetZoomAndPan() }
-            }
+            .onEnded { _ in zoomState.finishMagnification() }
     }
 
     private var panGesture: some Gesture {
         DragGesture()
             .onChanged { value in
-                guard zoomScale > minZoom else { return }
-                panOffset = CGSize(
-                    width: steadyPanOffset.width + value.translation.width,
-                    height: steadyPanOffset.height + value.translation.height
-                )
+                zoomState.updatePan(translation: value.translation)
             }
-            .onEnded { _ in steadyPanOffset = panOffset }
+            .onEnded { _ in zoomState.finishPan() }
     }
 
     private func resetZoomAndPan() {
-        zoomScale = 1
-        steadyZoomScale = 1
-        panOffset = .zero
-        steadyPanOffset = .zero
+        zoomState.reset()
     }
 
     // MARK: - Defect map controls (DEF-02)
@@ -682,7 +704,7 @@ struct FrameDetailWorkspaceView: View {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ForEach(1...frameCount, id: \.self) { otherFrameIndex in
+                        ForEach(frameIndices, id: \.self) { otherFrameIndex in
                             FilmstripTile(
                                 frameIndex: otherFrameIndex,
                                 isCurrent: otherFrameIndex == frameIndex,
@@ -931,6 +953,13 @@ struct FrameDetailWorkspaceView: View {
                 InspectorTextFieldRow(label: "Destination", text: outputPreviewDestinationBinding)
             }
 
+            subHeading("Geometry").padding(.top, 8)
+            InspectorToggleRow(label: "Auto crop derived outputs", isOn: outputAutoCropBinding)
+            Text("Crops this frame's positive and preview to its own detected image area at scan time. The master TIFF keeps the full frame; the crop is recorded in the frame's receipt.")
+                .font(.system(size: 10))
+                .foregroundStyle(Color.scanStudioSecondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
             Label(OutputRetentionPolicy.helpText, systemImage: "info.circle")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.scanStudioSecondaryText)
@@ -1052,7 +1081,9 @@ struct FrameDetailWorkspaceView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(Color.scanStudioSecondaryText)
 
-                    Text(preview.arguments.joined(separator: " "))
+                    Text(preview.arguments.isEmpty
+                        ? "No metadata fields are set. Apply Metadata will leave these outputs unchanged."
+                        : preview.arguments.joined(separator: " "))
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(Color.scanStudioPrimaryText)
                         .textSelection(.enabled)
@@ -1119,6 +1150,9 @@ struct FrameDetailWorkspaceView: View {
         }
         guard !preview.targets.isEmpty else {
             return "This frame has no scanned outputs yet, so there's nothing for ExifTool to tag."
+        }
+        guard !preview.arguments.isEmpty else {
+            return "No metadata fields are set. Apply Metadata is a successful no-op and won't launch ExifTool."
         }
         return "Apply runs ExifTool against this frame's scanned outputs for real."
     }
@@ -1288,6 +1322,16 @@ struct FrameDetailWorkspaceView: View {
             archiveEnabled: current.archive.enabled,
             positiveEnabled: current.positive.enabled,
             previewEnabled: current.preview.enabled
+        )
+    }
+
+    private var outputAutoCropBinding: Binding<Bool> {
+        Binding(
+            get: { outputDraft?.autoCrop ?? sessionModel.outputRecipe.autoCrop },
+            set: { newValue in
+                guard let current = outputDraft else { return }
+                outputDraft = current.with(autoCrop: newValue)
+            }
         )
     }
 
@@ -1812,11 +1856,17 @@ private extension PreviewRecipe {
 }
 
 private extension OutputRecipe {
-    func with(archive: ArchiveRecipe? = nil, positive: PositiveRecipe? = nil, preview: PreviewRecipe? = nil) -> OutputRecipe {
+    func with(
+        archive: ArchiveRecipe? = nil,
+        positive: PositiveRecipe? = nil,
+        preview: PreviewRecipe? = nil,
+        autoCrop: Bool? = nil
+    ) -> OutputRecipe {
         OutputRecipe(
             archive: archive ?? self.archive,
             positive: positive ?? self.positive,
-            preview: preview ?? self.preview
+            preview: preview ?? self.preview,
+            autoCrop: autoCrop ?? self.autoCrop
         )
     }
 }

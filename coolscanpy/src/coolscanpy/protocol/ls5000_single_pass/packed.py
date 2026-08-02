@@ -110,29 +110,35 @@ def _counter_train_ok(
 
 
 def _padding_counter_dialect(block: np.ndarray) -> str | None:
-    """Identify either complete padding counter dialect observed live.
+    """Identify any complete padding counter dialect observed live.
 
-    The original captures begin with the canonical ``AA55,D893`` pair.  A
-    second stable LS-5000 state, observed identically in both long padding
-    blocks across every record of three independent captures, replaces only
-    the first three words with ``E9EA`` sentinels.  Its fourth word remains
-    ``D894`` and the canonical ``AA55,D895...`` train resumes immediately
-    afterward.  Accept only those two exact whole-block forms.
+    The original captures begin with the canonical ``AA55,D893`` pair.  Two
+    further stable LS-5000 states, each observed identically in both long
+    padding blocks across every record of its captured stream, replace only
+    the first three words with a repeated sentinel — ``E9EA``, ``E004``, or
+    ``DC4C``.
+    The fourth word remains ``D894`` and the canonical ``AA55,D895...`` train
+    resumes immediately afterward.  Accept only those exact whole-block forms.
     """
 
     if _counter_train_ok(block, first_counter=0xD893):
         return "canonical"
     if block.ndim != 2 or block.shape[1] < 4:
         return None
-    sentinel_prefix = np.array(
-        [0xE9EA, 0xE9EA, 0xE9EA, 0xD894],
-        dtype=np.uint16,
-    )
-    if np.all(block[:, :4] == sentinel_prefix[None, :]) and _counter_train_ok(
-        block[:, 4:],
-        first_counter=0xD895,
+    for sentinel, dialect in (
+        (0xE9EA, "e9ea-prefixed"),
+        (0xE004, "e004-prefixed"),
+        (0xDC4C, "dc4c-prefixed"),
     ):
-        return "e9ea-prefixed"
+        sentinel_prefix = np.array(
+            [sentinel, sentinel, sentinel, 0xD894],
+            dtype=np.uint16,
+        )
+        if np.all(block[:, :4] == sentinel_prefix[None, :]) and _counter_train_ok(
+            block[:, 4:],
+            first_counter=0xD895,
+        ):
+            return dialect
     return None
 
 

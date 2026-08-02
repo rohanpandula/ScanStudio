@@ -80,7 +80,7 @@ struct ErrorPresentationPolicyTests {
             (
                 "HW_MOTION_NOT_ARMED: movement safeguards are not ready",
                 "Scanner isn’t ready yet",
-                "Restart ScanStudio, check the scanner status, then try again."
+                "Moving film has to be enabled when ScanStudio starts, and it was not this time. Starting it again the usual way will not change that."
             ),
             (
                 "NOT_CONNECTED: no scanner session",

@@ -141,7 +141,10 @@ struct ProjectLauncherView: View {
                         onProjectSaved?()
                         dismiss()
                     } else {
-                        createAttemptError = session.lastErrorMessage
+                        // Curated title, not the raw `lastErrorMessage` --
+                        // this sheet is the primary new-project flow, not a
+                        // developer pane.
+                        createAttemptError = session.errorPresentation?.title
                     }
                 }
             }
@@ -167,7 +170,10 @@ struct ProjectLauncherView: View {
     }
 
     private var disabledReason: String? {
-        ProjectLaunchPolicy.createDisabledReason(
+        if session.isJobActive || session.jobId != nil {
+            return "Finish or stop the current scan before changing projects."
+        }
+        return ProjectLaunchPolicy.createDisabledReason(
             name: name,
             carrier: carrier,
             registeredPreviewFrameCount: registeredPreviewFrameCount
@@ -188,13 +194,16 @@ struct ProjectLauncherView: View {
                                 onProjectSaved?()
                                 dismiss()
                             } else {
-                                openRecentAttemptError = session.lastErrorMessage
+                                // Curated title, not the raw `lastErrorMessage`
+                                // -- same reasoning as `createAttemptError`.
+                                openRecentAttemptError = session.errorPresentation?.title
                             }
                         }
                     } label: {
                         recentProjectRow(summary)
                     }
                     .buttonStyle(.plain)
+                    .disabled(session.isJobActive || session.jobId != nil)
                 }
             }
 

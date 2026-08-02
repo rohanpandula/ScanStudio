@@ -2944,6 +2944,22 @@ fn map_transport_smear_assessment(
     }
 }
 
+/// Mirrors `bridge_protocol::BridgeExposureAuthority` field-for-field.
+fn map_exposure_authority(authority: &BridgeExposureAuthority) -> domain::ExposureAuthority {
+    domain::ExposureAuthority {
+        rgb_source: authority.rgb_source.clone(),
+        ir_source: authority.ir_source.clone(),
+        commanded_channels_raw_10ns: authority.commanded_channels_raw_10ns.clone(),
+        active_controller_channels_raw_10ns: authority
+            .active_controller_channels_raw_10ns
+            .clone(),
+        device_bound_clamped_channels_raw_10ns: authority
+            .device_bound_clamped_channels_raw_10ns
+            .clone(),
+        device_exposure_bounds_raw_10ns: authority.device_exposure_bounds_raw_10ns,
+    }
+}
+
 /// Builds the engine's `ScanReceipt` for a completed real-backend frame.
 /// `duration_ms`/`started_at` are documented approximations: BRIDGE.md's
 /// `ScanReceipt` carries neither a timestamp nor a duration field at all.
@@ -2967,6 +2983,11 @@ fn build_real_receipt(
         .unwrap_or_default()
         .as_secs() as i64;
     domain::ScanReceipt {
+        exposure_authority: bridge_receipt
+            .exposure_authority
+            .as_ref()
+            .map(map_exposure_authority),
+        auto_crop: None,
         job_id: job_id.to_string(),
         frame_index: slot,
         started_at: crate::sim::format_iso8601(now_unix_secs),
@@ -3160,6 +3181,14 @@ fn emit_terminal_job_failure(
     );
 }
 
+/// `terminal_error` names the reason the bridge's own terminal closure
+/// happened to be a failure (`scan.error`'s code+message) rather than a
+/// clean `scan.completed` -- `None` for the ordinary success path. Threaded
+/// straight into `evidence_package::finalize`, which folds it into the
+/// written package's own `detail`/`status` -- without it, a package
+/// finalized after a `scan.error` recorded every attempted frame's own
+/// outcome but never *why the job itself* stopped, leaving that reason
+/// nowhere but engine stderr once this process exits.
 fn finalize_evidence_status_after_bridge_terminal(
     output: &OutputRecipe,
     overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
@@ -3167,6 +3196,7 @@ fn finalize_evidence_status_after_bridge_terminal(
     job_id: &str,
     evidence: &Arc<Mutex<Vec<crate::evidence_package::EvidenceFrame>>>,
     settings: &serde_json::Value,
+    terminal_error: Option<&str>,
 ) -> EvidenceFinalization {
     let mut requested_destinations = std::collections::BTreeMap::<String, Vec<u32>>::new();
     for slot in capture_plan.expected_by_slot.keys() {
@@ -3219,6 +3249,7 @@ fn finalize_evidence_status_after_bridge_terminal(
             job_id,
             &frames,
             settings,
+            terminal_error,
         ) {
             Ok(result) => {
                 every_package_verified_complete &= result.status == "complete";
@@ -4586,6 +4617,7 @@ fn run_real_scan_job_inner(
                                 // rendered this frame -- see build_real_receipt's
                                 // own `nikonlook: None` comment above.
                                 receipt.nikonlook = written.nikonlook;
+                                receipt.auto_crop = written.auto_crop;
                                 if let Ok(mut evidence) = shared_evidence.lock() {
                                     if let Some(frame) = evidence.iter_mut().rev().find(|value| value.frame_index == frame_completed.slot) {
                                         frame.engine_receipt["receipt"] = serde_json::to_value(&receipt)
@@ -4594,15 +4626,45 @@ fn run_real_scan_job_inner(
                                             serde_json::json!({"status": "completed", "outputs": receipt.outputs});
                                     }
                                 }
-                                if let Some(directory) = &project_directory {
-                                    if let Err(err) = crate::manifest::persist_frame_receipt(
+                                // A receipt persistence failure here does not
+                                // mean the frame failed -- the master and any
+                                // derivatives are already durably on disk, so
+                                // reporting FrameState::Failed would be its
+                                // own dishonesty (D-08's transition table has
+                                // no "completed but actually failed" state,
+                                // and nothing about the capture failed). What
+                                // did not happen is the provenance record
+                                // landing in the project manifest, and pre-fix
+                                // that gap reached nowhere but this process's
+                                // stderr -- invisible to the app and the
+                                // person who scanned this frame. Attaching the
+                                // error to this same Completed event (rather
+                                // than inventing a new event the app doesn't
+                                // already parse) reuses FrameStatePayload's
+                                // existing optional `error` field, which
+                                // SessionModel.applyFrameState already stores
+                                // per frame regardless of state and already
+                                // logs as a diagnostic.
+                                let manifest_persist_error = match &project_directory {
+                                    Some(directory) => crate::manifest::persist_frame_receipt(
                                         directory,
                                         frame_completed.slot,
                                         &receipt,
-                                    ) {
-                                        eprintln!(
-                                            "scanstudio-engine: failed to persist frame receipt to manifest: {err}"
-                                        );
+                                    )
+                                    .err(),
+                                    None => None,
+                                };
+                                if let Some(err) = &manifest_persist_error {
+                                    eprintln!(
+                                        "scanstudio-engine: failed to persist frame receipt to manifest: {err}"
+                                    );
+                                    if let Ok(mut evidence) = shared_evidence.lock() {
+                                        if let Some(frame) = evidence.iter_mut().rev().find(|value| value.frame_index == frame_completed.slot) {
+                                            frame.engine_receipt["manifestPersistence"] = serde_json::json!({
+                                                "status": "failed",
+                                                "error": ErrorPayload::from(err),
+                                            });
+                                        }
                                     }
                                 }
                                 emit(
@@ -4613,7 +4675,7 @@ fn run_real_scan_job_inner(
                                         frame_index: frame_completed.slot,
                                         state: FrameState::Completed,
                                         attempt: 1,
-                                        error: None,
+                                        error: manifest_persist_error.as_ref().map(ErrorPayload::from),
                                     },
                                 );
                                 emit(
@@ -4875,6 +4937,7 @@ fn run_real_scan_job_inner(
                                 &job_id,
                                 &shared_evidence,
                                 &settings,
+                                Some(&error.message),
                             );
                             if let Some(working) = capture_plan.private_working_directory.as_ref() {
                                 format!("{}; {}", package_finalization.summary, working.recovery_message("scan.error ended this engine job before derivative/terminal reconciliation"))
@@ -4975,6 +5038,7 @@ fn run_real_scan_job_inner(
                                 &job_id,
                                 &shared_evidence,
                                 &settings,
+                                None,
                             );
                         let private_capture_status = finalize_private_capture_workspace(
                             &capture_plan,
