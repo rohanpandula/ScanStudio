@@ -5,10 +5,11 @@ LS-5000. It keeps the scan workflow in one place: identify the film that is
 loaded, preview the roll, select frames, choose the capture settings, scan,
 and stop safely when needed.
 
-The default device is a clearly labeled **SIMULATED** LS-5000. It is useful
-for exploring the interface and testing the workflow without a scanner. A
-real LS-5000 can be used only when the optional, separate CoolscanPy bridge is
-installed and configured. The app never presents the simulator as hardware.
+Developer runs without a hardware bridge offer a clearly labeled
+**SIMULATED** LS-5000 for exploring the interface safely. The release DMG
+already includes the CoolscanPy bridge and its direct-USB runtime; source
+builds can instead configure a separate compatible bridge. The app never
+presents the simulator as hardware.
 
 This is an alpha. It has been tested on one Mac and one LS-5000 setup. Treat
 each real scan as a new operation: confirm the detected carrier and the
@@ -98,8 +99,10 @@ The real-device backend speaks the NDJSON contract in
 [`protocol/BRIDGE.md`](protocol/BRIDGE.md) to `scanstudio-bridge`, the
 GPL-3.0-only CoolscanPy helper. `make package` includes that helper, a
 relocatable CPython 3.13 runtime, production Python dependencies (including
-`python-sane`), and visible license/source material inside `ScanStudio.app`.
-It does not include Nikon software or an operating-system SANE/libusb driver.
+`python-sane`), a signed app-owned libusb built from pinned source for the
+app's macOS 14 deployment target, and visible license/source material inside
+`ScanStudio.app`. It does not include Nikon software or an operating-system
+SANE backend.
 
 The package launcher resolves a bridge in this order: `SCANSTUDIO_BRIDGE_CMD`,
 the user bridge-command file, the bundled helper, then `PATH`. Set
@@ -121,12 +124,17 @@ operation; only explicit Preview, Scan, and Eject actions can move film. Direct
 bridge and developer launches still need to provide the two-part authorization
 described in `protocol/BRIDGE.md`.
 
-`python-sane` is the bundled Python binding only. A compatible system SANE
-backend and libusb driver remain external prerequisites for the tested
-LS-5000 path. On the tested Apple Silicon configuration, install them with
-`brew install sane-backends libusb`; `_sane` expects Homebrew's
-`libsane.1.dylib`. If that backend cannot load, the real bridge fails closed;
-the simulator must remain visibly simulated.
+The supported color-roll path does not require SANE. On a clean Mac, device
+discovery and connection fall back to the app-owned direct-USB route;
+film-status checks, whole-roll preview, and color fine scanning use direct USB
+and the exact signed libusb copy inside the app. A recipient does not need
+Homebrew, SANE, or a Nikon driver for that workflow. If a working host SANE
+installation already exists, discovery may use it, but capture remains direct
+USB. The bridge still includes `python-sane` for its separate plain-scan and
+software-eject paths; those optional actions need a compatible system SANE
+backend (`brew install sane-backends` on the tested Apple Silicon setup). If
+an unavailable optional path is requested, it fails rather than pretending it
+succeeded; it does not turn a real scanner into the simulator.
 
 The device bar identifies a connected real device as `real` and the simulator
 as `simulated`. Selecting a device is separate from confirming that film is

@@ -22,6 +22,64 @@ relocated_app="$workdir/ScanStudio relocated app/ScanStudio.app"
 mkdir -p "${relocated_app:h}"
 ditto "$source_app" "$relocated_app"
 
+bundled_libusb="$relocated_app/Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib"
+libusb_license="$relocated_app/Contents/Resources/Licenses/libusb-LGPL-2.1-or-later.txt"
+libusb_source="$relocated_app/Contents/Resources/CorrespondingSource/libusb/libusb-1.0.30.tar.bz2"
+libusb_builder="$relocated_app/Contents/Resources/CorrespondingSource/libusb/build_bundled_libusb.sh"
+libusb_rebuild="$relocated_app/Contents/Resources/CorrespondingSource/libusb/REBUILD.txt"
+if [[ ! -f "$bundled_libusb" || -L "$bundled_libusb" ]]; then
+    print -u2 "packaged bridge check failed: app-owned libusb is missing, not regular, or a symlink"
+    exit 1
+fi
+if find "$relocated_app/Contents/Frameworks" -type l -print -quit | grep -q .; then
+    print -u2 "packaged bridge check failed: Frameworks contains a symlink escape surface"
+    exit 1
+fi
+if [[ ! -f "$libusb_license" || ! -f "$libusb_source" \
+    || ! -x "$libusb_builder" || ! -f "$libusb_rebuild" ]]; then
+    print -u2 "packaged bridge check failed: bundled libusb license, source, or rebuild controls are missing"
+    exit 1
+fi
+if [[ "$(shasum -a 256 "$libusb_source" | awk '{print $1}')" \
+    != "fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf" ]]; then
+    print -u2 "packaged bridge check failed: bundled libusb source archive hash changed"
+    exit 1
+fi
+if ! cmp -s "$libusb_builder" "$script_dir/build_bundled_libusb.sh" \
+    || ! zsh -n "$libusb_builder" \
+    || ! grep -q 'SCANSTUDIO_LIBUSB_DEPLOYMENT_TARGET=14.0' "$libusb_rebuild" \
+    || ! grep -q 'SCANSTUDIO_LIBUSB_SOURCE_ARCHIVE=' "$libusb_rebuild"; then
+    print -u2 "packaged bridge check failed: bundled libusb rebuild controls are incomplete or changed"
+    exit 1
+fi
+if ! codesign --verify --strict "$bundled_libusb"; then
+    print -u2 "packaged bridge check failed: bundled libusb signature is invalid"
+    exit 1
+fi
+if [[ "$(otool -D "$bundled_libusb" | tail -n +2 | head -n 1)" \
+    != "@rpath/coolscanpy/_native/libusb-1.0.dylib" ]]; then
+    print -u2 "packaged bridge check failed: bundled libusb install identity is not relocatable"
+    exit 1
+fi
+if otool -L "$bundled_libusb" | tail -n +3 | awk '{print $1}' \
+    | grep -Ev '^(/usr/lib/|/System/Library/)' | grep -q .; then
+    print -u2 "packaged bridge check failed: bundled libusb retains a non-system dependency"
+    otool -L "$bundled_libusb" >&2
+    exit 1
+fi
+app_minimum="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$relocated_app/Contents/Info.plist")"
+libusb_minimum="$(vtool -show-build "$bundled_libusb" | awk '$1 == "minos" { print $2; exit }')"
+if [[ -z "$libusb_minimum" || "$libusb_minimum" != "$app_minimum" ]]; then
+    print -u2 "packaged bridge check failed: bundled libusb minimum macOS is '$libusb_minimum', expected '$app_minimum'"
+    exit 1
+fi
+app_architectures="$(lipo -archs "$relocated_app/Contents/MacOS/ScanStudio")"
+libusb_architectures="$(lipo -archs "$bundled_libusb")"
+if [[ "$libusb_architectures" != "$app_architectures" ]]; then
+    print -u2 "packaged bridge check failed: bundled libusb architecture '$libusb_architectures' does not match app '$app_architectures'"
+    exit 1
+fi
+
 base_dir="$workdir/isolated bridge base"
 output="$workdir/bridge.ndjson"
 bridge="$relocated_app/Contents/MacOS/scanstudio-bridge"
@@ -45,12 +103,18 @@ privacy_scan_targets=(
     "$relocated_app/Contents/Info.plist"
     "$relocated_app/Contents/Resources/CorrespondingSource"
 )
+private_email_scan_targets=(
+    "$relocated_app/Contents/MacOS"
+    "$relocated_app/Contents/Info.plist"
+    "$relocated_app/Contents/Resources/CorrespondingSource/scanstudio-bridge"
+    "$relocated_app/Contents/Resources/CorrespondingSource/coolscanpy"
+)
 if grep -R -a -q -F "$repository_root/" "$relocated_app" \
     || grep -R -a -q -E '/Users/[^/[:space:]]+/' "${privacy_scan_targets[@]}"; then
     print -u2 "packaged bridge check failed: bundle retains a private source path"
     exit 1
 fi
-if grep -R -a -q -E '[[:alnum:]._%+-]+@(gmail|outlook|yahoo)\.com' "${privacy_scan_targets[@]}"; then
+if grep -R -a -q -E '[[:alnum:]._%+-]+@(gmail|outlook|yahoo)\.com' "${private_email_scan_targets[@]}"; then
     print -u2 "packaged bridge check failed: bundle retains a personal email address"
     exit 1
 fi
@@ -133,6 +197,20 @@ fi
 # and curated dependencies, not a developer environment, user PYTHONPATH, or
 # the hostile current directory above.
 runtime_python="$relocated_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"
+resolved_libusb="$(
+    cd "$poison_root"
+    env -i HOME="$workdir/worker-home" PATH="/usr/bin:/bin" \
+        PYTHONHOME="$poison_root/not-a-python-home" \
+        PYTHONPATH="$poison_root" \
+        "$runtime_python" -I -B -c \
+        'from pathlib import Path; from coolscanpy.protocol.ls5000_single_pass.usb_backend import get_libusb_backend; print(Path(get_libusb_backend().lib._name).resolve())'
+)"
+if [[ "$resolved_libusb" != "${bundled_libusb:A}" ]]; then
+    print -u2 "packaged bridge check failed: isolated runtime did not load the exact app-owned libusb"
+    print -u2 "expected: ${bundled_libusb:A}"
+    print -u2 "actual:   $resolved_libusb"
+    exit 1
+fi
 expected_worker_package="$relocated_app/Contents/Resources/CorrespondingSource/coolscanpy/src/coolscanpy/__init__.py"
 expected_worker_package="${expected_worker_package:A}"
 worker_package="$(

@@ -88,7 +88,7 @@ if [[ ! -f "$bridge_source/LICENSE" || ! -f "$coolscanpy_source/LICENSE" ]]; the
 fi
 if [[ ! -f "$bridge_site_packages/sane.py" ]] \
     || ! find "$bridge_site_packages" -maxdepth 1 -type d -name 'python_sane-*.dist-info' -print -quit | grep -q .; then
-    print -u2 "Refusing to package a real bridge without python-sane. Install the scanner extra into SCANSTUDIO_BRIDGE_SITE_PACKAGES."
+    print -u2 "Refusing to package the optional plain-scan/eject compatibility binding without python-sane. Install the scanner extra into SCANSTUDIO_BRIDGE_SITE_PACKAGES."
     exit 66
 fi
 
@@ -132,6 +132,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Build libusb from a hash-pinned upstream archive at the app's declared
+# deployment target. Copying the builder's Homebrew dylib is not acceptable:
+# its minimum macOS can be newer than this app's macOS 14 contract.
+bundled_libusb_build="$staging_root/bundled-libusb"
+"$script_dir/build_bundled_libusb.sh" "$bundled_libusb_build"
+
 # Remap developer paths before compiling the distributable binaries. This is
 # both privacy hygiene and a reproducibility aid: the shipped bundle must not
 # disclose the builder's home directory through panic/file-location strings.
@@ -151,12 +157,35 @@ fi
         -Xswiftc -debug-prefix-map -Xswiftc "$package_home=/src"
 )
 
-mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources"
+mkdir -p "$staged_app/Contents/MacOS" \
+    "$staged_app/Contents/Frameworks/coolscanpy/_native" \
+    "$staged_app/Contents/Resources"
 install -m 755 "$package_root/.build/release/ScanStudio" "$staged_app/Contents/MacOS/ScanStudio"
 install -m 755 "$package_root/engine/target/release/scanstudio-engine" "$staged_app/Contents/MacOS/scanstudio-engine"
 install -m 755 "$package_root/packaging/ScanStudioLauncher" "$staged_app/Contents/MacOS/ScanStudioLauncher"
 install -m 755 "$package_root/packaging/ScanStudioBridge" "$staged_app/Contents/MacOS/scanstudio-bridge"
 install -m 644 "$package_root/packaging/Info.plist" "$staged_app/Contents/Info.plist"
+
+bundled_libusb="$staged_app/Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib"
+install -m 755 "$bundled_libusb_build/libusb-1.0.dylib" "$bundled_libusb"
+app_minimum="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$staged_app/Contents/Info.plist")"
+libusb_minimum="$(vtool -show-build "$bundled_libusb" | awk '$1 == "minos" { print $2; exit }')"
+if [[ -z "$libusb_minimum" || "$libusb_minimum" != "$app_minimum" ]]; then
+    print -u2 "Refusing bundled libusb with minimum macOS '$libusb_minimum'; the app declares '$app_minimum'."
+    exit 1
+fi
+app_architectures="$(lipo -archs "$staged_app/Contents/MacOS/ScanStudio")"
+libusb_architectures="$(lipo -archs "$bundled_libusb")"
+if [[ "$libusb_architectures" != "$app_architectures" ]]; then
+    print -u2 "Refusing bundled libusb architecture '$libusb_architectures'; the app is '$app_architectures'."
+    exit 1
+fi
+if otool -L "$bundled_libusb" | tail -n +3 | awk '{print $1}' \
+    | grep -Ev '^(/usr/lib/|/System/Library/)' | grep -q .; then
+    print -u2 "Refusing bundled libusb with a non-system transitive dependency."
+    otool -L "$bundled_libusb" >&2
+    exit 1
+fi
 
 for resource in AppIcon-1024.png AppIcon.icns; do
     install -m 644 \
@@ -251,9 +280,21 @@ find "$staged_app/Contents/Resources/BridgeRuntime/python" -type d -name '__pyca
 install -m 644 "$package_root/../../LICENSE" "$staged_app/Contents/Resources/Licenses/ScanStudio-MIT.txt"
 install -m 644 "$bridge_source/LICENSE" "$staged_app/Contents/Resources/Licenses/scanstudio-bridge-GPL-3.0.txt"
 install -m 644 "$coolscanpy_source/LICENSE" "$staged_app/Contents/Resources/Licenses/CoolscanPy-GPL-3.0.txt"
+install -m 644 "$bundled_libusb_build/COPYING" "$staged_app/Contents/Resources/Licenses/libusb-LGPL-2.1-or-later.txt"
 install -m 644 "$bridge_runtime_prefix/lib/python3.13/LICENSE.txt" "$staged_app/Contents/Resources/Licenses/CPython-3.13.txt"
 install -m 644 "$package_root/../../THIRD_PARTY_NOTICES.md" "$staged_app/Contents/Resources/Licenses/THIRD_PARTY_NOTICES.md"
 install -m 644 "$package_root/engine/Cargo.lock" "$staged_app/Contents/Resources/Licenses/Rust-Cargo.lock"
+mkdir -p "$staged_app/Contents/Resources/CorrespondingSource/libusb"
+install -m 644 \
+    "$bundled_libusb_build/libusb-1.0.30.tar.bz2" \
+    "$staged_app/Contents/Resources/CorrespondingSource/libusb/libusb-1.0.30.tar.bz2"
+install -m 755 \
+    "$script_dir/build_bundled_libusb.sh" \
+    "$staged_app/Contents/Resources/CorrespondingSource/libusb/build_bundled_libusb.sh"
+print -r -- $'Rebuild the bundled libusb library on macOS with Apple command-line developer tools:\n\n  SCANSTUDIO_LIBUSB_DEPLOYMENT_TARGET=14.0 \\\n  SCANSTUDIO_LIBUSB_SOURCE_ARCHIVE="$PWD/libusb-1.0.30.tar.bz2" \\\n  ./build_bundled_libusb.sh "$PWD/rebuilt"\n\nThe script verifies the pinned source SHA-256, builds only the shared library with a fixed install prefix, fixes its app-relative install identity, and rejects non-system dependencies or a mismatched deployment target/architecture. The output is rebuilt/libusb-1.0.dylib.\n' \
+    > "$staged_app/Contents/Resources/CorrespondingSource/libusb/REBUILD.txt"
+print -r -- $'libusb 1.0.30\nLicense: LGPL-2.1-or-later\nSource: https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2\nSource SHA-256: fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf\nBundled library: Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib\nThe complete pinned source archive, exact build script, and rebuild instructions are under Contents/Resources/CorrespondingSource/libusb.\n' \
+    > "$staged_app/Contents/Resources/Licenses/libusb-NOTICE.txt"
 for dist_info in "$staged_app/Contents/Resources/BridgeRuntime/site-packages"/*.dist-info; do
     [[ -d "$dist_info" ]] || continue
     dist_name="${dist_info:t}"
@@ -376,8 +417,12 @@ The bundled hardware helper and CoolscanPy are GPL-3.0-only. Their complete
 corresponding source snapshots are in ../CorrespondingSource/scanstudio-bridge
 and ../CorrespondingSource/coolscanpy, with their GPL texts in this directory.
 CPython 3.13 and each included Python wheel's metadata/license material are
-listed in python-wheels. This app does not include a SANE backend or libusb:
-real hardware additionally requires a compatible system SANE/libusb driver.
+listed in python-wheels. libusb 1.0.30 is dynamically loaded from the signed
+app bundle under LGPL-2.1-or-later; its license and notice are here and its
+complete pinned source archive is in ../CorrespondingSource/libusb. Normal
+LS-5000 color-roll detection, preview, and capture require no host driver.
+The bundled python-sane binding still needs a compatible system SANE backend
+for its optional plain-scan and software-eject paths.
 LICENSES
 
 # Swift links object provenance strings into the executable even in a release
@@ -385,6 +430,8 @@ LICENSES
 # before signing so the distributed binary contains no builder filesystem
 # paths. This does not alter executable code.
 strip -S "$staged_app/Contents/MacOS/scanstudio-engine" "$staged_app/Contents/MacOS/ScanStudio"
+codesign --force --sign - "$bundled_libusb"
+codesign --verify --strict "$bundled_libusb"
 codesign --force --sign - "$staged_app/Contents/MacOS/scanstudio-engine"
 codesign --force --sign - "$staged_app/Contents/MacOS/ScanStudio"
 codesign --force --deep --sign - "$staged_app"
