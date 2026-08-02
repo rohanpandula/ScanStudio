@@ -620,6 +620,10 @@ public final class SessionModel {
     /// sent with `scan.start`, and resets whenever media changes, exactly like
     /// `selectedFrameIndices` and `frameOrientations`.
     public private(set) var frameMirrors: [Int: Bool] = [:]
+    /// Session-local per-frame top-to-bottom flip intent. Kept independent
+    /// from `frameMirrors` so either axis can be toggled or reset without
+    /// changing the other.
+    public private(set) var frameVerticalMirrors: [Int: Bool] = [:]
     public var scanResolutionDpi = 4_000
     public var scanBitDepth = 16
     public var scanMultisamplePasses = 2
@@ -735,6 +739,10 @@ public final class SessionModel {
     /// a stale anchor from a previous carrier/project can never leak into a
     /// new one.
     public private(set) var selectionAnchorFrameIndex: Int?
+    /// The one frame targeted by edit commands. This is deliberately
+    /// independent from scan selection: six frames can remain checked while
+    /// rotation or flipping changes only the focused frame.
+    public private(set) var focusedFrameIndex: Int?
     private var bufferedJobEvents: [String: [EngineEvent]] = [:]
 
     /// Which frame's detail workspace is open, if any — pure UI navigation
@@ -1934,6 +1942,19 @@ public final class SessionModel {
         guard beginProjectLifecycleChange() else { return }
         defer { isChangingProject = false }
         lastErrorMessage = nil
+        // Save Roll attaches the preview already on screen to its first
+        // project. Keep that preview's scan choices across this one boundary;
+        // switching from one existing project to another still clears them.
+        let preProjectSelection = project == nil
+            ? selectedFrameIndices
+            : []
+        let preProjectSelectionAnchor = project == nil
+            ? selectionAnchorFrameIndex
+            : nil
+        let preProjectFocus = project == nil ? focusedFrameIndex : nil
+        let preProjectOrientations = project == nil ? frameOrientations : [:]
+        let preProjectHorizontalMirrors = project == nil ? frameMirrors : [:]
+        let preProjectVerticalMirrors = project == nil ? frameVerticalMirrors : [:]
         // Batch Settings is intentionally editable before Save Roll. Capture
         // those choices before awaiting the engine: the fresh manifest owns
         // its project-rooted destinations, but its all-enabled recipe defaults
@@ -1957,6 +1978,24 @@ public final class SessionModel {
             resetProjectScopedScanState()
             project = result.project
             restoreProjectProgress(from: result.project.frames)
+            let projectFrameIndices = Set(result.project.frames.map(\.index))
+            selectedFrameIndices = preProjectSelection
+                .intersection(projectFrameIndices)
+            selectionAnchorFrameIndex = preProjectSelectionAnchor.flatMap {
+                projectFrameIndices.contains($0) ? $0 : nil
+            }
+            focusedFrameIndex = preProjectFocus.flatMap {
+                projectFrameIndices.contains($0) ? $0 : nil
+            }
+            frameOrientations = preProjectOrientations.filter {
+                projectFrameIndices.contains($0.key)
+            }
+            frameMirrors = preProjectHorizontalMirrors.filter {
+                projectFrameIndices.contains($0.key)
+            }
+            frameVerticalMirrors = preProjectVerticalMirrors.filter {
+                projectFrameIndices.contains($0.key)
+            }
             scanFilmProcess = result.project.filmProcess
             canonicalizeFilmProcessDisplayState()
             rollMetadataDraft = result.project.rollMetadata
@@ -2012,6 +2051,45 @@ public final class SessionModel {
         } catch {
             lastErrorMessage = Self.describe(error)
         }
+    }
+
+    /// The pre-project contact sheet's primary action: attach the completed
+    /// preview to a new roll project, then continue the exact frame selection
+    /// into the ordinary review/scan gate. A flagged boundary intentionally
+    /// returns with `pendingManualReviewScan` rather than moving film; the
+    /// user's confirmation resumes this same frame list exactly once.
+    @discardableResult
+    public func saveRollAndScanSelectedFrames(
+        name: String,
+        carrier: SimulatedFilmCarrier,
+        frameCount: Int,
+        filmProcess: FilmProcess
+    ) async -> Bool {
+        lastErrorMessage = nil
+        guard project == nil else {
+            lastErrorMessage =
+                "This roll is already saved. Use Scan to start the selected frames."
+            return false
+        }
+
+        let requestedFrames = selectedFrames
+        guard !requestedFrames.isEmpty else {
+            lastErrorMessage = "Select at least one frame before saving and scanning."
+            return false
+        }
+
+        await createProject(
+            name: name,
+            carrier: carrier,
+            frameCount: frameCount,
+            filmProcess: filmProcess
+        )
+        guard project != nil, lastErrorMessage == nil else { return false }
+
+        let started = await startScanOrRequestManualReview(
+            frames: requestedFrames
+        )
+        return started || pendingManualReviewScan?.frames == requestedFrames
     }
 
     /// Moves any contact-sheet nudges made before Save Roll into the newly
@@ -2106,9 +2184,11 @@ public final class SessionModel {
         clearFrameAlignmentSessionState()
         selectedFrameIndices.removeAll()
         selectionAnchorFrameIndex = nil
+        focusedFrameIndex = nil
         detailFrameIndex = nil
         frameOrientations.removeAll()
         frameMirrors.removeAll()
+        frameVerticalMirrors.removeAll()
         isAcquiringThumbnails = false
         activeOperationStartedAt = nil
     }
@@ -2392,7 +2472,11 @@ public final class SessionModel {
         frameDefects.removeAll()
         selectedFrameIndices.removeAll()
         selectionAnchorFrameIndex = nil
+        focusedFrameIndex = nil
         detailFrameIndex = nil
+        frameOrientations.removeAll()
+        frameMirrors.removeAll()
+        frameVerticalMirrors.removeAll()
         bufferedJobEvents.removeAll()
     }
 
@@ -2969,6 +3053,11 @@ public final class SessionModel {
         selectedFrameIndices = Set(validFrameIndices)
             .subtracting(excludedFrameIndices)
             .subtracting(reviewSkippedFrames)
+        if focusedFrameIndex == nil
+            || !validFrameIndices.contains(focusedFrameIndex ?? -1)
+        {
+            focusedFrameIndex = selectedFrameIndices.min()
+        }
     }
 
     public func clearFrameSelection() {
@@ -2990,9 +3079,35 @@ public final class SessionModel {
             .symmetricDifference(selectedFrameIndices)
     }
 
+    // MARK: - Frame edit focus
+
+    /// Focuses one frame for rotate/flip commands without changing which
+    /// frames are selected for scanning.
+    public func focusFrame(_ frameIndex: Int) {
+        guard validFrameIndices.contains(frameIndex) else { return }
+        focusedFrameIndex = frameIndex
+    }
+
+    /// The explicit focus wins. A sole selected frame remains a useful
+    /// fallback for keyboard commands in older/session-restored UI states.
+    public var frameTransformTargetIndex: Int? {
+        if let focusedFrameIndex,
+           validFrameIndices.contains(focusedFrameIndex) {
+            return focusedFrameIndex
+        }
+        guard selectedFrameIndices.count == 1,
+              let soleSelection = selectedFrameIndices.first,
+              validFrameIndices.contains(soleSelection)
+        else {
+            return nil
+        }
+        return soleSelection
+    }
+
     // MARK: - Frame detail navigation
 
     public func openFrameDetail(_ frameIndex: Int) {
+        focusFrame(frameIndex)
         detailFrameIndex = frameIndex
     }
 
@@ -3021,6 +3136,13 @@ public final class SessionModel {
     public func rotateFrame(_ frameIndex: Int, by degrees: Int) {
         let current = frameOrientations[frameIndex] ?? 0
         frameOrientations[frameIndex] = FrameOrientation.normalized(current + degrees)
+    }
+
+    @discardableResult
+    public func rotateFocusedFrame(by degrees: Int) -> Bool {
+        guard let frameIndex = frameTransformTargetIndex else { return false }
+        rotateFrame(frameIndex, by: degrees)
+        return true
     }
 
     public func resetFrameOrientation(_ frameIndex: Int) {
@@ -3055,6 +3177,27 @@ public final class SessionModel {
 
     public func frameMirror(_ frameIndex: Int) -> Bool {
         frameMirrors[frameIndex] ?? false
+    }
+
+    public func toggleFrameVerticalMirror(_ frameIndex: Int) {
+        setFrameVerticalMirror(!frameVerticalMirror(frameIndex), for: frameIndex)
+    }
+
+    public func setFrameVerticalMirror(_ mirrored: Bool, for frameIndex: Int) {
+        if mirrored {
+            frameVerticalMirrors[frameIndex] = true
+        } else {
+            frameVerticalMirrors.removeValue(forKey: frameIndex)
+        }
+    }
+
+    public func frameVerticalMirror(_ frameIndex: Int) -> Bool {
+        frameVerticalMirrors[frameIndex] ?? false
+    }
+
+    public func resetFrameMirrors(_ frameIndex: Int) {
+        frameMirrors.removeValue(forKey: frameIndex)
+        frameVerticalMirrors.removeValue(forKey: frameIndex)
     }
 
     // MARK: - Event subscription
@@ -3238,6 +3381,7 @@ public final class SessionModel {
         clearFrameAlignmentSessionState()
         selectedFrameIndices.removeAll()
         selectionAnchorFrameIndex = nil
+        focusedFrameIndex = nil
         detailFrameIndex = nil
         if !preservingActiveJob {
             jobId = nil
@@ -3256,6 +3400,7 @@ public final class SessionModel {
         }
         frameOrientations.removeAll()
         frameMirrors.removeAll()
+        frameVerticalMirrors.removeAll()
         if !preservingActiveJob {
             bufferedJobEvents.removeAll()
             if let project {
@@ -3916,6 +4061,18 @@ public enum FrameOrientation {
         let normalized = normalized(degrees)
         guard normalized != 0 else { return nil }
         return "rotated \(normalized) degrees"
+    }
+
+    /// The contact sheet's outer card must participate in a quarter-turn;
+    /// `rotationEffect` changes pixels but not SwiftUI layout bounds.
+    public static func displayAspectRatio(_ degrees: Int) -> Double {
+        swapsLayoutAxes(degrees) ? 2.0 / 3.0 : 3.0 / 2.0
+    }
+
+    /// A quarter-turn also swaps the bitmap's proposed layout dimensions
+    /// before SwiftUI paints the rotation.
+    public static func swapsLayoutAxes(_ degrees: Int) -> Bool {
+        !normalized(degrees).isMultiple(of: 180)
     }
 }
 

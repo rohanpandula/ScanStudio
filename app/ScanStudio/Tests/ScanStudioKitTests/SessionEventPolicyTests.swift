@@ -49,6 +49,11 @@ private actor ProjectFlowEngineStub: EngineClientProtocol {
                 transport: "idle",
                 activeJobId: nil
             )
+        case "scanner.acquireThumbnails":
+            value = AcquireThumbnailsAck(
+                accepted: true,
+                frames: Array(1...project.frameCount)
+            )
         default: throw ProjectFlowStubError.unexpectedMethod(method)
         }
         guard let result = value as? Result else {
@@ -1256,6 +1261,46 @@ struct SessionEventPolicyTests {
         )
     }
 
+    @Test("Save Roll preserves the selected frames from its completed preview")
+    @MainActor
+    func saveRollPreservesPreProjectSelection() async throws {
+        let project = try projectLifecycleFixture(
+            id: "saved-preview-project",
+            completedFrames: []
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: project)
+        )
+
+        await model.loadCarrier(.strip6)
+        model.scanFilmProcess = .positive
+        let token = PreviewIntentToken()
+        #expect(await model.requestPreview(.initial(token: token)) == .started)
+        establishCompletedPreview(
+            frameCount: 6,
+            operationID: token.id.uuidString,
+            on: model
+        )
+        model.selectAllFrames()
+        model.focusFrame(3)
+        model.rotateFrame(3, by: 90)
+        model.toggleFrameVerticalMirror(3)
+        #expect(model.selectedFrames == [1, 2, 3, 4, 5, 6])
+
+        await model.createProject(
+            name: project.name,
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+
+        #expect(model.project?.id == project.id)
+        #expect(model.selectedFrames == [1, 2, 3, 4, 5, 6])
+        #expect(model.focusedFrameIndex == 3)
+        #expect(model.frameOrientation(3) == 90)
+        #expect(model.frameVerticalMirror(3))
+    }
+
     @Test("project changes clear the previous selection and last-batch state while new jobs retain other persisted completions")
     @MainActor
     func projectChangesIsolateSessionStateAndJobsPreservePriorReceipts() async throws {
@@ -1283,6 +1328,9 @@ struct SessionEventPolicyTests {
         #expect(model.pendingFrames == [1, 2, 3, 5, 6])
         #expect(model.completedFrameCount == 1)
         model.toggleFrameSelection(2)
+        model.focusFrame(2)
+        model.rotateFrame(2, by: 90)
+        model.toggleFrameMirror(2)
         model.beginJob(id: "live-job", frames: [2])
 
         #expect(model.frameStates[4] == .completed)
@@ -1314,6 +1362,10 @@ struct SessionEventPolicyTests {
 
         #expect(model.project?.id == second.id)
         #expect(model.selectedFrameIndices.isEmpty)
+        #expect(model.focusedFrameIndex == nil)
+        #expect(model.frameOrientations.isEmpty)
+        #expect(model.frameMirrors.isEmpty)
+        #expect(model.frameVerticalMirrors.isEmpty)
         #expect(model.receipts.isEmpty)
         #expect(model.scanSummary == nil)
         #expect(model.frameStates.isEmpty)
@@ -2799,6 +2851,19 @@ struct SessionEventPolicyTests {
         #expect(FrameOrientation.accessibilityText(-90) == "rotated 270 degrees")
     }
 
+    @Test("FrameOrientation.displayAspectRatio rotates the outer card as well as the pixels")
+    func frameOrientationDisplayAspectRatioTracksQuarterTurns() {
+        #expect(FrameOrientation.displayAspectRatio(0) == 3.0 / 2.0)
+        #expect(FrameOrientation.displayAspectRatio(90) == 2.0 / 3.0)
+        #expect(FrameOrientation.displayAspectRatio(180) == 3.0 / 2.0)
+        #expect(FrameOrientation.displayAspectRatio(270) == 2.0 / 3.0)
+        #expect(FrameOrientation.displayAspectRatio(-90) == 2.0 / 3.0)
+        #expect(FrameOrientation.swapsLayoutAxes(0) == false)
+        #expect(FrameOrientation.swapsLayoutAxes(90))
+        #expect(FrameOrientation.swapsLayoutAxes(180) == false)
+        #expect(FrameOrientation.swapsLayoutAxes(-90))
+    }
+
     @Test("rotateFrame accumulates and normalizes into 0/90/180/270 both clockwise and counter-clockwise, and resetFrameOrientation clears it back to 0")
     @MainActor
     func rotateFrameAccumulatesNormalizesAndResets() async throws {
@@ -2839,6 +2904,52 @@ struct SessionEventPolicyTests {
         #expect(model.frameOrientation(2) == 0)
 
         await client.terminate()
+    }
+
+    @Test("editing one focused frame keeps all six scan selections intact")
+    @MainActor
+    func focusedFrameTransformDoesNotChangeScanSelection() async throws {
+        let project = try projectLifecycleFixture(
+            id: "focused-transform-project",
+            completedFrames: []
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: project)
+        )
+        await model.loadCarrier(.strip6)
+        model.selectAllFrames()
+
+        model.focusFrame(3)
+        #expect(model.rotateFocusedFrame(by: 90))
+
+        #expect(model.focusedFrameIndex == 3)
+        #expect(model.selectedFrames == [1, 2, 3, 4, 5, 6])
+        #expect(model.frameOrientation(3) == 90)
+        #expect(model.frameOrientation(1) == 0)
+        #expect(model.frameOrientation(6) == 0)
+    }
+
+    @Test("invalid focus is ignored and a real media change clears focus")
+    @MainActor
+    func frameFocusIsValidatedAndClearsWithMedia() async throws {
+        let project = try projectLifecycleFixture(
+            id: "focus-lifecycle-project",
+            completedFrames: []
+        )
+        let model = SessionModel(
+            engineClient: ProjectFlowEngineStub(project: project)
+        )
+        await model.loadCarrier(.strip6)
+
+        model.focusFrame(3)
+        model.focusFrame(99)
+        #expect(model.focusedFrameIndex == 3)
+
+        let notLoaded = Data(
+            #"{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":null,"mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null}}}"#.utf8
+        )
+        model.handle(event: EngineEvent(name: "scanner.status", rawLine: notLoaded))
+        #expect(model.focusedFrameIndex == nil)
     }
 
     // MARK: - scan.completed terminal jobState resolution
@@ -2972,6 +3083,28 @@ struct SessionEventPolicyTests {
 
         #expect(model.frameMirror(1) == false)
         #expect(model.frameMirrors.isEmpty)
+        await client.terminate()
+    }
+
+    @Test("horizontal and vertical frame flips are independent and reset together")
+    @MainActor
+    func frameFlipsAreIndependent() async throws {
+        let client = try EngineClient(engineURL: URL(fileURLWithPath: "/bin/cat"))
+        let model = SessionModel(engineClient: client)
+
+        model.toggleFrameMirror(3)
+        model.toggleFrameVerticalMirror(3)
+        #expect(model.frameMirror(3))
+        #expect(model.frameVerticalMirror(3))
+
+        model.toggleFrameMirror(3)
+        #expect(model.frameMirror(3) == false)
+        #expect(model.frameVerticalMirror(3))
+
+        model.resetFrameMirrors(3)
+        #expect(model.frameMirror(3) == false)
+        #expect(model.frameVerticalMirror(3) == false)
+
         await client.terminate()
     }
 

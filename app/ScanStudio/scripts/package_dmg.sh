@@ -18,7 +18,7 @@ if [[ ! -f "$info_plist" ]]; then
 fi
 
 bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist")"
-release_version="${SCANSTUDIO_RELEASE_VERSION:-$bundle_version-alpha.6}"
+release_version="${SCANSTUDIO_RELEASE_VERSION:-$bundle_version-alpha.7}"
 release_arch="${SCANSTUDIO_RELEASE_ARCH:-$(uname -m)}"
 output="${2:-$package_root/.build/ScanStudio-$release_version-macOS-$release_arch.dmg}"
 

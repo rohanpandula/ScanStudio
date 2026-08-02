@@ -74,10 +74,12 @@ struct ThumbnailGridView: View {
                                 frameIndex: frameIndex,
                                 thumbnail: sessionModel.thumbnails[frameIndex],
                                 isSelected: sessionModel.selectedFrameIndices.contains(frameIndex),
+                                isFocused: sessionModel.focusedFrameIndex == frameIndex,
                                 frameState: sessionModel.frameStates[frameIndex],
                                 displayMode: showAsPositive ? .positivePreview : .asScanned,
                                 orientationDegrees: sessionModel.frameOrientation(frameIndex),
                                 mirrored: sessionModel.frameMirror(frameIndex),
+                                verticallyMirrored: sessionModel.frameVerticalMirror(frameIndex),
                                 reviewDecision: sessionModel.manualReviewDecision(
                                     for: frameIndex
                                 ),
@@ -90,7 +92,10 @@ struct ThumbnailGridView: View {
                                         previewOperationId: previewOperationId
                                     )
                                 },
-                                action: { shiftHeld in
+                                onFocus: {
+                                    sessionModel.focusFrame(frameIndex)
+                                },
+                                onSelection: { shiftHeld in
                                     sessionModel.selectFrame(
                                         frameIndex,
                                         extendingSelectionIfShiftHeld: shiftHeld
@@ -269,49 +274,103 @@ struct ThumbnailGridView: View {
 
     private var rotationMenu: some View {
         Menu("Rotate", systemImage: "rotate.right") {
-            Button("Rotate Left") {
-                for frame in sessionModel.selectedFrames {
-                    sessionModel.rotateFrame(frame, by: -90)
+            Button(transformActionLabel("Rotate Left")) {
+                _ = sessionModel.rotateFocusedFrame(by: -90)
+            }
+            .keyboardShortcut("l", modifiers: .command)
+            Button(transformActionLabel("Rotate Right")) {
+                _ = sessionModel.rotateFocusedFrame(by: 90)
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            Button(transformActionLabel("Reset Rotation")) {
+                if let frameIndex = sessionModel.frameTransformTargetIndex {
+                    sessionModel.resetFrameOrientation(frameIndex)
                 }
             }
-            Button("Rotate Right") {
-                for frame in sessionModel.selectedFrames {
-                    sessionModel.rotateFrame(frame, by: 90)
-                }
-            }
-            Button("Reset Rotation") {
-                for frame in sessionModel.selectedFrames {
-                    sessionModel.resetFrameOrientation(frame)
+
+            if sessionModel.selectedFrameCount > 1 {
+                Divider()
+                Menu("Apply to \(sessionModel.selectedFrameCount) Selected Frames") {
+                    Button("Rotate All Left") {
+                        for frame in sessionModel.selectedFrames {
+                            sessionModel.rotateFrame(frame, by: -90)
+                        }
+                    }
+                    Button("Rotate All Right") {
+                        for frame in sessionModel.selectedFrames {
+                            sessionModel.rotateFrame(frame, by: 90)
+                        }
+                    }
+                    Button("Reset All Rotations") {
+                        for frame in sessionModel.selectedFrames {
+                            sessionModel.resetFrameOrientation(frame)
+                        }
+                    }
                 }
             }
         }
         .controlSize(.small)
         .fixedSize(horizontal: true, vertical: false)
-        .disabled(sessionModel.selectedFrameCount == 0)
-        .help(sessionModel.selectedFrameCount == 0
-            ? "Select one or more frames to rotate them."
-            : "Rotates the selected frame(s) for display in this session only — not yet sent to the engine or saved with the project.")
+        .disabled(sessionModel.frameTransformTargetIndex == nil)
+        .help(sessionModel.frameTransformTargetIndex == nil
+            ? "Click a frame to focus it, then rotate it."
+            : "Rotates the focused frame for display in this session only. Command-L rotates left; Command-R rotates right.")
     }
 
     private var mirrorMenu: some View {
         Menu("Mirror", systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right") {
-            Button("Toggle Horizontal Mirror") {
-                for frame in sessionModel.selectedFrames {
-                    sessionModel.toggleFrameMirror(frame)
+            Button(transformActionLabel("Flip Left to Right")) {
+                if let frameIndex = sessionModel.frameTransformTargetIndex {
+                    sessionModel.toggleFrameMirror(frameIndex)
                 }
             }
-            Button("Reset Mirror") {
-                for frame in sessionModel.selectedFrames {
-                    sessionModel.resetFrameMirror(frame)
+            .keyboardShortcut("h", modifiers: [.command, .shift])
+            Button(transformActionLabel("Flip Top to Bottom")) {
+                if let frameIndex = sessionModel.frameTransformTargetIndex {
+                    sessionModel.toggleFrameVerticalMirror(frameIndex)
+                }
+            }
+            .keyboardShortcut("v", modifiers: [.command, .shift])
+            Button(transformActionLabel("Reset Flips")) {
+                if let frameIndex = sessionModel.frameTransformTargetIndex {
+                    sessionModel.resetFrameMirrors(frameIndex)
+                }
+            }
+
+            if sessionModel.selectedFrameCount > 1 {
+                Divider()
+                Menu("Apply to \(sessionModel.selectedFrameCount) Selected Frames") {
+                    Button("Flip All Left to Right") {
+                        for frame in sessionModel.selectedFrames {
+                            sessionModel.toggleFrameMirror(frame)
+                        }
+                    }
+                    Button("Flip All Top to Bottom") {
+                        for frame in sessionModel.selectedFrames {
+                            sessionModel.toggleFrameVerticalMirror(frame)
+                        }
+                    }
+                    Button("Reset All Flips") {
+                        for frame in sessionModel.selectedFrames {
+                            sessionModel.resetFrameMirrors(frame)
+                        }
+                    }
                 }
             }
         }
         .controlSize(.small)
         .fixedSize(horizontal: true, vertical: false)
-        .disabled(sessionModel.selectedFrameCount == 0)
-        .help(sessionModel.selectedFrameCount == 0
-            ? "Select one or more frames to mirror them."
-            : "Flips the selected frame(s) horizontally for display in this session only — not yet sent to the engine or saved with the project.")
+        .disabled(sessionModel.frameTransformTargetIndex == nil)
+        .help(sessionModel.frameTransformTargetIndex == nil
+            ? "Click a frame to focus it, then flip it."
+            : "Flips the focused frame for display in this session only. Shift-Command-H flips left to right; Shift-Command-V flips top to bottom.")
+    }
+
+    private func transformActionLabel(_ action: String) -> String {
+        guard let frameIndex = sessionModel.frameTransformTargetIndex else {
+            return action
+        }
+        return "\(action) — Frame \(String(format: "%02d", frameIndex))"
     }
 
     private var emptyState: some View {
@@ -494,9 +553,15 @@ private struct ManualReviewFrameSheet: View {
                 thumbnail: thumbnail,
                 displayMode: displayMode,
                 orientationDegrees: session.frameOrientation(frameIndex),
-                mirrored: session.frameMirror(frameIndex)
+                mirrored: session.frameMirror(frameIndex),
+                verticallyMirrored: session.frameVerticalMirror(frameIndex)
             )
-            .aspectRatio(3.0 / 2.0, contentMode: .fit)
+            .aspectRatio(
+                FrameOrientation.displayAspectRatio(
+                    session.frameOrientation(frameIndex)
+                ),
+                contentMode: .fit
+            )
             .frame(maxWidth: .infinity)
             .frame(maxHeight: 250)
             .background(Color.black.opacity(0.35))
@@ -747,19 +812,55 @@ struct ThumbnailTileImage: View {
     /// FrameDetail filmstrip all rotate identically for free.
     var orientationDegrees: Int = 0
     var mirrored: Bool = false
+    var verticallyMirrored: Bool = false
 
     var body: some View {
-        Group {
-            if let path = thumbnail?.imagePath, let nsImage = ThumbnailImageCache.image(atPath: path, mode: displayMode) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                SimulatedFrameImage(frameIndex: frameIndex, isAvailable: isGenuinelySimulatedThumbnail, displayMode: displayMode)
-            }
+        GeometryReader { geometry in
+            imageContent
+                // `rotationEffect` is paint-only: without swapping these
+                // proposed dimensions first, a 90° image is still laid out
+                // as landscape and then clipped/letterboxed inside the new
+                // portrait card. Give it the card's opposite dimensions so
+                // the painted quarter-turn lands exactly inside the card.
+                .frame(
+                    width: swapsLayoutAxes
+                        ? geometry.size.height
+                        : geometry.size.width,
+                    height: swapsLayoutAxes
+                        ? geometry.size.width
+                        : geometry.size.height
+                )
+                .scaleEffect(
+                    x: mirrored ? -1 : 1,
+                    y: verticallyMirrored ? -1 : 1
+                )
+                .rotationEffect(.degrees(Double(orientationDegrees)))
+                .position(
+                    x: geometry.size.width / 2,
+                    y: geometry.size.height / 2
+                )
         }
-        .scaleEffect(x: mirrored ? -1 : 1, y: 1)
-        .rotationEffect(.degrees(Double(orientationDegrees)))
+        .clipped()
+    }
+
+    @ViewBuilder
+    private var imageContent: some View {
+        if let path = thumbnail?.imagePath,
+           let nsImage = ThumbnailImageCache.image(atPath: path, mode: displayMode) {
+            Image(nsImage: nsImage)
+                .resizable()
+                .scaledToFill()
+        } else {
+            SimulatedFrameImage(
+                frameIndex: frameIndex,
+                isAvailable: isGenuinelySimulatedThumbnail,
+                displayMode: displayMode
+            )
+        }
+    }
+
+    private var swapsLayoutAxes: Bool {
+        FrameOrientation.swapsLayoutAxes(orientationDegrees)
     }
 
     /// True only when `thumbnail` itself carries affirmative simulator
@@ -950,6 +1051,7 @@ private struct ThumbnailTile: View {
     let frameIndex: Int
     let thumbnail: Thumbnail?
     let isSelected: Bool
+    let isFocused: Bool
     let frameState: FrameState?
     /// DEF-05 "Show as positive" — see `ThumbnailTileImage`/
     /// `PositivePreviewRenderer`'s own doc comments.
@@ -959,6 +1061,7 @@ private struct ThumbnailTile: View {
     /// display-only.
     var orientationDegrees: Int = 0
     var mirrored: Bool = false
+    var verticallyMirrored: Bool = false
     let reviewDecision: ManualReviewDecision?
     let onReview: () -> Void
     /// `Bool` is whether Shift was held at tap time (Finder-style
@@ -967,10 +1070,10 @@ private struct ThumbnailTile: View {
     /// `NSEvent.modifierFlags` at the moment the tap fires and reports it
     /// here, rather than this view (or `SessionModel`) needing its own
     /// gesture recognizer.
-    let action: (Bool) -> Void
+    let onFocus: () -> Void
+    let onSelection: (Bool) -> Void
 
     @Environment(SessionModel.self) private var sessionModel
-    @State private var isHovering = false
 
     private var isRealDevice: Bool { sessionModel.device?.kind == "real" }
 
@@ -1053,16 +1156,24 @@ private struct ThumbnailTile: View {
         .accessibilityAction(named: "View Details") {
             sessionModel.openFrameDetail(frameIndex)
         }
+        .overlay(alignment: .topTrailing) { selectionButton }
         .overlay(alignment: .bottomLeading) { reviewActionButton }
         .overlay(alignment: .topLeading) { viewDetailsButton }
     }
 
     private var tileButton: some View {
         Button {
-            action(NSApp.currentEvent?.modifierFlags.contains(.shift) == true)
+            onFocus()
         } label: {
             ZStack(alignment: .topLeading) {
-                ThumbnailTileImage(frameIndex: frameIndex, thumbnail: thumbnail, displayMode: displayMode, orientationDegrees: orientationDegrees, mirrored: mirrored)
+                ThumbnailTileImage(
+                    frameIndex: frameIndex,
+                    thumbnail: thumbnail,
+                    displayMode: displayMode,
+                    orientationDegrees: orientationDegrees,
+                    mirrored: mirrored,
+                    verticallyMirrored: verticallyMirrored
+                )
 
                 LinearGradient(
                     colors: [.black.opacity(0.58), .clear],
@@ -1090,21 +1201,6 @@ private struct ThumbnailTile: View {
                     ).opacity(0.22)
                 }
 
-                if isSelected {
-                    Image(systemName: "checkmark.square.fill")
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(Color.black.opacity(0.86), Color.scanStudioAmber)
-                        .font(.system(size: 16, weight: .bold))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                        .padding(5)
-                } else if isHovering {
-                    Image(systemName: "square")
-                        .foregroundStyle(Color.white.opacity(0.75))
-                        .font(.system(size: 16, weight: .bold))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                        .padding(5)
-                }
-
                 // Excluded takes visual precedence over any live FrameState
                 // treatment in the same corner — exclusion means this frame
                 // will never be scanned regardless of a prior transient
@@ -1127,7 +1223,10 @@ private struct ThumbnailTile: View {
                     .padding(5)
                 }
             }
-            .aspectRatio(3.0 / 2.0, contentMode: .fit)
+            .aspectRatio(
+                FrameOrientation.displayAspectRatio(orientationDegrees),
+                contentMode: .fit
+            )
             .background(Color.black.opacity(0.34))
             .clipShape(RoundedRectangle(cornerRadius: ScanStudioMetrics.thumbnailCornerRadius))
             .overlay {
@@ -1137,10 +1236,40 @@ private struct ThumbnailTile: View {
             .contentShape(RoundedRectangle(cornerRadius: ScanStudioMetrics.thumbnailCornerRadius))
         }
         .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-        .accessibilityLabel("Frame \(frameIndex)")
+        .accessibilityLabel("Frame \(frameIndex) image")
         .accessibilityValue(accessibilityValue)
-        .accessibilityHint(isSelected ? "Deselect this frame" : "Select this frame")
+        .accessibilityHint("Focus this frame for rotation, flipping, or detail editing")
+    }
+
+    /// Scan inclusion is independent from edit focus. Keeping this as a
+    /// sibling overlay—not a button nested inside `tileButton`—lets all six
+    /// frames stay checked while the image button focuses only one of them.
+    private var selectionButton: some View {
+        Button {
+            onSelection(
+                NSApp.currentEvent?.modifierFlags.contains(.shift) == true
+            )
+        } label: {
+            Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                .symbolRenderingMode(isSelected ? .palette : .monochrome)
+                .foregroundStyle(
+                    isSelected ? Color.black.opacity(0.86) : Color.white.opacity(0.78),
+                    Color.scanStudioAmber
+                )
+                .font(.system(size: 16, weight: .bold))
+                .frame(
+                    minWidth: ScanStudioMetrics.minimumInteractiveTarget,
+                    minHeight: ScanStudioMetrics.minimumInteractiveTarget
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isSelected ? "Do not scan frame \(frameIndex)" : "Scan frame \(frameIndex)")
+        .accessibilityLabel(
+            isSelected
+                ? "Remove frame \(frameIndex) from this scan"
+                : "Include frame \(frameIndex) in this scan"
+        )
     }
 
     /// Transport-smear is a completed-capture QC verdict only; it is
@@ -1168,13 +1297,16 @@ private struct ThumbnailTile: View {
                 ? Color.scanStudioAmber
                 : Color.scanStudioRed.opacity(0.85)
         }
-        if isSelected || transportSmearFlagged { return Color.scanStudioAmber }
+        if isFocused { return Color.scanStudioAmber }
+        if isSelected { return Color.scanStudioAmber.opacity(0.55) }
+        if transportSmearFlagged { return Color.scanStudioAmber }
         return Color.white.opacity(0.14)
     }
 
     private var tileBorderLineWidth: CGFloat {
         if frameState == .active { return 2.5 }
-        if isSelected || transportSmearFlagged || frameState == .failed { return 2 }
+        if isFocused { return 2.5 }
+        if isSelected || transportSmearFlagged || frameState == .failed { return 1.5 }
         return 1
     }
 
@@ -1324,7 +1456,7 @@ private struct ThumbnailTile: View {
         Button {
             sessionModel.openFrameDetail(frameIndex)
         } label: {
-            Label("Align", systemImage: "viewfinder.circle.fill")
+            Label("Edit", systemImage: "slider.horizontal.3")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundStyle(Color.white.opacity(0.94))
                 .padding(.horizontal, 7)
@@ -1337,13 +1469,14 @@ private struct ThumbnailTile: View {
         }
         .buttonStyle(.plain)
         .padding(.leading, 20)
-        .help("Adjust frame alignment and view details")
-        .accessibilityLabel("Adjust frame \(frameIndex)")
-        .accessibilityHint("Opens the full preview and scanner alignment controls.")
+        .help("Edit frame alignment, rotation, and flips")
+        .accessibilityLabel("Edit frame \(frameIndex)")
+        .accessibilityHint("Opens the full preview and frame editing controls.")
     }
 
     private var accessibilityValue: String {
-        var values = [isSelected ? "selected" : "not selected"]
+        var values = [isSelected ? "selected for scanning" : "not selected for scanning"]
+        if isFocused { values.append("focused for editing") }
         values.append(thumbnail == nil ? "preview not acquired" : "preview acquired")
         if let frameState { values.append(frameState.rawValue) }
         if thumbnail?.needsApproval == true {
@@ -1358,6 +1491,7 @@ private struct ThumbnailTile: View {
         }
         if let orientationText = FrameOrientation.accessibilityText(orientationDegrees) { values.append(orientationText) }
         if mirrored { values.append("mirrored horizontally") }
+        if verticallyMirrored { values.append("mirrored vertically") }
         // Only ever appended for the simulator's genuinely live per-frame
         // fraction (see `liveFramePercent`'s own doc comment) — VoiceOver
         // must not hear a percentage real hardware cannot back either.
