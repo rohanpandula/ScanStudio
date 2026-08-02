@@ -1,4 +1,4 @@
-.PHONY: app-test bridge-sync bridge-sync-scanner bridge-test test package
+.PHONY: app-test bridge-sync bridge-sync-scanner bridge-test test package dmg
 
 UV ?= uv
 
@@ -21,3 +21,6 @@ bridge-sync-scanner:
 
 package: bridge-sync-scanner
 	$(MAKE) -C app/ScanStudio package
+
+dmg: bridge-sync-scanner
+	$(MAKE) -C app/ScanStudio dmg

@@ -12,7 +12,19 @@ The screenshot above is the current installed app. The LS-5000 ED has been detec
 
 Real scanning has been tested on one Mac and one LS-5000 setup. Treat that as a narrow, useful result rather than a promise for every Coolscan, adapter, Mac, operating system, or film holder. The hardware bridge can move film, so stay nearby and supervise any real job.
 
-The source is still under active development. There is no promise of a signed download, notarized installer, support plan, or release schedule.
+The source is still under active development. The release DMG is an alpha,
+ad-hoc-signed build rather than a notarized Developer ID distribution; there is
+no support or release-schedule promise.
+
+## Download
+
+The current Apple Silicon DMG is published on the
+[GitHub Releases page](https://github.com/rohanpandula/ScanStudio/releases).
+It targets macOS 14 or newer and contains the app, the GPL hardware bridge and
+CoolscanPy source required for redistribution, and the applicable dependency
+notices. Because this alpha is not notarized, macOS may require the normal
+Control-click **Open** confirmation on first launch. Do not disable Gatekeeper
+globally.
 
 ## What it does
 
