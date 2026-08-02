@@ -1,7 +1,8 @@
 #!/bin/zsh
-# Black-box verification for the bundled GPL bridge. It works from an app path
-# containing spaces, uses only the mock transport, and proves the handshake
-# does not arm hardware motion or create the armed-latch file.
+# Black-box verification for the bundled launcher and GPL bridge. It works
+# from an app path containing spaces and uses only the mock transport. The app
+# launcher must authorize its session before exec; invoking the bridge helper
+# directly must remain disarmed.
 set -euo pipefail
 
 script_dir="${0:A:h}"
@@ -70,16 +71,16 @@ if ! (cd "$source_verify/scanstudio-bridge" && uv sync --locked --offline --no-i
     print -u2 "packaged bridge check failed: corresponding source cannot resolve its shipped sibling CoolscanPy source with uv sync --locked"
     exit 1
 fi
-if grep -hv '^[[:space:]]*#' \
-    "$relocated_app/Contents/MacOS/ScanStudioLauncher" "$bridge" \
+"$script_dir/test_launcher.sh" \
+    "$relocated_app/Contents/MacOS/ScanStudioLauncher"
+if grep -hv '^[[:space:]]*#' "$bridge" \
     | grep -Eq '(^|[[:space:];])(export[[:space:]]+)?SCANSTUDIO_HW_MOTION='; then
-    print -u2 "packaged bridge check failed: launcher/helper assigns SCANSTUDIO_HW_MOTION"
+    print -u2 "packaged bridge check failed: bridge helper assigns SCANSTUDIO_HW_MOTION"
     exit 1
 fi
-if grep -hv '^[[:space:]]*#' \
-    "$relocated_app/Contents/MacOS/ScanStudioLauncher" "$bridge" \
+if grep -hv '^[[:space:]]*#' "$bridge" \
     | grep -Eq '(^|[[:space:];])(touch|rm|mv|cp|install)[^[:cntrl:]]*hw-motion-armed'; then
-    print -u2 "packaged bridge check failed: launcher/helper mutates the armed latch"
+    print -u2 "packaged bridge check failed: bridge helper mutates the armed latch"
     exit 1
 fi
 
@@ -312,4 +313,4 @@ if ! codesign --verify --deep --strict "$relocated_app"; then
     print -u2 "packaged bridge check failed: app signature changed after bridge execution"
     exit 1
 fi
-print "packaged bridge relocation and unarmed mock handshake passed"
+print "packaged launcher arming, bridge relocation, and direct-helper checks passed"

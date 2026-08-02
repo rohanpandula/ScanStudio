@@ -26,6 +26,11 @@ notices. Because this alpha is not notarized, macOS may require the normal
 Control-click **Open** confirmation on first launch. Do not disable Gatekeeper
 globally.
 
+Opening the packaged app with its hardware bridge available automatically
+prepares that app session for film movement. Launching alone does not move the
+film; movement still begins only after an explicit Preview, Scan, or Eject
+action.
+
 ## What it does
 
 - Detects the reported carrier and media when the scanner can provide them, while keeping simulator and real hardware visibly distinct.
@@ -50,6 +55,7 @@ The bundle names missing evidence instead of inventing it. It does not replace o
 - Preview establishes the current registration. Preview again after a refeed or ejection.
 - Confirm that the app identifies a real scanner before treating it as hardware. The built-in simulator is for safe workflow exploration only.
 - Keep physical film transport under supervision. Stop and inspect the scanner if the physical state is uncertain.
+- Opening ScanStudio authorizes later explicit Preview, Scan, and Eject actions for that app session; it does not move film by itself.
 - Do not post scans, private paths, device serial numbers, or raw capture journals in a public issue.
 
 ## Source and feedback

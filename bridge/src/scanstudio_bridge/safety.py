@@ -15,6 +15,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,19 +33,34 @@ MAX_FRAME_RETRIES = 2  # additional attempts beyond the first; 3 total
 _LATCH_FILENAME = "hw-motion-armed"
 _LANE_LOCK_FILENAME = "hw-lane.lock"
 _TELEMETRY_DIRNAME = "hw-telemetry"
+_MAX_LATCH_BYTES = 4096
 
 
 def armed_media(base_dir: Path = DEFAULT_BASE_DIR) -> str | None:
     """Live re-check, never cached. `None` unless `SCANSTUDIO_HW_MOTION` is
-    `"1"` AND `base_dir / "hw-motion-armed"` exists with non-empty stripped
-    content, in which case that content (the loaded media's name) is
-    returned."""
+    `"1"` AND `base_dir / "hw-motion-armed"` is a regular, non-symlink file
+    with non-empty stripped authorization text, which is returned."""
     if os.environ.get(HW_MOTION_ENV_VAR) != "1":
         return None
+    descriptor = -1
     try:
-        content = (base_dir / _LATCH_FILENAME).read_text().strip()
-    except OSError:
+        descriptor = os.open(
+            base_dir / _LATCH_FILENAME,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "rb") as latch_file:
+            descriptor = -1
+            payload = latch_file.read(_MAX_LATCH_BYTES + 1)
+            if len(payload) > _MAX_LATCH_BYTES:
+                return None
+            content = payload.decode("utf-8").strip()
+    except (OSError, UnicodeError):
         return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     return content or None
 
 

@@ -35,7 +35,8 @@ package: check-tools
 	./scripts/test_packaged_bridge.sh .build/ScanStudio.app
 
 # Runs the relocation/mock smoke independently after an already-built bundle.
-# It never opens a scanner, enables motion, or writes the armed latch.
+# It never opens a scanner or sends motion; its isolated launcher probe does
+# verify automatic app-session authorization inside a temporary base directory.
 package-check:
 	./scripts/test_packaged_bridge.sh .build/ScanStudio.app
 

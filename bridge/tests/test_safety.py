@@ -10,6 +10,8 @@ app/ScanStudio/protocol/BRIDGE.md).
 from __future__ import annotations
 
 import json
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,55 @@ def test_armed_media_is_none_when_latch_file_empty_or_whitespace(
 ) -> None:
     monkeypatch.setenv(safety.HW_MOTION_ENV_VAR, "1")
     (tmp_path / "hw-motion-armed").write_text("   \n\t  ")
+    assert safety.armed_media(tmp_path) is None
+
+
+def test_armed_media_is_none_when_latch_is_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(safety.HW_MOTION_ENV_VAR, "1")
+    target = tmp_path / "authorization-target"
+    target.write_text("scanstudio-app-session")
+    (tmp_path / "hw-motion-armed").symlink_to(target)
+    assert safety.armed_media(tmp_path) is None
+
+
+def test_armed_media_does_not_block_when_latch_is_a_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(safety.HW_MOTION_ENV_VAR, "1")
+    latch = tmp_path / "hw-motion-armed"
+    os.mkfifo(latch)
+    result: list[str | None] = []
+    reader = threading.Thread(
+        target=lambda: result.append(safety.armed_media(tmp_path)),
+        daemon=True,
+    )
+    reader.start()
+    reader.join(timeout=0.25)
+    if reader.is_alive():
+        # Release a blocking implementation before failing so the test does
+        # not strand a thread in the shared pytest process.
+        writer = os.open(latch, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
+        reader.join(timeout=1)
+        pytest.fail("armed_media blocked while opening a FIFO latch")
+    assert result == [None]
+
+
+def test_armed_media_is_none_when_latch_is_not_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(safety.HW_MOTION_ENV_VAR, "1")
+    (tmp_path / "hw-motion-armed").write_bytes(b"\xff")
+    assert safety.armed_media(tmp_path) is None
+
+
+def test_armed_media_is_none_when_latch_is_oversized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(safety.HW_MOTION_ENV_VAR, "1")
+    (tmp_path / "hw-motion-armed").write_bytes(b"a" * 4097)
     assert safety.armed_media(tmp_path) is None
 
 

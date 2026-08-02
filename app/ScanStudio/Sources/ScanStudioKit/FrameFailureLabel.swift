@@ -79,8 +79,8 @@ public enum FrameFailureLabel {
             body: "This frame needs its boundary confirmed before the scanner will move the film. Review the preview, then approve."
         ),
         "HW_MOTION_NOT_ARMED": Copy(
-            title: "Motion not armed",
-            body: "The safety latch that allows the scanner to move film is not armed, so the request was refused."
+            title: "Scanner wasn’t prepared",
+            body: "ScanStudio was not prepared to move film in this session, so the request was refused. Quit and reopen the app before trying again."
         ),
         "BATCH_INTEGRITY_ERROR": Copy(
             title: "Capture refused",
