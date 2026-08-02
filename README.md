@@ -53,6 +53,7 @@ The bundle names missing evidence instead of inventing it. It does not replace o
 ## Safety and limits
 
 - Preview establishes the current registration. Preview again after a refeed or ejection.
+- If Capture reports that the film shifted, physically refeed it and acquire a fresh preview; ScanStudio discards the old frame registration so it cannot be retried accidentally.
 - Confirm that the app identifies a real scanner before treating it as hardware. The built-in simulator is for safe workflow exploration only.
 - Keep physical film transport under supervision. Stop and inspect the scanner if the physical state is uncertain.
 - Opening ScanStudio authorizes later explicit Preview, Scan, and Eject actions for that app session; it does not move film by itself.

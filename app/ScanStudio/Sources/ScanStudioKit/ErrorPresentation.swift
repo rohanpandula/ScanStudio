@@ -140,7 +140,8 @@ public enum ErrorPresentationPolicy {
         context: ErrorPresentationContext = .init()
     ) -> ErrorPresentation {
         let normalizedMessage = lastErrorMessage.uppercased()
-        let copy = previewReadinessTimeoutCopy(in: lastErrorMessage)
+        let copy = filmTransportSlipCopy(in: lastErrorMessage)
+            ?? previewReadinessTimeoutCopy(in: lastErrorMessage)
             ?? knownCopy.first { containsCode($0.code, in: normalizedMessage) }
             ?? Copy(
                 code: leadingCode(in: normalizedMessage) ?? "UNKNOWN",
@@ -160,6 +161,21 @@ public enum ErrorPresentationPolicy {
                 lastErrorMessage: lastErrorMessage,
                 context: context
             )
+        )
+    }
+
+    private static func filmTransportSlipCopy(in message: String) -> Copy? {
+        guard FilmTransportFailurePolicy.requiresPhysicalRefeed(
+            message: message
+        ) else {
+            return nil
+        }
+        return Copy(
+            code: "REFEED_REQUIRED",
+            title: "Film shifted—refeed required",
+            guidance: "The scanner lost the film’s position. Remove and firmly reinsert "
+                + "the strip, then acquire a fresh preview. Do not retry Capture with "
+                + "the current preview."
         )
     }
 

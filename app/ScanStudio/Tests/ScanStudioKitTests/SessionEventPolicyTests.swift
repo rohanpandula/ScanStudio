@@ -1871,6 +1871,88 @@ struct SessionEventPolicyTests {
         #expect(model.refeedRequired)
     }
 
+    @Test("a scan-time roll slip invalidates the preview and requires a refeed before another capture")
+    @MainActor
+    func scanTimeRollSlipRequiresFreshPhysicalRegistration() async {
+        let diagnostics = [
+            "bridge scan.frameFailed (ROLL_MISMATCH): IndexDecodeError: transport anchor residual is inconsistent with one affine preview traversal (MAE 3.813 rows, max 7.554 rows)",
+            "bridge scan.frameFailed (FINGERPRINT_REFUSED): ProtocolError: fresh live index does not match the reviewed roll fingerprint: slot-count-mismatch",
+            "bridge scan.frameFailed (ROLL_MISMATCH): SynchronizedProtocolError: command 124: sense 045300 not in accepted ['000000']",
+        ]
+
+        for (caseIndex, rawDiagnostic) in diagnostics.enumerated() {
+            let client = CountingPreviewEngineStub()
+            let model = SessionModel(engineClient: client)
+            let previewToken = PreviewIntentToken()
+            let jobId = "roll-slip-job-\(caseIndex)"
+            #expect(
+                await model.requestPreview(.initial(token: previewToken))
+                    == .started
+            )
+            establishCompletedPreview(
+                frameCount: 6,
+                operationID: previewToken.id.uuidString,
+                on: model
+            )
+            model.selectAllFrames()
+            model.beginJob(id: jobId, frames: Array(1...6))
+            model.handle(event: EngineEvent(
+                name: "scan.jobState",
+                rawLine: Data(
+                    #"{"event":"scan.jobState","payload":{"jobId":"\#(jobId)","state":"scanning"}}"#.utf8
+                )
+            ))
+            model.handle(event: EngineEvent(
+                name: "scan.frameState",
+                rawLine: Data(
+                    #"{"event":"scan.frameState","payload":{"jobId":"\#(jobId)","frameIndex":1,"state":"failed","attempt":1,"error":{"code":"INTERNAL","message":"\#(rawDiagnostic)","recoverable":false}}}"#.utf8
+                )
+            ))
+            model.handle(event: EngineEvent(
+                name: "scan.jobState",
+                rawLine: Data(
+                    #"{"event":"scan.jobState","payload":{"jobId":"\#(jobId)","state":"failed"}}"#.utf8
+                )
+            ))
+            model.handle(event: EngineEvent(
+                name: "scan.completed",
+                rawLine: Data(
+                    #"{"event":"scan.completed","payload":{"jobId":"\#(jobId)","summary":{"completed":[],"failed":[1,2,3,4,5,6],"skipped":[],"stopped":false}}}"#.utf8
+                )
+            ))
+
+            // The authoritative terminal event preserves the failed job
+            // evidence, then invalidates the registration whose physical
+            // coordinates the fresh-index check disproved.
+            #expect(model.refeedRequired)
+            #expect(model.thumbnails.isEmpty)
+            #expect(model.selectedFrameIndices.isEmpty)
+            #expect(model.latestCompletedPreviewOperationId == nil)
+            #expect(model.jobState == .failed)
+            #expect(model.scanSummary?.failed == Array(1...6))
+            #expect(model.frameErrors[1]?.message == rawDiagnostic)
+            #expect(model.lastErrorMessage == "INTERNAL: \(rawDiagnostic)")
+            #expect(model.errorPresentation?.title == "Film shifted—refeed required")
+            #expect(
+                model.errorPresentation?.guidance
+                    == "The scanner lost the film’s position. Remove and firmly reinsert the strip, then acquire a fresh preview. Do not retry Capture with the current preview."
+            )
+
+            // A following status can carry previewEstablished=true while its
+            // live film sensor says no medium is gripped. It must not erase
+            // the actionable reason or restore the old registration.
+            model.handle(event: EngineEvent(
+                name: "scanner.status",
+                rawLine: Data(
+                    #"{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":true,"carrier":"strip6","frameCount":6,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":false,"motionArmed":true}}}"#.utf8
+                )
+            ))
+            #expect(model.refeedRequired)
+            #expect(model.errorPresentation?.title == "Film shifted—refeed required")
+            #expect(!model.hasCompletePreviewRegistration)
+        }
+    }
+
     @Test("a FEEDER_PARKED preview failure surfaces typed but does NOT arm eject")
     @MainActor
     func feederParkedPreviewFailureDoesNotArmEject() async {
@@ -1891,11 +1973,20 @@ struct SessionEventPolicyTests {
         #expect(model.lastErrorMessage?.contains("FEEDER_PARKED") == true)
     }
 
-    @Test("a synchronous scan.start REFEED_REQUIRED refusal arms the eject affordance")
+    @Test("a synchronous scan.start REFEED_REQUIRED refusal invalidates stale registration and arms eject")
     @MainActor
-    func synchronousScanStartRefusalArmsEject() async throws {
-        let client = try EngineClient(engineURL: URL(fileURLWithPath: "/bin/cat"))
+    func synchronousScanStartRefusalRequiresFreshPreview() async {
+        let client = CountingPreviewEngineStub()
         let model = SessionModel(engineClient: client)
+        let previewToken = PreviewIntentToken()
+        #expect(await model.requestPreview(.initial(token: previewToken)) == .started)
+        establishCompletedPreview(
+            frameCount: 6,
+            operationID: previewToken.id.uuidString,
+            on: model
+        )
+        model.selectAllFrames()
+        #expect(model.hasCompletePreviewRegistration)
 
         model.noteRefeedRequired(from: EngineRequestError(
             code: "internal",
@@ -1903,7 +1994,14 @@ struct SessionEventPolicyTests {
             recoverable: false
         ))
         #expect(model.refeedRequired)
-        await client.terminate()
+        #expect(model.thumbnails.isEmpty)
+        #expect(model.selectedFrameIndices.isEmpty)
+        #expect(model.latestCompletedPreviewOperationId == nil)
+        #expect(!model.hasCompletePreviewRegistration)
+        #expect(
+            model.lastErrorMessage
+                == "internal: bridge error REFEED_REQUIRED: scan_many's fresh index read failed from the parked transport"
+        )
     }
 
     @Test("an unrelated engine error never arms the eject affordance")

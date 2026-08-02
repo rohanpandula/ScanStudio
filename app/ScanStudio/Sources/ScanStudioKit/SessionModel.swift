@@ -585,10 +585,9 @@ public final class SessionModel {
     /// simply overwritten (including a `nil` clear when no coercion was
     /// needed) by the next call to either of those two methods.
     public private(set) var multisampleCoercionNote: String?
-    /// True while the transport is in the refeed-required state: the last
-    /// preview (`scanner.thumbnailsFailed`) or batch start (a synchronous
-    /// `scan.start` refusal) failed with the bridge's `REFEED_REQUIRED`,
-    /// whose own message tells the operator to eject or refeed the strip.
+    /// True while the transport is in the refeed-required state: a preview,
+    /// synchronous batch refusal, or scan-time fresh-index check proved the
+    /// current physical registration cannot be trusted.
     /// Gates `DeviceBarView`'s Eject affordance in exactly that state —
     /// found live 2026-07-26, when the refusal's message said "eject or
     /// refeed" while the app offered no eject affordance anywhere and the
@@ -1093,7 +1092,9 @@ public final class SessionModel {
             if !refreshed.mediaLoaded || refreshed.filmPresent == false {
                 clearMediaState(preservingPreviewAuthorization: true)
             }
-            lastErrorMessage = nil
+            if !refeedRequired {
+                lastErrorMessage = nil
+            }
         } catch {
             guard pendingStatusRefresh?.id == marker.id,
                   connectionEpoch == marker.connectionEpoch
@@ -3424,6 +3425,14 @@ public final class SessionModel {
 
     private func applyCompleted(_ payload: ScanCompletedPayload, source: EngineEvent) {
         guard eventIsRelevant(payload.jobId, source: source) else { return }
+        let transportFailure = payload.summary.failed
+            .compactMap { frameErrors[$0] }
+            .first {
+                FilmTransportFailurePolicy.requiresPhysicalRefeed(
+                    errorCode: $0.code,
+                    message: $0.message
+                )
+            }
         scanSummary = payload.summary
         // A re-scan is allowed to replace a persisted frame's live display
         // state with waiting/active/failed while the attempt is in flight.
@@ -3453,6 +3462,13 @@ public final class SessionModel {
         // otherwise stuck "SCANNING"); an existing terminal state is preserved,
         // never overridden. See `ScanCompletionPolicy`.
         jobState = ScanCompletionPolicy.resolveJobState(current: jobState, summary: payload.summary)
+        if let transportFailure {
+            requirePhysicalRefeed(
+                errorCode: transportFailure.code,
+                message: transportFailure.message,
+                preservingActiveJob: true
+            )
+        }
         jobId = nil
     }
 
@@ -3479,8 +3495,26 @@ public final class SessionModel {
     func noteRefeedRequired(from error: Error) {
         guard let requestError = error as? EngineRequestError else { return }
         if requestError.message.contains("REFEED_REQUIRED") {
-            refeedRequired = true
+            requirePhysicalRefeed(
+                errorCode: requestError.code,
+                message: requestError.message,
+                preservingActiveJob: false
+            )
         }
+    }
+
+    /// Records the operator-facing recovery reason and invalidates every
+    /// preview-bound coordinate before another Capture can be attempted.
+    /// Terminal scan failures preserve their job evidence; synchronous
+    /// refusals have no accepted job to retain.
+    private func requirePhysicalRefeed(
+        errorCode: String,
+        message: String,
+        preservingActiveJob: Bool
+    ) {
+        lastErrorMessage = "\(errorCode): \(message)"
+        refeedRequired = true
+        clearMediaState(preservingActiveJob: preservingActiveJob)
     }
 
     private var diagnosticUIConnected: Bool {
@@ -3600,6 +3634,12 @@ public final class SessionModel {
         code: String,
         message: String
     ) -> String {
+        if FilmTransportFailurePolicy.requiresPhysicalRefeed(
+            errorCode: code,
+            message: message
+        ) {
+            return "REFEED_REQUIRED"
+        }
         if code == "NOT_CONNECTED"
             || message.range(
                 of: #"(?<![A-Z0-9_])NOT_CONNECTED(?![A-Z0-9_])"#,

@@ -182,6 +182,27 @@ struct ScannerStatusRefreshTests {
         #expect(model.lastErrorMessage == nil)
     }
 
+    @Test("a successful status refresh preserves an unresolved refeed explanation")
+    @MainActor
+    func refreshPreservesRefeedExplanation() async {
+        let client = ScannerStatusRefreshEngineStub()
+        let model = SessionModel(engineClient: client)
+        await model.connect(deviceId: "real-ls5000-status-test")
+        let diagnostic =
+            "bridge error REFEED_REQUIRED: fresh index no longer matches the loaded film"
+        model.noteRefeedRequired(from: EngineRequestError(
+            code: "internal",
+            message: diagnostic,
+            recoverable: false
+        ))
+
+        await model.refreshScannerStatus()
+
+        #expect(model.refeedRequired)
+        #expect(model.lastErrorMessage == "internal: \(diagnostic)")
+        #expect(model.errorPresentation?.technicalDetails.contains(diagnostic) == true)
+    }
+
     @Test("a status response from a replaced connection cannot overwrite the new session")
     @MainActor
     func staleResponseIsDiscarded() async {
