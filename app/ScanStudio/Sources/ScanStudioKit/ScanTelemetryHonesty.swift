@@ -29,6 +29,13 @@ public struct ScanTelemetryHonesty: Equatable, Sendable {
         self.isRealDevice = isRealDevice
     }
 
+    /// User-facing wording for the number of frames whose completion is
+    /// proven by receipts. Receipts remain the underlying evidence, but that
+    /// implementation detail should not be exposed in the capture monitor.
+    public static func scannedFramesLabel(_ count: Int) -> String {
+        "\(count) frame\(count == 1 ? "" : "s") scanned"
+    }
+
     /// A genuine, continuously live per-frame completion fraction exists only
     /// on the simulator. `isInFlightFrame` must already encode "this tile is
     /// the one `scan.progress` currently names" (`frameState == .active` and

@@ -656,7 +656,7 @@ private struct PreProjectPreviewWorkspaceView: View {
         if unresolvedReviewCount > 1 {
             return "\(unresolvedReviewCount) frames need boundary choices. Click each Review button to use it, skip it, or preview again."
         }
-        return "Save Roll names the output folder and enables scanning."
+        return "Save Roll names this roll, creates its resumable project, sets up default output locations, and enables scanning."
     }
 
     private var calloutActions: some View {

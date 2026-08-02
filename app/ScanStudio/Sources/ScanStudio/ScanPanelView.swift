@@ -357,12 +357,15 @@ struct ScanPanelView: View {
         return "\(frame) · Pass \(sessionModel.progress?.pass ?? 1) of \(sessionModel.progress?.totalPasses ?? 2)"
     }
 
-    /// Receipt count (always real) plus " · ETA …" only when honest
-    /// (simulator only — see `etaLabel`/`telemetryHonesty`).
+    /// Completed-frame count (backed by receipts, but expressed in user
+    /// language) plus " · ETA …" only when honest (simulator only — see
+    /// `etaLabel`/`telemetryHonesty`).
     private var receiptsAndEtaLabel: String {
-        let receipts = "\(sessionModel.receiptCount) receipts"
-        guard telemetryHonesty.showsLiveEta else { return receipts }
-        return "\(receipts) · \(etaLabel)"
+        let framesScanned = ScanTelemetryHonesty.scannedFramesLabel(
+            sessionModel.receiptCount
+        )
+        guard telemetryHonesty.showsLiveEta else { return framesScanned }
+        return "\(framesScanned) · \(etaLabel)"
     }
 }
 

@@ -298,13 +298,18 @@ struct BatchInspectorView: View {
             .padding(.bottom, 6)
 
             HStack(alignment: .top, spacing: 8) {
-                Text(sessionModel.saveLocation.isEmpty ? "Choose a save location when you are ready." : sessionModel.saveLocation)
+                Text(outputLocationSummary)
                     .font(.system(size: 11))
                     .foregroundStyle(Color.scanStudioSecondaryText)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Button("Choose…", action: chooseSaveLocation)
-                    .controlSize(.small)
+                if OutputLocationPresentation.showsChangeAction(
+                    hasOpenProject: sessionModel.project != nil
+                ) {
+                    Button("Change…", action: chooseSaveLocation)
+                        .controlSize(.small)
+                        .help("Optionally change where this roll's enabled outputs are saved")
+                }
             }
             InspectorToggleRow(label: "Save each output in its own folder", isOn: saveEachOutputInOwnFolderBinding)
             Text("Keep at least one output.")
@@ -820,6 +825,13 @@ struct BatchInspectorView: View {
         Binding(get: { sessionModel.saveEachOutputInOwnFolder }, set: { sessionModel.saveEachOutputInOwnFolder = $0 })
     }
 
+    private var outputLocationSummary: String {
+        OutputLocationPresentation.summary(
+            hasOpenProject: sessionModel.project != nil,
+            customLocation: sessionModel.saveLocation
+        )
+    }
+
     private var fullCapturePackageBinding: Binding<Bool> {
         Binding(
             get: { sessionModel.masterTIFFEnabled && sessionModel.fullCapturePackageEnabled },
@@ -879,7 +891,8 @@ struct BatchInspectorView: View {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Choose Save Location"
+        panel.prompt = "Use This Location"
+        panel.message = "Optional: choose a custom location for this roll's enabled outputs."
         if panel.runModal() == .OK, let url = panel.url {
             sessionModel.saveLocation = url.path
         }
