@@ -241,6 +241,13 @@ class ScanReceipt:
     # Best-effort copy of CoolscanPy's active_exposure_authority journal
     # block. Defaulted for older persisted and in-process receipts.
     exposure_authority: ExposureAuthority | None = None
+    # Wall-clock capture start (ISO-8601 UTC) and per-frame hardware capture
+    # duration in milliseconds, forwarded verbatim from CoolscanPy's journal
+    # at the authoritative capture boundary. Optional so older wire payloads
+    # and in-process receipts without timing stay valid; absent values stay
+    # None (never an engine-receipt-arrival time).
+    started_at: str | None = None
+    capture_duration_ms: int | None = None
 
 
 # --- internal (non-wire) types Plan 08-02 needs ---

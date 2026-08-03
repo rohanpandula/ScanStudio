@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime
 import errno
 import hashlib
 import json
@@ -2312,6 +2313,22 @@ def _write_journal(path: Path, journal: dict) -> None:
     _fsync_parent_directory(path)
 
 
+def _iso_utc_now() -> str:
+    """Current UTC wall clock as an ISO-8601 UTC timestamp."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _capture_timing_start() -> tuple[float, float, str]:
+    """Return one aligned monotonic and UTC wall-clock capture boundary."""
+    wall_clock = datetime.datetime.now(datetime.timezone.utc)
+    return time.monotonic(), wall_clock.timestamp(), wall_clock.isoformat()
+
+
+def _elapsed_ms(started_monotonic: float) -> int:
+    """Nonnegative monotonic elapsed milliseconds since a capture start."""
+    return max(0, int(round((time.monotonic() - started_monotonic) * 1000)))
+
+
 def _fsync_parent_directory(path: Path) -> None:
     """Make a newly created or replaced file name durable in its directory."""
 
@@ -3834,6 +3851,11 @@ def _run_live_continuation_frame(
         frame_index=frame_index,
         frame_capture_attempt_id=output_path.parent.name,
     )
+    (
+        _capture_started_monotonic,
+        capture_started_unix,
+        capture_started_at,
+    ) = _capture_timing_start()
     journal: dict[str, Any] = {
         "status": "starting",
         "plan": str(plan_path.resolve()),
@@ -3859,7 +3881,9 @@ def _run_live_continuation_frame(
         "completed_reads": 0,
         "completed_bytes": 0,
         "stall_recoveries": 0,
-        "started_unix": time.time(),
+        "started_unix": capture_started_unix,
+        "started_at": capture_started_at,
+        "capture_duration_ms": 0,
         "scanner_identity": "Nikon LS-5000 ED 1.03",
         "preview_geometry_validated_before_reads": True,
         "live_frame_selection": selection.diagnostics(),
@@ -4313,6 +4337,7 @@ def _run_live_continuation_frame(
             raw_sha256=journal["output_sha256"],
             raw_bytes=expected_bytes,
         )
+        journal["capture_duration_ms"] = _elapsed_ms(_capture_started_monotonic)
         journal["ack_nonce"] = secrets.token_hex(16)
         journal["frame_complete"] = True
         journal["recovery_required"] = None
@@ -4321,6 +4346,7 @@ def _run_live_continuation_frame(
         _write_journal(journal_path, journal)
         return journal
     except BaseException as error:
+        failed_capture_duration_ms = _elapsed_ms(_capture_started_monotonic)
         _abort_fine_stream(
             fine_stream,
             reason=f"capture-error:{type(error).__name__}",
@@ -4329,6 +4355,7 @@ def _run_live_continuation_frame(
             "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
         )
         journal["error"] = f"{type(error).__name__}: {error}"
+        journal["capture_duration_ms"] = failed_capture_duration_ms
         journal["finished_unix"] = time.time()
         try:
             _write_journal(journal_path, journal)
@@ -4507,8 +4534,14 @@ def run_live_capture(
         "completed_bytes": 0,
         "stall_recoveries": 0,
         "started_unix": time.time(),
+        "started_at": _iso_utc_now(),
+        "capture_duration_ms": 0,
         "density_calibration_session_id": calibration_session_id,
     }
+    # Diagnostic timer for preview-only/meter-only work and for failures before
+    # a full-capture frame can be bound. A successful full capture resets this
+    # at the exact post-selection, pre-meter boundary below.
+    _capture_started_monotonic = time.monotonic()
     session_journal: dict[str, Any] | None = None
     frame_journal_finalized = False
     batch_stopped = False
@@ -5070,6 +5103,17 @@ def run_live_capture(
                             for color, exposure in initial_wire_exposures.items()
                         },
                     }
+                    # Authoritative first-frame capture boundary: roll/session
+                    # setup, density preview, frame detection, selection, and
+                    # frame binding are complete. Time only metering ->
+                    # exposure/focus -> acquisition -> decode/QC. Persist the
+                    # authoritative start before the first metering command.
+                    (
+                        _capture_started_monotonic,
+                        journal["started_unix"],
+                        journal["started_at"],
+                    ) = _capture_timing_start()
+                    journal["capture_duration_ms"] = 0
                     journal["status"] = "metering"
                     _write_journal(journal_path, journal)
                 if entry["seq"] in METER_GET_WINDOW_SEQUENCES:
@@ -5440,6 +5484,10 @@ def run_live_capture(
             raise SynchronizedProtocolError(
                 "capture completed without the RGB READ(0x8c) calibration"
             )
+        # Authoritative completion boundary for the first-frame capture
+        # attempt: decode + capture QC are done here, before any release or
+        # inter-frame wait. The duration intentionally excludes those.
+        journal["capture_duration_ms"] = _elapsed_ms(_capture_started_monotonic)
         if batch_mode:
             assert batch_job is not None
             assert continuation_plan is not None
@@ -5582,6 +5630,7 @@ def run_live_capture(
             journal["finished_unix"] = time.time()
             _write_journal(journal_path, journal)
     except BaseException as error:
+        failed_capture_duration_ms = _elapsed_ms(_capture_started_monotonic)
         if not frame_journal_finalized:
             _abort_fine_stream(
                 fine_stream,
@@ -5666,6 +5715,7 @@ def run_live_capture(
             )
             journal["error"] = f"{type(error).__name__}: {error}"
             journal["recovery_required"] = recovery_required
+            journal["capture_duration_ms"] = failed_capture_duration_ms
             journal["finished_unix"] = time.time()
             try:
                 _write_journal(journal_path, journal)

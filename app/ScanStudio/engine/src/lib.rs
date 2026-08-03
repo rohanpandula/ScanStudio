@@ -3,6 +3,7 @@ pub mod real_backend;
 pub mod domain;
 pub mod evidence_package;
 pub mod exiftool;
+pub mod icc;
 pub mod manifest;
 pub mod parity;
 pub mod processing;

@@ -1559,6 +1559,27 @@ def test_start_scan_receipt_forwards_the_exact_current_roll_attempts_root(
     assert frames[0].attempts_root == str(caller_owned_root)
 
 
+def test_scan_receipt_forwards_captured_timing_from_coolscanpy_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt = dataclasses.replace(
+        _fake_receipt(1),
+        started_at="2026-08-02T20:05:00+00:00",
+        capture_duration_ms=1900,
+    )
+    with tempfile.TemporaryDirectory() as attempts:
+        mapped = coolscanpy_transport_module._scan_receipt_from_coolscanpy(
+            receipt,
+            rgb_path="/tmp/frame-0001.tif",
+            ir_path=None,
+            meter_rgbi_path=None,
+            attempts_root=Path(attempts),
+        )
+    assert mapped.started_at == "2026-08-02T20:05:00+00:00"
+    assert mapped.capture_duration_ms == 1900
+    assert mapped.started_at == receipt.started_at
+
+
 def test_start_scan_receipt_forwards_best_effort_exposure_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

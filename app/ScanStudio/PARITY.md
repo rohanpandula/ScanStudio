@@ -53,7 +53,7 @@ was built and verified against:
 - **Device:** `Nikon LS-5000 ED 1.03` (`.device_model`), a real SUPER COOLSCAN 5000 ED.
 - **Resolution / depth:** 4000 dpi, 16-bit (`.dpi`, `.depth`).
 - **Batch/session id:** `batch-slot01-slot06-31odjrup` (`.nikon_density_ownership.batch_session_id`) — identical across all 6 slots; they are one capture session of six frames (`.nikon_density_ownership.frame_total` = 6).
-- **Reference-corpus positive color metadata:** `.outputs.positive.color_mode` = `nikon-exact`, built by `.outputs.positive.builder_receipt.algorithm` = `ls5000-md3-prescan-to-pref-v1` plus `.outputs.positive.cms_receipt.algorithm` = `cml4-captured-optimized-stage1-stage2-v1`, tagged `.outputs.positive.icc_profile.name` = `Nikon Adobe RGB 4.0.0.3000`. This records the external reference artifact only; ScanStudio does not redistribute those profile bytes or embed them in current alpha output.
+- **Reference-corpus positive color metadata:** `.outputs.positive.color_mode` = `nikon-exact`, built by `.outputs.positive.builder_receipt.algorithm` = `ls5000-md3-prescan-to-pref-v1` plus `.outputs.positive.cms_receipt.algorithm` = `cml4-captured-optimized-stage1-stage2-v1`, tagged `.outputs.positive.icc_profile.name` = `Nikon Adobe RGB 4.0.0.3000`. This records the external reference artifact only. ScanStudio does not redistribute those profile bytes; C41 derivatives instead embed a ScanStudio-authored ICC profile compatible with the Adobe RGB (1998) color space.
 - **Repair pipeline:** `.outputs.repaired.engine` = `digital-fauxice`, `.outputs.repaired.engine_version` = `0.3.0`, `.outputs.repaired.mode_resolved` = `hybrid`.
 
 ## 3. Reference provenance mismatch — read this before trusting a score

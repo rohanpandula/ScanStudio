@@ -391,6 +391,8 @@ def _scan_receipt_from_coolscanpy(
         # never inferred by looking at unrelated filesystem state.
         attempts_root=str(attempts_root) if attempts_root is not None else None,
         exposure_authority=exposure_authority,
+        started_at=receipt.started_at,
+        capture_duration_ms=receipt.capture_duration_ms,
     )
 
 

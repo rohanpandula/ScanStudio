@@ -34,6 +34,7 @@ rather than on a static source hash.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import hmac
 import json
@@ -42,6 +43,7 @@ import os
 import re
 import stat as stat_module
 import tempfile
+import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -463,6 +465,127 @@ def _load_json_stable(path: Path) -> tuple[dict[str, Any], str, int]:
     if type(parsed) is not dict:
         raise SinglePassIntegrityError(f"{path} must contain a JSON object")
     return cast(dict[str, Any], parsed), hashlib.sha256(payload).hexdigest(), len(payload)
+
+
+_U64_MAX = (1 << 64) - 1
+
+
+def _iso_utc_from_unix(unix_seconds: float) -> str | None:
+    try:
+        return datetime.datetime.fromtimestamp(
+            unix_seconds, tz=datetime.timezone.utc
+        ).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _coerce_nonnegative_u64_ms(value: Any) -> int | None:
+    """Reject non-integer, bool, negative, or oversized millisecond values. Returns a
+    trusted nonnegative integer or ``None`` when the value is untrustworthy."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= _U64_MAX else None
+
+
+def _coerce_nonnegative_unix(value: Any) -> float | None:
+    """Reject bool/NaN/inf/negative legacy unix-timestamp seconds."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except (OverflowError, ValueError):
+            return None
+        if math.isnan(number) or math.isinf(number) or number < 0:
+            return None
+        return number
+    return None
+
+
+def _normalize_started_at_string(value: Any) -> str | None:
+    """Validate and return a worker-written ISO-8601 ''started_at'' string,
+    or ``None`` when it is absent or malformed (never silently trusted)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if not parsed.tzinfo:
+        return None
+    return _iso_utc_from_unix(parsed.timestamp())
+
+
+def _normalize_capture_timing(
+    journal: dict[str, Any],
+) -> tuple[str | None, int | None]:
+    """Normalize a raw capture journal's timing into trusted downstream
+    ``started_at`` (ISO-8601 UTC) and ``capture_duration_ms`` (nonnegative
+    integer). Prefers the worker's explicit fields and falls back to deriving
+    a duration from legacy ``started_unix``/``finished_unix``. Malformed,
+    reversed, or missing values are never turned into trusted timing -- they
+    yield ``None`` (absent start, zero duration downstream)."""
+    started_at = _normalize_started_at_string(journal.get("started_at"))
+    duration_ms = _coerce_nonnegative_u64_ms(journal.get("capture_duration_ms"))
+
+    start_unix = _coerce_nonnegative_unix(journal.get("started_unix"))
+    finish_unix = _coerce_nonnegative_unix(journal.get("finished_unix"))
+    if start_unix is not None and finish_unix is not None:
+        legacy_started_at = _iso_utc_from_unix(start_unix)
+        legacy_finished_at = _iso_utc_from_unix(finish_unix)
+        if (
+            legacy_started_at is not None
+            and legacy_finished_at is not None
+            and finish_unix >= start_unix
+        ):
+            derived = round((finish_unix - start_unix) * 1000)
+            if derived <= _U64_MAX:
+                if duration_ms is None:
+                    duration_ms = derived
+                if started_at is None:
+                    started_at = legacy_started_at
+        # else: a reversed legacy pair is rejected entirely -- no trusted
+        # timing, and no trusted start either.
+    elif start_unix is not None and started_at is None:
+        # A lone legacy start is a legitimate capture start, not an
+        # engine-receipt-arrival time; keep it even though no finish means no
+        # duration can be derived.
+        started_at = _iso_utc_from_unix(start_unix)
+    return started_at, duration_ms
+
+
+def _finalized_capture_timing(
+    journal: dict[str, Any],
+    finalization_duration_ms: int,
+) -> tuple[str | None, int | None, int | None, int | None]:
+    """Return start, worker, applied-finalizer, and total capture timing.
+
+    New journals carry an explicit worker duration, so their sequential
+    decode/QC finalization time is added. Legacy journals already provide only
+    a wall-clock approximation; preserve that exact derived value so replaying
+    one on a different machine cannot rewrite its historical duration.
+    """
+    started_at, worker_duration_ms = _normalize_capture_timing(journal)
+    explicit_worker_duration_ms = _coerce_nonnegative_u64_ms(
+        journal.get("capture_duration_ms")
+    )
+    total_duration_ms = worker_duration_ms
+    applied_finalization_duration_ms = None
+    if explicit_worker_duration_ms is not None:
+        combined_duration_ms = (
+            explicit_worker_duration_ms + finalization_duration_ms
+        )
+        if combined_duration_ms <= _U64_MAX:
+            total_duration_ms = combined_duration_ms
+            applied_finalization_duration_ms = finalization_duration_ms
+        else:
+            total_duration_ms = None
+    return (
+        started_at,
+        worker_duration_ms,
+        applied_finalization_duration_ms,
+        total_duration_ms,
+    )
 
 
 def _write_exclusive_fsynced(path: Path, payload: bytes) -> None:
@@ -926,6 +1049,7 @@ class LS5000SinglePassWorkflow:
         if attempt.worker_returncode != 0:
             raise SinglePassIntegrityError(f"worker return code {attempt.worker_returncode} is not complete")
 
+        finalization_started_monotonic = time.monotonic()
         journal, journal_sha, journal_bytes = _load_json_stable(attempt.journal_path)
         stream_sha, stream_bytes = self._hash(attempt.stream_path)
         frame_evidence, exposure_evidence, scanner_identity = self._validate_completed_capture(
@@ -1018,6 +1142,10 @@ class LS5000SinglePassWorkflow:
             raise SinglePassIntegrityError(
                 "focus-detail telemetry returned invalid evidence"
             )
+        finalization_duration_ms = max(
+            0,
+            int(round((time.monotonic() - finalization_started_monotonic) * 1000)),
+        )
         clipping_evidence = asdict(clipping)
         # JSON has no tuple type. Normalize before binding the manifest so the
         # in-memory evidence and its durable round-trip remain byte-for-byte
@@ -1067,6 +1195,12 @@ class LS5000SinglePassWorkflow:
 
         roll_metadata = self._roll_metadata(attempt, journal)
         batch_session = self._batch_session_evidence(attempt)
+        (
+            started_at,
+            worker_capture_duration_ms,
+            applied_finalization_duration_ms,
+            capture_duration_ms,
+        ) = _finalized_capture_timing(journal, finalization_duration_ms)
         capture_evidence: dict[str, object] = {
             "status": "frame-complete" if batch_session is not None else "complete",
             "mode": "full",
@@ -1076,6 +1210,10 @@ class LS5000SinglePassWorkflow:
             "unit_released": batch_session is None,
             "plan_sha256": journal["plan_sha256"],
             "capture_engine_sha256": journal["capture_engine_sha256"],
+            "started_at": started_at,
+            "worker_capture_duration_ms": worker_capture_duration_ms,
+            "finalization_duration_ms": applied_finalization_duration_ms,
+            "capture_duration_ms": capture_duration_ms,
         }
         if batch_session is not None:
             capture_evidence.update(

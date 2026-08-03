@@ -1964,6 +1964,7 @@ pub fn render_derivative_from_archive(
     storage_transform_override: Option<&str>,
     detected_boundary: Option<(u32, u32)>,
     alignment: Option<&domain::FrameAlignment>,
+    resolution_dpi: u32,
 ) -> Result<WrittenPaths, domain::EngineError> {
     let processing = domain::ProcessingRecipe { film_process, ..domain::ProcessingRecipe::default() };
     render_derivative_from_archive_with_processing(
@@ -1973,6 +1974,7 @@ pub fn render_derivative_from_archive(
         // pass through — callers that have it use the _with_processing
         // form directly (see real_backend.rs).
         None,
+        resolution_dpi,
     )
 }
 
@@ -1982,6 +1984,10 @@ pub fn render_derivative_from_archive(
 /// hardware exposure (10ns ticks, RGB order) when the caller has it and has
 /// opted into the exposure path — see `render_positive` and
 /// `real_backend.rs`.
+///
+/// `resolution_dpi` is the capture recipe's DPI (`CaptureRecipe.resolution_dpi`)
+/// and is embedded into TIFF derivatives as their XResolution/YResolution so
+/// the output carries the same scale as the capture that produced it.
 pub fn render_derivative_from_archive_with_processing(
     archive_rgb_path: &std::path::Path,
     frame_index: u32,
@@ -1992,6 +1998,7 @@ pub fn render_derivative_from_archive_with_processing(
     detected_boundary: Option<(u32, u32)>,
     alignment: Option<&domain::FrameAlignment>,
     exposure_10ns: Option<[f64; 3]>,
+    resolution_dpi: u32,
 ) -> Result<WrittenPaths, domain::EngineError> {
     let derivative_transform = alignment
         .map(|value| value.derivative_transform)
@@ -2018,7 +2025,7 @@ pub fn render_derivative_from_archive_with_processing(
         return Err(domain::EngineError::new(
             protocol::ErrorCode::InvalidParams,
             format!(
-                "positive color setting {:?} is unsupported: nikonlook writes Adobe RGB (1998)-encoded values without an embedded ICC tag, and no profile-conversion path exists",
+                "positive color setting {:?} is unsupported: nikonlook writes values in the Adobe RGB (1998) color space and no alternate profile-conversion path exists",
                 recipes.positive.color_profile
             ),
         ));
@@ -2122,6 +2129,13 @@ pub fn render_derivative_from_archive_with_processing(
     let mut positive_path = None;
     let mut preview_path = None;
 
+    // The color-profile contract (ICC) and physical scale (DPI) differ per
+    // output: the full-resolution positive is at `resolution_dpi`; the
+    // downsampled preview must not claim that DPI. ICC attaches only for C41.
+    let positive_metadata =
+        DerivativeMetadata::positive(processing.film_process, resolution_dpi);
+    let preview_metadata = DerivativeMetadata::preview(processing.film_process);
+
     if recipes.positive.enabled {
         let path = preflight_positive_path
             .clone()
@@ -2133,6 +2147,7 @@ pub fn render_derivative_from_archive_with_processing(
             positive_height,
             recipes.positive.file_format,
             is_reserved_sequence_template(&recipes.positive.filename_template),
+            &positive_metadata,
         )?;
         positive_path = Some(path);
     }
@@ -2160,6 +2175,7 @@ pub fn render_derivative_from_archive_with_processing(
             preview_height,
             recipes.preview.file_format,
             is_reserved_sequence_template(&recipes.preview.filename_template),
+            &preview_metadata,
         )?;
         preview_path = Some(path);
     }
@@ -2425,6 +2441,196 @@ fn write_tiff_create_only(
     Ok(())
 }
 
+/// Color/metadata to attach to a rendered derivative. It distinguishes two
+/// independent guarantees:
+///
+/// * the color-profile contract — only a C41 color-negative render actually
+///   produces Adobe RGB-family encoded values (see `render_positive`); the
+///   positive-film/Kodachrome passthrough and the B&W inversion are not
+///   Adobe RGB-encoded and must not be falsely labeled with that profile;
+/// * the physical DPI scale — only the full-resolution positive is at the
+///   capture recipe's DPI; the downsampled preview is not, so it must never
+///   claim the capture DPI as its own.
+#[derive(Debug, Clone, Copy)]
+struct DerivativeMetadata {
+    /// Capture recipe's DPI, written as the Positive TIFF's
+    /// XResolution/YResolution in pixels/inch. `None` for the downsampled
+    /// preview (and for any JPEG, which has no such resolution tags here).
+    resolution_dpi: Option<u32>,
+    /// Whether to embed ScanStudio's Adobe RGB (1998)-compatible ICC profile.
+    attach_icc: bool,
+}
+
+impl DerivativeMetadata {
+    /// Only the C41 color-negative path (nikonlook) produces the Adobe
+    /// RGB-family encoding the profile labels; all other processes leave the
+    /// buffer passthrough or grayscale and must stay unprofiled.
+    fn attach_icc(film_process: domain::FilmProcess) -> bool {
+        film_process == domain::FilmProcess::C41ColorNegative
+    }
+
+    /// Full-resolution positive output at the capture recipe's DPI.
+    fn positive(film_process: domain::FilmProcess, resolution_dpi: u32) -> Self {
+        Self {
+            resolution_dpi: Some(resolution_dpi),
+            attach_icc: Self::attach_icc(film_process),
+        }
+    }
+
+    /// Downsampled preview output: same color contract as the positive, but
+    /// never tagged at the capture DPI it was scaled down from.
+    fn preview(film_process: domain::FilmProcess) -> Self {
+        Self {
+            resolution_dpi: None,
+            attach_icc: Self::attach_icc(film_process),
+        }
+    }
+}
+
+/// Encodes a TIFF derivative directly with the `tiff` crate so the metadata
+/// the `image` crate's higher-level TiffEncoder omits (resolution tags and
+/// the ICC profile) can be written in the same pass. `bit_depth` is 8 or 16
+/// (derivatives always force 16 for TIFF / 8 for JPEG -- see
+/// `write_derivative`). The ICC profile is embedded only when the render is
+/// actually Adobe RGB-encoded (C41), and the DPI resolution tags only when
+/// the derivative is at the capture's physical scale (the full-resolution
+/// positive), never the downsampled preview.
+fn write_tiff_with_metadata<W: std::io::Write + std::io::Seek>(
+    writer: W,
+    raw: &[[f64; 3]],
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    metadata: &DerivativeMetadata,
+) -> Result<(), domain::EngineError> {
+    use tiff::encoder::colortype::RGB16;
+    use tiff::encoder::colortype::RGB8;
+    use tiff::encoder::TiffEncoder;
+
+    if bit_depth == 8 {
+        let samples = to_u8_samples(raw);
+        let mut encoder = TiffEncoder::new(writer).map_err(metadata_encode_error)?;
+        let mut image = encoder
+            .new_image::<RGB8>(width, height)
+            .map_err(metadata_encode_error)?;
+        emit_tiff_metadata(image.encoder(), metadata)?;
+        image.write_data(&samples).map_err(metadata_encode_error)
+    } else {
+        let samples = to_u16_samples(raw);
+        let mut encoder = TiffEncoder::new(writer).map_err(metadata_encode_error)?;
+        let mut image = encoder
+            .new_image::<RGB16>(width, height)
+            .map_err(metadata_encode_error)?;
+        emit_tiff_metadata(image.encoder(), metadata)?;
+        image.write_data(&samples).map_err(metadata_encode_error)
+    }
+}
+
+/// TIFF/EP requires the ICC profile tag (34675) to use field type UNDEFINED,
+/// not BYTE. A bare `&[u8]` implements `TiffValue` as BYTE, which is readable
+/// by tolerant software but non-conforming and rejected by strict validators.
+struct IccProfileValue<'a>(&'a [u8]);
+
+impl tiff::encoder::TiffValue for IccProfileValue<'_> {
+    const BYTE_LEN: u8 = 1;
+    const FIELD_TYPE: tiff::tags::Type = tiff::tags::Type::UNDEFINED;
+
+    fn count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn data(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(self.0)
+    }
+}
+
+/// Writes the metadata selected by `metadata` onto a TIFF directory encoder
+/// before its pixel data:
+///
+/// * the ScanStudio RGB compatible ICC profile, iff `metadata.attach_icc` (C41);
+/// * `XResolution`/`YResolution`/`ResolutionUnit` = pixels/inch at
+///   `metadata.resolution_dpi`, iff it is `Some` (the full-resolution
+///   positive only).
+///
+/// Every metadata write must succeed or the derivative is rejected
+/// (fail-closed) rather than silently unlabeled. A zero DPI is untruthful
+/// and refused rather than emitting an undefined resolution unit.
+fn emit_tiff_metadata<W: std::io::Write + std::io::Seek>(
+    ifd: &mut tiff::encoder::DirectoryEncoder<'_, W, tiff::encoder::TiffKindStandard>,
+    metadata: &DerivativeMetadata,
+) -> Result<(), domain::EngineError> {
+    use tiff::encoder::Rational;
+    use tiff::tags::ResolutionUnit;
+    use tiff::tags::Tag;
+
+    if metadata.attach_icc {
+        let profile = crate::icc::scanstudio_rgb_icc_profile()?;
+        ifd.write_tag(Tag::IccProfile, IccProfileValue(&profile[..]))
+            .map_err(metadata_encode_error)?;
+    }
+    if let Some(resolution_dpi) = metadata.resolution_dpi {
+        if resolution_dpi == 0 {
+            return Err(domain::EngineError::new(
+                protocol::ErrorCode::InvalidParams,
+                format!("cannot embed a truthful DPI metadata tag for a {resolution_dpi} DPI capture recipe"),
+            ));
+        }
+        ifd.write_tag(Tag::XResolution, Rational { n: resolution_dpi, d: 1 })
+            .map_err(metadata_encode_error)?;
+        ifd.write_tag(Tag::YResolution, Rational { n: resolution_dpi, d: 1 })
+            .map_err(metadata_encode_error)?;
+        ifd.write_tag(Tag::ResolutionUnit, ResolutionUnit::Inch)
+            .map_err(metadata_encode_error)?;
+    }
+    Ok(())
+}
+
+fn metadata_encode_error(error: tiff::TiffError) -> domain::EngineError {
+    domain::EngineError::new(
+        protocol::ErrorCode::Internal,
+        format!("failed to encode derivative TIFF metadata: {error}"),
+    )
+}
+
+/// Encodes a JPEG derivative with the `image`-crate JPEG encoder, embedding
+/// the ScanStudio RGB compatible ICC profile when the render is Adobe RGB-encoded
+/// (C41). JPEG carries no resolution tags here, so DPI is never written for
+/// JPEG even for the full-resolution positive. The default quality equals the
+/// historical `DynamicImage::write_to(ImageFormat::Jpeg)` path, preserving
+/// the 8-bit sample encoding.
+fn write_jpeg_with_metadata<W: std::io::Write>(
+    writer: W,
+    raw: &[[f64; 3]],
+    width: u32,
+    height: u32,
+    metadata: &DerivativeMetadata,
+) -> Result<(), domain::EngineError> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::{ExtendedColorType, ImageEncoder};
+
+    let samples = to_u8_samples(raw);
+    let mut encoder = JpegEncoder::new(writer);
+    if metadata.attach_icc {
+        let profile = crate::icc::scanstudio_rgb_icc_profile()?;
+        encoder.set_icc_profile(profile).map_err(|error| {
+            domain::EngineError::new(
+                protocol::ErrorCode::Internal,
+                format!("failed to attach derivative JPEG ICC profile: {error}"),
+            )
+        })?;
+    }
+    encoder
+        .encode(&samples, width, height, ExtendedColorType::Rgb8)
+        .map_err(jpeg_encode_error)
+}
+
+fn jpeg_encode_error(error: image::ImageError) -> domain::EngineError {
+    domain::EngineError::new(
+        protocol::ErrorCode::Internal,
+        format!("failed to encode derivative JPEG: {error}"),
+    )
+}
+
 /// Publishes a completely encoded and synced private sibling at the final
 /// leaf. Auto-sequenced outputs use an atomic same-directory hard link, so
 /// publishing is create-only even if another process creates the leaf after
@@ -2435,6 +2641,11 @@ fn write_tiff_create_only(
 /// `CaptureRecipe.bit_depth` does -- 16-bit is the max fidelity a `[0,1]`
 /// float sample can be quantized to); JPEG has no 16-bit mode, so it always
 /// encodes at 8-bit regardless of the capture's own bit depth.
+///
+/// `metadata` carries the color-profile contract (ICC only for C41) and the
+/// physical DPI scale (only the full-resolution positive), so the right
+/// metadata is attached per derivative: TIFF carries ICC and optionally DPI;
+/// JPEG carries ICC only (it has no resolution tags in this encoder).
 fn write_derivative(
     path: &std::path::Path,
     raw: &[[f64; 3]],
@@ -2442,6 +2653,7 @@ fn write_derivative(
     height: u32,
     format: domain::OutputFileFormat,
     create_only: bool,
+    metadata: &DerivativeMetadata,
 ) -> Result<(), domain::EngineError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
@@ -2455,16 +2667,9 @@ fn write_derivative(
         })?;
     }
 
-    let (image, image_format) = match format {
-        domain::OutputFileFormat::Tiff => (
-            build_dynamic_image(raw, width, height, 16)?,
-            image::ImageFormat::Tiff,
-        ),
-        domain::OutputFileFormat::Jpeg => (
-            build_dynamic_image(raw, width, height, 8)?,
-            image::ImageFormat::Jpeg,
-        ),
-    };
+    // TIFF derivatives are written by the direct `tiff`-crate encoder (ICC +
+    // optional DPI); JPEG is written by the `image`-crate JPEG encoder with
+    // an optional ICC profile. Both preserve the quantized sample values.
 
     static TEMP_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
@@ -2523,15 +2728,17 @@ fn write_derivative(
     })?;
     let mut writer = std::io::BufWriter::new(file);
 
-    let write_result = image
-        .write_to(&mut writer, image_format)
-        .map_err(|err| {
-            domain::EngineError::new(
-                protocol::ErrorCode::Internal,
-                format!("failed to encode derivative at {}: {err}", path.display()),
-            )
-        })
-        .and_then(|_| {
+    // TIFF derivatives carry ICC and optional resolution tags. JPEG carries
+    // the same ICC contract when applicable, but no physical-resolution tag.
+    let write_result = match format {
+        domain::OutputFileFormat::Jpeg => {
+            write_jpeg_with_metadata(&mut writer, raw, width, height, metadata)
+        }
+        domain::OutputFileFormat::Tiff => {
+            write_tiff_with_metadata(&mut writer, raw, width, height, 16, metadata)
+        }
+    }
+    .and_then(|_| {
             writer.flush().map_err(|err| {
                 domain::EngineError::new(
                     protocol::ErrorCode::Internal,
@@ -2640,7 +2847,8 @@ pub fn render_and_write_frame(
 ) -> Result<WrittenPaths, domain::EngineError> {
     let processing = domain::ProcessingRecipe { film_process, ..domain::ProcessingRecipe::default() };
     render_and_write_frame_with_processing(
-        device_id, frame_index, &processing, width, height, bit_depth, recipes,
+        device_id, frame_index, &processing, width, height, bit_depth,
+        domain::CaptureRecipe::default().resolution_dpi, recipes,
         detected_boundary, alignment,
     )
 }
@@ -2654,6 +2862,7 @@ pub fn render_and_write_frame_with_processing(
     width: u32,
     height: u32,
     bit_depth: u32,
+    resolution_dpi: u32,
     recipes: &domain::OutputRecipe,
     detected_boundary: Option<(u32, u32)>,
     alignment: Option<&domain::FrameAlignment>,
@@ -2711,6 +2920,10 @@ pub fn render_and_write_frame_with_processing(
             derivative_transform,
         )?;
 
+        let positive_metadata =
+            DerivativeMetadata::positive(processing.film_process, resolution_dpi);
+        let preview_metadata = DerivativeMetadata::preview(processing.film_process);
+
         if recipes.positive.enabled {
             let path = preflight_positive_path.clone().expect("enabled positive has preflight path");
             write_derivative(
@@ -2720,6 +2933,7 @@ pub fn render_and_write_frame_with_processing(
                 positive_height,
                 recipes.positive.file_format,
                 is_reserved_sequence_template(&recipes.positive.filename_template),
+                &positive_metadata,
             )?;
             positive_path = Some(path);
         }
@@ -2737,6 +2951,7 @@ pub fn render_and_write_frame_with_processing(
                 preview_height,
                 recipes.preview.file_format,
                 is_reserved_sequence_template(&recipes.preview.filename_template),
+                &preview_metadata,
             )?;
             preview_path = Some(path);
         }
@@ -2850,6 +3065,43 @@ mod tests {
             },
         )
         .expect("write RGB16 TIFF fixture");
+    }
+
+    fn classic_tiff_field_type(bytes: &[u8], wanted_tag: u16) -> Option<u16> {
+        let little_endian = match bytes.get(0..2)? {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let read_u16 = |slice: &[u8]| -> Option<u16> {
+            let value: [u8; 2] = slice.try_into().ok()?;
+            Some(if little_endian {
+                u16::from_le_bytes(value)
+            } else {
+                u16::from_be_bytes(value)
+            })
+        };
+        let read_u32 = |slice: &[u8]| -> Option<u32> {
+            let value: [u8; 4] = slice.try_into().ok()?;
+            Some(if little_endian {
+                u32::from_le_bytes(value)
+            } else {
+                u32::from_be_bytes(value)
+            })
+        };
+        if read_u16(bytes.get(2..4)?)? != 42 {
+            return None;
+        }
+        let ifd_offset = read_u32(bytes.get(4..8)?)? as usize;
+        let entry_count = read_u16(bytes.get(ifd_offset..ifd_offset.checked_add(2)?)?)? as usize;
+        for index in 0..entry_count {
+            let start = ifd_offset.checked_add(2)?.checked_add(index.checked_mul(12)?)?;
+            let entry = bytes.get(start..start.checked_add(12)?)?;
+            if read_u16(&entry[0..2])? == wanted_tag {
+                return read_u16(&entry[2..4]);
+            }
+        }
+        None
     }
 
     #[test]
@@ -3449,6 +3701,7 @@ mod tests {
             3,
             domain::OutputFileFormat::Tiff,
             false,
+            &DerivativeMetadata::positive(domain::FilmProcess::C41ColorNegative, 4000),
         )
         .unwrap();
         assert_eq!(std::fs::read(&protected).unwrap(), b"do-not-touch");
@@ -3476,6 +3729,7 @@ mod tests {
             3,
             domain::OutputFileFormat::Tiff,
             true,
+            &DerivativeMetadata::positive(domain::FilmProcess::C41ColorNegative, 4000),
         )
         .unwrap_err();
 
@@ -3500,6 +3754,7 @@ mod tests {
             3,
             domain::OutputFileFormat::Jpeg,
             true,
+            &DerivativeMetadata::positive(domain::FilmProcess::C41ColorNegative, 4000),
         )
         .unwrap_err();
 
@@ -3657,6 +3912,7 @@ mod tests {
             None,
             None,
             None,
+            3200,
         )
         .expect("render real derivatives");
 
@@ -3667,6 +3923,47 @@ mod tests {
         let positive = image_io::read_rgb16(written.positive_path.as_ref().unwrap())
             .expect("positive is a readable RGB16 TIFF");
         assert_eq!((positive.width, positive.height), (8, 6));
+
+        assert_eq!(
+            <IccProfileValue<'static> as tiff::encoder::TiffValue>::FIELD_TYPE,
+            tiff::tags::Type::UNDEFINED
+        );
+        let positive_bytes = std::fs::read(written.positive_path.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            classic_tiff_field_type(&positive_bytes, 34675),
+            Some(7),
+            "TIFF ICC_Profile must use field type UNDEFINED (7), not BYTE (1)"
+        );
+
+        let positive_file = std::fs::File::open(written.positive_path.as_ref().unwrap()).unwrap();
+        let mut positive_decoder = tiff::decoder::Decoder::new(positive_file).unwrap();
+        assert!(matches!(
+            positive_decoder.get_tag(tiff::tags::Tag::XResolution).unwrap(),
+            tiff::decoder::ifd::Value::Rational(3200, 1)
+        ));
+        assert!(matches!(
+            positive_decoder.get_tag(tiff::tags::Tag::YResolution).unwrap(),
+            tiff::decoder::ifd::Value::Rational(3200, 1)
+        ));
+        assert_eq!(
+            positive_decoder.get_tag_u32(tiff::tags::Tag::ResolutionUnit).unwrap(),
+            2
+        );
+        let positive_icc = positive_decoder
+            .get_tag_u8_vec(tiff::tags::Tag::IccProfile)
+            .expect("C41 Positive TIFF carries ICC");
+        moxcms::ColorProfile::new_from_slice(&positive_icc)
+            .expect("Positive TIFF ICC parses");
+
+        use image::ImageDecoder as _;
+        let preview_file = std::fs::File::open(written.preview_path.as_ref().unwrap()).unwrap();
+        let mut preview_decoder =
+            image::codecs::jpeg::JpegDecoder::new(std::io::BufReader::new(preview_file)).unwrap();
+        let preview_icc = preview_decoder
+            .icc_profile()
+            .unwrap()
+            .expect("C41 Preview JPEG carries ICC");
+        assert_eq!(preview_icc, positive_icc, "C41 color contract is format-independent");
 
         // This is the exact function real_backend.rs's `run_real_scan_job_inner`
         // calls (`render_derivative_from_archive` is a thin exposure_10ns=None
@@ -3736,6 +4033,7 @@ mod tests {
             None,
             None,
             Some(&alignment),
+            4000,
         )
         .expect("render transformed derivatives");
 
@@ -3745,7 +4043,8 @@ mod tests {
             horizontal_mirror: true,
             vertical_mirror: false,
         });
-        for path in [written.positive_path, written.preview_path] {
+        let positive_path = written.positive_path.clone().unwrap();
+        for path in [&written.positive_path, &written.preview_path] {
             let image = image_io::read_rgb16(path.as_ref().unwrap()).unwrap();
             assert_eq!((image.width, image.height), (2, 3));
             assert_eq!(
@@ -3760,6 +4059,13 @@ mod tests {
                 ]
             );
         }
+
+        let mut decoder = tiff::decoder::Decoder::new(std::fs::File::open(positive_path).unwrap())
+            .unwrap();
+        assert!(
+            decoder.get_tag(tiff::tags::Tag::IccProfile).is_err(),
+            "positive-film passthrough must not be falsely labeled as ScanStudio RGB"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3828,6 +4134,7 @@ mod tests {
         let written_hardware = render_derivative_from_archive_with_processing(
             &archive_path, 1, &processing, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01),
             None, None, None, Some(USABLE_EXPOSURE_10NS),
+            4000,
         )
         .expect("render real derivatives");
         let hardware_provenance = written_hardware
@@ -3841,6 +4148,7 @@ mod tests {
         let written_malformed = render_derivative_from_archive_with_processing(
             &archive_path, 1, &processing, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01),
             None, None, None, Some([f64::NAN, 312892.0, 259345.0]),
+            4000,
         )
         .expect("a malformed exposure must fall back to blind, never fail");
         let malformed_provenance = written_malformed
@@ -3897,6 +4205,7 @@ mod tests {
             None,
             None,
             None,
+            4000,
         )
         .expect("auto-cropped derivatives render");
 
@@ -3936,6 +4245,7 @@ mod tests {
             None,
             None,
             None,
+            4000,
         )
         .unwrap();
         assert!(written.auto_crop.is_none());
@@ -3969,6 +4279,7 @@ mod tests {
             None,
             Some((40, 280)),
             Some(&alignment),
+            4000,
         )
         .unwrap();
         let outcome = written.auto_crop.expect("deferred outcome");
@@ -4003,17 +4314,17 @@ mod tests {
         recipes.preview.enabled = false;
         recipes.positive.destination = dir.join("Off").display().to_string();
         let default_off = domain::ProcessingRecipe { film_process: domain::FilmProcess::BwNegative, ..domain::ProcessingRecipe::default() };
-        let written_off = render_derivative_from_archive_with_processing(&archive_path, 1, &default_off, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None).unwrap();
+        let written_off = render_derivative_from_archive_with_processing(&archive_path, 1, &default_off, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None, 4000).unwrap();
         let off_bytes = std::fs::read(written_off.positive_path.unwrap()).unwrap();
 
         recipes.positive.destination = dir.join("ExplicitFalse").display().to_string();
         let explicit_false = domain::ProcessingRecipe { film_process: domain::FilmProcess::BwNegative, software_dust_removal_bw: false, ..domain::ProcessingRecipe::default() };
-        let written_false = render_derivative_from_archive_with_processing(&archive_path, 1, &explicit_false, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None).unwrap();
+        let written_false = render_derivative_from_archive_with_processing(&archive_path, 1, &explicit_false, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None, 4000).unwrap();
         assert_eq!(off_bytes, std::fs::read(written_false.positive_path.unwrap()).unwrap());
 
         recipes.positive.destination = dir.join("On").display().to_string();
         let enabled = domain::ProcessingRecipe { film_process: domain::FilmProcess::BwNegative, software_dust_removal_bw: true, ..domain::ProcessingRecipe::default() };
-        let written_on = render_derivative_from_archive_with_processing(&archive_path, 1, &enabled, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None).unwrap();
+        let written_on = render_derivative_from_archive_with_processing(&archive_path, 1, &enabled, &recipes, Some(STORAGE_TRANSFORM_SWAPAXES01), None, None, None, None, 4000).unwrap();
         assert_ne!(off_bytes, std::fs::read(written_on.positive_path.unwrap()).unwrap());
         assert_eq!(std::fs::read(&archive_path).unwrap(), archive_before);
 
@@ -4038,6 +4349,7 @@ mod tests {
             None,
             None,
             None,
+            4000,
         )
         .expect("disabled derivatives are a no-op");
         assert_eq!(written.archive_path, Some(missing));
@@ -4062,6 +4374,7 @@ mod tests {
             None,
             None,
             None,
+            4000,
         )
         .unwrap_err();
         assert_eq!(missing_transform.code, protocol::ErrorCode::InvalidParams);
@@ -4075,6 +4388,7 @@ mod tests {
             None,
             None,
             None,
+            4000,
         )
         .unwrap_err();
         assert_eq!(wrong_transform.code, protocol::ErrorCode::InvalidParams);
@@ -4089,6 +4403,7 @@ mod tests {
             None,
             None,
             None,
+            4000,
         )
         .unwrap_err();
         assert_eq!(unsupported_profile.code, protocol::ErrorCode::InvalidParams);
@@ -4103,6 +4418,7 @@ mod tests {
             None,
             None,
             Some(&domain::FrameAlignment::approved(0)),
+            4000,
         )
         .unwrap_err();
         assert_eq!(missing_boundary.code, protocol::ErrorCode::InvalidParams);
@@ -4223,6 +4539,7 @@ mod tests {
             16,
             12,
             16,
+            4000,
             &recipes,
             None,
             None,

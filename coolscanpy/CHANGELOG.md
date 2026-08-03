@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+C-41 derivatives now identify their color and physical scale correctly.
+Positive TIFFs and preview JPEGs embed a deterministic, ScanStudio-authored
+ICC profile compatible with the Adobe RGB (1998) color space. Full-resolution
+Positive TIFFs also carry the capture recipe's real pixels-per-inch value,
+while downsampled previews do not falsely claim the capture resolution.
+Positive-film, Kodachrome, and black-and-white derivatives remain unlabelled
+unless their render path actually has that color contract. Archival masters
+are never rewritten by this metadata correction.
+
+Real capture receipts now record an authoritative per-frame UTC start and
+duration instead of substituting receipt-arrival time and zero milliseconds.
+The measured interval begins after frame selection and binding, includes
+metering, exposure and focus, acquisition, durable raw validation, decode, and
+capture quality checks, and excludes session setup, inter-frame waits, release,
+bridge delivery, and derivative rendering. The timing survives CoolscanPy,
+bridge, engine, manifest, and app boundaries. Legacy receipts remain valid and
+show their absent timing as not recorded rather than inventing a value.
+
 Whole-roll preview now keeps a content-supported leading frame when an
 otherwise valid feed places its fitted start exactly one 97-dpi preview row
 before the captured raster. The thumbnail is clamped to row zero, its

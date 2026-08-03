@@ -9,6 +9,7 @@ here.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import re
@@ -616,11 +617,39 @@ class Receipt:
     # silent None a reader could mistake for "no transform applied".
     storage_transform: str
     nikon_density_ownership: NikonDensityFrameOwnershipReceipt | None = None
+    # Wall-clock capture start (ISO-8601 UTC) and per-frame hardware capture
+    # duration in milliseconds. `None`/zero means the capture did not record
+    # trustworthy timing (e.g. a legacy journal); downstream consumers must
+    # not substitute engine-receipt-arrival time for an absent value.
+    started_at: str | None = None
+    capture_duration_ms: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "artifacts", _ImmutableArtifacts(self.artifacts))
         if type(self.storage_transform) is not str or not self.storage_transform.strip():
             raise ValueError("receipt storage_transform must be a non-empty string")
+        if self.capture_duration_ms is not None and (
+            isinstance(self.capture_duration_ms, bool)
+            or not isinstance(self.capture_duration_ms, int)
+            or self.capture_duration_ms < 0
+            or self.capture_duration_ms > ((1 << 64) - 1)
+        ):
+            raise ValueError(
+                "receipt capture_duration_ms must be an unsigned 64-bit integer"
+            )
+        if self.started_at is not None:
+            if not isinstance(self.started_at, str) or not self.started_at.strip():
+                raise ValueError("receipt started_at must be a non-empty string")
+            try:
+                parsed_started_at = datetime.datetime.fromisoformat(self.started_at)
+            except ValueError as error:
+                raise ValueError(
+                    "receipt started_at must be an ISO-8601 UTC timestamp"
+                ) from error
+            if parsed_started_at.utcoffset() != datetime.timedelta(0):
+                raise ValueError(
+                    "receipt started_at must be an ISO-8601 UTC timestamp"
+                )
 
 
 @dataclass(frozen=True)

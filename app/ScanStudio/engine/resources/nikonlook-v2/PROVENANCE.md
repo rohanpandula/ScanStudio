@@ -29,8 +29,9 @@ authorization covers vendoring the three JSON files as data under
 
 No Nikon ICC profile bytes are redistributed in this repository, same as
 v1: `nikon-adobe-rgb.icc` is deliberately excluded from this directory. The
-numeric model targets Adobe RGB-family encoded values; the current alpha
-renderer writes Adobe RGB (1998)-encoded values without embedding an ICC tag.
+numeric model targets Adobe RGB-family encoded values. C41 derivatives embed
+a runtime-generated, ScanStudio-authored ICC profile compatible with the Adobe
+RGB (1998) color space; no Adobe- or Nikon-authored profile file is bundled.
 
 ## Quality tier
 
