@@ -45,6 +45,42 @@ final class UpdateServiceTests: XCTestCase {
         """
     }
 
+    // MARK: - Phase-02 arch-aware pointer fixtures
+
+    /// The arch-keyed pointer (02-01 emitter output) for a hypothetical
+    /// `v0.3.1-alpha.13`: one distinct url+sha256 per architecture.
+    private static let archPointerVersion = "0.3.1-alpha.13"
+    private static let arm64Checksum = String(repeating: "c", count: 64)
+    private static let x8664Checksum = String(repeating: "d", count: 64)
+
+    private static let archKeyedArm64URL =
+        "https://github.com/rohanpandula/ScanStudio/releases/download/v0.3.1-alpha.13/ScanStudio-0.3.1-alpha.13-macOS-arm64.dmg"
+    private static let archKeyedX86_64URL =
+        "https://github.com/rohanpandula/ScanStudio/releases/download/v0.3.1-alpha.13/ScanStudio-0.3.1-alpha.13-macOS-x86_64.dmg"
+
+    private static var archKeyedPointerJSON: String {
+        """
+        {
+            "version": "\(archPointerVersion)",
+            "architectures": {
+                "arm64": { "url": "\(archKeyedArm64URL)", "sha256": "\(arm64Checksum)" },
+                "x86_64": { "url": "\(archKeyedX86_64URL)", "sha256": "\(x8664Checksum)" }
+            }
+        }
+        """
+    }
+
+    private static var archKeyedArm64OnlyJSON: String {
+        """
+        {
+            "version": "\(archPointerVersion)",
+            "architectures": {
+                "arm64": { "url": "\(archKeyedArm64URL)", "sha256": "\(arm64Checksum)" }
+            }
+        }
+        """
+    }
+
     override func setUpWithError() throws {
         try super.setUpWithError()
         root = FileManager.default.temporaryDirectory
@@ -68,6 +104,120 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(pointer.version, "0.3.0-alpha.11")
         XCTAssertEqual(pointer.url.absoluteString, Self.pointerDownloadURL)
         XCTAssertEqual(pointer.sha256, String(repeating: "a", count: 64))
+    }
+
+    // MARK: - 1b. Phase-02 arch-keyed pointer decode + selection
+
+    func testArchKeyedPointerDecodesBothArchs() throws {
+        let pointer = try JSONDecoder().decode(UpdatePointerArch.self, from: Data(Self.archKeyedPointerJSON.utf8))
+
+        XCTAssertEqual(pointer.version, Self.archPointerVersion)
+        XCTAssertEqual(pointer.architectures.count, 2)
+        XCTAssertEqual(pointer.architectures[.arm64]?.url.absoluteString, Self.archKeyedArm64URL)
+        XCTAssertEqual(pointer.architectures[.x86_64]?.url.absoluteString, Self.archKeyedX86_64URL)
+        XCTAssertEqual(pointer.architectures[.arm64]?.sha256, Self.arm64Checksum)
+        XCTAssertEqual(pointer.architectures[.x86_64]?.sha256, Self.x8664Checksum)
+        XCTAssertNotEqual(pointer.architectures[.arm64]?.sha256, pointer.architectures[.x86_64]?.sha256,
+                          "the two arch entries must describe distinct artifacts")
+    }
+
+    func testPointerArchRoundTripEncodesArchKeyedForm() throws {
+        let original = UpdatePointerArch(
+            version: Self.archPointerVersion,
+            architectures: [
+                .arm64: UpdateArchEntry(url: URL(string: Self.archKeyedArm64URL)!, sha256: Self.arm64Checksum),
+                .x86_64: UpdateArchEntry(url: URL(string: Self.archKeyedX86_64URL)!, sha256: Self.x8664Checksum),
+            ]
+        )
+
+        let data = try JSONEncoder().encode(original)
+        // Encode must emit the arch-keyed JSON *object* (per-arch keys), not
+        // a key/value array.
+        let jsonObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let archs = try XCTUnwrap(jsonObject["architectures"] as? [String: Any])
+        XCTAssertEqual(archs.count, 2)
+        XCTAssertNotNil(archs["arm64"])
+        XCTAssertNotNil(archs["x86_64"])
+
+        let decoded = try JSONDecoder().decode(UpdatePointerArch.self, from: data)
+        XCTAssertEqual(decoded, original)
+    }
+
+    func testUnknownArchKeyInPointerThrowsOnDecode() throws {
+        // Trust gate: an unrecognized arch key is a malformed/untrusted
+        // pointer and must throw, never be silently dropped.
+        let json = """
+        {
+            "version": "\(Self.archPointerVersion)",
+            "architectures": {
+                "arm64": { "url": "\(Self.archKeyedArm64URL)", "sha256": "\(Self.arm64Checksum)" },
+                "powerpc": { "url": "https://example.com/ScanStudio-ppc.dmg", "sha256": "\(Self.x8664Checksum)" }
+            }
+        }
+        """
+        XCTAssertThrowsError(try JSONDecoder().decode(UpdatePointerArch.self, from: Data(json.utf8)))
+    }
+
+    func testLegacyFlatPointerStillDecodes() async throws {
+        // Regression guard: the old flat {version,url,sha256} pointer must
+        // still yield a single candidate with the promised bytes+checksum.
+        let stub = StubURLSession()
+        stub.dataByURL[pointerURL()] = Data(Self.pointerJSON.utf8)
+
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+        let candidate = try await checker.latestCandidate(channel: .stable)
+
+        let resolved = try XCTUnwrap(candidate, "a legacy flat pointer must still produce a candidate")
+        XCTAssertEqual(resolved.version.raw, "0.3.0-alpha.11")
+        XCTAssertEqual(resolved.downloadURL.absoluteString, Self.pointerDownloadURL)
+        XCTAssertEqual(resolved.sha256, String(repeating: "a", count: 64))
+    }
+
+    func testSelectsHostArchEntry() async throws {
+        let stub = StubURLSession()
+        stub.dataByURL[pointerURL()] = Data(Self.archKeyedPointerJSON.utf8)
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+
+        let arm = try await checker.latestCandidate(channel: .stable, arch: .arm64)
+        let armCandidate = try XCTUnwrap(arm)
+        XCTAssertEqual(armCandidate.version.raw, Self.archPointerVersion)
+        XCTAssertEqual(armCandidate.downloadURL.absoluteString, Self.archKeyedArm64URL)
+        XCTAssertEqual(armCandidate.sha256, Self.arm64Checksum)
+
+        let intel = try await checker.latestCandidate(channel: .stable, arch: .x86_64)
+        let intelCandidate = try XCTUnwrap(intel)
+        XCTAssertEqual(intelCandidate.version.raw, Self.archPointerVersion)
+        XCTAssertEqual(intelCandidate.downloadURL.absoluteString, Self.archKeyedX86_64URL)
+        XCTAssertEqual(intelCandidate.sha256, Self.x8664Checksum)
+    }
+
+    func testSelectsDefaultCurrentArchForExistingCallSites() async throws {
+        // The single-arch entry point must keep working (the 01-05 model calls
+        // it with no arch), delegating to the current host architecture.
+        let stub = StubURLSession()
+        stub.dataByURL[pointerURL()] = Data(Self.archKeyedPointerJSON.utf8)
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+
+        let fetched = try await checker.latestCandidate(channel: .stable)
+        let candidate = try XCTUnwrap(fetched)
+        let expected = HostArchitectureProvider.current() == .arm64
+            ? Self.archKeyedArm64URL
+            : Self.archKeyedX86_64URL
+        XCTAssertEqual(candidate.downloadURL.absoluteString, expected,
+                       "the default arch must match the current host architecture")
+    }
+
+    func testMissingArchThrowsUnsupported() async throws {
+        let stub = StubURLSession()
+        stub.dataByURL[pointerURL()] = Data(Self.archKeyedArm64OnlyJSON.utf8)
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+
+        do {
+            _ = try await checker.latestCandidate(channel: .stable, arch: .x86_64)
+            XCTFail("expected unsupportedArchitecture for a missing x86_64 entry")
+        } catch let error as UpdateArchError {
+            XCTAssertEqual(error, .unsupportedArchitecture(.x86_64))
+        }
     }
 
     // MARK: - 2. Stable trusts the pointer only
