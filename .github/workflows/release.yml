@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: macos-15
+    # See the package job in ci.yml: the relocatable package requires uv's
+    # standalone CPython, not the runner image's framework Python. This is
+    # the same verified `make dmg` path used locally, so a release is only
+    # publishable if the exact signed app passes the packaging verification.
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install optional SANE binding build prerequisite
+        # The release does not copy Homebrew's libusb: package_app.sh builds
+        # the signed app-owned copy from hash-pinned source. sane-backends is
+        # needed only to compile the optional python-sane compatibility
+        # binding included in the bundle.
+        run: brew install sane-backends
+      - name: Point the compiler at Homebrew's headers and libraries
+        # GitHub Actions does not expand $(...) inside an `env:` block and the
+        # Homebrew prefix varies by runner arch (/opt/homebrew on arm64,
+        # /usr/local on x86_64), so resolve it here and export it through
+        # GITHUB_ENV for every later step in this job.
+        run: |
+          echo "CPPFLAGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L$(brew --prefix)/lib" >> "$GITHUB_ENV"
+      - name: Install locked bridge dependencies (with scanner extra)
+        working-directory: bridge
+        run: uv sync --locked --extra scanner
+      - name: Resolve release version from the tag
+        # The workflow only runs on `v*` tag pushes, so the exact-match tag
+        # is authoritative; fall back to GITHUB_REF_NAME minus the leading v.
+        run: |
+          STAMP="$({ git describe --tags --exact-match HEAD 2>/dev/null || echo "$GITHUB_REF_NAME"; } | sed 's/^v//')"
+          echo "RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
+          echo "SCANSTUDIO_RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
+          echo "Resolved release version: $STAMP"
+      - name: Build and verify the local DMG
+        # package_dmg.sh names the artifact ScanStudio-<version>-macOS-<arch>.dmg
+        # from SCANSTUDIO_RELEASE_VERSION (set above from the tag) and refuses
+        # to overwrite an existing artifact. It also verifies the mounted app's
+        # code signature and runs test_packaged_bridge.sh on it; any failure
+        # here aborts the job and nothing is released.
+        working-directory: app/ScanStudio
+        run: make dmg
+      - name: Emit SHA256SUMS and latest.json
+        working-directory: app/ScanStudio
+        run: |
+          scripts/emit_release_assets.sh ".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg" "$RELEASE_VERSION" ".build"
+      - name: Re-verify released assets
+        # codesign --verify --deep --strict on the mounted app is already part
+        # of make dmg's packaging; do not re-mount here. Assert the checksum in
+        # SHA256SUMS matches the actual DMG and latest.json is non-empty.
+        working-directory: app/ScanStudio
+        run: |
+          DMG=".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
+          EXPECTED="$(awk '{print $1}' .build/SHA256SUMS)"
+          ACTUAL="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+          test -n "$EXPECTED"
+          test "$EXPECTED" = "$ACTUAL"
+          test -s .build/latest.json
+          echo "Checksum re-verified: $ACTUAL"
+      - name: Create GitHub release
+        # How the alpha parcel behaves today: alphas are pre-releases on
+        # GitHub. Keep that --prerelease only for -alpha versions; stable
+        # tags publish as full releases.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: app/ScanStudio
+        run: |
+          DMG=".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
+          SHA256="$(awk '{print $1}' .build/SHA256SUMS)"
+          PRERELEASE=""
+          case "$RELEASE_VERSION" in
+            *-alpha*) PRERELEASE="--prerelease" ;;
+          esac
+          gh release create "v$RELEASE_VERSION" \
+            --repo rohanpandula/ScanStudio \
+            --title "ScanStudio $RELEASE_VERSION" \
+            --notes "Automated release of ScanStudio $RELEASE_VERSION.
+
+SHA-256: $SHA256" \
+            $PRERELEASE \
+            -- "$DMG" .build/SHA256SUMS .build/latest.json
+      - name: Summarize published release
+        working-directory: app/ScanStudio
+        run: |
+          echo "Asset: https://github.com/rohanpandula/ScanStudio/releases/download/v$RELEASE_VERSION/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
+          echo "SHA-256 $(awk '{print $1}' .build/SHA256SUMS)"
