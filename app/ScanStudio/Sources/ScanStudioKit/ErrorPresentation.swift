@@ -140,7 +140,8 @@ public enum ErrorPresentationPolicy {
         context: ErrorPresentationContext = .init()
     ) -> ErrorPresentation {
         let normalizedMessage = lastErrorMessage.uppercased()
-        let copy = filmFeedInterruptedCopy(in: lastErrorMessage)
+        let copy = leadingFrameClippedCopy(in: lastErrorMessage)
+            ?? filmFeedInterruptedCopy(in: lastErrorMessage)
             ?? filmTransportSlipCopy(in: lastErrorMessage)
             ?? previewReadinessTimeoutCopy(in: lastErrorMessage)
             ?? knownCopy.first { containsCode($0.code, in: normalizedMessage) }
@@ -162,6 +163,27 @@ public enum ErrorPresentationPolicy {
                 lastErrorMessage: lastErrorMessage,
                 context: context
             )
+        )
+    }
+
+    private static func leadingFrameClippedCopy(in message: String) -> Copy? {
+        guard
+            message.range(
+                of: "the first frame begins",
+                options: .caseInsensitive
+            ) != nil,
+            message.range(
+                of: "before the captured preview area",
+                options: .caseInsensitive
+            ) != nil
+        else {
+            return nil
+        }
+        return Copy(
+            code: "REFEED_REQUIRED",
+            title: "The first frame is not fully inside the scanner",
+            guidance: "Reinsert the film a little farther into the adapter, then preview it again. "
+                + "ScanStudio did not offer the cropped frame for scanning."
         )
     }
 

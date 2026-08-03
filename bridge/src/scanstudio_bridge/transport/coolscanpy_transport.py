@@ -34,7 +34,10 @@ import tifffile
 # coolscanpy leak, not a wire contract of coolscanpy's own -- it becomes
 # harmless, dead code the day coolscanpy's own facade translates these into
 # its public taxonomy instead.
-from coolscanpy.protocol.ls5000_single_pass.roll_index import IndexDecodeError
+from coolscanpy.protocol.ls5000_single_pass.roll_index import (
+    IndexDecodeError,
+    LeadingFrameClippedError,
+)
 from coolscanpy.roll.preview_session import (
     RollSessionError,
     RollSessionIntegrityError,
@@ -554,6 +557,11 @@ class CoolscanPyTransport:
             raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
         except coolscanpy.DeviceBusy as exc:
             raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
+        except LeadingFrameClippedError as exc:
+            # This is a proven physical-registration condition, unlike the
+            # broader IndexDecodeError bucket below. Preserve its precise
+            # deeper-refeed guidance in both the UI and diagnostics.
+            raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
         except IndexDecodeError as exc:
             # Hedged wording (2026-07-25 adversarial-review finding): the
             # IndexDecodeError class also covers malformed envelopes and

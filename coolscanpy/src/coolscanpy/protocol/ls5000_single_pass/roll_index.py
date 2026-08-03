@@ -29,10 +29,36 @@ MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS = 2.0
 MAXIMUM_LEADING_ANCHOR_ERROR_ROWS = 5.0
 LEADING_ANCHOR_REVIEW_REASON = "leading-anchor-divergence"
 TRANSPORT_ORIGIN_CLAMP_REASON = "transport-origin-extrapolated-clamp"
+MINIMUM_CONFIDENT_CLEAR_FILM_FRACTION = 0.95
 
 
 class IndexDecodeError(ValueError):
     """Input is not a self-consistent LS-5000 roll-index capture."""
+
+
+class LeadingFrameClippedError(IndexDecodeError):
+    """A photographed leading cell is visible but cannot be scanned whole."""
+
+    def __init__(
+        self,
+        *,
+        fitted_start_row: int,
+        coverage_fraction: float,
+        content_fraction: float,
+        clear_film_fraction: float,
+    ) -> None:
+        self.fitted_start_row = fitted_start_row
+        self.clipped_preview_rows = max(0, -fitted_start_row)
+        self.coverage_fraction = coverage_fraction
+        self.content_fraction = content_fraction
+        self.clear_film_fraction = clear_film_fraction
+        super().__init__(
+            "the first frame begins "
+            f"{self.clipped_preview_rows} preview rows before the captured preview "
+            f"area ({coverage_fraction:.1%} remains); refeed the film slightly deeper "
+            "and acquire a fresh preview. ScanStudio did not expose the cropped frame "
+            "for scanning"
+        )
 
 
 class IncompleteIndexError(IndexDecodeError):
@@ -958,6 +984,37 @@ def detect_roll_frames(
         raise IndexDecodeError("roll detector found no in-raster lattice origin")
     cell_start = lattice_starts[0]
     preceding_cell = cell_start - 1
+    if preceding_cell >= 0:
+        preceding_start = int(all_positions[preceding_cell])
+        preceding_coverage = float(cell_coverage[preceding_cell])
+        preceding_content = float(cell_content[preceding_cell])
+        observed_start = max(0, preceding_start)
+        observed_end = min(len(direct), int(all_positions[preceding_cell + 1]))
+        preceding_clear_film = (
+            float(direct[observed_start:observed_end].mean())
+            if observed_end > observed_start
+            else 1.0
+        )
+        if (
+            preceding_start < -1
+            and bool(cell_supported[preceding_cell])
+            and preceding_clear_film < MINIMUM_CONFIDENT_CLEAR_FILM_FRACTION
+        ):
+            # ``direct`` is the detector's strict clear-film contract: high
+            # transmission, low nonuniformity, and safe samples. A normal
+            # leader fixture satisfies it on 100% of this cell. If at least 5%
+            # does not look like clear film, the normal content threshold is
+            # enough to prove a photographed slot exists even when that slot
+            # is bright or partly blank. Its fitted origin is outside the
+            # scanner-addressable range. Silently starting at the next cell
+            # renumbers a six-frame strip as five; clamping to row zero would
+            # crop frame 1 and overlap frame 2. Refuse both outcomes.
+            raise LeadingFrameClippedError(
+                fitted_start_row=preceding_start,
+                coverage_fraction=preceding_coverage,
+                content_fraction=preceding_content,
+                clear_film_fraction=preceding_clear_film,
+            )
     if (
         preceding_cell >= 0
         and int(all_positions[preceding_cell]) == -1

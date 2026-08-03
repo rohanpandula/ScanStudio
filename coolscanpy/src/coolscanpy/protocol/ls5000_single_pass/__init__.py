@@ -73,6 +73,7 @@ from .plan import (
 from .roll_index import (
     IndexDecodeError,
     IndexGeometry,
+    LeadingFrameClippedError,
     RollDetection,
     TransportMapping,
     decode_full_index_bytes,
@@ -106,6 +107,7 @@ __all__ = [
     "FineStreamSession",
     "IndexDecodeError",
     "IndexGeometry",
+    "LeadingFrameClippedError",
     "MeterObservation",
     "MeterProposal",
     "MeterResult",
