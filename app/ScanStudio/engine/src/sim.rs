@@ -1197,6 +1197,7 @@ fn run_scan_job(
                     width,
                     height,
                     effective_recipe.bit_depth,
+                    effective_recipe.resolution_dpi,
                     &effective_output,
                     Some(detected_boundary),
                     effective_alignment,

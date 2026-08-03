@@ -260,6 +260,8 @@ ScanReceipt
   irPath: string|null
   meterRgbiPath: string|null
   exposureAuthority: ExposureAuthority|null
+  startedAt?: string|null                 // ISO-8601 UTC capture start; absent on legacy receipts
+  captureDurationMs?: number|null         // nonnegative u64; absent means not recorded
 ```
 
 `$ScanStudioSequence(N)` is an additive engine-to-bridge, job-local exact-name marker (`N` is a positive decimal integer). It resolves to just `N`, with no slot substitution. The engine uses it only after reserving a single-`#` automatic sequence before dispatch; it is not a user template token and must never be persisted in a project manifest, output recipe, or receipt.
@@ -275,6 +277,8 @@ ScanReceipt
 CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanReceipt` as `meterRgbiPath` starting this phase (Phase 10): the bridge writes `frame.meter_rgbi` (an HxWx4 uint16 array) to `{stem}_METER.tif` alongside the RGB/IR files, unconditionally whenever CoolscanPy supplies it — never fabricated; `null` only if absent.
 
 `exposureAuthority` is a best-effort, additive copy of CoolscanPy's per-frame `active_exposure_authority` journal block. It distinguishes the guarded Nikon-parity RGB command from the active controller's accepted solve, preserves the controller-owned IR command, and records any RGB channels clamped to the device exposure window. It is `null` when the journal block is absent, malformed, or cannot be read; that telemetry failure never invalidates an otherwise completed frame receipt.
+
+`startedAt` and `captureDurationMs` are additive, legacy-safe timing fields. For new captures they identify the authoritative per-frame interval from metering through exposure/focus, acquisition, decode, and capture QC; roll/session setup, inter-frame waits, release, bridge delivery, and ScanStudio derivative rendering are outside that interval. Older receipts may omit either field. Consumers must treat an absent value—or a downstream engine `durationMs` of zero—as “not recorded,” never substitute receipt-arrival time.
 
 ## Events
 

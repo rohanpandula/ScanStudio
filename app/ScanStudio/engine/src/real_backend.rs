@@ -2960,15 +2960,12 @@ fn map_exposure_authority(authority: &BridgeExposureAuthority) -> domain::Exposu
 }
 
 /// Builds the engine's `ScanReceipt` for a completed real-backend frame.
-/// `duration_ms`/`started_at` are documented approximations: BRIDGE.md's
-/// `ScanReceipt` carries neither a timestamp nor a duration field at all.
-/// `started_at` is approximated as receipt-arrival time; `duration_ms: 0`
-/// is an honest "not available", never a fabricated number — no bridge
-/// field exists to source either from. BRIDGE.md's rich exposure/clipping/
-/// focus/transport-smear telemetry, plus the rgb/ir/meter capture-file
-/// paths, now flow onto `hardware_telemetry`/`rgb_path`/`ir_path`/
-/// `meter_rgbi_path` (Phase 10) — superseding the stderr-only diagnostic
-/// dump this used to be the caller's only option.
+/// `started_at`/`duration_ms` are forwarded verbatim from the bridge, which
+/// in turn forwards CoolscanPy's journal timing recorded at the authoritative
+/// per-frame capture boundary (metering -> exposure/focus -> acquisition ->
+/// decode -> capture QC). Absent bridge timing falls back to an empty start
+/// and zero duration -- an honest "not recorded", never a fabricated
+/// receipt-arrival time.
 fn build_real_receipt(
     job_id: &str,
     slot: u32,
@@ -2977,10 +2974,6 @@ fn build_real_receipt(
     output: &OutputRecipe,
     bridge_receipt: &BridgeScanReceipt,
 ) -> domain::ScanReceipt {
-    let now_unix_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
     domain::ScanReceipt {
         exposure_authority: bridge_receipt
             .exposure_authority
@@ -2989,8 +2982,8 @@ fn build_real_receipt(
         auto_crop: None,
         job_id: job_id.to_string(),
         frame_index: slot,
-        started_at: crate::sim::format_iso8601(now_unix_secs),
-        duration_ms: 0,
+        started_at: bridge_receipt.started_at.clone().unwrap_or_default(),
+        duration_ms: bridge_receipt.capture_duration_ms.unwrap_or_default(),
         passes: recipe.multisample_passes,
         resolution_dpi: bridge_receipt.dpi,
         bit_depth: bridge_receipt.depth,
@@ -4607,6 +4600,7 @@ fn run_real_scan_job_inner(
                             None,
                             derivative_geometry.as_ref(),
                             nikonlook_exposure_10ns_from_receipt(&frame_completed.receipt.exposure),
+                            frame_completed.receipt.dpi,
                         );
 
                         match derivative {

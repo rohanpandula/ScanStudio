@@ -140,6 +140,32 @@ def test_scan_receipt_accepts_an_older_wire_payload_without_attempts_root() -> N
     assert restored.attempts_root is None
 
 
+def test_scan_receipt_timing_round_trips_through_wire() -> None:
+    original = dataclasses.replace(
+        _make_scan_receipt(),
+        started_at="2026-08-02T20:05:00+00:00",
+        capture_duration_ms=1900,
+    )
+    wire = to_wire(original)
+    assert wire["startedAt"] == "2026-08-02T20:05:00+00:00"
+    assert wire["captureDurationMs"] == 1900
+
+    restored = from_wire(wire, ScanReceipt)
+    assert restored.started_at == original.started_at
+    assert restored.capture_duration_ms == original.capture_duration_ms
+
+
+def test_scan_receipt_accepts_legacy_wire_without_timing() -> None:
+    wire = to_wire(_make_scan_receipt())
+    del wire["startedAt"]
+    del wire["captureDurationMs"]
+
+    restored = from_wire(wire, ScanReceipt)
+
+    assert restored.started_at is None
+    assert restored.capture_duration_ms is None
+
+
 def _make_exposure_authority() -> ExposureAuthority:
     return ExposureAuthority(
         rgb_source="nikon-parity-guarded-v2",

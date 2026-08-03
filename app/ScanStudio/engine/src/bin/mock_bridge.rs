@@ -1124,6 +1124,8 @@ fn fixed_scan_receipt(
         meter_rgbi_path: Some(meter_path.display().to_string()),
         attempts_root: None,
         exposure_authority: None,
+        started_at: Some("2026-08-02T20:05:00+00:00".to_string()),
+        capture_duration_ms: Some(1900),
     }
 }
 

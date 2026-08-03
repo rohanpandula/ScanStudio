@@ -19,6 +19,10 @@ fn backfill_positive_from_real_archive_without_rescan() {
         .expect("SCANSTUDIO_FRAME must be an integer");
     let storage_transform = std::env::var("SCANSTUDIO_STORAGE_TRANSFORM")
         .expect("set SCANSTUDIO_STORAGE_TRANSFORM");
+    let resolution_dpi: u32 = std::env::var("SCANSTUDIO_RESOLUTION_DPI")
+        .unwrap_or_else(|_| "4000".to_string())
+        .parse()
+        .expect("SCANSTUDIO_RESOLUTION_DPI must be an integer");
 
     let archive_before = std::fs::read(&archive).expect("archive must exist and be readable");
     let mut recipes = OutputRecipe::default();
@@ -35,6 +39,7 @@ fn backfill_positive_from_real_archive_without_rescan() {
         Some(storage_transform.as_str()),
         None,
         None,
+        resolution_dpi,
     )
     .expect("positive derivative must render from the real archive");
 

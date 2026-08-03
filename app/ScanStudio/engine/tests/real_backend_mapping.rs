@@ -1012,6 +1012,16 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
         Some(800),
         "must match fixed_scan_receipt's literal exposure.focus_position: {telemetry:#?}"
     );
+    assert_eq!(
+        receipt["startedAt"].as_str(),
+        Some("2026-08-02T20:05:00+00:00"),
+        "the engine receipt must forward the bridge's wall-clock capture start verbatim, never a receipt-arrival time: {receipt:#?}"
+    );
+    assert_eq!(
+        receipt["durationMs"].as_u64(),
+        Some(1900),
+        "the engine receipt must forward the bridge's per-frame capture duration milliseconds: {receipt:#?}"
+    );
 }
 
 #[test]
@@ -2448,6 +2458,17 @@ fn scan_start_persists_frame_receipts_to_manifest_for_real_hardware() {
         !read_back.frames[0].receipts[0].simulated,
         "the persisted receipt must be marked not simulated for real hardware"
     );
+    for frame_index in 0..2 {
+        let receipt = &read_back.frames[frame_index].receipts[0];
+        assert_eq!(
+            receipt.started_at, "2026-08-02T20:05:00+00:00",
+            "the authoritative capture start must survive manifest persistence"
+        );
+        assert_eq!(
+            receipt.duration_ms, 1900,
+            "the authoritative capture duration must survive manifest persistence"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&project_directory);
 }

@@ -973,7 +973,7 @@ struct FrameDetailWorkspaceView: View {
                         Text("Adobe RGB (1998)").tag(OutputColorProfile.adobeRgb1998)
                     }
                 }
-                Text("Current alpha writes Adobe RGB (1998)-encoded values without an embedded ICC tag.")
+                Text("C41 files include a ScanStudio color profile compatible with Adobe RGB (1998).")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.scanStudioSecondaryText)
                 InspectorTextFieldRow(label: "Naming", text: outputPositiveFilenameBinding)

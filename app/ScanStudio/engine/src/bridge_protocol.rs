@@ -384,6 +384,15 @@ pub struct BridgeScanReceipt {
     /// otherwise complete frame receipt.
     #[serde(default, deserialize_with = "deserialize_exposure_authority_fail_soft")]
     pub exposure_authority: Option<BridgeExposureAuthority>,
+    /// Wall-clock capture start (ISO-8601 UTC) and per-frame hardware capture
+    /// duration in milliseconds, forwarded verbatim from CoolscanPy's journal
+    /// at the authoritative capture boundary. Optional so older bridge
+    /// payloads and mock receipts stay valid; absent stays `None` (never an
+    /// engine-receipt-arrival time).
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub capture_duration_ms: Option<u64>,
 }
 
 fn deserialize_exposure_authority_fail_soft<'de, D>(
@@ -803,6 +812,8 @@ mod tests {
             meter_rgbi_path: None,
             attempts_root: None,
             exposure_authority: None,
+            started_at: Some("2026-07-22T09:00:00+00:00".into()),
+            capture_duration_ms: Some(1900),
         };
 
         let value = serde_json::to_value(&receipt).unwrap();
@@ -819,16 +830,20 @@ mod tests {
         round_trip(&receipt);
 
         let mut legacy_value = value;
-        legacy_value
+        let legacy_object = legacy_value
             .as_object_mut()
-            .expect("receipt JSON must be an object")
-            .remove("storageTransform");
+            .expect("receipt JSON must be an object");
+        legacy_object.remove("storageTransform");
+        legacy_object.remove("startedAt");
+        legacy_object.remove("captureDurationMs");
         let legacy: BridgeScanReceipt =
             serde_json::from_value(legacy_value).expect("legacy receipt must still deserialize");
         assert!(
             legacy.storage_transform.is_empty(),
             "a missing legacy storageTransform must become an explicit unsupported value"
         );
+        assert!(legacy.started_at.is_none());
+        assert!(legacy.capture_duration_ms.is_none());
     }
 
     #[test]

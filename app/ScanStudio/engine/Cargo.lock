@@ -521,9 +521,11 @@ version = "0.1.0"
 dependencies = [
  "image",
  "imageproc",
+ "moxcms",
  "serde",
  "serde_json",
  "sha2",
+ "tiff",
 ]
 
 [[package]]

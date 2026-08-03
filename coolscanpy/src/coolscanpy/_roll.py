@@ -22,6 +22,7 @@ Only ``Material.COLOR_NEGATIVE``'s single-pass RGBI4 capture route
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import hmac
 import json
@@ -1245,6 +1246,36 @@ def _ticks_to_microseconds(raw: object) -> float:
     )
 
 
+def _receipt_started_at(capture: dict[str, Any]) -> str | None:
+    """Defensively validate the capture-committed ''started_at'' (ISO-8601
+    UTC). Malformed or absent values yield ``None`` -- never a fabricated
+    engine-arrival time."""
+    value = capture.get("started_at")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+        if parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(datetime.timezone.utc).isoformat()
+    except (OverflowError, ValueError):
+        return None
+
+
+def _receipt_duration_ms(capture: dict[str, Any]) -> int | None:
+    """Defensively validate the capture-committed ''capture_duration_ms''.
+    Rejects bools, negatives, and non-finite or oversize values, returning
+    ``None`` so a caller never consumes untrusted timing."""
+    value = capture.get("capture_duration_ms")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value > ((1 << 64) - 1):
+        return None
+    return value
+
+
 def _build_receipt(
     manifest: dict[str, Any],
     *,
@@ -1349,6 +1380,8 @@ def _build_receipt(
         artifacts=artifacts,
         storage_transform=storage_transform,
         nikon_density_ownership=density_ownership,
+        started_at=_receipt_started_at(capture),
+        capture_duration_ms=_receipt_duration_ms(capture),
     )
 
 

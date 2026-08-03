@@ -410,7 +410,12 @@ struct BatchInspectorView: View {
             if let receipt = sessionModel.receipts.last {
                 InspectorSection(title: "Scan Receipt") {
                     InspectorRow(label: "Frame", value: "\(receipt.frameIndex)")
-                    InspectorRow(label: "Duration", value: String(format: "%.1fs", Double(receipt.durationMs) / 1_000))
+                    InspectorRow(
+                        label: "Duration",
+                        value: receipt.durationMs > 0
+                            ? String(format: "%.1fs", Double(receipt.durationMs) / 1_000)
+                            : "Not recorded"
+                    )
                     InspectorRow(label: "Passes", value: "\(receipt.passes)")
                     InspectorRow(label: "Engine", value: receipt.engineVersion)
                     InspectorRow(label: "Proof", value: String(receipt.settingsFingerprint.prefix(8)))
