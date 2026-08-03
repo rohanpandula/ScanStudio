@@ -166,6 +166,15 @@ install -m 755 "$package_root/packaging/ScanStudioLauncher" "$staged_app/Content
 install -m 755 "$package_root/packaging/ScanStudioBridge" "$staged_app/Contents/MacOS/scanstudio-bridge"
 install -m 644 "$package_root/packaging/Info.plist" "$staged_app/Contents/Info.plist"
 
+# Stamp the exact release version from the build environment, so the running
+# app can report "I am 0.3.0-alpha.N". Best-effort: dev builds without
+# SCANSTUDIO_RELEASE_VERSION keep the empty default.
+if [[ -n "${SCANSTUDIO_RELEASE_VERSION:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :ScanStudioRelease '$SCANSTUDIO_RELEASE_VERSION'" \
+        "$staged_app/Contents/Info.plist" \
+        || { print -u2 "Failed to stamp ScanStudioRelease=$SCANSTUDIO_RELEASE_VERSION"; exit 1; }
+fi
+
 bundled_libusb="$staged_app/Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib"
 install -m 755 "$bundled_libusb_build/libusb-1.0.dylib" "$bundled_libusb"
 app_minimum="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$staged_app/Contents/Info.plist")"

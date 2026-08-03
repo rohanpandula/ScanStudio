@@ -54,10 +54,38 @@ jobs:
         run: uv run pytest
 
   package:
-    name: Self-contained package build
-    runs-on: macos-15
+    name: Self-contained package build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
     # See the bridge job: the relocatable package requires uv's standalone
     # CPython, not the runner image's framework Python.
+    #
+    # Why package runs on BOTH archs while app-and-engine / bridge / coolscanpy
+    # stay single-arch: those suites are arch-independent logic + tests, and a
+    # full double run doubles billing for no extra coverage. The package gate
+    # is the arch-relevant one -- it proves the bundled app + libusb + CPython
+    # wheels build and pass the relocation-safe bridge check natively on arm64
+    # AND x86_64 on every PR, mirroring the release matrix before a tag exists.
+    #
+    # Only the arm64 leg uploads the ScanStudio-app artifact: package-macos-14
+    # (the OS-floor gate) and updater-integration consume that one arm64 app,
+    # and two matrix legs must not race on the same artifact name. The x86_64
+    # leg still builds + verifies natively; it just has no downstream consumer
+    # yet.
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [arm64, x86_64]
+        include:
+          - arch: arm64
+            runs-on: macos-15
+            upload-artifact: true
+          # GitHub-hosted Intel labels change over time; per the GitHub-hosted
+          # runners reference the current standard is `macos-15-intel`. Kept in
+          # lockstep with the release.yml matrix -- if it stops resolving, the
+          # conservative fallback is `macos-13`; update BOTH files together.
+          - arch: x86_64
+            runs-on: macos-15-intel
+            upload-artifact: false
     env:
       UV_PYTHON_PREFERENCE: only-managed
     steps:
@@ -85,12 +113,17 @@ jobs:
         working-directory: bridge
         run: uv sync --locked --extra scanner
       - name: Build and verify the local package
+        # make package runs package_app.sh then test_packaged_bridge.sh on the
+        # built ScanStudio.app -- the relocation-safe bridge check -- so this
+        # leg proves the packaged app works on this runner's native arch.
         working-directory: app/ScanStudio
         run: make package
       - name: Preserve the exact signed app for the macOS 14 runtime gate
+        if: ${{ matrix.upload-artifact }}
         working-directory: app/ScanStudio/.build
         run: ditto -c -k --sequesterRsrc --keepParent ScanStudio.app ScanStudio-app.zip
       - uses: actions/upload-artifact@v4
+        if: ${{ matrix.upload-artifact }}
         with:
           name: ScanStudio-app
           path: app/ScanStudio/.build/ScanStudio-app.zip
@@ -123,3 +156,42 @@ jobs:
         run: |
           ditto -x -k "$RUNNER_TEMP/scanstudio-package/ScanStudio-app.zip" "$RUNNER_TEMP/scanstudio-package/unpacked"
           app/ScanStudio/scripts/test_packaged_bridge.sh "$RUNNER_TEMP/scanstudio-package/unpacked/ScanStudio.app"
+
+  updater-integration:
+    name: Updater integration gate
+    # Reuses the exact signed app produced by the package job so the "release"
+    # under test is the shipped artifact, not a dev build. Same-workflow job
+    # ordering means the artifact is still present when this job runs, so the
+    # package job's 1-day retention needs no bump.
+    runs-on: macos-15
+    needs: package
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Warm the locked dependency cache
+        # Keeps the runner environment interchangeable with the other uv-managed
+        # jobs (see the bridge job note) so script behaviour is reproducible.
+        working-directory: bridge
+        run: uv sync --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-app
+          path: ${{ runner.temp }}/scanstudio-updater
+      - name: Unpack the packaged app for the updater gate
+        run: |
+          ditto -x -k "$RUNNER_TEMP/scanstudio-updater/ScanStudio-app.zip" "$RUNNER_TEMP/scanstudio-updater/unpacked"
+      - name: Run the seeded updater verification against the exact packaged app
+        # Both point at the same real app: the script seeds its feed from the
+        # new-app bytes and the harness proves resolve -> download -> verify ->
+        # snapshot -> swap -> rollback on its own synthetic old/new fixtures, so
+        # the flow's hash + swap still prove out against the signed artifact.
+        env:
+          SCANSTUDIO_UPDATER_CURRENT_APP: ${{ runner.temp }}/scanstudio-updater/unpacked/ScanStudio.app
+          SCANSTUDIO_UPDATER_NEW_APP: ${{ runner.temp }}/scanstudio-updater/unpacked/ScanStudio.app
+        run: |
+          scripts/verify_updater.sh 2>&1 | tee "$RUNNER_TEMP/verify_updater.log"
+          grep -q "VERIFY_UPDATER OK" "$RUNNER_TEMP/verify_updater.log"
