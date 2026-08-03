@@ -69,6 +69,16 @@ public final class GitHubUpdateChecker: UpdateChecking {
     public static let apiReleasesURL: URL =
         URL(string: "https://api.github.com/repos/rohanpandula/ScanStudio/releases?per_page=5")!
 
+    /// The deterministic per-release pointer asset for `tag`. The 01-01
+    /// release pipeline emits a `latest.json` (`{"version","url","sha256"}`)
+    /// into every release, so the alpha path can fetch the newest pre-release's
+    /// OWN pointer instead of borrowing the configured (stable) pointer's
+    /// checksum. Mirrors `apiReleasesURL` as an exposed constant surface for
+    /// tests; the tag is a parameter because it varies per release.
+    public static func releasePointerURL(tag: String) -> URL {
+        URL(string: "https://github.com/rohanpandula/ScanStudio/releases/download/\(tag)/latest.json")!
+    }
+
     private let pointerURL: URL
     private let session: any URLSessionProtocol
 
@@ -108,59 +118,63 @@ public final class GitHubUpdateChecker: UpdateChecking {
     // MARK: - Alpha API probe
 
     /// Best-effort: the newest pre-release from the GitHub API that is at
-    /// least as new as `pointer`. Any API failure (transport, decode, no
-    /// match) degrades gracefully to nil → the caller keeps the pointer
-    /// candidate. The API payload decodes only `tag_name`/`prerelease`/
-    /// `html_url` (the source of truth for artifact bytes stays the pointer),
-    /// so a found candidate's download URL is derived from the deterministic
-    /// asset naming and its `sha256` falls back to the pointer's. If that
-    /// derivation does not match the real artifact, the downloader's
-    /// checksum gate rejects the download before anything is mounted or
-    /// installed — a safe failure, never a silent wrong install.
+    /// least as new as `pointer`. The API probe only answers *which* tag is
+    /// newest; the candidate's bytes + sha256 come from that release's OWN
+    /// per-release `latest.json` (authoritative artifact metadata), never
+    /// borrowed from the configured stable pointer. Any failure — API
+    /// transport/decode, a missing or corrupt per-release pointer, or a
+    /// version mismatch between the tag and its pointer — degrades silently to
+    /// nil, so the caller keeps the configured pointer candidate (fail-closed:
+    /// never a wrong install, never a self-inconsistent url+sha256 pairing).
     private func newestPreRelease(over pointer: UpdateCandidate) async -> UpdateCandidate? {
         guard let (data, _) = try? await session.data(from: Self.apiReleasesURL),
               let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data) else {
             return nil
         }
-        var candidates: [UpdateCandidate] = []
-        candidates.reserveCapacity(releases.count)
+        // Locate the newest prerelease tag that is at least as new as the
+        // pointer (as today). Normalize the tag so versions compare
+        // semantically (no leading `v`); the tag stays verbatim for the URL.
+        var newest: (tag: String, version: UpdateVersion, notesURL: URL?)?
         for release in releases where release.prerelease {
-            // Normalize the tag so the candidate's raw version matches the
-            // pointer's spelling (no leading `v`); the tag itself is still
-            // used verbatim for the release download-URL path.
             let tag = release.tag_name
             let versionString = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-            guard let version = UpdateVersion(raw: versionString) else { continue }
-            candidates.append(UpdateCandidate(
-                version: version,
-                downloadURL: Self.releaseDownloadURL(tag: tag, version: version),
-                sha256: pointer.sha256,
-                releaseNotesURL: URL(string: release.html_url)
-            ))
+            guard let version = UpdateVersion(raw: versionString), version >= pointer.version else {
+                continue
+            }
+            if newest == nil || newest!.version < version {
+                newest = (tag, version, URL(string: release.html_url))
+            }
         }
-        guard let newest = Self.newest(candidates), newest.version >= pointer.version else {
+        guard let newest else { return nil }
+
+        // Authoritative bytes + checksum come from the newest release's own
+        // per-release pointer. Equality-of-intent: the pointer's version must
+        // match the tag we probed, or we silently fall back to the configured
+        // pointer rather than install mismatched bytes.
+        guard let releasePointer = await fetchReleasePointer(tag: newest.tag),
+              let releaseVersion = UpdateVersion(raw: releasePointer.version),
+              releaseVersion == newest.version else {
             return nil
         }
-        return newest
+        return UpdateCandidate(
+            version: newest.version,
+            downloadURL: releasePointer.url,
+            sha256: releasePointer.sha256,
+            releaseNotesURL: newest.notesURL
+        )
     }
 
-    /// Deterministic DMG asset path on GitHub Releases for a tag, matching the
-    /// pipeline's `ScanStudio-<ver>-macOS-arm64.dmg` naming (leading `v` in
-    /// the tag is not part of the asset name).
-    private static func releaseDownloadURL(tag: String, version: UpdateVersion) -> URL {
-        let stem = version.raw.hasPrefix("v") ? String(version.raw.dropFirst()) : version.raw
-        return URL(
-            string: "https://github.com/rohanpandula/ScanStudio/releases/download/\(tag)/ScanStudio-\(stem)-macOS-arm64.dmg"
-        )!
-    }
-
-    /// Newest candidate under `UpdateVersion` ordering (`<`); nil when empty.
-    static func newest(_ candidates: [UpdateCandidate]) -> UpdateCandidate? {
-        guard var best = candidates.first else { return nil }
-        for candidate in candidates.dropFirst() where best.version < candidate.version {
-            best = candidate
+    /// Fetches and decodes the per-release `latest.json` pointer for `tag`.
+    /// Returns nil (never throws) on any transport or decode failure so the
+    /// alpha path can fall back silently to the configured pointer. Version
+    /// validation against the tag happens in the caller.
+    private func fetchReleasePointer(tag: String) async -> UpdatePointer? {
+        let url = Self.releasePointerURL(tag: tag)
+        guard let (data, _) = try? await session.data(from: url),
+              let pointer = try? JSONDecoder().decode(UpdatePointer.self, from: data) else {
+            return nil
         }
-        return best
+        return pointer
     }
 
     /// The subset of a GitHub release object the alpha probe decodes.

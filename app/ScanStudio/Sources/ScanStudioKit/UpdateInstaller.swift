@@ -22,6 +22,9 @@ public enum UpdateInstallError: Error, Equatable {
     case swapFailed
     /// `restorePrevious()` was called but no snapshot is available.
     case rolledBack
+    /// No install destination is writable: neither `appDirectory` nor any
+    /// user-writable fallback (e.g. `~/Applications`) accepts the install.
+    case cannotWriteTarget
 }
 
 /// A verified update candidate ready to install: the mounted app bundle
@@ -53,6 +56,10 @@ public final class UpdateInstaller {
     /// Where versioned snapshots are written, e.g.
     /// `~/Library/Application Support/ScanStudio/Rollback/`.
     private let rollbackDirectory: URL
+    /// Additional destinations the caller permits falling back to when
+    /// `appDirectory` is not writable (01-08 gap closure). Empty means
+    /// "default to the user-writable `~/Applications`".
+    private let authorizedDestinations: [URL]
 
     /// The most recent snapshot taken by this instance — the only source of
     /// truth for `availableRollback`. Never cleared after a later successful
@@ -61,12 +68,29 @@ public final class UpdateInstaller {
 
     private let fileManager = FileManager.default
 
-    public init(appDirectory: URL, rollbackDirectory: URL) throws {
+    /// The preferred install candidate destinations, in preference order:
+    /// `/Applications`, then the current user's `~/Applications` (a candidate
+    /// only — never created on disk here). Kept as a pure static helper so
+    /// tests and the flow model share one source of truth.
+    public static func defaultInstallDestinations() -> [URL] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            home.appendingPathComponent("Applications", isDirectory: true),
+        ]
+    }
+
+    public init(
+        appDirectory: URL,
+        rollbackDirectory: URL,
+        authorizedDestinations: [URL] = []
+    ) throws {
         guard appDirectory.isExistingDirectory, rollbackDirectory.isExistingDirectory else {
             throw UpdateInstallError.badArguments
         }
         self.appDirectory = appDirectory
         self.rollbackDirectory = rollbackDirectory
+        self.authorizedDestinations = authorizedDestinations
     }
 
     /// The last snapshot this instance recorded, if any.
@@ -74,30 +98,77 @@ public final class UpdateInstaller {
         lastSnapshot
     }
 
+    /// The destination installs will actually write to, given the state of the
+    /// filesystem: `appDirectory` when writable, else the first writable
+    /// authorized destination, else `.cannotWriteTarget`. Throwing so the
+    /// caller can surface a clear error instead of a misleading `.swapFailed`.
+    public var installDestination: URL {
+        get throws { try resolveInstallDestination() }
+    }
+
+    /// Resolves where an install may happen: prefers `appDirectory` when it is
+    /// writable; otherwise falls back through `authorizedDestinations`
+    /// (defaulting to `~/Applications`) to the first writable one; otherwise
+    /// throws `.cannotWriteTarget`. `~/Applications` keeps snapshot/rollback
+    /// identical — both are per-destination rollback directories.
+    public func resolveInstallDestination() throws -> URL {
+        if fileManager.isWritableFile(atPath: appDirectory.path) {
+            return appDirectory
+        }
+        let fallbacks = authorizedDestinations.isEmpty
+            ? Array(Self.defaultInstallDestinations().dropFirst())
+            : authorizedDestinations
+        for destination in fallbacks where Self.isWritableTarget(destination) {
+            return destination
+        }
+        throw UpdateInstallError.cannotWriteTarget
+    }
+
+    /// Whether `directory` can accept a write: writable when it exists;
+    /// when it does not exist yet (e.g. `~/Applications`), writable iff its
+    /// nearest existing ancestor is writable.
+    private static func isWritableTarget(_ directory: URL) -> Bool {
+        var probe = directory
+        while !FileManager.default.fileExists(atPath: probe.path) {
+            let parent = probe.deletingLastPathComponent()
+            if parent == probe { return false }
+            probe = parent
+        }
+        return FileManager.default.isWritableFile(atPath: probe.path)
+    }
+
     /// Copies the current `<appDirectory>/ScanStudio.app` into the rollback
     /// directory as `ScanStudio-<version>.app`. No-op (does not throw) when
     /// there is no app to snapshot.
     public func snapshotCurrent() throws {
-        let appURL = appDirectory.appendingPathComponent("ScanStudio.app", isDirectory: true)
+        try snapshotCurrentCore(in: appDirectory)
+    }
+
+    /// The snapshot core — exactly the shipped snapshot mechanics, operating
+    /// on whichever install directory is actually in use (so a user-folder
+    /// install snapshots/restores correctly from that destination).
+    private func snapshotCurrentCore(in destination: URL) throws {
+        let appURL = destination.appendingPathComponent("ScanStudio.app", isDirectory: true)
         guard fileManager.fileExists(atPath: appURL.path) else {
             return
         }
         do {
             let version = try Self.versionOfBundle(at: appURL)
             try fileManager.createDirectory(at: rollbackDirectory, withIntermediateDirectories: true)
-            let destination = rollbackDirectory.appendingPathComponent("ScanStudio-\(version.raw).app", isDirectory: true)
-            if fileManager.fileExists(atPath: destination.path) {
-                try fileManager.removeItem(at: destination)
+            let snapshotURL = rollbackDirectory.appendingPathComponent("ScanStudio-\(version.raw).app", isDirectory: true)
+            if fileManager.fileExists(atPath: snapshotURL.path) {
+                try fileManager.removeItem(at: snapshotURL)
             }
-            try fileManager.copyItem(at: appURL, to: destination)
-            lastSnapshot = (version, destination)
+            try fileManager.copyItem(at: appURL, to: snapshotURL)
+            lastSnapshot = (version, snapshotURL)
         } catch {
             throw UpdateInstallError.cannotSnapshot
         }
     }
 
-    /// Installs a verified archive: snapshot current, stage the source
-    /// bundle beside the app, atomically replace, confirm in place.
+    /// Installs a verified archive: resolve the writable destination, snapshot
+    /// current, stage the source bundle beside the app, atomically replace,
+    /// confirm in place.
     public func install(_ archive: UpdateArchive) throws {
         guard fileManager.fileExists(atPath: archive.sourceAppPath.path),
               archive.sourceAppPath.isExistingDirectory else {
@@ -106,33 +177,38 @@ public final class UpdateInstaller {
         guard !archive.checksumSHA256.isEmpty else {
             throw UpdateInstallError.notVerified
         }
-        try snapshotCurrent()
+        // Preflight the destination up front: an unwritable target surfaces a
+        // clear `.cannotWriteTarget`, never a misleading `.swapFailed`.
+        let destination = try resolveInstallDestination()
+        try snapshotCurrentCore(in: destination)
         do {
-            let staging = stagingURL()
+            let staging = stagingURL(in: destination)
             if fileManager.fileExists(atPath: staging.path) {
                 try fileManager.removeItem(at: staging)
             }
             try fileManager.copyItem(at: archive.sourceAppPath, to: staging)
-            try swapIn(staged: staging)
+            try swapIn(staged: staging, into: destination)
         } catch {
             throw UpdateInstallError.swapFailed
         }
     }
 
-    /// Restores the last snapshot (if any) into `<appDirectory>/ScanStudio.app`
-    /// via the same stage-and-swap path. Returns the restored app path.
+    /// Restores the last snapshot (if any) into the resolved install
+    /// destination's `ScanStudio.app` via the same stage-and-swap path.
+    /// Returns the restored app path.
     @discardableResult
     public func restorePrevious() throws -> URL {
         guard let snapshot = lastSnapshot else {
             throw UpdateInstallError.rolledBack
         }
-        let staging = stagingURL()
+        let destination = try resolveInstallDestination()
+        let staging = stagingURL(in: destination)
         if fileManager.fileExists(atPath: staging.path) {
             try fileManager.removeItem(at: staging)
         }
         try fileManager.copyItem(at: snapshot.url, to: staging)
-        try swapIn(staged: staging)
-        return appDirectory.appendingPathComponent("ScanStudio.app", isDirectory: true)
+        try swapIn(staged: staging, into: destination)
+        return destination.appendingPathComponent("ScanStudio.app", isDirectory: true)
     }
 
     // MARK: - Swapping
@@ -140,9 +216,9 @@ public final class UpdateInstaller {
     /// Atomic-ish replacement: move the staged bundle into the app slot,
     /// keeping the previous app as `ScanStudio.prev` until the new one is
     /// confirmed present and readable, then drop the backup.
-    private func swapIn(staged: URL) throws {
-        let current = appDirectory.appendingPathComponent("ScanStudio.app", isDirectory: true)
-        let backup = appDirectory.appendingPathComponent("ScanStudio.prev", isDirectory: true)
+    private func swapIn(staged: URL, into destination: URL) throws {
+        let current = destination.appendingPathComponent("ScanStudio.app", isDirectory: true)
+        let backup = destination.appendingPathComponent("ScanStudio.prev", isDirectory: true)
 
         do {
             _ = try fileManager.replaceItemAt(current, withItemAt: staged, backupItemName: "ScanStudio.prev")
@@ -169,8 +245,8 @@ public final class UpdateInstaller {
         try? fileManager.moveItem(at: backup, to: current)
     }
 
-    private func stagingURL() -> URL {
-        appDirectory.appendingPathComponent(".ScanStudio.new", isDirectory: true)
+    private func stagingURL(in directory: URL) -> URL {
+        directory.appendingPathComponent(".ScanStudio.new", isDirectory: true)
     }
 
     // MARK: - Version helpers

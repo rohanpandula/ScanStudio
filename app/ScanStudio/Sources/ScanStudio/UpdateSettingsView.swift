@@ -35,6 +35,17 @@ struct UpdateSettingsView: View {
 
                 stateContent
 
+                if let destination = model.pendingInstallDestination {
+                    Text("Install target: \(destination)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if destination != "/Applications" {
+                        Text("This installation uses a user-folder target instead of /Applications.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if case .updateAvailable = model.checkState, model.jobActive {
                     Text("Install is paused while a scan or preview is active.")
                         .font(.caption)

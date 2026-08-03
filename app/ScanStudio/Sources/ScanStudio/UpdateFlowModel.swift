@@ -59,6 +59,12 @@ final class UpdateFlowModel {
     /// its own.
     var pendingInstallURL: URL?
 
+    /// The resolved install destination (user-visible path) once an install
+    /// has preflighted writability — e.g. `/Applications` or a user-writable
+    /// `~/Applications` fallback (01-08 gap closure). Surfaced in the Settings
+    /// scene so the user knows where the update is going.
+    var pendingInstallDestination: String?
+
     /// Host-owned job-active guard (AUT-05-GUARD). `ScanStudioApp`'s
     /// `AppDelegate` mirrors the real `SessionModel.isJobActive` signal into
     /// this property. The Settings scene disables Install while `true`, and
@@ -135,6 +141,12 @@ final class UpdateFlowModel {
                 sourceAppPath: appURL,
                 checksumSHA256: candidate.sha256
             )
+            // Preflight the destination so an unwritable target resolves to a
+            // user-writable location (or a clear typed error) — never a
+            // misleading bare `.swapFailed`. The installer re-resolves the same
+            // destination internally, so the surfaced path matches the swap.
+            let destination = try installer.installDestination
+            pendingInstallDestination = destination.path
             try installer.install(archive)
             installProgress = 1
             pendingInstallURL = appURL
@@ -188,6 +200,8 @@ final class UpdateFlowModel {
             return "The current app could not be snapshotted for rollback."
         case UpdateInstallError.swapFailed:
             return "The install failed; your previous version is still in place."
+        case UpdateInstallError.cannotWriteTarget:
+            return "The current user cannot write to the app folder; install to ~/Applications (or add an administrator account) and try again."
         case UpdateInstallError.rolledBack:
             return "No previous version was available to roll back to."
         default:

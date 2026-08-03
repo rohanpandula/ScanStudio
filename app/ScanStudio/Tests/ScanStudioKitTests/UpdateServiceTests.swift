@@ -25,6 +25,26 @@ final class UpdateServiceTests: XCTestCase {
     private static let pointerDownloadURL =
         "https://github.com/rohanpandula/ScanStudio/releases/download/v0.3.0-alpha.11/ScanStudio-0.3.0-alpha.11-macOS-arm64.dmg"
 
+    /// The configured pointer's checksum ('a'…). Deliberately distinct from the
+    /// per-release checksum below so tests can prove the alpha path never
+    /// borrows the stable pointer's sha256 for a different artifact.
+    private static let stableChecksum = String(repeating: "a", count: 64)
+
+    /// The newest pre-release's OWN per-release pointer checksum ('b'…).
+    private static let perReleaseChecksum = String(repeating: "b", count: 64)
+
+    /// The per-release `latest.json` the 01-01 pipeline emits for the
+    /// `v0.3.0-alpha.12` release: authoritative url + sha256 for THAT release.
+    private static var alpha12ReleasePointerJSON: String {
+        """
+        {
+            "version": "0.3.0-alpha.12",
+            "url": "https://github.com/rohanpandula/ScanStudio/releases/download/v0.3.0-alpha.12/ScanStudio-0.3.0-alpha.12-macOS-arm64.dmg",
+            "sha256": "\(perReleaseChecksum)"
+        }
+        """
+    }
+
     override func setUpWithError() throws {
         try super.setUpWithError()
         root = FileManager.default.temporaryDirectory
@@ -89,6 +109,10 @@ final class UpdateServiceTests: XCTestCase {
             }
         ]
         """.utf8)
+        // Production behavior: the newer prerelease's candidate requires its
+        // own per-release pointer (authoritative bytes+checksum). Stub it so
+        // the API-probed alpha.12 is preferred, as the release pipeline emits.
+        stub.dataByURL[perReleaseURL(tag: "v0.3.0-alpha.12")] = Data(Self.alpha12ReleasePointerJSON.utf8)
 
         let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
         let candidate = try await checker.latestCandidate(channel: .alpha)
@@ -96,6 +120,8 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(candidate?.version.raw, "0.3.0-alpha.12",
                        "alpha must prefer the newer prerelease from the API")
         XCTAssertEqual(candidate?.version, UpdateVersion(raw: "0.3.0-alpha.12"))
+        XCTAssertEqual(candidate?.sha256, Self.perReleaseChecksum,
+                       "the newer prerelease's checksum must come from its own per-release pointer")
         XCTAssertEqual(candidate?.releaseNotesURL?.absoluteString,
                        "https://github.com/rohanpandula/ScanStudio/releases/tag/v0.3.0-alpha.12")
     }
@@ -113,6 +139,92 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertNotNil(candidate, "an API failure must not crash or throw")
         XCTAssertEqual(candidate?.version.raw, "0.3.0-alpha.11",
                        "alpha must fall back to the pointer candidate on API error")
+    }
+
+    // MARK: - 4b. Authoritative alpha checksum (01-08 gap closure)
+
+    func testAlphaUsesPerReleaseChecksum() async throws {
+        let stub = StubURLSession()
+        stub.dataByURL[pointerURL()] = Data(Self.pointerJSON.utf8)
+        stub.dataByURL[GitHubUpdateChecker.apiReleasesURL] = Data("""
+        [
+            {
+                "tag_name": "v0.3.0-alpha.12",
+                "prerelease": true,
+                "html_url": "https://github.com/rohanpandula/ScanStudio/releases/tag/v0.3.0-alpha.12"
+            }
+        ]
+        """.utf8)
+        // The newest pre-release's own per-release pointer — checksum 'b'…,
+        // distinct from the configured pointer's 'a'….
+        stub.dataByURL[perReleaseURL(tag: "v0.3.0-alpha.12")] = Data(Self.alpha12ReleasePointerJSON.utf8)
+
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+        let candidate = try await checker.latestCandidate(channel: .alpha)
+
+        let resolved = try XCTUnwrap(candidate)
+        XCTAssertEqual(resolved.version.raw, "0.3.0-alpha.12")
+        XCTAssertEqual(resolved.sha256, Self.perReleaseChecksum,
+                       "the candidate's sha256 must come from the release's own pointer, not the stable pointer")
+        XCTAssertEqual(
+            resolved.downloadURL.absoluteString,
+            "https://github.com/rohanpandula/ScanStudio/releases/download/v0.3.0-alpha.12/ScanStudio-0.3.0-alpha.12-macOS-arm64.dmg"
+        )
+        XCTAssertNotEqual(resolved.sha256, Self.stableChecksum,
+                         "the per-release checksum must differ from the configured pointer's")
+    }
+
+    func testAlphaFallsBackToPointerWhenPerReleasePointerUnavailable() async throws {
+        let stub = StubURLSession()
+        stub.dataByURL[pointerURL()] = Data(Self.pointerJSON.utf8)
+        stub.dataByURL[GitHubUpdateChecker.apiReleasesURL] = Data("""
+        [
+            { "tag_name": "v0.3.0-alpha.12", "prerelease": true, "html_url": "https://github.com/x" }
+        ]
+        """.utf8)
+        // NOTE: the per-release URL is NOT stubbed → data(from:) throws.
+
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+        let candidate = try await checker.latestCandidate(channel: .alpha)
+
+        let resolved = try XCTUnwrap(candidate, "a missing per-release pointer must not throw")
+        XCTAssertEqual(resolved.version.raw, "0.3.0-alpha.11",
+                       "fallback must resolve to the configured pointer candidate")
+        XCTAssertEqual(resolved.sha256, Self.stableChecksum)
+        XCTAssertEqual(resolved.downloadURL.absoluteString, Self.pointerDownloadURL)
+    }
+
+    func testAlphaIgnoresPerReleasePointerOnVersionMismatch() async throws {
+        let stub = StubURLSession()
+        stub.dataByURL[pointerURL()] = Data(Self.pointerJSON.utf8)
+        stub.dataByURL[GitHubUpdateChecker.apiReleasesURL] = Data("""
+        [
+            { "tag_name": "v0.3.0-alpha.12", "prerelease": true, "html_url": "https://github.com/x" }
+        ]
+        """.utf8)
+        // Per-release pointer decodes but its version (alpha.11) ≠ the tag
+        // (alpha.12) — equality-of-intent fails → fall back to the pointer.
+        stub.dataByURL[perReleaseURL(tag: "v0.3.0-alpha.12")] = Data(Self.pointerJSON.utf8)
+
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+        let candidate = try await checker.latestCandidate(channel: .alpha)
+
+        let resolved = try XCTUnwrap(candidate)
+        XCTAssertEqual(resolved.version.raw, "0.3.0-alpha.11",
+                       "a version mismatch between tag and per-release pointer must fall back to the configured pointer")
+        XCTAssertEqual(resolved.sha256, Self.stableChecksum)
+        XCTAssertEqual(resolved.downloadURL.absoluteString, Self.pointerDownloadURL)
+    }
+
+    func testAlphaStableChecksumDifferenceProvesBorrowEnded() {
+        // Guards the regression: the per-release checksum constant and the
+        // stable pointer's checksum genuinely differ, so the alpha test can
+        // actually detect a re-borrow of the stable checksum.
+        XCTAssertEqual(Self.stableChecksum, String(repeating: "a", count: 64))
+        XCTAssertEqual(Self.perReleaseChecksum, String(repeating: "b", count: 64))
+        XCTAssertNotEqual(Self.perReleaseChecksum, Self.stableChecksum)
+        XCTAssertEqual(Self.perReleaseChecksum.count, 64)
+        XCTAssertEqual(Self.stableChecksum.count, 64)
     }
 
     // MARK: - 5. Unparseable pointer version means no update
@@ -242,6 +354,12 @@ final class UpdateServiceTests: XCTestCase {
 
     private func pointerURL() -> URL {
         URL(string: "https://example.com/latest.json")!
+    }
+
+    /// The deterministic per-release pointer URL for a tag (mirrors the
+    /// checker's exposed `releasePointerURL(tag:)`).
+    private func perReleaseURL(tag: String) -> URL {
+        GitHubUpdateChecker.releasePointerURL(tag: tag)
     }
 
     private func requireHDIUtil() throws {

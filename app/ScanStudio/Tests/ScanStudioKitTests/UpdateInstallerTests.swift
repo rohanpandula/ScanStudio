@@ -11,6 +11,9 @@ final class UpdateInstallerTests: XCTestCase {
     private var applicationsDirectory: URL!
     private var rollbackDirectory: URL!
     private var sourceDirectory: URL!
+    /// Directories the tests chmod'd non-writable; reset to writable in
+    /// tearDown so the temp tree can always be removed.
+    private var nonWritableDirs: [URL] = []
 
     override func setUpWithError() throws {
         try super.setUpWithError()
@@ -28,6 +31,9 @@ final class UpdateInstallerTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        for directory in nonWritableDirs {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
+        }
         if let root {
             try? FileManager.default.removeItem(at: root)
         }
@@ -111,10 +117,118 @@ final class UpdateInstallerTests: XCTestCase {
         }
     }
 
+    // MARK: - 01-08: install-destination resolution + rollback intact
+
+    func testResolveInstallDestinationPrefersWritableAppDir() throws {
+        let installer = try makeInstaller()
+
+        let resolved = try installer.resolveInstallDestination()
+        XCTAssertEqual(resolved, applicationsDirectory,
+                       "a writable appDirectory must be preferred as the install destination")
+        XCTAssertEqual(try installer.installDestination, applicationsDirectory,
+                       "the throwing computed installDestination must agree")
+    }
+
+    func testResolveInstallDestinationFallsBackToWritable() throws {
+        let unwritable = root.appendingPathComponent("Unwritable", isDirectory: true)
+        try FileManager.default.createDirectory(at: unwritable, withIntermediateDirectories: true)
+        guard makeNonWritable(unwritable) else {
+            // Filesystem refused chmod (e.g. a sandboxed container): the
+            // non-writable scenario cannot be simulated here — skip rather
+            // than fail the suite.
+            throw XCTSkip("chmod was refused; cannot simulate a non-writable directory")
+        }
+        nonWritableDirs.append(unwritable)
+
+        let fallback = root.appendingPathComponent("Fallback", isDirectory: true)
+        try FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+
+        let installer = try UpdateInstaller(
+            appDirectory: unwritable,
+            rollbackDirectory: rollbackDirectory,
+            authorizedDestinations: [fallback]
+        )
+
+        XCTAssertEqual(try installer.resolveInstallDestination(), fallback,
+                       "an unwritable appDirectory must fall back to a writable authorized destination")
+    }
+
+    func testResolveInstallDestinationThrowsWhenNothingWritable() throws {
+        let unwritable = root.appendingPathComponent("Unwritable", isDirectory: true)
+        let unwritableFallback = root.appendingPathComponent("UnwritableFallback", isDirectory: true)
+        try FileManager.default.createDirectory(at: unwritable, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: unwritableFallback, withIntermediateDirectories: true)
+        guard makeNonWritable(unwritable), makeNonWritable(unwritableFallback) else {
+            throw XCTSkip("chmod was refused; cannot simulate non-writable directories")
+        }
+        nonWritableDirs.append(contentsOf: [unwritable, unwritableFallback])
+
+        let installer = try UpdateInstaller(
+            appDirectory: unwritable,
+            rollbackDirectory: rollbackDirectory,
+            authorizedDestinations: [unwritableFallback]
+        )
+
+        XCTAssertThrowsError(try installer.resolveInstallDestination()) { error in
+            XCTAssertEqual(error as? UpdateInstallError, .cannotWriteTarget)
+        }
+    }
+
+    func testInstallStillSwapsAndRollsBackAfterFallback() throws {
+        // The preferred target is non-writable; install must fall back to a
+        // user-writable destination and still snapshot/swap/roll back there
+        // (rollback integrity must survive the destination change).
+        let unwritable = root.appendingPathComponent("Unwritable", isDirectory: true)
+        try FileManager.default.createDirectory(at: unwritable, withIntermediateDirectories: true)
+        guard makeNonWritable(unwritable) else {
+            throw XCTSkip("chmod was refused; cannot simulate a non-writable directory")
+        }
+        nonWritableDirs.append(unwritable)
+
+        let fallback = root.appendingPathComponent("Fallback", isDirectory: true)
+        try FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+        // An existing app in the fallback destination, so the snapshot has
+        // something to capture and rollback can prove full restoration.
+        try makeFakeApp("ScanStudio.app", at: fallback, release: "0.3.0-alpha.10", marker: "old")
+
+        let installer = try UpdateInstaller(
+            appDirectory: unwritable,
+            rollbackDirectory: rollbackDirectory,
+            authorizedDestinations: [fallback]
+        )
+        let archive = makeArchive(appName: "ScanStudio.app", in: sourceDirectory, version: "0.3.0-alpha.11")
+
+        XCTAssertEqual(try installer.resolveInstallDestination(), fallback)
+        try installer.install(archive)
+
+        XCTAssertEqual(try markerContents(at: fallback.appendingPathComponent("ScanStudio.app")), "new",
+                       "install must swap the new app into the fallback destination")
+        XCTAssertNotNil(installer.availableRollback, "install must first snapshot so rollback is available")
+        XCTAssertEqual(installer.availableRollback?.version.raw, "0.3.0-alpha.10")
+
+        let restored = try installer.restorePrevious()
+        XCTAssertEqual(restored.lastPathComponent, "ScanStudio.app")
+        XCTAssertEqual(try markerContents(at: fallback.appendingPathComponent("ScanStudio.app")), "old",
+                       "rollback must restore the previous app in the fallback destination")
+    }
+
     // MARK: - Fixture helpers
 
     private func makeInstaller() throws -> UpdateInstaller {
         try UpdateInstaller(appDirectory: applicationsDirectory, rollbackDirectory: rollbackDirectory)
+    }
+
+    /// Makes `directory` un-writable (chmod 0555) so destination-resolution
+    /// tests can prove fallback behavior. Returns whether it actually became
+    /// non-writable; if the filesystem refuses `chmod` (e.g. a container that
+    /// ignores modes), callers skip their assertion rather than fail the suite.
+    private func makeNonWritable(_ directory: URL) -> Bool {
+        do {
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory.path)
+            return !FileManager.default.isWritableFile(atPath: directory.path)
+        } catch {
+            return false
+        }
     }
 
     private func makeArchive(appName: String, in directory: URL, version: String) -> UpdateArchive {
