@@ -38,8 +38,8 @@ final class UpdateFlowModel {
     private let channelDefaultsKey: String
     private let defaults: UserDefaults
 
-    /// Release channel the user is on. Persisted on change; the project ships
-    /// alphas, so the default is `.alpha`.
+    /// Release channel the user is on. Persisted on change. The `.alpha` raw
+    /// value is retained for compatibility and represents all prereleases.
     var channel: UpdateChannel {
         didSet {
             defaults.set(channel.rawValue, forKey: channelDefaultsKey)

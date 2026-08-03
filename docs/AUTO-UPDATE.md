@@ -18,11 +18,9 @@ works with the existing ad-hoc signing, so it ships now and Path B waits.
 
 ## Path A (active) — how it works
 
-As of this writing the shipped pieces are the release pipeline (01-01), version
-identity (01-02), the install core (01-03), and the verified update service
-(01-04, extended in Phase 02 with host-architecture-aware resolution); the
-Settings UI (01-05) is next in the plan queue but not yet shipped; the bullets
-mark status rather than claim what exists.
+The shipped pieces are the release pipeline (01-01), version identity (01-02),
+install core (01-03), verified update service (01-04), Settings UI (01-05),
+integration gate (01-06), and host-architecture-aware resolution (Phase 02).
 
 - **Release pipeline (plan 01-01, shipped):** tag-triggered
   `.github/workflows/release.yml` (`on: push: tags: ['v*']`) runs `make dmg`
@@ -56,8 +54,8 @@ mark status rather than claim what exists.
   unsupported-architecture error — never a wrong-arch install. Local
   verification proves selection + hash integrity offline; the real Intel
   bundle executes on the CI x86_64 runner.
-- **UI (plan 01-05, NOT yet shipped):** once landed, `UpdateSettingsView.swift`
-  + `UpdateFlowModel.swift` will surface current version, "Check for Updates",
+- **UI (plan 01-05, shipped):** `UpdateSettingsView.swift` +
+  `UpdateFlowModel.swift` surface current version, "Check for Updates",
   channel toggle, install/rollback, a 24 h background cadence, and the guard
   that refuses an install while a scan/preview job is active.
 

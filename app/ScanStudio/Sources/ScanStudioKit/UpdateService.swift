@@ -1,6 +1,6 @@
 // Update feed and verified download service (01-04). Resolves the newest
 // release for a channel (the `latest.json` pointer, plus a GitHub API probe
-// for the alpha channel), downloads the DMG, verifies its SHA-256 before any
+// for the prerelease channel), downloads the DMG, verifies its SHA-256 before any
 // mount, then mounts and checks the code signature so a corrupted or
 // tampered download can never reach the install core (01-03). All network is
 // behind an injectable `URLSessionProtocol`, so the whole service is unit
@@ -99,7 +99,8 @@ public enum HostArchitectureProvider {
 }
 
 /// The release channel a user is on. `stable` only trusts the pointer;
-/// `alpha` also probes the GitHub API for freshly published pre-releases.
+/// `alpha` is the persisted raw value for the prerelease channel and also
+/// probes the GitHub API for freshly published alpha, beta, or RC releases.
 public enum UpdateChannel: String, CaseIterable, Sendable {
     case stable = "stable"
     case alpha = "alpha"
@@ -212,13 +213,13 @@ public protocol URLSessionProtocol: Sendable {
 extension URLSession: URLSessionProtocol {}
 
 /// Feed resolver: latest.json pointer for stable, pointer + a best-effort
-/// GitHub API probe for alpha.
+/// GitHub API probe for prereleases.
 public protocol UpdateChecking: Sendable {
     func latestCandidate(channel: UpdateChannel) async throws -> UpdateCandidate?
 }
 
 public final class GitHubUpdateChecker: UpdateChecking {
-    /// GitHub releases list the alpha channel probes. `per_page=5` keeps the
+    /// GitHub releases list the prerelease channel probes. `per_page=5` keeps the
     /// unauthenticated rate-limit headroom (60 req/hr/IP) comfortable for a
     /// once-per-launch check.
     public static let apiReleasesURL: URL =
@@ -226,7 +227,7 @@ public final class GitHubUpdateChecker: UpdateChecking {
 
     /// The deterministic per-release pointer asset for `tag`. The 01-01
     /// release pipeline emits a `latest.json` (`{"version","url","sha256"}`)
-    /// into every release, so the alpha path can fetch the newest pre-release's
+    /// into every release, so the prerelease path can fetch the newest release's
     /// OWN pointer instead of borrowing the configured (stable) pointer's
     /// checksum. Mirrors `apiReleasesURL` as an exposed constant surface for
     /// tests; the tag is a parameter because it varies per release.
@@ -255,8 +256,20 @@ public final class GitHubUpdateChecker: UpdateChecking {
         case .stable:
             return try await fetchPointerCandidate(arch: arch)
         case .alpha:
-            guard let pointer = try await fetchPointerCandidate(arch: arch) else { return nil }
-            return try await newestPreRelease(over: pointer, arch: arch) ?? pointer
+            do {
+                let pointer = try await fetchPointerCandidate(arch: arch)
+                return try await newestPreRelease(over: pointer, arch: arch) ?? pointer
+            } catch {
+                // A prerelease-only repository has no GitHub "latest" release,
+                // so releases/latest/download/latest.json returns 404. Probe
+                // prereleases anyway and use the chosen release's own pointer.
+                // If that bootstrap probe also fails, preserve the original
+                // feed error rather than disguising it as "no update."
+                if let prerelease = try await newestPreRelease(over: nil, arch: arch) {
+                    return prerelease
+                }
+                throw error
+            }
         }
     }
 
@@ -291,10 +304,12 @@ public final class GitHubUpdateChecker: UpdateChecking {
         return entry
     }
 
-    // MARK: - Alpha API probe
+    // MARK: - Prerelease API probe
 
     /// Best-effort: the newest pre-release from the GitHub API that is at
-    /// least as new as `pointer`, for the requested host arch. The API probe
+    /// least as new as `pointer` when a stable pointer exists, for the
+    /// requested host arch. With no stable release yet, `pointer` is nil and
+    /// the newest valid prerelease bootstraps the channel. The API probe
     /// only answers *which* tag is newest; the candidate's bytes + sha256 come
     /// from that release's OWN per-release `latest.json` (authoritative
     /// artifact metadata), never borrowed from the configured stable pointer.
@@ -304,7 +319,7 @@ public final class GitHubUpdateChecker: UpdateChecking {
     /// never a wrong install, never a self-inconsistent url+sha256 pairing).
     /// A per-release pointer with no entry for `arch` is NOT a transient
     /// network issue — it throws `UpdateArchError.unsupportedArchitecture`.
-    private func newestPreRelease(over pointer: UpdateCandidate, arch: HostArchitecture) async throws -> UpdateCandidate? {
+    private func newestPreRelease(over pointer: UpdateCandidate?, arch: HostArchitecture) async throws -> UpdateCandidate? {
         guard let (data, _) = try? await session.data(from: Self.apiReleasesURL),
               let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data) else {
             return nil
@@ -316,9 +331,10 @@ public final class GitHubUpdateChecker: UpdateChecking {
         for release in releases where release.prerelease {
             let tag = release.tag_name
             let versionString = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-            guard let version = UpdateVersion(raw: versionString), version >= pointer.version else {
+            guard let version = UpdateVersion(raw: versionString) else {
                 continue
             }
+            if let pointer, version < pointer.version { continue }
             if newest == nil || newest!.version < version {
                 newest = (tag, version, URL(string: release.html_url))
             }
@@ -345,7 +361,7 @@ public final class GitHubUpdateChecker: UpdateChecking {
 
     /// Fetches and decodes the per-release arch-aware `latest.json` pointer
     /// for `tag`. Returns nil (never throws) on any transport or decode
-    /// failure so the alpha path can fall back silently to the configured
+    /// failure so the prerelease path can fall back silently to the configured
     /// pointer. Version validation against the tag happens in the caller.
     private func fetchReleasePointer(tag: String) async -> UpdatePointerArch? {
         let url = Self.releasePointerURL(tag: tag)

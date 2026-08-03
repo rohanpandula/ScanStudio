@@ -19,10 +19,10 @@ struct UpdateSettingsView: View {
 
             Section("Release channel") {
                 Picker("Channel", selection: $model.channel) {
-                    Text("Alpha").tag(UpdateChannel.alpha)
+                    Text("Prerelease").tag(UpdateChannel.alpha)
                     Text("Stable").tag(UpdateChannel.stable)
                 }
-                Text("Alpha installs the newest pre-release; Stable only installs verified releases.")
+                Text("Prerelease installs the newest alpha, beta, or release candidate. Stable only installs full releases.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

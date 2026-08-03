@@ -182,9 +182,9 @@ jobs:
           print("Combined checksums re-verified for both architectures")
           PY
       - name: Create GitHub release
-        # How the alpha parcel behaves today: alphas are pre-releases on
-        # GitHub. Keep that --prerelease only for -alpha versions; stable
-        # tags publish as full releases. Both DMGs + combined checksums +
+        # Alpha, beta, and release-candidate parcels are pre-releases on
+        # GitHub. Stable versions publish as full releases. Both DMGs +
+        # combined checksums +
         # the arch-keyed pointer are attached in one release.
         env:
           GH_TOKEN: ${{ github.token }}
@@ -193,9 +193,15 @@ jobs:
           X86_SHA256="$(awk '{print $1}' "$RUNNER_TEMP/x86_64/SHA256SUMS")"
           PRERELEASE=""
           case "$RELEASE_VERSION" in
-            *-alpha*) PRERELEASE="--prerelease" ;;
+            *-alpha*|*-beta*|*-rc*) PRERELEASE="--prerelease" ;;
           esac
-          NOTES="Automated release of ScanStudio $RELEASE_VERSION.
+          NOTES="ScanStudio $RELEASE_VERSION
+
+          Apple Silicon (arm64): Beta. Validated with the real LS-5000 workflow.
+          Intel (x86_64): Preview. Built and tested natively in CI; real-scanner validation is still pending.
+
+          Both builds are ad-hoc signed and are not notarized. macOS may require Control-click > Open on first launch. Do not disable Gatekeeper globally.
+
           arm64 SHA-256: $ARM_SHA256
           x86_64 SHA-256: $X86_SHA256"
           gh release create "v$RELEASE_VERSION" \

@@ -4,15 +4,15 @@
 
 <img src="assets/scanstudio-ls5000-offline.jpeg" alt="ScanStudio running on macOS with an LS-5000 ED offered by the bridge as a Connect target. No scanner is selected, the status is OFFLINE, the simulator is absent, and no media or preview data is shown." width="1000">
 
-ScanStudio is a native macOS alpha for scanning 35 mm film with a Nikon SUPER COOLSCAN 5000 ED, also called the LS-5000. It replaces the practical Nikon Scan workflow on the tested setup: identify the loaded holder, preview the film, choose frames, set the recipe and outputs, scan, and stop safely when needed.
+ScanStudio is a native macOS beta for scanning 35 mm film with a Nikon SUPER COOLSCAN 5000 ED, also called the LS-5000. It replaces the practical Nikon Scan workflow on the tested Apple Silicon setup: identify the loaded holder, preview the film, choose frames, set the recipe and outputs, scan, and stop safely when needed.
 
 The screenshot above is the current installed app. The LS-5000 ED has been detected through the bridge and is offered as a Connect target, but it is not connected. The app is OFFLINE, the simulator is absent, and no media, preview, or scan image is displayed.
 
-## Alpha scope
+## Beta scope
 
-Real scanning has been tested on one Mac and one LS-5000 setup. Treat that as a narrow, useful result rather than a promise for every Coolscan, adapter, Mac, operating system, or film holder. The hardware bridge can move film, so stay nearby and supervise any real job.
+Real scanning has been tested on one Apple Silicon Mac and one LS-5000 setup. The Intel build is a prerelease preview that is built and tested natively in CI, but has not yet been validated with a real scanner. Treat both as narrow results rather than a promise for every Coolscan, adapter, Mac, operating system, or film holder. The hardware bridge can move film, so stay nearby and supervise any real job.
 
-The source is still under active development. The release DMG is an alpha,
+The source is still under active development. The release DMG is a beta,
 ad-hoc-signed build rather than a notarized Developer ID distribution; there is
 no support or release-schedule promise.
 
@@ -28,7 +28,7 @@ required for redistribution, and the applicable dependency notices. The
 supported LS-5000 color-roll workflow uses the signed libusb copy inside the
 app, so installing ScanStudio does not require Homebrew, SANE, or a Nikon
 driver. The optional software-eject and legacy plain-scan paths still need a
-system SANE backend. Because this alpha is not notarized, macOS may require
+system SANE backend. Because this beta is not notarized, macOS may require
 the normal Control-click **Open** confirmation on first launch. Do not disable
 Gatekeeper globally.
 

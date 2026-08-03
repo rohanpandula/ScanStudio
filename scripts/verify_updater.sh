@@ -30,7 +30,7 @@
 #                                   "new release" whose bytes seed the feed
 #                                   (default: synthetic)
 #   SCANSTUDIO_UPDATER_VERSION      release version string for the seeded feed
-#                                   (default: 0.3.0-alpha.11)
+#                                   (default: 0.3.0-beta.1)
 #
 # Exit code is nonzero on any failure; a green run ends with
 #   VERIFY_UPDATER OK
@@ -40,7 +40,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EMITTER="$ROOT/app/ScanStudio/scripts/emit_release_assets.sh"
 SWIFT_DIR="$ROOT/app/ScanStudio"
 
-VERSION="${SCANSTUDIO_UPDATER_VERSION:-0.3.0-alpha.11}"
+VERSION="${SCANSTUDIO_UPDATER_VERSION:-0.3.0-beta.1}"
 
 WORK="$(mktemp -d)"
 cleanup() {
@@ -76,7 +76,7 @@ else
     current_app="$WORK/current/ScanStudio.app"
     new_app="$WORK/new/ScanStudio.app"
     make_fake_app "$current_app" "0.3.0-alpha.10" "old"
-    make_fake_app "$new_app" "0.3.0-alpha.11" "new"
+    make_fake_app "$new_app" "0.3.0-beta.1" "new"
 fi
 
 for app in "$current_app" "$new_app"; do

@@ -276,6 +276,46 @@ final class UpdateServiceTests: XCTestCase {
                        "https://github.com/rohanpandula/ScanStudio/releases/tag/v0.3.0-alpha.12")
     }
 
+    func testPrereleaseBootstrapsWhenStablePointerIsMissing() async throws {
+        let stub = StubURLSession()
+        stub.failingURLs.insert(pointerURL())
+        stub.dataByURL[GitHubUpdateChecker.apiReleasesURL] = Data("""
+        [
+            {
+                "tag_name": "v0.3.0-beta.1",
+                "prerelease": true,
+                "html_url": "https://github.com/rohanpandula/ScanStudio/releases/tag/v0.3.0-beta.1"
+            }
+        ]
+        """.utf8)
+        let betaChecksum = String(repeating: "e", count: 64)
+        let betaURL = "https://github.com/rohanpandula/ScanStudio/releases/download/v0.3.0-beta.1/ScanStudio-0.3.0-beta.1-macOS-arm64.dmg"
+        stub.dataByURL[perReleaseURL(tag: "v0.3.0-beta.1")] = Data("""
+        {
+            "version": "0.3.0-beta.1",
+            "architectures": {
+                "arm64": { "url": "\(betaURL)", "sha256": "\(betaChecksum)" }
+            }
+        }
+        """.utf8)
+
+        let checker = GitHubUpdateChecker(pointerURL: pointerURL(), session: stub)
+        let candidate = try await checker.latestCandidate(channel: .alpha, arch: .arm64)
+
+        let resolved = try XCTUnwrap(candidate)
+        XCTAssertEqual(resolved.version.raw, "0.3.0-beta.1")
+        XCTAssertEqual(resolved.downloadURL.absoluteString, betaURL)
+        XCTAssertEqual(resolved.sha256, betaChecksum)
+        XCTAssertEqual(resolved.releaseNotesURL?.absoluteString,
+                       "https://github.com/rohanpandula/ScanStudio/releases/tag/v0.3.0-beta.1")
+        XCTAssertTrue(stub.requestedURLs.contains(pointerURL()),
+                      "the checker should first try the stable pointer")
+        XCTAssertTrue(stub.requestedURLs.contains(GitHubUpdateChecker.apiReleasesURL),
+                      "a missing stable pointer must still probe prereleases")
+        XCTAssertTrue(stub.requestedURLs.contains(perReleaseURL(tag: "v0.3.0-beta.1")),
+                      "the candidate must come from the beta release's own pointer")
+    }
+
     // MARK: - 4. Alpha degrades to the pointer on API trouble
 
     func testAlphaFallsBackOnAPIError() async throws {
