@@ -123,3 +123,42 @@ jobs:
         run: |
           ditto -x -k "$RUNNER_TEMP/scanstudio-package/ScanStudio-app.zip" "$RUNNER_TEMP/scanstudio-package/unpacked"
           app/ScanStudio/scripts/test_packaged_bridge.sh "$RUNNER_TEMP/scanstudio-package/unpacked/ScanStudio.app"
+
+  updater-integration:
+    name: Updater integration gate
+    # Reuses the exact signed app produced by the package job so the "release"
+    # under test is the shipped artifact, not a dev build. Same-workflow job
+    # ordering means the artifact is still present when this job runs, so the
+    # package job's 1-day retention needs no bump.
+    runs-on: macos-15
+    needs: package
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Warm the locked dependency cache
+        # Keeps the runner environment interchangeable with the other uv-managed
+        # jobs (see the bridge job note) so script behaviour is reproducible.
+        working-directory: bridge
+        run: uv sync --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-app
+          path: ${{ runner.temp }}/scanstudio-updater
+      - name: Unpack the packaged app for the updater gate
+        run: |
+          ditto -x -k "$RUNNER_TEMP/scanstudio-updater/ScanStudio-app.zip" "$RUNNER_TEMP/scanstudio-updater/unpacked"
+      - name: Run the seeded updater verification against the exact packaged app
+        # Both point at the same real app: the script seeds its feed from the
+        # new-app bytes and the harness proves resolve -> download -> verify ->
+        # snapshot -> swap -> rollback on its own synthetic old/new fixtures, so
+        # the flow's hash + swap still prove out against the signed artifact.
+        env:
+          SCANSTUDIO_UPDATER_CURRENT_APP: ${{ runner.temp }}/scanstudio-updater/unpacked/ScanStudio.app
+          SCANSTUDIO_UPDATER_NEW_APP: ${{ runner.temp }}/scanstudio-updater/unpacked/ScanStudio.app
+        run: |
+          scripts/verify_updater.sh 2>&1 | tee "$RUNNER_TEMP/verify_updater.log"
+          grep -q "VERIFY_UPDATER OK" "$RUNNER_TEMP/verify_updater.log"
