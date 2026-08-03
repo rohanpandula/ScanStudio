@@ -9,13 +9,39 @@ permissions:
 
 jobs:
   release:
-    name: Build and publish release
-    runs-on: macos-15
-    # See the package job in ci.yml: the relocatable package requires uv's
-    # standalone CPython, not the runner image's framework Python. This is
-    # the same verified `make dmg` path used locally, so a release is only
-    # publishable if the exact signed app passes the packaging verification.
+    name: Build and verify ${{ matrix.arch }} DMG
+    # Per-arch DMGs (see .planning/phases/02-intel-support/02-CONTEXT.md): a
+    # universal bundle is impossible because the pinned cv2/numpy wheels are
+    # not universal, so each architecture is built natively on its own runner
+    # through the SAME verified `make dmg` path (codesign --deep --strict,
+    # relocation-safe bridge check, SHA-256). If EITHER matrix cell fails,
+    # fail-fast aborts the whole workflow and nothing is published.
+    #
+    # Intel runner label: GitHub-hosted Intel labels change over time. Per the
+    # GitHub-hosted runners reference (docs.github.com, 2026-08) the current
+    # standard Intel label is `macos-15-intel`; hosted-label availability is
+    # NOT exposed through the API (gh api /repos/{owner}/{repo}/actions/runners
+    # only lists self-hosted runners), so it cannot be probed in advance. We
+    # hard-code `macos-15-intel` and let GitHub fail the job loudly if the
+    # label is ever retired or unavailable on this account -- fail-loud is
+    # acceptable for this gate (T-02-01-02). If it stops resolving, the
+    # conservative fallback is the last Intel-only label, `macos-13`; update
+    # BOTH this include and the package matrix in ci.yml together.
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [arm64, x86_64]
+        include:
+          - arch: arm64
+            runs-on: macos-15
+          - arch: x86_64
+            runs-on: macos-15-intel
+    runs-on: ${{ matrix.runs-on }}
     env:
+      # See the package job in ci.yml: the relocatable package requires uv's
+      # standalone CPython, not the runner image's framework Python. This is
+      # the same verified `make dmg` path used locally, so a release is only
+      # publishable if the exact signed app passes the packaging verification.
       UV_PYTHON_PREFERENCE: only-managed
     steps:
       - uses: actions/checkout@v4
@@ -50,20 +76,22 @@ jobs:
           echo "Resolved release version: $STAMP"
       - name: Build and verify the local DMG
         # package_dmg.sh names the artifact ScanStudio-<version>-macOS-<arch>.dmg
-        # from SCANSTUDIO_RELEASE_VERSION (set above from the tag) and refuses
-        # to overwrite an existing artifact. It also verifies the mounted app's
+        # (arch from uname -m, i.e. this runner's native arch) and refuses to
+        # overwrite an existing artifact. It also verifies the mounted app's
         # code signature and runs test_packaged_bridge.sh on it; any failure
         # here aborts the job and nothing is released.
         working-directory: app/ScanStudio
         run: make dmg
-      - name: Emit SHA256SUMS and latest.json
+      - name: Emit SHA256SUMS and arch-keyed latest.json
         working-directory: app/ScanStudio
         run: |
-          scripts/emit_release_assets.sh ".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg" "$RELEASE_VERSION" ".build"
+          scripts/emit_release_assets.sh ".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg" "$RELEASE_VERSION" ".build" "$(uname -m)"
       - name: Re-verify released assets
         # codesign --verify --deep --strict on the mounted app is already part
-        # of make dmg's packaging; do not re-mount here. Assert the checksum in
-        # SHA256SUMS matches the actual DMG and latest.json is non-empty.
+        # of make dmg's packaging; do not re-mount here. Assert the per-arch
+        # checksum in SHA256SUMS matches the actual DMG, latest.json is
+        # non-empty, and THIS arch's entry is present and carries that sha
+        # (T-02-01-04: the arm64 entry never carries the x86_64 url/sha).
         working-directory: app/ScanStudio
         run: |
           DMG=".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
@@ -72,31 +100,116 @@ jobs:
           test -n "$EXPECTED"
           test "$EXPECTED" = "$ACTUAL"
           test -s .build/latest.json
+          python3 - "$(uname -m)" "$ACTUAL" <<'PY'
+          import json, sys
+          arch, actual = sys.argv[1:3]
+          d = json.load(open(".build/latest.json"))
+          entry = d["architectures"][arch]
+          assert entry["sha256"] == actual
+          assert d["architectures"][arch]["url"].endswith(".dmg")
+          print(f"{arch} entry present and matches checksum {actual}")
+          PY
           echo "Checksum re-verified: $ACTUAL"
+      - name: Upload ${{ matrix.arch }} release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScanStudio-dmg-${{ matrix.arch }}
+          path: |
+            app/ScanStudio/.build/ScanStudio-${{ env.RELEASE_VERSION }}-macOS-${{ matrix.arch }}.dmg
+            app/ScanStudio/.build/SHA256SUMS
+            app/ScanStudio/.build/latest.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish combined multi-arch release
+    needs: release
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-dmg-arm64
+          path: ${{ runner.temp }}/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-dmg-x86_64
+          path: ${{ runner.temp }}/x86_64
+      - name: Resolve release version from the tag
+        run: |
+          STAMP="${GITHUB_REF_NAME#v}"
+          echo "RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
+          echo "SCANSTUDIO_RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
+          echo "Resolved release version: $STAMP"
+      - name: Merge arch-keyed pointers and combine checksums
+        # Fold the two matrix cells' arch-keyed latest.json into ONE pointer by
+        # re-running the emitter against both downloaded DMGs: the second emit
+        # sees the same version plus a distinct arch and MERGES the entry in
+        # (never clobbers). Concatenate the basename-only SHA256SUMS files so
+        # the published checksum covers both DMGs.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/combined"
+          app/ScanStudio/scripts/emit_release_assets.sh \
+            "$RUNNER_TEMP/arm64/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
+            "$RELEASE_VERSION" "$RUNNER_TEMP/combined" arm64
+          app/ScanStudio/scripts/emit_release_assets.sh \
+            "$RUNNER_TEMP/x86_64/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
+            "$RELEASE_VERSION" "$RUNNER_TEMP/combined" x86_64
+          cat "$RUNNER_TEMP/arm64/SHA256SUMS" "$RUNNER_TEMP/x86_64/SHA256SUMS" > "$RUNNER_TEMP/combined/SHA256SUMS"
+          echo "Combined pointer:"
+          cat "$RUNNER_TEMP/combined/latest.json"
+      - name: Re-verify combined assets before publish
+        # Re-assert the merged pointer carries BOTH arch entries whose
+        # checksums match the two downloaded DMGs, so an unverified artifact
+        # is never attached (T-02-01-03).
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/combined/latest.json" "$RELEASE_VERSION" "$RUNNER_TEMP" <<'PY'
+          import hashlib, json, os, sys
+          path, version, base = sys.argv[1:4]
+          d = json.load(open(path))
+          assert d["version"] == version
+          assert set(d["architectures"]) == {"arm64", "x86_64"}
+          for arch in ("arm64", "x86_64"):
+              entry = d["architectures"][arch]
+              dmg = os.path.join(base, arch, os.path.basename(entry["url"]))
+              assert os.path.isfile(dmg), dmg
+              h = hashlib.sha256(open(dmg, "rb").read()).hexdigest()
+              assert entry["sha256"] == h, arch
+          print("Combined checksums re-verified for both architectures")
+          PY
       - name: Create GitHub release
         # How the alpha parcel behaves today: alphas are pre-releases on
         # GitHub. Keep that --prerelease only for -alpha versions; stable
-        # tags publish as full releases.
+        # tags publish as full releases. Both DMGs + combined checksums +
+        # the arch-keyed pointer are attached in one release.
         env:
           GH_TOKEN: ${{ github.token }}
-        working-directory: app/ScanStudio
         run: |
-          DMG=".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
-          SHA256="$(awk '{print $1}' .build/SHA256SUMS)"
+          ARM_SHA256="$(awk '{print $1}' "$RUNNER_TEMP/arm64/SHA256SUMS")"
+          X86_SHA256="$(awk '{print $1}' "$RUNNER_TEMP/x86_64/SHA256SUMS")"
           PRERELEASE=""
           case "$RELEASE_VERSION" in
             *-alpha*) PRERELEASE="--prerelease" ;;
           esac
+          NOTES="Automated release of ScanStudio $RELEASE_VERSION.
+          arm64 SHA-256: $ARM_SHA256
+          x86_64 SHA-256: $X86_SHA256"
           gh release create "v$RELEASE_VERSION" \
             --repo rohanpandula/ScanStudio \
             --title "ScanStudio $RELEASE_VERSION" \
-            --notes "Automated release of ScanStudio $RELEASE_VERSION.
-
-SHA-256: $SHA256" \
+            --notes "$NOTES" \
             $PRERELEASE \
-            -- "$DMG" .build/SHA256SUMS .build/latest.json
+            "$RUNNER_TEMP/arm64/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
+            "$RUNNER_TEMP/x86_64/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
+            "$RUNNER_TEMP/combined/SHA256SUMS" \
+            "$RUNNER_TEMP/combined/latest.json"
       - name: Summarize published release
-        working-directory: app/ScanStudio
         run: |
-          echo "Asset: https://github.com/rohanpandula/ScanStudio/releases/download/v$RELEASE_VERSION/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
-          echo "SHA-256 $(awk '{print $1}' .build/SHA256SUMS)"
+          echo "arm64 asset: https://github.com/rohanpandula/ScanStudio/releases/download/v$RELEASE_VERSION/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg"
+          echo "x86_64 asset: https://github.com/rohanpandula/ScanStudio/releases/download/v$RELEASE_VERSION/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg"
+          echo "arm64 SHA-256 $(awk '{print $1}' "$RUNNER_TEMP/arm64/SHA256SUMS")"
+          echo "x86_64 SHA-256 $(awk '{print $1}' "$RUNNER_TEMP/x86_64/SHA256SUMS")"
