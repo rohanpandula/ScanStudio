@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc, Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scanstudio_engine::domain::{self, ScannerBackend};
 use scanstudio_engine::protocol::{ConnectOptions, ErrorCode, StopMode};
@@ -526,10 +526,21 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     // The preceding completion is public closure, not reader detachment. This
     // test's explicit delay keeps the private gate observable; production
     // leaves that delay at zero.
-    std::thread::sleep(Duration::from_millis(1100));
-    backend
-        .connect(DEVICE_ID, &ConnectOptions::default())
-        .expect("once the old reader detached, reconnect should not require a separate disconnect");
+    let reconnect_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match backend.connect(DEVICE_ID, &ConnectOptions::default()) {
+            Ok(_) => break,
+            Err(error)
+                if error.code == ErrorCode::ScannerBusy
+                    && Instant::now() < reconnect_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!(
+                "once the old reader detached, reconnect should not require a separate disconnect: {error:?}"
+            ),
+        }
+    }
 
     let stale_approval = backend
         .roll_approve(1, "predecessor-preview")
