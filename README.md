@@ -18,16 +18,24 @@ no support or release-schedule promise.
 
 ## Download
 
-The current Apple Silicon DMG is published on the
+ScanStudio ships per-architecture DMGs: `ScanStudio-<version>-macOS-arm64.dmg`
+for Apple Silicon (M-series) and `ScanStudio-<version>-macOS-x86_64.dmg` for
+Intel. Choose the DMG matching your Mac; the in-app updater does this
+automatically. Both are published on the
 [GitHub Releases page](https://github.com/rohanpandula/ScanStudio/releases).
-It targets macOS 14 or newer and contains the app, the GPL hardware bridge and
-CoolscanPy source required for redistribution, and the applicable dependency
-notices. The supported LS-5000 color-roll workflow uses the signed libusb copy
-inside the app, so installing ScanStudio does not require Homebrew, SANE, or a
-Nikon driver. The optional software-eject and legacy plain-scan paths still
-need a system SANE backend. Because this alpha is not notarized, macOS may
-require the normal Control-click **Open** confirmation on first launch. Do not
-disable Gatekeeper globally.
+A release DMG contains the app, the GPL hardware bridge and CoolscanPy source
+required for redistribution, and the applicable dependency notices. The
+supported LS-5000 color-roll workflow uses the signed libusb copy inside the
+app, so installing ScanStudio does not require Homebrew, SANE, or a Nikon
+driver. The optional software-eject and legacy plain-scan paths still need a
+system SANE backend. Because this alpha is not notarized, macOS may require
+the normal Control-click **Open** confirmation on first launch. Do not disable
+Gatekeeper globally.
+
+## System requirements
+
+- macOS 14 (Sonoma) or newer.
+- An Apple Silicon (M-series) Mac or an Intel Mac.
 
 Opening the packaged app with its hardware bridge available automatically
 prepares that app session for film movement. Launching alone does not move the

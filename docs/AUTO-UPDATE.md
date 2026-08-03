@@ -18,17 +18,19 @@ works with the existing ad-hoc signing, so it ships now and Path B waits.
 
 ## Path A (active) — how it works
 
-As of this writing the shipped pieces are the release pipeline (01-01),
-version identity (01-02), and the install core (01-03). The service (01-04)
-and Settings UI (01-05) are next in the plan queue but not yet shipped; the
-bullets mark them as such rather than claim they exist.
+As of this writing the shipped pieces are the release pipeline (01-01), version
+identity (01-02), the install core (01-03), and the verified update service
+(01-04, extended in Phase 02 with host-architecture-aware resolution); the
+Settings UI (01-05) is next in the plan queue but not yet shipped; the bullets
+mark status rather than claim what exists.
 
 - **Release pipeline (plan 01-01, shipped):** tag-triggered
   `.github/workflows/release.yml` (`on: push: tags: ['v*']`) runs `make dmg`
   the same way CI already does, then
   `app/ScanStudio/scripts/emit_release_assets.sh` writes `SHA256SUMS` +
-  `latest.json` (the `{"version","url","sha256"}` pointer), re-verifies the
-  checksum, and `gh release create`s the DMG + `SHA256SUMS` + `latest.json`.
+  `latest.json` (the arch-keyed `{"version","architectures":{<arch>:{url,sha256}}}`
+  pointer), re-verifies the checksum, and `gh release create`s the DMGs +
+  `SHA256SUMS` + `latest.json`.
 - **Version identity (plan 01-02, shipped):** the packaged app stamps its
   exact release into `Info.plist` (`ScanStudioRelease`, from
   `SCANSTUDIO_RELEASE_VERSION`), and
@@ -39,11 +41,21 @@ bullets mark them as such rather than claim they exist.
   `app/ScanStudio/Sources/ScanStudioKit/UpdateInstaller.swift` does the pure
   app-bundle snapshot → stage (`ditto`) → swap → rollback, always without
   spawning the bridge or touching the scanner.
-- **Service (plan 01-04, NOT yet shipped):** once landed,
-  `app/ScanStudio/Sources/ScanStudioKit/UpdateService.swift` will bring
+- **Service (plan 01-04, shipped):**
+  `app/ScanStudio/Sources/ScanStudioKit/UpdateService.swift` provides
   `GitHubUpdateChecker` + `UpdateDownloader`, which resolve the pointer/channel,
   verify the downloaded DMG's SHA-256 before mounting, and code-signature
   verify (`codesign --verify --deep --strict`) the mounted app before install.
+- **Architecture-aware resolution (Phase 02, shipped):** the updater resolves
+  the newest release for the HOST architecture from the arch-keyed
+  `latest.json` (a single `architectures` mapping with a distinct
+  `url`+`sha256` per `arm64`/`x86_64`) and downloads + verifies only that
+  architecture's DMG. Intel (x86_64) support shipped in Phase 02: each release
+  publishes a `-macOS-arm64.dmg` for Apple Silicon and a `-macOS-x86_64.dmg`
+  for Intel. A missing entry for a host architecture surfaces the typed
+  unsupported-architecture error — never a wrong-arch install. Local
+  verification proves selection + hash integrity offline; the real Intel
+  bundle executes on the CI x86_64 runner.
 - **UI (plan 01-05, NOT yet shipped):** once landed, `UpdateSettingsView.swift`
   + `UpdateFlowModel.swift` will surface current version, "Check for Updates",
   channel toggle, install/rollback, a 24 h background cadence, and the guard
