@@ -556,6 +556,32 @@ def test_preview_session_keeps_one_row_clipped_first_frame_for_review(
     )
 
 
+def test_preview_session_refuses_a_first_frame_clipped_beyond_scannable_range(
+    tmp_path: Path,
+) -> None:
+    complete = _synthetic_index(
+        height=882,
+        frame_count=6,
+        content_frames=6,
+        leader=0,
+    )
+    fixture = _preview_fixture(
+        tmp_path,
+        slot_capacity_hint=6,
+        active_rgb=complete[17:],
+    )
+
+    with pytest.raises(roll_index.LeadingFrameClippedError) as excinfo:
+        build_roll_preview_session(
+            fixture.result,
+            material=ScanMaterial.COLOR_NEGATIVE,
+        )
+
+    assert excinfo.value.fitted_start_row == -17
+    assert excinfo.value.coverage_fraction == pytest.approx(126 / 143)
+    assert "fresh preview" in str(excinfo.value)
+
+
 def test_preview_refuses_density_source_geometry_from_another_startup_count(
     tmp_path: Path,
 ) -> None:

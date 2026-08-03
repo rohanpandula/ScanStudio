@@ -5,6 +5,22 @@ import Testing
 
 @Suite("Error presentation policy")
 struct ErrorPresentationPolicyTests {
+    @Test("a clipped first frame asks for a deeper refeed without offering a crop")
+    func leadingFrameClipped() {
+        let rawMessage = "REFEED_REQUIRED: the first frame begins 17 preview rows before "
+            + "the captured preview area (88.1% remains); refeed the film slightly deeper "
+            + "and acquire a fresh preview. ScanStudio did not expose the cropped frame for scanning"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "The first frame is not fully inside the scanner")
+        #expect(
+            presentation.guidance
+                == "Reinsert the film a little farther into the adapter, then preview it again. ScanStudio did not offer the cropped frame for scanning."
+        )
+        #expect(presentation.technicalDetails == rawMessage)
+    }
+
     @Test("medium-not-present during batch positioning is a clear feed interruption")
     func filmFeedInterrupted() {
         let rawMessage = "FILM_FEED_INTERRUPTED: bridge scan.frameFailed "

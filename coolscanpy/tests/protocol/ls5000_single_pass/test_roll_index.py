@@ -282,14 +282,63 @@ def test_one_row_clipped_leading_cell_is_exposed_for_manual_review() -> None:
     )
 
 
-def test_two_row_clipped_leading_cell_remains_excluded_fail_closed() -> None:
+def test_content_supported_leading_cell_with_real_feed_clip_requires_refeed() -> None:
+    complete_rgb, _boundaries = _synthetic_roll(6, leader=0, tail=24)
+    clipped_rgb = complete_rgb[17:]
+
+    with pytest.raises(roll.LeadingFrameClippedError) as excinfo:
+        _detect(clipped_rgb)
+
+    error = excinfo.value
+    assert error.fitted_start_row == -17
+    assert error.clipped_preview_rows == 17
+    assert error.coverage_fraction == pytest.approx(126 / 143)
+    assert error.content_fraction == pytest.approx(0.9761904761904762)
+    assert error.clear_film_fraction < 0.05
+    assert "17 preview rows" in str(error)
+    assert "refeed" in str(error).lower()
+
+
+def test_two_row_clipped_leading_cell_requires_refeed() -> None:
     complete_rgb, _boundaries = _synthetic_roll(6, leader=0, tail=24)
     clipped_rgb = complete_rgb[2:]
 
+    with pytest.raises(roll.LeadingFrameClippedError, match="2 preview rows"):
+        _detect(clipped_rgb)
+
+
+def test_partly_blank_clipped_leading_frame_still_requires_refeed() -> None:
+    complete_rgb, _boundaries = _synthetic_roll(6, leader=0, tail=24)
+    # Make roughly half of frame 1 indistinguishable from clear film. The
+    # remaining photographed rows still prove that the off-raster cell is a
+    # real exposure, even though its content score is well below 75%.
+    complete_rgb[:75] = complete_rgb[-1]
+    clipped_rgb = complete_rgb[17:]
+
+    with pytest.raises(roll.LeadingFrameClippedError) as excinfo:
+        _detect(clipped_rgb)
+
+    assert 0.25 <= excinfo.value.content_fraction < 0.75
+    assert excinfo.value.clear_film_fraction < 0.95
+
+
+def test_less_than_half_visible_leading_cell_is_not_mistaken_for_a_frame() -> None:
+    complete_rgb, _boundaries = _synthetic_roll(6, leader=0, tail=24)
+    clipped_rgb = complete_rgb[72:]
+
     detection = _detect(clipped_rgb)
 
-    assert detection.frame_starts[0] > 100
+    assert detection.frame_starts[0] > 50
     assert roll.scanner_addressable_interval_count(detection.intervals) == 5
+
+
+def test_clear_leader_is_not_mistaken_for_a_clipped_photographed_frame() -> None:
+    rgb, _boundaries = _synthetic_roll(6, leader=128, tail=176)
+
+    detection = _detect(rgb)
+
+    assert detection.frame_starts[0] == pytest.approx(128, abs=1)
+    assert detection.intervals[0].coverage_fraction == 1.0
 
 
 def test_channel_gain_changes_do_not_move_detected_boundaries() -> None:

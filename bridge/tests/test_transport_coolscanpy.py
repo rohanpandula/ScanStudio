@@ -852,6 +852,34 @@ def test_preview_maps_leaked_index_decode_error(monkeypatch: pytest.MonkeyPatch)
     assert "MAE 4.447" in message
 
 
+def test_preview_preserves_leading_frame_clipped_refeed_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from coolscanpy.protocol.ls5000_single_pass.roll_index import (
+        LeadingFrameClippedError,
+    )
+
+    class _LeadingFrameClippedRoll(_FakeRoll):
+        def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
+            raise LeadingFrameClippedError(
+                fitted_start_row=-17,
+                coverage_fraction=126 / 143,
+                content_fraction=41 / 42,
+                clear_film_fraction=1 / 42,
+            )
+
+    transport, _device = _opened_transport(monkeypatch, _LeadingFrameClippedRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    assert excinfo.value.code == ErrorCode.REFEED_REQUIRED
+    message = str(excinfo.value)
+    assert "first frame begins 17 preview rows" in message
+    assert "refeed the film slightly deeper" in message
+    assert "uniform traversal" not in message
+
+
 def test_preview_maps_leaked_roll_session_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """`coolscanpy.roll.preview_session.RollSessionError` is another
     coolscanpy-internal type outside the public taxonomy that `Roll.preview()`

@@ -6,9 +6,15 @@ Whole-roll preview now keeps a content-supported leading frame when an
 otherwise valid feed places its fitted start exactly one 97-dpi preview row
 before the captured raster. The thumbnail is clamped to row zero, its
 same-capture transport origin is inferred from the validated interior mapping,
-and the frame remains blocked on explicit manual review; clips of two or more
-rows are still excluded fail-closed. This prevents a six-exposure strip from
-being silently presented as five after a one-row feed variation.
+and the frame remains blocked on explicit manual review. When enough of a
+leading frame remains to prove it exists but two or more rows fall outside the
+captured raster, preview now refuses with a typed deeper-refeed instruction
+instead of silently presenting a six-exposure strip as five. It also refuses
+to clamp that missing origin into the transport table, which would scan a
+cropped first frame and overlap the second. Clips with less than half a frame
+visible remain excluded as non-addressable edge material, while cells that
+meet the strict clear-film contract remain ordinary leader rather than being
+misreported as a clipped exposure.
 
 Transparent macOS app bundles can now pin PyUSB to an app-owned libusb
 without pretending the interpreter is PyInstaller-frozen. The resolver accepts
