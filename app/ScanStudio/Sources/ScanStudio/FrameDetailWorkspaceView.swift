@@ -272,7 +272,8 @@ struct FrameDetailWorkspaceView: View {
             // SAME scaleEffect/offset the image gets and never drift off
             // the image on pinch-zoom/pan.
             ZStack {
-                // Session-local display rotation (`SessionModel.rotateFrame`).
+                // Preview of the persisted derivative rotation
+                // (`SessionModel.rotateFrame`).
                 // The image and the defect markers rotate together by the same
                 // angle about the same center: marker coordinates are defined
                 // in the UNROTATED frame (DefectOverlayCanvas, DefectMapView.swift),
@@ -413,7 +414,8 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Rotate counter-clockwise—display only; saved output is unchanged")
+            .disabled(!sessionModel.frameTransformsAreEditable)
+            .help(frameTransformHelp("Rotate the Positive/Preview files produced by the next scan counter-clockwise. Existing files and Master TIFF, IR, and meter files stay untouched."))
 
             Button {
                 sessionModel.rotateFrame(frameIndex, by: 90)
@@ -422,7 +424,8 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Rotate clockwise—display only; saved output is unchanged")
+            .disabled(!sessionModel.frameTransformsAreEditable)
+            .help(frameTransformHelp("Rotate the Positive/Preview files produced by the next scan clockwise. Existing files and Master TIFF, IR, and meter files stay untouched."))
 
             Button {
                 sessionModel.resetFrameOrientation(frameIndex)
@@ -431,7 +434,11 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(sessionModel.frameOrientation(frameIndex) == 0)
+            .disabled(
+                !sessionModel.frameTransformsAreEditable
+                    || sessionModel.frameOrientation(frameIndex) == 0
+            )
+            .help(frameTransformHelp("Reset this frame's rotation for its next Positive/Preview scan."))
 
             Divider().frame(height: 18)
 
@@ -442,7 +449,8 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Flip left to right—display only; saved output is unchanged")
+            .disabled(!sessionModel.frameTransformsAreEditable)
+            .help(frameTransformHelp("Flip the Positive/Preview files produced by the next scan left to right. Existing files and Master TIFF, IR, and meter files stay untouched."))
 
             Button {
                 sessionModel.toggleFrameVerticalMirror(frameIndex)
@@ -451,7 +459,8 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Flip top to bottom—display only; saved output is unchanged")
+            .disabled(!sessionModel.frameTransformsAreEditable)
+            .help(frameTransformHelp("Flip the Positive/Preview files produced by the next scan top to bottom. Existing files and Master TIFF, IR, and meter files stay untouched."))
 
             Button {
                 sessionModel.resetFrameMirrors(frameIndex)
@@ -461,19 +470,28 @@ struct FrameDetailWorkspaceView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .disabled(
-                !sessionModel.frameMirror(frameIndex)
+                !sessionModel.frameTransformsAreEditable
+                    || (!sessionModel.frameMirror(frameIndex)
                     && !sessionModel.frameVerticalMirror(frameIndex)
+                    )
             )
+            .help(frameTransformHelp("Reset both flips for this frame's next Positive/Preview scan."))
 
             Spacer(minLength: 12)
 
-            Text("Display only—saved scan output is unchanged")
+            Text("Applied on next scan · Existing files and capture masters stay untouched")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.scanStudioSecondaryText)
                 .fixedSize()
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Frame orientation and flips, display only")
+        .accessibilityLabel("Frame orientation and flips for the next Positive and Preview scan")
+    }
+
+    private func frameTransformHelp(_ availableHelp: String) -> String {
+        sessionModel.frameTransformsAreEditable
+            ? availableHelp
+            : "Rotation and flips cannot be changed while a scan is starting or running."
     }
 
     /// Defect Map mode's overlay content, layered inside the same
@@ -1675,7 +1693,7 @@ private struct FilmstripTile: View {
     let frameIndex: Int
     let isCurrent: Bool
     let thumbnail: Thumbnail?
-    /// Session-local display rotation, kept in sync with the contact sheet
+    /// Derivative rotation preview, kept in sync with the contact sheet
     /// — see `ThumbnailTileImage.orientationDegrees`.
     let orientationDegrees: Int
     let mirrored: Bool

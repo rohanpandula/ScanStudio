@@ -16,11 +16,13 @@ Contract between the SwiftUI app and the `scanstudio-engine` subprocess. This fi
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `INTERNAL`, `PROJECT_NOT_FOUND`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
 
 `recoverable` is `true` only for faults where retrying the same operation can succeed (`FEED_JAM`). All others are `false`.
 
 > **Real-backend recoverable policy (additive, 2026-07-24):** for bridge-sourced failures, `error.recoverable` reflects BRIDGE.md's own policy: `true` only when the underlying bridge code is `HARDWARE_LANE_BUSY` (retrying the identical request once the lane frees can succeed with no other action). Every other bridge code (`REFEED_REQUIRED`, `MANUAL_REVIEW_REQUIRED`, `FEEDER_PARKED`, `TRANSPORT_SMEAR_DETECTED`, ...) is `recoverable: false` because a different action is needed first. Unrecognized bridge codes default to `false`.
+
+`FILM_FEED_INTERRUPTED` means a batch-positioning operation received the scanner's verified medium-not-present response (`02/3A/00`). Frames completed before the interruption remain durable. The preview registration is invalidated; the operator must refeed the film, acquire a fresh preview, and resume only unfinished frames.
 
 ## Methods
 
@@ -127,7 +129,7 @@ The engine's project-mutating handlers (`project.setFrameExcluded`, `project.set
 `{frameIndex: u32, output: OutputRecipe|null}` → `{project: ScanProject}`. Sets or clears this frame's independent output override (archive/positive/preview); same persistence and error contract as `setFrameCaptureOverride`.
 
 ### `project.setFrameAlignment`
-`{frameIndex: u32, alignment: FrameAlignment|null}` → `{project: ScanProject}`. Sets or clears the saved native-preview-row offset for this frame. The saved value is a draft, never proof that an offset is active in a later scanner session: after a new preview, the client must replay it through `roll.setSpacingOffset`, wait for the bridge-confirmed replacement thumbnail, and keep scanning unavailable if replay fails. `approved` is retained for manifest compatibility but does not replace preview-bound manual approval. A real derivative renderer never interprets these transport rows as stored-image crop pixels. Same persistence and error contract as `setFrameCaptureOverride`. Errors: `PROJECT_NOT_FOUND`, `INVALID_PARAMS`.
+`{frameIndex: u32, alignment: FrameAlignment|null}` → `{project: ScanProject}`. Sets or clears the saved native-preview-row offset and derivative presentation transform for this frame. The row offset remains a draft, never proof that an offset is active in a later scanner session: after a new preview, the client must replay it through `roll.setSpacingOffset`, wait for the bridge-confirmed replacement thumbnail, and keep scanning unavailable if replay fails. `approved` is retained for manifest compatibility but does not replace preview-bound manual approval. A real derivative renderer never interprets these transport rows as stored-image crop pixels. `derivativeTransform`, however, is explicit user intent: mirrors are applied in the unrotated source axes, then the clockwise quarter-turn is applied to Positive/Preview derivatives only. Rotations other than `0|90|180|270` are rejected with `INVALID_PARAMS`. Archive RGB, IR, and meter capture files never consume this transform. Same persistence and error contract as `setFrameCaptureOverride`. Errors: `PROJECT_NOT_FOUND`, `INVALID_PARAMS`.
 
 ### `project.setRollMetadata`
 `{metadata: MetadataSet}` → `{project: ScanProject}`. Sets the roll-wide metadata that every frame without its own override inherits; persisted atomically before returning. Errors: `PROJECT_NOT_FOUND`.
@@ -178,7 +180,8 @@ PositiveRecipe  {enabled: bool, fileFormat: "tiff"|"jpeg",
                  filenameTemplate: string, destination: string}
 PreviewRecipe   {enabled: bool, fileFormat: "tiff"|"jpeg", maxLongEdgePx: u32,
                  filenameTemplate: string, destination: string}
-WrittenOutputs  {archivePath?: string, positivePath?: string, previewPath?: string}
+WrittenOutputs  {archivePath?: string, positivePath?: string, previewPath?: string,
+                 derivativeTransform: DerivativeTransform}
 Thumbnail       {brightness?: number 0.25–0.85, tint?: number -0.5–0.5, imagePath?: string,
                  boundaryRows?: [u32, u32], spacingOffset?: i64,
                  needsApproval?: bool, warnings?: [string]}
@@ -212,7 +215,10 @@ ScanReceipt     {jobId, frameIndex, startedAt: ISO-8601 UTC string, durationMs: 
                  rgbPath?: string, irPath?: string, meterRgbiPath?: string,
                  hardwareTelemetry?: HardwareTelemetry, nikonlook?: NikonlookProvenance,
                  autoCrop?: AutoCropOutcome, exposureAuthority?: ExposureAuthority}
-FrameAlignment  {offsetRows: i64, approved: bool}
+DerivativeTransform {rotationDegrees: 0|90|180|270,
+                     horizontalMirror: bool, verticalMirror: bool}
+FrameAlignment  {offsetRows: i64, approved: bool,
+                 derivativeTransform: DerivativeTransform}
 MetadataSet     {camera?: string, lens?: string, filmStock?: string,
                  process?: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome",
                  iso?: u32, date?: PartialDate, location?: string, photographer?: string,
@@ -249,11 +255,13 @@ ApplyMetadataResult {success: bool, exitCode: i32, stdout: string, stderr: strin
 
 `Thumbnail`'s `brightness`/`tint` and `imagePath` are mutually exclusive: exactly one of the `{brightness, tint}` pair or `imagePath` is populated per instance, never both, never neither. The simulator populates `brightness`/`tint` and omits the real transport fields. A real backend populates `imagePath` (BRIDGE.md's bridge-written, Nikon-render-oriented preview tile), `boundaryRows`, `spacingOffset`, `needsApproval`, and `warnings`, while omitting `brightness`/`tint` rather than fabricating them. `spacingOffset` is the bridge-confirmed value active in this exact preview session; a project manifest value alone is not equivalent. Before sending `scan.start`, clients must inspect every requested frame's current completed-preview thumbnail. If any has `needsApproval: true`, the client must obtain explicit operator confirmation, send `roll.approve` for every such frame with that preview's exact `operationId`, and only then send the original complete frame list in one `scan.start`. Starting an unapproved subset and retrying the omitted frame as a second job is not equivalent: it loses the one-traversal transport assumption.
 
-`ScannerStatus.filmPresent` mirrors BRIDGE.md's `DeviceStatus.filmPresent` verbatim for a real backend — a live, no-motion film-presence read. `true` means the scanner reports film gripped, `false` is the verified MEDIUM NOT PRESENT response, and `null` means no trustworthy verdict was available; `null` is never absence. Presence is not motion readiness because an end-stop-parked strip can still report `true`. The simulator always omits this field (it has no bridge to source it from).
+`ScannerStatus.filmPresent` mirrors BRIDGE.md's `DeviceStatus.filmPresent` for a real backend — a live, no-motion film-presence read. `true` means the scanner reports film gripped, `false` is the verified MEDIUM NOT PRESENT response, and `null` means no trustworthy verdict was available; `null` is never absence. A verified `false` also invalidates any preview-derived `mediaLoaded`/`frameCount` claim, so the emitted status carries `mediaLoaded: false` and `frameCount: null`; this cannot discard project receipts or the unfinished resume set. Presence is not motion readiness because an end-stop-parked strip can still report `true`. The simulator always omits this field (it has no bridge to source it from).
 
 `ScannerStatus.motionArmed` is present only for a real bridge session and mirrors BRIDGE.md's live, no-motion `DeviceStatus.motionArmed` observation. It is informative, not authority: the packaged `ScanStudioLauncher` prepares the session environment and shared authorization latch when it selects a hardware bridge, while the bridge still re-checks both at every motion-capable request. Launch itself sends no hardware command; Preview, Scan, and Eject remain explicit user actions. Direct bridge/developer launches remain responsible for their own authorization. The simulator omits the field rather than fabricating a hardware-ready state.
 
 `OutputRecipe.autoCrop` defaults to `false` when omitted. When enabled, each frame's derived positive and preview are cropped independently to the detected image area. The retained archive master remains full-frame. `ScanReceipt.autoCrop` records the half-open ROI or the reason the crop was not applied; an approved manual `FrameAlignment` takes precedence, and an unusable detection falls back to the uncropped derivative.
+
+`FrameAlignment.derivativeTransform` and `WrittenOutputs.derivativeTransform` default to identity when omitted so older manifests and receipts remain readable. New scans persist the selected per-frame transform before `scan.start`; the renderer applies it after crop/color processing to both Positive and Preview outputs, and records the exact applied value under `WrittenOutputs` for reproducible rerendering. In the current app, an edit made after a project already exists remains a session draft until that next scan boundary; it never rewrites existing outputs in place. The archive master, bridge RGB/IR files, and meter sidecar remain byte-untouched.
 
 `ArchiveRecipe.enabled` defaults to `true` when omitted, preserving older projects. At least one retained output (`archive`, positive TIFF, or positive JPEG) is required for every effective frame recipe. When archive retention is disabled, `WrittenOutputs.archivePath` is absent; the real backend still reports bridge provenance in `rgbPath`/`irPath` while routing the mandatory physical capture into an engine-owned private working directory. That temporary capture is cleaned only after the observed bridge terminal closure and successful derivative completion; otherwise it is recovery-held and never represented as a user output.
 

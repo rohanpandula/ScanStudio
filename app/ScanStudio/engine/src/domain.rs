@@ -504,6 +504,28 @@ impl OutputRecipe {
     }
 }
 
+/// A reproducible, non-destructive presentation transform applied only to
+/// finished positive/preview derivatives. Quarter-turn rotation is clockwise,
+/// and mirrors are evaluated in the unrotated source axes before rotation --
+/// the same ordering SwiftUI uses for ScanStudio's preview tiles. Capture
+/// masters and their IR/meter sidecars never consume this value.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DerivativeTransform {
+    #[serde(default)]
+    pub rotation_degrees: u16,
+    #[serde(default)]
+    pub horizontal_mirror: bool,
+    #[serde(default)]
+    pub vertical_mirror: bool,
+}
+
+impl DerivativeTransform {
+    pub fn is_supported(self) -> bool {
+        matches!(self.rotation_degrees, 0 | 90 | 180 | 270)
+    }
+}
+
 /// Per-frame alignment intent for frame-alignment review (SPEC-FRAME-
 /// ALIGNMENT-REVIEW.md Rule 2). The adjustment is stored as a row offset
 /// relative to the frame boundary that detection found, plus an explicit
@@ -523,6 +545,11 @@ pub struct FrameAlignment {
     /// nudge) but is inert for both derived-output rendering and the
     /// backend scan wire.
     pub approved: bool,
+    /// Display geometry selected in the contact sheet/detail editor. Unlike
+    /// the crop nudge, it does not require approval: it is explicit user
+    /// intent and applies only to regenerable derivatives.
+    #[serde(default)]
+    pub derivative_transform: DerivativeTransform,
 }
 
 impl FrameAlignment {
@@ -532,6 +559,7 @@ impl FrameAlignment {
         Self {
             offset_rows,
             approved: true,
+            derivative_transform: DerivativeTransform::default(),
         }
     }
 
@@ -540,6 +568,7 @@ impl FrameAlignment {
         Self {
             offset_rows,
             approved: false,
+            derivative_transform: DerivativeTransform::default(),
         }
     }
 }
@@ -569,6 +598,10 @@ pub struct WrittenOutputs {
     pub positive_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_path: Option<String>,
+    /// Exact presentation transform used for the finished derivatives.
+    /// Identity on legacy receipts whose `outputs` object predates this key.
+    #[serde(default)]
+    pub derivative_transform: DerivativeTransform,
 }
 
 /// Which of nikonlook v2's Layer-A gain-estimation paths a rendered C41

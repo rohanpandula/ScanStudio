@@ -11,6 +11,7 @@ private enum SaveRollScanStubError: Error {
 
 private enum SaveRollScanCall: Equatable, Sendable {
     case createProject
+    case setAlignment(frameIndex: Int, alignment: FrameAlignment?)
     case approve(frameIndex: Int)
     case startScan(frames: [Int])
 }
@@ -27,7 +28,7 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
         connection: "in-process",
         supportedMultisamplePasses: [1, 2, 4, 8, 16]
     )
-    private let project = ScanProject(
+    private var project = ScanProject(
         schemaVersion: 1,
         id: "saved-six-frame-roll",
         name: "Saved six-frame roll",
@@ -63,13 +64,18 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
     private var recordedCalls: [SaveRollScanCall] = []
     private let createError: EngineRequestError?
     private let scanStartError: EngineRequestError?
+    private var remainingSuspendedFrameAlignmentRequests: Int
+    private var frameAlignmentContinuation: CheckedContinuation<Void, Never>?
+    private var frameAlignmentWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         createError: EngineRequestError? = nil,
-        scanStartError: EngineRequestError? = nil
+        scanStartError: EngineRequestError? = nil,
+        suspendFrameAlignment: Bool = false
     ) {
         self.createError = createError
         self.scanStartError = scanStartError
+        remainingSuspendedFrameAlignmentRequests = suspendFrameAlignment ? 1 : 0
     }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
@@ -114,6 +120,48 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
                 project: project,
                 directory: "/tmp/saved-six-frame-roll"
             )
+        case "project.setFrameAlignment":
+            guard let params = params as? SetFrameAlignmentParams else {
+                throw SaveRollScanStubError.unexpectedParams(method)
+            }
+            recordedCalls.append(.setAlignment(
+                frameIndex: params.frameIndex,
+                alignment: params.alignment
+            ))
+            if remainingSuspendedFrameAlignmentRequests > 0 {
+                remainingSuspendedFrameAlignmentRequests -= 1
+                await withCheckedContinuation { continuation in
+                    frameAlignmentContinuation = continuation
+                    let waiters = frameAlignmentWaiters
+                    frameAlignmentWaiters.removeAll()
+                    for waiter in waiters { waiter.resume() }
+                }
+            }
+            project = ScanProject(
+                schemaVersion: project.schemaVersion,
+                id: project.id,
+                name: project.name,
+                carrier: project.carrier,
+                frameCount: project.frameCount,
+                filmProcess: project.filmProcess,
+                recipes: project.recipes,
+                rollMetadata: project.rollMetadata,
+                createdAt: project.createdAt,
+                frames: project.frames.map { frame in
+                    guard frame.index == params.frameIndex else { return frame }
+                    return ProjectFrame(
+                        index: frame.index,
+                        excluded: frame.excluded,
+                        captureOverride: frame.captureOverride,
+                        processingOverride: frame.processingOverride,
+                        outputOverride: frame.outputOverride,
+                        alignment: params.alignment,
+                        metadataOverride: frame.metadataOverride,
+                        receipts: frame.receipts
+                    )
+                }
+            )
+            value = SetFrameResult(project: project)
         case "roll.approve":
             guard let params = params as? RollApproveParams else {
                 throw SaveRollScanStubError.unexpectedParams(method)
@@ -137,6 +185,18 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
     }
 
     func calls() -> [SaveRollScanCall] { recordedCalls }
+
+    func waitForFrameAlignmentRequest() async {
+        if frameAlignmentContinuation != nil { return }
+        await withCheckedContinuation { continuation in
+            frameAlignmentWaiters.append(continuation)
+        }
+    }
+
+    func resumeFrameAlignmentRequest() {
+        frameAlignmentContinuation?.resume()
+        frameAlignmentContinuation = nil
+    }
 }
 
 @Suite("Save Roll and scan flow")
@@ -199,6 +259,191 @@ struct SaveRollScanFlowTests {
             .startScan(frames: [1, 2, 3, 4, 5, 6]),
         ])
         #expect(model.jobId == "saved-roll-job")
+    }
+
+    @Test("Save Roll persists focused-frame rotation and mirrors before scan.start")
+    @MainActor
+    func saveRollPersistsDerivativeTransformBeforeStartingScan() async {
+        let (model, client) = await preparedModel()
+        model.rotateFrame(2, by: 90)
+        model.toggleFrameMirror(2)
+        model.toggleFrameVerticalMirror(2)
+
+        let continued = await model.saveRollAndScanSelectedFrames(
+            name: "Saved six-frame roll",
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+
+        #expect(continued)
+        #expect(await client.calls() == [
+            .createProject,
+            .setAlignment(
+                frameIndex: 2,
+                alignment: FrameAlignment(
+                    offsetRows: 0,
+                    approved: false,
+                    derivativeTransform: DerivativeTransform(
+                        rotationDegrees: 90,
+                        horizontalMirror: true,
+                        verticalMirror: true
+                    )
+                )
+            ),
+            .startScan(frames: [1, 2, 3, 4, 5, 6]),
+        ])
+    }
+
+    @Test("rotation changed after project creation is persisted before an ordinary scan")
+    @MainActor
+    func existingProjectPersistsLatestTransformBeforeOrdinaryScan() async {
+        let (model, client) = await preparedModel()
+        await model.createProject(
+            name: "Saved six-frame roll",
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+        model.rotateFrame(3, by: -90)
+        model.toggleFrameVerticalMirror(3)
+
+        // An edit remains a session draft until the next scan boundary; no
+        // already-written derivative is silently rewritten in place.
+        #expect(await client.calls() == [.createProject])
+
+        await model.startMockScan()
+
+        #expect(await client.calls() == [
+            .createProject,
+            .setAlignment(
+                frameIndex: 3,
+                alignment: FrameAlignment(
+                    offsetRows: 0,
+                    approved: false,
+                    derivativeTransform: DerivativeTransform(
+                        rotationDegrees: 270,
+                        horizontalMirror: false,
+                        verticalMirror: true
+                    )
+                )
+            ),
+            .startScan(frames: [1, 2, 3, 4, 5, 6]),
+        ])
+    }
+
+    @Test("A reconnect while transform persistence is suspended prevents scan.start")
+    @MainActor
+    func reconnectDuringTransformPersistenceFailsClosedBeforeScanStart() async {
+        let client = SaveRollScanEngineStub(suspendFrameAlignment: true)
+        let (model, _) = await preparedModel(client: client)
+        await model.createProject(
+            name: "Saved six-frame roll",
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+        model.rotateFrame(3, by: 90)
+
+        let start = Task { @MainActor in
+            await model.startMockScan()
+        }
+        await client.waitForFrameAlignmentRequest()
+
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"{"event":"scanner.status","payload":{"status":{"connected":false,"adapter":null,"mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"off","transport":"idle","activeJobId":null,"filmPresent":null}}}"#.utf8
+            )
+        ))
+        await model.connect(deviceId: "sim-save-roll")
+        await client.resumeFrameAlignmentRequest()
+        await start.value
+
+        #expect(await client.calls() == [
+            .createProject,
+            .setAlignment(
+                frameIndex: 3,
+                alignment: FrameAlignment(
+                    offsetRows: 0,
+                    approved: false,
+                    derivativeTransform: DerivativeTransform(
+                        rotationDegrees: 90,
+                        horizontalMirror: false,
+                        verticalMirror: false
+                    )
+                )
+            ),
+        ])
+        #expect(model.jobId == nil)
+    }
+
+    @Test("Frame transform editability is shared across pending and active scan states")
+    @MainActor
+    func frameTransformEditabilityTracksTheWholeScanBoundary() async {
+        let client = SaveRollScanEngineStub(suspendFrameAlignment: true)
+        let (model, _) = await preparedModel(client: client)
+        await model.createProject(
+            name: "Saved six-frame roll",
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+        #expect(model.frameTransformsAreEditable)
+
+        model.rotateFrame(2, by: 90)
+        let start = Task { @MainActor in
+            await model.startMockScan()
+        }
+        await client.waitForFrameAlignmentRequest()
+
+        #expect(model.frameTransformsAreEditable == false)
+        await client.resumeFrameAlignmentRequest()
+        await start.value
+        #expect(model.jobId == "saved-roll-job")
+        #expect(model.frameTransformsAreEditable == false)
+
+        model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                #"{"event":"scan.completed","payload":{"jobId":"saved-roll-job","summary":{"completed":[1,2,3,4,5,6],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
+            )
+        ))
+        #expect(model.frameTransformsAreEditable)
+    }
+
+    @Test("rotation changed during manual review is persisted before the approved scan")
+    @MainActor
+    func manualReviewPathPersistsLatestTransformBeforeScan() async {
+        let (model, client) = await preparedModel(flaggedFrames: [1])
+        _ = await model.saveRollAndScanSelectedFrames(
+            name: "Saved six-frame roll",
+            carrier: .strip6,
+            frameCount: 6,
+            filmProcess: .positive
+        )
+        model.rotateFrame(2, by: 180)
+        model.toggleFrameMirror(2)
+
+        await model.approvePendingManualReviewAndStart()
+
+        #expect(await client.calls() == [
+            .createProject,
+            .approve(frameIndex: 1),
+            .setAlignment(
+                frameIndex: 2,
+                alignment: FrameAlignment(
+                    offsetRows: 0,
+                    approved: false,
+                    derivativeTransform: DerivativeTransform(
+                        rotationDegrees: 180,
+                        horizontalMirror: true,
+                        verticalMirror: false
+                    )
+                )
+            ),
+            .startScan(frames: [1, 2, 3, 4, 5, 6]),
+        ])
     }
 
     @Test("Save Roll opens review for the original six before one scan")

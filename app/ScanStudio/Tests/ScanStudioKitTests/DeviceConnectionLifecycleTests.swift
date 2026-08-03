@@ -21,6 +21,37 @@ private actor ConnectionLifecycleEngineStub: EngineClientProtocol {
         connection: "usb",
         supportedMultisamplePasses: [4]
     )
+    private let project = ScanProject(
+        schemaVersion: 1,
+        id: "connection-lifecycle-project",
+        name: "Connection lifecycle",
+        carrier: .mounted,
+        frameCount: 1,
+        filmProcess: .c41ColorNegative,
+        recipes: OutputRecipe(
+            archive: ArchiveRecipe(
+                filenameTemplate: "Archive_####",
+                destination: "/tmp/connection-lifecycle/archive"
+            ),
+            positive: PositiveRecipe(
+                enabled: true,
+                fileFormat: .tiff,
+                colorProfile: .adobeRgb1998,
+                filenameTemplate: "Positive_####",
+                destination: "/tmp/connection-lifecycle/positive"
+            ),
+            preview: PreviewRecipe(
+                enabled: true,
+                fileFormat: .jpeg,
+                maxLongEdgePx: 1_024,
+                filenameTemplate: "Preview_####",
+                destination: "/tmp/connection-lifecycle/preview"
+            )
+        ),
+        rollMetadata: MetadataSet(),
+        createdAt: "2026-08-02T00:00:00Z",
+        frames: [ProjectFrame(index: 1, excluded: false, receipts: [])]
+    )
     private var connectRequestCount = 0
     private var connectContinuation: CheckedContinuation<ConnectResult, Error>?
     private var requestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
@@ -59,6 +90,14 @@ private actor ConnectionLifecycleEngineStub: EngineClientProtocol {
             }
             return try cast(
                 AcquireThumbnailsAck(accepted: true, frames: []),
+                as: Result.self
+            )
+        case "project.open":
+            return try cast(
+                ProjectOpenResult(
+                    project: project,
+                    directory: "/tmp/connection-lifecycle"
+                ),
                 as: Result.self
             )
         case "scan.start":
@@ -161,6 +200,38 @@ private func waitForInitialConnectionDiscovery(_ model: SessionModel) async -> B
         try? await Task.sleep(for: .milliseconds(5))
     }
     return !model.isDiscoveringDevices
+}
+
+@MainActor
+private func prepareConnectionLifecycleScanReadiness(
+    _ model: SessionModel
+) async -> Bool {
+    await model.openProject(directory: "/tmp/connection-lifecycle")
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}"#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.refreshSavedProject(token: token))
+        == .started
+    else {
+        return false
+    }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnail",
+        rawLine: Data(
+            #"{"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":1,"thumbnail":{"brightness":0.5,"tint":0.0}}}"#.utf8
+        )
+    ))
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"{"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":1}}"#.utf8
+        )
+    ))
+    return model.scanReadiness(for: [1]).isReady
 }
 
 @Suite("Device connection lifecycle")
@@ -440,7 +511,9 @@ struct DeviceConnectionLifecycleTests {
         #expect(model.jobId == nil)
         let details = model.errorPresentation?.technicalDetails ?? ""
         #expect(details.contains("bridge process generation changed"))
-        #expect(details.contains("scan.frame.failed attempt=1 code=NOT_CONNECTED uiConnectedBefore=true"))
+        #expect(details.contains(
+            "scan.frame.failed attempt=1 code=NOT_CONNECTED frameIndex=1 uiConnectedBefore=true"
+        ))
         #expect(
             details.components(separatedBy: "connection.invalidated").count - 1
                 == 1
@@ -517,7 +590,7 @@ struct DeviceConnectionLifecycleTests {
     @Test("A scan-start response from a retired connection is discarded")
     @MainActor
     func lateScanStartResponseCannotCreateJobAfterReconnect() async {
-        let stub = ConnectionLifecycleEngineStub()
+        let stub = ConnectionLifecycleEngineStub(acquireError: nil)
         let model = SessionModel(engineClient: stub)
         #expect(await waitForInitialConnectionDiscovery(model))
 
@@ -527,6 +600,7 @@ struct DeviceConnectionLifecycleTests {
         await stub.waitForConnectRequestCount(1)
         await stub.succeedConnect()
         await firstConnection.value
+        #expect(await prepareConnectionLifecycleScanReadiness(model))
 
         let oldStart = Task { @MainActor in
             try? await model.dispatchScanStart(frames: [1])
@@ -562,7 +636,7 @@ struct DeviceConnectionLifecycleTests {
     @Test("Events that beat a valid scan-start response are applied to that job")
     @MainActor
     func earlyScanEventStillBuffersWithinCurrentConnection() async {
-        let stub = ConnectionLifecycleEngineStub()
+        let stub = ConnectionLifecycleEngineStub(acquireError: nil)
         let model = SessionModel(engineClient: stub)
         #expect(await waitForInitialConnectionDiscovery(model))
 
@@ -572,6 +646,7 @@ struct DeviceConnectionLifecycleTests {
         await stub.waitForConnectRequestCount(1)
         await stub.succeedConnect()
         await connection.value
+        #expect(await prepareConnectionLifecycleScanReadiness(model))
 
         let start = Task { @MainActor in
             try? await model.dispatchScanStart(frames: [1])

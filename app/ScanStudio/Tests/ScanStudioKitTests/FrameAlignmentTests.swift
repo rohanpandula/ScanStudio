@@ -23,17 +23,23 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
     )
     private let holdSpacingResponses: Bool
     private let holdProjectResponses: Bool
+    private let holdScanStartResponses: Bool
     private let spacingErrorAtRequestIndex: Int?
     private let alignmentPersistenceErrorAtRequestIndex: Int?
     private var spacingRequests: [RollSetSpacingOffsetParams] = []
     private var alignmentPersistenceRequests: [SetFrameAlignmentParams] = []
+    private var scanStartRequests: [ScanStartParams] = []
     private var spacingContinuations: [CheckedContinuation<Void, Never>] = []
     private var projectContinuations: [CheckedContinuation<Void, Never>] = []
+    private var scanStartContinuations: [CheckedContinuation<Void, Never>] = []
     private var projectRequestCount = 0
     private var spacingWaiters: [
         (count: Int, continuation: CheckedContinuation<Void, Never>)
     ] = []
     private var projectWaiters: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private var scanStartWaiters: [
         (count: Int, continuation: CheckedContinuation<Void, Never>)
     ] = []
     private var project = ScanProject(
@@ -73,11 +79,13 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
     init(
         holdSpacingResponses: Bool = false,
         holdProjectResponses: Bool = false,
+        holdScanStartResponses: Bool = false,
         spacingErrorAtRequestIndex: Int? = nil,
         alignmentPersistenceErrorAtRequestIndex: Int? = nil
     ) {
         self.holdSpacingResponses = holdSpacingResponses
         self.holdProjectResponses = holdProjectResponses
+        self.holdScanStartResponses = holdScanStartResponses
         self.spacingErrorAtRequestIndex = spacingErrorAtRequestIndex
         self.alignmentPersistenceErrorAtRequestIndex =
             alignmentPersistenceErrorAtRequestIndex
@@ -183,6 +191,18 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
                 alignment: params.alignment
             )
             value = SetFrameResult(project: project)
+        case "scan.start":
+            guard let params = params as? ScanStartParams else {
+                throw FrameAlignmentStubError.unexpectedParams(method)
+            }
+            scanStartRequests.append(params)
+            resumeSatisfiedScanStartWaiters()
+            if holdScanStartResponses {
+                await withCheckedContinuation { continuation in
+                    scanStartContinuations.append(continuation)
+                }
+            }
+            value = ScanStartResult(jobId: "frame-alignment-job")
         default:
             throw FrameAlignmentStubError.unexpectedMethod(method)
         }
@@ -198,6 +218,10 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
 
     func recordedAlignmentPersistenceRequests() -> [SetFrameAlignmentParams] {
         alignmentPersistenceRequests
+    }
+
+    func recordedScanStartRequests() -> [ScanStartParams] {
+        scanStartRequests
     }
 
     func seedProjectAlignment(
@@ -224,6 +248,13 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
         }
     }
 
+    func waitForScanStartRequestCount(_ count: Int) async {
+        guard scanStartRequests.count < count else { return }
+        await withCheckedContinuation { continuation in
+            scanStartWaiters.append((count, continuation))
+        }
+    }
+
     func resumeSpacingResponses() {
         let continuations = spacingContinuations
         spacingContinuations.removeAll()
@@ -235,6 +266,14 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
     func resumeProjectResponses() {
         let continuations = projectContinuations
         projectContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+
+    func resumeScanStartResponses() {
+        let continuations = scanStartContinuations
+        scanStartContinuations.removeAll()
         for continuation in continuations {
             continuation.resume()
         }
@@ -258,6 +297,18 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
         }
         projectWaiters.removeAll {
             projectRequestCount >= $0.count
+        }
+        for waiter in satisfied {
+            waiter.continuation.resume()
+        }
+    }
+
+    private func resumeSatisfiedScanStartWaiters() {
+        let satisfied = scanStartWaiters.filter {
+            scanStartRequests.count >= $0.count
+        }
+        scanStartWaiters.removeAll {
+            scanStartRequests.count >= $0.count
         }
         for waiter in satisfied {
             waiter.continuation.resume()
@@ -704,6 +755,93 @@ struct FrameAlignmentTests {
         await client.resumeSpacingResponses()
         await nudge.value
         #expect(!model.isAdjustingFrameAlignment(2))
+    }
+
+    @Test("A suspended nudge blocks scan.start until live alignment is saved")
+    @MainActor
+    func suspendedNudgeBlocksScanUntilPersistenceCompletes() async {
+        let client = FrameAlignmentEngineStub(holdSpacingResponses: true)
+        let (model, _, _) = await preparedSavedProjectModel(
+            client: client,
+            alignments: [:]
+        )
+
+        let nudge = Task {
+            await model.nudgeFrameAlignment(frameIndex: 2, by: 1)
+        }
+        await client.waitForSpacingRequestCount(1)
+
+        #expect(model.scanReadiness(for: [2]) == .alignmentInProgress)
+        await model.scanSingleFrame(2)
+        #expect(await client.recordedScanStartRequests().isEmpty)
+
+        await client.resumeSpacingResponses()
+        await nudge.value
+        #expect(
+            model.project?.frames.first(where: { $0.index == 2 })?.alignment
+                == FrameAlignment(offsetRows: 1, approved: false)
+        )
+        #expect(model.scanReadiness(for: [2]).isReady)
+
+        let result = try? await model.dispatchScanStart(frames: [2])
+        #expect(result?.jobId == "frame-alignment-job")
+        #expect(
+            await client.recordedScanStartRequests().map(\.frames) == [[2]]
+        )
+    }
+
+    @Test("A pending scan start blocks a new frame nudge")
+    @MainActor
+    func pendingScanStartBlocksFrameNudge() async {
+        let client = FrameAlignmentEngineStub(holdScanStartResponses: true)
+        let (model, _, _) = await preparedSavedProjectModel(
+            client: client,
+            alignments: [:]
+        )
+
+        let start = Task {
+            try? await model.dispatchScanStart(frames: [2])
+        }
+        await client.waitForScanStartRequestCount(1)
+
+        #expect(!model.canNudgeFrameAlignment(2, by: 1))
+        await model.nudgeFrameAlignment(frameIndex: 2, by: 1)
+        #expect(await client.recordedSpacingRequests().isEmpty)
+
+        await client.resumeScanStartResponses()
+        #expect(await start.value?.jobId == "frame-alignment-job")
+    }
+
+    @Test("An active scan blocks frame nudge and alignment retry")
+    @MainActor
+    func activeScanBlocksFrameAlignmentMutation() async {
+        let client = FrameAlignmentEngineStub(
+            spacingErrorAtRequestIndex: 1
+        )
+        let (model, _, _) = await preparedSavedProjectModel(
+            client: client,
+            alignments: [
+                2: FrameAlignment(offsetRows: 5, approved: false)
+            ]
+        )
+        for _ in 0..<100 {
+            if model.failedFrameAlignmentRestoreIndices == [2] { break }
+            await Task.yield()
+        }
+        #expect(model.failedFrameAlignmentRestoreIndices == [2])
+        #expect(await client.recordedSpacingRequests().count == 1)
+
+        model.beginJob(id: "active-alignment-job", frames: [2])
+        model.handle(event: EngineEvent(
+            name: "scan.jobState",
+            rawLine: Data(
+                #"{"event":"scan.jobState","payload":{"jobId":"active-alignment-job","state":"scanning"}}"#.utf8
+            )
+        ))
+
+        #expect(!model.canNudgeFrameAlignment(2, by: 1))
+        await model.retryFrameAlignment(frameIndex: 2)
+        #expect(await client.recordedSpacingRequests().count == 1)
     }
 
     @Test("Project creation is rejected while a frame alignment request is pending")

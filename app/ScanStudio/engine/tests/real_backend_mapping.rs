@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc, Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scanstudio_engine::domain::{self, ScannerBackend};
 use scanstudio_engine::protocol::{ConnectOptions, ErrorCode, StopMode};
@@ -526,10 +526,21 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     // The preceding completion is public closure, not reader detachment. This
     // test's explicit delay keeps the private gate observable; production
     // leaves that delay at zero.
-    std::thread::sleep(Duration::from_millis(1100));
-    backend
-        .connect(DEVICE_ID, &ConnectOptions::default())
-        .expect("once the old reader detached, reconnect should not require a separate disconnect");
+    let reconnect_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match backend.connect(DEVICE_ID, &ConnectOptions::default()) {
+            Ok(_) => break,
+            Err(error)
+                if error.code == ErrorCode::ScannerBusy
+                    && Instant::now() < reconnect_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!(
+                "once the old reader detached, reconnect should not require a separate disconnect: {error:?}"
+            ),
+        }
+    }
 
     let stale_approval = backend
         .roll_approve(1, "predecessor-preview")
@@ -893,13 +904,28 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
             .expect("archive test filename must have a UTF-8 stem")
     ));
     let (tx, rx) = mpsc::channel();
+    let overrides = std::collections::HashMap::from([(
+        1,
+        domain::FrameOverrides {
+            alignment: Some(domain::FrameAlignment {
+                offset_rows: 0,
+                approved: false,
+                derivative_transform: domain::DerivativeTransform {
+                    rotation_degrees: 90,
+                    horizontal_mirror: true,
+                    vertical_mirror: false,
+                },
+            }),
+            ..domain::FrameOverrides::default()
+        },
+    )]);
     RealLs5000::scan_start(
         &backend,
         vec![1],
         valid_capture_recipe(),
         domain::ProcessingRecipe::default(),
         output,
-        std::collections::HashMap::new(),
+        overrides,
         None,
         tx,
     )
@@ -943,6 +969,25 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
             "{output_key} must name a rendered derivative: {receipt:#?}"
         );
     }
+    assert_eq!(
+        receipt["outputs"]["derivativeTransform"],
+        serde_json::json!({
+            "rotationDegrees": 90,
+            "horizontalMirror": true,
+            "verticalMirror": false,
+        }),
+        "the receipt must make derivative rerender geometry reproducible: {receipt:#?}"
+    );
+    let archive_dimensions = image::image_dimensions(rgb_path).unwrap();
+    let positive_dimensions = image::image_dimensions(
+        receipt["outputs"]["positivePath"].as_str().unwrap()
+    )
+    .unwrap();
+    assert_eq!(
+        positive_dimensions,
+        (archive_dimensions.1, archive_dimensions.0),
+        "a 90-degree finished output must swap axes while the archive keeps scanner-native dimensions"
+    );
     assert_eq!(
         receipt["irPath"].as_str().map(std::path::Path::new),
         Some(expected_ir_path.as_path()),

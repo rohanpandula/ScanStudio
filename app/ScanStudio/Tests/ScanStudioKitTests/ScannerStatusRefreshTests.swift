@@ -318,8 +318,9 @@ struct ScannerStatusRefreshTests {
 
         await model.refreshScannerStatus()
 
-        #expect(model.status?.mediaLoaded == true)
+        #expect(model.status?.mediaLoaded == false)
         #expect(model.status?.filmPresent == false)
+        #expect(model.status?.frameCount == nil)
         #expect(model.thumbnails.isEmpty)
         #expect(model.selectedFrameIndices.isEmpty)
     }
@@ -344,8 +345,9 @@ struct ScannerStatusRefreshTests {
             )
         ))
 
-        #expect(model.status?.mediaLoaded == true)
+        #expect(model.status?.mediaLoaded == false)
         #expect(model.status?.filmPresent == false)
+        #expect(model.status?.frameCount == nil)
         #expect(model.thumbnails.isEmpty)
         #expect(model.selectedFrameIndices.isEmpty)
     }

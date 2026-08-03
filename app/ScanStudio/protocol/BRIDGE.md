@@ -16,7 +16,7 @@ Contract between the external `scanstudio-bridge` sidecar (GPL-3.0, wraps Coolsc
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `DEVICE_NOT_FOUND`, `DEVICE_BUSY`, `NO_PREVIEW`, `UNKNOWN_JOB`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED`, `FINGERPRINT_REFUSED`, `MANUAL_REVIEW_REQUIRED`, `REFEED_REQUIRED`, `ROLL_MISMATCH`, `TRANSPORT_SMEAR_DETECTED`, `GEOMETRY_VALIDATION_ERROR`, `SPLIT_ALIGNMENT_ERROR`, `BATCH_INTEGRITY_ERROR`, `NOT_IMPLEMENTED`, `INTERNAL` — 22 total.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `DEVICE_NOT_FOUND`, `DEVICE_BUSY`, `NO_PREVIEW`, `UNKNOWN_JOB`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED`, `FINGERPRINT_REFUSED`, `MANUAL_REVIEW_REQUIRED`, `REFEED_REQUIRED`, `FILM_FEED_INTERRUPTED`, `ROLL_MISMATCH`, `TRANSPORT_SMEAR_DETECTED`, `GEOMETRY_VALIDATION_ERROR`, `SPLIT_ALIGNMENT_ERROR`, `BATCH_INTEGRITY_ERROR`, `NOT_IMPLEMENTED`, `INTERNAL` — 23 total.
 
 `recoverable` is `true` only for `HARDWARE_LANE_BUSY`: retrying the identical request once the lane frees can succeed with no other action. Every other code needs a *different* action first — re-arm the latch, call `roll.approve`, physically refeed the strip, power-cycle the transport — so every other code is `recoverable: false`.
 
@@ -31,7 +31,8 @@ Contract between the external `scanstudio-bridge` sidecar (GPL-3.0, wraps Coolsc
 | `FingerprintRefused` | `FINGERPRINT_REFUSED` |
 | `ManualReviewRequired` | `MANUAL_REVIEW_REQUIRED` |
 | `RefeedRequired` | `REFEED_REQUIRED` |
-| `RollMismatch` (base class, after every mapped subclass) | `ROLL_MISMATCH` — unclassified synchronized refusals, e.g. a stale unit attention breaking a ready group, or completed preview evidence from a different USB topology (added 2026-07-25 after a live case reached the app as `INTERNAL`) |
+| `RollMismatch` carrying synchronized SCSI `02/3A/00` during a batch | `FILM_FEED_INTERRUPTED` — the scanner stopped detecting film while positioning the next frame; completed frames remain valid, but a physical refeed and fresh preview are required before resuming |
+| `RollMismatch` (base class, after the `02/3A/00` classification and every mapped subclass) | `ROLL_MISMATCH` — unclassified synchronized refusals, e.g. a stale unit attention breaking a ready group, or completed preview evidence from a different USB topology (added 2026-07-25 after a live case reached the app as `INTERNAL`) |
 | `TransportSmearDetected` | `TRANSPORT_SMEAR_DETECTED` — only surfaced after the bridge's retry budget is exhausted (see SAFE-02 guardrails) |
 | `GeometryValidationError` | `GEOMETRY_VALIDATION_ERROR` |
 | `SplitAlignmentError` | `SPLIT_ALIGNMENT_ERROR` |
@@ -269,7 +270,7 @@ ScanReceipt
 
 `Thumbnail.imagePath` is also bridge-added, not a CoolscanPy path: the bridge transposes that slot's raw scanner-linear HxWx3 uint16 preview crop with `swapaxes(0,1)` (the same scanner-native-to-Nikon-render orientation as a saved capture; no axis is flipped), applies a 0.5th/99.5th percentile stretch, and writes the already-thumbnail-sized result as an 8-bit TIFF. A `roll.preview` uses `~/.scanstudio/previews/{preview-session-uuid}/slot-{NNNN}.tif`; every `roll.setSpacingOffset` response uses another fresh UUID path so image caches cannot keep showing the previous crop. This does not relax "Image payloads"'s no-bytes-on-the-wire rule: only a path crosses the wire, exactly like `rgbPath`/`irPath` already do.
 
-`DeviceStatus.filmPresent` is a live, no-motion film-presence read, distinct from `previewEstablished` (which only means "a preview has run this session," never "film is physically loaded right now"). The bundled CoolScanPy asks the exact opened LS-5000 with TEST UNIT READY: `true` means the scanner reports medium gripped, `false` means its verified MEDIUM NOT PRESENT sense was observed, and `null` means no trustworthy verdict was available (for example, an active capture owns the interface, an older dependency lacks the method, or the scanner returned an unrecognised/malformed reply). `null` is never interpreted as absence. Presence is not motion readiness: a short strip parked at the transport end-stop can still report `true`.
+`DeviceStatus.filmPresent` is a live, no-motion film-presence read, distinct from `previewEstablished` (which only means "a preview has run this session," never "film is physically loaded right now"). The bundled CoolScanPy asks the exact opened LS-5000 with TEST UNIT READY: `true` means the scanner reports medium gripped, `false` means its verified MEDIUM NOT PRESENT sense was observed, and `null` means no trustworthy verdict was available (for example, an active capture owns the interface, an older dependency lacks the method, or the scanner returned an unrecognised/malformed reply). A verified `false` retires the stale preview registration in the same status snapshot (`previewEstablished: false`, `slotCount: null`) and gates the next scan on a fresh preview. `null` is never interpreted as absence. Presence is not motion readiness: a short strip parked at the transport end-stop can still report `true`.
 
 CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanReceipt` as `meterRgbiPath` starting this phase (Phase 10): the bridge writes `frame.meter_rgbi` (an HxWx4 uint16 array) to `{stem}_METER.tif` alongside the RGB/IR files, unconditionally whenever CoolscanPy supplies it — never fabricated; `null` only if absent.
 

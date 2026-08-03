@@ -50,4 +50,48 @@ struct DeviceBarMediaPolicyTests {
             refeedRequired: false
         ) == "No film detected")
     }
+
+    @Test("film-feed interruption hides Eject despite stale media while legacy refeed keeps it")
+    func ejectRecoveryDistinguishesPhysicalAbsenceFromLegacyRefeed() {
+        #expect(!DeviceBarEjectPolicy.canOffer(
+            isConnected: true,
+            transportIsIdle: true,
+            isJobActive: false,
+            mediaLoaded: true,
+            filmPresent: nil,
+            refeedRequired: true,
+            lastErrorMessage: "FILM_FEED_INTERRUPTED: scanner stopped detecting film (02/3A/00)"
+        ))
+        #expect(DeviceBarEjectPolicy.canOffer(
+            isConnected: true,
+            transportIsIdle: true,
+            isJobActive: false,
+            mediaLoaded: false,
+            filmPresent: nil,
+            refeedRequired: true,
+            lastErrorMessage: "REFEED_REQUIRED: eject or refeed the strip"
+        ))
+    }
+
+    @Test("verified no-film state hides Eject after error dismissal and for legacy refeed")
+    func noFilmSensorAlwaysVetoesEject() {
+        #expect(!DeviceBarEjectPolicy.canOffer(
+            isConnected: true,
+            transportIsIdle: true,
+            isJobActive: false,
+            mediaLoaded: true,
+            filmPresent: false,
+            refeedRequired: true,
+            lastErrorMessage: nil
+        ))
+        #expect(!DeviceBarEjectPolicy.canOffer(
+            isConnected: true,
+            transportIsIdle: true,
+            isJobActive: false,
+            mediaLoaded: true,
+            filmPresent: false,
+            refeedRequired: true,
+            lastErrorMessage: "REFEED_REQUIRED: eject or refeed the strip"
+        ))
+    }
 }

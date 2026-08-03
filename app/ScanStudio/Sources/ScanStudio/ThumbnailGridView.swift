@@ -228,7 +228,7 @@ struct ThumbnailGridView: View {
         .fixedSize(horizontal: true, vertical: false)
     }
 
-    /// Display-only approximation. It changes this contact sheet, never the
+    /// Contact-sheet-only approximation. It changes this contact sheet, never the
     /// scanned or saved files.
     private var previewModeControl: some View {
         VStack(alignment: .trailing, spacing: 2) {
@@ -240,7 +240,7 @@ struct ThumbnailGridView: View {
             .labelsHidden()
             .controlSize(.small)
             .frame(width: 156)
-            .help("Preview approximation, not the final render — Positive inverts and neutralizes the orange mask for display only. Scanned and saved files are unchanged.")
+            .help("Contact-sheet approximation, not the final render — Positive inverts and neutralizes the orange mask here. Scanned and saved files are unchanged.")
             .accessibilityHint("Preview approximation, not the final render. Scanned and saved files are unchanged.")
             .accessibilityLabel("Preview display mode")
 
@@ -309,10 +309,14 @@ struct ThumbnailGridView: View {
         }
         .controlSize(.small)
         .fixedSize(horizontal: true, vertical: false)
-        .disabled(sessionModel.frameTransformTargetIndex == nil)
-        .help(sessionModel.frameTransformTargetIndex == nil
-            ? "Click a frame to focus it, then rotate it."
-            : "Rotates the focused frame for display in this session only. Command-L rotates left; Command-R rotates right.")
+        .disabled(
+            sessionModel.frameTransformTargetIndex == nil
+                || !sessionModel.frameTransformsAreEditable
+        )
+        .help(transformMenuHelp(
+            missingTarget: "Click a frame to focus it, then rotate it.",
+            available: "Rotates the focused frame's Positive/Preview files on its next scan. Existing files and Master TIFF, IR, and meter stay untouched. Command-L rotates left; Command-R rotates right."
+        ))
     }
 
     private var mirrorMenu: some View {
@@ -352,10 +356,26 @@ struct ThumbnailGridView: View {
         }
         .controlSize(.small)
         .fixedSize(horizontal: true, vertical: false)
-        .disabled(sessionModel.frameTransformTargetIndex == nil)
-        .help(sessionModel.frameTransformTargetIndex == nil
-            ? "Click a frame to focus it, then flip it."
-            : "Flips the focused frame for display in this session only. Shift-Command-H flips left to right; Option-Command-V flips top to bottom.")
+        .disabled(
+            sessionModel.frameTransformTargetIndex == nil
+                || !sessionModel.frameTransformsAreEditable
+        )
+        .help(transformMenuHelp(
+            missingTarget: "Click a frame to focus it, then flip it.",
+            available: "Flips the focused frame's Positive/Preview files on its next scan. Existing files and Master TIFF, IR, and meter stay untouched. Shift-Command-H flips left to right; Option-Command-V flips top to bottom."
+        ))
+    }
+
+    private func transformMenuHelp(
+        missingTarget: String,
+        available: String
+    ) -> String {
+        guard sessionModel.frameTransformsAreEditable else {
+            return "Rotation and flips cannot be changed while a scan is starting or running."
+        }
+        return sessionModel.frameTransformTargetIndex == nil
+            ? missingTarget
+            : available
     }
 
     private func transformActionLabel(_ action: String) -> String {
@@ -797,9 +817,8 @@ struct ThumbnailTileImage: View {
     let frameIndex: Int
     let thumbnail: Thumbnail?
     var displayMode: ThumbnailDisplayMode = .asScanned
-    /// Session-local display rotation in degrees (0/90/180/270), applied to
-    /// the rendered bitmap only — see `SessionModel.rotateFrame`'s own doc
-    /// comment for why this is display-only. Centralized here (not at each
+    /// Preview of the persisted derivative rotation (0/90/180/270).
+    /// Centralized here (not at each
     /// call site) so the contact sheet, the carrier-loading grid, and the
     /// FrameDetail filmstrip all rotate identically for free.
     var orientationDegrees: Int = 0
@@ -964,7 +983,7 @@ enum ThumbnailImageCache {
     }
 }
 
-/// Cheap, DISPLAY-ONLY negative-to-positive approximation for one tile
+/// Cheap, CONTACT-SHEET-ONLY negative-to-positive approximation for one tile
 /// image — never touches capture data or written outputs, and is
 /// intentionally not colorimetric (no per-stock calibration, no ICC
 /// awareness). This is the small AppKit/CGImage-specific glue: it extracts
@@ -1048,9 +1067,7 @@ private struct ThumbnailTile: View {
     /// DEF-05 "Show as positive" — see `ThumbnailTileImage`/
     /// `PositivePreviewRenderer`'s own doc comments.
     var displayMode: ThumbnailDisplayMode = .asScanned
-    /// Session-local display rotation in degrees (0/90/180/270) — see
-    /// `SessionModel.rotateFrame`'s own doc comment for why this is
-    /// display-only.
+    /// Preview of the saved derivative rotation in degrees (0/90/180/270).
     var orientationDegrees: Int = 0
     var mirrored: Bool = false
     var verticallyMirrored: Bool = false

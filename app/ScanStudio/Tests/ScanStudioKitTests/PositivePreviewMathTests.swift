@@ -1,4 +1,4 @@
-// Unit tests for the pure, DISPLAY-ONLY negative-to-positive approximation
+// Unit tests for the pure, CONTACT-SHEET-ONLY negative-to-positive approximation
 // math backing the contact sheet's "Show as positive" toggle. The
 // AppKit/CGImage plumbing that actually calls this (`PositivePreviewRenderer`
 // in `ThumbnailGridView.swift`) lives in the `ScanStudio` executable

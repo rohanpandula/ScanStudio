@@ -146,6 +146,27 @@ _OUT_OF_TABLE_MESSAGE_RE = re.compile(
 )
 
 
+def _is_medium_not_present_roll_mismatch(message: str) -> bool:
+    """Recognize SCSI 02/3A/00 inside CoolScanPy's bare RollMismatch.
+
+    CoolScanPy preserves this worker diagnostic only as text today. Strip
+    separators so both ``023a00`` and the canonical ``02/3A/00`` spelling
+    match, while still requiring the synchronized-protocol context and the
+    sense label so unrelated hexadecimal text cannot be misclassified.
+    """
+    compact = re.sub(r"[^A-Za-z0-9]", "", message).lower()
+    return "synchronizedprotocolerror" in compact and "sense023a00" in compact
+
+
+def _film_feed_interrupted_message(scanner_diagnostic: str) -> str:
+    return (
+        "film feed interrupted: the scanner stopped detecting film while "
+        "positioning the next frame (02/3A/00); refeed the film, acquire a "
+        "fresh preview, then resume the remaining frames; scanner diagnostic: "
+        f"{scanner_diagnostic}"
+    )
+
+
 def _trim_out_of_table_slots(
     remaining: list[int], message: str
 ) -> tuple[list[int], list[int]] | None:
@@ -429,6 +450,13 @@ class CoolscanPyTransport:
                 film_present = None
         else:
             film_present = None
+        # A completed preview records coordinates from an earlier traversal;
+        # it is not live evidence that the medium is still gripped. A verified
+        # MEDIUM NOT PRESENT response therefore retires that registration.
+        # Keep the Roll object/evidence itself so a fresh preview can reuse the
+        # same session storage, but block every capture until that happens.
+        if film_present is False:
+            self._preview_established = False
         return domain.DeviceStatus(
             connected=True,
             device_id=self._device_id,
@@ -883,6 +911,12 @@ class CoolscanPyTransport:
                     # raise below, and a RollMismatch whose message doesn't
                     # match this exact shape (_trim_out_of_table_slots
                     # returns None) always did too.
+                    if _is_medium_not_present_roll_mismatch(str(exc)):
+                        self._preview_established = False
+                        raise BridgeError(
+                            ErrorCode.FILM_FEED_INTERRUPTED,
+                            _film_feed_interrupted_message(str(exc)),
+                        ) from exc
                     trimmed = (
                         None
                         if table_trim_retried

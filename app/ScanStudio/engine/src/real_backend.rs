@@ -2426,11 +2426,9 @@ impl ScannerBackend for RealLs5000 {
 
 /// Maps a `BridgeCallError` (Plan 09-02's transport-level error vocabulary)
 /// onto `domain::EngineError`. PROTOCOL.md's `ErrorCode` enum is a closed,
-/// Swift-decoded wire vocabulary that this phase must not extend
-/// (`app/ScanStudio/protocol/PROTOCOL.md` stays unedited, per Phase 9's
-/// "zero Swift/protocol changes" success criterion) — every bridge code
-/// without a clean PROTOCOL.md equivalent becomes `Internal`, never
-/// silently dropped, always with the real code/message in the text.
+/// Swift-decoded wire vocabulary: bridge codes with an exact application
+/// meaning map explicitly; every other bridge code becomes `Internal`, never
+/// silently dropped and always with the real code/message in the text.
 fn map_bridge_error(err: BridgeCallError) -> EngineError {
     match err {
         BridgeCallError::Timeout | BridgeCallError::ProcessExited => EngineError::new(
@@ -2468,6 +2466,7 @@ fn map_bridge_error_code_str(code: &str) -> ErrorCode {
         "DEVICE_BUSY" => ErrorCode::ScannerBusy,
         "HARDWARE_LANE_BUSY" => ErrorCode::ScannerBusy,
         "MANUAL_REVIEW_REQUIRED" => ErrorCode::ManualReviewRequired,
+        "FILM_FEED_INTERRUPTED" => ErrorCode::FilmFeedInterrupted,
         "HW_MOTION_NOT_ARMED" => ErrorCode::HwMotionNotArmed,
         "UNKNOWN_JOB" => ErrorCode::UnknownJob,
         _ => ErrorCode::Internal,
@@ -4485,6 +4484,18 @@ fn run_real_scan_job_inner(
                             .effective();
                         let effective_alignment =
                             frame_overrides.and_then(|value| value.alignment.as_ref());
+                        // The bridge already applies an approved spacing
+                        // offset while positioning this real frame, so the
+                        // engine must not crop it a second time. Rotation and
+                        // flips are different: they are derivative-only pixel
+                        // geometry and still belong in the renderer.
+                        let derivative_geometry = effective_alignment.map(|value| {
+                            domain::FrameAlignment {
+                                offset_rows: 0,
+                                approved: false,
+                                derivative_transform: value.derivative_transform,
+                            }
+                        });
 
                         let receipt_path_validation = if frame_completed.receipt.slot
                             != frame_completed.slot
@@ -4594,7 +4605,7 @@ fn run_real_scan_job_inner(
                             // frame. Reusing that transport offset as a pixel
                             // crop would shift the completed raster twice.
                             None,
-                            None,
+                            derivative_geometry.as_ref(),
                             nikonlook_exposure_10ns_from_receipt(&frame_completed.receipt.exposure),
                         );
 
@@ -4612,6 +4623,7 @@ fn run_real_scan_job_inner(
                                     preview_path: written
                                         .preview_path
                                         .map(|path| path.display().to_string()),
+                                    derivative_transform: written.derivative_transform,
                                 });
                                 // Which nikonlook bundle/path/gains actually
                                 // rendered this frame -- see build_real_receipt's
@@ -5767,6 +5779,17 @@ mod tests {
                 "{code} must not be recoverable"
             );
         }
+    }
+
+    #[test]
+    fn film_feed_interrupted_bridge_code_is_typed_not_internal() {
+        assert_eq!(
+            map_bridge_error_code_str("FILM_FEED_INTERRUPTED"),
+            ErrorCode::FilmFeedInterrupted
+        );
+        assert!(!map_bridge_error_code_recoverable(
+            "FILM_FEED_INTERRUPTED"
+        ));
     }
 
     #[test]

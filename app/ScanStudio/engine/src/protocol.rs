@@ -98,6 +98,10 @@ pub enum ErrorCode {
     ScannerBusy,
     UnknownJob,
     FeedJam,
+    /// The scanner stopped reporting film while positioning a batch frame.
+    /// Completed frames remain durable; the operator must refeed, acquire a
+    /// fresh preview, and resume only the unfinished frames.
+    FilmFeedInterrupted,
     Internal,
     ProjectNotFound,
     ManifestInvalid,
@@ -758,6 +762,10 @@ mod tests {
             (ErrorCode::ScannerBusy, "SCANNER_BUSY"),
             (ErrorCode::UnknownJob, "UNKNOWN_JOB"),
             (ErrorCode::FeedJam, "FEED_JAM"),
+            (
+                ErrorCode::FilmFeedInterrupted,
+                "FILM_FEED_INTERRUPTED",
+            ),
             (ErrorCode::Internal, "INTERNAL"),
             (ErrorCode::ProjectNotFound, "PROJECT_NOT_FOUND"),
             (ErrorCode::ManifestInvalid, "MANIFEST_INVALID"),

@@ -236,6 +236,25 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
         self.filmPresent = filmPresent
         self.motionArmed = motionArmed
     }
+
+    /// Reconciles a legacy/stale preview flag with the stronger live sensor
+    /// verdict. Verified film absence retires preview-derived frame data;
+    /// unknown presence leaves it untouched.
+    public func invalidatingPreviewWhenFilmIsAbsent() -> ScannerStatus {
+        guard filmPresent == false else { return self }
+        return ScannerStatus(
+            connected: connected,
+            adapter: adapter,
+            mediaLoaded: false,
+            carrier: carrier,
+            frameCount: nil,
+            lamp: lamp,
+            transport: transport,
+            activeJobId: activeJobId,
+            filmPresent: false,
+            motionArmed: motionArmed
+        )
+    }
 }
 
 public struct ConnectResult: Decodable, Sendable {
@@ -734,11 +753,35 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
     public let archivePath: String?
     public let positivePath: String?
     public let previewPath: String?
+    /// Exact presentation transform applied to positive/preview derivatives.
+    /// The archive/IR/meter capture files are never transformed.
+    public let derivativeTransform: DerivativeTransform
 
-    public init(archivePath: String?, positivePath: String?, previewPath: String?) {
+    public init(
+        archivePath: String?,
+        positivePath: String?,
+        previewPath: String?,
+        derivativeTransform: DerivativeTransform = .identity
+    ) {
         self.archivePath = archivePath
         self.positivePath = positivePath
         self.previewPath = previewPath
+        self.derivativeTransform = derivativeTransform
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case archivePath, positivePath, previewPath, derivativeTransform
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        archivePath = try values.decodeIfPresent(String.self, forKey: .archivePath)
+        positivePath = try values.decodeIfPresent(String.self, forKey: .positivePath)
+        previewPath = try values.decodeIfPresent(String.self, forKey: .previewPath)
+        derivativeTransform = try values.decodeIfPresent(
+            DerivativeTransform.self,
+            forKey: .derivativeTransform
+        ) ?? .identity
     }
 }
 
@@ -927,16 +970,59 @@ public struct MetadataSet: Codable, Equatable, Sendable {
 
 // MARK: - project.create / project.open / project.list
 
-/// A project-persisted relative frame-boundary adjustment. Draft offsets are
+/// Reproducible display geometry for finished Positive/Preview files.
+/// Rotation is clockwise; horizontal/vertical mirrors are applied in the
+/// unrotated source axes before the quarter-turn. Capture masters remain
+/// byte-untouched.
+public struct DerivativeTransform: Codable, Equatable, Sendable {
+    public let rotationDegrees: Int
+    public let horizontalMirror: Bool
+    public let verticalMirror: Bool
+
+    public static let identity = DerivativeTransform()
+
+    public init(
+        rotationDegrees: Int = 0,
+        horizontalMirror: Bool = false,
+        verticalMirror: Bool = false
+    ) {
+        self.rotationDegrees = rotationDegrees
+        self.horizontalMirror = horizontalMirror
+        self.verticalMirror = verticalMirror
+    }
+}
+
+/// A project-persisted relative frame-boundary adjustment plus presentation
+/// transform. Draft offsets are
 /// deliberately retained with `approved == false` so reopening a project can
 /// restore the operator's work without making it scan-authoritative.
 public struct FrameAlignment: Codable, Equatable, Sendable {
     public let offsetRows: Int
     public let approved: Bool
+    public let derivativeTransform: DerivativeTransform
 
-    public init(offsetRows: Int, approved: Bool) {
+    public init(
+        offsetRows: Int,
+        approved: Bool,
+        derivativeTransform: DerivativeTransform = .identity
+    ) {
         self.offsetRows = offsetRows
         self.approved = approved
+        self.derivativeTransform = derivativeTransform
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case offsetRows, approved, derivativeTransform
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        offsetRows = try values.decode(Int.self, forKey: .offsetRows)
+        approved = try values.decode(Bool.self, forKey: .approved)
+        derivativeTransform = try values.decodeIfPresent(
+            DerivativeTransform.self,
+            forKey: .derivativeTransform
+        ) ?? .identity
     }
 }
 

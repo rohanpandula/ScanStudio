@@ -508,6 +508,22 @@ fn validate_output_retention(
     Ok(())
 }
 
+fn validate_derivative_transform(
+    transform: domain::DerivativeTransform,
+) -> Result<(), EngineError> {
+    if transform.is_supported() {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "unsupported derivative rotation {}: expected 0, 90, 180, or 270 degrees",
+                transform.rotation_degrees
+            ),
+        ))
+    }
+}
+
 /// Runs the engine: reads NDJSON requests from stdin, dispatches them
 /// against `Backends` (simulator always, plus the real backend when
 /// `SCANSTUDIO_BRIDGE_CMD` is configured), and writes NDJSON responses/
@@ -826,6 +842,11 @@ fn handle_request(
                                 ));
                             }
                         }
+                        if let Some(alignment) = frame.alignment.as_ref() {
+                            validate_derivative_transform(
+                                alignment.derivative_transform,
+                            )?;
+                        }
                         if frame.capture_override.is_some()
                             || frame.processing_override.is_some()
                             || frame.output_override.is_some()
@@ -1027,6 +1048,9 @@ fn handle_request(
                 if let Some(output) = frame.output_override.as_ref() {
                     crate::render::validate_user_output_recipe_paths(output)?;
                 }
+                if let Some(alignment) = frame.alignment.as_ref() {
+                    validate_derivative_transform(alignment.derivative_transform)?;
+                }
             }
             project_state.set(project.clone(), std::path::PathBuf::from(&params.directory));
             to_json(&protocol::ProjectOpenResult {
@@ -1089,6 +1113,9 @@ fn handle_request(
         }
         "project.setFrameAlignment" => {
             let params: protocol::SetFrameAlignmentParams = parse_params(&request.params)?;
+            if let Some(alignment) = params.alignment.as_ref() {
+                validate_derivative_transform(alignment.derivative_transform)?;
+            }
             let project = apply_frame_mutation(project_state, params.frame_index, |frame| {
                 frame.alignment = params.alignment.clone();
             })?;
@@ -2970,6 +2997,65 @@ mod tests {
             clear_result["project"]["frames"][0]["alignment"].is_null(),
             "sending null must clear the alignment"
         );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn project_set_frame_alignment_rejects_non_quarter_turn_derivative_rotation() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let directory = temp_test_dir("reject-frame-transform");
+
+        handle_request(
+            &mut backends,
+            &tx,
+            &Request {
+                id: 1,
+                method: "project.create".into(),
+                params: serde_json::json!({
+                    "name": "Transform Validation",
+                    "carrier": "strip6",
+                    "frameCount": 1,
+                    "filmProcess": "positive",
+                    "directory": directory.display().to_string(),
+                }),
+            },
+            &mut project_state,
+        )
+        .unwrap();
+
+        let error = handle_request(
+            &mut backends,
+            &tx,
+            &Request {
+                id: 2,
+                method: "project.setFrameAlignment".into(),
+                params: serde_json::json!({
+                    "frameIndex": 1,
+                    "alignment": {
+                        "offsetRows": 0,
+                        "approved": false,
+                        "derivativeTransform": {
+                            "rotationDegrees": 45,
+                            "horizontalMirror": false,
+                            "verticalMirror": false
+                        }
+                    },
+                }),
+            },
+            &mut project_state,
+        )
+        .expect_err("a non-quarter-turn cannot be persisted");
+
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("0, 90, 180, or 270"));
+        assert!(project_state.active.as_ref().unwrap().frames[0].alignment.is_none());
 
         let _ = std::fs::remove_dir_all(&directory);
     }
