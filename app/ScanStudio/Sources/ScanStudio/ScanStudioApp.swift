@@ -6,6 +6,7 @@
 // activate call.
 
 import AppKit
+import Observation
 import ScanStudioKit
 import SwiftUI
 
@@ -43,6 +44,10 @@ struct ScanStudioApp: App {
             if case .ready(_, let model) = appDelegate.launchState {
                 FrameTransformCommands(session: model)
             }
+        }
+
+        Settings {
+            UpdateSettingsView(model: appDelegate.updateFlowModel)
         }
     }
 }
@@ -104,6 +109,11 @@ enum LaunchState {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let launchState: LaunchState
+    /// Shared in-app update flow (01-05): one instance per app run, handed to
+    /// the Settings scene and the launch + 24 h background check.
+    let updateFlowModel: UpdateFlowModel
+    /// Cancellable handle for the rolling 24 h background check task.
+    private var backgroundUpdateTask: Task<Void, Never>?
 
     override init() {
         do {
@@ -120,7 +130,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             launchState = .failed(message: AppDelegate.describe(error))
         }
+
+        updateFlowModel = Self.makeUpdateFlowModel()
         super.init()
+
+        // AUT-05-GUARD: mirror the real job-active signal into the update flow
+        // so no install is offered or run during an active scan/preview. When
+        // the engine failed to launch there is no SessionModel, and `jobActive`
+        // stays false -- with no connected scanner there is nothing to guard.
+        if case .ready(_, let session) = launchState {
+            Self.bindJobActivity(of: session, into: updateFlowModel)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -128,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         AppDelegate.applyDockIcon()
+        startUpdateCheckLoops()
     }
 
     /// Packaged apps place resources directly in `Contents/Resources`. Source
@@ -144,6 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        backgroundUpdateTask?.cancel()
         guard case .ready(let client, _) = launchState else { return }
         let finished = DispatchSemaphore(value: 0)
         Task.detached {
@@ -158,6 +180,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return locateError.message
         }
         return String(describing: error)
+    }
+
+    // MARK: - Update wiring (01-05)
+
+    /// The versionless `latest.json` pointer. GitHub exposes assets of the
+    /// newest non-prerelease release at `releases/latest/download/<asset>`.
+    /// Alpha pre-releases are additionally probed via the API by the checker
+    /// (01-04), so this URL plus the API probe covers both channels.
+    private static let updatePointerURL = URL(
+        string: "https://github.com/rohanpandula/ScanStudio/releases/latest/download/latest.json"
+    )!
+
+    /// Constructs the single shared `UpdateFlowModel`: the 01-03 install core
+    /// pointed at `/Applications`, the 01-04 checker/downloader against the
+    /// feed, and an installed version stamped from `Info.plist` (or an
+    /// always-up-to-date sentinel for unstamped dev builds, T-01-05-02).
+    private static func makeUpdateFlowModel() -> UpdateFlowModel {
+        let supportURL = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "Library/Application Support/ScanStudio",
+                isDirectory: true
+            )
+        let rollbackDirectory = supportURL.appendingPathComponent("Rollback", isDirectory: true)
+        // The rollback directory is created up front: `UpdateInstaller` only
+        // rejects non-existent directories, and `/Applications` always exists
+        // on macOS, so this construction cannot throw once the directory
+        // exists.
+        try? FileManager.default.createDirectory(
+            at: rollbackDirectory,
+            withIntermediateDirectories: true
+        )
+        let installer = try! UpdateInstaller(
+            appDirectory: URL(fileURLWithPath: "/Applications", isDirectory: true),
+            rollbackDirectory: rollbackDirectory
+        )
+        return UpdateFlowModel(
+            checker: GitHubUpdateChecker(pointerURL: Self.updatePointerURL),
+            downloader: UpdateDownloader(),
+            installer: installer,
+            installedVersion: Self.installedUpdateVersion(),
+            channelDefaultsKey: "ScanStudio.updateChannel"
+        )
+    }
+
+    /// The running app's version: the packaged `ScanStudioRelease` stamp, or
+    /// an always-up-to-date sentinel for unstamped source/dev builds so a dev
+    /// build is never offered as an install target (T-01-05-02).
+    private static func installedUpdateVersion() -> UpdateVersion {
+        if let stamp = Bundle.main.infoDictionary?["ScanStudioRelease"] as? String,
+           !stamp.isEmpty,
+           let version = UpdateVersion(raw: stamp) {
+            return version
+        }
+        return UpdateVersion(raw: "999.0.0")!
+    }
+
+    /// Mirrors `SessionModel.isJobActive` into `model.jobActive` and re-arms
+    /// the observation after every change, so the AUT-05-GUARD stays live for
+    /// the whole run without polling.
+    private static func bindJobActivity(of session: SessionModel, into model: UpdateFlowModel) {
+        let isActive = withObservationTracking {
+            MainActor.assumeIsolated { session.isJobActive }
+        } onChange: {
+            Task { @MainActor [weak model] in
+                guard let model else { return }
+                model.jobActive = session.isJobActive
+                Self.bindJobActivity(of: session, into: model)
+            }
+        }
+        model.jobActive = isActive
+    }
+
+    /// Kicks the update cadence (AUT-05-CHECK): one check at launch, then one
+    /// every 24 h via a rolling `Task.sleep`. Read-only plumbing -- `checkNow()`
+    /// only mutates check state and never downloads or installs on cadence,
+    /// and it skips a beat while an install is already in flight.
+    private func startUpdateCheckLoops() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.updateFlowModel.checkNow()
+        }
+        backgroundUpdateTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    // 24 h between checks (AUT-05-CHECK). `Duration` has no
+                    // `.hours` member, so spell it in seconds.
+                    try await Task.sleep(for: .seconds(24 * 60 * 60))
+                } catch {
+                    break
+                }
+                guard let self, self.updateFlowModel.installProgress == nil else {
+                    continue
+                }
+                await self.updateFlowModel.checkNow()
+            }
+        }
     }
 }
 
