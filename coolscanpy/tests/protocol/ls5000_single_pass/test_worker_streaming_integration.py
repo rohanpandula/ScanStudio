@@ -377,6 +377,7 @@ def _drive_continuation(
         density_evidence=density_evidence,
         actual_usb_bus=1,
         actual_usb_address=2,
+        scanner_identity="Nikon LS-5000 ED 1.03",
     )
     return journal, second
 
@@ -771,7 +772,7 @@ def _drive_two_frame_batch(
     )
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     monkeypatch.setattr(
-        worker_module, "_validate_scanner_identity", lambda _payload: None
+        worker_module, "_validate_scanner_identity", lambda _payload: "Nikon LS-5000 ED 1.03"
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_a: preview_windows

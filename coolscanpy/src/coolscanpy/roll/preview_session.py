@@ -640,9 +640,11 @@ def _validate_preview_result(
         ("preview_geometry_validated_before_reads", True),
     ):
         _require_exact(journal, key, expected)
-    if journal.get("scanner_identity") != "Nikon LS-5000 ED 1.03":
+    if not isinstance(journal.get("scanner_identity"), str) or not journal.get(
+        "scanner_identity"
+    ).startswith("Nikon LS-5000 ED"):
         raise RollSessionIntegrityError(
-            "preview journal is not from the proven LS-5000 firmware"
+            "preview journal is not from a proven Nikon LS-5000 ED"
         )
     if not _is_sha256(journal.get("capture_engine_sha256")):
         raise RollSessionIntegrityError(
