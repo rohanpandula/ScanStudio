@@ -60,6 +60,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from coolscanpy.exceptions import MeterUnusableError
+
 
 CHANNELS = ("R", "G", "B")
 CALIBRATION_COLOR_IDS = (1, 2, 3)
@@ -1481,20 +1483,60 @@ def decode_nikon_density_source(
     return np.transpose(native_row_planar, (0, 2, 1))
 
 
-def _selected_row(image: np.ndarray, channel_index: int) -> tuple[int, float]:
+def _select_usable_mean(
+    image: np.ndarray,
+    channel_index: int,
+    *,
+    row_first: int,
+    row_stop: int,
+) -> tuple[int, float] | None:
+    """Best full-row mean in ``[row_first, row_stop)`` below saturation.
+
+    Returns ``(row_index, mean)`` for the greatest full-row mean strictly
+    below ``SATURATION_LIMIT`` within the window, or ``None`` when no row in
+    the window has a nonzero, unsaturated mean. ``row_stop`` is clamped to the
+    decoded source height so the widened full-frame retry cannot run past the
+    image.
+    """
+    row_stop = min(row_stop, int(image.shape[0]))
     selected_row = -1
     selected_mean = 0.0
-    for row_index in range(METER_ROWS_FIRST, METER_ROWS_STOP):
+    for row_index in range(max(0, row_first), row_stop):
         total = int(np.sum(image[row_index, :, channel_index], dtype=np.uint32))
         mean = float(total) / float(DENSITY_SOURCE_WIDTH)
         if selected_mean < mean < SATURATION_LIMIT:
             selected_row = row_index
             selected_mean = mean
     if selected_row < 0 or selected_mean == 0.0:
-        raise ValueError(
-            f"{CHANNELS[channel_index]} meter rows contain no nonzero unsaturated mean"
-        )
+        return None
     return selected_row, selected_mean
+
+
+def _selected_row(
+    image: np.ndarray,
+    channel_index: int,
+    *,
+    row_first: int = METER_ROWS_FIRST,
+    row_stop: int = METER_ROWS_STOP,
+) -> tuple[int, float]:
+    """Select a usable meter row for a channel (Lane B widened-window retry).
+
+    The primary meter window is ``[METER_ROWS_FIRST, METER_ROWS_STOP)``. If it
+    yields no usable mean, the selection retries once over the widened window
+    ``[0, height)`` (the full usable frame area, the ``#17`` fix) before giving
+    up. Only if both windows are unusable does it raise the typed
+    :class:`MeterUnusableError` (bridge code ``METER_UNUSABLE``) instead of a
+    bare ``ValueError``, so a B&W strip / modified SA-21 / dense negative
+    surfaces as a friendly card rather than ``INTERNAL``.
+    """
+    windows = [(row_first, row_stop), (0, int(image.shape[0]))]
+    for start, stop in windows:
+        selected = _select_usable_mean(
+            image, channel_index, row_first=start, row_stop=stop
+        )
+        if selected is not None:
+            return selected
+    raise MeterUnusableError(CHANNELS[channel_index])
 
 
 def evaluate_nikon_density(

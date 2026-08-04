@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from coolscanpy.exceptions import MeterUnusableError
 from coolscanpy.protocol.ls5000_single_pass import density as density_module
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     _validated_density_evidence,
@@ -895,13 +896,77 @@ def test_density_evaluator_refuses_a_zero_signal_source() -> None:
     image = np.zeros((6_104, 96, 3), dtype=np.uint16)
     wire = _wire_from_image(image)
 
-    with pytest.raises(ValueError, match="no nonzero unsaturated mean"):
+    with pytest.raises(MeterUnusableError, match="channel R"):
         evaluate_nikon_density(
             wire,
             calibration_binding=_calibration_binding(),
             source_binding=_source_binding(wire, image),
             exposure_binding=_exposure_binding(),
         )
+
+
+def test_density_evaluator_raises_meter_unusable_on_all_zero_g_channel() -> None:
+    # #17 reproduced exactly: R/B are usable in the primary meter window but
+    # the G rows are all zero (B&W strip / modified SA-21 / dense negative),
+    # so neither the primary nor the widened window finds a G mean. This must
+    # surface as the typed METER_UNUSABLE error for G, never a bare ValueError.
+    image = np.zeros((6_104, 96, 3), dtype=np.uint16)
+    image[100, :, 0] = 45_000  # R usable in primary window
+    image[101, :, 0] = 45_000
+    image[100, :, 2] = 32_000  # B usable in primary window
+    image[101, :, 2] = 32_000
+    wire = _wire_from_image(image)
+
+    with pytest.raises(MeterUnusableError, match="channel G"):
+        evaluate_nikon_density(
+            wire,
+            calibration_binding=_calibration_binding(),
+            source_binding=_source_binding(wire, image),
+            exposure_binding=_exposure_binding(),
+        )
+
+
+def test_density_evaluator_raises_meter_unusable_on_saturated_rows() -> None:
+    # Every row is at full scale (>= SATURATION_LIMIT), so no row is usable;
+    # the extra space outside the primary window is saturated too, so the
+    # widened retry also finds nothing and the typed error is raised.
+    image = np.full((6_104, 96, 3), 65_535, dtype=np.uint16)
+    wire = _wire_from_image(image)
+
+    with pytest.raises(MeterUnusableError, match="channel R"):
+        evaluate_nikon_density(
+            wire,
+            calibration_binding=_calibration_binding(),
+            source_binding=_source_binding(wire, image),
+            exposure_binding=_exposure_binding(),
+        )
+
+
+def test_density_evaluator_widened_window_retry_succeeds_on_sparse_rows() -> None:
+    # G has no usable mean in the primary meter window [75, 225) but a usable
+    # mean exists in the widened full-frame window (row 10). R and B are usable
+    # in the primary window. Lane B must recover via the widened retry rather
+    # than raising -- selecting the G row from outside the primary band.
+    image = np.zeros((6_104, 96, 3), dtype=np.uint16)
+    image[100, :, 0] = 45_000  # R usable in primary window
+    image[101, :, 0] = 45_000
+    image[100, :, 2] = 32_000  # B usable in primary window
+    image[101, :, 2] = 32_000
+    image[10, :, 1] = 5_000  # G usable ONLY in the widened full-frame window
+    wire = _wire_from_image(image)
+
+    result = evaluate_nikon_density(
+        wire,
+        calibration_binding=_calibration_binding(),
+        source_binding=_source_binding(wire, image),
+        exposure_binding=_exposure_binding(),
+    )
+    assert result.selected_rows[1] == 10
+    assert result.selected_row_means[1] == pytest.approx(5_000.0)
+    # R and B were resolved from the primary window (first occurrence of the
+    # greatest mean, row 100).
+    assert result.selected_rows[0] == 100
+    assert result.selected_rows[2] == 100
 
 
 def test_exposure_binding_refuses_out_of_contract_values() -> None:
