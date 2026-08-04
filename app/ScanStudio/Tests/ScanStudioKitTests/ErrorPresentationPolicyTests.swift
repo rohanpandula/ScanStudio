@@ -174,6 +174,11 @@ struct ErrorPresentationPolicyTests {
                 "A master TIFF already exists",
                 "Choose a different name or save location. ScanStudio will not overwrite an archive master."
             ),
+            (
+                "METER_UNUSABLE: the metering pass could not find usable image data for channel G — check film density/orientation and adapter modification; try a different process setting",
+                "This film could not be metered",
+                "ScanStudio couldn't find usable image data to meter this frame — the film may be too dense, upside down, or the film adapter may be modified. Check the film's density and orientation, then try a different process setting."
+            ),
         ]
 
         for (rawMessage, expectedTitle, expectedGuidance) in cases {
