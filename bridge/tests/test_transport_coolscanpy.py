@@ -976,6 +976,34 @@ def test_start_scan_maps_base_roll_mismatch(
     assert "untraced sense 063f03" in str(excinfo.value)
 
 
+def test_start_scan_maps_meter_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lane B (#17): a frame whose metering found no usable image data for a
+    channel raises ``coolscanpy.MeterUnusableError``. The scan path must map it
+    to the typed ``METER_UNUSABLE`` wire code (guidance preserved), never
+    flatten it to a bare INTERNAL."""
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1)],
+        scan_results={1: [coolscanpy.MeterUnusableError("G")]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.start_scan(
+            slots=[1],
+            recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            output=_output(tmp_path),
+            on_progress=lambda _p: None,
+            on_retry=lambda *a: None,
+            on_frame=lambda *_a: None,
+        )
+    assert excinfo.value.code == ErrorCode.METER_UNUSABLE
+    assert "could not find usable image data" in str(excinfo.value)
+    assert "channel G" in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     "diagnostic",
     (

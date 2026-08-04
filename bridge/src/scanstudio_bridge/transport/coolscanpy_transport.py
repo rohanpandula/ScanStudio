@@ -886,6 +886,12 @@ class CoolscanPyTransport:
                     raise BridgeError(ErrorCode.SPLIT_ALIGNMENT_ERROR, str(exc)) from exc
                 except coolscanpy.BatchIntegrityError as exc:
                     raise BridgeError(ErrorCode.BATCH_INTEGRITY_ERROR, str(exc)) from exc
+                except coolscanpy.MeterUnusableError as exc:
+                    # #17: no usable meter mean for a channel in either the
+                    # primary or widened window. Fail-closed -- no fabricated
+                    # exposure -- surfaced as a friendly METER_UNUSABLE card,
+                    # never INTERNAL. Guidance text is in the exception.
+                    raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
                 except coolscanpy.RollMismatch as exc:
                     # Base-class fallback AFTER every mapped RollMismatch
                     # subclass above (FingerprintRefused, RefeedRequired;
