@@ -1,0 +1,1 @@
+{"id": 3, "method": "scanner.connect", "params": {"deviceId": "sim-ls5000-0", "options": {"timeScale": 1.0, "faultInjection": "none"}}}

@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coolscanpy"
+version = "0.1.3"
+description = "Direct-USB acquisition library for Nikon Coolscan film scanners with a python-sane-style API — roll scanning, RGBI capture, IR plane, scan receipts"
+readme = "README.md"
+license = "GPL-3.0-only"
+authors = [{ name = "CoolscanPy contributors" }]
+keywords = [
+    "film scanning",
+    "Nikon",
+    "Coolscan",
+    "LS-5000",
+    "SANE",
+    "negative",
+    "RGBI",
+    "infrared",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4,<3",
+    "opencv-python-headless>=4.13,<5",
+    "tifffile>=2026.6.1,<2027",
+    "imagecodecs>=2026.6.6,<2027",
+    "pyusb>=1.3,<2",
+    "jinja2>=3.1,<4",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    # No "License :: OSI Approved" classifier: setuptools>=80 rejects a
+    # License classifier once `license` is a PEP 639 SPDX expression (see
+    # https://peps.python.org/pep-0639/) -- the `license = "GPL-3.0-only"`
+    # field above is the modern equivalent and is what tooling reads.
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics :: Capture :: Scanners",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+[project.optional-dependencies]
+# Direct-hardware transport route: only needed if the caller wants the
+# python-sane-backed `SaneBackend` path. `coolscanpy.transport.sane` imports
+# `sane` lazily inside the functions that need it, so `import coolscanpy`
+# never requires this.
+scanner = [
+    "python-sane>=2.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.14,<1",
+    "setuptools>=80",
+]
+
+[project.urls]
+Homepage = "https://github.com/rohanpandula/coolscanpy"
+Repository = "https://github.com/rohanpandula/coolscanpy.git"
+Issues = "https://github.com/rohanpandula/coolscanpy/issues"
+
+[project.scripts]
+coolscanpy-practical-parity = "coolscanpy.cli.practical_parity:main"
+coolscanpy-roll-scan = "coolscanpy.cli.roll_scan:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"coolscanpy" = ["py.typed"]
+"coolscanpy.protocol.ls5000_single_pass.data" = ["*.json", "*.jsonl"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]

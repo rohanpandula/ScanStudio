@@ -1,0 +1,3 @@
+{"event":"scanner.thumbnail","payload":{"frameIndex":1,"thumbnail":{"imagePath":"/mnt/c/film/frame0001.tif","boundaryRows":[12,884],"spacingOffset":3,"needsApproval":false,"warnings":[]},"operationId":"op-fixture-boundary"}}
+{"event":"scanner.thumbnail","payload":{"frameIndex":2,"thumbnail":{"imagePath":"/mnt/c/film/frame0002.tif","boundaryRows":[8,880],"spacingOffset":-2,"needsApproval":true,"warnings":["low confidence boundary detection"]},"operationId":"op-fixture-boundary"}}
+{"event":"scanner.thumbnailsComplete","payload":{"count":2,"operationId":"op-fixture-boundary"}}

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "appLicense": {"spdxId": "MIT", "sourceFile": "LICENSE", "bundledAs": "Licenses/ScanStudio-MIT.txt"},
+  "gplComponents": [
+    {"name": "scanstudio-bridge", "spdxId": "GPL-3.0-only", "sourceRepo": "vendor/scanstudio-bridge", "sourceLicenseFile": "LICENSE", "bundledLicenseAs": "Licenses/scanstudio-bridge-GPL-3.0.txt", "correspondingSourceDir": "CorrespondingSource/scanstudio-bridge"},
+    {"name": "coolscanpy", "spdxId": "GPL-3.0-only", "sourceRepo": "vendor/coolscanpy", "sourceLicenseFile": "LICENSE", "bundledLicenseAs": "Licenses/CoolscanPy-GPL-3.0.txt", "correspondingSourceDir": "CorrespondingSource/coolscanpy"}
+  ],
+  "sharedRequiredPaths": [
+    "Licenses/README.txt", "Licenses/ScanStudio-MIT.txt", "Licenses/scanstudio-bridge-GPL-3.0.txt",
+    "Licenses/CoolscanPy-GPL-3.0.txt",
+    "Licenses/Rust-App-Cargo.lock", "Licenses/Rust-App-THIRD-PARTY.txt",
+    "Licenses/Rust-Engine-Cargo.lock", "Licenses/Rust-Engine-THIRD-PARTY.txt",
+    "Licenses/npm-production/package-lock.json", "Licenses/npm-production/inventory.json",
+    "Licenses/THIRD_PARTY_NOTICES.md", "Licenses/dependency-notices-manifest.json",
+    "CorrespondingSource/scanstudio-bridge/src", "CorrespondingSource/scanstudio-bridge/LICENSE",
+    "CorrespondingSource/scanstudio-bridge/pyproject.toml",
+    "CorrespondingSource/coolscanpy/src", "CorrespondingSource/coolscanpy/LICENSE",
+    "CorrespondingSource/coolscanpy/pyproject.toml",
+    "provenance.json"
+  ],
+  "perPlatform": {
+    "linux": {
+      "additionalRequiredPaths": ["BridgeRuntime/python/bin/python3.13", "BridgeRuntime/site-packages", "scanstudio-bridge", "Licenses/CPython-3.13.txt", "Licenses/python-wheels"],
+      "requiredSitePackageEntries": ["numpy", "tifffile", "imagecodecs", "cv2", "usb", "jinja2", "markupsafe"],
+      "strictOnlyPaths": ["BridgeRuntime/site-packages/sane.py"],
+      "notes": "strictOnlyPaths are skipped when verify-bundle.sh runs with --staging-only (the local macOS pre-build check); mandatory when checking a real CI-built Linux bundle."
+    },
+    "windows": {
+      "additionalRequiredPaths": [
+        "install-bridge-wsl.sh",
+        "BridgeRuntime/cpython-3.13.14+20260728-x86_64-unknown-linux-gnu.tar.gz",
+        "BridgeRuntime/SHA256SUMS",
+        "Wheelhouse/SHA256SUMS",
+        "wsl-requirements.txt",
+        "Licenses/CPython-3.13.txt",
+        "Licenses/python-wheelhouse",
+        "Documentation/README-WINDOWS.md",
+        "Documentation/WINDOWS-WSL-LANE.md",
+        "Documentation/WINDOWS-LIVE-VALIDATION.md"
+      ],
+      "notes": "The native Windows app is Python-free. Its WSL2 lane ships sha256-pinned CPython 3.13.14 and a checksummed offline wheelhouse. install-bridge-wsl.sh installs CoolscanPy before scanstudio-bridge from the two shipped CorrespondingSource trees with --no-index and --no-deps."
+    }
+  },
+  "forbiddenPathSubstrings": ["/Users/"]
+}

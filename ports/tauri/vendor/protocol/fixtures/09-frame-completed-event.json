@@ -1,0 +1,1 @@
+{"event": "scan.frameCompleted", "payload": {"jobId": "job-1", "frameIndex": 1, "receipt": {"jobId": "job-1", "frameIndex": 1, "startedAt": "2026-07-22T09:00:00Z", "durationMs": 1900, "passes": 2, "resolutionDpi": 4000, "bitDepth": 16, "channels": "rgbi", "engineVersion": "0.1.0", "deviceId": "sim-ls5000-0", "simulated": true, "settingsFingerprint": "1a3d265e0b54bbd2"}}}

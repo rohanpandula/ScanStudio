@@ -5,13 +5,16 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
     name: Build and verify ${{ matrix.arch }} DMG
-    # Per-arch DMGs (see .planning/phases/02-intel-support/02-CONTEXT.md): a
-    # universal bundle is impossible because the pinned cv2/numpy wheels are
+    # A universal bundle is impossible because the pinned cv2/numpy wheels are
     # not universal, so each architecture is built natively on its own runner
     # through the SAME verified `make dmg` path (codesign --deep --strict,
     # relocation-safe bridge check, SHA-256). If EITHER matrix cell fails,
@@ -121,10 +124,127 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  windows-resources:
+    name: Assemble Windows offline resources
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ports/tauri/app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust dependency notice generator
+        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+      - name: Assemble and verify the WSL2 resource bundle
+        working-directory: ports/tauri
+        env:
+          HOST_PYTHON: python3
+        run: |
+          ./packaging/windows/assemble-staging.sh
+          ./packaging/windows/verify-bundle.sh ./packaging/.staging/windows
+          tar -C packaging/.staging -czf "$RUNNER_TEMP/windows-staging.tar.gz" windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScanStudio-windows-staging
+          path: ${{ runner.temp }}/windows-staging.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Build and verify Windows x64 Preview
+    needs: windows-resources
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-windows-staging
+          path: ${{ runner.temp }}/windows-staging
+      - name: Restore the exact verified resource tree
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ports/tauri/packaging/.staging | Out-Null
+          tar -xzf "$env:RUNNER_TEMP/windows-staging/windows-staging.tar.gz" -C ports/tauri/packaging/.staging
+          if ($LASTEXITCODE -ne 0) { throw "Could not restore Windows staging" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ports/tauri/app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+      - name: Resolve release version from the tag
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build, install, smoke-test, and re-extract both Windows packages
+        shell: pwsh
+        run: |
+          ports/tauri/packaging/windows/build-and-verify.ps1 `
+            -Version "$env:RELEASE_VERSION" `
+            -OutputDir "$env:RUNNER_TEMP/scanstudio-windows-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScanStudio-windows-x86_64-preview
+          path: ${{ runner.temp }}/scanstudio-windows-release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    name: Build and verify Linux x64 Preview
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build and runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file libayatana-appindicator3-dev libfuse2 libgtk-3-dev \
+            librsvg2-dev libsane-dev libssl-dev libusb-1.0-0 libwebkit2gtk-4.1-dev \
+            libxdo-dev patchelf pkg-config sane-utils wget
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ports/tauri/app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust dependency notice generator
+        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+      - name: Resolve release version from the tag
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Build, extract, smoke-test, and re-extract both Linux packages
+        run: |
+          ports/tauri/packaging/linux/build-and-verify.sh \
+            "$RELEASE_VERSION" \
+            "$RUNNER_TEMP/scanstudio-linux-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScanStudio-linux-x86_64-preview
+          path: ${{ runner.temp }}/scanstudio-linux-release/*
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
-    name: Publish combined multi-arch release
-    needs: release
+    name: Publish combined Beta and Previews
+    needs: [release, windows, linux]
     runs-on: macos-15
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -137,85 +257,204 @@ jobs:
         with:
           name: ScanStudio-dmg-x86_64
           path: ${{ runner.temp }}/x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-windows-x86_64-preview
+          path: ${{ runner.temp }}/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: ScanStudio-linux-x86_64-preview
+          path: ${{ runner.temp }}/linux
       - name: Resolve release version from the tag
         run: |
           STAMP="${GITHUB_REF_NAME#v}"
-          echo "RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
-          echo "SCANSTUDIO_RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
+          {
+            echo "RELEASE_VERSION=$STAMP"
+            echo "SCANSTUDIO_RELEASE_VERSION=$STAMP"
+            echo "RELEASE_ASSETS=$RUNNER_TEMP/release-assets"
+            echo "RELEASE_METADATA=$RUNNER_TEMP/release-metadata"
+          } >> "$GITHUB_ENV"
           echo "Resolved release version: $STAMP"
-      - name: Merge arch-keyed pointers and combine checksums
-        # Fold the two matrix cells' arch-keyed latest.json into ONE pointer by
-        # re-running the emitter against both downloaded DMGs: the second emit
-        # sees the same version plus a distinct arch and MERGES the entry in
-        # (never clobbers). Concatenate the basename-only SHA256SUMS files so
-        # the published checksum covers both DMGs.
+      - name: Stage exactly six packages and generate metadata
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/combined"
+          mkdir -p "$RELEASE_ASSETS" "$RELEASE_METADATA"
+          cp "$RUNNER_TEMP/arm64/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" "$RELEASE_ASSETS/"
+          cp "$RUNNER_TEMP/x86_64/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" "$RELEASE_ASSETS/"
+          cp "$RUNNER_TEMP/windows/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-setup.exe" "$RELEASE_ASSETS/"
+          cp "$RUNNER_TEMP/windows/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-portable.zip" "$RELEASE_ASSETS/"
+          cp "$RUNNER_TEMP/linux/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" "$RELEASE_ASSETS/"
+          cp "$RUNNER_TEMP/linux/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz" "$RELEASE_ASSETS/"
+          test "$(find "$RELEASE_ASSETS" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6
+
           app/ScanStudio/scripts/emit_release_assets.sh \
-            "$RUNNER_TEMP/arm64/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
-            "$RELEASE_VERSION" "$RUNNER_TEMP/combined" arm64
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
+            "$RELEASE_VERSION" "$RELEASE_METADATA" arm64
           app/ScanStudio/scripts/emit_release_assets.sh \
-            "$RUNNER_TEMP/x86_64/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
-            "$RELEASE_VERSION" "$RUNNER_TEMP/combined" x86_64
-          cat "$RUNNER_TEMP/arm64/SHA256SUMS" "$RUNNER_TEMP/x86_64/SHA256SUMS" > "$RUNNER_TEMP/combined/SHA256SUMS"
-          echo "Combined pointer:"
-          cat "$RUNNER_TEMP/combined/latest.json"
-      - name: Re-verify combined assets before publish
-        # Re-assert the merged pointer carries BOTH arch entries whose
-        # checksums match the two downloaded DMGs, so an unverified artifact
-        # is never attached (T-02-01-03).
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
+            "$RELEASE_VERSION" "$RELEASE_METADATA" x86_64
+
+          (
+            cd "$RELEASE_ASSETS"
+            shasum -a 256 \
+              "ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
+              "ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
+              "ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-setup.exe" \
+              "ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-portable.zip" \
+              "ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" \
+              "ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz"
+          ) > "$RELEASE_METADATA/SHA256SUMS"
+      - name: Re-verify all local release assets
         run: |
           set -euo pipefail
-          python3 - "$RUNNER_TEMP/combined/latest.json" "$RELEASE_VERSION" "$RUNNER_TEMP" <<'PY'
-          import hashlib, json, os, sys
-          path, version, base = sys.argv[1:4]
-          d = json.load(open(path))
-          assert d["version"] == version
-          assert set(d["architectures"]) == {"arm64", "x86_64"}
+          python3 - "$RELEASE_ASSETS" "$RELEASE_METADATA" "$RELEASE_VERSION" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          assets = Path(sys.argv[1])
+          metadata = Path(sys.argv[2])
+          version = sys.argv[3]
+          expected = {
+              f"ScanStudio-{version}-macOS-arm64.dmg",
+              f"ScanStudio-{version}-macOS-x86_64.dmg",
+              f"ScanStudio-{version}-Windows-x86_64-preview-setup.exe",
+              f"ScanStudio-{version}-Windows-x86_64-preview-portable.zip",
+              f"ScanStudio-{version}-Linux-x86_64-preview.AppImage",
+              f"ScanStudio-{version}-Linux-x86_64-preview-portable.tar.gz",
+          }
+          actual = {path.name for path in assets.iterdir() if path.is_file()}
+          assert actual == expected, (actual, expected)
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          ledger = {}
+          for line in (metadata / "SHA256SUMS").read_text().splitlines():
+              digest, name = line.split(None, 1)
+              ledger[name] = digest
+          assert set(ledger) == expected, ledger
+          for name in expected:
+              assert ledger[name] == sha256(assets / name), name
+
+          latest = json.loads((metadata / "latest.json").read_text())
+          assert latest["version"] == version
+          assert set(latest["architectures"]) == {"arm64", "x86_64"}
           for arch in ("arm64", "x86_64"):
-              entry = d["architectures"][arch]
-              dmg = os.path.join(base, arch, os.path.basename(entry["url"]))
-              assert os.path.isfile(dmg), dmg
-              h = hashlib.sha256(open(dmg, "rb").read()).hexdigest()
-              assert entry["sha256"] == h, arch
-          print("Combined checksums re-verified for both architectures")
+              name = f"ScanStudio-{version}-macOS-{arch}.dmg"
+              entry = latest["architectures"][arch]
+              assert entry["url"].endswith("/" + name)
+              assert entry["sha256"] == ledger[name]
+          print("six packages, central checksums, and Mac-only updater pointer verified")
           PY
-      - name: Create GitHub release
-        # Alpha, beta, and release-candidate parcels are pre-releases on
-        # GitHub. Stable versions publish as full releases. Both DMGs +
-        # combined checksums +
-        # the arch-keyed pointer are attached in one release.
+      - name: Write release notes
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ScanStudio $RELEASE_VERSION is one prerelease with four clearly separated support levels.
+
+          - **macOS Apple Silicon: Beta.** The Nikon LS-5000 real-film workflow has been validated.
+          - **macOS Intel: Preview.** Built and package-tested natively in CI; real-scanner validation is still pending.
+          - **Windows x64: Preview.** The native installer is built, installed, and checked in CI. The portable archive's contents and engine sidecar are checked; it requires Microsoft Edge WebView2 to already be installed, so clean systems should use setup.exe. The bundled Python bridge and dependency wheelhouse install without PyPI access, but Ubuntu system prerequisites still require apt/network. Real-scanner validation is pending. Scanner access requires WSL2 with Ubuntu 24.04 and usbipd-win.
+          - **Linux x64: Preview.** The AppImage and portable archive are built and package-verified on Ubuntu 22.04, including their contents, engine sidecar, bundled bridge launch/import, and python-sane imports. The Tauri GUI and real scanner have not been validated end to end. The host must provide compatible SANE/libusb runtime packages and scanner permissions.
+
+          The macOS builds are ad-hoc signed and not notarized. The Windows installer is unsigned and may show a SmartScreen warning. The Linux packages are unsigned. Review SHA256SUMS before installing when downloading outside the GitHub Releases page.
+
+          Choose the DMG matching your Mac. Windows users should use setup.exe on a clean system; the portable zip is for systems that already have WebView2. Linux users can choose the AppImage or extracted portable tarball.
+          EOF
+      - name: Create and verify a draft GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ARM_SHA256="$(awk '{print $1}' "$RUNNER_TEMP/arm64/SHA256SUMS")"
-          X86_SHA256="$(awk '{print $1}' "$RUNNER_TEMP/x86_64/SHA256SUMS")"
-          PRERELEASE=""
-          case "$RELEASE_VERSION" in
-            *-alpha*|*-beta*|*-rc*) PRERELEASE="--prerelease" ;;
-          esac
-          NOTES="ScanStudio $RELEASE_VERSION
-
-          Apple Silicon (arm64): Beta. Validated with the real LS-5000 workflow.
-          Intel (x86_64): Preview. Built and tested natively in CI; real-scanner validation is still pending.
-
-          Both builds are ad-hoc signed and are not notarized. macOS may require Control-click > Open on first launch. Do not disable Gatekeeper globally.
-
-          arm64 SHA-256: $ARM_SHA256
-          x86_64 SHA-256: $X86_SHA256"
-          gh release create "v$RELEASE_VERSION" \
-            --repo rohanpandula/ScanStudio \
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --latest=false \
             --title "ScanStudio $RELEASE_VERSION" \
-            --notes "$NOTES" \
-            $PRERELEASE \
-            "$RUNNER_TEMP/arm64/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
-            "$RUNNER_TEMP/x86_64/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
-            "$RUNNER_TEMP/combined/SHA256SUMS" \
-            "$RUNNER_TEMP/combined/latest.json"
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-setup.exe" \
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-portable.zip" \
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" \
+            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz" \
+            "$RELEASE_METADATA/SHA256SUMS" \
+            "$RELEASE_METADATA/latest.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$RUNNER_TEMP/draft-release.json"
+          python3 - "$RUNNER_TEMP/draft-release.json" "$RELEASE_ASSETS" "$RELEASE_METADATA" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text())
+          asset_dir, metadata_dir = map(Path, sys.argv[2:4])
+          local = {path.name: path for path in asset_dir.iterdir() if path.is_file()}
+          local.update({name: metadata_dir / name for name in ("SHA256SUMS", "latest.json")})
+          remote = {item["name"]: item for item in payload["assets"]}
+          assert payload["draft"] is True
+          assert payload["prerelease"] is True
+          assert set(remote) == set(local), (set(remote), set(local))
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          for name, path in local.items():
+              digest = sha256(path)
+              assert remote[name]["size"] == path.stat().st_size, name
+              assert remote[name].get("digest") == f"sha256:{digest}", name
+          print("draft release has exactly eight byte-verified assets")
+          PY
+      - name: Publish and re-verify the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease \
+            --latest=false
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$RUNNER_TEMP/published-release.json"
+          python3 - "$RUNNER_TEMP/published-release.json" "$RELEASE_ASSETS" "$RELEASE_METADATA" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text())
+          asset_dir, metadata_dir = map(Path, sys.argv[2:4])
+          local = {path.name: path for path in asset_dir.iterdir() if path.is_file()}
+          local.update({name: metadata_dir / name for name in ("SHA256SUMS", "latest.json")})
+          remote = {item["name"]: item for item in payload["assets"]}
+          assert payload["draft"] is False
+          assert payload["prerelease"] is True
+          assert set(remote) == set(local)
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          for name, path in local.items():
+              digest = sha256(path)
+              assert remote[name]["size"] == path.stat().st_size, name
+              assert remote[name].get("digest") == f"sha256:{digest}", name
+          print(payload["html_url"])
+          print("published prerelease reverified with exactly eight assets")
+          PY
       - name: Summarize published release
         run: |
-          echo "arm64 asset: https://github.com/rohanpandula/ScanStudio/releases/download/v$RELEASE_VERSION/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg"
-          echo "x86_64 asset: https://github.com/rohanpandula/ScanStudio/releases/download/v$RELEASE_VERSION/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg"
-          echo "arm64 SHA-256 $(awk '{print $1}' "$RUNNER_TEMP/arm64/SHA256SUMS")"
-          echo "x86_64 SHA-256 $(awk '{print $1}' "$RUNNER_TEMP/x86_64/SHA256SUMS")"
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME"
+          cat "$RELEASE_METADATA/SHA256SUMS"

@@ -1,0 +1,193 @@
+.contactSheet {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.toolbar {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.loadControls,
+.selectionControls,
+.transformControls {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.transformControls {
+  margin-left: auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.focusControl {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: #374151;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.focusControl select {
+  padding: 0.32rem 0.45rem;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.batchTransformControls {
+  position: relative;
+  font-size: 0.8rem;
+}
+
+.batchTransformControls summary {
+  padding: 0.35rem 0.6rem;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #f9fafb;
+  cursor: pointer;
+  user-select: none;
+}
+
+.batchTransformButtons {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  display: flex;
+  width: max-content;
+  max-width: min(36rem, 90vw);
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0.5rem;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #ffffff;
+  box-shadow: 0 0.35rem 1rem rgb(17 24 39 / 14%);
+}
+
+.controlButton {
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.controlButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.mediaGuidance {
+  max-width: 60ch;
+  margin: 0;
+  color: #4b5563;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.failureBanner {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 0.9rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+  gap: 0.75rem;
+}
+
+.tile {
+  position: relative;
+  display: block;
+  aspect-ratio: 3 / 2;
+  padding: 0.4rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f9fafb;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.tileMedia {
+  position: absolute;
+  inset: 0.4rem;
+  display: block;
+  overflow: hidden;
+  border-radius: 4px;
+}
+
+.tile img {
+  object-fit: contain;
+  transform-origin: center;
+  transition: transform 120ms ease;
+}
+
+.shadedTile {
+  border-radius: 4px;
+  transform-origin: center;
+  transition: transform 120ms ease;
+}
+
+.pending {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 4px;
+  background: repeating-linear-gradient(
+    45deg,
+    #f3f4f6,
+    #f3f4f6 0.5rem,
+    #e5e7eb 0.5rem,
+    #e5e7eb 1rem
+  );
+}
+
+.frameNumber {
+  position: absolute;
+  z-index: 2;
+  top: 0.45rem;
+  left: 0.45rem;
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+  background: rgb(255 255 255 / 82%);
+  font-size: 0.7rem;
+  color: #6b7280;
+}
+
+.selected {
+  border-color: #2563eb;
+  outline: 2px solid #2563eb;
+  outline-offset: -2px;
+}
+
+.focused::after {
+  position: absolute;
+  z-index: 3;
+  right: 0.45rem;
+  bottom: 0.45rem;
+  content: "Edit";
+  padding: 0.1rem 0.35rem;
+  border-radius: 999px;
+  background: rgb(17 24 39 / 78%);
+  color: #ffffff;
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}

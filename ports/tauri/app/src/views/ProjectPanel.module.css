@@ -1,0 +1,101 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.banner {
+  display: flex;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 0.75rem;
+  border: 1px solid #d1fae5;
+  border-radius: 6px;
+  background: #ecfdf5;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.directoryRow {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+}
+
+.directory {
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.inlineError {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #b91c1c;
+}
+
+.error {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 0.9rem;
+}
+
+.controlButton {
+  align-self: flex-start;
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.controlButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.recentList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.recentRow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.recentName {
+  font-weight: 600;
+}
+
+.recentMeta {
+  font-size: 0.8rem;
+  color: #6b7280;
+}

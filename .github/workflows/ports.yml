@@ -1,0 +1,119 @@
+name: Cross-platform port
+
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'ports/tauri/**'
+      - '.github/workflows/ports.yml'
+      - '.github/workflows/release.yml'
+  pull_request:
+    paths:
+      - 'ports/tauri/**'
+      - '.github/workflows/ports.yml'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ports-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-resources:
+    name: Assemble Windows offline resources
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ports/tauri/app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust dependency notice generator
+        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+      - name: Assemble and verify the WSL2 resource bundle
+        working-directory: ports/tauri
+        env:
+          HOST_PYTHON: python3
+        run: |
+          ./packaging/windows/assemble-staging.sh
+          ./packaging/windows/verify-bundle.sh ./packaging/.staging/windows
+          tar -C packaging/.staging -czf "$RUNNER_TEMP/windows-staging.tar.gz" windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: port-windows-staging
+          path: ${{ runner.temp }}/windows-staging.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Build and verify Windows x64 Preview
+    needs: windows-resources
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: port-windows-staging
+          path: ${{ runner.temp }}/windows-staging
+      - name: Restore the exact verified resource tree
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ports/tauri/packaging/.staging | Out-Null
+          tar -xzf "$env:RUNNER_TEMP/windows-staging/windows-staging.tar.gz" -C ports/tauri/packaging/.staging
+          if ($LASTEXITCODE -ne 0) { throw "Could not restore Windows staging" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ports/tauri/app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+      - name: Build, install, smoke-test, and re-extract both Windows packages
+        shell: pwsh
+        run: |
+          ports/tauri/packaging/windows/build-and-verify.ps1 `
+            -Version "0.3.0-ci.${{ github.run_number }}" `
+            -OutputDir "$env:RUNNER_TEMP/scanstudio-windows-preview"
+
+  linux:
+    name: Build and verify Linux x64 Preview
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build and runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file libayatana-appindicator3-dev libfuse2 libgtk-3-dev \
+            librsvg2-dev libsane-dev libssl-dev libusb-1.0-0 libwebkit2gtk-4.1-dev \
+            libxdo-dev patchelf pkg-config sane-utils wget
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ports/tauri/app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust dependency notice generator
+        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+      - name: Build, extract, smoke-test, and re-extract both Linux packages
+        run: |
+          ports/tauri/packaging/linux/build-and-verify.sh \
+            "0.3.0-ci.${{ github.run_number }}" \
+            "$RUNNER_TEMP/scanstudio-linux-preview"

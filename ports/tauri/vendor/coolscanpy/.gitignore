@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.DS_Store
+# Keep the resolved lockfile with the product source so local builds remain
+# reproducible; transient environments and build outputs stay ignored above.
+!uv.lock

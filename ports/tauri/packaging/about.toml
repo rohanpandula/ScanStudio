@@ -1,0 +1,30 @@
+# Fail-closed allowlist for the two Rust graphs shipped in the Windows and
+# Linux packages. cargo-about 0.9.1 resolves dual licenses in this priority
+# order and emits full license text through packaging/about.hbs.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "MPL-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "MIT-0",
+    "CC0-1.0",
+    "Unlicense",
+    "Apache-2.0 WITH LLVM-exception",
+]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+workarounds = ["ring", "rustls"]
+private = { ignore = true }
+
+[unicode-ident]
+accepted = ["Unicode-DFS-2016"]
