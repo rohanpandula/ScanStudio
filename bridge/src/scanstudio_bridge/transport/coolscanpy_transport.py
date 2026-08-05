@@ -591,6 +591,15 @@ class CoolscanPyTransport:
                 "strip and retry -- if this recurs on clean feeds it may be a "
                 f"capture or driver defect ({exc})",
             ) from exc
+        except coolscanpy.MeterUnusableError as exc:
+            # #17: no usable meter mean for a channel while replaying this
+            # preview's density evidence (density metering runs as part of
+            # Roll.preview, not just scan_many -- see preview_session.py's
+            # _validated_preview_density_evidence). Fail-closed -- no
+            # fabricated exposure -- surfaced as a friendly METER_UNUSABLE
+            # card, never INTERNAL. Guidance text is in the exception.
+            # Mirrors the start_scan handler below.
+            raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
         except coolscanpy.RollMismatch as exc:
             # Base-class fallback AFTER every mapped subclass (RefeedRequired
             # above; FingerprintRefused/ManualReviewRequired are scan-time

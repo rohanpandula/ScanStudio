@@ -18,6 +18,7 @@ from typing import Any, Iterable, Literal, Mapping, cast
 
 import numpy as np
 
+from coolscanpy.exceptions import MeterUnusableError
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     AttemptPaths,
     CaptureAttemptResult,
@@ -899,6 +900,17 @@ def _validated_preview_density_evidence(
 
     try:
         evidence = attempt.density_evidence
+    except MeterUnusableError:
+        # #17 (preview path): no usable meter mean for a channel while
+        # replaying this preview's density evidence. Deliberately NOT
+        # folded into the generic (OSError, ValueError) integrity path
+        # below -- MeterUnusableError is not a subclass of either, but that
+        # is pinned here explicitly (rather than left as an accident of the
+        # exception hierarchy) so it keeps propagating as the distinct,
+        # typed, fail-closed METER_UNUSABLE wire condition through
+        # Roll.preview() to the transport boundary, never INTERNAL and
+        # never swallowed into RollSessionIntegrityError.
+        raise
     except (OSError, ValueError) as error:
         raise RollSessionIntegrityError(
             f"preview density evidence does not replay from its source: {error}"

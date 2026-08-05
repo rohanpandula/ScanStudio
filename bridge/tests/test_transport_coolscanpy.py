@@ -841,6 +841,29 @@ def test_preview_maps_device_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     assert excinfo.value.code == ErrorCode.DEVICE_BUSY
 
 
+def test_preview_maps_meter_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lane B (#17): density metering runs as part of ``Roll.preview()``
+    itself (not just ``scan_many``), so a channel with no usable meter mean
+    can raise ``coolscanpy.MeterUnusableError`` from the PREVIEW path, not
+    only from ``start_scan`` (see ``test_start_scan_maps_meter_unusable``
+    above). Before this fix, ``preview()``'s except chain had no handler for
+    it, so it fell through to service.py's generic ``except Exception``
+    branch and flattened to a bare INTERNAL code. Must map to the typed
+    ``METER_UNUSABLE`` wire code instead, guidance text preserved."""
+
+    class _MeterUnusableRoll(_FakeRoll):
+        def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
+            raise coolscanpy.MeterUnusableError("G")
+
+    transport, _device = _opened_transport(monkeypatch, _MeterUnusableRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert excinfo.value.code == ErrorCode.METER_UNUSABLE
+    assert "could not find usable image data" in str(excinfo.value)
+    assert "channel G" in str(excinfo.value)
+
+
 def test_preview_maps_leaked_index_decode_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Live incident, 2026-07-25: `Roll.preview()` let a coolscanpy-internal
     `IndexDecodeError` (coolscanpy.protocol.ls5000_single_pass.roll_index --
