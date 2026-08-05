@@ -112,7 +112,6 @@ Files bridge/src/scanstudio_bridge/service.py and ports/tauri/vendor/scanstudio-
 Files bridge/src/scanstudio_bridge/transport/output_reservation.py and ports/tauri/vendor/scanstudio-bridge/src/scanstudio_bridge/transport/output_reservation.py differ
 Only in ports/tauri/vendor/scanstudio-bridge/tests: test_probe_linux_env.py
 Files bridge/tests/test_safety.py and ports/tauri/vendor/scanstudio-bridge/tests/test_safety.py differ
-Files bridge/tests/test_service_dispatch.py and ports/tauri/vendor/scanstudio-bridge/tests/test_service_dispatch.py differ
 Only in ports/tauri/vendor/scanstudio-bridge/tests: test_stdout_byte_discipline.py
 Files bridge/tests/test_transport_mock.py and ports/tauri/vendor/scanstudio-bridge/tests/test_transport_mock.py differ
 Files bridge/uv.lock and ports/tauri/vendor/scanstudio-bridge/uv.lock differ
