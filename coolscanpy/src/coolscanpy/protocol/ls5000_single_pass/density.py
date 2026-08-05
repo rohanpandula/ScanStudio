@@ -1512,6 +1512,31 @@ def _select_usable_mean(
     return selected_row, selected_mean
 
 
+# Lane B widened-window retry: how much wider than the primary meter band
+# the retry window is allowed to grow. Bounding this to a multiple of the
+# primary band's own height (rather than the whole frame) is a fail-closed
+# erosion fix -- the retry used to span [0, height) unconditionally, so a
+# usable row anywhere in the frame, arbitrarily far from the primary band,
+# could silently become the selected exposure reference.
+_METER_RETRY_WIDENING_FACTOR = 3
+
+
+def _widened_meter_window(
+    row_first: int, row_stop: int, frame_height: int
+) -> tuple[int, int]:
+    """Bound the Lane B retry window to the primary band widened
+    symmetrically to ``_METER_RETRY_WIDENING_FACTOR`` times its own height,
+    centered on the primary band and clamped to the frame. See
+    :func:`_selected_row`.
+    """
+    band_height = row_stop - row_first
+    center = (row_first + row_stop) / 2.0
+    half_widened = (band_height * _METER_RETRY_WIDENING_FACTOR) / 2.0
+    widened_first = int(math.floor(center - half_widened))
+    widened_stop = int(math.ceil(center + half_widened))
+    return max(0, widened_first), min(frame_height, widened_stop)
+
+
 def _selected_row(
     image: np.ndarray,
     channel_index: int,
@@ -1522,14 +1547,17 @@ def _selected_row(
     """Select a usable meter row for a channel (Lane B widened-window retry).
 
     The primary meter window is ``[METER_ROWS_FIRST, METER_ROWS_STOP)``. If it
-    yields no usable mean, the selection retries once over the widened window
-    ``[0, height)`` (the full usable frame area, the ``#17`` fix) before giving
-    up. Only if both windows are unusable does it raise the typed
-    :class:`MeterUnusableError` (bridge code ``METER_UNUSABLE``) instead of a
-    bare ``ValueError``, so a B&W strip / modified SA-21 / dense negative
-    surfaces as a friendly card rather than ``INTERNAL``.
+    yields no usable mean, the selection retries once over the primary band
+    widened symmetrically to 3x its own height and clamped to the frame (the
+    ``#17`` fix, now bounded rather than spanning the whole frame -- see
+    :func:`_widened_meter_window`) before giving up. Only if both windows are
+    unusable does it raise the typed :class:`MeterUnusableError` (bridge code
+    ``METER_UNUSABLE``) instead of a bare ``ValueError``, so a B&W strip /
+    modified SA-21 / dense negative surfaces as a friendly card rather than
+    ``INTERNAL``.
     """
-    windows = [(row_first, row_stop), (0, int(image.shape[0]))]
+    widened = _widened_meter_window(row_first, row_stop, int(image.shape[0]))
+    windows = [(row_first, row_stop), widened]
     for start, stop in windows:
         selected = _select_usable_mean(
             image, channel_index, row_first=start, row_stop=stop

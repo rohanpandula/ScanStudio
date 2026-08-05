@@ -944,15 +944,18 @@ def test_density_evaluator_raises_meter_unusable_on_saturated_rows() -> None:
 
 def test_density_evaluator_widened_window_retry_succeeds_on_sparse_rows() -> None:
     # G has no usable mean in the primary meter window [75, 225) but a usable
-    # mean exists in the widened full-frame window (row 10). R and B are usable
-    # in the primary window. Lane B must recover via the widened retry rather
-    # than raising -- selecting the G row from outside the primary band.
+    # mean exists just past it, inside the bounded widened window (3x the
+    # primary band's 150-row height, centered on it: [0, 375) for this
+    # [75, 225) band -- see _widened_meter_window). R and B are usable in the
+    # primary window. Lane B must recover via the widened retry rather than
+    # raising -- selecting the G row from outside the primary band but still
+    # inside the bounded retry window.
     image = np.zeros((6_104, 96, 3), dtype=np.uint16)
     image[100, :, 0] = 45_000  # R usable in primary window
     image[101, :, 0] = 45_000
     image[100, :, 2] = 32_000  # B usable in primary window
     image[101, :, 2] = 32_000
-    image[10, :, 1] = 5_000  # G usable ONLY in the widened full-frame window
+    image[300, :, 1] = 5_000  # G usable ONLY in the bounded widened window
     wire = _wire_from_image(image)
 
     result = evaluate_nikon_density(
@@ -961,12 +964,35 @@ def test_density_evaluator_widened_window_retry_succeeds_on_sparse_rows() -> Non
         source_binding=_source_binding(wire, image),
         exposure_binding=_exposure_binding(),
     )
-    assert result.selected_rows[1] == 10
+    assert result.selected_rows[1] == 300
     assert result.selected_row_means[1] == pytest.approx(5_000.0)
     # R and B were resolved from the primary window (first occurrence of the
     # greatest mean, row 100).
     assert result.selected_rows[0] == 100
     assert result.selected_rows[2] == 100
+
+
+def test_density_evaluator_raises_meter_unusable_for_a_row_far_outside_the_bounded_widened_window() -> None:
+    # Fail-closed erosion fix: the widened retry is now bounded to 3x the
+    # primary band's height ([0, 375) for the [75, 225) band), not the whole
+    # 6,104-row frame. A usable row far outside that bound (row 400) was
+    # reachable by the old unbounded [0, height) retry and would have been
+    # silently selected; it must now raise the typed error instead.
+    image = np.zeros((6_104, 96, 3), dtype=np.uint16)
+    image[100, :, 0] = 45_000  # R usable in primary window
+    image[101, :, 0] = 45_000
+    image[100, :, 2] = 32_000  # B usable in primary window
+    image[101, :, 2] = 32_000
+    image[400, :, 1] = 5_000  # G usable ONLY far outside the bounded window
+    wire = _wire_from_image(image)
+
+    with pytest.raises(MeterUnusableError, match="channel G"):
+        evaluate_nikon_density(
+            wire,
+            calibration_binding=_calibration_binding(),
+            source_binding=_source_binding(wire, image),
+            exposure_binding=_exposure_binding(),
+        )
 
 
 def test_exposure_binding_refuses_out_of_contract_values() -> None:
