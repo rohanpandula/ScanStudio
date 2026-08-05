@@ -181,6 +181,33 @@ jobs:
               assert entry["sha256"] == h, arch
           print("Combined checksums re-verified for both architectures")
           PY
+      - name: Assert the release asset set is complete before publish
+        # The beta.1 (mac-only) pipeline publishes exactly four assets: two
+        # arch DMGs, one combined SHA256SUMS, one arch-keyed latest.json. Fail
+        # loud if any is missing, empty, or misnamed so an incomplete release
+        # is never attached (E1 asset-completeness gate).
+        run: |
+          set -euo pipefail
+          ERR=0
+          for f in \
+            "$RUNNER_TEMP/arm64/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
+            "$RUNNER_TEMP/x86_64/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
+            "$RUNNER_TEMP/combined/SHA256SUMS" \
+            "$RUNNER_TEMP/combined/latest.json"; do
+            test -s "$f" || { echo "MISSING or empty release asset: $f" >&2; ERR=1; }
+          done
+          LINE_COUNT="$(wc -l < "$RUNNER_TEMP/combined/SHA256SUMS" | tr -d ' ')"
+          test "$LINE_COUNT" -eq 2 || { echo "expected 2 checksum lines, got $LINE_COUNT" >&2; ERR=1; }
+          for name in "ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" "ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg"; do
+            grep -qF "$name" "$RUNNER_TEMP/combined/SHA256SUMS" || { echo "SHA256SUMS missing $name" >&2; ERR=1; }
+          done
+          python3 - "$RUNNER_TEMP/combined/latest.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          assert set(d["architectures"]) == {"arm64", "x86_64"}, d
+          PY
+          test "$ERR" -eq 0
+          echo "Release asset set complete: 2 DMGs + SHA256SUMS + latest.json"
       - name: Create GitHub release
         # Alpha, beta, and release-candidate parcels are pre-releases on
         # GitHub. Stable versions publish as full releases. Both DMGs +
