@@ -281,11 +281,26 @@ mod tests {
 
     #[test]
     fn path_outside_home_is_refused_with_403() {
+        // The outside fixture must live OUTSIDE $HOME on every host.
+        // temp_dir() is genuinely outside home on POSIX (/tmp). On Windows
+        // the temp dir is under the user profile (inside home), so use the
+        // profile's parent instead. If the chosen parent is not writable in a
+        // restricted CI account, skip rather than fail the lane.
+        let home = home_dir();
+        #[cfg(not(target_os = "windows"))]
         let outside = std::env::temp_dir().join("scanstudio-preview-403-test.txt");
-        std::fs::write(&outside, b"not a tiff").expect("write outside file");
+        #[cfg(target_os = "windows")]
+        let outside = home
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("C:\\"))
+            .join("scanstudio-preview-403-test.txt");
+        if std::fs::write(&outside, b"not a tiff").is_err() {
+            eprintln!("skipping 403 fixture: cannot write {outside:?}");
+            return;
+        }
         let request = request_for_path(&outside);
 
-        let response = handle_with_home(home_dir(), &request);
+        let response = handle_with_home(home, &request);
 
         assert_eq!(response.status(), 403);
         let _ = std::fs::remove_file(&outside);
