@@ -120,7 +120,6 @@ EOF
 
 check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" <<'EOF'
 Files coolscanpy/src/coolscanpy/__init__.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/__init__.py differ
-Files coolscanpy/src/coolscanpy/_roll.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/_roll.py differ
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py differ
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py differ
 Files coolscanpy/tests/test_usb_backend.py and ports/tauri/vendor/coolscanpy/tests/test_usb_backend.py differ
