@@ -23,7 +23,7 @@ private actor BWFineScanEngineStub: EngineClientProtocol {
             kind: kind,
             firmware: "test",
             connection: "USB",
-            supportedMultisamplePasses: kind == "real" ? [4] : nil
+            supported: true, supportedMultisamplePasses: kind == "real" ? [4] : nil
         )
         project = ScanProject(
             schemaVersion: 1,

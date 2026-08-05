@@ -24,7 +24,7 @@ private actor ManualReviewApprovalEngineStub: EngineClientProtocol {
         kind: "real",
         firmware: "test",
         connection: "USB",
-        supportedMultisamplePasses: [4]
+        supported: true, supportedMultisamplePasses: [4]
     )
     private var project = ScanProject(
         schemaVersion: 1,

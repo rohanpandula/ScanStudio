@@ -148,6 +148,10 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
     public let kind: String
     public let firmware: String
     public let connection: String
+    /// False when discovery recognized a Nikon Coolscan that is not the
+    /// supported LS-5000 (Lane D, #14). An unsupported device is named in
+    /// ``scanner.list`` but is never connectable.
+    public let supported: Bool
     /// Device-sourced accepted set for `CaptureRecipe.multisamplePasses`
     /// (BRIDGE.md's `Capabilities.supportedMultisamplePasses`, always `[4]`
     /// for the LS-5000 today). The engine already derives this internally

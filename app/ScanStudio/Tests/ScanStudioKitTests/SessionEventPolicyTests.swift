@@ -2787,7 +2787,7 @@ struct SessionEventPolicyTests {
     func multisamplePassPolicyRealDeviceFallsBackToFour() {
         let device = DeviceInfo(
             deviceId: "real-ls5000-0", model: "SUPER COOLSCAN 5000 ED", kind: "real",
-            firmware: "bridge 0.1.0", connection: "USB (bridge)", supportedMultisamplePasses: nil
+            firmware: "bridge 0.1.0", connection: "USB (bridge)", supported: true, supportedMultisamplePasses: nil
         )
         #expect(MultisamplePassPolicy.supportedOptions(for: device) == [4])
     }
@@ -2796,7 +2796,7 @@ struct SessionEventPolicyTests {
     func multisamplePassPolicyEmptyWireListFallsBackToKindDefault() {
         let device = DeviceInfo(
             deviceId: "real-ls5000-0", model: "SUPER COOLSCAN 5000 ED", kind: "real",
-            firmware: "bridge 0.1.0", connection: "USB (bridge)", supportedMultisamplePasses: []
+            firmware: "bridge 0.1.0", connection: "USB (bridge)", supported: true, supportedMultisamplePasses: []
         )
         #expect(MultisamplePassPolicy.supportedOptions(for: device) == [4])
     }
@@ -2805,7 +2805,7 @@ struct SessionEventPolicyTests {
     func multisamplePassPolicySimulatedDeviceKeepsFullRange() {
         let device = DeviceInfo(
             deviceId: "sim-ls5000-0", model: "SUPER COOLSCAN 5000 ED", kind: "simulated",
-            firmware: "1.03-sim", connection: "USB (simulated)", supportedMultisamplePasses: nil
+            firmware: "1.03-sim", connection: "USB (simulated)", supported: true, supportedMultisamplePasses: nil
         )
         #expect(MultisamplePassPolicy.supportedOptions(for: device) == [1, 2, 4, 8, 16])
     }
@@ -2814,7 +2814,7 @@ struct SessionEventPolicyTests {
     func multisamplePassPolicyPrefersWireReportedList() {
         let device = DeviceInfo(
             deviceId: "real-ls9000-0", model: "SUPER COOLSCAN 9000 ED", kind: "real",
-            firmware: "bridge 0.2.0", connection: "USB (bridge)", supportedMultisamplePasses: [8, 4]
+            firmware: "bridge 0.2.0", connection: "USB (bridge)", supported: true, supportedMultisamplePasses: [8, 4]
         )
         #expect(MultisamplePassPolicy.supportedOptions(for: device) == [4, 8])
     }

@@ -112,6 +112,22 @@ struct SessionSidebarView: View {
                         .buttonStyle(.borderless)
                         .font(.system(size: 11))
                     }
+                case .unsupported(let devices):
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(devices, id: \.deviceId) { device in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(device.model) detected")
+                                    .foregroundStyle(Color.secondary)
+                                Text("This model is not yet supported (LS-5000 only today). Follow rohanpandula/ScanStudio#14 for updates.")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Color.secondary)
+                                    .multilineTextAlignment(.leading)
+                            }
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)))
+                        }
+                    }
                 case .directConnect(let device):
                     Button {
                         Task { await sessionModel.connect(deviceId: device.deviceId) }

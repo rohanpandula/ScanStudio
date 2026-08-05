@@ -10,6 +10,9 @@ public enum DeviceSelectionPolicy {
         case noDevices
         case directConnect(DeviceInfo)
         case explicitChoice([DeviceInfo])
+        /// Only recognized-but-unsupported Nikon models (e.g. an LS-50) are
+        /// present: they are named but have no connect affordance (Lane D, #14).
+        case unsupported([DeviceInfo])
 
         public var progressText: String? {
             switch self {
@@ -17,7 +20,7 @@ public enum DeviceSelectionPolicy {
                 "Searching for scanner…"
             case .connecting:
                 "Connecting to scanner…"
-            case .noDevices, .directConnect, .explicitChoice:
+            case .noDevices, .directConnect, .explicitChoice, .unsupported:
                 nil
             }
         }
@@ -34,10 +37,14 @@ public enum DeviceSelectionPolicy {
         if isConnecting {
             return .connecting
         }
+        let unsupported = unsupportedDevices(from: devices)
         let visibleDevices = connectionCandidates(from: devices)
         switch visibleDevices.count {
         case 0:
-            return .noDevices
+            // No connectable device, but a recognized unsupported model is
+            // present -- named card, no connect affordance (never the silent
+            // empty-list confusion of #14).
+            return unsupported.isEmpty ? .noDevices : .unsupported(unsupported)
         case 1:
             return .directConnect(visibleDevices[0])
         default:
@@ -45,13 +52,22 @@ public enum DeviceSelectionPolicy {
         }
     }
 
-    /// Connection affordances prefer discovered hardware over the simulator.
+    /// Connection affordances prefer discovered hardware over the simulator,
+    /// and never include a recognized-but-unsupported model (Lane D, #14).
     /// The underlying discovery list is intentionally left untouched: it is
     /// still the engine's authoritative inventory, but a simulator must not
-    /// compete with an available real scanner at the decision point.
+    /// compete with an available real scanner at the decision point, and an
+    /// unsupported unit is never connectable.
     public static func connectionCandidates(from devices: [DeviceInfo]) -> [DeviceInfo] {
-        let realDevices = devices.filter { $0.kind == "real" }
-        return realDevices.isEmpty ? devices : realDevices
+        let supported = devices.filter { $0.supported }
+        let realDevices = supported.filter { $0.kind == "real" }
+        return realDevices.isEmpty ? supported : realDevices
+    }
+
+    /// Recognized-but-unsupported Nikon models present in discovery (Lane D).
+    /// These are shown by name, grayed out, and are never connect candidates.
+    public static func unsupportedDevices(from devices: [DeviceInfo]) -> [DeviceInfo] {
+        devices.filter { !$0.supported }
     }
 
     /// Stable-partitions real devices ahead of simulators while preserving

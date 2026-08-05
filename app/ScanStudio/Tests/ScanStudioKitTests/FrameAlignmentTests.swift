@@ -19,7 +19,7 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
         kind: "real",
         firmware: "test",
         connection: "USB",
-        supportedMultisamplePasses: [4]
+        supported: true, supportedMultisamplePasses: [4]
     )
     private let holdSpacingResponses: Bool
     private let holdProjectResponses: Bool
