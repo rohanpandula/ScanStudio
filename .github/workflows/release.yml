@@ -393,7 +393,13 @@ jobs:
             "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz" \
             "$RELEASE_METADATA/SHA256SUMS" \
             "$RELEASE_METADATA/latest.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$RUNNER_TEMP/draft-release.json"
+          # A draft release's tag is not attached until publish, so the
+          # releases/tags/<tag> endpoint returns 404 for it. List releases and
+          # match on tag_name, which IS populated on drafts.
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" \
+            --jq "first(.[] | select(.tag_name == \"$GITHUB_REF_NAME\"))" \
+            > "$RUNNER_TEMP/draft-release.json"
+          test -s "$RUNNER_TEMP/draft-release.json"
           python3 - "$RUNNER_TEMP/draft-release.json" "$RELEASE_ASSETS" "$RELEASE_METADATA" <<'PY'
           import hashlib
           import json
