@@ -1070,6 +1070,39 @@ def _slot_warnings(
     return tuple(dict.fromkeys(warnings))
 
 
+def _roll_session_diagnostics(detection: RollDetection) -> str:
+    """Compact numeric roll-session diagnostics (Lane C, C2): numbers only,
+    no image/array data, embedded verbatim in a roll-session failure so a
+    low-confidence or no-slot establishment error becomes root-causable from
+    the report without retuning any threshold blind.
+    """
+    per_slot = {
+        interval.frame: {
+            "content_fraction": interval.content_fraction,
+            "coverage_fraction": interval.coverage_fraction,
+        }
+        for interval in detection.intervals
+    }
+    return (
+        "confidence="
+        + detection.confidence
+        + " count_confidence="
+        + detection.count_confidence
+        + " count_confirmation="
+        + detection.count_confirmation
+        + f" lattice_score={detection.lattice_score:.4f}"
+        + f" alt_lattice_score={detection.alternative_lattice_score:.4f}"
+        + f" mean_boundary_evidence={detection.mean_boundary_evidence:.4f}"
+        + f" min_boundary_evidence={detection.minimum_boundary_evidence:.4f}"
+        + f" autocorr_peak={detection.autocorrelation_peak:.4f}"
+        + f" candidate_slots={detection.candidate_slot_count}"
+        + " detected_perforation_candidates="
+        + json.dumps(list(detection.content_end_candidates))
+        + " per_slot="
+        + json.dumps(per_slot)
+    )
+
+
 def build_roll_preview_session(
     attempt: CaptureAttemptResult,
     *,
@@ -1114,7 +1147,10 @@ def build_roll_preview_session(
         expected_frame_count=expected_frame_count,
     )
     if detection.alignment_confidence == "low":
-        raise RollSessionError("roll preview physical alignment confidence is low")
+        raise RollSessionError(
+            "roll preview physical alignment confidence is low: "
+            + _roll_session_diagnostics(detection)
+        )
     records = parse_live_transport_records_bytes(
         validated_table,
         maximum_rows=geometry.height,
@@ -1127,7 +1163,10 @@ def build_roll_preview_session(
     )
     slot_count = min(capacity, scanner_frame_count, len(mapping.origins))
     if slot_count < 1:
-        raise RollSessionError("roll preview produced no scanner-addressable slots")
+        raise RollSessionError(
+            "roll preview produced no scanner-addressable slots: "
+            + _roll_session_diagnostics(detection)
+        )
     preview = ValidatedRollPreview(
         preview_artifact=preview_artifact,
         table_artifact=table_artifact,
