@@ -11,6 +11,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
+# GitHub Actions Windows runners do not set $HOME (they use $USERPROFILE). The
+# Rust engine's preview tests expect a home directory via the HOME env var;
+# mirror the user profile so those tests run (runner-env fix, nothing else
+# depends on HOME from this point).
+if ($env:HOME -eq $null) {
+    $env:HOME = $env:USERPROFILE
+}
+
 $portRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $appRoot = Join-Path $portRoot 'app'
 $stagingRoot = Join-Path $portRoot 'packaging\.staging\windows'

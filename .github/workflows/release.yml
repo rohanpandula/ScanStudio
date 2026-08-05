@@ -213,7 +213,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential curl file libayatana-appindicator3-dev libfuse2 libgtk-3-dev \
-            librsvg2-dev libsane-dev libssl-dev libusb-1.0-0 libwebkit2gtk-4.1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev librsvg2-dev \
+            libsane-dev libssl-dev libusb-1.0-0 libwebkit2gtk-4.1-dev \
             libxdo-dev patchelf pkg-config sane-utils wget
       - uses: actions/setup-node@v4
         with:
