@@ -166,10 +166,13 @@ describe("scripted transport", () => {
 
 describe("bounded request timeout", () => {
   it("a request that never resolves rejects after the bounded timeout instead of hanging the suite", async () => {
-    // /bin/cat echoes each request line back verbatim; the echo decodes as a
-    // "request" envelope (never a response), standing in for a hung engine.
+    // A subprocess that echoes each request line back verbatim; the echo
+    // decodes as a "request" envelope (never a response), standing in for a
+    // hung engine. Uses the current Node runtime so it is cross-platform
+    // (there is no /bin/cat on Windows).
     const handle = await createSubprocessTransport({
-      engineBinaryPath: "/bin/cat",
+      engineBinaryPath: process.execPath,
+      engineBinaryArgs: ["-e", "process.stdin.pipe(process.stdout)"],
       timeoutMs: 100,
     });
     try {

@@ -15,6 +15,9 @@ const SHUTDOWN_GRACE_MS = 2000;
 
 export interface SubprocessTransportOptions {
   engineBinaryPath: string;
+  // Optional args for the engine subprocess (e.g. a cross-platform node -e
+  // echo stand-in for the bounded-timeout test on Windows).
+  engineBinaryArgs?: string[];
   // Convenience for callers: the value to pass in scanner.connect's options.
   // The engine only accepts timeScale via scanner.connect, not at spawn time,
   // so the harness never sends it itself.
@@ -39,7 +42,7 @@ export async function createSubprocessTransport(
   opts: SubprocessTransportOptions,
 ): Promise<SubprocessTransportHandle> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  const child = spawn(opts.engineBinaryPath, [], {
+  const child = spawn(opts.engineBinaryPath, opts.engineBinaryArgs ?? [], {
     stdio: ["pipe", "pipe", "inherit"],
   });
 

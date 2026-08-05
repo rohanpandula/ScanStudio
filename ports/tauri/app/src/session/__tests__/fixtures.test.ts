@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { decodeEnvelope } from "../wire/codec";
 import {
@@ -17,7 +18,11 @@ import {
 // SCANSTUDIO_PROTOCOL_DIR may override them for compatibility testing.
 const FIXTURES_DIR =
   process.env.SCANSTUDIO_PROTOCOL_DIR ??
-  new URL("../../../../vendor/protocol/fixtures", import.meta.url).pathname;
+  // fileURLToPath (not URL.pathname) so a Windows host gets a clean "D:\..."
+  // path instead of a doubled/encoded drive prefix.
+  fileURLToPath(
+    new URL("../../../../vendor/protocol/fixtures", import.meta.url),
+  );
 
 const describeFixtures = (() => {
   try {
