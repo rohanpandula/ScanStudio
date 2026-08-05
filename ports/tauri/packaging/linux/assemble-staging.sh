@@ -55,6 +55,18 @@ mv "$extract_tmp/python" "$STAGING_ROOT/BridgeRuntime/python"
 rmdir "$extract_tmp"
 require_file "bundled CPython interpreter" "$PYTHON_BIN"
 
+# The bundled python's `_tkinter` extension links libtcl9.0.so, which
+# linuxdeploy cannot bundle during AppImage creation (Tcl 9 is not in Ubuntu
+# 22.04's repos, so no apt package satisfies it). The bridge never uses Tk, so
+# strip _tkinter and the Tcl/Tk runtime from the bundled Linux python so the
+# AppImage bundle stays resolvable.
+PYTHON_ROOT="$STAGING_ROOT/BridgeRuntime/python"
+rm -f \
+    "$PYTHON_ROOT"/lib/python3.13/lib-dynload/_tkinter*.so \
+    "$PYTHON_ROOT"/lib/libtcl*.so* \
+    "$PYTHON_ROOT"/lib/libtk*.so*
+rm -rf "$PYTHON_ROOT"/lib/tcl*/ "$PYTHON_ROOT"/lib/tk*/
+
 # (3) GPL corresponding source snapshots.
 mkdir -p "$STAGING_ROOT/CorrespondingSource"
 copy_corresponding_source "$SCANSTUDIO_BRIDGE_SOURCE" "$STAGING_ROOT/CorrespondingSource/scanstudio-bridge"
