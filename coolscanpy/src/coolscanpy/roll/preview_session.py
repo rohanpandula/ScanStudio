@@ -1197,17 +1197,17 @@ def build_roll_preview_session(
     ):
         warnings = _slot_warnings(interval.frame, interval, origin, detection)
         # Lane C (D2): expose >=90%-covered frames flagged partial instead of
-        # refusing them; strictly-below-90% stays REFEED_REQUIRED.
+        # refusing them.
         #
         # #19: coverage is measured against each boundary's UNCLAMPED fitted
         # row when available, not the raster-clamped start_row/end_row --
         # otherwise a frame whose true (fitted) extent runs past the
         # captured preview raster always measures as 100% covered (the
         # clamp already pinned it to the raster edge before this ever ran),
-        # so the refeed raise below and the partial flag were unreachable on
-        # the initial build. Falls back to the clamped rows when a detection
-        # was built without the additive fields (e.g. an older/hand-built
-        # FrameInterval) -- identical to the pre-fix behavior in that case.
+        # so the partial flag was unreachable on the initial build. Falls
+        # back to the clamped rows when a detection was built without the
+        # additive fields (e.g. an older/hand-built FrameInterval) --
+        # identical to the pre-fix behavior in that case.
         coverage_start = (
             interval.unclamped_start_row
             if interval.unclamped_start_row is not None
@@ -1219,12 +1219,23 @@ def build_roll_preview_session(
             else interval.end_row
         )
         state = _crop_state(coverage_start, coverage_end, len(rgb))
-        if state == "refeed":
-            raise RollSessionError(
-                f"frame {interval.frame} has <"
-                f"{int(PARTIAL_FRAME_MIN_COVERAGE * 100)}% of its height inside "
-                "the preview; refeed and retry"
-            )
+        # Owner call (post-beta.1 field review): a sub-90% TRAILING frame
+        # must not abort the whole session -- "rather a person reject a bad
+        # frame than have it totally fail". This is per-FRAME, not a relaxed
+        # threshold: a <90% frame is neither "full" nor Lane C "partial" (it
+        # does not get the partial:true badge -- that is reserved for the
+        # >=90% band), it is beta.1's original, field-proven shape for a
+        # boundary whose end lies outside the captured raster -- clamped
+        # thumbnail (unchanged, tiles never render unclamped rows), plus
+        # whatever manual_review/warnings interval.review_reasons /
+        # origin.review_reasons already carry (make_boundary's own
+        # "outside-index-raster"/"end-outside-index-raster" reasons are
+        # independent of this coverage check and already flow into
+        # `warnings`/`manual_review` below regardless of state). The
+        # session-level refusal for a genuinely unusable capture remains --
+        # it lives at the LEADING edge, in roll_index.py's
+        # LeadingFrameClippedError, raised earlier during detection and
+        # unaffected by this per-frame trailing handling.
         slots.append(
             RollPreviewSlot(
                 slot_id=interval.frame,
