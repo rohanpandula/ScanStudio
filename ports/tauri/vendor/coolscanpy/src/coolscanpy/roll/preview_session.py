@@ -14,10 +14,11 @@ import stat
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Iterable, Literal, Mapping, cast
 
 import numpy as np
 
+from coolscanpy.exceptions import MeterUnusableError
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     AttemptPaths,
     CaptureAttemptResult,
@@ -244,6 +245,10 @@ class RollPreviewSlot:
     warnings: tuple[str, ...] = ()
     manual_review: bool = False
     boundary_offset_rows: int = 0
+    # Lane C (D2): True when >=90% of the frame's height is inside the preview
+    # but not all of it. None/omitted for every full-cover frame (strictly
+    # additive on the wire).
+    partial: bool | None = None
 
     def __post_init__(self) -> None:
         if type(self.slot_id) is not int or self.slot_id < 1:
@@ -413,10 +418,18 @@ class RollPreviewSession:
             slot,
             boundary_offset_rows,
         )
+        # Lane C (D2): an offset re-crop that is a partial frame stays flagged
+        # partial (None for full-cover), preserving the additive wire contract.
+        partial = (
+            True
+            if _resolved_crop_partial(self.preview, slot, boundary_offset_rows)
+            else None
+        )
         updated = replace(
             slot,
             thumbnail=thumbnail,
             boundary_offset_rows=boundary_offset_rows,
+            partial=partial,
         )
         slots = list(self.slots)
         slots[slot_id - 1] = updated
@@ -640,9 +653,11 @@ def _validate_preview_result(
         ("preview_geometry_validated_before_reads", True),
     ):
         _require_exact(journal, key, expected)
-    if journal.get("scanner_identity") != "Nikon LS-5000 ED 1.03":
+    if not isinstance(journal.get("scanner_identity"), str) or not journal.get(
+        "scanner_identity"
+    ).startswith("Nikon LS-5000 ED"):
         raise RollSessionIntegrityError(
-            "preview journal is not from the proven LS-5000 firmware"
+            "preview journal is not from a proven Nikon LS-5000 ED"
         )
     if not _is_sha256(journal.get("capture_engine_sha256")):
         raise RollSessionIntegrityError(
@@ -885,6 +900,17 @@ def _validated_preview_density_evidence(
 
     try:
         evidence = attempt.density_evidence
+    except MeterUnusableError:
+        # #17 (preview path): no usable meter mean for a channel while
+        # replaying this preview's density evidence. Deliberately NOT
+        # folded into the generic (OSError, ValueError) integrity path
+        # below -- MeterUnusableError is not a subclass of either, but that
+        # is pinned here explicitly (rather than left as an accident of the
+        # exception hierarchy) so it keeps propagating as the distinct,
+        # typed, fail-closed METER_UNUSABLE wire condition through
+        # Roll.preview() to the transport boundary, never INTERNAL and
+        # never swallowed into RollSessionIntegrityError.
+        raise
     except (OSError, ValueError) as error:
         raise RollSessionIntegrityError(
             f"preview density evidence does not replay from its source: {error}"
@@ -913,6 +939,38 @@ def _validated_preview_density_evidence(
             "preview density provenance disagrees with the startup-bound artifact"
         )
     return evidence
+
+
+# Lane C (D2): a frame whose crop overlaps the preview such that >= this
+# fraction of its height is inside (but not all of it) is exposed flagged
+# partial instead of refused. Strictly below it stays REFEED_REQUIRED.
+PARTIAL_FRAME_MIN_COVERAGE = 0.90
+
+
+def _crop_coverage(start: int, end: int, preview_height: int) -> float:
+    """Fraction of crop ``[start, end)`` that lies inside ``[0, preview_height)``.
+
+    ``1.0`` for a fully-inside frame; lower when the frame runs off the top or
+    bottom edge of the preview. ``0.0`` for an empty/invalid crop.
+    """
+    if end <= start:
+        return 0.0
+    inside_top = min(max(0, start), preview_height)
+    inside_bottom = min(max(0, end), preview_height)
+    inside = max(0, inside_bottom - inside_top)
+    return inside / (end - start)
+
+
+def _crop_state(
+    start: int, end: int, preview_height: int
+) -> Literal["full", "partial", "refeed"]:
+    """Classify a frame crop against the preview (Lane C, D2)."""
+    coverage = _crop_coverage(start, end, preview_height)
+    if coverage < PARTIAL_FRAME_MIN_COVERAGE:
+        return "refeed"
+    if coverage < 1.0:
+        return "partial"
+    return "full"
 
 
 def _thumbnail(rgb: np.ndarray, start: int, end: int) -> np.ndarray:
@@ -953,6 +1011,30 @@ def _resolved_transport_record(
     return record
 
 
+def _resolved_crop_bounds(
+    preview: ValidatedRollPreview,
+    slot: RollPreviewSlot,
+    boundary_offset_rows: int,
+) -> tuple[int, int]:
+    """Resolve the row delta and return the re-crop ``(start, end)`` bounds."""
+
+    validate_boundary_offset(slot.slot_id, boundary_offset_rows)
+    record = _resolved_transport_record(preview, slot, boundary_offset_rows)
+    row_delta = record.row - slot.base_origin.lookup_row
+    return slot.start_boundary_row + row_delta, slot.end_boundary_row + row_delta
+
+
+def _resolved_crop_partial(
+    preview: ValidatedRollPreview,
+    slot: RollPreviewSlot,
+    boundary_offset_rows: int,
+) -> bool:
+    """True when the resolved re-crop is a Lane C partial frame (Lane C, D2)."""
+
+    start, end = _resolved_crop_bounds(preview, slot, boundary_offset_rows)
+    return _crop_state(start, end, len(preview.rgb)) == "partial"
+
+
 def reload_thumbnail(
     preview: ValidatedRollPreview,
     slot: RollPreviewSlot,
@@ -963,18 +1045,17 @@ def reload_thumbnail(
     This does not shift an already-rendered thumbnail.  The selected offset is
     first resolved through the raw table captured during the same traversal;
     the original decoded RGB96 preview is then cropped again at that row delta.
+
+    Lane C (D2): a re-crop with >=90% of its height inside the preview is
+    exposed (clamped) as a partial frame; strictly below stays REFEED_REQUIRED.
     """
 
     if not isinstance(preview, ValidatedRollPreview):
         raise TypeError("preview must be a ValidatedRollPreview")
     if not isinstance(slot, RollPreviewSlot):
         raise TypeError("slot must be a RollPreviewSlot")
-    validate_boundary_offset(slot.slot_id, boundary_offset_rows)
-    record = _resolved_transport_record(preview, slot, boundary_offset_rows)
-    row_delta = record.row - slot.base_origin.lookup_row
-    start = slot.start_boundary_row + row_delta
-    end = slot.end_boundary_row + row_delta
-    if start < 0 or end > len(preview.rgb):
+    start, end = _resolved_crop_bounds(preview, slot, boundary_offset_rows)
+    if _crop_state(start, end, len(preview.rgb)) == "refeed":
         raise RollSessionError(
             f"slot {slot.slot_id} boundary offset lies outside the saved preview"
         )
@@ -999,6 +1080,39 @@ def _slot_warnings(
         if slot_id > last_end:
             warnings.append("beyond-advisory-content-end")
     return tuple(dict.fromkeys(warnings))
+
+
+def _roll_session_diagnostics(detection: RollDetection) -> str:
+    """Compact numeric roll-session diagnostics (Lane C, C2): numbers only,
+    no image/array data, embedded verbatim in a roll-session failure so a
+    low-confidence or no-slot establishment error becomes root-causable from
+    the report without retuning any threshold blind.
+    """
+    per_slot = {
+        interval.frame: {
+            "content_fraction": interval.content_fraction,
+            "coverage_fraction": interval.coverage_fraction,
+        }
+        for interval in detection.intervals
+    }
+    return (
+        "confidence="
+        + detection.confidence
+        + " count_confidence="
+        + detection.count_confidence
+        + " count_confirmation="
+        + detection.count_confirmation
+        + f" lattice_score={detection.lattice_score:.4f}"
+        + f" alt_lattice_score={detection.alternative_lattice_score:.4f}"
+        + f" mean_boundary_evidence={detection.mean_boundary_evidence:.4f}"
+        + f" min_boundary_evidence={detection.minimum_boundary_evidence:.4f}"
+        + f" autocorr_peak={detection.autocorrelation_peak:.4f}"
+        + f" candidate_slots={detection.candidate_slot_count}"
+        + " detected_perforation_candidates="
+        + json.dumps(list(detection.content_end_candidates))
+        + " per_slot="
+        + json.dumps(per_slot)
+    )
 
 
 def build_roll_preview_session(
@@ -1045,7 +1159,10 @@ def build_roll_preview_session(
         expected_frame_count=expected_frame_count,
     )
     if detection.alignment_confidence == "low":
-        raise RollSessionError("roll preview physical alignment confidence is low")
+        raise RollSessionError(
+            "roll preview physical alignment confidence is low: "
+            + _roll_session_diagnostics(detection)
+        )
     records = parse_live_transport_records_bytes(
         validated_table,
         maximum_rows=geometry.height,
@@ -1058,7 +1175,10 @@ def build_roll_preview_session(
     )
     slot_count = min(capacity, scanner_frame_count, len(mapping.origins))
     if slot_count < 1:
-        raise RollSessionError("roll preview produced no scanner-addressable slots")
+        raise RollSessionError(
+            "roll preview produced no scanner-addressable slots: "
+            + _roll_session_diagnostics(detection)
+        )
     preview = ValidatedRollPreview(
         preview_artifact=preview_artifact,
         table_artifact=table_artifact,
@@ -1076,6 +1196,35 @@ def build_roll_preview_session(
         mapping.origins[:slot_count],
     ):
         warnings = _slot_warnings(interval.frame, interval, origin, detection)
+        # Lane C (D2): expose >=90%-covered frames flagged partial instead of
+        # refusing them; strictly-below-90% stays REFEED_REQUIRED.
+        #
+        # #19: coverage is measured against each boundary's UNCLAMPED fitted
+        # row when available, not the raster-clamped start_row/end_row --
+        # otherwise a frame whose true (fitted) extent runs past the
+        # captured preview raster always measures as 100% covered (the
+        # clamp already pinned it to the raster edge before this ever ran),
+        # so the refeed raise below and the partial flag were unreachable on
+        # the initial build. Falls back to the clamped rows when a detection
+        # was built without the additive fields (e.g. an older/hand-built
+        # FrameInterval) -- identical to the pre-fix behavior in that case.
+        coverage_start = (
+            interval.unclamped_start_row
+            if interval.unclamped_start_row is not None
+            else interval.start_row
+        )
+        coverage_end = (
+            interval.unclamped_end_row
+            if interval.unclamped_end_row is not None
+            else interval.end_row
+        )
+        state = _crop_state(coverage_start, coverage_end, len(rgb))
+        if state == "refeed":
+            raise RollSessionError(
+                f"frame {interval.frame} has <"
+                f"{int(PARTIAL_FRAME_MIN_COVERAGE * 100)}% of its height inside "
+                "the preview; refeed and retry"
+            )
         slots.append(
             RollPreviewSlot(
                 slot_id=interval.frame,
@@ -1087,6 +1236,7 @@ def build_roll_preview_session(
                 manual_review=bool(
                     interval.manual_review or origin.manual_review or warnings
                 ),
+                partial=(True if state == "partial" else None),
             )
         )
     selected = _validate_selected_slots(selected_slots, len(slots))

@@ -23,6 +23,9 @@ pub struct DeviceInfo {
     pub kind: String,
     pub firmware: String,
     pub connection: String,
+    /// False for a recognized-but-unsupported Nikon model (Lane D): it is
+    /// listed by name in ``scanner.list`` but is never connectable.
+    pub supported: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -1135,9 +1138,11 @@ mod tests {
             kind: "simulated".into(),
             firmware: "1.03-sim".into(),
             connection: "USB (simulated)".into(),
+            supported: true,
         };
         let value = serde_json::to_value(&device).unwrap();
         assert_eq!(value["deviceId"], json!("sim-ls5000-0"));
+        assert_eq!(value["supported"], json!(true));
         round_trip(&device);
     }
 

@@ -108,6 +108,7 @@ class DeviceInfo:
     vendor: str
     model: str
     capabilities: Capabilities
+    supported: bool = True
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,10 @@ class Thumbnail:
     spacing_offset: int
     needs_approval: bool
     warnings: tuple[str, ...]
+    # Lane C (D2): True when the frame's crop overlaps the preview so that
+    # >=90% of its height is inside but not 100%. None/omitted for full-cover
+    # frames -- strictly additive, carried on the wire only as partial:true.
+    partial: bool | None = None
 
 
 @dataclass(frozen=True)

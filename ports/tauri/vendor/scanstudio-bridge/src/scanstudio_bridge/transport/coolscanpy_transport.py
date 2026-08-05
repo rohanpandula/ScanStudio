@@ -260,6 +260,7 @@ def _device_info_from_coolscanpy(info: coolscanpy.DeviceInfo) -> domain.DeviceIn
         vendor=info.vendor,
         model=info.model,
         capabilities=_capabilities_from_coolscanpy(info.capabilities),
+        supported=info.supported,
     )
 
 
@@ -293,6 +294,7 @@ def _thumbnail_from_coolscanpy(
         needs_approval=thumbnail.needs_approval,
         warnings=tuple(thumbnail.warnings),
         image_path=image_path,
+        partial=thumbnail.partial,
     )
 
 
@@ -437,6 +439,7 @@ class CoolscanPyTransport:
             vendor=_DEVICE_VENDOR,
             model=_DEVICE_MODEL,
             capabilities=_capabilities_from_coolscanpy(self._device.capabilities),
+            supported=True,
         )
 
     def status(self) -> domain.DeviceStatus:
@@ -588,6 +591,15 @@ class CoolscanPyTransport:
                 "strip and retry -- if this recurs on clean feeds it may be a "
                 f"capture or driver defect ({exc})",
             ) from exc
+        except coolscanpy.MeterUnusableError as exc:
+            # #17: no usable meter mean for a channel while replaying this
+            # preview's density evidence (density metering runs as part of
+            # Roll.preview, not just scan_many -- see preview_session.py's
+            # _validated_preview_density_evidence). Fail-closed -- no
+            # fabricated exposure -- surfaced as a friendly METER_UNUSABLE
+            # card, never INTERNAL. Guidance text is in the exception.
+            # Mirrors the start_scan handler below.
+            raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
         except coolscanpy.RollMismatch as exc:
             # Base-class fallback AFTER every mapped subclass (RefeedRequired
             # above; FingerprintRefused/ManualReviewRequired are scan-time
@@ -886,6 +898,12 @@ class CoolscanPyTransport:
                     raise BridgeError(ErrorCode.SPLIT_ALIGNMENT_ERROR, str(exc)) from exc
                 except coolscanpy.BatchIntegrityError as exc:
                     raise BridgeError(ErrorCode.BATCH_INTEGRITY_ERROR, str(exc)) from exc
+                except coolscanpy.MeterUnusableError as exc:
+                    # #17: no usable meter mean for a channel in either the
+                    # primary or widened window. Fail-closed -- no fabricated
+                    # exposure -- surfaced as a friendly METER_UNUSABLE card,
+                    # never INTERNAL. Guidance text is in the exception.
+                    raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
                 except coolscanpy.RollMismatch as exc:
                     # Base-class fallback AFTER every mapped RollMismatch
                     # subclass above (FingerprintRefused, RefeedRequired;

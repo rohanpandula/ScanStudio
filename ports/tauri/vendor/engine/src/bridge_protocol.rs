@@ -150,6 +150,15 @@ pub struct BridgeDeviceInfo {
     pub vendor: String,
     pub model: String,
     pub capabilities: BridgeCapabilities,
+    /// False for a recognized-but-unsupported Nikon model (Lane D, #14): the
+    /// bridge reports it so it is visible but never connectable. The bridge
+    /// always sends this; the default keeps older test fixtures valid.
+    #[serde(default = "bridge_device_default_supported")]
+    pub supported: bool,
+}
+
+fn bridge_device_default_supported() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

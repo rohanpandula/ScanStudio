@@ -1193,6 +1193,28 @@ class TestOpenErrors:
         with pytest.raises(coolscanpy.DeviceNotFound):
             coolscanpy.open("ls5000")
 
+    def test_open_ls5000_alias_succeeds_with_an_unsupported_device_also_attached(
+        self, fake_service_factory
+    ) -> None:
+        # 14-B: an LS-50 (recognized but unsupported -- see
+        # _device_info_from's model-string classification) attached
+        # alongside the one supported LS-5000 must not make "the one
+        # attached unit" look ambiguous: open("ls5000") filters to
+        # supported units BEFORE the more-than-one-unit ambiguity check.
+        unsupported = ScannerDevice(
+            id="net:scanner:coolscan3:usb:ls50",
+            vendor="Nikon",
+            model="LS-50 ED",
+            capabilities=_caps(),
+        )
+        fake_service_factory([unsupported, _coolscan_device()])
+
+        dev = coolscanpy.open("ls5000")
+        try:
+            assert dev._info.id == _COOLSCAN_ID
+        finally:
+            dev.close()
+
     def test_open_exact_id_not_found_raises_device_not_found(
         self, fake_service_factory
     ) -> None:
@@ -3418,10 +3440,16 @@ class TestRollBatchRefusal:
 @dataclass
 class _FakeUsbDevice:
     """Just enough of a ``usb.core.Device`` for ``_usb_fallback_device_infos``
-    to read: the two attributes it actually uses."""
+    to read: the attributes it actually uses. Defaults to the LS-5000 product
+    id so pre-existing fixture uses stay valid."""
 
     bus: int
     address: int
+    idProduct: int = 0x4002
+
+
+_LS50_PRODUCT_ID = 0x4001
+_LS40_PRODUCT_ID = 0x4000
 
 
 @pytest.fixture
@@ -3464,7 +3492,61 @@ class TestSaneFreeFallback:
         assert info.id == "usb:1:7"
         assert info.vendor == "Nikon"
         assert info.model == "LS-5000 ED"
+        assert info.supported is True
         assert info.capabilities.adapter_frame_control is True
+
+    def test_get_devices_lists_ls50_as_recognized_but_unsupported(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #14: an LS-50 (04b0:4001) on the bus must be named, not silently
+        # missing, and must never be connectable.
+        _mock_usb_find(monkeypatch, [_FakeUsbDevice(bus=5, address=3, idProduct=_LS50_PRODUCT_ID)])
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        info = devices[0]
+        assert info.model == "LS-50 ED"
+        assert info.supported is False
+
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000")
+
+    def test_get_devices_lists_ls40_as_recognized_but_unsupported(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mock_usb_find(monkeypatch, [_FakeUsbDevice(bus=6, address=2, idProduct=_LS40_PRODUCT_ID)])
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].model == "LS-40 ED"
+        assert devices[0].supported is False
+
+    def test_get_devices_skips_unknown_nikon_product_ids(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A foreign product id on the Nikon vendor is not guessed.
+        _mock_usb_find(
+            monkeypatch,
+            [_FakeUsbDevice(bus=7, address=1, idProduct=0x9999)],
+        )
+
+        assert coolscanpy.get_devices() == []
+
+    def test_get_devices_marks_ls5000_supported_alongside_an_ls50(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mock_usb_find(
+            monkeypatch,
+            [
+                _FakeUsbDevice(bus=1, address=1, idProduct=_LS50_PRODUCT_ID),
+                _FakeUsbDevice(bus=2, address=1, idProduct=0x4002),
+            ],
+        )
+
+        by_model = {d.model: d.supported for d in coolscanpy.get_devices()}
+        assert by_model == {"LS-5000 ED": True, "LS-50 ED": False}
 
     def test_get_devices_falls_back_to_empty_list_when_no_usb_device(
         self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
@@ -3585,3 +3667,146 @@ class TestSaneFreeFallback:
     def test_manual_review_required_carries_slot(self) -> None:
         error = coolscanpy.ManualReviewRequired("nope", slot=7)
         assert error.slot == 7
+
+
+# ===========================================================================
+# SANE lane discovery gate (#14): DeviceInfo.supported/model must be derived
+# from the SANE-reported model string for every coolscan3: device, not
+# defaulted to True just because the id has the right prefix -- the same
+# coolscan3 SANE backend also drives the LS-40/LS-50.
+# ===========================================================================
+
+
+@dataclass
+class _FakeSaneListingOption:
+    constraint: object
+
+
+class _FakeSaneListingDev:
+    """Just enough of a python-sane device handle for
+    ``SaneBackend.list_devices()`` to probe it: a bare ``resolution`` option
+    (so a supported device's default ``Device.resolution`` has a nonempty
+    ``supported_dpi`` to validate against -- everything else falls back to
+    ``_detect_caps``'s conservative empty-option-map defaults; film-scanner
+    ``sources`` comes from the device id itself, not from options -- see
+    ``transport.sane._infer_film_scanner``), plus a ``close()`` to match the
+    real probe-then-close sequence."""
+
+    opt = {"resolution": _FakeSaneListingOption(constraint=[4000, 2000, 1000])}
+
+    def close(self) -> None:
+        pass
+
+
+@dataclass
+class _FakeSaneListingModule:
+    """Stands in for the real ``sane`` module so ``get_devices()`` drives a
+    genuine ``SaneBackend.list_devices()`` -- the SANE discovery lane
+    itself, not the USB fallback (``python_sane_unavailable``) and not a
+    hand-rolled ``ScannerDevice`` list (``fake_service_factory``)."""
+
+    raw_devices: list[tuple[str, str, str, str]]
+
+    def init(self) -> None:
+        pass
+
+    def get_devices(self) -> list[tuple[str, str, str, str]]:
+        return list(self.raw_devices)
+
+    def open(self, device_id: str) -> _FakeSaneListingDev:
+        del device_id
+        return _FakeSaneListingDev()
+
+
+@pytest.fixture
+def fake_sane_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[list[tuple[str, str, str, str]]], None]:
+    """Installs a fake ``sane`` module (see ``_FakeSaneListingModule``) and
+    leaves ``_service_factory`` on its real, unpatched path, so
+    ``get_devices()`` runs the genuine ``ScannerService``/``SaneBackend``
+    machinery on top of it -- deliberately NOT ``python_sane_unavailable``
+    (that makes ``import sane`` fail, exercising the USB-fallback lane
+    instead). Also stubs the USB fallback lane to empty so a real LS-5000
+    attached to the host running this suite cannot leak into a result these
+    tests expect to come from SANE alone."""
+
+    def install(raw_devices: list[tuple[str, str, str, str]]) -> None:
+        monkeypatch.setitem(sys.modules, "sane", _FakeSaneListingModule(raw_devices))
+        monkeypatch.setattr("usb.core.find", lambda **_kwargs: [])
+        monkeypatch.setattr(
+            "coolscanpy.protocol.ls5000_single_pass.usb_backend.get_libusb_backend",
+            lambda: object(),
+        )
+
+    return install
+
+
+class TestSaneLaneDiscoveryGate:
+    def test_sane_listed_ls50_is_unsupported_and_not_connectable(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+    ) -> None:
+        # #14: the coolscan3 SANE backend also drives the LS-50 -- listing
+        # it must not default to supported=True just because the id has the
+        # right prefix.
+        fake_sane_module(
+            [("coolscan3:usb:001:005", "Nikon", "LS-50 ED", "film scanner")]
+        )
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        info = devices[0]
+        assert info.model == "LS-50 ED"
+        assert info.supported is False
+
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000")
+
+    def test_sane_listed_ls5000_stays_supported(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+    ) -> None:
+        fake_sane_module(
+            [("coolscan3:usb:001:002", "Nikon", "LS-5000 ED", "film scanner")]
+        )
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].model == "LS-5000 ED"
+        assert devices[0].supported is True
+
+        dev = coolscanpy.open("ls5000")
+        try:
+            assert dev._info.supported is True
+        finally:
+            dev.close()
+
+    def test_sane_listed_unrecognized_coolscan3_model_is_unsupported_and_labeled_generically(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+    ) -> None:
+        # A coolscan3: id this backend cannot name from its model string is
+        # still surfaced (this backend genuinely drives it) rather than
+        # guessed or silently dropped.
+        fake_sane_module(
+            [
+                (
+                    "coolscan3:usb:001:009",
+                    "Nikon",
+                    "Coolscan Mystery Model",
+                    "film scanner",
+                )
+            ]
+        )
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].model == "Nikon Coolscan (unrecognized model)"
+        assert devices[0].supported is False
+
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000")

@@ -3593,6 +3593,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
             density_evidence=density_evidence,
             actual_usb_bus=1,
             actual_usb_address=2,
+            scanner_identity="Nikon LS-5000 ED 1.03",
         )
     assert not second.output.parent.exists()
 
@@ -3613,6 +3614,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
         density_evidence=density_evidence,
         actual_usb_bus=1,
         actual_usb_address=2,
+        scanner_identity="Nikon LS-5000 ED 1.03",
     )
 
     assert len(ready_groups) == 15
@@ -3624,6 +3626,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     assert journal["frame_complete"] is True
     assert journal["session_reservation_retained"] is True
     assert journal["unit_released"] is False
+    assert journal["scanner_identity"] == "Nikon LS-5000 ED 1.03"
     assert journal["density_calibration_session_id"] == batch.session_id
     shadow = journal["meter_shadow_profiles"]["nikon-parity"]
     assert shadow["armed"] is True
@@ -3996,7 +3999,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     monkeypatch.setattr(
-        worker_module, "_validate_scanner_identity", lambda _payload: None
+        worker_module, "_validate_scanner_identity", lambda _payload: "Nikon LS-5000 ED 1.03"
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
