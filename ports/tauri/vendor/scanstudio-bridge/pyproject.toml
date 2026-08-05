@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanstudio-bridge"
+version = "0.1.0"
+description = "Headless NDJSON-over-stdio service wrapping CoolscanPy's LS-5000 roll-feeder engine for the Scan Studio Rust engine"
+readme = "README.md"
+# SPDX string field, no `License ::` trove classifier -- setuptools>=80 rejects
+# that combination (see CoolscanPy's own pyproject.toml for the same note).
+license = "GPL-3.0-only"
+authors = [{ name = "ScanStudio contributors" }]
+# CoolscanPy itself requires >=3.13; uv's resolver needs a solution valid
+# across the whole declared range, so requires-python has to match that
+# floor exactly or `uv sync` fails resolution outright.
+requires-python = ">=3.13"
+dependencies = [
+    # coolscanpy's own scanner extra (python-sane) is intentionally left out
+    # of the base dependency set: the bridge's test suite doesn't touch
+    # hardware, and python-sane needs OS SANE headers to build, which the
+    # test/CI environment doesn't have. Package builds install the `scanner`
+    # extra below so the optional plain-scan/eject compatibility path remains
+    # available when a host SANE backend exists; color-roll capture does not
+    # use it.
+    "coolscanpy",
+    "numpy>=2.4,<3",
+    "tifffile>=2026.6.1,<2027",
+]
+
+[project.optional-dependencies]
+# The production hardware bridge is installed with `uv sync --extra scanner`.
+# python-sane is packaged as part of this extra, and a compatible OS SANE
+# backend remains a host prerequisite only for plain scan and software eject.
+# ScanStudio packages its own libusb for CoolscanPy's direct color-roll path.
+scanner = ["coolscanpy[scanner]"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.14,<1",
+]
+
+[tool.uv.sources]
+# Checkout-relative on purpose: this keeps development locking reproducible
+# without embedding a maintainer's home directory. The app packager preserves
+# this same sibling relationship in the shipped corresponding source tree.
+coolscanpy = { path = "../coolscanpy", editable = true }
+
+[project.scripts]
+# cli.py doesn't exist until Plan 08-03; fine, `uv sync` only needs this
+# string to resolve when the console script actually runs.
+scanstudio-bridge = "scanstudio_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]

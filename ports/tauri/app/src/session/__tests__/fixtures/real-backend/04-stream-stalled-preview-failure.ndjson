@@ -1,0 +1,2 @@
+{"event":"scanner.thumbnailsFailed","payload":{"code":"BRIDGE_STREAM_STALLED","message":"bridge event stream stalled during preview (no events received within the expected window)","operationId":"op-fixture-stall"}}
+{"event":"scanner.thumbnailsComplete","payload":{"count":0,"operationId":"op-fixture-stall"}}

@@ -1,0 +1,19 @@
+ScanStudio Rust third-party licenses
+====================================
+
+This report is generated from the exact locked dependency graph by
+cargo-about 0.9.1. It groups every included crate by the license text used to
+satisfy that crate's declared license expression.
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+License: {{name}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}
+{{/each}}
+
+{{text}}
+
+{{/each}}

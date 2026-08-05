@@ -1,0 +1,273 @@
+// Recipe mirroring policy tests (04-03 Task 2). Client-side pre-validation
+// duplicating PROTOCOL.md's recipe constraints (defaults, bit depths, pass
+// counts, channels, bwNegative forcing rgb + ICE off, retained outputs,
+// fullCapturePackage/enabled combination, per-frame processingOverride
+// material matching, excluded-frame refusals) so the UI can pre-validate --
+// while the engine's own INVALID_PARAMS remains the authority and surfaces
+// verbatim when the wire call itself fails.
+
+import { describe, expect, it } from "vitest";
+import {
+  SessionStore,
+  applyRecipeDefaults,
+  resolveEffectiveProcessing,
+  validateRecipe,
+} from "../store/session";
+import { createScriptedTransport } from "../testing/harness";
+import type { CaptureRecipe, OutputRecipe, ProcessingRecipe } from "../wire/types";
+
+const VALID_CAPTURE = {
+  resolutionDpi: 4000,
+  bitDepth: 16,
+  multisamplePasses: 1,
+  channels: "rgbi",
+} satisfies CaptureRecipe;
+
+const VALID_PROCESSING: ProcessingRecipe = {
+  filmProcess: "positive",
+  autofocusEachFrame: false,
+  autoExposureEachFrame: false,
+  digitalIceEnabled: true,
+  digitalIceMode: "legacy",
+};
+
+const VALID_OUTPUT: OutputRecipe = {
+  archive: {
+    enabled: true,
+    filenameTemplate: "a.tiff",
+    destination: "/out",
+    fullCapturePackage: true,
+  },
+  positive: {
+    enabled: true,
+    fileFormat: "tiff",
+    colorProfile: "sRgb",
+    filenameTemplate: "p.tiff",
+    destination: "/out",
+  },
+  preview: {
+    enabled: false,
+    fileFormat: "jpeg",
+    maxLongEdgePx: 1024,
+    filenameTemplate: "v.jpg",
+    destination: "/out",
+  },
+};
+
+const EMPTY_CTX = { requestedFrames: [1] };
+
+function expectInvalid(
+  recipe: Parameters<typeof validateRecipe>[0],
+  ctx: Parameters<typeof validateRecipe>[1],
+  field: string,
+  messagePattern?: RegExp,
+): void {
+  const result = validateRecipe(recipe, ctx);
+  expect(result).toEqual({
+    valid: false,
+    field,
+    message: messagePattern ? expect.stringMatching(messagePattern) : expect.any(String),
+  });
+}
+
+describe("SessionStore recipe mirroring (pure helpers)", () => {
+  it("applies documented defaults when recipe fields are omitted", () => {
+    const outputWithOmittedArchiveDefaults: OutputRecipe = {
+      archive: { filenameTemplate: "a.tiff", destination: "/out" },
+      positive: VALID_OUTPUT.positive,
+      preview: VALID_OUTPUT.preview,
+    };
+    const resolved = applyRecipeDefaults({}, undefined, outputWithOmittedArchiveDefaults);
+    expect(resolved.capture).toEqual({
+      resolutionDpi: 4000,
+      bitDepth: 16,
+      multisamplePasses: 1,
+      channels: "rgbi",
+    });
+    // ArchiveRecipe.enabled defaults to true; fullCapturePackage defaults to
+    // true (requires enabled). Preview/positive have no documented default
+    // enabled value and are left as given.
+    expect(resolved.output?.archive.enabled).toBe(true);
+    expect(resolved.output?.archive.fullCapturePackage).toBe(true);
+    expect(resolved.output?.autoCrop).toBe(false);
+    expect(resolved.processing).toBeUndefined();
+  });
+
+  it("rejects bitDepth outside {8,16}", () => {
+    expectInvalid(
+      { capture: { ...VALID_CAPTURE, bitDepth: 12 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      EMPTY_CTX,
+      "capture.bitDepth",
+    );
+  });
+
+  it("rejects multisamplePasses outside {1,2,4,8,16}", () => {
+    expectInvalid(
+      { capture: { ...VALID_CAPTURE, multisamplePasses: 3 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      EMPTY_CTX,
+      "capture.multisamplePasses",
+    );
+  });
+
+  it("forces channels to rgb and digitalIceEnabled to false for bwNegative", () => {
+    const effective = resolveEffectiveProcessing({
+      ...VALID_PROCESSING,
+      filmProcess: "bwNegative",
+      digitalIceEnabled: true,
+    });
+    expect(effective.channels).toBe("rgb");
+    expect(effective.digitalIceEnabled).toBe(false);
+    // Non-B&W processing is untouched.
+    const unchanged = resolveEffectiveProcessing(VALID_PROCESSING);
+    expect(unchanged.channels).toBe("rgbi");
+    expect(unchanged.digitalIceEnabled).toBe(true);
+  });
+
+  it("requires at least one retained output", () => {
+    const bothDisabled: OutputRecipe = {
+      ...VALID_OUTPUT,
+      archive: { ...VALID_OUTPUT.archive, enabled: false },
+      positive: { ...VALID_OUTPUT.positive, enabled: false },
+    };
+    expectInvalid(
+      { capture: VALID_CAPTURE, processing: VALID_PROCESSING, output: bothDisabled },
+      EMPTY_CTX,
+      "output",
+      /at least one retained output/,
+    );
+  });
+
+  it("accepts a preview-only retained output, matching the current engine", () => {
+    const previewOnly: OutputRecipe = {
+      ...VALID_OUTPUT,
+      archive: { ...VALID_OUTPUT.archive, enabled: false, fullCapturePackage: false },
+      positive: { ...VALID_OUTPUT.positive, enabled: false },
+      preview: { ...VALID_OUTPUT.preview, enabled: true },
+    };
+    expect(
+      validateRecipe(
+        { capture: VALID_CAPTURE, processing: VALID_PROCESSING, output: previewOnly },
+        EMPTY_CTX,
+      ),
+    ).toEqual({ valid: true });
+  });
+
+  it("rejects fullCapturePackage true with archive enabled false", () => {
+    const disabledArchiveWithFullPackage: OutputRecipe = {
+      ...VALID_OUTPUT,
+      archive: { ...VALID_OUTPUT.archive, enabled: false, fullCapturePackage: true },
+    };
+    expectInvalid(
+      { capture: VALID_CAPTURE, processing: VALID_PROCESSING, output: disabledArchiveWithFullPackage },
+      EMPTY_CTX,
+      "output.archive.fullCapturePackage",
+    );
+  });
+
+  it("rejects a per-frame processingOverride.filmProcess mismatched against the active project", () => {
+    const result = validateRecipe(
+      { capture: VALID_CAPTURE, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      {
+        activeProjectFilmProcess: "positive",
+        frameProcessingOverrides: {
+          5: { ...VALID_PROCESSING, filmProcess: "bwNegative" },
+        },
+        requestedFrames: [1, 5],
+      },
+    );
+    expect(result).toEqual({
+      valid: false,
+      field: "processingOverride.filmProcess",
+      message: expect.stringMatching(/5/),
+    });
+    // A matching override passes.
+    const matching = validateRecipe(
+      { capture: VALID_CAPTURE, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      {
+        activeProjectFilmProcess: "positive",
+        frameProcessingOverrides: {
+          5: { ...VALID_PROCESSING, filmProcess: "positive" },
+        },
+        requestedFrames: [1, 5],
+      },
+    );
+    expect(matching).toEqual({ valid: true });
+  });
+
+  it("rejects a request naming an excluded frame", () => {
+    const result = validateRecipe(
+      { capture: VALID_CAPTURE, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      { excludedFrameIndices: new Set([3, 7]), requestedFrames: [1, 3] },
+    );
+    expect(result).toEqual({
+      valid: false,
+      field: "frames",
+      message: expect.stringMatching(/excluded frame/),
+    });
+    // No excluded frame in the request: valid.
+    const clean = validateRecipe(
+      { capture: VALID_CAPTURE, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      { excludedFrameIndices: new Set([3, 7]), requestedFrames: [1, 2] },
+    );
+    expect(clean).toEqual({ valid: true });
+  });
+});
+
+describe("SessionStore recipe mirroring (wired into startScan)", () => {
+  it("surfaces a wire-sourced INVALID_PARAMS message verbatim even after local validation passes", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const handle = createScriptedTransport({
+      onRequest: (method, params) => {
+        calls.push({ method, params: params as Record<string, unknown> });
+        if (method === "scan.start") {
+          return {
+            error: {
+              code: "INVALID_PARAMS",
+              message: "engine-side rule this local mirror does not model: frame 3 excluded in manifest",
+              recoverable: false,
+            },
+          };
+        }
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+
+    let caught: unknown;
+    try {
+      await store.startScan([1], VALID_CAPTURE);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toEqual({
+      code: "INVALID_PARAMS",
+      message: "engine-side rule this local mirror does not model: frame 3 excluded in manifest",
+      recoverable: false,
+    });
+    expect(calls.filter((call) => call.method === "scan.start")).toHaveLength(1);
+  });
+
+  it("the bwNegative forcing reaches the wire call (channels rgb, digitalIceEnabled false)", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const handle = createScriptedTransport({
+      onRequest: (method, params) => {
+        calls.push({ method, params: params as Record<string, unknown> });
+        if (method === "scan.start") return { result: { jobId: "job-1" } };
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+
+    await store.startScan([1], { ...VALID_CAPTURE, channels: "rgbi" }, {
+      ...VALID_PROCESSING,
+      filmProcess: "bwNegative",
+      digitalIceEnabled: true,
+    });
+    const scanCall = calls.find((call) => call.method === "scan.start");
+    expect(scanCall).toBeDefined();
+    const params = scanCall?.params as { recipe: CaptureRecipe; processing: ProcessingRecipe };
+    expect(params.recipe.channels).toBe("rgb");
+    expect((params.processing as ProcessingRecipe & { channels?: string }).channels).toBe("rgb");
+    expect(params.processing.digitalIceEnabled).toBe(false);
+  });
+});

@@ -1,0 +1,1 @@
+{"event": "scanner.status", "payload": {"status": {"connected": true, "adapter": "SA-30 (simulated)", "mediaLoaded": true, "carrier": "roll36", "frameCount": 36, "lamp": "stable", "transport": "idle", "activeJobId": null}}}

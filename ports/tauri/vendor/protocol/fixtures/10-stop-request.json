@@ -1,0 +1,1 @@
+{"id": 5, "method": "scan.stop", "params": {"jobId": "job-1", "mode": "afterCurrentFrame"}}

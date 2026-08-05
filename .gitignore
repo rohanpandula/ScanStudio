@@ -60,7 +60,9 @@ tmp/
 *.pcapng
 
 # Vendor software, local secrets, and packaging staging
-vendor/
+/vendor/
+/ports/tauri/vendor/engine/target/
+/ports/tauri/packaging/.staging/
 *.exe
 *.dll
 *.sys

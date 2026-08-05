@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# Fake exiftool launcher: resolves this script's directory (argv[0] is the
+# resolved PATH search result on macOS/Linux) and defers to the Node stub,
+# forwarding every argument unchanged.
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+exec node "$SCRIPT_DIR/exiftool.mjs" "$@"
