@@ -3418,10 +3418,16 @@ class TestRollBatchRefusal:
 @dataclass
 class _FakeUsbDevice:
     """Just enough of a ``usb.core.Device`` for ``_usb_fallback_device_infos``
-    to read: the two attributes it actually uses."""
+    to read: the attributes it actually uses. Defaults to the LS-5000 product
+    id so pre-existing fixture uses stay valid."""
 
     bus: int
     address: int
+    idProduct: int = 0x4002
+
+
+_LS50_PRODUCT_ID = 0x4001
+_LS40_PRODUCT_ID = 0x4000
 
 
 @pytest.fixture
@@ -3464,7 +3470,61 @@ class TestSaneFreeFallback:
         assert info.id == "usb:1:7"
         assert info.vendor == "Nikon"
         assert info.model == "LS-5000 ED"
+        assert info.supported is True
         assert info.capabilities.adapter_frame_control is True
+
+    def test_get_devices_lists_ls50_as_recognized_but_unsupported(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #14: an LS-50 (04b0:4001) on the bus must be named, not silently
+        # missing, and must never be connectable.
+        _mock_usb_find(monkeypatch, [_FakeUsbDevice(bus=5, address=3, idProduct=_LS50_PRODUCT_ID)])
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        info = devices[0]
+        assert info.model == "LS-50 ED"
+        assert info.supported is False
+
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000")
+
+    def test_get_devices_lists_ls40_as_recognized_but_unsupported(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mock_usb_find(monkeypatch, [_FakeUsbDevice(bus=6, address=2, idProduct=_LS40_PRODUCT_ID)])
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].model == "LS-40 ED"
+        assert devices[0].supported is False
+
+    def test_get_devices_skips_unknown_nikon_product_ids(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A foreign product id on the Nikon vendor is not guessed.
+        _mock_usb_find(
+            monkeypatch,
+            [_FakeUsbDevice(bus=7, address=1, idProduct=0x9999)],
+        )
+
+        assert coolscanpy.get_devices() == []
+
+    def test_get_devices_marks_ls5000_supported_alongside_an_ls50(
+        self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mock_usb_find(
+            monkeypatch,
+            [
+                _FakeUsbDevice(bus=1, address=1, idProduct=_LS50_PRODUCT_ID),
+                _FakeUsbDevice(bus=2, address=1, idProduct=0x4002),
+            ],
+        )
+
+        by_model = {d.model: d.supported for d in coolscanpy.get_devices()}
+        assert by_model == {"LS-5000 ED": True, "LS-50 ED": False}
 
     def test_get_devices_falls_back_to_empty_list_when_no_usb_device(
         self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch

@@ -38,6 +38,16 @@ fall back to direct USB when SANE is absent, while status, preview, and color
 capture use direct USB. A missing optional backend must remain a clear
 operation failure, never a simulated successful connection.
 
+## Nikon Coolscan USB identity table (reference)
+
+CoolscanPy's USB discovery recognizes Nikon Coolscan units by vendor/product id.
+The PID-to-model mapping (LS-40 `04b0:4000`, LS-50 `04b0:4001`, LS-5000
+`04b0:4002`) is referenced from the `nkscan` project by activexray, licensed
+Apache-2.0, at commit `87a1724886f8262e7791731ca055aa00ad6632fb`
+(`src/scanners/ls40.rs`, `src/scanners/ls50/mod.rs`, `src/scanners/ls5000/mod.rs`;
+`src/devices.rs` round-trip tests). This is a reference to the USB identity
+facts only; no `nkscan` source code is vendored.
+
 ## Rust engine dependencies
 
 The macOS app package includes the Rust engine, and its compiled binary includes Rust dependency code. The current locked dependency set uses the licenses shown below. `Cargo.lock` is the source of the version set; these SPDX expressions come from the resolved package metadata.

@@ -260,6 +260,7 @@ def _device_info_from_coolscanpy(info: coolscanpy.DeviceInfo) -> domain.DeviceIn
         vendor=info.vendor,
         model=info.model,
         capabilities=_capabilities_from_coolscanpy(info.capabilities),
+        supported=info.supported,
     )
 
 
@@ -437,6 +438,7 @@ class CoolscanPyTransport:
             vendor=_DEVICE_VENDOR,
             model=_DEVICE_MODEL,
             capabilities=_capabilities_from_coolscanpy(self._device.capabilities),
+            supported=True,
         )
 
     def status(self) -> domain.DeviceStatus:

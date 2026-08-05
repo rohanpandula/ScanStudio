@@ -108,6 +108,7 @@ class DeviceInfo:
     vendor: str
     model: str
     capabilities: Capabilities
+    supported: bool = True
 
 
 @dataclass(frozen=True)

@@ -194,9 +194,15 @@ def _fake_capabilities() -> "coolscanpy.Capabilities":
     )
 
 
-def _fake_device_info(device_id: str = _DEVICE_ID) -> "coolscanpy.DeviceInfo":
+def _fake_device_info(
+    device_id: str = _DEVICE_ID, *, supported: bool = True
+) -> "coolscanpy.DeviceInfo":
     return coolscanpy.DeviceInfo(
-        id=device_id, vendor="Nikon", model="SUPER COOLSCAN 5000 ED", capabilities=_fake_capabilities()
+        id=device_id,
+        vendor="Nikon",
+        model="SUPER COOLSCAN 5000 ED",
+        capabilities=_fake_capabilities(),
+        supported=supported,
     )
 
 
@@ -320,6 +326,20 @@ def test_list_devices_maps_coolscanpy_device_info(monkeypatch: pytest.MonkeyPatc
     assert devices[0].vendor == "Nikon"
     assert devices[0].capabilities.ir_channel is True
     assert devices[0].capabilities.supported_dpi == (4000,)
+
+
+def test_list_devices_passes_through_supported_from_coolscanpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lane D (#14): a recognized-but-unsupported model must reach the wire
+    # with supported=False so the app never offers a connect affordance.
+    info = _fake_device_info(supported=False)
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+
+    devices = CoolscanPyTransport().list_devices()
+
+    assert len(devices) == 1
+    assert devices[0].supported is False
 
 
 def test_capabilities_from_coolscanpy_reports_fixed_supported_multisample_passes() -> None:

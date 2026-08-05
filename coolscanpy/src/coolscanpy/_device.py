@@ -72,6 +72,22 @@ _LS5000_USB_VENDOR_ID = 0x04B0
 _LS5000_USB_PRODUCT_ID = 0x4002
 _USB_FALLBACK_ID_PREFIX = "usb"
 
+# Nikon Coolscan USB identity table, referenced from nkscan (Apache-2.0,
+# activexray/nkscan @ 87a1724886f8262e7791731ca055aa00ad6632fb;
+# src/scanners/{ls40,ls50,ls5000}, src/devices.rs). Verified from source, not
+# from memory: LS-40 = 0x4000 (Coolscan IV), LS-50 = 0x4001 (Coolscan V),
+# LS-5000 = 0x4002 (Coolscan 5000 ED). FireWire models (LS-8000/9000/4000)
+# expose no USB ids and are found by SCSI only, so they are out of scope here.
+# Of which only the LS-5000 (0x4002) is driven; the other models are listed
+# by discovery as recognized-but-unsupported (labeled, never connectable).
+_NIKON_COOLSCAN_USB_MODELS: dict[int, dict[int, str]] = {
+    _LS5000_USB_VENDOR_ID: {
+        0x4000: "LS-40 ED",
+        0x4001: "LS-50 ED",
+        _LS5000_USB_PRODUCT_ID: "LS-5000 ED",
+    },
+}
+
 
 def _default_service_factory() -> "ScannerService":
     from coolscanpy.session.service import ScannerService
@@ -164,11 +180,18 @@ def _usb_fallback_capabilities() -> Capabilities:
 
 
 def _usb_fallback_device_infos() -> list[DeviceInfo]:
-    """Enumerate attached LS-5000 units directly over USB, no python-sane.
+    """Enumerate attached Nikon Coolscan units directly over USB, no python-sane.
 
     Used by :func:`get_devices` only when python-sane is not importable.
     ``usb.core`` is imported lazily here, matching this package's convention
     of scoping USB imports to the code that actually touches the bus.
+
+    Every model in the nkscan-referenced PID table is reported by its real
+    model name (LS-40 / LS-50 / LS-5000); only the LS-5000 carries
+    ``supported=True``. A recognized-but-unsupported unit (LS-50, LS-40) is
+    therefore visible in discovery instead of silently missing from the
+    list -- labeled, and not connectable (Lane D, #14). An unknown Nikon
+    product id is skipped rather than guessed.
 
     The returned id is synthetic (``"usb:<bus>:<address>"``): honest about
     the USB topology it was found on, but not a SANE device string, since
@@ -187,30 +210,41 @@ def _usb_fallback_device_infos() -> list[DeviceInfo]:
     )
 
     capabilities = _usb_fallback_capabilities()
+    product_table = _NIKON_COOLSCAN_USB_MODELS[_LS5000_USB_VENDOR_ID]
     found = usb.core.find(
         find_all=True,
         idVendor=_LS5000_USB_VENDOR_ID,
-        idProduct=_LS5000_USB_PRODUCT_ID,
         backend=get_libusb_backend(),
     )
-    return [
-        DeviceInfo(
-            id=f"{_USB_FALLBACK_ID_PREFIX}:{device.bus}:{device.address}",
-            vendor="Nikon",
-            model="LS-5000 ED",
-            capabilities=capabilities,
+    infos: list[DeviceInfo] = []
+    for device in found:
+        model = product_table.get(device.idProduct)
+        if model is None:
+            continue
+        infos.append(
+            DeviceInfo(
+                id=f"{_USB_FALLBACK_ID_PREFIX}:{device.bus}:{device.address}",
+                vendor="Nikon",
+                model=model,
+                capabilities=capabilities,
+                supported=device.idProduct == _LS5000_USB_PRODUCT_ID,
+            )
         )
-        for device in found
-    ]
+    return infos
 
 
 def get_devices(local_only: bool = False) -> list[DeviceInfo]:
-    """Enumerate attached Coolscan LS-5000 units.
+    """Enumerate attached Nikon Coolscan units.
 
     Mirrors ``sane.get_devices()``; unlike SANE, this never returns a
     non-Coolscan device -- there is no backend negotiation. ``local_only`` is
     accepted for signature-compatibility with ``sane.get_devices()`` and is
     currently always true (no network transport exists for this package).
+
+    A supported LS-5000 is connectable (``supported=True``). Any other Nikon
+    Coolscan found on the bus (LS-50, LS-40) is reported by name with
+    ``supported=False`` so it is visible rather than silently missing -- see
+    :func:`_usb_fallback_device_infos`.
 
     Tries the SANE route first. When SANE is unavailable, its enumeration
     fails, or it finds no Coolscan, falls back to direct USB enumeration -- see
@@ -269,6 +303,14 @@ def open(devname: str) -> "Device":
                 f"no attached Coolscan LS-5000 unit matches {devname!r}"
             )
         info = matches[0]
+
+    if not info.supported:
+        # Recognize-and-refuse (Lane D): a Nikon Coolscan that is not the
+        # LS-5000 is listed in discovery but must never be opened. Fail-closed.
+        raise DeviceNotFound(
+            f"{info.model} is recognized but not supported; "
+            "only the LS-5000 is supported"
+        )
 
     _register_open_device(info.id)
     try:
