@@ -88,6 +88,40 @@ _NIKON_COOLSCAN_USB_MODELS: dict[int, dict[int, str]] = {
     },
 }
 
+# SANE lane counterpart of the USB lane's product-id table above (#14): SANE
+# has no product id, only the backend's free-text model string, so a
+# recognized non-LS-5000 model is matched by substring instead. Ordered
+# most-specific-marker-first -- "LS-50" is itself a substring of "LS-5000",
+# so checking "LS-5000" first is load-bearing, not stylistic. Reuses the USB
+# lane's exact naming (_NIKON_COOLSCAN_USB_MODELS' values) so discovery
+# reports the same model label regardless of which lane found the device.
+_SANE_COOLSCAN_MODEL_MARKERS: tuple[tuple[str, str], ...] = (
+    ("LS-5000", "LS-5000 ED"),
+    ("LS-50", "LS-50 ED"),
+    ("LS-40", "LS-40 ED"),
+)
+_UNRECOGNIZED_SANE_COOLSCAN_MODEL_NAME = "Nikon Coolscan (unrecognized model)"
+
+
+def _sane_model_and_supported(device: ScannerDevice) -> tuple[str, bool]:
+    """Classify a SANE-enumerated coolscan3 device's free-text model string.
+
+    Returns ``(model, supported)``. Only the LS-5000 is supported. A
+    recognized-but-unsupported Nikon Coolscan (LS-50, LS-40) is labeled with
+    the USB lane's exact name instead of whatever raw string SANE reported,
+    so it is visible in discovery but never connectable -- see :func:`open`'s
+    ``supported`` gate (Lane D, #14). A ``coolscan3:``-prefixed id whose model
+    string matches none of the known markers is still surfaced (this backend
+    genuinely drives it), just with a generic unsupported label rather than a
+    guessed one.
+    """
+
+    raw_model = device.model or ""
+    for marker, canonical_name in _SANE_COOLSCAN_MODEL_MARKERS:
+        if marker in raw_model:
+            return canonical_name, canonical_name == "LS-5000 ED"
+    return _UNRECOGNIZED_SANE_COOLSCAN_MODEL_NAME, False
+
 
 def _default_service_factory() -> "ScannerService":
     from coolscanpy.session.service import ScannerService
@@ -144,11 +178,17 @@ def _capabilities_from(caps: ScannerCapabilities) -> Capabilities:
 
 
 def _device_info_from(device: ScannerDevice) -> DeviceInfo:
+    # #14 (SANE lane): a coolscan3 id is not, on its own, proof of an
+    # LS-5000 -- the same SANE backend drives the LS-40/LS-50 too. Derive
+    # supported/model from the device's own model string rather than
+    # defaulting DeviceInfo.supported's bare True (see _sane_model_and_supported).
+    model, supported = _sane_model_and_supported(device)
     return DeviceInfo(
         id=device.id,
         vendor=device.vendor,
-        model=device.model,
+        model=model,
         capabilities=_capabilities_from(device.capabilities),
+        supported=supported,
     )
 
 
