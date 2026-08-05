@@ -660,6 +660,10 @@ pub struct RealLs5000 {
     preview_terminal_generation_loss_test_hook: bool,
     device_id: String,
     model: String,
+    /// False when the bridge discovered a recognized-but-unsupported Nikon
+    /// model (Lane D, #14). The backend still starts so ``scanner.list`` can
+    /// show the unit by name, but ``connect`` refuses it.
+    supported: bool,
     /// The holder classification derived from the bridge's authoritative
     /// `DeviceInfo.capabilities`. `device.list` supplies the initial value,
     /// and every successful `device.open` refreshes it because a holder may
@@ -912,6 +916,7 @@ impl RealLs5000 {
             preview_terminal_generation_loss_test_hook: false,
             device_id: bridge_device.device_id,
             model: bridge_device.model,
+            supported: bridge_device.supported,
             detected_holder: Mutex::new(detected_holder),
             firmware_label,
             supported_multisample_passes,
@@ -966,6 +971,7 @@ impl RealLs5000 {
             kind: "real".to_string(),
             firmware: self.firmware_label.clone(),
             connection: "USB (bridge)".to_string(),
+            supported: self.supported,
         }
     }
 
@@ -1747,6 +1753,17 @@ impl ScannerBackend for RealLs5000 {
         _options: &ConnectOptions,
     ) -> Result<ConnectResult, EngineError> {
         self.ensure_preview_stream_allows_connect_or_eject()?;
+        if !self.supported {
+            // Recognize-and-refuse (Lane D, #14): an unsupported model is
+            // listed by name in scanner.list but must never connect.
+            return Err(EngineError::new(
+                ErrorCode::NotSupported,
+                format!(
+                    "{} is recognized but not supported; only the LS-5000 is supported",
+                    self.model
+                ),
+            ));
+        }
         // BRIDGE.md has no equivalent of the simulator's `timeScale` /
         // `faultInjection` concepts — both are simulator-only, so
         // `options` is intentionally ignored here.

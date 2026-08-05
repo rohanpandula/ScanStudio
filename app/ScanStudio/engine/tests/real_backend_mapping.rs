@@ -184,6 +184,30 @@ fn connect_unknown_device_id_maps_to_unknown_device() {
 }
 
 #[test]
+fn unsupported_bridge_device_is_listed_but_never_connectable() {
+    // Lane D (#14): the mock advertises a recognized-but-unsupported LS-50.
+    // The backend starts so scanner.list can name the unit, but connect is
+    // refused fail-closed.
+    let backend = RealLs5000::new_with_env(
+        mock_bridge_bin(),
+        GENEROUS_TIMEOUT,
+        &[("MOCK_BRIDGE_DEVICE_UNSUPPORTED", "1")],
+    )
+    .expect("RealLs5000::new should start even for an unsupported model");
+
+    assert_eq!(backend.device_info().model, "LS-50 ED");
+    assert!(
+        !backend.device_info().supported,
+        "an unsupported model must never be connectable"
+    );
+
+    let err = backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect_err("connecting an unsupported model must be refused");
+    assert_eq!(err.code, ErrorCode::NotSupported);
+}
+
+#[test]
 fn load_media_is_always_an_internal_error_and_never_calls_the_bridge() {
     let backend = RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
         .expect("RealLs5000::new should succeed against a healthy mock bridge");

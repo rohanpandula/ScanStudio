@@ -654,10 +654,21 @@ fn require_open(state: &MockState) -> Result<(), (BridgeErrorCode, String)> {
 }
 
 fn fixed_device_info() -> BridgeDeviceInfo {
+    // Lane D (S04): the mock can advertise a recognized-but-unsupported
+    // Nikon model so the engine's recognize-and-refuse path is testable
+    // without real hardware.
+    let unsupported = std::env::var("MOCK_BRIDGE_DEVICE_UNSUPPORTED")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     BridgeDeviceInfo {
         device_id: DEVICE_ID.to_string(),
         vendor: "Nikon".to_string(),
-        model: "SUPER COOLSCAN 5000 ED".to_string(),
+        model: if unsupported {
+            "LS-50 ED".to_string()
+        } else {
+            "SUPER COOLSCAN 5000 ED".to_string()
+        },
+        supported: !unsupported,
         capabilities: BridgeCapabilities {
             ir_channel: true,
             supported_dpi: vec![4000],
