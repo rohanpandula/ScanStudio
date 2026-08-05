@@ -1156,6 +1156,7 @@ def _thumbnail_from_slot(slot: Any) -> Thumbnail:
         spacing_offset=slot.boundary_offset_rows,
         needs_approval=slot.manual_review,
         warnings=slot.warnings,
+        partial=slot.partial,
     )
 
 

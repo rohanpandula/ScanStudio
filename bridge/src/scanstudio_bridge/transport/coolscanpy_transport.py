@@ -294,6 +294,7 @@ def _thumbnail_from_coolscanpy(
         needs_approval=thumbnail.needs_approval,
         warnings=tuple(thumbnail.warnings),
         image_path=image_path,
+        partial=thumbnail.partial,
     )
 
 

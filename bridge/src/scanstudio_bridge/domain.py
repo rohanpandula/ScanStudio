@@ -120,6 +120,10 @@ class Thumbnail:
     needs_approval: bool
     warnings: tuple[str, ...]
     image_path: str
+    # Lane C (D2): True when >=90% of the frame's height is inside the preview
+    # but not all of it. Emitted only when true (strictly additive); see
+    # service._thumbnail_to_wire for why it is not a plain to_wire field.
+    partial: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,7 @@ import stat
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Iterable, Literal, Mapping, cast
 
 import numpy as np
 
@@ -244,6 +244,10 @@ class RollPreviewSlot:
     warnings: tuple[str, ...] = ()
     manual_review: bool = False
     boundary_offset_rows: int = 0
+    # Lane C (D2): True when >=90% of the frame's height is inside the preview
+    # but not all of it. None/omitted for every full-cover frame (strictly
+    # additive on the wire).
+    partial: bool | None = None
 
     def __post_init__(self) -> None:
         if type(self.slot_id) is not int or self.slot_id < 1:
@@ -413,10 +417,18 @@ class RollPreviewSession:
             slot,
             boundary_offset_rows,
         )
+        # Lane C (D2): an offset re-crop that is a partial frame stays flagged
+        # partial (None for full-cover), preserving the additive wire contract.
+        partial = (
+            True
+            if _resolved_crop_partial(self.preview, slot, boundary_offset_rows)
+            else None
+        )
         updated = replace(
             slot,
             thumbnail=thumbnail,
             boundary_offset_rows=boundary_offset_rows,
+            partial=partial,
         )
         slots = list(self.slots)
         slots[slot_id - 1] = updated
@@ -917,6 +929,38 @@ def _validated_preview_density_evidence(
     return evidence
 
 
+# Lane C (D2): a frame whose crop overlaps the preview such that >= this
+# fraction of its height is inside (but not all of it) is exposed flagged
+# partial instead of refused. Strictly below it stays REFEED_REQUIRED.
+PARTIAL_FRAME_MIN_COVERAGE = 0.90
+
+
+def _crop_coverage(start: int, end: int, preview_height: int) -> float:
+    """Fraction of crop ``[start, end)`` that lies inside ``[0, preview_height)``.
+
+    ``1.0`` for a fully-inside frame; lower when the frame runs off the top or
+    bottom edge of the preview. ``0.0`` for an empty/invalid crop.
+    """
+    if end <= start:
+        return 0.0
+    inside_top = min(max(0, start), preview_height)
+    inside_bottom = min(max(0, end), preview_height)
+    inside = max(0, inside_bottom - inside_top)
+    return inside / (end - start)
+
+
+def _crop_state(
+    start: int, end: int, preview_height: int
+) -> Literal["full", "partial", "refeed"]:
+    """Classify a frame crop against the preview (Lane C, D2)."""
+    coverage = _crop_coverage(start, end, preview_height)
+    if coverage < PARTIAL_FRAME_MIN_COVERAGE:
+        return "refeed"
+    if coverage < 1.0:
+        return "partial"
+    return "full"
+
+
 def _thumbnail(rgb: np.ndarray, start: int, end: int) -> np.ndarray:
     start = max(0, min(start, len(rgb)))
     end = max(start, min(end, len(rgb)))
@@ -955,6 +999,30 @@ def _resolved_transport_record(
     return record
 
 
+def _resolved_crop_bounds(
+    preview: ValidatedRollPreview,
+    slot: RollPreviewSlot,
+    boundary_offset_rows: int,
+) -> tuple[int, int]:
+    """Resolve the row delta and return the re-crop ``(start, end)`` bounds."""
+
+    validate_boundary_offset(slot.slot_id, boundary_offset_rows)
+    record = _resolved_transport_record(preview, slot, boundary_offset_rows)
+    row_delta = record.row - slot.base_origin.lookup_row
+    return slot.start_boundary_row + row_delta, slot.end_boundary_row + row_delta
+
+
+def _resolved_crop_partial(
+    preview: ValidatedRollPreview,
+    slot: RollPreviewSlot,
+    boundary_offset_rows: int,
+) -> bool:
+    """True when the resolved re-crop is a Lane C partial frame (Lane C, D2)."""
+
+    start, end = _resolved_crop_bounds(preview, slot, boundary_offset_rows)
+    return _crop_state(start, end, len(preview.rgb)) == "partial"
+
+
 def reload_thumbnail(
     preview: ValidatedRollPreview,
     slot: RollPreviewSlot,
@@ -965,18 +1033,17 @@ def reload_thumbnail(
     This does not shift an already-rendered thumbnail.  The selected offset is
     first resolved through the raw table captured during the same traversal;
     the original decoded RGB96 preview is then cropped again at that row delta.
+
+    Lane C (D2): a re-crop with >=90% of its height inside the preview is
+    exposed (clamped) as a partial frame; strictly below stays REFEED_REQUIRED.
     """
 
     if not isinstance(preview, ValidatedRollPreview):
         raise TypeError("preview must be a ValidatedRollPreview")
     if not isinstance(slot, RollPreviewSlot):
         raise TypeError("slot must be a RollPreviewSlot")
-    validate_boundary_offset(slot.slot_id, boundary_offset_rows)
-    record = _resolved_transport_record(preview, slot, boundary_offset_rows)
-    row_delta = record.row - slot.base_origin.lookup_row
-    start = slot.start_boundary_row + row_delta
-    end = slot.end_boundary_row + row_delta
-    if start < 0 or end > len(preview.rgb):
+    start, end = _resolved_crop_bounds(preview, slot, boundary_offset_rows)
+    if _crop_state(start, end, len(preview.rgb)) == "refeed":
         raise RollSessionError(
             f"slot {slot.slot_id} boundary offset lies outside the saved preview"
         )
@@ -1078,6 +1145,15 @@ def build_roll_preview_session(
         mapping.origins[:slot_count],
     ):
         warnings = _slot_warnings(interval.frame, interval, origin, detection)
+        # Lane C (D2): expose >=90%-covered frames flagged partial instead of
+        # refusing them; strictly-below-90% stays REFEED_REQUIRED.
+        state = _crop_state(interval.start_row, interval.end_row, len(rgb))
+        if state == "refeed":
+            raise RollSessionError(
+                f"frame {interval.frame} has <"
+                f"{int(PARTIAL_FRAME_MIN_COVERAGE * 100)}% of its height inside "
+                "the preview; refeed and retry"
+            )
         slots.append(
             RollPreviewSlot(
                 slot_id=interval.frame,
@@ -1089,6 +1165,7 @@ def build_roll_preview_session(
                 manual_review=bool(
                     interval.manual_review or origin.manual_review or warnings
                 ),
+                partial=(True if state == "partial" else None),
             )
         )
     selected = _validate_selected_slots(selected_slots, len(slots))
