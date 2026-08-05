@@ -53,6 +53,17 @@ jobs:
         working-directory: coolscanpy
         run: uv run pytest
 
+  ports-vendor-sync:
+    name: ports/tauri/vendor mirror drift check
+    # Pure diff -rq against a checked-in allowlist -- no build, no deps, no
+    # macOS runner needed. See scripts/check_ports_vendor_sync.sh's header
+    # for what this does and does not guarantee.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check ports/tauri/vendor mirrors for drift beyond the known baseline
+        run: scripts/check_ports_vendor_sync.sh
+
   package:
     name: Self-contained package build (${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
