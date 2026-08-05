@@ -79,7 +79,11 @@ if missing_reports:
 
 for report_name in ("Rust-App-THIRD-PARTY.txt", "Rust-Engine-THIRD-PARTY.txt"):
     report = actual_files[report_name]
-    text = report.read_text(errors="strict")
+    # The notice reports and JSON manifests are written as UTF-8 by the
+    # tooling. Read them as UTF-8 explicitly so a Windows host (default
+    # encoding cp1252) does not fail decoding a non-ASCII license/report byte
+    # (UnicodeDecodeError); this is a runner-compat fix, not a looser check.
+    text = report.read_text(encoding="utf-8", errors="strict")
     if report.stat().st_size < 10_000 or "License:" not in text or "Used by:" not in text:
         fail(f"Rust report is empty or malformed: {report_name}")
     if "/Users/" in text:
@@ -88,8 +92,8 @@ for report_name in ("Rust-App-THIRD-PARTY.txt", "Rust-Engine-THIRD-PARTY.txt"):
 npm_root = licenses_root / "npm-production"
 lock_path = npm_root / "package-lock.json"
 inventory_path = npm_root / "inventory.json"
-lock = json.loads(lock_path.read_text())
-inventory = json.loads(inventory_path.read_text())
+lock = json.loads(lock_path.read_text(encoding="utf-8"))
+inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
 if inventory.get("sourceLockfileSha256") != digest(lock_path):
     fail("npm inventory is not bound to the bundled package-lock.json")
 
