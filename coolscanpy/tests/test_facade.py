@@ -3785,13 +3785,67 @@ class TestSaneLaneDiscoveryGate:
         finally:
             dev.close()
 
-    def test_sane_listed_unrecognized_coolscan3_model_is_unsupported_and_labeled_generically(
+    def test_sane_listed_ls4000_is_unsupported_and_not_connectable(
         self,
         fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
     ) -> None:
-        # A coolscan3: id this backend cannot name from its model string is
-        # still surfaced (this backend genuinely drives it) rather than
-        # guessed or silently dropped.
+        # R2: coolscan3.c's own identification table also names the LS-4000
+        # (cs3_open()'s "LS-4000 ED" strncmp literal) -- recognized, not the
+        # driven model, refused the same way as the LS-40/LS-50.
+        fake_sane_module(
+            [("coolscan3:usb:001:011", "Nikon", "LS-4000 ED", "film scanner")]
+        )
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].model == "LS-4000 ED"
+        assert devices[0].supported is False
+
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000")
+
+    def test_sane_model_marker_order_matches_the_longer_digit_model_first(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+    ) -> None:
+        # R2, pinned: "LS-50" is a literal substring of "LS-5000 ED", and
+        # "LS-40" is a literal substring of "LS-4000 ED". If
+        # _SANE_COOLSCAN_MODEL_MARKERS were ordered the other way, a
+        # genuine LS-5000 (or LS-4000) would be misclassified as the
+        # unsupported LS-50 (or LS-40) and bricked. Prove the actual
+        # classifier resolves both correctly, not just that some model
+        # string round-trips.
+        assert device_module._sane_model_and_supported(
+            ScannerDevice(
+                id="coolscan3:usb:1:2",
+                vendor="Nikon",
+                model="LS-5000 ED",
+                capabilities=_caps(),
+            )
+        ) == ("LS-5000 ED", True)
+        assert device_module._sane_model_and_supported(
+            ScannerDevice(
+                id="coolscan3:usb:1:3",
+                vendor="Nikon",
+                model="LS-4000 ED",
+                capabilities=_caps(),
+            )
+        ) == ("LS-4000 ED", False)
+
+    def test_sane_listed_unrecognized_coolscan3_model_stays_supported(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+    ) -> None:
+        # R2 (reviewer's call): this backend's device family is closed to
+        # the models coolscan3.c's identification table names -- a
+        # coolscan3: id whose model string matches none of them is most
+        # plausibly a firmware/model-string variant of the one model this
+        # package actually drives, not a foreign device (get_devices()
+        # already filtered to coolscan3: ids). Bricking a genuine LS-5000
+        # on an exact-string mismatch would be worse than the reverse, so
+        # this defaults supported=True with the raw reported string
+        # preserved (not relabeled) instead of failing closed.
         fake_sane_module(
             [
                 (
@@ -3806,11 +3860,14 @@ class TestSaneLaneDiscoveryGate:
         devices = coolscanpy.get_devices()
 
         assert len(devices) == 1
-        assert devices[0].model == "Nikon Coolscan (unrecognized model)"
-        assert devices[0].supported is False
+        assert devices[0].model == "Coolscan Mystery Model"
+        assert devices[0].supported is True
 
-        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
-            coolscanpy.open("ls5000")
+        dev = coolscanpy.open("ls5000")
+        try:
+            assert dev._info.supported is True
+        finally:
+            dev.close()
 
 
 # ===========================================================================
