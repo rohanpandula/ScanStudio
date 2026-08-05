@@ -1193,6 +1193,28 @@ class TestOpenErrors:
         with pytest.raises(coolscanpy.DeviceNotFound):
             coolscanpy.open("ls5000")
 
+    def test_open_ls5000_alias_succeeds_with_an_unsupported_device_also_attached(
+        self, fake_service_factory
+    ) -> None:
+        # 14-B: an LS-50 (recognized but unsupported -- see
+        # _device_info_from's model-string classification) attached
+        # alongside the one supported LS-5000 must not make "the one
+        # attached unit" look ambiguous: open("ls5000") filters to
+        # supported units BEFORE the more-than-one-unit ambiguity check.
+        unsupported = ScannerDevice(
+            id="net:scanner:coolscan3:usb:ls50",
+            vendor="Nikon",
+            model="LS-50 ED",
+            capabilities=_caps(),
+        )
+        fake_service_factory([unsupported, _coolscan_device()])
+
+        dev = coolscanpy.open("ls5000")
+        try:
+            assert dev._info.id == _COOLSCAN_ID
+        finally:
+            dev.close()
+
     def test_open_exact_id_not_found_raises_device_not_found(
         self, fake_service_factory
     ) -> None:

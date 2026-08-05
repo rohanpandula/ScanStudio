@@ -328,14 +328,26 @@ def open(devname: str) -> "Device":
 
     infos = get_devices()
     if devname == "ls5000":
-        if not infos:
-            raise DeviceNotFound("no Coolscan LS-5000 unit is attached")
-        if len(infos) > 1:
+        # 14-B: filter to supported units BEFORE the ambiguity check. A
+        # recognized-but-unsupported Coolscan (LS-50, LS-40) attached
+        # alongside a supported LS-5000 must not make "the one attached
+        # unit" look ambiguous -- only multiple SUPPORTED units are. When
+        # nothing supported is attached but something unsupported is,
+        # fall through to it so the more specific "recognized but not
+        # supported" message below fires instead of the generic
+        # not-attached one.
+        supported_infos = [candidate for candidate in infos if candidate.supported]
+        if len(supported_infos) > 1:
             raise DeviceNotFound(
                 "more than one Coolscan LS-5000 unit is attached; "
                 "disambiguate via get_devices()"
             )
-        info = infos[0]
+        if supported_infos:
+            info = supported_infos[0]
+        elif infos:
+            info = infos[0]
+        else:
+            raise DeviceNotFound("no Coolscan LS-5000 unit is attached")
     else:
         matches = [candidate for candidate in infos if candidate.id == devname]
         if not matches:
