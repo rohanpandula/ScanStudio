@@ -517,18 +517,57 @@ private struct DeviceConnectionWorkspaceView: View {
                     .font(.system(size: 19, weight: .semibold))
                 Button("Look Again") { Task { await sessionModel.refreshAvailableDevices() } }
                     .buttonStyle(.bordered)
+            case .unsupported(let devices):
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 30))
+                        .foregroundStyle(Color.secondary)
+                    ForEach(devices, id: \.deviceId) { device in
+                        VStack(spacing: 4) {
+                            Text("\(device.model) detected")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("This model is not yet supported (LS-5000 only today). Follow rohanpandula/ScanStudio#14 for updates.")
+                                .font(.system(size: 12))
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(Color.secondary)
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.12)))
+                        .foregroundStyle(Color.secondary)
+                    }
+                }
             case .directConnect(let device):
                 deviceCard(device)
+                unsupportedCards(DeviceSelectionPolicy.unsupportedDevices(from: sessionModel.availableDevices))
             case .explicitChoice(let devices):
                 Text("Choose a scanner")
                     .font(.system(size: 19, weight: .semibold))
                 ForEach(devices, id: \.deviceId) { device in
                     deviceCard(device)
                 }
+                unsupportedCards(DeviceSelectionPolicy.unsupportedDevices(from: sessionModel.availableDevices))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.scanStudioWorkspace)
+    }
+
+    @ViewBuilder
+    private func unsupportedCards(_ devices: [DeviceInfo]) -> some View {
+        if !devices.isEmpty {
+            VStack(spacing: 6) {
+                ForEach(devices, id: \.deviceId) { device in
+                    Text("\(device.model) detected — not yet supported (LS-5000 only today). Follow rohanpandula/ScanStudio#14 for updates.")
+                        .font(.system(size: 11))
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(Color.secondary)
+                        .padding(8)
+                        .frame(maxWidth: .infinity)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.12)))
+                }
+            }
+        }
     }
 
     private func connectionProgress(_ state: DeviceSelectionPolicy.State) -> some View {

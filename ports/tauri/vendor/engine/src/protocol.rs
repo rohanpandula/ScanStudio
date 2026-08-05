@@ -113,6 +113,9 @@ pub enum ErrorCode {
     /// request. This reports readiness only; it never grants permission or
     /// changes the bridge latch.
     HwMotionNotArmed,
+    /// A recognized-but-unsupported Nikon model (Lane D, #14): discovery
+    /// lists it by name, but connect is refused. Fail-closed.
+    NotSupported,
 }
 
 // ---------------------------------------------------------------------
@@ -772,6 +775,7 @@ mod tests {
             (ErrorCode::ArchiveCollision, "ARCHIVE_COLLISION"),
             (ErrorCode::ManualReviewRequired, "MANUAL_REVIEW_REQUIRED"),
             (ErrorCode::HwMotionNotArmed, "HW_MOTION_NOT_ARMED"),
+            (ErrorCode::NotSupported, "NOT_SUPPORTED"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
             let decoded: ErrorCode = serde_json::from_value(json!(wire)).unwrap();

@@ -194,9 +194,15 @@ def _fake_capabilities() -> "coolscanpy.Capabilities":
     )
 
 
-def _fake_device_info(device_id: str = _DEVICE_ID) -> "coolscanpy.DeviceInfo":
+def _fake_device_info(
+    device_id: str = _DEVICE_ID, *, supported: bool = True
+) -> "coolscanpy.DeviceInfo":
     return coolscanpy.DeviceInfo(
-        id=device_id, vendor="Nikon", model="SUPER COOLSCAN 5000 ED", capabilities=_fake_capabilities()
+        id=device_id,
+        vendor="Nikon",
+        model="SUPER COOLSCAN 5000 ED",
+        capabilities=_fake_capabilities(),
+        supported=supported,
     )
 
 
@@ -320,6 +326,20 @@ def test_list_devices_maps_coolscanpy_device_info(monkeypatch: pytest.MonkeyPatc
     assert devices[0].vendor == "Nikon"
     assert devices[0].capabilities.ir_channel is True
     assert devices[0].capabilities.supported_dpi == (4000,)
+
+
+def test_list_devices_passes_through_supported_from_coolscanpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lane D (#14): a recognized-but-unsupported model must reach the wire
+    # with supported=False so the app never offers a connect affordance.
+    info = _fake_device_info(supported=False)
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+
+    devices = CoolscanPyTransport().list_devices()
+
+    assert len(devices) == 1
+    assert devices[0].supported is False
 
 
 def test_capabilities_from_coolscanpy_reports_fixed_supported_multisample_passes() -> None:
@@ -821,6 +841,29 @@ def test_preview_maps_device_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     assert excinfo.value.code == ErrorCode.DEVICE_BUSY
 
 
+def test_preview_maps_meter_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lane B (#17): density metering runs as part of ``Roll.preview()``
+    itself (not just ``scan_many``), so a channel with no usable meter mean
+    can raise ``coolscanpy.MeterUnusableError`` from the PREVIEW path, not
+    only from ``start_scan`` (see ``test_start_scan_maps_meter_unusable``
+    above). Before this fix, ``preview()``'s except chain had no handler for
+    it, so it fell through to service.py's generic ``except Exception``
+    branch and flattened to a bare INTERNAL code. Must map to the typed
+    ``METER_UNUSABLE`` wire code instead, guidance text preserved."""
+
+    class _MeterUnusableRoll(_FakeRoll):
+        def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
+            raise coolscanpy.MeterUnusableError("G")
+
+    transport, _device = _opened_transport(monkeypatch, _MeterUnusableRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert excinfo.value.code == ErrorCode.METER_UNUSABLE
+    assert "could not find usable image data" in str(excinfo.value)
+    assert "channel G" in str(excinfo.value)
+
+
 def test_preview_maps_leaked_index_decode_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Live incident, 2026-07-25: `Roll.preview()` let a coolscanpy-internal
     `IndexDecodeError` (coolscanpy.protocol.ls5000_single_pass.roll_index --
@@ -974,6 +1017,34 @@ def test_start_scan_maps_base_roll_mismatch(
         )
     assert excinfo.value.code == ErrorCode.ROLL_MISMATCH
     assert "untraced sense 063f03" in str(excinfo.value)
+
+
+def test_start_scan_maps_meter_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lane B (#17): a frame whose metering found no usable image data for a
+    channel raises ``coolscanpy.MeterUnusableError``. The scan path must map it
+    to the typed ``METER_UNUSABLE`` wire code (guidance preserved), never
+    flatten it to a bare INTERNAL."""
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1)],
+        scan_results={1: [coolscanpy.MeterUnusableError("G")]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.start_scan(
+            slots=[1],
+            recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            output=_output(tmp_path),
+            on_progress=lambda _p: None,
+            on_retry=lambda *a: None,
+            on_frame=lambda *_a: None,
+        )
+    assert excinfo.value.code == ErrorCode.METER_UNUSABLE
+    assert "could not find usable image data" in str(excinfo.value)
+    assert "channel G" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(

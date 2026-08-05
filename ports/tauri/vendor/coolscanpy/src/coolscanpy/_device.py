@@ -72,6 +72,84 @@ _LS5000_USB_VENDOR_ID = 0x04B0
 _LS5000_USB_PRODUCT_ID = 0x4002
 _USB_FALLBACK_ID_PREFIX = "usb"
 
+# Nikon Coolscan USB identity table, referenced from nkscan (Apache-2.0,
+# activexray/nkscan @ 87a1724886f8262e7791731ca055aa00ad6632fb;
+# src/scanners/{ls40,ls50,ls5000}, src/devices.rs). Verified from source, not
+# from memory: LS-40 = 0x4000 (Coolscan IV), LS-50 = 0x4001 (Coolscan V),
+# LS-5000 = 0x4002 (Coolscan 5000 ED). FireWire models (LS-8000/9000/4000)
+# expose no USB ids and are found by SCSI only, so they are out of scope here.
+# Of which only the LS-5000 (0x4002) is driven; the other models are listed
+# by discovery as recognized-but-unsupported (labeled, never connectable).
+_NIKON_COOLSCAN_USB_MODELS: dict[int, dict[int, str]] = {
+    _LS5000_USB_VENDOR_ID: {
+        0x4000: "LS-40 ED",
+        0x4001: "LS-50 ED",
+        _LS5000_USB_PRODUCT_ID: "LS-5000 ED",
+    },
+}
+
+# SANE lane counterpart of the USB lane's product-id table above (#14): SANE
+# has no product id, only the backend's free-text model string, so a
+# recognized non-LS-5000 model is matched by substring instead.
+#
+# Sourced from the coolscan3 SANE backend's own device-identification table,
+# not guessed: sane-backends backend/coolscan3.c, cs3_open(), the
+# strncmp(s->product_string, "...", 16) literals at (as of this repo's
+# vendored sane-backends-src checkout) lines 1944-1957, in the SAME order
+# they appear there. s->product_string is trimmed of its fixed-width SCSI
+# INQUIRY padding by cs3_trim() (coolscan3.c ~line 1970) before
+# device_list[n]->model is set from it (coolscan3.c ~lines 2020-2025) -- so
+# these trimmed strings are exactly what a real device reports as its SANE
+# model, byte for byte. LS-9000 is not in this table: this backend's
+# identification switch never added it (a late, SCSI-only, high-end model),
+# so it cannot be matched by name here regardless.
+#
+# Ordered most-specific-marker-first: "LS-50" is itself a substring of
+# "LS-5000", and likewise "LS-40" of "LS-4000" -- checking the 4/5-digit
+# models before their 2-digit siblings is load-bearing, not stylistic.
+_SANE_COOLSCAN_MODEL_MARKERS: tuple[tuple[str, str], ...] = (
+    ("LS-5000", "LS-5000 ED"),
+    ("LS-4000", "LS-4000 ED"),
+    ("LS-50", "LS-50 ED"),
+    ("LS-40", "LS-40 ED"),
+    ("LS-8000", "LS-8000 ED"),
+    ("LS-2000", "LS-2000"),
+    ("COOLSCANIII", "COOLSCANIII"),
+)
+
+
+def _sane_model_and_supported(device: ScannerDevice) -> tuple[str, bool]:
+    """Classify a SANE-enumerated coolscan3 device's free-text model string.
+
+    Returns ``(model, supported)``. Only the LS-5000 is supported. A
+    RECOGNIZED but unsupported Nikon Coolscan (LS-40/50/4000/8000/2000, the
+    original Coolscan III) is labeled with the backend's own exact name and
+    refused -- see :func:`open`'s ``supported`` gate (Lane D, #14) -- from
+    ``_SANE_COOLSCAN_MODEL_MARKERS``, sourced from coolscan3.c's own
+    identification table (see its comment).
+
+    A ``coolscan3:`` id whose model string matches none of those markers is
+    left ``supported=True`` (reviewer's call, R2) rather than guessed-
+    unsupported: this backend's device family is closed to the models in
+    that table, so a string that doesn't match any of them is most plausibly
+    a firmware/model-string variant of the one model this package actually
+    drives (the LS-5000) that the table's exact literals don't happen to
+    match byte-for-byte -- not a foreign device slipping through a loose
+    filter, since :func:`_is_coolscan_device_id` already restricted the
+    caller to a ``coolscan3:``-backed id before this function ever runs.
+    Bricking a genuine LS-5000 on a model-string mismatch would be worse
+    than the reverse. Fail-closed only for the models this table can
+    actually NAME as unsupported; fail-open for everything it cannot name at
+    all. The raw reported string is returned unchanged in that case -- not
+    relabeled -- since it is now being treated as usable, not guessed.
+    """
+
+    raw_model = device.model or ""
+    for marker, canonical_name in _SANE_COOLSCAN_MODEL_MARKERS:
+        if marker in raw_model:
+            return canonical_name, canonical_name == "LS-5000 ED"
+    return raw_model, True
+
 
 def _default_service_factory() -> "ScannerService":
     from coolscanpy.session.service import ScannerService
@@ -128,11 +206,17 @@ def _capabilities_from(caps: ScannerCapabilities) -> Capabilities:
 
 
 def _device_info_from(device: ScannerDevice) -> DeviceInfo:
+    # #14 (SANE lane): a coolscan3 id is not, on its own, proof of an
+    # LS-5000 -- the same SANE backend drives the LS-40/LS-50 too. Derive
+    # supported/model from the device's own model string rather than
+    # defaulting DeviceInfo.supported's bare True (see _sane_model_and_supported).
+    model, supported = _sane_model_and_supported(device)
     return DeviceInfo(
         id=device.id,
         vendor=device.vendor,
-        model=device.model,
+        model=model,
         capabilities=_capabilities_from(device.capabilities),
+        supported=supported,
     )
 
 
@@ -164,11 +248,18 @@ def _usb_fallback_capabilities() -> Capabilities:
 
 
 def _usb_fallback_device_infos() -> list[DeviceInfo]:
-    """Enumerate attached LS-5000 units directly over USB, no python-sane.
+    """Enumerate attached Nikon Coolscan units directly over USB, no python-sane.
 
     Used by :func:`get_devices` only when python-sane is not importable.
     ``usb.core`` is imported lazily here, matching this package's convention
     of scoping USB imports to the code that actually touches the bus.
+
+    Every model in the nkscan-referenced PID table is reported by its real
+    model name (LS-40 / LS-50 / LS-5000); only the LS-5000 carries
+    ``supported=True``. A recognized-but-unsupported unit (LS-50, LS-40) is
+    therefore visible in discovery instead of silently missing from the
+    list -- labeled, and not connectable (Lane D, #14). An unknown Nikon
+    product id is skipped rather than guessed.
 
     The returned id is synthetic (``"usb:<bus>:<address>"``): honest about
     the USB topology it was found on, but not a SANE device string, since
@@ -187,30 +278,41 @@ def _usb_fallback_device_infos() -> list[DeviceInfo]:
     )
 
     capabilities = _usb_fallback_capabilities()
+    product_table = _NIKON_COOLSCAN_USB_MODELS[_LS5000_USB_VENDOR_ID]
     found = usb.core.find(
         find_all=True,
         idVendor=_LS5000_USB_VENDOR_ID,
-        idProduct=_LS5000_USB_PRODUCT_ID,
         backend=get_libusb_backend(),
     )
-    return [
-        DeviceInfo(
-            id=f"{_USB_FALLBACK_ID_PREFIX}:{device.bus}:{device.address}",
-            vendor="Nikon",
-            model="LS-5000 ED",
-            capabilities=capabilities,
+    infos: list[DeviceInfo] = []
+    for device in found:
+        model = product_table.get(device.idProduct)
+        if model is None:
+            continue
+        infos.append(
+            DeviceInfo(
+                id=f"{_USB_FALLBACK_ID_PREFIX}:{device.bus}:{device.address}",
+                vendor="Nikon",
+                model=model,
+                capabilities=capabilities,
+                supported=device.idProduct == _LS5000_USB_PRODUCT_ID,
+            )
         )
-        for device in found
-    ]
+    return infos
 
 
 def get_devices(local_only: bool = False) -> list[DeviceInfo]:
-    """Enumerate attached Coolscan LS-5000 units.
+    """Enumerate attached Nikon Coolscan units.
 
     Mirrors ``sane.get_devices()``; unlike SANE, this never returns a
     non-Coolscan device -- there is no backend negotiation. ``local_only`` is
     accepted for signature-compatibility with ``sane.get_devices()`` and is
     currently always true (no network transport exists for this package).
+
+    A supported LS-5000 is connectable (``supported=True``). Any other Nikon
+    Coolscan found on the bus (LS-50, LS-40) is reported by name with
+    ``supported=False`` so it is visible rather than silently missing -- see
+    :func:`_usb_fallback_device_infos`.
 
     Tries the SANE route first. When SANE is unavailable, its enumeration
     fails, or it finds no Coolscan, falls back to direct USB enumeration -- see
@@ -254,14 +356,26 @@ def open(devname: str) -> "Device":
 
     infos = get_devices()
     if devname == "ls5000":
-        if not infos:
-            raise DeviceNotFound("no Coolscan LS-5000 unit is attached")
-        if len(infos) > 1:
+        # 14-B: filter to supported units BEFORE the ambiguity check. A
+        # recognized-but-unsupported Coolscan (LS-50, LS-40) attached
+        # alongside a supported LS-5000 must not make "the one attached
+        # unit" look ambiguous -- only multiple SUPPORTED units are. When
+        # nothing supported is attached but something unsupported is,
+        # fall through to it so the more specific "recognized but not
+        # supported" message below fires instead of the generic
+        # not-attached one.
+        supported_infos = [candidate for candidate in infos if candidate.supported]
+        if len(supported_infos) > 1:
             raise DeviceNotFound(
                 "more than one Coolscan LS-5000 unit is attached; "
                 "disambiguate via get_devices()"
             )
-        info = infos[0]
+        if supported_infos:
+            info = supported_infos[0]
+        elif infos:
+            info = infos[0]
+        else:
+            raise DeviceNotFound("no Coolscan LS-5000 unit is attached")
     else:
         matches = [candidate for candidate in infos if candidate.id == devname]
         if not matches:
@@ -269,6 +383,14 @@ def open(devname: str) -> "Device":
                 f"no attached Coolscan LS-5000 unit matches {devname!r}"
             )
         info = matches[0]
+
+    if not info.supported:
+        # Recognize-and-refuse (Lane D): a Nikon Coolscan that is not the
+        # LS-5000 is listed in discovery but must never be opened. Fail-closed.
+        raise DeviceNotFound(
+            f"{info.model} is recognized but not supported; "
+            "only the LS-5000 is supported"
+        )
 
     _register_open_device(info.id)
     try:

@@ -18,7 +18,7 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
         kind: "real",
         firmware: "test",
         connection: "USB",
-        supportedMultisamplePasses: [4]
+        supported: true, supportedMultisamplePasses: [4]
     )
     private var statusRequestCount = 0
     private var movementCalls: [String] = []

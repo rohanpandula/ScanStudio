@@ -10,7 +10,7 @@ struct DeviceSelectionPolicyTests {
         kind: "simulated",
         firmware: "1.0",
         connection: "usb",
-        supportedMultisamplePasses: nil
+        supported: true, supportedMultisamplePasses: nil
     )
     private let real = DeviceInfo(
         deviceId: "coolscan3:usb:libusb:000:013",
@@ -18,7 +18,15 @@ struct DeviceSelectionPolicyTests {
         kind: "real",
         firmware: "1.0",
         connection: "usb",
-        supportedMultisamplePasses: [4]
+        supported: true, supportedMultisamplePasses: [4]
+    )
+    private let ls50 = DeviceInfo(
+        deviceId: "usb:3:1",
+        model: "LS-50 ED",
+        kind: "real",
+        firmware: "1.0",
+        connection: "usb",
+        supported: false, supportedMultisamplePasses: nil
     )
 
     @Test("Discovery in flight suppresses connection with no devices")
@@ -62,6 +70,36 @@ struct DeviceSelectionPolicyTests {
         #expect(
             DeviceSelectionPolicy.state(isDiscovering: false, devices: [])
                 == .noDevices
+        )
+    }
+
+    @Test("A recognized-but-unsupported model is named but not connectable")
+    func unsupportedOnly() {
+        #expect(
+            DeviceSelectionPolicy.state(isDiscovering: false, devices: [ls50])
+                == .unsupported([ls50])
+        )
+        #expect(DeviceSelectionPolicy.connectionCandidates(from: [ls50]).isEmpty)
+        #expect(
+            DeviceSelectionPolicy.unsupportedDevices(from: [ls50]) == [ls50]
+        )
+    }
+
+    @Test("An unsupported model never displaces a connectable simulator")
+    func unsupportedAlongsideSimulator() {
+        // The engine always lists the simulator; an LS-50 alongside it must
+        // not become a connect candidate, and is surfaced separately.
+        let state = DeviceSelectionPolicy.state(
+            isDiscovering: false,
+            devices: [simulated, ls50]
+        )
+        #expect(state == .directConnect(simulated))
+        #expect(
+            DeviceSelectionPolicy.connectionCandidates(from: [simulated, ls50])
+                == [simulated]
+        )
+        #expect(
+            DeviceSelectionPolicy.unsupportedDevices(from: [simulated, ls50]) == [ls50]
         )
     }
 
@@ -116,7 +154,7 @@ struct DeviceSelectionPolicyTests {
             kind: "simulated",
             firmware: "1.0",
             connection: "usb",
-            supportedMultisamplePasses: nil
+            supported: true, supportedMultisamplePasses: nil
         )
         let real2 = DeviceInfo(
             deviceId: "real-ls5000-2",
@@ -124,7 +162,7 @@ struct DeviceSelectionPolicyTests {
             kind: "real",
             firmware: "1.0",
             connection: "usb",
-            supportedMultisamplePasses: [4]
+            supported: true, supportedMultisamplePasses: [4]
         )
 
         #expect(
@@ -153,7 +191,7 @@ struct DeviceSelectionPolicyTests {
             kind: "simulated",
             firmware: "1.0",
             connection: "usb",
-            supportedMultisamplePasses: nil
+            supported: true, supportedMultisamplePasses: nil
         )
         let real2 = DeviceInfo(
             deviceId: "real-ls5000-2",
@@ -161,7 +199,7 @@ struct DeviceSelectionPolicyTests {
             kind: "real",
             firmware: "1.0",
             connection: "usb",
-            supportedMultisamplePasses: [4]
+            supported: true, supportedMultisamplePasses: [4]
         )
 
         #expect(

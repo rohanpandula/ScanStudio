@@ -170,6 +170,27 @@ _FRAME_FAILED_RESERVED_TELEMETRY_FIELDS = frozenset(
 _BATCH_PRE_FRAME_ATTRIBUTION = "batch-pre-frame"
 
 
+def _thumbnail_to_wire(thumbnail: domain.Thumbnail) -> dict:
+    """Serialize a Thumbnail to the wire, adding the additive ``partial`` key
+    only when the frame is partial.
+
+    WHY post-``to_wire`` and not a plain field on ``domain.Thumbnail``:
+    ``to_wire`` emits every dataclass field, so a ``partial=None`` would
+    serialize as ``"partial": null`` on every full-cover thumbnail and change
+    the wire. ``None`` cannot be skipped globally in ``to_wire`` because
+    ``activeJobId: null`` in ``DeviceStatus`` is a MEANINGFUL value (it is a
+    byte-valid golden fixture, ``05-status-event.json``); omit-when-None would
+    silently drop it. So ``partial`` is injected here only when true --
+    strictly additive and byte-absent for full-cover frames (Lane C, D2).
+    """
+    wire = to_wire(thumbnail)
+    if thumbnail.partial:
+        wire["partial"] = True
+    else:
+        wire.pop("partial", None)
+    return wire
+
+
 def _coolscanpy_error_attributes(exc: BaseException) -> dict[str, object]:
     """(if present) coolscanpy error attributes: any custom instance
     attribute an exception's own `__init__` set (e.g.
@@ -341,7 +362,7 @@ class BridgeService:
                 int(_require_param(params, "slot")),
                 int(_require_param(params, "offsetRows")),
             )
-            return {"thumbnail": to_wire(thumbnail)}
+            return {"thumbnail": _thumbnail_to_wire(thumbnail)}
         if method == "scan.start":
             return self._handle_scan_start(request, emit)
         if method == "scan.stop":
@@ -544,7 +565,7 @@ class BridgeService:
                     result = transport.preview(
                         material,
                         slots,
-                        on_thumbnail=lambda t: emit("roll.thumbnail", {"thumbnail": to_wire(t)}),
+                        on_thumbnail=lambda t: emit("roll.thumbnail", {"thumbnail": _thumbnail_to_wire(t)}),
                     )
                 except BridgeError as exc:
                     # A worker exception with no except clause dies silently and the

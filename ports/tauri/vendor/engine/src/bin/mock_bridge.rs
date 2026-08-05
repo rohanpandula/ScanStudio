@@ -25,6 +25,11 @@ use serde::Serialize;
 use scanstudio_engine::bridge_protocol::*;
 
 const DEVICE_ID: &str = "bridge-ls5000-0";
+// Lane D, #14-C: a second, always-unsupported device id, reported alongside
+// DEVICE_ID only when MOCK_BRIDGE_DEVICE_DUAL_ATTACH is set -- proves the
+// engine's connect() decides per REQUESTED device id, not whichever device
+// this engine happened to see first in device.list.
+const UNSUPPORTED_DEVICE_ID: &str = "bridge-ls50-0";
 
 struct MockState {
     device_open: bool,
@@ -468,9 +473,16 @@ fn handle_request(
                 capabilities: vec!["ls5000-coolscanpy".to_string()],
             })
         }
-        "device.list" => to_json(&BridgeDeviceListResult {
-            devices: vec![fixed_device_info()],
-        }),
+        "device.list" => {
+            let mut devices = vec![fixed_device_info()];
+            let dual_attach = std::env::var("MOCK_BRIDGE_DEVICE_DUAL_ATTACH")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            if dual_attach {
+                devices.push(dual_attach_secondary_device_info());
+            }
+            to_json(&BridgeDeviceListResult { devices })
+        }
         "device.open" => {
             let params: BridgeDeviceOpenParams = parse_params(&request.params)?;
             if params.device_id != DEVICE_ID {
@@ -654,10 +666,21 @@ fn require_open(state: &MockState) -> Result<(), (BridgeErrorCode, String)> {
 }
 
 fn fixed_device_info() -> BridgeDeviceInfo {
+    // Lane D (S04): the mock can advertise a recognized-but-unsupported
+    // Nikon model so the engine's recognize-and-refuse path is testable
+    // without real hardware.
+    let unsupported = std::env::var("MOCK_BRIDGE_DEVICE_UNSUPPORTED")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     BridgeDeviceInfo {
         device_id: DEVICE_ID.to_string(),
         vendor: "Nikon".to_string(),
-        model: "SUPER COOLSCAN 5000 ED".to_string(),
+        model: if unsupported {
+            "LS-50 ED".to_string()
+        } else {
+            "SUPER COOLSCAN 5000 ED".to_string()
+        },
+        supported: !unsupported,
         capabilities: BridgeCapabilities {
             ir_channel: true,
             supported_dpi: vec![4000],
@@ -671,6 +694,18 @@ fn fixed_device_info() -> BridgeDeviceInfo {
             supported_multisample_passes: vec![4],
         },
     }
+}
+
+/// Lane D, #14-C: a second, always-unsupported LS-50 alongside the primary
+/// device, reported only when MOCK_BRIDGE_DEVICE_DUAL_ATTACH is set. Never
+/// openable through device.open -- the engine's connect() must refuse it
+/// before ever sending that request.
+fn dual_attach_secondary_device_info() -> BridgeDeviceInfo {
+    let mut device = fixed_device_info();
+    device.device_id = UNSUPPORTED_DEVICE_ID.to_string();
+    device.model = "LS-50 ED".to_string();
+    device.supported = false;
+    device
 }
 
 /// `device.list` stays fixed, while this open-time result can model a holder

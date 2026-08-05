@@ -30,6 +30,7 @@ __all__ = [
     "TransportSmearDetected",
     "SplitAlignmentError",
     "BatchIntegrityError",
+    "MeterUnusableError",
 ]
 
 
@@ -129,3 +130,22 @@ class SplitAlignmentError(PyCoolscanError):
 class BatchIntegrityError(PyCoolscanError):
     """The packaged capture worker, plan, or manifest failed self-
     verification before any hardware access was attempted."""
+
+
+class MeterUnusableError(PyCoolscanError):
+    """The metering pass could not find usable image data for a channel.
+
+    Raised when neither the primary meter window nor the widened full-frame
+    window yields a nonzero, unsaturated mean for a channel (a B&W strip, a
+    modified SA-21, or a dense negative whose G rows are all zero or
+    saturated, per #17). Fail-closed: no capture proceeds with fabricated
+    metering. Bridges to the ``METER_UNUSABLE`` wire code, never ``INTERNAL``.
+    """
+
+    def __init__(self, channel: str) -> None:
+        super().__init__(
+            f"the metering pass could not find usable image data for channel "
+            f"{channel} \u2014 check film density/orientation and adapter "
+            f"modification; try a different process setting"
+        )
+        self.channel = channel

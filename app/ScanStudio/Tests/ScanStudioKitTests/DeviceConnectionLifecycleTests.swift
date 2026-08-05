@@ -19,7 +19,7 @@ private actor ConnectionLifecycleEngineStub: EngineClientProtocol {
         kind: "real",
         firmware: "test",
         connection: "usb",
-        supportedMultisamplePasses: [4]
+        supported: true, supportedMultisamplePasses: [4]
     )
     private let project = ScanProject(
         schemaVersion: 1,

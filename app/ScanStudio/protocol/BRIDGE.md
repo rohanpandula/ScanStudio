@@ -133,6 +133,23 @@ DeviceInfo
   vendor: string
   model: string
   capabilities: Capabilities
+  supported?: bool                        // optional; absent means true (see prose below)
+
+`DeviceInfo.supported` (Lane D, additive) is optional and defaults to `true`
+when a response omits it, for compatibility with bridges built before this
+field existed (deliberate fail-open: an old bridge that never emits
+`supported` is trusted exactly as before). `false` marks a recognized-but-
+unsupported Nikon Coolscan model (e.g. an LS-50 or LS-40 seen alongside the
+LS-5000): the device is still returned by `device.list` so it is visible,
+but a client must not call `device.open` for that id. If it does anyway,
+the bridge's own CoolscanPy `open()` call refuses it, surfacing the
+identical `DEVICE_NOT_FOUND` wire error `device.open` already returns for
+an id it has never seen at all -- `supported` is what lets a client tell
+the two apart (present-but-unsupported vs. genuinely absent) before ever
+sending the request. The reference engine additionally pre-checks
+`supported` itself and reports a local `NOT_SUPPORTED` condition without
+sending `device.open` at all; that engine-side error is not part of this
+wire contract.
 
 Capabilities
   irChannel: bool
@@ -176,6 +193,15 @@ Thumbnail
   needsApproval: bool
   warnings: string[]
   imagePath: string
+  partial: bool?  (optional; present only when true)
+
+`Thumbnail.partial` (Lane C, additive) is present as `partial: true` ONLY on a
+frame whose crop overlaps the preview with >=90% of its height inside but not
+all of it (a frame running off the top/bottom edge). It is ABSENT (never
+`null`) on every full-cover frame, so existing wire bytes are unchanged.
+Strictly-below-90% coverage is not a thumbnail at all: it is a `REFEED_REQUIRED`
+failure. An absent/omitted `partial` means a full frame; old readers ignore the
+additive key.
 
 ScanProgress
   jobId: string

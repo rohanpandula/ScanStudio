@@ -60,6 +60,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from coolscanpy.exceptions import MeterUnusableError
+
 
 CHANNELS = ("R", "G", "B")
 CALIBRATION_COLOR_IDS = (1, 2, 3)
@@ -1481,20 +1483,88 @@ def decode_nikon_density_source(
     return np.transpose(native_row_planar, (0, 2, 1))
 
 
-def _selected_row(image: np.ndarray, channel_index: int) -> tuple[int, float]:
+def _select_usable_mean(
+    image: np.ndarray,
+    channel_index: int,
+    *,
+    row_first: int,
+    row_stop: int,
+) -> tuple[int, float] | None:
+    """Best full-row mean in ``[row_first, row_stop)`` below saturation.
+
+    Returns ``(row_index, mean)`` for the greatest full-row mean strictly
+    below ``SATURATION_LIMIT`` within the window, or ``None`` when no row in
+    the window has a nonzero, unsaturated mean. ``row_stop`` is clamped to the
+    decoded source height so the widened full-frame retry cannot run past the
+    image.
+    """
+    row_stop = min(row_stop, int(image.shape[0]))
     selected_row = -1
     selected_mean = 0.0
-    for row_index in range(METER_ROWS_FIRST, METER_ROWS_STOP):
+    for row_index in range(max(0, row_first), row_stop):
         total = int(np.sum(image[row_index, :, channel_index], dtype=np.uint32))
         mean = float(total) / float(DENSITY_SOURCE_WIDTH)
         if selected_mean < mean < SATURATION_LIMIT:
             selected_row = row_index
             selected_mean = mean
     if selected_row < 0 or selected_mean == 0.0:
-        raise ValueError(
-            f"{CHANNELS[channel_index]} meter rows contain no nonzero unsaturated mean"
-        )
+        return None
     return selected_row, selected_mean
+
+
+# Lane B widened-window retry: how much wider than the primary meter band
+# the retry window is allowed to grow. Bounding this to a multiple of the
+# primary band's own height (rather than the whole frame) is a fail-closed
+# erosion fix -- the retry used to span [0, height) unconditionally, so a
+# usable row anywhere in the frame, arbitrarily far from the primary band,
+# could silently become the selected exposure reference.
+_METER_RETRY_WIDENING_FACTOR = 3
+
+
+def _widened_meter_window(
+    row_first: int, row_stop: int, frame_height: int
+) -> tuple[int, int]:
+    """Bound the Lane B retry window to the primary band widened
+    symmetrically to ``_METER_RETRY_WIDENING_FACTOR`` times its own height,
+    centered on the primary band and clamped to the frame. See
+    :func:`_selected_row`.
+    """
+    band_height = row_stop - row_first
+    center = (row_first + row_stop) / 2.0
+    half_widened = (band_height * _METER_RETRY_WIDENING_FACTOR) / 2.0
+    widened_first = int(math.floor(center - half_widened))
+    widened_stop = int(math.ceil(center + half_widened))
+    return max(0, widened_first), min(frame_height, widened_stop)
+
+
+def _selected_row(
+    image: np.ndarray,
+    channel_index: int,
+    *,
+    row_first: int = METER_ROWS_FIRST,
+    row_stop: int = METER_ROWS_STOP,
+) -> tuple[int, float]:
+    """Select a usable meter row for a channel (Lane B widened-window retry).
+
+    The primary meter window is ``[METER_ROWS_FIRST, METER_ROWS_STOP)``. If it
+    yields no usable mean, the selection retries once over the primary band
+    widened symmetrically to 3x its own height and clamped to the frame (the
+    ``#17`` fix, now bounded rather than spanning the whole frame -- see
+    :func:`_widened_meter_window`) before giving up. Only if both windows are
+    unusable does it raise the typed :class:`MeterUnusableError` (bridge code
+    ``METER_UNUSABLE``) instead of a bare ``ValueError``, so a B&W strip /
+    modified SA-21 / dense negative surfaces as a friendly card rather than
+    ``INTERNAL``.
+    """
+    widened = _widened_meter_window(row_first, row_stop, int(image.shape[0]))
+    windows = [(row_first, row_stop), widened]
+    for start, stop in windows:
+        selected = _select_usable_mean(
+            image, channel_index, row_first=start, row_stop=stop
+        )
+        if selected is not None:
+            return selected
+    raise MeterUnusableError(CHANNELS[channel_index])
 
 
 def evaluate_nikon_density(

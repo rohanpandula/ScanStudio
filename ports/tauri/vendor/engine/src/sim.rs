@@ -229,6 +229,7 @@ impl SimulatedLs5000 {
                 kind: "simulated".to_string(),
                 firmware: "1.03-sim".to_string(),
                 connection: "USB (simulated)".to_string(),
+                supported: true,
             },
             state: Mutex::new(State::default()),
             cancelled: AtomicBool::new(false),

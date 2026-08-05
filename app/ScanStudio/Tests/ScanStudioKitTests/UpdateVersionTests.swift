@@ -18,6 +18,7 @@ final class UpdateVersionTests: XCTestCase {
         XCTAssertLessThan(parse("0.3.0-alpha.9"), parse("0.3.0-alpha.11"))
         XCTAssertLessThan(parse("0.3.0-alpha.11"), parse("0.3.0"))
         XCTAssertLessThan(parse("0.3.0-alpha.1"), parse("0.3.0-beta.1"))
+        XCTAssertLessThan(parse("0.3.0-alpha.11"), parse("0.3.0-beta.1"))
         XCTAssertLessThan(parse("0.3.0-beta.1"), parse("0.3.0-rc.1"))
         XCTAssertLessThan(parse("0.3.0-rc.1"), parse("0.3.0"))
         XCTAssertEqual(parse("0.3.0"), parse("0.3.0"))

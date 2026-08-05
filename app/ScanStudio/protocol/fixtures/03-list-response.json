@@ -1,1 +1,1 @@
-{"id": 2, "result": {"devices": [{"deviceId": "sim-ls5000-0", "model": "SUPER COOLSCAN 5000 ED", "kind": "simulated", "firmware": "1.03-sim", "connection": "USB (simulated)"}]}}
+{"id": 2, "result": {"devices": [{"deviceId": "sim-ls5000-0", "model": "SUPER COOLSCAN 5000 ED", "kind": "simulated", "firmware": "1.03-sim", "connection": "USB (simulated)", "supported": true}]}}

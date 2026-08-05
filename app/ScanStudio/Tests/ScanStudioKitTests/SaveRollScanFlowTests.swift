@@ -26,7 +26,7 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
         kind: "simulated",
         firmware: "test",
         connection: "in-process",
-        supportedMultisamplePasses: [1, 2, 4, 8, 16]
+        supported: true, supportedMultisamplePasses: [1, 2, 4, 8, 16]
     )
     private var project = ScanProject(
         schemaVersion: 1,

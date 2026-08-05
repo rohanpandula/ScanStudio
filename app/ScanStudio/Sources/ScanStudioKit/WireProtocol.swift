@@ -148,6 +148,10 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
     public let kind: String
     public let firmware: String
     public let connection: String
+    /// False when discovery recognized a Nikon Coolscan that is not the
+    /// supported LS-5000 (Lane D, #14). An unsupported device is named in
+    /// ``scanner.list`` but is never connectable.
+    public let supported: Bool
     /// Device-sourced accepted set for `CaptureRecipe.multisamplePasses`
     /// (BRIDGE.md's `Capabilities.supportedMultisamplePasses`, always `[4]`
     /// for the LS-5000 today). The engine already derives this internally
@@ -328,6 +332,11 @@ public struct Thumbnail: Codable, Equatable, Sendable {
     /// Human/diagnostic context for `needsApproval`; empty for normal frames
     /// and for simulator thumbnails.
     public let warnings: [String]
+    /// Lane C/partial frame: `true` when >=90% of the frame's height is inside
+    /// the preview but not all of it. Absent/`nil` for every full frame (the
+    /// wire omits the key), so an old bridge with a new app (and vice versa)
+    /// stays working -- the badge is a strict no-op when absent.
+    public let partial: Bool?
 
     public init(
         brightness: Double?,
@@ -336,7 +345,8 @@ public struct Thumbnail: Codable, Equatable, Sendable {
         boundaryRows: [Int]? = nil,
         spacingOffset: Int? = nil,
         needsApproval: Bool = false,
-        warnings: [String] = []
+        warnings: [String] = [],
+        partial: Bool? = nil
     ) {
         self.brightness = brightness
         self.tint = tint
@@ -345,6 +355,7 @@ public struct Thumbnail: Codable, Equatable, Sendable {
         self.spacingOffset = spacingOffset
         self.needsApproval = needsApproval
         self.warnings = warnings
+        self.partial = partial
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -355,6 +366,7 @@ public struct Thumbnail: Codable, Equatable, Sendable {
         case spacingOffset
         case needsApproval
         case warnings
+        case partial
     }
 
     public init(from decoder: Decoder) throws {
@@ -368,6 +380,7 @@ public struct Thumbnail: Codable, Equatable, Sendable {
             try container.decodeIfPresent(Bool.self, forKey: .needsApproval) ?? false
         warnings =
             try container.decodeIfPresent([String].self, forKey: .warnings) ?? []
+        partial = try container.decodeIfPresent(Bool.self, forKey: .partial)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -383,6 +396,7 @@ public struct Thumbnail: Codable, Equatable, Sendable {
         if !warnings.isEmpty {
             try container.encode(warnings, forKey: .warnings)
         }
+        try container.encodeIfPresent(partial, forKey: .partial)
     }
 
     /// Affirmative simulator provenance: `true` only when this thumbnail

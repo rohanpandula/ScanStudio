@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from coolscanpy.protocol.ls5000_single_pass import roll_index
+from coolscanpy.roll import preview_session as preview_session_module
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     AttemptPaths,
     CaptureAttemptResult,
@@ -25,8 +26,11 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
     build_nikon_density_evidence,
 )
 from coolscanpy.roll.preview_session import (
+    PARTIAL_FRAME_MIN_COVERAGE,
     CaptureRoute,
     RollSessionIntegrityError,
+    _crop_coverage,
+    _crop_state,
     _preview_binding_contract,
     build_roll_preview_session,
     reload_thumbnail,
@@ -301,6 +305,106 @@ def _preview_fixture(
         journal=journal,
     )
     return PreviewFixture(result=result, rgb=rgb)
+
+
+def _minimal_detection() -> roll_index.RollDetection:
+    interval = roll_index.FrameInterval(
+        frame=1,
+        start_row=0,
+        end_row=1000,
+        height_rows=1000,
+        start_boundary=1,
+        end_boundary=2,
+        content_fraction=0.42,
+        coverage_fraction=0.923,
+        count_supported=True,
+        count_bridged=False,
+        manual_review=False,
+        review_reasons=(),
+    )
+    boundary = roll_index.GapBoundary(
+        index=1,
+        output_row=10,
+        fitted_row=9.5,
+        evidence=0.81,
+        transmission=0.12,
+        nonuniformity=0.03,
+        support="high",
+        evidence_run=(1, 2),
+        manual_review=False,
+        review_reasons=(),
+    )
+    return roll_index.RollDetection(
+        aperture_columns=(8, 12),
+        nominal_frame_rows=1000,
+        autocorrelation_lag=41,
+        autocorrelation_peak=0.97,
+        autocorrelation_best_non_neighbor=0.31,
+        pitch_rows=41.0,
+        phase_rows=0.5,
+        lattice_score=0.66,
+        alternative_lattice_score=0.29,
+        lattice_margin_fraction=0.7,
+        mean_boundary_evidence=0.83,
+        minimum_boundary_evidence=0.45,
+        content_level_threshold=0.05,
+        content_range_threshold=0.2,
+        candidate_cell_count=1,
+        bridged_cell_count=0,
+        expected_frame_count=1,
+        expected_frame_count_matches=True,
+        count_confirmation="confirmed",
+        count_confidence="low",
+        content_end_candidates=(1,),
+        confidence="low",
+        warnings=(),
+        boundaries=(boundary,),
+        intervals=(interval,),
+        manual_review_frames=(),
+    )
+
+
+def test_c2_roll_session_diagnostics_carry_confidence_per_slot_and_perforation() -> None:
+    text = preview_session_module._roll_session_diagnostics(_minimal_detection())
+    assert "confidence=low" in text
+    assert "count_confirmation=confirmed" in text
+    assert "lattice_score=0.6600" in text
+    assert "detected_perforation_candidates=[1]" in text
+    assert '"coverage_fraction": 0.923' in text
+    assert '"content_fraction": 0.42' in text
+
+
+def test_c2_low_confidence_roll_session_error_embeds_numeric_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _preview_fixture(tmp_path)
+    detection = _minimal_detection()
+    monkeypatch.setattr(
+        preview_session_module,
+        "detect_roll_frames",
+        lambda *_a, **_k: detection,
+    )
+    with pytest.raises(preview_session_module.RollSessionError) as excinfo:
+        build_roll_preview_session(
+            fixture.result, material=ScanMaterial.COLOR_NEGATIVE
+        )
+    message = str(excinfo.value)
+    assert "alignment confidence is low" in message
+    assert "confidence=low" in message
+    assert "detected_perforation_candidates=[1]" in message
+    assert "per_slot=" in message
+
+
+def test_c1_partial_frame_coverage_threshold() -> None:
+    assert _crop_coverage(0, 1000, 923) == pytest.approx(0.923)
+    assert _crop_coverage(0, 1000, 850) == pytest.approx(0.85)
+    assert _crop_coverage(0, 1000, 1000) == 1.0
+    assert _crop_coverage(-77, 1000, 1000) == pytest.approx(1000 / 1077)
+    assert _crop_state(0, 1000, 923) == "partial"
+    assert _crop_state(0, 1000, 850) == "refeed"
+    assert _crop_state(0, 1000, 1000) == "full"
+    assert _crop_state(0, 1000, int(PARTIAL_FRAME_MIN_COVERAGE * 1000)) == "partial"
+    assert PARTIAL_FRAME_MIN_COVERAGE == 0.90
 
 
 def test_complete_preview_builds_fixed_order_session_with_exact_transport_origins(
@@ -580,6 +684,75 @@ def test_preview_session_refuses_a_first_frame_clipped_beyond_scannable_range(
     assert excinfo.value.fitted_start_row == -17
     assert excinfo.value.coverage_fraction == pytest.approx(126 / 143)
     assert "fresh preview" in str(excinfo.value)
+
+
+def test_preview_session_exposes_partial_last_frame_on_initial_build(
+    tmp_path: Path,
+) -> None:
+    # #19: the preview raster is truncated 11 rows short of the last frame's
+    # true (fitted) end -- 132 of 143 rows remain, 92.3% coverage. Before the
+    # fix, make_boundary's raster clamp made every frame's row range always
+    # measure as fully inside the preview (coverage 1.0 against the already-
+    # clamped end_row), so this path was unreachable on the FIRST build.
+    complete = _synthetic_index(height=882, frame_count=6, content_frames=6, leader=24)
+    fixture = _preview_fixture(
+        tmp_path,
+        slot_capacity_hint=6,
+        active_rgb=complete[: 882 - 11],
+    )
+
+    session = build_roll_preview_session(
+        fixture.result,
+        material=ScanMaterial.COLOR_NEGATIVE,
+    )
+
+    assert [slot.slot_id for slot in session.slots] == [1, 2, 3, 4, 5, 6]
+    trailing = session.slots[-1]
+    assert trailing.end_boundary_row == 871  # clamped to the truncated preview
+    assert trailing.partial is True
+    assert trailing.manual_review
+    assert "end-outside-index-raster" in trailing.warnings
+    # Rendering stays clamped to what was actually captured -- no padding.
+    np.testing.assert_array_equal(
+        trailing.thumbnail, fixture.rgb[trailing.start_boundary_row : 871]
+    )
+
+
+def test_preview_session_flags_a_sub_90_percent_trailing_frame_without_aborting(
+    tmp_path: Path,
+) -> None:
+    # Same shape as the 92.3% case above, deeper cut: 21 of ~143 rows
+    # missing is ~85.3% coverage, strictly below the 90% partial floor.
+    # Owner call (post-beta.1 field review): this must NOT abort the whole
+    # session -- "rather a person reject a bad frame than have it totally
+    # fail". The roll delivers all 6 slots; only the offending trailing
+    # frame is flagged (manual_review + its existing
+    # end-outside-index-raster warning, beta.1's original shape for this),
+    # not badged partial=true (that badge stays reserved for the >=90% band).
+    complete = _synthetic_index(height=882, frame_count=6, content_frames=6, leader=24)
+    fixture = _preview_fixture(
+        tmp_path,
+        slot_capacity_hint=6,
+        active_rgb=complete[: 882 - 21],
+    )
+
+    session = build_roll_preview_session(
+        fixture.result,
+        material=ScanMaterial.COLOR_NEGATIVE,
+    )
+
+    assert [slot.slot_id for slot in session.slots] == [1, 2, 3, 4, 5, 6]
+    trailing = session.slots[-1]
+    assert trailing.end_boundary_row == 861  # clamped to the truncated preview
+    assert trailing.partial is None  # below the partial floor -- not badged
+    assert trailing.manual_review
+    assert "end-outside-index-raster" in trailing.warnings
+    # Rendering stays clamped to what was actually captured -- no padding.
+    np.testing.assert_array_equal(
+        trailing.thumbnail, fixture.rgb[trailing.start_boundary_row : 861]
+    )
+    # Every other frame is unaffected.
+    assert all(not slot.partial for slot in session.slots[:-1])
 
 
 def test_preview_refuses_density_source_geometry_from_another_startup_count(

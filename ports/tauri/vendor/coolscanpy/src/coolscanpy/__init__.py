@@ -38,6 +38,7 @@ from coolscanpy.exceptions import (
     SafeStopRequested,
     SplitAlignmentError,
     TransportSmearDetected,
+    MeterUnusableError,
 )
 from coolscanpy.types import (
     ApprovalReceipt,
@@ -112,4 +113,5 @@ __all__ = [
     "TransportSmearDetected",
     "SplitAlignmentError",
     "BatchIntegrityError",
+    "MeterUnusableError",
 ]

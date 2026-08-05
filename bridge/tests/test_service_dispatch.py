@@ -54,6 +54,36 @@ def _thumbnail(slot: int) -> domain.Thumbnail:
     )
 
 
+def test_thumbnail_wire_is_byte_absent_for_full_frames() -> None:
+    # Lane C (D2), guardrail: the partial key must be ABSENT -- not null -- on
+    # a full-cover frame's wire thumbnail, so the additive field never changes
+    # existing wire bytes.
+    wire = service._thumbnail_to_wire(_thumbnail(1))
+    assert "partial" not in wire, wire
+
+
+def test_thumbnail_wire_carries_partial_true_only_when_partial() -> None:
+    # Lane C (D2): a partial frame emits exactly ``partial: true`` -- and only
+    # that one additive key; nothing else about the payload changes.
+    full = service._thumbnail_to_wire(_thumbnail(1))
+    partial = service._thumbnail_to_wire(
+        domain.Thumbnail(
+            slot=1,
+            boundary_rows=(0, 100),
+            spacing_offset=0,
+            needs_approval=False,
+            warnings=(),
+            image_path="/tmp/stub-preview/slot-0001.tif",
+            partial=True,
+        )
+    )
+    assert partial["partial"] is True
+    # The only difference vs the full-frame payload is the added key.
+    expected = dict(full)
+    expected["partial"] = True
+    assert partial == expected
+    assert "\"partial\": null" not in str(full)
+
 def _stub_receipt(slot: int) -> domain.ScanReceipt:
     """Minimal valid receipt for a transport double's on_frame callback."""
     return domain.ScanReceipt(
