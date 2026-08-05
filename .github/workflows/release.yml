@@ -230,6 +230,11 @@ jobs:
       - name: Resolve release version from the tag
         run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Build, extract, smoke-test, and re-extract both Linux packages
+        env:
+          # linuxdeploy is itself an AppImage; running it needs FUSE, which the
+          # ubuntu GitHub runners do not reliably provide. Extract-and-run
+          # removes that dependency so the bundle is deterministic.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           ports/tauri/packaging/linux/build-and-verify.sh \
             "$RELEASE_VERSION" \
