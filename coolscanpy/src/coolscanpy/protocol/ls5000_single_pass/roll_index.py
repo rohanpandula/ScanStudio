@@ -138,6 +138,19 @@ class FrameInterval:
     count_bridged: bool
     manual_review: bool
     review_reasons: tuple[str, ...]
+    # #19: the RASTER-clamped boundary rows above are what every renderer
+    # (thumbnail cropping, transport mapping) uses -- unchanged. These two
+    # carry each boundary's UNCLAMPED fitted row (GapBoundary.fitted_row)
+    # alongside them, purely additively: default None means "not carried",
+    # so any caller/test that builds a FrameInterval without them keeps
+    # exactly today's behavior (coverage measured against the already-
+    # clamped start_row/end_row). preview_session.py's initial slot build is
+    # the one caller that now passes the true fitted rows, so a frame whose
+    # true origin/end lies outside the captured preview raster is
+    # measurable as partial/refeed on first build instead of always
+    # appearing as 100% covered.
+    unclamped_start_row: float | None = None
+    unclamped_end_row: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1156,6 +1169,8 @@ def detect_roll_frames(
                 count_bridged=False,
                 manual_review=bool(reasons),
                 review_reasons=tuple(reasons),
+                unclamped_start_row=start.fitted_row,
+                unclamped_end_row=end.fitted_row,
             )
         )
 

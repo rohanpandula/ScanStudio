@@ -1198,7 +1198,27 @@ def build_roll_preview_session(
         warnings = _slot_warnings(interval.frame, interval, origin, detection)
         # Lane C (D2): expose >=90%-covered frames flagged partial instead of
         # refusing them; strictly-below-90% stays REFEED_REQUIRED.
-        state = _crop_state(interval.start_row, interval.end_row, len(rgb))
+        #
+        # #19: coverage is measured against each boundary's UNCLAMPED fitted
+        # row when available, not the raster-clamped start_row/end_row --
+        # otherwise a frame whose true (fitted) extent runs past the
+        # captured preview raster always measures as 100% covered (the
+        # clamp already pinned it to the raster edge before this ever ran),
+        # so the refeed raise below and the partial flag were unreachable on
+        # the initial build. Falls back to the clamped rows when a detection
+        # was built without the additive fields (e.g. an older/hand-built
+        # FrameInterval) -- identical to the pre-fix behavior in that case.
+        coverage_start = (
+            interval.unclamped_start_row
+            if interval.unclamped_start_row is not None
+            else interval.start_row
+        )
+        coverage_end = (
+            interval.unclamped_end_row
+            if interval.unclamped_end_row is not None
+            else interval.end_row
+        )
+        state = _crop_state(coverage_start, coverage_end, len(rgb))
         if state == "refeed":
             raise RollSessionError(
                 f"frame {interval.frame} has <"

@@ -28,6 +28,7 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
 from coolscanpy.roll.preview_session import (
     PARTIAL_FRAME_MIN_COVERAGE,
     CaptureRoute,
+    RollSessionError,
     RollSessionIntegrityError,
     _crop_coverage,
     _crop_state,
@@ -684,6 +685,58 @@ def test_preview_session_refuses_a_first_frame_clipped_beyond_scannable_range(
     assert excinfo.value.fitted_start_row == -17
     assert excinfo.value.coverage_fraction == pytest.approx(126 / 143)
     assert "fresh preview" in str(excinfo.value)
+
+
+def test_preview_session_exposes_partial_last_frame_on_initial_build(
+    tmp_path: Path,
+) -> None:
+    # #19: the preview raster is truncated 11 rows short of the last frame's
+    # true (fitted) end -- 132 of 143 rows remain, 92.3% coverage. Before the
+    # fix, make_boundary's raster clamp made every frame's row range always
+    # measure as fully inside the preview (coverage 1.0 against the already-
+    # clamped end_row), so this path was unreachable on the FIRST build.
+    complete = _synthetic_index(height=882, frame_count=6, content_frames=6, leader=24)
+    fixture = _preview_fixture(
+        tmp_path,
+        slot_capacity_hint=6,
+        active_rgb=complete[: 882 - 11],
+    )
+
+    session = build_roll_preview_session(
+        fixture.result,
+        material=ScanMaterial.COLOR_NEGATIVE,
+    )
+
+    assert [slot.slot_id for slot in session.slots] == [1, 2, 3, 4, 5, 6]
+    trailing = session.slots[-1]
+    assert trailing.end_boundary_row == 871  # clamped to the truncated preview
+    assert trailing.partial is True
+    assert trailing.manual_review
+    assert "end-outside-index-raster" in trailing.warnings
+    # Rendering stays clamped to what was actually captured -- no padding.
+    np.testing.assert_array_equal(
+        trailing.thumbnail, fixture.rgb[trailing.start_boundary_row : 871]
+    )
+
+
+def test_preview_session_refuses_last_frame_below_partial_coverage_floor(
+    tmp_path: Path,
+) -> None:
+    # Same shape as the 92.3% case above, deeper cut: 21 of ~143 rows
+    # missing is ~85.3% coverage, strictly below the 90% partial floor --
+    # this must refeed, not silently expose a full or partial frame.
+    complete = _synthetic_index(height=882, frame_count=6, content_frames=6, leader=24)
+    fixture = _preview_fixture(
+        tmp_path,
+        slot_capacity_hint=6,
+        active_rgb=complete[: 882 - 21],
+    )
+
+    with pytest.raises(RollSessionError, match="refeed"):
+        build_roll_preview_session(
+            fixture.result,
+            material=ScanMaterial.COLOR_NEGATIVE,
+        )
 
 
 def test_preview_refuses_density_source_geometry_from_another_startup_count(
