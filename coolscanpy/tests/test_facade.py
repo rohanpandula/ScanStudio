@@ -25,6 +25,7 @@ import time
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -3810,3 +3811,42 @@ class TestSaneLaneDiscoveryGate:
 
         with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
             coolscanpy.open("ls5000")
+
+
+# ===========================================================================
+# _thumbnail_from_slot (Lane C, d818a66): the public coolscanpy.Thumbnail
+# Roll.preview()/Roll.set_spacing_offset() return must carry the same
+# ``partial`` flag the internal RollPreviewSlot has. d818a66's own test
+# coverage was bridge-side only (test_service_dispatch.py's byte-absence
+# tests on the wire dict); nothing exercised this coolscanpy-level
+# translation step directly, which is how a vendored copy could silently
+# drop the ``partial=slot.partial`` kwarg without any coolscanpy suite
+# catching it.
+# ===========================================================================
+
+
+def test_thumbnail_from_slot_carries_partial_through_to_the_public_thumbnail() -> None:
+    partial_slot = SimpleNamespace(
+        slot_id=3,
+        thumbnail=np.zeros((4, 4, 3), dtype=np.uint16),
+        boundary_rows=(10, 20),
+        boundary_offset_rows=0,
+        manual_review=True,
+        warnings=("end-outside-index-raster",),
+        partial=True,
+    )
+    full_slot = SimpleNamespace(
+        slot_id=4,
+        thumbnail=np.zeros((4, 4, 3), dtype=np.uint16),
+        boundary_rows=(20, 30),
+        boundary_offset_rows=0,
+        manual_review=False,
+        warnings=(),
+        partial=None,
+    )
+
+    partial_thumbnail = roll_module._thumbnail_from_slot(partial_slot)
+    full_thumbnail = roll_module._thumbnail_from_slot(full_slot)
+
+    assert partial_thumbnail.partial is True
+    assert full_thumbnail.partial is None
