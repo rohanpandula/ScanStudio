@@ -616,6 +616,19 @@ use crate::protocol::{
 };
 use serde::Serialize;
 
+/// One bridge-reported device's identity/support flag as of the last
+/// `device.list` this engine instance saw, keyed by device id in
+/// `RealLs5000::known_devices`. `connect()` looks up the REQUESTED device id
+/// here (Lane D, #14-C) so a dual-attach -- e.g. an unsupported LS-50
+/// alongside a supported LS-5000 -- refuses only the specific unsupported
+/// unit that was actually asked for, not every id regardless of which
+/// device this engine happened to see first.
+#[derive(Debug, Clone)]
+struct KnownDevice {
+    model: String,
+    supported: bool,
+}
+
 /// Backend for the real Nikon LS-5000, speaking to it through the
 /// `scanstudio-bridge` subprocess over `BridgeClient`. Every
 /// `ScannerBackend` method translates the engine's PROTOCOL.md-shaped call
@@ -664,6 +677,14 @@ pub struct RealLs5000 {
     /// model (Lane D, #14). The backend still starts so ``scanner.list`` can
     /// show the unit by name, but ``connect`` refuses it.
     supported: bool,
+    /// Every device this engine instance's construction-time `device.list`
+    /// reported, keyed by id (Lane D, #14-C). `device_id`/`model`/`supported`
+    /// above stay the single FIRST-seen device (unchanged -- `device_info()`
+    /// still reports only one device, matching `scanner.list`'s existing
+    /// one-real-device shape); this map exists so `connect(device_id)` can
+    /// decide per REQUESTED device instead of trusting whichever device was
+    /// first in the original list.
+    known_devices: HashMap<String, KnownDevice>,
     /// The holder classification derived from the bridge's authoritative
     /// `DeviceInfo.capabilities`. `device.list` supplies the initial value,
     /// and every successful `device.open` refreshes it because a holder may
@@ -895,6 +916,25 @@ impl RealLs5000 {
                     format!("malformed device.list result: {err}"),
                 )
             })?;
+        // Lane D, #14-C: snapshot every device this device.list reported,
+        // not just the first -- connect() needs the REQUESTED device's own
+        // supported flag, not whichever device this engine happened to see
+        // first. device_id/model/supported below deliberately stay the
+        // first-seen device unchanged (device_info()/scanner.list still
+        // report exactly one real device).
+        let known_devices: HashMap<String, KnownDevice> = devices_result
+            .devices
+            .iter()
+            .map(|device| {
+                (
+                    device.device_id.clone(),
+                    KnownDevice {
+                        model: device.model.clone(),
+                        supported: device.supported,
+                    },
+                )
+            })
+            .collect();
         let bridge_device = devices_result.devices.into_iter().next().ok_or_else(|| {
             EngineError::new(ErrorCode::Internal, "bridge reported zero devices")
         })?;
@@ -917,6 +957,7 @@ impl RealLs5000 {
             device_id: bridge_device.device_id,
             model: bridge_device.model,
             supported: bridge_device.supported,
+            known_devices,
             detected_holder: Mutex::new(detected_holder),
             firmware_label,
             supported_multisample_passes,
@@ -1753,17 +1794,29 @@ impl ScannerBackend for RealLs5000 {
         _options: &ConnectOptions,
     ) -> Result<ConnectResult, EngineError> {
         self.ensure_preview_stream_allows_connect_or_eject()?;
-        if !self.supported {
-            // Recognize-and-refuse (Lane D, #14): an unsupported model is
-            // listed by name in scanner.list but must never connect.
-            return Err(EngineError::new(
-                ErrorCode::NotSupported,
-                format!(
-                    "{} is recognized but not supported; only the LS-5000 is supported",
-                    self.model
-                ),
-            ));
+        if let Some(requested) = self.known_devices.get(device_id) {
+            if !requested.supported {
+                // Recognize-and-refuse (Lane D, #14 / #14-C): refuse the
+                // SPECIFIC requested device when it is a recognized-but-
+                // unsupported Nikon model, decided from THIS id's own
+                // supported flag -- not `self.supported`, which is only
+                // ever the first device this engine saw in device.list. A
+                // dual-attach (e.g. an unsupported LS-50 alongside a
+                // supported LS-5000) must not block connecting to the
+                // LS-5000 just because the LS-50 happened to enumerate
+                // first.
+                return Err(EngineError::new(
+                    ErrorCode::NotSupported,
+                    format!(
+                        "{} is recognized but not supported; only the LS-5000 is supported",
+                        requested.model
+                    ),
+                ));
+            }
         }
+        // An id this engine's device.list snapshot did not recognize falls
+        // through to device.open below, which surfaces the bridge's own
+        // not-found response -- unchanged from before known_devices existed.
         // BRIDGE.md has no equivalent of the simulator's `timeScale` /
         // `faultInjection` concepts — both are simulator-only, so
         // `options` is intentionally ignored here.

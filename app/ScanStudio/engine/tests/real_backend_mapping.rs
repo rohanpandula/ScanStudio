@@ -207,6 +207,36 @@ fn unsupported_bridge_device_is_listed_but_never_connectable() {
     assert_eq!(err.code, ErrorCode::NotSupported);
 }
 
+const UNSUPPORTED_DEVICE_ID: &str = "bridge-ls50-0";
+
+#[test]
+fn connect_decides_per_requested_device_in_a_dual_attach() {
+    // Lane D, #14-C: an unsupported LS-50 alongside a supported LS-5000 must
+    // not block connecting to the LS-5000, and the LS-50 must still be
+    // refused when requested directly -- decided per REQUESTED device id
+    // (RealLs5000::known_devices), not whichever device this engine
+    // happened to see first in device.list.
+    let backend = RealLs5000::new_with_env(
+        mock_bridge_bin(),
+        GENEROUS_TIMEOUT,
+        &[("MOCK_BRIDGE_DEVICE_DUAL_ATTACH", "1")],
+    )
+    .expect("RealLs5000::new should start with two devices attached");
+
+    let err = backend
+        .connect(UNSUPPORTED_DEVICE_ID, &ConnectOptions::default())
+        .expect_err("connecting the unsupported LS-50 must still be refused");
+    assert_eq!(err.code, ErrorCode::NotSupported);
+
+    let result = backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect(
+            "connecting the supported LS-5000 must succeed even with an \
+             unsupported LS-50 also attached",
+        );
+    assert!(result.status.connected);
+}
+
 #[test]
 fn load_media_is_always_an_internal_error_and_never_calls_the_bridge() {
     let backend = RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
