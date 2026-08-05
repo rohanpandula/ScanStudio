@@ -3805,7 +3805,11 @@ def _run_live_continuation_frame(
     density_evidence: NikonDensityEvidence,
     actual_usb_bus: int,
     actual_usb_address: int,
-    scanner_identity: str,
+    # Type-only: the caller's own local is `str | None` (set once the
+    # batch's first INQUIRY validates it), so a `str`-only annotation here
+    # was already an unsound accepted-argument type, not a runtime
+    # contract -- no observed call has ever actually passed None.
+    scanner_identity: str | None,
 ) -> dict[str, Any]:
     """Capture one later frame without reconnecting, reserving, or releasing."""
 
