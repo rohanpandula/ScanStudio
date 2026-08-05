@@ -176,6 +176,15 @@ Thumbnail
   needsApproval: bool
   warnings: string[]
   imagePath: string
+  partial: bool?  (optional; present only when true)
+
+`Thumbnail.partial` (Lane C, additive) is present as `partial: true` ONLY on a
+frame whose crop overlaps the preview with >=90% of its height inside but not
+all of it (a frame running off the top/bottom edge). It is ABSENT (never
+`null`) on every full-cover frame, so existing wire bytes are unchanged.
+Strictly-below-90% coverage is not a thumbnail at all: it is a `REFEED_REQUIRED`
+failure. An absent/omitted `partial` means a full frame; old readers ignore the
+additive key.
 
 ScanProgress
   jobId: string

@@ -614,6 +614,16 @@ private struct ManualReviewFrameSheet: View {
                         ? Color.scanStudioGreen
                         : Color.scanStudioSecondaryText
                 )
+            } else if thumbnail?.partial == true {
+                // Lane C: a partial frame (>=90% of its height inside the
+                // preview, not all of it) is shown with an informed scan-or-
+                // refeed badge; the frame is still scannable below.
+                Label(
+                    "Partial frame — refeed for full coverage",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.scanStudioSecondaryText)
             }
 
             HStack(spacing: 10) {

@@ -13,6 +13,29 @@ import Testing
 
 @Suite("Thumbnail simulator provenance")
 struct ThumbnailProvenanceTests {
+    @Test("Decoding a thumbnail without partial yields nil (no-op when absent); with partial yields its value")
+    func partialDecodeIsAdditiveNoOp() throws {
+        // Lane C guardrail 2: an old bridge (no partial key) with a new app
+        // (and vice versa) keeps working -- absent decodes to nil, never
+        // throws, and does not spawn a badge.
+        let absent = try JSONDecoder().decode(
+            Thumbnail.self,
+            from: Data(#"{"imagePath":"/tmp/a.tif"}"#.utf8)
+        )
+        #expect(absent.partial == nil)
+
+        let present = try JSONDecoder().decode(
+            Thumbnail.self,
+            from: Data(#"{"imagePath":"/tmp/b.tif","partial":true}"#.utf8)
+        )
+        #expect(present.partial == true)
+
+        let explicitFalse = try JSONDecoder().decode(
+            Thumbnail.self,
+            from: Data(#"{"imagePath":"/tmp/c.tif","partial":false}"#.utf8)
+        )
+        #expect(explicitFalse.partial == false)
+    }
     @Test("A simulator thumbnail (brightness + tint, no imagePath) is simulator-shaped")
     func simulatorBrightnessAndTint() {
         #expect(Thumbnail(brightness: 0.12, tint: -0.04, imagePath: nil).isSimulatorShaped == true)
