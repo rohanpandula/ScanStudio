@@ -28,7 +28,16 @@ from scanstudio_bridge import domain, safety
 from scanstudio_bridge.protocol import BridgeError, ErrorCode, from_wire, hello_result, to_wire
 from scanstudio_bridge.transport import FrameRetryExhausted, Transport
 
-BRIDGE_VERSION = importlib.metadata.version("scanstudio-bridge")
+try:
+    BRIDGE_VERSION = importlib.metadata.version("scanstudio-bridge")
+except importlib.metadata.PackageNotFoundError:
+    # Run-from-source bundles (the Linux/Windows sealed launchers exec the
+    # bridge via runpy with the corresponding-source tree on sys.path, and do
+    # not pip-install it, so no distribution metadata exists). A missing
+    # version must never crash bridge startup -- report a stable marker so
+    # bridge.hello still answers. A pip-installed bridge (e.g. the Windows
+    # WSL runtime) resolves the real version above.
+    BRIDGE_VERSION = "0.0.0-src"
 
 # Bounded so bridge.shutdown / dispatch-time joins never hang indefinitely
 # on a stuck worker thread (BRIDGE.md: "Cancellation is bounded so an
