@@ -109,7 +109,7 @@ PY
     npx tsc --noEmit
     npm run build
     cargo test --locked --manifest-path src-tauri/Cargo.toml
-    npm run tauri -- build --ci --bundles appimage --config "$build_config" -- --locked
+    npm run tauri -- build --ci --bundles appimage --config "$build_config" --verbose -- --locked
 )
 
 mapfile -t appimages < <(find "$app_root/src-tauri/target/release/bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)
