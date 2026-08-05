@@ -28,7 +28,6 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
 from coolscanpy.roll.preview_session import (
     PARTIAL_FRAME_MIN_COVERAGE,
     CaptureRoute,
-    RollSessionError,
     RollSessionIntegrityError,
     _crop_coverage,
     _crop_state,
@@ -719,12 +718,17 @@ def test_preview_session_exposes_partial_last_frame_on_initial_build(
     )
 
 
-def test_preview_session_refuses_last_frame_below_partial_coverage_floor(
+def test_preview_session_flags_a_sub_90_percent_trailing_frame_without_aborting(
     tmp_path: Path,
 ) -> None:
     # Same shape as the 92.3% case above, deeper cut: 21 of ~143 rows
-    # missing is ~85.3% coverage, strictly below the 90% partial floor --
-    # this must refeed, not silently expose a full or partial frame.
+    # missing is ~85.3% coverage, strictly below the 90% partial floor.
+    # Owner call (post-beta.1 field review): this must NOT abort the whole
+    # session -- "rather a person reject a bad frame than have it totally
+    # fail". The roll delivers all 6 slots; only the offending trailing
+    # frame is flagged (manual_review + its existing
+    # end-outside-index-raster warning, beta.1's original shape for this),
+    # not badged partial=true (that badge stays reserved for the >=90% band).
     complete = _synthetic_index(height=882, frame_count=6, content_frames=6, leader=24)
     fixture = _preview_fixture(
         tmp_path,
@@ -732,11 +736,23 @@ def test_preview_session_refuses_last_frame_below_partial_coverage_floor(
         active_rgb=complete[: 882 - 21],
     )
 
-    with pytest.raises(RollSessionError, match="refeed"):
-        build_roll_preview_session(
-            fixture.result,
-            material=ScanMaterial.COLOR_NEGATIVE,
-        )
+    session = build_roll_preview_session(
+        fixture.result,
+        material=ScanMaterial.COLOR_NEGATIVE,
+    )
+
+    assert [slot.slot_id for slot in session.slots] == [1, 2, 3, 4, 5, 6]
+    trailing = session.slots[-1]
+    assert trailing.end_boundary_row == 861  # clamped to the truncated preview
+    assert trailing.partial is None  # below the partial floor -- not badged
+    assert trailing.manual_review
+    assert "end-outside-index-raster" in trailing.warnings
+    # Rendering stays clamped to what was actually captured -- no padding.
+    np.testing.assert_array_equal(
+        trailing.thumbnail, fixture.rgb[trailing.start_boundary_row : 861]
+    )
+    # Every other frame is unaffected.
+    assert all(not slot.partial for slot in session.slots[:-1])
 
 
 def test_preview_refuses_density_source_geometry_from_another_startup_count(
