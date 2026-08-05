@@ -1,0 +1,3 @@
+{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"sane","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"off","transport":"idle","activeJobId":null,"motionArmed":true,"filmPresent":true}}}
+{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"sane","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"off","transport":"idle","activeJobId":null,"motionArmed":false,"filmPresent":false}}}
+{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"sane","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"off","transport":"idle","activeJobId":null,"motionArmed":true,"filmPresent":null}}}

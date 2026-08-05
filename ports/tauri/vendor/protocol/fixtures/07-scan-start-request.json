@@ -1,0 +1,1 @@
+{"id": 4, "method": "scan.start", "params": {"frames": [1, 2, 3], "recipe": {"resolutionDpi": 4000, "bitDepth": 16, "multisamplePasses": 2, "channels": "rgbi"}}}

@@ -1,0 +1,4 @@
+{"id":205,"method":"scan.start","params":{"frames":[1],"recipe":{"resolutionDpi":4000,"bitDepth":16,"multisamplePasses":1,"channels":"rgbi"}}}
+{"id":205,"error":{"code":"FEEDER_PARKED","message":"transport parked at end-stop after slot 14; power cycle required before further motion","recoverable":false}}
+{"id":206,"method":"scanner.acquireThumbnails","params":{"frames":[1],"filmProcess":"c41ColorNegative"}}
+{"id":206,"error":{"code":"HW_MOTION_NOT_ARMED","message":"motion refused: SCANSTUDIO_HW_MOTION unset or hw-motion-armed latch missing/empty","recoverable":false}}

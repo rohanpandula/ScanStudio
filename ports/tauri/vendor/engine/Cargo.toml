@@ -1,0 +1,28 @@
+[package]
+name = "scanstudio-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["tiff", "png", "jpeg"] }
+imageproc = { version = "0.27", default-features = false }
+same-file = "1"
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: without it, serde_json's default float parser can be off
+# by 1 ULP on some literal-JSON-text inputs (fast best-effort parsing, not
+# exact) -- manifest.rs's persist_frame_receipt/read_manifest round trips
+# ScanReceipt through real JSON text on disk (not an in-memory
+# serde_json::Value, which never loses precision either way), so a receipt
+# field carrying a "nasty" enough decimal (e.g. NikonlookProvenance.gains)
+# could silently drift by 1 ULP on every read -- confirmed empirically via
+# manifest.rs's persist_frame_receipt_round_trips_nikonlook_provenance_through_disk.
+# A receipt is supposed to be an exact record.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+# Direct dependencies already present in Cargo.lock through `image`. `tiff`
+# exposes derivative ICC/resolution tags; `moxcms` generates and validates a
+# ScanStudio-authored profile compatible with the Adobe RGB (1998) color space.
+tiff = "=0.11.3"
+moxcms = "=0.8.1"

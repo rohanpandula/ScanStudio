@@ -1,0 +1,239 @@
+.viewShell {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.viewHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.scannedCount {
+  margin-left: auto;
+  font-size: 0.85rem;
+  color: #374151;
+  font-variant-numeric: tabular-nums;
+}
+
+.jobStateBadge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.progressRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.primaryButton {
+  padding: 0.45rem 1rem;
+  border-radius: 4px;
+  border: 1px solid #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.primaryButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.dangerButton {
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.dangerButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.controlButton {
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.controlButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.frameTable {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.frameRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.frameRow[data-state="completed"] {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.frameRow[data-state="failed"] {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.frameRow[data-state="skipped"] {
+  border-color: #e5e7eb;
+  background: #f9fafb;
+  color: #6b7280;
+}
+
+.frameRow[data-state="active"] {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.frameIndex {
+  font-variant-numeric: tabular-nums;
+  min-width: 5rem;
+}
+
+.frameStateBadge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+}
+
+.frameError {
+  font-size: 0.8rem;
+  color: #b91c1c;
+  overflow-wrap: anywhere;
+}
+
+.receiptSummary {
+  margin-left: auto;
+  color: #4b5563;
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.ticker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.tickerHeading {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.tickerList {
+  margin: 0;
+  padding-left: 1.25rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  font-size: 0.8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tickerLine {
+  color: #374151;
+}
+
+.tickerError {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+.pendingPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+}
+
+.pendingRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.pendingStats {
+  font-size: 0.85rem;
+  color: #374151;
+}
+
+.resumeButton {
+  padding: 0.35rem 0.9rem;
+  border-radius: 4px;
+  border: 1px solid #2563eb;
+  background: #eff6ff;
+  color: #1d4ed8;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.resumeButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}

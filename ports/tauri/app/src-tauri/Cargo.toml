@@ -1,0 +1,25 @@
+[package]
+name = "scanstudio-app"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "scanstudio_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-dialog = "2.7.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "process", "io-util", "time"] }
+url = "2"
+image = { version = "0.25.10", default-features = false, features = ["tiff", "png", "jpeg"] }
+lru = "0.18.1"

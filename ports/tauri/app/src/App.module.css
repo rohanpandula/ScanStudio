@@ -1,0 +1,42 @@
+.windowsSetupPanel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 1rem;
+}
+
+.windowsSetupHeading {
+  margin: 0;
+  color: #111827;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+.windowsSetupCopy {
+  margin: 0;
+  color: #4b5563;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.windowsSetupButton {
+  padding: 0.45rem 0.75rem;
+  border: 1px solid #9ca3af;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #111827;
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.windowsSetupButton:hover {
+  background: #f9fafb;
+}
+
+.windowsSetupButton:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}

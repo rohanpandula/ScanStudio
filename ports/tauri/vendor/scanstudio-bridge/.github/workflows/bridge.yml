@@ -1,0 +1,91 @@
+# Bridge CI -- CONTEXT decision 5: "Workflow files authored, never pushed --
+# activation is the owner's checkpoint." This workflow is deliberately
+# workflow_dispatch-only: no push/pull_request trigger until the owner adds
+# one as part of the CI-activation checkpoint.
+name: bridge
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-ubuntu:
+    # Pinned, not ubuntu-latest -- this project's stack research documents
+    # runner-image drift (floating aliases silently raise the glibc floor).
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout scanstudio-bridge
+        uses: actions/checkout@v4
+        with:
+          path: scanstudio-bridge
+
+      - name: Checkout CoolscanPy sibling
+        uses: actions/checkout@v4
+        with:
+          repository: rohanpandula/coolscanpy
+          ref: port/cross-platform
+          path: digital-ice-2026/public-release/coolscanpy
+        # (a) Recreates the exact sibling relative-path layout that
+        #     scanstudio-bridge/pyproject.toml's [tool.uv.sources] needs
+        #     (coolscanpy = { path = "../digital-ice-2026/public-release/coolscanpy" }):
+        #     a hosted runner starts with neither repo present.
+        # (b) ACTIVATION PREREQUISITE: the port/cross-platform ref exists only
+        #     locally today (the coolscanpy remote is public and that branch is
+        #     deliberately unpushed). This workflow cannot succeed until the
+        #     owner pushes that branch or retargets ref: to a tag containing the
+        #     Phase 2 discovery fixes -- part of the same owner-only CI-activation
+        #     checkpoint that adds real triggers.
+
+      - name: Install SANE/libusb system prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsane-dev libusb-1.0-0-dev libusb-1.0-0 pkg-config
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: uv sync
+        working-directory: scanstudio-bridge
+        run: uv sync
+
+      - name: Run bridge test suite
+        working-directory: scanstudio-bridge
+        run: uv run pytest -q
+
+      # CONTEXT decision 5: "ubuntu job additionally runs the NDJSON byte
+      # test explicitly" -- BRDG-02's cross-platform wire guard.
+      - name: Run NDJSON byte-discipline test explicitly
+        working-directory: scanstudio-bridge
+        run: uv run pytest tests/test_stdout_byte_discipline.py -q
+
+  test-windows:
+    # windows-latest floats; pin to an explicit image if this workflow is
+    # ever activated (per this project's runner-image drift policy).
+    runs-on: windows-latest
+    steps:
+      - name: Checkout scanstudio-bridge
+        uses: actions/checkout@v4
+        with:
+          path: scanstudio-bridge
+
+      - name: Checkout CoolscanPy sibling
+        uses: actions/checkout@v4
+        with:
+          repository: rohanpandula/coolscanpy
+          ref: port/cross-platform
+          path: digital-ice-2026/public-release/coolscanpy
+        # Same two notes as the ubuntu job: (a) sibling layout for
+        # [tool.uv.sources]; (b) port/cross-platform is unpushed today, so
+        # this ref must be pushed/retargeted at the activation checkpoint.
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: uv sync
+        working-directory: scanstudio-bridge
+        run: uv sync
+
+      - name: Run bridge test suite (mock transport)
+        working-directory: scanstudio-bridge
+        env:
+          SCANSTUDIO_BRIDGE_TRANSPORT: mock
+        run: uv run pytest -q
