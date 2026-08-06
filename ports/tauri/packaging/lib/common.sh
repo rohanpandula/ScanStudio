@@ -204,12 +204,32 @@ def digest(path: Path) -> str:
     return value.hexdigest()
 
 
-# @tauri-apps/plugin-dialog 2.7.2 publishes an SPDX copyright declaration but
-# not the full MIT/Apache terms. Its exact sibling @tauri-apps/api 2.11.1
-# package carries the reviewed full texts from the same Tauri project. Hashes
-# make this fallback fail closed if either upstream file changes.
+# @tauri-apps/plugin-dialog 2.7.2 and @tauri-apps/plugin-os 2.3.2 each publish
+# an SPDX copyright declaration but not the full MIT/Apache terms (same
+# byte-identical LICENSE.spdx boilerplate for both -- both are published from
+# the tauri-apps/plugins-workspace monorepo, whose root carries LICENSE_MIT
+# and LICENSE_APACHE-2.0; GitHub's own repo-level license detection confirms
+# "Apache-2.0, MIT licenses found" there). Their exact sibling @tauri-apps/api
+# 2.11.1 package -- published from the same monorepo -- carries those reviewed
+# full texts already. Hashes make this fallback fail closed if either upstream
+# file changes.
 reviewed_fallbacks = {
     ("@tauri-apps/plugin-dialog", "2.7.2"): {
+        "declaration": ("LICENSE.spdx", "eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef"),
+        "fullTexts": [
+            (
+                "node_modules/@tauri-apps/api/LICENSE_MIT",
+                "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d",
+                "FALLBACK-LICENSE_MIT",
+            ),
+            (
+                "node_modules/@tauri-apps/api/LICENSE_APACHE-2.0",
+                "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+                "FALLBACK-LICENSE_APACHE-2.0",
+            ),
+        ],
+    },
+    ("@tauri-apps/plugin-os", "2.3.2"): {
         "declaration": ("LICENSE.spdx", "eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef"),
         "fullTexts": [
             (
