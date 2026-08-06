@@ -28,6 +28,8 @@ struct UpdateSettingsView: View {
             }
 
             Section("Updates") {
+                Toggle("Check for updates at launch", isOn: $model.launchCheckEnabled)
+
                 Button("Check for Updates") {
                     Task { await model.checkNow() }
                 }

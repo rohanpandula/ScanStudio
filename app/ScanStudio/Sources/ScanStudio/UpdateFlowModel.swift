@@ -1,8 +1,10 @@
-// In-app update flow (01-05): the host-owned model behind the Settings scene.
+// In-app update flow (01-05): the host-owned model behind the Settings scene,
+// PLUS the launch-time "Update Now" / "Not Now" offer (feat/launch-update-offer).
 // Renders honest check/install/rollback state and enforces the AUT-05-GUARD:
 // no install while a scan/preview job is active. The model itself never
 // relaunches the app, never auto-installs, and never touches the scanner --
-// it only mutates observable state and drives the 01-03/01-04 services on
+// it only mutates observable state and drives the ScanStudioKit services
+// (checker, downloader, installer, and now the launch-offer model) on
 // explicit user action. Relaunch wiring is deliberately out of scope here and
 // left to explicit user confirmation ("Restart to finish"), per the plan.
 
@@ -36,7 +38,11 @@ final class UpdateFlowModel {
     /// The running app's stamped version, read from `Bundle.main` at launch.
     private let installedVersion: UpdateVersion
     private let channelDefaultsKey: String
+    private let launchCheckEnabledDefaultsKey: String
     private let defaults: UserDefaults
+    /// Gates + runs the once-per-launch check and owns the offer's
+    /// shown/dismissed state (ScanStudioKit; unit tested there directly).
+    private let launchOfferModel: LaunchUpdateOfferModel
 
     /// Release channel the user is on. Persisted on change. The `.alpha` raw
     /// value is retained for compatibility and represents all prereleases.
@@ -45,6 +51,21 @@ final class UpdateFlowModel {
             defaults.set(channel.rawValue, forKey: channelDefaultsKey)
         }
     }
+
+    /// Persisted "Check for updates at launch" setting (default ON). When
+    /// `false`, `checkForUpdateAtLaunch()` makes no network call at all; the
+    /// manual "Check for Updates" button and the 24 h background cadence are
+    /// unaffected either way -- this only gates the once-per-launch check.
+    var launchCheckEnabled: Bool {
+        didSet {
+            defaults.set(launchCheckEnabled, forKey: launchCheckEnabledDefaultsKey)
+        }
+    }
+
+    /// Non-nil while the launch-time offer alert should be visible. Set by
+    /// `checkForUpdateAtLaunch()`; cleared by `dismissLaunchUpdateOffer()`
+    /// ("Not Now") or `installFromLaunchUpdateOffer()` ("Update Now").
+    var launchUpdateOffer: UpdateCandidate?
 
     /// Whichever of `.idle` / `.checking` / `.updateAvailable` / `.upToDate`
     /// / `.failed` the last action produced.
@@ -80,6 +101,7 @@ final class UpdateFlowModel {
         installer: UpdateInstaller,
         installedVersion: UpdateVersion,
         channelDefaultsKey: String,
+        launchCheckEnabledDefaultsKey: String,
         defaults: UserDefaults = .standard
     ) {
         self.checker = checker
@@ -87,12 +109,19 @@ final class UpdateFlowModel {
         self.installer = installer
         self.installedVersion = installedVersion
         self.channelDefaultsKey = channelDefaultsKey
+        self.launchCheckEnabledDefaultsKey = launchCheckEnabledDefaultsKey
+        self.launchOfferModel = LaunchUpdateOfferModel(checker: checker, installedVersion: installedVersion)
         self.defaults = defaults
         if let stored = defaults.string(forKey: channelDefaultsKey),
            let parsed = UpdateChannel(rawValue: stored) {
             channel = parsed
         } else {
             channel = .alpha
+        }
+        if defaults.object(forKey: launchCheckEnabledDefaultsKey) != nil {
+            launchCheckEnabled = defaults.bool(forKey: launchCheckEnabledDefaultsKey)
+        } else {
+            launchCheckEnabled = true
         }
     }
 
@@ -114,6 +143,37 @@ final class UpdateFlowModel {
         } catch {
             checkState = .failed(Self.describe(error))
         }
+    }
+
+    // MARK: - Launch-time offer
+
+    /// The once-per-launch check (AUT-05-CHECK's "one check at launch"
+    /// half), gated on `launchCheckEnabled` and delegated to
+    /// `LaunchUpdateOfferModel` so the gate is unit tested in ScanStudioKit.
+    /// When it finds something strictly newer than `installedVersion`,
+    /// mirrors the candidate into `launchUpdateOffer` so the root scene can
+    /// show the "Update Now" / "Not Now" alert. Intended to run at most once
+    /// per app launch (the `AppDelegate` call site does exactly that);
+    /// `LaunchUpdateOfferModel` itself also refuses a second run.
+    func checkForUpdateAtLaunch() async {
+        await launchOfferModel.checkAtLaunch(launchCheckEnabled: launchCheckEnabled, channel: channel)
+        launchUpdateOffer = launchOfferModel.offer.candidate
+    }
+
+    /// "Not Now": dismiss the launch-time offer for the rest of this app run.
+    func dismissLaunchUpdateOffer() {
+        launchOfferModel.dismiss()
+        launchUpdateOffer = nil
+    }
+
+    /// "Update Now": routes the offered candidate into the EXISTING install
+    /// flow (`install()`, unchanged below -- same AUT-05-GUARD, same error
+    /// mapping) instead of duplicating any of its logic.
+    func installFromLaunchUpdateOffer() async {
+        guard let candidate = launchOfferModel.consumeForInstall() else { return }
+        launchUpdateOffer = nil
+        checkState = .updateAvailable(candidate)
+        await install()
     }
 
     /// Downloads, verifies, and installs the offered candidate. Gated on
