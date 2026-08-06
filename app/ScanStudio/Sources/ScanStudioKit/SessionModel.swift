@@ -538,14 +538,15 @@ public final class SessionModel {
             outputRecipe.preview.destination,
         ].compactMap { $0 }.filter { !$0.isEmpty } + frameOutputPaths
 
-        let appVersion = Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String
         return ErrorPresentationPolicy.make(
             lastErrorMessage: lastErrorMessage,
             context: ErrorPresentationContext(
-                scanStudioVersion: appVersion,
-                operatingSystemVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+                scanStudioVersion: Self.releaseStamp,
+                operatingSystemVersion: "macOS " + ProcessInfo.processInfo.operatingSystemVersionString,
+                cpuArchitecture: HostArchitectureProvider.currentHostArchitecture.rawValue,
+                scannerFirmware: device?.firmware,
+                scannerAdapter: status?.adapter,
+                scannerHolder: status?.carrier,
                 selectedPaths: selectedPaths,
                 filmMetadataValues: metadataValues,
                 deviceIdentifiers: (
@@ -556,10 +557,26 @@ public final class SessionModel {
                 engineVersion: engineVersion,
                 connectionSummary: diagnosticConnectionSummary,
                 recentDiagnosticEvents: diagnosticTimeline.summaryLines,
-                diagnosticLogRelativePath: diagnosticLogRelativePath
+                diagnosticLogRelativePath: diagnosticLogRelativePath,
+                diagnosticLogPath: diagnosticLogPath
             )
         )
     }
+
+    /// The packaged `ScanStudioRelease` stamp, falling back to
+    /// `CFBundleShortVersionString` for an unstamped dev/source build --
+    /// mirrors `ScanStudioApp.installedUpdateVersion()`'s own precedence so
+    /// the error report names the exact same build the updater would offer
+    /// to replace. `nil` (never a hardcoded placeholder) when neither key is
+    /// set, so `ErrorPresentationPolicy` renders the header's honest
+    /// "unknown" instead of a fabricated version string.
+    private static var releaseStamp: String? {
+        if let stamp = Bundle.main.infoDictionary?["ScanStudioRelease"] as? String, !stamp.isEmpty {
+            return stamp
+        }
+        return Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    }
+
     public private(set) var project: ScanProject?
     public private(set) var projectDirectory: String?
     public private(set) var recentProjects: [ProjectSummary] = []
@@ -3966,11 +3983,61 @@ public final class SessionModel {
         return "~/.scanstudio/diagnostics/\(logURL.lastPathComponent)"
     }
 
+    /// The true absolute path to the durable diagnostics log, for the
+    /// local-only technical details view (T-ERR-02). Never surfaced in the
+    /// public issue draft -- see `diagnosticLogRelativePath` for that form.
+    private var diagnosticLogPath: String? {
+        diagnosticTimeline.logURL?.path
+    }
+
+    /// Builds "Save Diagnostic Bundle..."'s zip bytes (T-ERR-04): the
+    /// session's diagnostics.jsonl, the current generated report text, and
+    /// -- when the session had a roll preview whose image path is still
+    /// readable -- that preview raster. The raster comes only from
+    /// already-decoded `Thumbnail.imagePath` state; this never opens a new
+    /// engine/bridge round trip to locate it.
+    public func makeDiagnosticBundleData() -> Data {
+        let reportText = errorPresentation?.technicalDetails
+            ?? lastErrorMessage
+            ?? "No error was active when this bundle was saved."
+        let (raster, unavailableReason) = DiagnosticBundleRasterPolicy.resolve(
+            thumbnails: thumbnails,
+            readFile: { FileManager.default.contents(atPath: $0) }
+        )
+        let entries = DiagnosticBundleBuilder.makeEntries(
+            diagnosticsJSONL: diagnosticsJSONLData(),
+            reportText: reportText,
+            previewRaster: raster,
+            unavailableRasterReason: unavailableReason
+        )
+        return StoredZipWriter.write(entries)
+    }
+
+    /// Re-derives diagnostics.jsonl's exact bytes from the in-memory
+    /// timeline -- identical in shape to what `SessionDiagnosticTimeline`
+    /// persists to disk -- so the bundle never depends on a prior disk write
+    /// having succeeded (a memory-only timeline in tests still bundles).
+    private func diagnosticsJSONLData() -> Data {
+        var data = Data()
+        let encoder = JSONEncoder()
+        for entry in diagnosticTimeline.entries {
+            guard let encoded = try? encoder.encode(entry) else { continue }
+            data.append(encoded)
+            data.append(0x0A)
+        }
+        return data
+    }
+
     private func recordDiagnostic(
         event: String,
         fields: [String: String] = [:]
     ) {
-        diagnosticTimeline.record(event: event, fields: fields)
+        // Every current call site hands this plain String fields, but the
+        // timeline itself stores the generic `DiagnosticFieldValue` shape
+        // (SessionDiagnosticTimeline.swift) so future instrumentation can
+        // record numbers/bools/nested objects straight into
+        // `diagnosticTimeline.record` without a report-side change.
+        diagnosticTimeline.record(event: event, fields: fields.mapValues { .string($0) })
     }
 
     /// A scanner operation can prove that the bridge has no live device

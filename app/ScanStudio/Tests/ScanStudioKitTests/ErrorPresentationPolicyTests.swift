@@ -268,7 +268,8 @@ struct ErrorPresentationPolicyTests {
                     "2026-07-28T00:08:18Z device.connect.succeeded connected=true kind=real",
                     "2026-07-28T00:09:01Z preview.failed code=NOT_CONNECTED uiConnectedBefore=true",
                 ],
-                diagnosticLogRelativePath: "~/.scanstudio/diagnostics/session-1234.jsonl"
+                diagnosticLogRelativePath: "~/.scanstudio/diagnostics/session-1234.jsonl",
+                diagnosticLogPath: "/Users/tester/.scanstudio/diagnostics/session-1234.jsonl"
             )
         )
         let components = try #require(
@@ -285,9 +286,93 @@ struct ErrorPresentationPolicyTests {
         #expect(body.contains("preview.failed code=NOT_CONNECTED uiConnectedBefore=true"))
         #expect(body.contains("No images, receipts, or raw logs are attached automatically."))
 
+        // The public issue draft gets the home-relative form only -- it must
+        // never disclose the local account name baked into the absolute path.
+        #expect(body.contains("Local log: ~/.scanstudio/diagnostics/session-1234.jsonl"))
+        #expect(!body.contains("/Users/tester"))
+
         #expect(presentation.technicalDetails.contains("Diagnostic session: session-1234"))
-        #expect(presentation.technicalDetails.contains("Local log: ~/.scanstudio/diagnostics/session-1234.jsonl"))
+        #expect(
+            presentation.technicalDetails
+                .contains("Local log: /Users/tester/.scanstudio/diagnostics/session-1234.jsonl")
+        )
         #expect(presentation.technicalDetails.contains("preview.failed code=NOT_CONNECTED"))
+    }
+
+    @Test("the build-identifying header always renders every field, falling back to unknown")
+    func buildHeaderRendersUnknownForMissingFields() throws {
+        let presentation = ErrorPresentationPolicy.make(
+            lastErrorMessage: "NOT_CONNECTED: no device is open",
+            context: ErrorPresentationContext(scanStudioVersion: "0.3.0-alpha.11")
+        )
+        let components = try #require(
+            URLComponents(url: presentation.issueURL, resolvingAgainstBaseURL: false)
+        )
+        let body = try #require(components.queryItems?.first { $0.name == "body" }?.value)
+
+        #expect(body.contains("ScanStudio version: 0.3.0-alpha.11"))
+        #expect(body.contains("Operating system: unknown"))
+        #expect(body.contains("CPU architecture: unknown"))
+        #expect(body.contains("Scanner firmware: unknown"))
+        #expect(body.contains("Adapter: unknown"))
+        #expect(body.contains("Holder: unknown"))
+        // Never silently dropped: technicalDetails renders the exact same
+        // always-present header once any part of the context is populated.
+        #expect(presentation.technicalDetails.contains("Scanner firmware: unknown"))
+    }
+
+    @Test("known scanner identity and holder state populate the build header")
+    func buildHeaderPopulatesKnownScannerIdentity() throws {
+        let presentation = ErrorPresentationPolicy.make(
+            lastErrorMessage: "INTERNAL: unexpected scanner identity",
+            context: ErrorPresentationContext(
+                scanStudioVersion: "0.3.0-alpha.11",
+                operatingSystemVersion: "macOS Version 15.4.1 (Build 24E263)",
+                cpuArchitecture: "arm64",
+                scannerFirmware: "1.02",
+                scannerAdapter: "SA-21",
+                scannerHolder: "roll36"
+            )
+        )
+        let components = try #require(
+            URLComponents(url: presentation.issueURL, resolvingAgainstBaseURL: false)
+        )
+        let body = try #require(components.queryItems?.first { $0.name == "body" }?.value)
+
+        #expect(body.contains("Operating system: macOS Version 15.4.1 (Build 24E263)"))
+        #expect(body.contains("CPU architecture: arm64"))
+        #expect(body.contains("Scanner firmware: 1.02"))
+        #expect(body.contains("Adapter: SA-21"))
+        #expect(body.contains("Holder: roll36"))
+    }
+
+    @Test("both report outputs include up to the last 40 diagnostic events, not ~10")
+    func reportsIncludeUpToFortyDiagnosticEvents() throws {
+        // Distinct per-index timestamps (no wraparound) keep every event
+        // string unique, so a substring check can never cross-match a
+        // different index.
+        let events = (1...50).map { "2026-08-05T00:00:00Z-\($0) event-\($0)" }
+        let droppedLine = "- 2026-08-05T00:00:00Z-10 event-10"
+        let survivingOldestLine = "- 2026-08-05T00:00:00Z-11 event-11"
+        let survivingNewestLine = "- 2026-08-05T00:00:00Z-50 event-50"
+        let presentation = ErrorPresentationPolicy.make(
+            lastErrorMessage: "INTERNAL: something failed",
+            context: ErrorPresentationContext(recentDiagnosticEvents: events)
+        )
+        let components = try #require(
+            URLComponents(url: presentation.issueURL, resolvingAgainstBaseURL: false)
+        )
+        let body = try #require(components.queryItems?.first { $0.name == "body" }?.value)
+
+        #expect(ErrorPresentationPolicy.maximumRecentDiagnosticEvents == 40)
+        // The most recent 40 (event-11 through event-50) survive; earlier
+        // ones fall off the bounded window in both outputs.
+        #expect(body.contains(survivingNewestLine))
+        #expect(body.contains(survivingOldestLine))
+        #expect(!body.contains(droppedLine))
+        #expect(presentation.technicalDetails.contains(survivingNewestLine))
+        #expect(presentation.technicalDetails.contains(survivingOldestLine))
+        #expect(!presentation.technicalDetails.contains(droppedLine))
     }
 
     @Test("issue text redacts paths and explicitly supplied private work details")

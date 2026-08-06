@@ -8,6 +8,15 @@ import Foundation
 public struct ErrorPresentationContext: Equatable, Sendable {
     public let scanStudioVersion: String?
     public let operatingSystemVersion: String?
+    /// CPU architecture of the host running ScanStudio (e.g. `"arm64"`).
+    public let cpuArchitecture: String?
+    /// The connected scanner's reported firmware revision, when a device is
+    /// connected and the identity handshake has recorded one.
+    public let scannerFirmware: String?
+    /// `ScannerStatus.adapter`, when known.
+    public let scannerAdapter: String?
+    /// `ScannerStatus.carrier` (the loaded film holder), when known.
+    public let scannerHolder: String?
     public let selectedPaths: [String]
     public let filmMetadataValues: [String]
     public let deviceIdentifiers: [String]
@@ -15,11 +24,20 @@ public struct ErrorPresentationContext: Equatable, Sendable {
     public let engineVersion: String?
     public let connectionSummary: String?
     public let recentDiagnosticEvents: [String]
+    /// Home-relative (`~/...`) diagnostic log location, safe to publish in a
+    /// public issue draft -- never reveals the local account name.
     public let diagnosticLogRelativePath: String?
+    /// The true absolute diagnostic log path, for the local-only technical
+    /// details view. Never included in the public issue draft.
+    public let diagnosticLogPath: String?
 
     public init(
         scanStudioVersion: String? = nil,
         operatingSystemVersion: String? = nil,
+        cpuArchitecture: String? = nil,
+        scannerFirmware: String? = nil,
+        scannerAdapter: String? = nil,
+        scannerHolder: String? = nil,
         selectedPaths: [String] = [],
         filmMetadataValues: [String] = [],
         deviceIdentifiers: [String] = [],
@@ -27,10 +45,15 @@ public struct ErrorPresentationContext: Equatable, Sendable {
         engineVersion: String? = nil,
         connectionSummary: String? = nil,
         recentDiagnosticEvents: [String] = [],
-        diagnosticLogRelativePath: String? = nil
+        diagnosticLogRelativePath: String? = nil,
+        diagnosticLogPath: String? = nil
     ) {
         self.scanStudioVersion = scanStudioVersion
         self.operatingSystemVersion = operatingSystemVersion
+        self.cpuArchitecture = cpuArchitecture
+        self.scannerFirmware = scannerFirmware
+        self.scannerAdapter = scannerAdapter
+        self.scannerHolder = scannerHolder
         self.selectedPaths = selectedPaths
         self.filmMetadataValues = filmMetadataValues
         self.deviceIdentifiers = deviceIdentifiers
@@ -39,6 +62,7 @@ public struct ErrorPresentationContext: Equatable, Sendable {
         self.connectionSummary = connectionSummary
         self.recentDiagnosticEvents = recentDiagnosticEvents
         self.diagnosticLogRelativePath = diagnosticLogRelativePath
+        self.diagnosticLogPath = diagnosticLogPath
     }
 }
 
@@ -66,6 +90,15 @@ public struct ErrorPresentation: Equatable, Sendable {
 /// diagnostic detail.
 public enum ErrorPresentationPolicy {
     public static let maximumIssueBodyCharacters = 4_000
+    /// Both report outputs show at most this many of the most recent
+    /// diagnostic events. Matches `SessionDiagnosticTimeline`'s own retention
+    /// cap (T-ERR-02), so raising one without the other cannot silently
+    /// under-fill the report.
+    public static let maximumRecentDiagnosticEvents = 40
+    /// Rendered in place of any build-identifying header field ScanStudio
+    /// could not determine, so a field is always present and never silently
+    /// dropped from the report.
+    private static let unknownFieldValue = "unknown"
 
     private struct Copy {
         let code: String
@@ -288,17 +321,14 @@ public enum ErrorPresentationPolicy {
     ) -> URL {
         let safeMessage = redactIssueText(lastErrorMessage, context: context)
         var bodyLines = ["ScanStudio error report"]
-        if let version = context.scanStudioVersion, !version.isEmpty {
-            bodyLines.append("ScanStudio version: \(version)")
+        appendBuildHeader(to: &bodyLines, context: context)
+        // Home-relative, never the true absolute path -- this line ships in a
+        // public GitHub issue draft and must not disclose the local account
+        // name (see `diagnosticLogPath` for the local-only absolute form).
+        if let relativeLogPath = context.diagnosticLogRelativePath, !relativeLogPath.isEmpty {
+            bodyLines.append("Local log: \(relativeLogPath)")
         }
-        if let operatingSystem = context.operatingSystemVersion, !operatingSystem.isEmpty {
-            bodyLines.append("Operating system: \(operatingSystem)")
-        }
-        appendDiagnosticContext(
-            to: &bodyLines,
-            context: context,
-            includeLocalLogPath: false
-        )
+        appendDiagnosticContext(to: &bodyLines, context: context)
         bodyLines.append("Error code: \(copy.code)")
         bodyLines.append("")
         bodyLines.append("Message:")
@@ -307,7 +337,7 @@ public enum ErrorPresentationPolicy {
             bodyLines.append("")
             bodyLines.append("Recent diagnostic events:")
             bodyLines.append(
-                contentsOf: context.recentDiagnosticEvents.suffix(12).map {
+                contentsOf: context.recentDiagnosticEvents.suffix(maximumRecentDiagnosticEvents).map {
                     "- \(redactIssueText($0, context: context))"
                 }
             )
@@ -332,30 +362,65 @@ public enum ErrorPresentationPolicy {
         context: ErrorPresentationContext
     ) -> String {
         let hasDiagnostics =
-            context.diagnosticSessionId != nil
+            context.scanStudioVersion != nil
+            || context.operatingSystemVersion != nil
+            || context.cpuArchitecture != nil
+            || context.scannerFirmware != nil
+            || context.scannerAdapter != nil
+            || context.scannerHolder != nil
+            || context.diagnosticSessionId != nil
             || context.engineVersion != nil
             || context.connectionSummary != nil
             || !context.recentDiagnosticEvents.isEmpty
             || context.diagnosticLogRelativePath != nil
+            || context.diagnosticLogPath != nil
         guard hasDiagnostics else { return lastErrorMessage }
 
         var lines = [lastErrorMessage, "", "Diagnostic context"]
-        appendDiagnosticContext(
-            to: &lines,
-            context: context,
-            includeLocalLogPath: true
-        )
+        appendBuildHeader(to: &lines, context: context)
+        // The true absolute path -- safe here because this view is local-only
+        // and never leaves the machine (contrast the public issue draft's
+        // home-relative `diagnosticLogRelativePath` line).
+        if let logPath = context.diagnosticLogPath, !logPath.isEmpty {
+            lines.append("Local log: \(logPath)")
+        }
+        appendDiagnosticContext(to: &lines, context: context)
         if !context.recentDiagnosticEvents.isEmpty {
             lines.append("Recent events:")
-            lines.append(contentsOf: context.recentDiagnosticEvents.suffix(20).map { "- \($0)" })
+            lines.append(
+                contentsOf: context.recentDiagnosticEvents.suffix(maximumRecentDiagnosticEvents).map { "- \($0)" }
+            )
         }
         return lines.joined(separator: "\n")
     }
 
+    /// Appends the build-identifying header (T-ERR-01): release stamp,
+    /// OS name+version, CPU architecture, and -- when a scanner session has
+    /// established them -- firmware revision and adapter/holder. Every field
+    /// always renders, falling back to `unknownFieldValue` rather than being
+    /// silently omitted, so a reader never has to wonder whether a value was
+    /// dropped versus genuinely undetermined.
+    private static func appendBuildHeader(
+        to lines: inout [String],
+        context: ErrorPresentationContext
+    ) {
+        lines.append("ScanStudio version: \(rendered(context.scanStudioVersion))")
+        lines.append("Operating system: \(rendered(context.operatingSystemVersion))")
+        lines.append("CPU architecture: \(rendered(context.cpuArchitecture))")
+        lines.append("Scanner firmware: \(rendered(context.scannerFirmware))")
+        lines.append("Adapter: \(rendered(context.scannerAdapter))")
+        lines.append("Holder: \(rendered(context.scannerHolder))")
+    }
+
+    private static func rendered(_ value: String?) -> String {
+        guard let value else { return unknownFieldValue }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? unknownFieldValue : trimmed
+    }
+
     private static func appendDiagnosticContext(
         to lines: inout [String],
-        context: ErrorPresentationContext,
-        includeLocalLogPath: Bool
+        context: ErrorPresentationContext
     ) {
         if let sessionID = context.diagnosticSessionId, !sessionID.isEmpty {
             lines.append("Diagnostic session: \(sessionID)")
@@ -365,11 +430,6 @@ public enum ErrorPresentationPolicy {
         }
         if let connectionSummary = context.connectionSummary, !connectionSummary.isEmpty {
             lines.append("Connection state: \(connectionSummary)")
-        }
-        if includeLocalLogPath,
-           let logPath = context.diagnosticLogRelativePath,
-           !logPath.isEmpty {
-            lines.append("Local log: \(logPath)")
         }
     }
 

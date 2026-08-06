@@ -128,4 +128,62 @@ struct SessionDiagnosticTimelineTests {
             "old-3.jsonl",
         ])
     }
+
+    @Test("The default retention matches the error report's 40-event window")
+    func defaultRetentionMatchesReportWindow() {
+        let timeline = SessionDiagnosticTimeline(sessionID: "defaults")
+        #expect(timeline.maximumEntries == ErrorPresentationPolicy.maximumRecentDiagnosticEvents)
+    }
+
+    @Test("Numbers, bools, arrays, and objects render as compact key=value lines with zero per-field coupling")
+    func genericFieldRendering() throws {
+        var timeline = SessionDiagnosticTimeline(sessionID: "generic-fields")
+
+        timeline.record(
+            timestamp: "2026-08-05T12:31:10Z",
+            event: "detector.scored",
+            fields: [
+                "confidence": 0.937,
+                "boxCount": 3,
+                "simulated": false,
+                "box": ["x": 10, "y": 20, "w": 30, "h": 40],
+                "scores": [0.1, 0.5, 0.9],
+            ]
+        )
+
+        let line = try #require(timeline.summaryLines.first)
+        // Field order is sorted by key, exactly like the existing string-only
+        // path -- adding a numeric/bool/nested field never needs a code
+        // change here or in the report builder.
+        #expect(line == "2026-08-05T12:31:10Z detector.scored "
+            + "box={h=40,w=30,x=10,y=20} boxCount=3 confidence=0.937 "
+            + "scores=[0.1,0.5,0.9] simulated=false")
+    }
+
+    @Test("Numeric and boolean fields persist as real JSON types, not stringified text")
+    func structuredFieldsPersistAsRealJSONTypes() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scanstudio-diagnostics-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var timeline = SessionDiagnosticTimeline(
+            sessionID: "typed-fields",
+            directory: directory
+        )
+        timeline.record(
+            event: "detector.scored",
+            fields: ["confidence": 0.5, "boxCount": 3, "simulated": true]
+        )
+
+        let logURL = try #require(timeline.logURL)
+        let line = try String(contentsOf: logURL, encoding: .utf8)
+            .split(separator: "\n")[0]
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        )
+        let fields = try #require(object["fields"] as? [String: Any])
+        #expect(fields["confidence"] as? Double == 0.5)
+        #expect(fields["boxCount"] as? Int == 3)
+        #expect(fields["simulated"] as? Bool == true)
+    }
 }

@@ -1,6 +1,7 @@
 import AppKit
 import ScanStudioKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(SessionModel.self) private var sessionModel
@@ -361,8 +362,10 @@ private struct WorkspaceErrorBanner: View {
     let onDismiss: () -> Void
 
     @Environment(\.openURL) private var openURL
+    @Environment(SessionModel.self) private var sessionModel
     @State private var isShowingTechnicalDetails = false
     @State private var didCopyTechnicalDetails = false
+    @State private var didSaveDiagnosticBundle = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -453,6 +456,23 @@ private struct WorkspaceErrorBanner: View {
                             .buttonStyle(.borderless)
                             .font(.system(size: 11, weight: .medium))
                             .accessibilityLabel("Copy technical details")
+
+                            Button {
+                                saveDiagnosticBundle()
+                            } label: {
+                                Label(
+                                    didSaveDiagnosticBundle ? "Saved" : "Save Diagnostic Bundle…",
+                                    systemImage: didSaveDiagnosticBundle ? "checkmark" : "shippingbox"
+                                )
+                                .frame(minHeight: 32)
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.system(size: 11, weight: .medium))
+                            .help(
+                                "Save a zip with this session's diagnostics, the report, "
+                                    + "and the roll preview when one is available"
+                            )
+                            .accessibilityLabel("Save diagnostic bundle")
                         }
 
                         ScrollView(.vertical) {
@@ -491,6 +511,37 @@ private struct WorkspaceErrorBanner: View {
             try? await Task.sleep(for: .seconds(1.5))
             didCopyTechnicalDetails = false
         }
+    }
+
+    /// Presents a native save panel, then writes `SessionModel
+    /// .makeDiagnosticBundleData()`'s zip bytes verbatim -- this view never
+    /// builds the archive itself, so the saved bundle always matches
+    /// whatever ScanStudioKit assembled (T-ERR-04).
+    private func saveDiagnosticBundle() {
+        let panel = NSSavePanel()
+        panel.title = "Save Diagnostic Bundle"
+        panel.nameFieldStringValue = "ScanStudio-Diagnostics-\(Self.diagnosticBundleTimestamp()).zip"
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let data = sessionModel.makeDiagnosticBundleData()
+        // Best-effort local save: a write failure leaves the banner's
+        // existing error state untouched rather than fabricating a new one.
+        try? data.write(to: url, options: .atomic)
+        didSaveDiagnosticBundle = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.5))
+            didSaveDiagnosticBundle = false
+        }
+    }
+
+    private static func diagnosticBundleTimestamp() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate, .withTime, .withTimeZone]
+        return formatter.string(from: Date())
+            .replacingOccurrences(of: ":", with: "")
     }
 }
 

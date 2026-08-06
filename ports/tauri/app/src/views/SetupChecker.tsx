@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { formatSetupCheckProbesAsText, setupCheckResults } from "../session/setupCheckResults";
 import styles from "./SetupChecker.module.css";
 
 export type ProbeStatus = "Ok" | "Fail" | "Unknown";
@@ -35,6 +36,7 @@ export default function SetupChecker() {
   const [probes, setProbes] = useState<ProbeResult[] | null>(null);
   const [maxRead, setMaxRead] = useState<MaxReadReport | null>(null);
   const [writeMode, setWriteMode] = useState<string | null>(null);
+  const [didCopyProbes, setDidCopyProbes] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -48,6 +50,10 @@ export default function SetupChecker() {
         setProbes(probeResults);
         setMaxRead(maxReadReport);
         setWriteMode(mode);
+        // Shares this run's results with the error-report builder (item 5):
+        // any report generated while this session's probe results exist
+        // appends them, id/status/detail, with no further wiring needed.
+        setupCheckResults.set(probeResults);
       })
       .catch(() => {
         if (cancelled) return;
@@ -68,9 +74,25 @@ export default function SetupChecker() {
     );
   }
 
+  const copyProbesAsText = () => {
+    void navigator.clipboard.writeText(formatSetupCheckProbesAsText(probes)).then(() => {
+      setDidCopyProbes(true);
+      setTimeout(() => setDidCopyProbes(false), 1500);
+    });
+  };
+
   return (
     <div className={styles.viewShell} data-testid="setup-checker">
       <h2 className={styles.heading}>Windows Setup Checker</h2>
+      <button
+        type="button"
+        onClick={copyProbesAsText}
+        disabled={probes.length === 0}
+        data-testid="copy-probes-as-text"
+        aria-label="Copy probe results as text"
+      >
+        {didCopyProbes ? "Copied" : "Copy as text"}
+      </button>
       {writeMode !== "" && (
         <p className={styles.writeMode} data-testid="write-mode-row">
           <strong>Write mode:</strong> {writeMode}
