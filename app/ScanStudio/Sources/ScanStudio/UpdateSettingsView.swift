@@ -111,7 +111,15 @@ struct UpdateSettingsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Update available: \(candidate.version.raw)")
                 if model.pendingInstallURL != nil {
-                    Label("Restart to finish", systemImage: "arrow.triangle.2.circlepath")
+                    Button {
+                        model.relaunchToFinishUpdate()
+                    } label: {
+                        Label("Relaunch Now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(model.jobActive)
+                    .help(model.jobActive
+                        ? "Relaunch is disabled while a scan is active."
+                        : "Quit and reopen Scan Studio to finish the update.")
                 } else if let progress = model.installProgress {
                     ProgressView(
                         value: progress,

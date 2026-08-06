@@ -135,6 +135,22 @@ private struct FrameTransformCommands: Commands {
     }
 }
 
+/// The real `AppRelaunching`: spawns a detached new process for the app at
+/// `appURL` via `/usr/bin/open -n`, so the fresh instance is independent of
+/// the quitting one. `UpdateFlowModel.relaunchToFinishUpdate()` only calls
+/// `NSApp.terminate` after this returns without throwing. Kept in the
+/// executable target -- spawning a process and quitting the running app are
+/// host/AppKit concerns -- with only the guard/routing logic (`RelaunchCoordinator`)
+/// living in ScanStudioKit, where it is unit tested with a fake instead.
+private struct ProcessAppRelauncher: AppRelaunching {
+    func relaunch(appURL: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-n", appURL.path]
+        try process.run()
+    }
+}
+
 /// What `ScanStudioApp` could build at launch: either a working
 /// `EngineClient`/`SessionModel` pair, or — if `EngineLocator.locate()`
 /// threw — a message describing exactly why, surfaced in the window rather
@@ -261,7 +277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             installer: installer,
             installedVersion: Self.installedUpdateVersion(),
             channelDefaultsKey: "ScanStudio.updateChannel",
-            launchCheckEnabledDefaultsKey: "ScanStudio.checkForUpdatesAtLaunch"
+            launchCheckEnabledDefaultsKey: "ScanStudio.checkForUpdatesAtLaunch",
+            relauncher: ProcessAppRelauncher()
         )
     }
 

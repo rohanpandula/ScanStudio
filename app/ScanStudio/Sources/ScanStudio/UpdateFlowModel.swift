@@ -1,13 +1,23 @@
 // In-app update flow (01-05): the host-owned model behind the Settings scene,
 // PLUS the launch-time "Update Now" / "Not Now" offer (feat/launch-update-offer).
-// Renders honest check/install/rollback state and enforces the AUT-05-GUARD:
-// no install while a scan/preview job is active. The model itself never
-// relaunches the app, never auto-installs, and never touches the scanner --
-// it only mutates observable state and drives the ScanStudioKit services
-// (checker, downloader, installer, and now the launch-offer model) on
-// explicit user action. Relaunch wiring is deliberately out of scope here and
-// left to explicit user confirmation ("Restart to finish"), per the plan.
+// Renders honest check/install/rollback state and enforces the job-active
+// guard: no install, and no relaunch, while a scan/preview job is active. The
+// model itself never auto-installs and never touches the scanner -- it only
+// mutates observable state and drives the ScanStudioKit services (checker,
+// downloader, installer, launch-offer model, relaunch coordinator) on
+// explicit user action.
+//
+// Relaunching used to be left entirely to the user quitting and reopening the
+// app by hand: "Restart to finish" was instructional copy attached to inert
+// text/labels, not a wired control (field-found 2026-08-05 running the first
+// real beta.1 -> beta.2 update: clicking it twice did nothing, and the swap
+// only actually took effect once the user quit via the menu). It is now a
+// real "Relaunch Now" action routed through an injected `AppRelaunching`, so
+// the actual process spawn is a real side effect only in production while the
+// guard/routing logic is unit tested in ScanStudioKit with a fake (see
+// RelaunchCoordinatorTests).
 
+import AppKit
 import Foundation
 import Observation
 import ScanStudioKit
@@ -43,6 +53,9 @@ final class UpdateFlowModel {
     /// Gates + runs the once-per-launch check and owns the offer's
     /// shown/dismissed state (ScanStudioKit; unit tested there directly).
     private let launchOfferModel: LaunchUpdateOfferModel
+    /// Guard + routing for "Relaunch Now" (ScanStudioKit; unit tested there
+    /// directly with a fake `AppRelaunching`).
+    private let relaunchCoordinator: RelaunchCoordinator
 
     /// Release channel the user is on. Persisted on change. The `.alpha` raw
     /// value is retained for compatibility and represents all prereleases.
@@ -102,6 +115,7 @@ final class UpdateFlowModel {
         installedVersion: UpdateVersion,
         channelDefaultsKey: String,
         launchCheckEnabledDefaultsKey: String,
+        relauncher: any AppRelaunching,
         defaults: UserDefaults = .standard
     ) {
         self.checker = checker
@@ -111,6 +125,7 @@ final class UpdateFlowModel {
         self.channelDefaultsKey = channelDefaultsKey
         self.launchCheckEnabledDefaultsKey = launchCheckEnabledDefaultsKey
         self.launchOfferModel = LaunchUpdateOfferModel(checker: checker, installedVersion: installedVersion)
+        self.relaunchCoordinator = RelaunchCoordinator(relauncher: relauncher)
         self.defaults = defaults
         if let stored = defaults.string(forKey: channelDefaultsKey),
            let parsed = UpdateChannel(rawValue: stored) {
@@ -176,10 +191,34 @@ final class UpdateFlowModel {
         await install()
     }
 
+    // MARK: - Relaunch
+
+    /// "Relaunch Now": spawns a fresh process at the install destination and
+    /// quits the current one via the normal `NSApp.terminate` path (so
+    /// `AppDelegate.applicationWillTerminate` still cleans up the engine
+    /// client exactly as a manual Quit would). Refuses while `jobActive`
+    /// (mirrors AUT-05-GUARD) and surfaces a failure through the same
+    /// `checkState = .failed(...)` idiom `install()` uses, rather than
+    /// silently doing nothing -- which is what the old inert "Restart to
+    /// finish" text/label did.
+    func relaunchToFinishUpdate() {
+        guard let destinationPath = pendingInstallDestination else { return }
+        let appURL = URL(fileURLWithPath: destinationPath, isDirectory: true)
+            .appendingPathComponent("ScanStudio.app", isDirectory: true)
+        do {
+            try relaunchCoordinator.relaunch(appURL: appURL, jobActive: jobActive)
+        } catch {
+            checkState = .failed(Self.describe(error))
+            return
+        }
+        NSApp.terminate(nil)
+    }
+
     /// Downloads, verifies, and installs the offered candidate. Gated on
     /// `!jobActive` (AUT-05-GUARD). On success this leaves `pendingInstallURL`
-    /// set so the Settings scene shows "Restart to finish" -- it never
-    /// auto-relaunches.
+    /// set so the Settings scene offers "Relaunch Now" -- installing never
+    /// auto-relaunches by itself; relaunching is always the separate,
+    /// explicit action above.
     func install() async {
         guard !jobActive else {
             checkState = .failed("Cannot install while a scan is active.")
@@ -218,7 +257,7 @@ final class UpdateFlowModel {
     }
 
     /// Restores the 01-03 snapshot, if any. Best-effort; never crashes. Clears
-    /// the "Restart to finish" marker on success.
+    /// the pending-install ("Relaunch Now") marker on success.
     func rollback() async {
         do {
             try installer.restorePrevious()
@@ -264,6 +303,10 @@ final class UpdateFlowModel {
             return "The current user cannot write to the app folder; install to ~/Applications (or add an administrator account) and try again."
         case UpdateInstallError.rolledBack:
             return "No previous version was available to roll back to."
+        case RelaunchError.jobActive:
+            return "Cannot relaunch while a scan is active."
+        case RelaunchError.launchFailed:
+            return "Scan Studio could not relaunch itself. Quit and reopen it manually to finish the update."
         default:
             return String(describing: error)
         }
