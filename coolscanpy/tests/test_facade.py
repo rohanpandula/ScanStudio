@@ -2699,10 +2699,33 @@ class TestRollPreview:
         closer_errors: list[BaseException] = []
         consumer: threading.Thread | None = None
         closer: threading.Thread | None = None
+        # Unlike this class's other concurrent-close tests, this one has to
+        # drive close_from_callback through the real scan_many()/on_progress
+        # path -- not a hand-rolled generator handed to
+        # _reserve_batch_locked() -- because the regression lives in
+        # _invoke_progress()'s real dispatch. That path costs two thread
+        # hops before the callback ever runs (this test's own consumer
+        # thread, then _scan_many's internal worker_thread, which is only
+        # created on that thread's first next() call) plus real fake-process
+        # file I/O under tmp_path, so it is measurably heavier than the
+        # sibling tests' single-hop handshakes. A 2026-08-06 GitHub Actions
+        # run (31063964944) timed out callback_entered.wait(timeout=10) with
+        # zero signal under runner load -- not a near-miss, so a longer
+        # fixed timeout alone would still be a guess. Using one shared
+        # deadline for every wait in this handshake (instead of each
+        # restarting its own fixed timeout) is what makes it deterministic:
+        # a slow-but-progressing run always sees its true remaining budget,
+        # so no downstream wait can starve just because it happens to start
+        # later than an upstream one measured against the same nominal
+        # duration.
+        deadline = time.monotonic() + 30.0
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
 
         def close_from_callback(_progress: coolscanpy.Progress) -> None:
             callback_entered.set()
-            if not callback_may_reenter_close.wait(timeout=10):
+            if not callback_may_reenter_close.wait(timeout=remaining()):
                 raise AssertionError("concurrent close never acquired Roll ownership")
             try:
                 roll.close()
@@ -2725,7 +2748,9 @@ class TestRollPreview:
 
             consumer = threading.Thread(target=consume, daemon=True)
             consumer.start()
-            assert callback_entered.wait(timeout=10)
+            assert callback_entered.wait(timeout=remaining()), (
+                "scan_many's worker thread never invoked the progress callback"
+            )
 
             def close_from_other_thread() -> None:
                 try:
@@ -2738,8 +2763,8 @@ class TestRollPreview:
             with roll._state_condition:
                 assert roll._state_condition.wait_for(
                     lambda: roll._closing,
-                    timeout=10,
-                )
+                    timeout=remaining(),
+                ), "concurrent Roll.close() never acquired the closing state"
             callback_may_reenter_close.set()
 
             returned_without_rescue = callback_returned.wait(timeout=3)
