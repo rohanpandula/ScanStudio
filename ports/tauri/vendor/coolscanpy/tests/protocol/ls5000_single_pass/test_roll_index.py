@@ -655,6 +655,26 @@ def test_gap_beyond_alignment_window_raises_direct_support_floor_with_diagnostic
     assert json.dumps(diagnostics, sort_keys=True) in str(error)
 
 
+def test_autocorrelation_lag_search_matches_declared_pitch_band() -> None:
+    """P2 (FEEDING-ROBUSTNESS-20260805.md).  The lag search now spans the
+    same ``[0.85, 1.15] * nominal`` band the refined-pitch check already
+    declares acceptable (:879), closing the dead zone where a real
+    periodicity existed but the old ``[0.90, 1.10]`` search never looked.
+    Pitches just inside the widened band now resolve; pitches just outside
+    it still correctly refuse.
+    """
+    for pitch in (125, 165):  # inside [0.85, 1.15] * 145, outside the old band
+        rgb, _boundaries = _synthetic_roll(30, pitch=pitch, leader=30, tail=30)
+        detection = _detect(rgb)
+        assert detection.confidence == "high"
+        assert detection.pitch_rows == pytest.approx(pitch, abs=0.01)
+
+    for pitch in (123, 167):  # just outside even the widened [0.85, 1.15] band
+        rgb, _boundaries = _synthetic_roll(30, pitch=pitch, leader=30, tail=30)
+        with pytest.raises(roll.IndexDecodeError):
+            _detect(rgb)
+
+
 def _boundary(
     index: int,
     row: int,

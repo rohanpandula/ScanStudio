@@ -969,8 +969,16 @@ def detect_roll_frames(
         anchor_centers.append((start + end - 1) / 2.0)
 
     centered = anchor_signal - float(anchor_signal.mean())
-    lag_min = max(3, int(math.floor(nominal_frame_rows * 0.90)))
-    lag_max = min(len(evidence) - 3, int(math.ceil(nominal_frame_rows * 1.10)))
+    # Matches the band the final refined-pitch check below already declares
+    # acceptable (0.85x/1.15x nominal). The search used to stop at
+    # 0.90x/1.10x, so pitches the band check would happily accept were
+    # structurally unreachable here -- a real dead zone, always reported as
+    # "no physical gap periodicity" (misleading: the periodicity exists, the
+    # search simply never looked there). Replayed bit-identical (frame
+    # origins, pitch, confidence) on all 44 real archived LS-5000 whole-roll
+    # previews in the corpus; see FEEDING-ROBUSTNESS-20260805.md P2.
+    lag_min = max(3, int(math.floor(nominal_frame_rows * 0.85)))
+    lag_max = min(len(evidence) - 3, int(math.ceil(nominal_frame_rows * 1.15)))
     correlations: list[tuple[float, int]] = []
     for lag in range(lag_min, lag_max + 1):
         value = float(np.dot(centered[:-lag], centered[lag:]) / (len(centered) - lag))
