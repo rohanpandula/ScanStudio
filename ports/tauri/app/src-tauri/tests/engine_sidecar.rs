@@ -3,12 +3,22 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use scanstudio_app_lib::engine::{dispatch_line, engine_request, spawn_engine, EngineError};
+use scanstudio_app_lib::engine::{dispatch_line, EngineError};
 use serde_json::Value;
-use tauri::Manager;
-use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
+
+// tauri::test's mocked runtime is Windows-CI-broken (see the cfg-gated test
+// below), so everything that touches it -- these two imports plus the test
+// itself -- stays behind the same `not(windows)` gate. dispatch_line/
+// EngineError above are used by the always-on handshake_against_real_engine_binary
+// test too and stay unconditional.
+#[cfg(not(windows))]
+use scanstudio_app_lib::engine::{engine_request, spawn_engine};
+#[cfg(not(windows))]
+use tauri::Manager;
+#[cfg(not(windows))]
+use tauri_plugin_shell::ShellExt;
 
 type PendingMap = Mutex<HashMap<u64, oneshot::Sender<Result<Value, EngineError>>>>;
 
@@ -147,6 +157,25 @@ async fn handshake_against_real_engine_binary() {
 /// `CommandChild`/`CommandEvent` types it returns do not depend on the
 /// windowing runtime, only `Manager::manage`/`AppHandle::state` do, and both
 /// work identically under `tauri::test::mock_builder`'s `MockRuntime`.
+///
+/// `not(windows)`: on the Windows CI runner, linking `tauri::test`'s mocked
+/// runtime into a bare `cargo test` binary (never `tauri build`'s bundling
+/// step, which is what normally stages WebView2's loader next to the real
+/// app's exe) fails DLL entry-point resolution at process start --
+/// `engine_sidecar-*.exe` exits `0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND`
+/// before any test body runs, taking the whole binary (including the
+/// unrelated `handshake_against_real_engine_binary` test above) down with
+/// it. This is a Windows-CI-only linkage gap in `tauri::test`, not a gap in
+/// coverage: the handshake gate itself (`await_handshake`/`HandshakeState`)
+/// is platform-independent Rust with no windowing/runtime dependency at all,
+/// and is unit-tested on every platform including Windows by
+/// `await_handshake_resolves_immediately_when_already_ready`,
+/// `await_handshake_propagates_the_recorded_failure`, and
+/// `await_handshake_blocks_a_caller_until_pending_resolves` in
+/// `src/engine.rs`. This exact field sequence, wired through the real
+/// production `spawn_engine`/`engine_request` path, still runs end-to-end on
+/// every PR via the macOS and Linux Verify/ports.yml lanes.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn field_sequence_succeeds_without_the_frontend_ever_sending_hello() {
     let engine_path = match std::env::var("SCANSTUDIO_ENGINE_PATH") {
