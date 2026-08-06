@@ -44,13 +44,34 @@ pub trait CommandExecutor {
 /// is simply never invoked by any test or verification step on this host.
 pub struct RealCommandExecutor;
 
+/// wsl.exe emits UTF-16LE on stock Windows consoles; decoding those bytes as
+/// UTF-8 interleaves NULs and no substring probe can match. Valid UTF-8
+/// console output never contains NUL, so a NUL anywhere is the discriminator.
+fn decode_console_bytes(bytes: &[u8]) -> String {
+    if bytes.contains(&0) {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 impl CommandExecutor for RealCommandExecutor {
     fn run(&self, program: &str, args: &[&str]) -> CommandOutput {
-        match std::process::Command::new(program).args(args).output() {
+        // WSL_UTF8=1 asks modern wsl.exe for UTF-8 directly; the decoder above
+        // still covers older builds that ignore it. Inert for other programs.
+        match std::process::Command::new(program)
+            .env("WSL_UTF8", "1")
+            .args(args)
+            .output()
+        {
             Ok(output) => CommandOutput {
                 success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stdout: decode_console_bytes(&output.stdout),
+                stderr: decode_console_bytes(&output.stderr),
             },
             Err(e) => CommandOutput {
                 success: false,
@@ -704,5 +725,28 @@ mod tests {
             describe_max_read(&some),
             "max single read observed: 5242880 bytes across 4 scan.call entries"
         );
+    }
+
+    #[test]
+    fn utf16le_wsl_status_bytes_decode_to_matchable_text() {
+        let text = "Default Distribution: Ubuntu-24.04\r\nDefault Version: 2\r\n";
+        let bytes: Vec<u8> = text
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        let decoded = super::decode_console_bytes(&bytes);
+        assert!(decoded.to_lowercase().contains("ubuntu-24.04"), "{decoded:?}");
+        assert!(
+            decoded
+                .lines()
+                .any(|l| l.trim_start().starts_with("Default Version:") && l.contains('2')),
+            "{decoded:?}"
+        );
+    }
+
+    #[test]
+    fn utf8_console_bytes_pass_through_unchanged() {
+        let text = "Default Distribution: Ubuntu-24.04\nDefault Version: 2\n";
+        assert_eq!(super::decode_console_bytes(text.as_bytes()), text);
     }
 }
