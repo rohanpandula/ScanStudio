@@ -108,14 +108,30 @@ struct UpdateSettingsView: View {
         case .upToDate:
             Label("You're up to date", systemImage: "checkmark.circle")
         case .updateAvailable(let candidate):
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Update available: \(candidate.version.raw)")
+            // Made visually unmissable (field feedback 2026-08-05: a first
+            // live update read as "nothing happened" when this was just a
+            // plain Text row with a plain-style button). Same amber-card
+            // idiom WorkspaceErrorBanner uses for red errors, and the same
+            // prominent-tinted-button idiom already used for primary actions
+            // elsewhere (Save & Scan, Acquire Previews, device connect).
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Update available: \(candidate.version.raw)", systemImage: "arrow.down.circle.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.scanStudioAmber)
+
                 if model.pendingInstallURL != nil {
+                    // The prominent next action once install() has already
+                    // swapped the bundle on disk (feat/launch-update-offer,
+                    // field fix: this used to be an inert Label).
                     Button {
                         model.relaunchToFinishUpdate()
                     } label: {
                         Label("Relaunch Now", systemImage: "arrow.triangle.2.circlepath")
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.scanStudioAmber)
+                    .foregroundStyle(.black)
                     .disabled(model.jobActive)
                     .help(model.jobActive
                         ? "Relaunch is disabled while a scan is active."
@@ -129,12 +145,20 @@ struct UpdateSettingsView: View {
                     Button("Install Update") {
                         Task { await model.install() }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.scanStudioAmber)
+                    .foregroundStyle(.black)
                     .disabled(model.jobActive)
                     .help(model.jobActive
                         ? "Install is disabled while a scan is active."
                         : "Download, verify, and install this update.")
                 }
             }
+            .padding(12)
+            .background(
+                Color.scanStudioAmber.opacity(0.14),
+                in: RoundedRectangle(cornerRadius: ScanStudioMetrics.cardCornerRadius)
+            )
         case .failed(let message):
             Text(message)
                 .foregroundStyle(.red)
