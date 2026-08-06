@@ -23,3 +23,10 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "proce
 url = "2"
 image = { version = "0.25.10", default-features = false, features = ["tiff", "png", "jpeg"] }
 lru = "0.18.1"
+
+[dev-dependencies]
+# Adds tauri::test's mock_builder/mock_context (a zero-dependency cfg gate --
+# see upstream's `test = []` feature) so the engine_sidecar integration test
+# can drive spawn_engine's real handshake-gating code against a mocked,
+# windowless runtime instead of a real display.
+tauri = { version = "2.11.5", features = ["test"] }

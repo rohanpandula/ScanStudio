@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State, Wry};
-use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State, Wry};
+use tauri_plugin_shell::process::{Command, CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::wsl::bridge_cmd::{
     build_engine_env, BRIDGE_ENTRYPOINT, HW_MOTION_ENV_VAR, WSLENV_ENV_VAR,
@@ -26,12 +26,53 @@ type PendingMap = Mutex<HashMap<u64, oneshot::Sender<Result<Value, EngineError>>
 // taking longer than this means it was lost and the waiter must not hang.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Hello-handshake outcome for one spawned engine process. Starts `Pending`
+/// and resolves exactly once, from the handshake task `spawn_engine` starts
+/// (below), to `Ready` or `Failed`. The engine enforces `engine.hello` as the
+/// first request on a freshly spawned process's stdin (server.rs's
+/// `reject_before_hello`); this is what makes that true for every caller
+/// instead of trusting each call site to remember it.
+#[derive(Clone, Debug)]
+enum HandshakeState {
+    Pending,
+    Ready,
+    Failed(EngineError),
+}
+
+/// Blocks until this process's handshake has resolved -- immediately if it
+/// already has (the common case: by the time any real request is fired, the
+/// handshake task finished long ago), otherwise until the handshake task
+/// sends `Ready`/`Failed`. Every `send_request` caller goes through this
+/// before writing anything to the child's stdin, so `engine.hello` is
+/// structurally guaranteed to be the first line written on every connection,
+/// regardless of how early the frontend's first request arrives relative to
+/// the handshake task actually running.
+async fn await_handshake(handshake: &watch::Sender<HandshakeState>) -> Result<(), EngineError> {
+    let mut rx = handshake.subscribe();
+    let outcome = rx
+        .wait_for(|state| !matches!(state, HandshakeState::Pending))
+        .await
+        .map_err(|_| EngineError {
+            code: "INTERNAL".into(),
+            message: "engine handshake never completed".into(),
+            recoverable: false,
+        })?;
+    match &*outcome {
+        HandshakeState::Ready => Ok(()),
+        HandshakeState::Failed(err) => Err(err.clone()),
+        HandshakeState::Pending => unreachable!("wait_for only returns on a non-Pending value"),
+    }
+}
+
 pub struct EngineHandle {
     // Option because CommandChild::kill(self) consumes the child, so it must
     // be .take()-n out of the Mutex rather than called through the guard.
     child: Mutex<Option<CommandChild>>,
     next_id: AtomicU64,
     pending: PendingMap,
+    // Resolved once by the handshake task `spawn_engine` starts for this
+    // process; `send_request` awaits it before writing anything else.
+    handshake: watch::Sender<HandshakeState>,
 }
 
 /// Explicit environment additions for the engine sidecar.
@@ -205,13 +246,33 @@ pub fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>
             windows_hw_motion.as_deref(),
             windows_wslenv.as_deref(),
         ));
+    spawn_engine(&app.handle().clone(), command)
+}
+
+/// Spawns `command`, wires its stdout into the shared pending/event dispatch,
+/// and starts the `engine.hello` handshake task -- the exact sequence a real
+/// connection to the engine needs, regardless of which `Command` produced it
+/// (the bundled sidecar in production, or a plain path to a locally built
+/// binary in tests). Generic over `R` (rather than pinned to the production
+/// `Wry` runtime) so the integration test can drive this identical code path
+/// against `tauri::test::mock_builder`'s `MockRuntime` instead of
+/// re-implementing spawn/wire/handshake by hand -- `Command::spawn` and the
+/// `CommandChild`/`CommandEvent` types it returns do not depend on the
+/// runtime at all, only `Manager::manage`/`AppHandle::state` do, and both
+/// work identically under a mocked runtime.
+pub fn spawn_engine<R: Runtime>(
+    app: &AppHandle<R>,
+    command: Command,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mut rx, child) = command.spawn()?;
+    let (handshake_tx, _handshake_rx) = watch::channel(HandshakeState::Pending);
     app.manage(EngineHandle {
         child: Mutex::new(Some(child)),
         next_id: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),
+        handshake: handshake_tx,
     });
-    let app_handle = app.handle().clone();
+    let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
@@ -242,10 +303,51 @@ pub fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>
         let state = app_handle.state::<EngineHandle>();
         fail_pending_requests(&state);
     });
+
+    // Send engine.hello on this freshly spawned process before any other
+    // request can reach it, and resolve the handshake gate from the outcome.
+    // This runs concurrently with the reader task above (which routes the
+    // hello response back through the same `pending` map) rather than
+    // blocking `spawn_engine`/`setup`, so a slow handshake delays only
+    // engine-bound requests -- never app startup -- while `send_request`
+    // (every production caller's sole entry point) waits on
+    // `await_handshake` before writing anything, so ordering holds no matter
+    // how early the frontend fires its first request relative to this task
+    // actually running. `send_request_unchecked` is used here specifically
+    // because it is what resolves the gate `send_request` waits on.
+    let app_handle_for_hello = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_handle_for_hello.state::<EngineHandle>();
+        let outcome = send_request_unchecked(
+            &state,
+            "engine.hello",
+            serde_json::json!({
+                "clientName": env!("CARGO_PKG_NAME"),
+                "protocolVersion": 1,
+            }),
+        )
+        .await;
+        let resolved = match outcome {
+            Ok(_) => HandshakeState::Ready,
+            Err(err) => {
+                eprintln!("[engine handshake failed] {err:?}");
+                HandshakeState::Failed(err)
+            }
+        };
+        // No receiver (e.g. every request so far happened to already be
+        // gone) is not an error here -- there is nothing left to unblock.
+        let _ = state.handshake.send(resolved);
+    });
+
     Ok(())
 }
 
-async fn send_request(
+/// Writes one request line to the child's stdin and awaits its response
+/// (bounded by `RESPONSE_TIMEOUT`). Does not itself wait on the handshake --
+/// the handshake task above is the one caller allowed to skip that wait,
+/// since it is what resolves it. Every other caller must go through
+/// `send_request`.
+async fn send_request_unchecked(
     state: &State<'_, EngineHandle>,
     method: &str,
     params: Value,
@@ -288,6 +390,22 @@ async fn send_request(
             })
         }
     }
+}
+
+/// Production entry point for every engine request except the handshake
+/// itself: waits for `engine.hello` to have completed on this process before
+/// writing anything, so `engine_request` (the sole path from the frontend to
+/// the engine) can never win a race against the handshake and trip the
+/// engine's `reject_before_hello` guard (server.rs:678-687) -- regardless of
+/// how early the frontend fires its first request after launch, or after any
+/// future respawn that resets the same gate.
+async fn send_request(
+    state: &State<'_, EngineHandle>,
+    method: &str,
+    params: Value,
+) -> Result<Value, EngineError> {
+    await_handshake(&state.handshake).await?;
+    send_request_unchecked(state, method, params).await
 }
 
 #[tauri::command]
@@ -519,6 +637,7 @@ mod tests {
             child: Mutex::new(None),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
+            handshake: watch::channel(HandshakeState::Ready).0,
         };
         let (tx, mut rx) = oneshot::channel();
         handle.pending.lock().unwrap().insert(5, tx);
@@ -547,5 +666,54 @@ mod tests {
             panic!("no event expected")
         });
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn await_handshake_resolves_immediately_when_already_ready() {
+        let (tx, _rx) = watch::channel(HandshakeState::Ready);
+        await_handshake(&tx)
+            .await
+            .expect("an already-ready handshake must not block or error");
+    }
+
+    #[tokio::test]
+    async fn await_handshake_propagates_the_recorded_failure() {
+        let failure = EngineError {
+            code: "INTERNAL".into(),
+            message: "engine process terminated".into(),
+            recoverable: false,
+        };
+        let (tx, _rx) = watch::channel(HandshakeState::Failed(failure.clone()));
+        let err = await_handshake(&tx)
+            .await
+            .expect_err("a failed handshake must be reported to the caller");
+        assert_eq!(err, failure);
+    }
+
+    // Regression coverage for the field bug (engine.hello arriving after a
+    // request it should have gated): proves `await_handshake` genuinely
+    // blocks while `Pending` -- not just that it "eventually" returns Ok,
+    // which a no-op gate would also do -- and only unblocks once the
+    // handshake task resolves it, in the order that happened.
+    #[tokio::test]
+    async fn await_handshake_blocks_a_caller_until_pending_resolves() {
+        let (tx, _rx) = watch::channel(HandshakeState::Pending);
+        let tx = std::sync::Arc::new(tx);
+        let tx_for_waiter = tx.clone();
+        let waiter = tokio::spawn(async move { await_handshake(&tx_for_waiter).await });
+
+        // Let the waiter task actually run and park on the still-Pending
+        // state before we resolve it.
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a request must not proceed while the handshake is still Pending"
+        );
+
+        tx.send(HandshakeState::Ready).expect("receiver still live");
+        waiter
+            .await
+            .expect("waiter task must not panic")
+            .expect("must resolve Ok once Ready is sent");
     }
 }
