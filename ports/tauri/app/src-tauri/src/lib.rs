@@ -1,3 +1,4 @@
+pub mod diagnostics;
 pub mod engine;
 pub mod preview;
 mod wsl;
@@ -107,13 +108,16 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_os::init())
         .register_uri_scheme_protocol("scanstudio-preview", preview::handle_request)
         .invoke_handler(tauri::generate_handler![
             engine::engine_request,
             engine::engine_state,
             wsl_run_checks,
             wsl_max_read_report,
-            wsl_write_mode_report
+            wsl_write_mode_report,
+            diagnostics::write_diagnostic_bundle,
+            diagnostics::read_preview_raster
         ])
         .setup(|app| engine::setup(app))
         .build(tauri::generate_context!())
