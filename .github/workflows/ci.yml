@@ -7,6 +7,15 @@ on:
 permissions:
   contents: read
 
+# Every push runs the full macOS matrix, so a quickly-superseded commit leaves
+# an obsolete run holding runners ahead of the one that matters. Mirrors
+# ports.yml. Release deliberately keeps cancel-in-progress: false -- a tagged
+# build must never be interrupted -- but nothing consumes a Verify run via
+# workflow_run, so cancelling a superseded one here is safe.
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   app-and-engine:
     name: App and engine tests
