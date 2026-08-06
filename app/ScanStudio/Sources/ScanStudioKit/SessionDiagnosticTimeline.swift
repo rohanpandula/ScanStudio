@@ -1,5 +1,111 @@
 import Foundation
 
+/// A generic, JSON-shaped diagnostic field value. Event authors may record a
+/// string, a number, a boolean, or a nested array/object without the report
+/// renderer ever needing per-event or per-key knowledge of the shape --
+/// future instrumentation (e.g. detector confidence scores) starts rendering
+/// into reports the moment it starts recording a field, with zero coupling
+/// to `SessionDiagnosticEntry.summaryLine` or the error-report builder.
+public enum DiagnosticFieldValue: Equatable, Sendable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case array([DiagnosticFieldValue])
+    case object([String: DiagnosticFieldValue])
+
+    /// Compact, single-line rendering used by `SessionDiagnosticEntry
+    /// .summaryLine` and, transitively, every generated error report. Never
+    /// multi-line and never pretty-printed JSON -- nested values still
+    /// collapse into one `key=value` diagnostic line.
+    public var compactDescription: String {
+        switch self {
+        case .string(let value):
+            return value
+        case .number(let value):
+            return DiagnosticFieldValue.formatNumber(value)
+        case .bool(let value):
+            return value ? "true" : "false"
+        case .array(let values):
+            return "[" + values.map(\.compactDescription).joined(separator: ",") + "]"
+        case .object(let fields):
+            let rendered = fields
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value.compactDescription)" }
+                .joined(separator: ",")
+            return "{\(rendered)}"
+        }
+    }
+
+    private static func formatNumber(_ value: Double) -> String {
+        if value.isFinite, value == value.rounded(), value.magnitude < 1e15 {
+            return String(Int64(value))
+        }
+        return String(value)
+    }
+}
+
+extension DiagnosticFieldValue: ExpressibleByStringLiteral {
+    public init(stringLiteral value: String) { self = .string(value) }
+}
+
+extension DiagnosticFieldValue: ExpressibleByIntegerLiteral {
+    public init(integerLiteral value: Int) { self = .number(Double(value)) }
+}
+
+extension DiagnosticFieldValue: ExpressibleByFloatLiteral {
+    public init(floatLiteral value: Double) { self = .number(value) }
+}
+
+extension DiagnosticFieldValue: ExpressibleByBooleanLiteral {
+    public init(booleanLiteral value: Bool) { self = .bool(value) }
+}
+
+extension DiagnosticFieldValue: ExpressibleByArrayLiteral {
+    public init(arrayLiteral elements: DiagnosticFieldValue...) { self = .array(elements) }
+}
+
+extension DiagnosticFieldValue: ExpressibleByDictionaryLiteral {
+    public init(dictionaryLiteral elements: (String, DiagnosticFieldValue)...) {
+        self = .object(Dictionary(uniqueKeysWithValues: elements))
+    }
+}
+
+/// Round-trips through the timeline's durable JSONL log as plain JSON --
+/// a string field stays a JSON string, a number stays a JSON number, and so
+/// on -- so the on-disk log and the in-memory value never diverge in shape.
+extension DiagnosticFieldValue: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([DiagnosticFieldValue].self) {
+            self = .array(value)
+        } else if let value = try? container.decode([String: DiagnosticFieldValue].self) {
+            self = .object(value)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported DiagnosticFieldValue payload"
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value): try container.encode(value)
+        case .number(let value): try container.encode(value)
+        case .bool(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .object(let value): try container.encode(value)
+        }
+    }
+}
+
 /// One privacy-safe, structured decision or state transition from the current
 /// ScanStudio session. Callers supply only operational fields; paths, film
 /// metadata, image names, receipts, and device identifiers do not belong here.
@@ -7,13 +113,13 @@ public struct SessionDiagnosticEntry: Codable, Equatable, Sendable {
     public let timestamp: String
     public let sessionId: String
     public let event: String
-    public let fields: [String: String]
+    public let fields: [String: DiagnosticFieldValue]
 
     public init(
         timestamp: String,
         sessionId: String,
         event: String,
-        fields: [String: String]
+        fields: [String: DiagnosticFieldValue]
     ) {
         self.timestamp = timestamp
         self.sessionId = sessionId
@@ -24,7 +130,7 @@ public struct SessionDiagnosticEntry: Codable, Equatable, Sendable {
     public var summaryLine: String {
         let details = fields
             .sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
+            .map { "\($0.key)=\($0.value.compactDescription)" }
             .joined(separator: " ")
         return details.isEmpty
             ? "\(timestamp) \(event)"
@@ -90,7 +196,7 @@ public struct SessionDiagnosticTimeline: Sendable {
     public mutating func record(
         timestamp: String? = nil,
         event: String,
-        fields: [String: String] = [:]
+        fields: [String: DiagnosticFieldValue] = [:]
     ) {
         let entry = SessionDiagnosticEntry(
             timestamp: timestamp ?? SessionDiagnosticTimeline.currentTimestamp(),
