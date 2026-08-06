@@ -1,5 +1,6 @@
 """Regression contracts for whole-roll index decoding and dynamic frame origins."""
 
+import json
 import math
 import os
 import struct
@@ -483,6 +484,195 @@ def test_expected_count_must_be_an_integer_in_supported_range(expected: int) -> 
     rgb, _boundaries = _synthetic_roll(8, leader=91, tail=47)
     with pytest.raises(roll.IndexDecodeError, match="integer in 2..40"):
         _detect(rgb, expected_frame_count=expected)
+
+
+# --- P1: numeric diagnostics + stable ids on the physical-gap-count raises ---
+# (FEEDING-ROBUSTNESS-20260805.md P1). :810, :861 and :1085 (near-identical
+# prose to :810 but a different predicate, per the report's own reporting
+# hazard, Sec 1.0) were previously bare strings; each now carries a unique
+# ``error_id`` plus a numbers-only, JSON-safe ``diagnostics`` payload of
+# exactly what its predicate evaluated, mirroring how
+# ``preview_session._roll_session_diagnostics`` already instruments
+# ``RollSessionError`` (Lane C, C2).
+
+
+def _synthetic_roll_with_gap_rows(
+    boundary_rows: list[int],
+    *,
+    height: int,
+    band_halfwidth: int = 3,
+) -> np.ndarray:
+    """Like ``_synthetic_roll`` but with explicit clear-film gap rows and a
+    configurable band half-width, so a test can force run widths outside the
+    ``[3, 12]``-row narrow window or place a gap off the fitted lattice.
+    """
+    y = np.arange(height, dtype=np.int64)[:, None]
+    x = np.arange(90, dtype=np.int64)[None, :]
+    texture = (x * 173 + y * 71 + (x * y) % 997) % 7_000
+    aperture = np.empty((height, 90, 3), dtype=np.int64)
+    for channel, base in enumerate((7_000, 5_500, 4_000)):
+        aperture[:, :, channel] = base + texture * (3 - channel) // 2
+    clear_base = np.asarray((34_200, 25_500, 17_800), dtype=np.int64)
+    clear_noise = ((x * 19 + y * 13) % 301 - 150)[:, :, None]
+    for boundary in boundary_rows:
+        lo = max(0, boundary - band_halfwidth)
+        hi = min(height, boundary + band_halfwidth)
+        aperture[lo:hi] = clear_base + clear_noise[lo:hi]
+    rgb = np.empty((height, 96, 3), dtype=np.int64)
+    rgb[:, 2:92] = aperture
+    rgb[:, :2] = np.asarray((1_300, 1_000, 700))
+    rgb[:, 92:] = np.asarray((1_100, 850, 600))
+    return rgb.clip(0, 65_535).astype(np.uint16)
+
+
+def test_wide_gaps_raise_gap_count_floor_with_numeric_diagnostics() -> None:
+    """P1, site :810.  Six gaps widened to 20 rows (>12, discarded as "wide")
+    leaves zero narrow runs -- confirms the id and every field the predicate
+    actually evaluated.
+    """
+    boundary_rows = [200 + index * 143 for index in range(6)]
+    rgb = _synthetic_roll_with_gap_rows(
+        boundary_rows, height=6 * 145 + 200, band_halfwidth=10
+    )
+
+    with pytest.raises(roll.IndexDecodeError) as excinfo:
+        _detect(rgb)
+
+    error = excinfo.value
+    assert error.error_id == roll.GAP_COUNT_FLOOR_ERROR_ID
+    assert f"[{roll.GAP_COUNT_FLOOR_ERROR_ID}]" in str(error)
+    diagnostics = error.diagnostics
+    assert diagnostics["narrow_run_count"] == 0
+    assert diagnostics["narrow_run_count_required"] == 3
+    assert diagnostics["evidence_run_count"] == 6
+    assert diagnostics["discarded_wide_widths"] == [20] * 6
+    assert diagnostics["discarded_narrow_widths"] == []
+    assert diagnostics["raster_rows"] == rgb.shape[0]
+    assert diagnostics["aperture_width"] == 90
+    assert json.dumps(diagnostics, sort_keys=True) in str(error)
+
+
+def test_off_lattice_gap_raises_lattice_anchor_floor_with_numeric_diagnostics() -> None:
+    """P1, site :861-864.  Three narrow gaps clear the count floor, but the
+    third is 30 rows off the pitch the other two establish, so it cannot be
+    assigned to the fitted comb -- confirms the id and the lattice-specific
+    fields (autocorrelation, coarse pitch/phase, anchor residuals).
+    """
+    boundary_rows = [200, 345, 520]  # third displaced +30 rows from pitch 145
+    rgb = _synthetic_roll_with_gap_rows(boundary_rows, height=6 * 145, band_halfwidth=3)
+
+    with pytest.raises(roll.IndexDecodeError) as excinfo:
+        _detect(rgb)
+
+    error = excinfo.value
+    assert error.error_id == roll.GAP_LATTICE_ANCHOR_ERROR_ID
+    assert f"[{roll.GAP_LATTICE_ANCHOR_ERROR_ID}]" in str(error)
+    diagnostics = error.diagnostics
+    assert diagnostics["narrow_run_count"] == 3
+    assert diagnostics["anchor_center_count"] == 3
+    assert diagnostics["anchor_assignment_count"] == 2
+    assert diagnostics["anchor_assignment_count_required"] == 3
+    assert len(diagnostics["anchor_residual_rows"]) == 3
+    assert max(diagnostics["anchor_residual_rows"]) > 8.0
+    assert diagnostics["anchor_residuals_rejected_count"] == 1
+    assert diagnostics["autocorrelation_peak"] > 0
+    assert diagnostics["coarse_pitch_rows"] > 0
+    assert json.dumps(diagnostics, sort_keys=True) in str(error)
+
+
+def _synthetic_roll_with_isolated_trailing_gap(
+    *,
+    pitch: int = 145,
+    leading_gap: int = 300,
+    band_halfwidth: int = 3,
+    background_fraction: float = 0.80,
+    tail: int = 250,
+) -> np.ndarray:
+    """Two real content-bordered gaps (the alignment window's real evidence)
+    plus a third narrow gap two pitches further out, sitting in a flat,
+    content-free background. All three clear the count floor (:810) and the
+    lattice-anchor floor (:861), but the third lies outside the
+    content-driven alignment window: the window sees only 2 "direct"
+    boundaries out of the 3 required, tripping the near-twin at :1085
+    without tripping either earlier, differently-worded gate. The
+    background must be perfectly flat (zero row-to-row variation) -- any
+    noise crosses the derived content-range threshold and pulls the window
+    past the isolated third gap.
+    """
+    trailing_gap = leading_gap + 2 * pitch
+    isolated_gap = trailing_gap + pitch
+    height = isolated_gap + tail
+    y = np.arange(height, dtype=np.int64)[:, None]
+    x = np.arange(90, dtype=np.int64)[None, :]
+    texture = (x * 173 + y * 71 + (x * y) % 997) % 7_000
+    clear_base = np.asarray((34_200, 25_500, 17_800), dtype=np.int64)
+    clear_noise = ((x * 19 + y * 13) % 301 - 150)[:, :, None]
+
+    aperture = np.empty((height, 90, 3), dtype=np.int64)
+    aperture[:, :, :] = (clear_base * background_fraction).astype(np.int64)
+    for channel, base in enumerate((7_000, 5_500, 4_000)):
+        aperture[leading_gap:trailing_gap, :, channel] = (
+            base + texture[leading_gap:trailing_gap] * (3 - channel) // 2
+        )
+    for boundary in (leading_gap, trailing_gap, isolated_gap):
+        lo = max(0, boundary - band_halfwidth)
+        hi = min(height, boundary + band_halfwidth)
+        aperture[lo:hi] = clear_base + clear_noise[lo:hi]
+
+    rgb = np.empty((height, 96, 3), dtype=np.int64)
+    rgb[:, 2:92] = aperture
+    rgb[:, :2] = np.asarray((1_300, 1_000, 700))
+    rgb[:, 92:] = np.asarray((1_100, 850, 600))
+    return rgb.clip(0, 65_535).astype(np.uint16)
+
+
+def test_gap_beyond_alignment_window_raises_direct_support_floor_with_diagnostics() -> (
+    None
+):
+    """P1, near-twin site :1085.  A predicate distinct from :810 despite
+    near-identical prose (the report's reporting hazard, Sec 1.0): this one
+    fires on the content-truncated alignment window, evaluated ~270 lines
+    after the count floor, with its own id and payload.
+    """
+    rgb = _synthetic_roll_with_isolated_trailing_gap()
+
+    with pytest.raises(roll.IndexDecodeError) as excinfo:
+        _detect(rgb)
+
+    error = excinfo.value
+    assert error.error_id == roll.GAP_DIRECT_SUPPORT_ERROR_ID
+    assert error.error_id != roll.GAP_COUNT_FLOOR_ERROR_ID
+    assert f"[{roll.GAP_DIRECT_SUPPORT_ERROR_ID}]" in str(error)
+    diagnostics = error.diagnostics
+    assert diagnostics["narrow_run_count"] == 3  # the count floor (:810) passed
+    assert diagnostics["direct_support_count"] == 2
+    assert diagnostics["direct_support_count_required"] == 3
+    assert diagnostics["alignment_boundary_count"] == len(
+        diagnostics["alignment_boundary_supports"]
+    )
+    assert diagnostics["alignment_boundary_supports"].count("direct") == 2
+    assert diagnostics["refined_pitch_rows"] == pytest.approx(145.0, abs=0.5)
+    assert json.dumps(diagnostics, sort_keys=True) in str(error)
+
+
+def test_autocorrelation_lag_search_matches_declared_pitch_band() -> None:
+    """P2 (FEEDING-ROBUSTNESS-20260805.md).  The lag search now spans the
+    same ``[0.85, 1.15] * nominal`` band the refined-pitch check already
+    declares acceptable (:879), closing the dead zone where a real
+    periodicity existed but the old ``[0.90, 1.10]`` search never looked.
+    Pitches just inside the widened band now resolve; pitches just outside
+    it still correctly refuse.
+    """
+    for pitch in (125, 165):  # inside [0.85, 1.15] * 145, outside the old band
+        rgb, _boundaries = _synthetic_roll(30, pitch=pitch, leader=30, tail=30)
+        detection = _detect(rgb)
+        assert detection.confidence == "high"
+        assert detection.pitch_rows == pytest.approx(pitch, abs=0.01)
+
+    for pitch in (123, 167):  # just outside even the widened [0.85, 1.15] band
+        rgb, _boundaries = _synthetic_roll(30, pitch=pitch, leader=30, tail=30)
+        with pytest.raises(roll.IndexDecodeError):
+            _detect(rgb)
 
 
 def _boundary(
