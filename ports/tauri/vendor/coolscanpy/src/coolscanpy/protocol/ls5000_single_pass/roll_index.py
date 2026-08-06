@@ -7,6 +7,7 @@ pcap discovery, rendering, and scanner lifecycle remain outside this module.
 
 from __future__ import annotations
 
+import json
 import math
 import struct
 import sys
@@ -31,9 +32,45 @@ LEADING_ANCHOR_REVIEW_REASON = "leading-anchor-divergence"
 TRANSPORT_ORIGIN_CLAMP_REASON = "transport-origin-extrapolated-clamp"
 MINIMUM_CONFIDENT_CLEAR_FILM_FRACTION = 0.95
 
+# Stable short codes for the three physical-gap-count IndexDecodeError sites
+# in detect_roll_frames (Lane C, C2-style instrumentation). Field reports
+# quote the exception's own text, and two of these three raises are
+# near-identical prose for different predicates -- these ids are the
+# unambiguous, greppable discriminator the bridge's parenthetical catch-all
+# cannot provide on its own.
+GAP_COUNT_FLOOR_ERROR_ID = "gap-count-floor"
+GAP_LATTICE_ANCHOR_ERROR_ID = "gap-lattice-anchor-floor"
+GAP_DIRECT_SUPPORT_ERROR_ID = "gap-direct-support-floor"
+
 
 class IndexDecodeError(ValueError):
-    """Input is not a self-consistent LS-5000 roll-index capture."""
+    """Input is not a self-consistent LS-5000 roll-index capture.
+
+    ``error_id`` and ``diagnostics`` are optional, keyword-only, and additive
+    (Lane C, C2 style): a stable short code plus a numbers-only, JSON-safe
+    payload of exactly what the failing predicate evaluated, appended to the
+    message the same way ``preview_session._roll_session_diagnostics``
+    embeds ``RollSessionError``'s numbers -- never image or array data. Every
+    raise site that omits them keeps today's plain single-string behavior.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_id: str | None = None,
+        diagnostics: dict | None = None,
+    ) -> None:
+        full_message = message
+        if error_id is not None:
+            full_message = f"{full_message} [{error_id}]"
+        if diagnostics is not None:
+            full_message = f"{full_message} " + json.dumps(
+                diagnostics, sort_keys=True
+            )
+        super().__init__(full_message)
+        self.error_id = error_id
+        self.diagnostics = diagnostics
 
 
 class LeadingFrameClippedError(IndexDecodeError):
@@ -795,6 +832,85 @@ def _nearest_evidence_run(
     return nearest, nearest_distance
 
 
+def _gap_run_diagnostics(
+    rgb16: np.ndarray,
+    aperture: tuple[int, int],
+    evidence_runs: list[tuple[int, int]],
+    narrow_runs: list[tuple[int, int]],
+    transmission: np.ndarray,
+    nonuniformity: np.ndarray,
+    direct: np.ndarray,
+) -> dict:
+    """Numbers-only physical-gap diagnostics shared by every distinct-gap-
+    count ``IndexDecodeError`` (Lane C, C2 style): raster/aperture geometry,
+    every detected evidence-run width, which widths the ``[3, 12]``-row
+    narrow window discarded and why, and how strong the accepted gap rows'
+    transmission/uniformity readings actually were. Scalars and lists of
+    numbers only -- no image or array data -- safe to embed verbatim in a
+    field report.
+    """
+
+    widths = [int(end - start) for start, end in evidence_runs]
+    gap_transmission = transmission[direct]
+    gap_nonuniformity = nonuniformity[direct]
+    return {
+        "raster_rows": int(len(rgb16)),
+        "aperture_columns": [int(aperture[0]), int(aperture[1])],
+        "aperture_width": int(aperture[1] - aperture[0]),
+        "evidence_run_count": len(evidence_runs),
+        "evidence_run_widths": widths,
+        "narrow_run_count": len(narrow_runs),
+        "narrow_run_count_required": 3,
+        "discarded_narrow_widths": sorted(width for width in widths if width < 3),
+        "discarded_wide_widths": sorted(width for width in widths if width > 12),
+        "gap_row_transmission_median": (
+            float(np.median(gap_transmission)) if gap_transmission.size else None
+        ),
+        "gap_row_transmission_min": (
+            float(gap_transmission.min()) if gap_transmission.size else None
+        ),
+        "gap_row_nonuniformity_median": (
+            float(np.median(gap_nonuniformity)) if gap_nonuniformity.size else None
+        ),
+        "gap_row_nonuniformity_max": (
+            float(gap_nonuniformity.max()) if gap_nonuniformity.size else None
+        ),
+    }
+
+
+def _gap_lattice_diagnostics(
+    *,
+    anchor_centers: list[float],
+    assignments: dict[int, tuple[float, float]],
+    residuals: list[float],
+    autocorrelation_peak: float,
+    autocorrelation_lag: int,
+    coarse_pitch: float,
+    coarse_phase: float,
+) -> dict:
+    """Numbers-only lattice-anchor diagnostics (Lane C, C2 style) for the
+    physical-gap-lattice-anchoring failure: how many narrow-run centers were
+    found vs. survived assignment to the fitted comb, their displacement
+    (residual) distribution, and the coarse pitch/phase the comb was fit
+    against. Scalars and lists of numbers only.
+    """
+
+    return {
+        "anchor_center_count": len(anchor_centers),
+        "anchor_assignment_count": len(assignments),
+        "anchor_assignment_count_required": 3,
+        "anchor_residual_rows": [round(float(value), 3) for value in residuals],
+        "anchor_residual_max_rows": 8.0,
+        "anchor_residuals_rejected_count": sum(
+            1 for value in residuals if value > 8.0
+        ),
+        "autocorrelation_peak": float(autocorrelation_peak),
+        "autocorrelation_lag": int(autocorrelation_lag),
+        "coarse_pitch_rows": float(coarse_pitch),
+        "coarse_phase_rows": float(coarse_phase),
+    }
+
+
 def detect_roll_frames(
     rgb16: np.ndarray,
     known: np.ndarray,
@@ -833,7 +949,19 @@ def detect_roll_frames(
         (start, end) for start, end in evidence_runs if 3 <= end - start <= 12
     ]
     if len(narrow_runs) < 3:
-        raise IndexDecodeError("roll detector found too few distinct physical gaps")
+        raise IndexDecodeError(
+            "roll detector found too few distinct physical gaps",
+            error_id=GAP_COUNT_FLOOR_ERROR_ID,
+            diagnostics=_gap_run_diagnostics(
+                rgb16,
+                aperture,
+                evidence_runs,
+                narrow_runs,
+                transmission,
+                nonuniformity,
+                direct,
+            ),
+        )
     anchor_signal = np.zeros_like(evidence)
     anchor_centers = []
     for start, end in narrow_runs:
@@ -876,9 +1004,11 @@ def detect_roll_frames(
     # more than eight rows from the comb are scene artifacts; a second robust
     # fit removes assignments whose residual still exceeds three rows.
     assignments: dict[int, tuple[float, float]] = {}
+    anchor_residuals: list[float] = []
     for center in anchor_centers:
         lattice_index = int(np.rint((center - coarse_phase) / coarse_pitch))
         residual = abs(center - (coarse_phase + lattice_index * coarse_pitch))
+        anchor_residuals.append(residual)
         if residual > 8.0:
             continue
         previous = assignments.get(lattice_index)
@@ -886,7 +1016,28 @@ def detect_roll_frames(
             assignments[lattice_index] = (residual, center)
     if len(assignments) < 3:
         raise IndexDecodeError(
-            "roll detector could not anchor the physical-gap lattice"
+            "roll detector could not anchor the physical-gap lattice",
+            error_id=GAP_LATTICE_ANCHOR_ERROR_ID,
+            diagnostics={
+                **_gap_run_diagnostics(
+                    rgb16,
+                    aperture,
+                    evidence_runs,
+                    narrow_runs,
+                    transmission,
+                    nonuniformity,
+                    direct,
+                ),
+                **_gap_lattice_diagnostics(
+                    anchor_centers=anchor_centers,
+                    assignments=assignments,
+                    residuals=anchor_residuals,
+                    autocorrelation_peak=autocorrelation_peak,
+                    autocorrelation_lag=peak_lag,
+                    coarse_pitch=coarse_pitch,
+                    coarse_phase=coarse_phase,
+                ),
+            },
         )
     anchor_indices = np.asarray(sorted(assignments), dtype=np.float64)
     anchored_centers = np.asarray(
@@ -1137,9 +1288,32 @@ def detect_roll_frames(
         raise IndexDecodeError("roll detector found fewer than two frame intervals")
     alignment_boundary_count = alignment_end - cell_start + 1
     alignment_boundaries = boundaries[:alignment_boundary_count]
-    if sum(item.support == "direct" for item in alignment_boundaries) < 3:
+    direct_support_count = sum(
+        item.support == "direct" for item in alignment_boundaries
+    )
+    if direct_support_count < 3:
         raise IndexDecodeError(
-            "roll detector found insufficient distinct physical gaps"
+            "roll detector found insufficient distinct physical gaps",
+            error_id=GAP_DIRECT_SUPPORT_ERROR_ID,
+            diagnostics={
+                **_gap_run_diagnostics(
+                    rgb16,
+                    aperture,
+                    evidence_runs,
+                    narrow_runs,
+                    transmission,
+                    nonuniformity,
+                    direct,
+                ),
+                "alignment_boundary_count": alignment_boundary_count,
+                "alignment_boundary_supports": [
+                    item.support for item in alignment_boundaries
+                ],
+                "direct_support_count": direct_support_count,
+                "direct_support_count_required": 3,
+                "refined_pitch_rows": float(pitch),
+                "phase_rows": float(phase),
+            },
         )
 
     intervals: list[FrameInterval] = []
