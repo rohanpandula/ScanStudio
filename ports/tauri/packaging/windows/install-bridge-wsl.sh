@@ -4,6 +4,11 @@
 # Windows ScanStudio bundle. Python and every Python package are bundle-owned:
 # this script never uses the distro Python and never resolves a project or a
 # dependency from a package index.
+#
+# Run this as your normal user -- not as root and not via sudo. The script
+# calls sudo itself, narrowly, for apt-get and for installing the
+# /usr/local/bin wrapper; a root/sudo invocation would install the bridge
+# under /root's home directory and strand that wrapper for every real user.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -16,9 +21,11 @@ usage() {
     cat <<'USAGE'
 usage: install-bridge-wsl.sh [--bundle-dir <bundle-root>] [--force]
 
-Run this inside WSL2 Ubuntu-24.04. The bundle root is the directory containing
-BridgeRuntime/, Wheelhouse/, CorrespondingSource/, and this script. When the
-script is run from that directory, --bundle-dir is optional.
+Run this inside WSL2 Ubuntu-24.04, as your normal user -- not as root and not
+via sudo (the script calls sudo itself for the pieces that need it). The
+bundle root is the directory containing BridgeRuntime/, Wheelhouse/,
+CorrespondingSource/, and this script. When the script is run from that
+directory, --bundle-dir is optional.
 USAGE
 }
 
@@ -44,6 +51,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'error: do not run install-bridge-wsl.sh as root or via sudo.' >&2
+    printf '%s\n' 'Run it as your normal user -- it calls sudo itself for apt-get and for' >&2
+    printf '%s\n' 'installing the /usr/local/bin wrapper. A root/sudo run installs the' >&2
+    printf '%s\n' 'bridge under /root and strands that wrapper for every other user.' >&2
+    exit 77
+fi
 
 BUNDLE_DIR="$(cd "$BUNDLE_DIR" 2>/dev/null && pwd)" || {
     printf 'bundle directory does not exist: %s\n' "$BUNDLE_DIR" >&2
@@ -105,12 +120,57 @@ if [[ -e "$install_root" && "$FORCE" -ne 1 ]]; then
 fi
 
 stage_root="$(mktemp -d "$install_parent/.wsl-bridge-install.XXXXXX")"
-cleanup_stage() {
-    if [[ -d "$stage_root" ]]; then
+rollback_root=""
+swap_started=0
+
+# Restores $install_root to a known-good state after a failure that happened
+# once the staging tree had already been swapped into place (swap_started=1
+# below). $install_root is guaranteed to be either the broken new tree or
+# nothing at all by the time this can run -- never the still-good old
+# install -- because swap_started only flips to 1 after the old install (if
+# any) has already been safely moved aside to $rollback_root. `set +e` is in
+# effect for the whole cleanup/rollback trap (see cleanup_and_maybe_rollback),
+# so one failing step here (e.g. a permissions problem on the restore mv)
+# cannot skip the rest of the restore or swallow the original exit code.
+restore_broken_install() {
+    if [[ -n "$stage_root" && -d "$stage_root" ]]; then
         rm -rf -- "$stage_root"
     fi
+    if [[ -e "$install_root" ]]; then
+        rm -rf -- "$install_root"
+    fi
+    if [[ -n "$rollback_root" && -e "$rollback_root" ]]; then
+        mv "$rollback_root" "$install_root"
+        printf 'Restored the previous install at %s\n' "$install_root" >&2
+    else
+        printf 'No usable install was left in place (no previous install to restore).\n' >&2
+    fi
 }
-trap cleanup_stage EXIT
+
+cleanup_and_maybe_rollback() {
+    local exit_code=$?
+    # Disable errexit for the remainder of this handler. Without this, a
+    # failing command inside the trap (e.g. an `rm -rf` that hits a
+    # permission error) would abort the trap immediately under `set -e`,
+    # skip the rest of the restore, and replace the real exit code with a
+    # generic 1 -- verified empirically against this bash.
+    set +e
+    if [[ "$swap_started" -ne 1 ]]; then
+        # Nothing has touched $install_root yet. Only the staging directory
+        # needs cleaning up -- this mirrors the pre-fix behavior exactly.
+        if [[ -n "$stage_root" && -d "$stage_root" ]]; then
+            rm -rf -- "$stage_root"
+        fi
+        exit "$exit_code"
+    fi
+    if [[ "$exit_code" -eq 0 ]]; then
+        exit 0
+    fi
+    printf '\n%s\n' '=== Install failed after the new runtime was swapped in; rolling back ===' >&2
+    restore_broken_install
+    exit "$exit_code"
+}
+trap cleanup_and_maybe_rollback EXIT
 
 tar -xzf "$cpython_tarball" -C "$stage_root"
 python_bin="$stage_root/python/bin/python3.13"
@@ -127,10 +187,35 @@ fi
 # install. Copy the two immutable installer resources into the private staging
 # root first, so installation also works when the Windows bundle is mounted or
 # installed read-only from WSL's point of view.
-install_sources="$stage_root/sources"
-mkdir -p "$install_sources/coolscanpy" "$install_sources/scanstudio-bridge"
-cp -a "$coolscanpy_source/." "$install_sources/coolscanpy/"
-cp -a "$bridge_source/." "$install_sources/scanstudio-bridge/"
+mkdir -p "$stage_root/sources/coolscanpy" "$stage_root/sources/scanstudio-bridge"
+cp -a "$coolscanpy_source/." "$stage_root/sources/coolscanpy/"
+cp -a "$bridge_source/." "$stage_root/sources/scanstudio-bridge/"
+
+# Swap the verified staging tree into $install_root *before* any pip install
+# runs below. pip/distlib write every console-script entrypoint (including
+# python/bin/scanstudio-bridge) with a `#!` shebang that embeds the exact
+# interpreter path used to invoke pip -- literally, not resolved at run time.
+# Running pip against the mktemp staging path and renaming the directory
+# afterward (the old order) left every generated shebang pointing at a
+# .wsl-bridge-install.XXXXXX path that no longer existed once this script's
+# EXIT trap cleaned it up, so /usr/local/bin/scanstudio-bridge would exec a
+# script whose own interpreter had vanished. Doing the swap first and running
+# every pip install against $install_root/python/bin/python3.13 makes the
+# shebangs correct by construction.
+if [[ -e "$install_root" ]]; then
+    rollback_root="$install_parent/wsl-bridge.previous.$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "$install_root" "$rollback_root"
+fi
+# From here on $install_root is guaranteed to be empty (either it never
+# existed, or it was just moved to $rollback_root above), so any failure from
+# this point forward -- including the mv immediately below failing outright --
+# can safely be handled by reclaiming $install_root: it is never the
+# still-good previous install by the time swap_started can be seen as 1.
+swap_started=1
+mv "$stage_root" "$install_root"
+stage_root=""
+install_sources="$install_root/sources"
+python_bin="$install_root/python/bin/python3.13"
 
 printf '%s\n' '=== Installing pinned dependencies from the offline wheelhouse ==='
 CC=gcc CXX=g++ "$python_bin" -m pip install \
@@ -154,14 +239,6 @@ printf '%s\n' '=== Installing scanstudio-bridge from shipped corresponding sourc
 "$python_bin" -I -c \
     'import coolscanpy, sane, scanstudio_bridge; print("bridge imports: OK")'
 
-rollback_root=""
-if [[ -e "$install_root" ]]; then
-    rollback_root="$install_parent/wsl-bridge.previous.$(date -u +%Y%m%dT%H%M%SZ)"
-    mv "$install_root" "$rollback_root"
-fi
-mv "$stage_root" "$install_root"
-stage_root=""
-
 # `wsl.exe -e scanstudio-bridge` does not run a login shell, so relying on
 # ~/.local/bin would be fragile. Install one tiny global wrapper whose target
 # remains the per-user, bundle-owned runtime. The wrapper never arms motion.
@@ -172,8 +249,45 @@ chmod 755 "$wrapper_tmp"
 "${SUDO[@]}" install -m 755 "$wrapper_tmp" /usr/local/bin/scanstudio-bridge
 rm -f -- "$wrapper_tmp"
 
+# Post-install verification: prove the shebang fix actually landed rather
+# than trusting the reorder above by construction alone, and prove the
+# installed entrypoint actually runs end to end.
+printf '%s\n' '=== Verifying the installed bridge entrypoint ==='
+bridge_entrypoint="$install_root/python/bin/scanstudio-bridge"
+if [[ ! -f "$bridge_entrypoint" ]]; then
+    printf 'post-install check failed: missing %s\n' "$bridge_entrypoint" >&2
+    exit 70
+fi
+shebang_line="$(head -n 1 -- "$bridge_entrypoint")"
+case "$shebang_line" in
+    '#!'*)
+        shebang_interpreter="${shebang_line#\#!}"
+        # A `#!` line can carry a trailing argument (e.g. `#!/usr/bin/env
+        # python3.13`); pip/distlib always emit a bare absolute path here,
+        # but tokenize defensively rather than assume that.
+        shebang_interpreter="${shebang_interpreter%% *}"
+        ;;
+    *)
+        shebang_interpreter=""
+        ;;
+esac
+if [[ -z "$shebang_interpreter" || ! -x "$shebang_interpreter" ]]; then
+    printf 'post-install check failed: %s has no usable #! interpreter (got %q)\n' \
+        "$bridge_entrypoint" "$shebang_interpreter" >&2
+    exit 70
+fi
+if [[ "$shebang_interpreter" != "$python_bin" ]]; then
+    printf 'post-install check failed: %s shebang is %q, expected %q\n' \
+        "$bridge_entrypoint" "$shebang_interpreter" "$python_bin" >&2
+    exit 70
+fi
+if ! /usr/local/bin/scanstudio-bridge --version </dev/null; then
+    printf 'post-install check failed: /usr/local/bin/scanstudio-bridge --version exited nonzero\n' >&2
+    exit 70
+fi
+
 printf '\nInstallation complete.\n'
-printf 'Python: %s\n' "$install_root/python/bin/python3.13"
+printf 'Python: %s\n' "$python_bin"
 printf 'Bridge: %s\n' /usr/local/bin/scanstudio-bridge
 if [[ -n "$rollback_root" ]]; then
     printf 'Rollback copy: %s\n' "$rollback_root"
