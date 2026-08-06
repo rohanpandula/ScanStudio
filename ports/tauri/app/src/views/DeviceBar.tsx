@@ -1,6 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../session";
 import type { DeviceInfo } from "../session/wire/types";
+import DiagnosticReportActions from "./DiagnosticReportActions";
 import HardwareErrorPanel from "./HardwareErrorPanel";
 import HardwareStatusChips from "./HardwareStatusChips";
 import styles from "./DeviceBar.module.css";
@@ -136,6 +137,15 @@ export default function DeviceBar() {
         thumbnailsFailed={
           state.previewOutcome === "failed" ? state.previewError : null
         }
+      />
+      <DiagnosticReportActions
+        error={state.filmFeedInterrupted}
+        thumbnailsFailed={
+          state.previewOutcome === "failed" ? state.previewError : null
+        }
+        device={device}
+        status={status}
+        thumbnails={state.thumbnails}
       />
     </div>
   );

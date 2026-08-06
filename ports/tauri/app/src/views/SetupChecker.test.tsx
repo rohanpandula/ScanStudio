@@ -1,19 +1,31 @@
 /** @vitest-environment jsdom */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setupCheckResults } from "../session/setupCheckResults";
 import SetupChecker, { type MaxReadReport, type ProbeResult } from "./SetupChecker";
 
 // SetupChecker calls invoke from @tauri-apps/api/core. Mock the module so no
 // real Tauri runtime is needed; each test points invoke at controlled
 // resolved/rejected/pending promises.
-const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
+const mocks = vi.hoisted(() => ({ invoke: vi.fn(), writeText: vi.fn() }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+
+// jsdom's Navigator.prototype defines "clipboard" as a getter that builds a
+// fresh (non-mockable) stub on every access, so a plain
+// `navigator.clipboard = ...` assignment silently lands on nothing.
+// Redefining it as an own data property on this navigator instance shadows
+// that getter for good.
+Object.defineProperty(navigator, "clipboard", {
+  configurable: true,
+  value: { writeText: mocks.writeText },
+});
 
 afterEach(() => {
   cleanup();
   mocks.invoke.mockReset();
+  mocks.writeText.mockReset();
 });
 
 const FIXTURE_PROBES: ProbeResult[] = [
@@ -80,5 +92,34 @@ describe("SetupChecker", () => {
     mocks.invoke.mockImplementation(() => new Promise(() => {}));
     render(<SetupChecker />);
     expect(screen.getByText("Checking...")).toBeInTheDocument();
+  });
+
+  it("shares its results with the error-report builder as soon as they load", async () => {
+    resolveAll(FIXTURE_PROBES, { maxBytes: null, entriesScanned: 0 }, WRITE_MODE_TEXT);
+    render(<SetupChecker />);
+
+    await screen.findByText("OK");
+
+    expect(setupCheckResults.get()).toEqual(FIXTURE_PROBES);
+  });
+
+  it("copies id/status/detail/fix as plain text and briefly confirms the copy", async () => {
+    resolveAll(FIXTURE_PROBES, { maxBytes: null, entriesScanned: 0 }, WRITE_MODE_TEXT);
+    mocks.writeText.mockResolvedValue(undefined);
+    render(<SetupChecker />);
+    await screen.findByText("OK");
+
+    // Plain fireEvent, not @testing-library/user-event: user-event's
+    // setup() installs its own navigator.clipboard stub for copy/paste
+    // simulation, silently shadowing the mock defined above.
+    fireEvent.click(screen.getByTestId("copy-probes-as-text"));
+
+    expect(mocks.writeText).toHaveBeenCalledWith(
+      "wsl-status: Ok -- WSL2 with Ubuntu-24.04 default\n" +
+        "bridge-which: Fail -- scanstudio-bridge not found on PATH inside WSL " +
+        "(fix: Run install-bridge-wsl.sh inside your WSL Ubuntu-24.04 distro)\n" +
+        "bridge-version: Unknown -- windows only",
+    );
+    await waitFor(() => expect(screen.getByTestId("copy-probes-as-text")).toHaveTextContent("Copied"));
   });
 });
