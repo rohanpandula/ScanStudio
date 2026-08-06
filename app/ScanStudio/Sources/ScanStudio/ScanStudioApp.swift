@@ -30,13 +30,16 @@ struct ScanStudioApp: App {
         // makes the focused Photo commands unambiguous: there is no second
         // scene that can publish a competing focused frame.
         Window("Scan Studio", id: "main") {
-            switch appDelegate.launchState {
-            case .ready(_, let model):
-                ContentView()
-                    .environment(model)
-            case .failed(let message):
-                EngineUnavailableView(message: message)
+            Group {
+                switch appDelegate.launchState {
+                case .ready(_, let model):
+                    ContentView()
+                        .environment(model)
+                case .failed(let message):
+                    EngineUnavailableView(message: message)
+                }
             }
+            .launchUpdateOfferAlert(appDelegate.updateFlowModel)
         }
         .defaultSize(width: 1_500, height: 920)
         .windowResizability(.contentMinSize)
@@ -48,6 +51,42 @@ struct ScanStudioApp: App {
 
         Settings {
             UpdateSettingsView(model: appDelegate.updateFlowModel)
+        }
+    }
+}
+
+private extension View {
+    /// The launch-time "Update Now" / "Not Now" offer (feat/launch-update-offer,
+    /// item 1): a native alert. The app's one existing notice idiom
+    /// (`WorkspaceErrorBanner` in ContentView.swift) is purpose-built for
+    /// `SessionModel` scan/preview errors -- it needs a `SessionModel` in the
+    /// environment, which does not exist while `launchState == .failed`, and
+    /// its red "something went wrong" styling and issue-report action do not
+    /// fit an informational "there's a new version" notice. A plain alert
+    /// covers both launch states from one place at the Window scene level and
+    /// matches the two-action (primary / cancel) confirmation shape already
+    /// used elsewhere (e.g. `AcquirePreviewConfirmationSheet`).
+    func launchUpdateOfferAlert(_ model: UpdateFlowModel) -> some View {
+        alert(
+            "Update Available",
+            isPresented: Binding(
+                get: { model.launchUpdateOffer != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        model.dismissLaunchUpdateOffer()
+                    }
+                }
+            ),
+            presenting: model.launchUpdateOffer
+        ) { _ in
+            Button("Update Now") {
+                Task { await model.installFromLaunchUpdateOffer() }
+            }
+            Button("Not Now", role: .cancel) {
+                model.dismissLaunchUpdateOffer()
+            }
+        } message: { candidate in
+            Text("Scan Studio \(candidate.version.raw) is available.")
         }
     }
 }
@@ -93,6 +132,22 @@ private struct FrameTransformCommands: Commands {
     private func perform(_ command: FrameTransformCommand) {
         guard let activeFrameIndex else { return }
         session.performFrameTransformCommand(command, for: activeFrameIndex)
+    }
+}
+
+/// The real `AppRelaunching`: spawns a detached new process for the app at
+/// `appURL` via `/usr/bin/open -n`, so the fresh instance is independent of
+/// the quitting one. `UpdateFlowModel.relaunchToFinishUpdate()` only calls
+/// `NSApp.terminate` after this returns without throwing. Kept in the
+/// executable target -- spawning a process and quitting the running app are
+/// host/AppKit concerns -- with only the guard/routing logic (`RelaunchCoordinator`)
+/// living in ScanStudioKit, where it is unit tested with a fake instead.
+private struct ProcessAppRelauncher: AppRelaunching {
+    func relaunch(appURL: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-n", appURL.path]
+        try process.run()
     }
 }
 
@@ -221,7 +276,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             downloader: UpdateDownloader(),
             installer: installer,
             installedVersion: Self.installedUpdateVersion(),
-            channelDefaultsKey: "ScanStudio.updateChannel"
+            channelDefaultsKey: "ScanStudio.updateChannel",
+            launchCheckEnabledDefaultsKey: "ScanStudio.checkForUpdatesAtLaunch",
+            relauncher: ProcessAppRelauncher()
         )
     }
 
@@ -254,13 +311,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Kicks the update cadence (AUT-05-CHECK): one check at launch, then one
-    /// every 24 h via a rolling `Task.sleep`. Read-only plumbing -- `checkNow()`
-    /// only mutates check state and never downloads or installs on cadence,
-    /// and it skips a beat while an install is already in flight.
+    /// every 24 h via a rolling `Task.sleep`. Read-only plumbing -- neither
+    /// leg downloads or installs, and the 24 h leg skips a beat while an
+    /// install is already in flight.
+    ///
+    /// The launch leg (feat/launch-update-offer) is gated on the "Check for
+    /// updates at launch" setting and, when it finds something newer, also
+    /// drives the visible launch-time offer -- see
+    /// `UpdateFlowModel.checkForUpdateAtLaunch()`. The 24 h leg below is
+    /// untouched: it always runs, regardless of that setting.
     private func startUpdateCheckLoops() {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.updateFlowModel.checkNow()
+            await self.updateFlowModel.checkForUpdateAtLaunch()
         }
         backgroundUpdateTask = Task { [weak self] in
             while !Task.isCancelled {
