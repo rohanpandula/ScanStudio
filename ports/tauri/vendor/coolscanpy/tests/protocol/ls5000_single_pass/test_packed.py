@@ -143,6 +143,18 @@ def test_full_decoder_rejects_mixed_padding_counter_dialects(tmp_path: Path) -> 
         decode_full_records(path, height=3)
 
 
+def test_full_decoder_rejects_cross_record_dialect_change(tmp_path: Path) -> None:
+    _base, full = _synthetic_full_records()
+    record = full[1]
+    _e9ea_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+    _e9ea_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+    path = tmp_path / "cross-record-dialect-change.bin"
+    path.write_bytes(full.astype(">u2").tobytes())
+
+    with pytest.raises(ValueError, match="padding 1 counter train mismatch"):
+        decode_full_records(path, height=3)
+
+
 def test_full_decoder_accepts_e004_prefixed_padding_counter_dialect(tmp_path: Path) -> None:
     base, full = _synthetic_full_records()
     for record in full:

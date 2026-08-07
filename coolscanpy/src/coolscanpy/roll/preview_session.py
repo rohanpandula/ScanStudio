@@ -637,9 +637,20 @@ def _validate_preview_result(
         raise RollSessionIntegrityError(
             "persisted preview journal differs from the validated attempt result"
         )
+    # A held preview (CaptureProcessAdapter.begin_held_preview) never
+    # reaches this attempt's own release teardown -- it pauses at the
+    # `awaiting-hold-job` transaction boundary instead, reservation still
+    # held, so the parent (CaptureProcessAdapter._wait_for_held_preview_
+    # ready) can validate this exact on-disk snapshot before any resume/
+    # release decision exists (see run_live_capture's own comment at the
+    # `journal["disk_bytes"] = 0` / `journal["unit_released"] = False`
+    # stamps). That snapshot is legitimately never "complete"/"preview-
+    # only"/released -- it is the other of exactly two valid shapes this
+    # journal can take, never a partial or intermediate one.
+    held = journal.get("capture_mode") == "preview-and-hold"
     for key, expected in (
-        ("status", "complete"),
-        ("capture_mode", "preview-only"),
+        ("status", "awaiting-hold-job" if held else "complete"),
+        ("capture_mode", "preview-and-hold" if held else "preview-only"),
         ("requested_frame", None),
         ("requested_boundary_offset_rows", 0),
         ("expected_frame_count", None),
@@ -648,11 +659,18 @@ def _validate_preview_result(
         ("expected_bytes", 0),
         ("completed_bytes", 0),
         ("disk_bytes", 0),
-        ("unit_released", True),
+        ("unit_released", False if held else True),
         ("plan_sha256", CANONICAL_PLAN_SHA256),
         ("preview_geometry_validated_before_reads", True),
     ):
         _require_exact(journal, key, expected)
+    if held and (
+        not isinstance(journal.get("hold_session_id"), str)
+        or not 32 <= len(journal["hold_session_id"]) <= 128
+    ):
+        raise RollSessionIntegrityError(
+            "held preview journal has no valid hold_session_id"
+        )
     if not isinstance(journal.get("scanner_identity"), str) or not journal.get(
         "scanner_identity"
     ).startswith("Nikon LS-5000 ED"):
@@ -719,7 +737,7 @@ def _validate_preview_result(
         "status": startup_status,
     }
     expected_receipt = {
-        "status": "preview-only-complete",
+        "status": "preview-and-hold-awaiting-job" if held else "preview-only-complete",
         "slot_capacity_hint": slot_capacity,
         "slot_capacity_semantics": _PREVIEW_SLOT_SEMANTICS,
         "preview_bytes": len(preview),

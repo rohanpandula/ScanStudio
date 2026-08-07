@@ -19,6 +19,7 @@ __all__ = [
     "DeviceNotFound",
     "DeviceBusy",
     "EjectFailed",
+    "EjectNotAvailable",
     "SafeStopRequested",
     "FeederParked",
     "CaptureWorkerBootstrapFailed",
@@ -55,6 +56,20 @@ class DeviceBusy(PyCoolscanError):
 class EjectFailed(PyCoolscanError):
     """A vendor eject/unload action was available but triggering it, or the
     surrounding open/close, failed."""
+
+
+class EjectNotAvailable(PyCoolscanError):
+    """:meth:`Roll.eject` was called with no held reservation to eject.
+
+    Valid only while a preview's reservation is still held (between
+    :meth:`Roll.preview` and the next :meth:`Roll.scan_many`/:meth:`Roll.scan`
+    or an explicit :meth:`Roll.release`), or as part of the same batch call
+    that finishes it (``scan_many(..., eject_after=True)``). A Roll whose
+    reservation was already released -- explicitly, by a prior non-holding
+    ``scan_many()``, or because no ``preview()`` has run yet -- has nothing
+    left to eject from inside; physically remove the strip, or refeed and
+    call :meth:`Roll.preview` again.
+    """
 
 
 class SafeStopRequested(PyCoolscanError):

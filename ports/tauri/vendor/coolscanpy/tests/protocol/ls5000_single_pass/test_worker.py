@@ -16,10 +16,16 @@ import pytest
 
 from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    AttemptPaths,
+    CaptureAttemptResult,
+    CaptureMode,
+    CaptureOutcome,
+    CaptureRequest,
     ManualFrameApproval,
     ReviewedRollFingerprint,
     build_reviewed_roll_fingerprint,
 )
+from coolscanpy.roll.preview_session import _validate_preview_result
 from coolscanpy.protocol.ls5000_single_pass.roll_index import (
     NativeFrameOrigin,
     TransportMapping,
@@ -43,6 +49,7 @@ from coolscanpy.protocol.ls5000_single_pass.worker import (
     compile_continuation_steps,
     load_validated_batch_job,
     main,
+    wait_for_hold_decision,
     wait_for_parent_ack,
     _meter_controller_sha256,
     apply_boundary_offset,
@@ -1469,6 +1476,7 @@ def test_batch_job_loader_binds_ordered_frame_paths_and_parent_ack_contract(
                 "continuation_plan_sha256": "b" * 64,
                 "expected_usb_address": 2,
                 "expected_usb_bus": 1,
+                "exposure_override_10ns": None,
                 "frames": [
                     {
                         "ack": "frame-017/parent-ack.json",
@@ -1518,6 +1526,99 @@ def test_batch_job_loader_binds_ordered_frame_paths_and_parent_ack_contract(
     assert job.frames[0].ack == tmp_path / "frame-017" / "parent-ack.json"
 
 
+def _one_frame_job_payload(
+    fingerprint: ReviewedRollFingerprint,
+    *,
+    exposure_override_10ns: object,
+) -> dict[str, object]:
+    return {
+        "apply_all_boundary_offsets_before_first_frame": True,
+        "capture_plan_sha256": "a" * 64,
+        "continuation_plan_sha256": "b" * 64,
+        "expected_usb_bus": 1,
+        "expected_usb_address": 2,
+        "exposure_override_10ns": exposure_override_10ns,
+        "frames": [
+            {
+                "ack": "frame-001/parent-ack.json",
+                "boundary_offset_rows": 0,
+                "journal": "frame-001/journal.json",
+                "manual_review_approval": None,
+                "output": "frame-001/capture.bin",
+                "slot": 1,
+            },
+        ],
+        "parent_ack_required_after_every_frame": True,
+        "release_once_after_last_frame": True,
+        "reviewed_roll_fingerprint": fingerprint.to_payload(),
+        "schema_version": 3,
+        "session_contract": "one-process-one-reservation",
+        "session_id": "batch-exposure-override-session",
+    }
+
+
+def test_batch_job_loader_parses_a_valid_exposure_override(tmp_path: Path) -> None:
+    job_path = tmp_path / "batch-job.json"
+    job_path.write_text(
+        json.dumps(
+            _one_frame_job_payload(
+                _reviewed_fingerprint(),
+                exposure_override_10ns=[97_482, 195_597, 180_705],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    job = load_validated_batch_job(
+        job_path,
+        expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+        expected_plan_sha256="a" * 64,
+        expected_continuation_sha256="b" * 64,
+    )
+
+    assert job.exposure_override_10ns == (97_482, 195_597, 180_705)
+
+
+@pytest.mark.parametrize(
+    "bad_override",
+    [
+        [90_000, 90_000],
+        [0, 90_000, 90_000],
+        [49_999, 90_000, 90_000],
+        [400_001, 90_000, 90_000],
+        ["90000", 90_000, 90_000],
+    ],
+)
+def test_batch_job_loader_refuses_malformed_or_out_of_bounds_exposure_override(
+    tmp_path: Path,
+    bad_override: object,
+) -> None:
+    """Worker-side defense in depth: load_validated_batch_job re-validates
+    exposure_override_10ns from the untrusted job JSON with the same
+    metered-tick bounds Roll/CaptureBatchRequest already enforce -- never
+    reachable through the public API (Roll.scan_many validates eagerly
+    first), but the worker subprocess trusts nothing it reads from disk."""
+
+    job_path = tmp_path / "batch-job.json"
+    job_path.write_text(
+        json.dumps(
+            _one_frame_job_payload(
+                _reviewed_fingerprint(),
+                exposure_override_10ns=bad_override,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProtocolError, match="exposure_override_10ns"):
+        load_validated_batch_job(
+            job_path,
+            expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+            expected_plan_sha256="a" * 64,
+            expected_continuation_sha256="b" * 64,
+        )
+
+
 def test_parent_ack_is_bound_to_session_frame_slot_and_fresh_nonce(
     tmp_path: Path,
 ) -> None:
@@ -1553,6 +1654,574 @@ def test_parent_ack_is_bound_to_session_frame_slot_and_fresh_nonce(
     )
 
 
+def test_wait_for_hold_decision_accepts_scan_and_release_actions(
+    tmp_path: Path,
+) -> None:
+    """wait_for_hold_decision is a deliberate sibling of wait_for_parent_ack
+    (see its own docstring), not a reuse of it: no frame/slot exists yet at
+    this transaction boundary, only the hold_session_id this same attempt
+    minted. "eject" ends the session by replaying the traced vendor eject
+    sequence before releasing -- the operator-changed-their-mind case."""
+
+    for action in ("scan", "release", "eject"):
+        ack_path = tmp_path / f"hold-ack-{action}.json"
+        ack_path.write_text(
+            json.dumps(
+                {
+                    "action": action,
+                    "hold_session_id": "held-session-abc123",
+                    "schema_version": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        observed = wait_for_hold_decision(
+            ack_path,
+            hold_session_id="held-session-abc123",
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+        assert observed == action
+
+
+def test_wait_for_hold_decision_rejects_a_decision_for_a_different_session(
+    tmp_path: Path,
+) -> None:
+    """A hold decision must be bound to the exact session id this attempt
+    minted -- nothing else ties a resume/release decision to this specific
+    reservation, so a mismatch must fail closed (SynchronizedProtocolError:
+    we are at a safe transaction boundary, cleanup can proceed normally)."""
+
+    ack_path = tmp_path / "hold-ack.json"
+    ack_path.write_text(
+        json.dumps(
+            {
+                "action": "scan",
+                "hold_session_id": "a-different-session",
+                "schema_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(worker_module.SynchronizedProtocolError, match="hold_session_id"):
+        wait_for_hold_decision(
+            ack_path,
+            hold_session_id="held-session-abc123",
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+
+def test_wait_for_hold_decision_times_out_without_a_decision(tmp_path: Path) -> None:
+    with pytest.raises(worker_module.SynchronizedProtocolError, match="timeout"):
+        wait_for_hold_decision(
+            tmp_path / "never-written.json",
+            hold_session_id="held-session-abc123",
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+
+def test_wait_for_parent_ack_accepts_eject_action(tmp_path: Path) -> None:
+    """"eject" ends a batch exactly like "stop" for the frame loop, but
+    additionally arms the traced eject sequence at teardown -- see
+    Roll.scan_many's eject_after parameter."""
+
+    ack_path = tmp_path / "parent-ack.json"
+    ack_path.write_text(
+        json.dumps(
+            {
+                "ack_nonce": "nonce-abc",
+                "action": "eject",
+                "frame_index": 3,
+                "schema_version": 1,
+                "session_id": "session-xyz",
+                "slot": 19,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    observed = wait_for_parent_ack(
+        ack_path,
+        session_id="session-xyz",
+        frame_index=3,
+        slot=19,
+        nonce="nonce-abc",
+        timeout_seconds=0,
+        poll_seconds=0,
+    )
+
+    assert observed == "eject"
+
+
+def test_wait_for_parent_ack_accepts_continue_hold_action(tmp_path: Path) -> None:
+    """"continue_hold" ends a batch exactly like "stop"/"eject" for the
+    frame loop, but arms a loop back into a fresh hold-wait instead of
+    teardown's release -- see Roll.scan_many's default when resuming a
+    held session (neither eject_after nor a safe-stop)."""
+
+    ack_path = tmp_path / "parent-ack.json"
+    ack_path.write_text(
+        json.dumps(
+            {
+                "ack_nonce": "nonce-abc",
+                "action": "continue_hold",
+                "frame_index": 3,
+                "schema_version": 1,
+                "session_id": "session-xyz",
+                "slot": 19,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    observed = wait_for_parent_ack(
+        ack_path,
+        session_id="session-xyz",
+        frame_index=3,
+        slot=19,
+        nonce="nonce-abc",
+        timeout_seconds=0,
+        poll_seconds=0,
+    )
+
+    assert observed == "continue_hold"
+
+
+class _ScriptedEndpoint:
+    """Minimal ep_out/ep_in double driving perform_transaction's exact wire
+    grammar (CDB, 0xD0, phase byte, [data], 0x06, 8-byte status) from a
+    scripted read queue, recording every write in call order. Deliberately
+    not a real USB simulation -- just enough of the same interface
+    ``perform_transaction`` already assumes (``write``/``read``/
+    ``clear_halt``) to drive it byte-exact."""
+
+    def __init__(self, reads: list[bytes]) -> None:
+        self._reads = list(reads)
+        self.writes: list[bytes] = []
+
+    def write(self, data: object, timeout: int | None = None) -> int:
+        payload = bytes(data)  # type: ignore[arg-type]
+        self.writes.append(payload)
+        return len(payload)
+
+    def read(self, size: int, timeout: int | None = None) -> bytes:
+        value = self._reads.pop(0)
+        assert len(value) == size, (len(value), size)
+        return value
+
+    def clear_halt(self) -> None:  # pragma: no cover - no stall scripted here
+        pass
+
+
+def _eject_status(sense_hex: str) -> bytes:
+    sense = bytes.fromhex(sense_hex)
+    assert len(sense) == 3
+    return bytes([0]) + sense + bytes(4)
+
+
+def test_perform_vendor_eject_replays_the_traced_cdb_sequence_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Byte-exact reproduction of oracle-ice-on-1.pcapng commands 9843-9968
+    (negfit/data/usb-oracle/oracle-ice-on-1.pcapng, sha256
+    5e3a890fa7c61f4f6c9cf597f55c0e7ea71628818d449aa9c53760fb017d07be):
+    EJECT CDB + its 9-byte OUT payload, EXECUTE, then TEST UNIT READY
+    polled through 020401 (x2) -> 063f04 -> 062800 -> 023a00 (terminal).
+    Every write is captured in order and compared byte-for-byte against
+    the traced constants -- this is the "byte sequence in order" claim,
+    proven, not asserted."""
+
+    reads = [
+        b"\x02",
+        _eject_status("000000"),
+        b"\x01",
+        _eject_status("000000"),
+        b"\x01",
+        _eject_status("020401"),
+        b"\x01",
+        _eject_status("020401"),
+        b"\x01",
+        _eject_status("063f04"),
+        b"\x01",
+        _eject_status("062800"),
+        b"\x01",
+        _eject_status("023a00"),
+    ]
+    endpoint = _ScriptedEndpoint(reads)
+    monkeypatch.setattr(worker_module.time, "sleep", lambda _seconds: None)
+
+    evidence = worker_module._perform_vendor_eject(endpoint, endpoint)
+
+    assert evidence["eject_cdb_status"] == _eject_status("000000").hex()
+    assert evidence["eject_execute_status"] == _eject_status("000000").hex()
+    assert evidence["terminal_sense"] == "023a00"
+    assert evidence["wait_polls"] == 5
+    assert evidence["stall_recoveries"] == 0
+
+    tur_write = (bytes.fromhex("000000000000"), b"\xd0", b"\x06")
+    expected_writes = [
+        bytes.fromhex(worker_module.VENDOR_EJECT_CDB),
+        b"\xd0",
+        bytes.fromhex(worker_module.VENDOR_EJECT_DATA_OUT),
+        b"\x06",
+        bytes.fromhex(worker_module.EXECUTE_CDB),
+        b"\xd0",
+        b"\x06",
+        *tur_write,
+        *tur_write,
+        *tur_write,
+        *tur_write,
+        *tur_write,
+    ]
+    assert endpoint.writes == expected_writes
+    assert not endpoint._reads, "every scripted read must be consumed exactly once"
+
+
+def test_wait_eject_clear_fails_closed_on_a_wedge_before_first_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the exact documented failure (shortstrip-lab/INCIDENT-
+    20260719-eject-from-park.md, 2026-07-24 reopening): eject accepted,
+    sense pinned at 000000, no motion. _perform_ready_group would treat a
+    bare 000000 as an acceptable substitute for the 023a00 terminal sense
+    (its own "stronger startup state" carve-out) -- this must never
+    happen here, and this must never spin past the first-progress
+    deadline waiting for motion that will not come."""
+
+    endpoint = _ScriptedEndpoint([b"\x01", _eject_status("000000")] * 500)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        worker_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+
+    with pytest.raises(worker_module.EjectWedgeSuspected, match="no motion observed"):
+        worker_module._wait_eject_clear(endpoint, endpoint)
+
+    assert clock["now"] >= worker_module.EJECT_FIRST_PROGRESS_DEADLINE_SECONDS
+
+
+def test_wait_eject_clear_fails_closed_on_an_untraced_sense(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any sense outside the traced motion/terminal/not-yet-progressed set
+    stops the wait immediately -- never issuing another motion command --
+    rather than guessing at an unknown scanner state."""
+
+    endpoint = _ScriptedEndpoint(
+        [b"\x01", _eject_status("020401"), b"\x01", _eject_status("0b0000")]
+    )
+    monkeypatch.setattr(worker_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(worker_module.EjectWedgeSuspected, match="untraced sense"):
+        worker_module._wait_eject_clear(endpoint, endpoint)
+
+
+def _preview_and_hold_fakes() -> dict[str, object]:
+    """Shared plumbing for the preview-and-hold eject integration tests
+    below -- deliberately duplicated per test function rather than a
+    pytest fixture, matching this file's own stated convention (every test
+    fakes the boundary just below the module under test locally)."""
+
+    startup = bytearray(10 + 40 * 8)
+    startup[:4] = b"\x8f\0\0\0"
+    startup[4:6] = (len(startup) - 6).to_bytes(2, "big")
+    startup[6:8] = (len(startup) - 8).to_bytes(2, "big")
+    startup[8] = 40
+    header_8e = b"\x00\x8e\x00\x00\x00\x40"
+    table_8e = header_8e + bytes(0x40 - len(header_8e))
+
+    ep_out = SimpleNamespace(bEndpointAddress=0x01)
+    ep_in = SimpleNamespace(bEndpointAddress=0x82)
+    interface = SimpleNamespace(bInterfaceNumber=0)
+
+    class USBUtil:
+        @staticmethod
+        def release_interface(_device: object, _number: int) -> None:
+            pass
+
+        @staticmethod
+        def dispose_resources(_device: object) -> None:
+            pass
+
+    preview_windows = [
+        {
+            "color_id": color,
+            "resx": 97,
+            "resy": 97,
+            "upper_left_x": 0,
+            "upper_left_y": 0,
+            "width": 3_946,
+            "height": 250_278,
+            "bit_depth": 16,
+            "exposure_raw_10ns": exposure,
+        }
+        for color, exposure in zip((1, 2, 3), (71_373, 137_524, 126_126), strict=True)
+    ]
+
+    def perform(_ep_out: object, _ep_in: object, entry: dict, **_kwargs: object) -> TransactionResult:
+        sequence = entry["seq"]
+        if sequence in (115, 116, 117):
+            payload = b"window"
+        elif sequence in worker_module.PREVIEW_READ_SEQUENCES:
+            payload = bytes(entry["request_len"])
+        elif sequence == 171:
+            payload = header_8e
+        elif sequence == 172:
+            assert entry["request_len"] == len(table_8e)
+            payload = table_8e
+        else:
+            payload = bytes.fromhex(entry.get("expected_data_in", ""))
+        return TransactionResult(
+            phase=entry.get("expected_phase", 1),
+            payload=payload,
+            status=bytes.fromhex(entry.get("expected_status", "00" * 8)),
+            sense=entry.get("expected_sense", "000000"),
+            stall_recoveries=0,
+        )
+
+    def perform_startup(_ep_out: object, _ep_in: object, entry: dict, **_kwargs: object) -> TransactionResult:
+        assert entry["seq"] == worker_module.VARIABLE_FRAME_TABLE_SEQUENCE
+        return TransactionResult(
+            phase=3, payload=bytes(startup), status=bytes(8), sense="000000", stall_recoveries=0,
+        )
+
+    def ready(_ep_out: object, _ep_in: object, entries: list[dict], **_kwargs: object) -> tuple[int, int]:
+        return 1, 0
+
+    return {
+        "ep_out": ep_out,
+        "ep_in": ep_in,
+        "interface": interface,
+        "USBUtil": USBUtil,
+        "preview_windows": preview_windows,
+        "perform": perform,
+        "perform_startup": perform_startup,
+        "ready": ready,
+    }
+
+
+def _apply_preview_and_hold_fakes(
+    monkeypatch: pytest.MonkeyPatch, fakes: dict[str, object]
+) -> None:
+    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    monkeypatch.setattr(
+        worker_module, "_validate_live_preview_windows", lambda *_args: fakes["preview_windows"]
+    )
+    monkeypatch.setattr(worker_module, "_perform_with_busy_retry", fakes["perform"])
+    monkeypatch.setattr(
+        worker_module, "_perform_variable_frame_table_transaction", fakes["perform_startup"]
+    )
+    monkeypatch.setattr(worker_module, "_perform_ready_group", fakes["ready"])
+    monkeypatch.setattr(worker_module, "_wait_post_scan_ready", lambda *_args, **_kwargs: (1, 0))
+    monkeypatch.setattr(
+        worker_module,
+        "_connect_device",
+        lambda: (object(), fakes["interface"], fakes["ep_out"], fakes["ep_in"], fakes["USBUtil"]),
+    )
+    # This fixture family is about the preview-and-hold eject/release state
+    # machine, not density evaluation, and its all-zero synthetic preview
+    # raster has no nonzero unsaturated meter row for the real Nikon density
+    # arithmetic to select -- fake the boundary just below run_live_capture's
+    # density call the same way test_live_two_frame_batch_uses_one_combined_
+    # table_and_one_release already does for the batch-frame side.
+    monkeypatch.setattr(
+        worker_module,
+        "build_nikon_density_evidence",
+        lambda *_args, **kwargs: SimpleNamespace(
+            source_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            preview_identity_sha256="d" * 64,
+            to_dict=lambda: {"scope": "reservation-preview", "test_fixture": True},
+        ),
+    )
+
+
+def test_preview_and_hold_eject_decision_replays_sequence_then_releases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The "operator saw the preview, wants out" case: a hold decision of
+    "eject" must replay the traced vendor eject sequence -- still inside
+    this attempt's original reservation -- strictly before the
+    RELEASE_UNIT every held-preview teardown already sends, and must
+    record hold_outcome="ejected" plus the eject evidence in the final
+    journal."""
+
+    plan = load_canonical_plan()
+    journal_path = tmp_path / "journal.json"
+    output_path = tmp_path / "capture.bin"
+    hold_job_path = tmp_path / "hold-job.json"
+    fakes = _preview_and_hold_fakes()
+
+    calls: list[str] = []
+
+    def fake_perform_vendor_eject(ep_out_value: object, ep_in_value: object) -> dict:
+        assert (ep_out_value, ep_in_value) == (fakes["ep_out"], fakes["ep_in"])
+        calls.append("eject")
+        return {
+            "eject_cdb_status": "0000000000000000",
+            "eject_execute_status": "0000000000000000",
+            "terminal_sense": worker_module.EJECT_TERMINAL_SENSE,
+            "wait_polls": 5,
+            "stall_recoveries": 0,
+        }
+
+    def release(ep_out_value: object, ep_in_value: object) -> TransactionResult:
+        calls.append("release")
+        return TransactionResult(1, b"", bytes(8), "000000", 0)
+
+    _apply_preview_and_hold_fakes(monkeypatch, fakes)
+    monkeypatch.setattr(worker_module, "_perform_vendor_eject", fake_perform_vendor_eject)
+    monkeypatch.setattr(worker_module, "_release_unit", release)
+    monkeypatch.setattr(
+        worker_module,
+        "wait_for_hold_decision",
+        lambda _path, *, hold_session_id, **_kwargs: "eject",
+    )
+
+    worker_module.run_live_capture(
+        plan,
+        tmp_path / "plan.jsonl",
+        CANONICAL_PLAN_SHA256,
+        output_path,
+        journal_path,
+        0,
+        preview_and_hold=True,
+        hold_job_path=hold_job_path,
+        continuation_plan=load_canonical_continuation_plan(),
+        continuation_plan_sha256=worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+    )
+
+    assert calls == ["eject", "release"], "eject must replay before RELEASE_UNIT, in that order"
+
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["hold_outcome"] == "ejected"
+    assert journal["status"] == "complete"
+    assert journal["unit_released"] is True
+    assert journal["eject"]["terminal_sense"] == worker_module.EJECT_TERMINAL_SENSE
+
+
+def test_preview_and_hold_eject_wedge_forces_power_cycle_recovery_even_after_clean_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A suspected transport wedge during eject must demand a power cycle
+    even when the defensive RELEASE_UNIT inside _cleanup_synchronized
+    still succeeds -- RELEASE_UNIT and physical eject motion are
+    independent facts (EjectWedgeSuspected's own docstring). Failing to
+    force this would let a clean SCSI-level release mask exactly the
+    dangerous wedge shortstrip-lab/INCIDENT-20260719-eject-from-park.md's
+    2026-07-24 reopening recorded live."""
+
+    plan = load_canonical_plan()
+    journal_path = tmp_path / "journal.json"
+    output_path = tmp_path / "capture.bin"
+    hold_job_path = tmp_path / "hold-job.json"
+    fakes = _preview_and_hold_fakes()
+
+    def failing_eject(_ep_out: object, _ep_in: object) -> dict:
+        raise worker_module.EjectWedgeSuspected(
+            "eject wait: no motion observed within 36s of the eject "
+            "command (sense stayed 000000); matches the documented "
+            "accepted-without-actuation wedge signature -- power cycle "
+            "required, do not retry"
+        )
+
+    release_calls: list[str] = []
+
+    def release(ep_out_value: object, ep_in_value: object) -> TransactionResult:
+        release_calls.append("release")
+        return TransactionResult(1, b"", bytes(8), "000000", 0)
+
+    _apply_preview_and_hold_fakes(monkeypatch, fakes)
+    monkeypatch.setattr(worker_module, "_perform_vendor_eject", failing_eject)
+    monkeypatch.setattr(worker_module, "_release_unit", release)
+    monkeypatch.setattr(
+        worker_module,
+        "wait_for_hold_decision",
+        lambda _path, *, hold_session_id, **_kwargs: "eject",
+    )
+
+    with pytest.raises(worker_module.EjectWedgeSuspected):
+        worker_module.run_live_capture(
+            plan,
+            tmp_path / "plan.jsonl",
+            CANONICAL_PLAN_SHA256,
+            output_path,
+            journal_path,
+            0,
+            preview_and_hold=True,
+            hold_job_path=hold_job_path,
+            continuation_plan=load_canonical_continuation_plan(),
+            continuation_plan_sha256=worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+        )
+
+    # The defensive cleanup path did successfully call RELEASE_UNIT...
+    assert release_calls == ["release"]
+    # ...but recovery_required must still demand a power cycle regardless
+    # -- the state a human needs preserved and named, not silently cleared.
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["status"] == "failed"
+    assert journal["recovery_required"] == "power-cycle scanner before another attempt"
+    assert "EjectWedgeSuspected" in journal["error"]
+
+
+def test_preview_and_hold_release_decision_never_touches_eject_primitives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin: an ordinary "release" hold decision (today's
+    existing, cold path) must never call the new eject primitive -- this
+    feature is purely additive and must not perturb byte-identical
+    behavior for every caller that never asks for it."""
+
+    plan = load_canonical_plan()
+    journal_path = tmp_path / "journal.json"
+    output_path = tmp_path / "capture.bin"
+    hold_job_path = tmp_path / "hold-job.json"
+    fakes = _preview_and_hold_fakes()
+
+    def unexpected_eject(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("a release decision must never call _perform_vendor_eject")
+
+    def release(ep_out_value: object, ep_in_value: object) -> TransactionResult:
+        return TransactionResult(1, b"", bytes(8), "000000", 0)
+
+    _apply_preview_and_hold_fakes(monkeypatch, fakes)
+    monkeypatch.setattr(worker_module, "_perform_vendor_eject", unexpected_eject)
+    monkeypatch.setattr(worker_module, "_release_unit", release)
+    monkeypatch.setattr(
+        worker_module,
+        "wait_for_hold_decision",
+        lambda _path, *, hold_session_id, **_kwargs: "release",
+    )
+
+    worker_module.run_live_capture(
+        plan,
+        tmp_path / "plan.jsonl",
+        CANONICAL_PLAN_SHA256,
+        output_path,
+        journal_path,
+        0,
+        preview_and_hold=True,
+        hold_job_path=hold_job_path,
+        continuation_plan=load_canonical_continuation_plan(),
+        continuation_plan_sha256=worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+    )
+
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["hold_outcome"] == "released"
+    assert journal["status"] == "complete"
+    assert "eject" not in journal
+
+
 def test_batch_cli_dry_run_validates_one_session_without_single_frame_flags(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1575,6 +2244,7 @@ def test_batch_cli_dry_run_validates_one_session_without_single_frame_flags(
                 ).hexdigest(),
                 "expected_usb_address": 2,
                 "expected_usb_bus": 1,
+                "exposure_override_10ns": None,
                 "frames": [
                     {
                         "ack": "frame-017/parent-ack.json",
@@ -1626,6 +2296,91 @@ def test_batch_cli_dry_run_validates_one_session_without_single_frame_flags(
     assert "slots 17, 19" in output
     assert "dry run only; scanner was not accessed" in output
     assert not (tmp_path / "frame-017").exists()
+
+
+def test_preview_and_hold_cli_dry_run_validates_without_touching_scanner(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--preview-and-hold's CLI wiring: --hold-job and --continuation-plan
+    are required, batch/single-frame arguments are forbidden together with
+    it, and a dry run (no --live) validates without ever calling
+    _connect_device(). This is only the CLI-argument half of the
+    contract; the preview_and_hold branch's own protocol state machine is
+    exercised with a fake USB backend by
+    test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after
+    below, and by CaptureProcessAdapter's own hardware-free hold-path
+    tests in test_capture_process.py."""
+
+    data = files(DATA_PACKAGE)
+    plan_path = Path(data.joinpath("replay-first-rgbi4-plan.jsonl"))
+    manifest_path = Path(data.joinpath("replay-first-rgbi4-manifest.json"))
+    continuation_path = Path(data.joinpath("replay-next-rgbi4-plan.json"))
+
+    with pytest.raises(ProtocolError, match="requires --hold-job"):
+        main(
+            [
+                "--preview-and-hold",
+                "--plan",
+                str(plan_path),
+                "--manifest",
+                str(manifest_path),
+                "--continuation-plan",
+                str(continuation_path),
+            ]
+        )
+
+    with pytest.raises(ProtocolError, match="requires --continuation-plan"):
+        main(
+            [
+                "--preview-and-hold",
+                "--plan",
+                str(plan_path),
+                "--manifest",
+                str(manifest_path),
+                "--hold-job",
+                str(tmp_path / "hold-job.json"),
+            ]
+        )
+
+    with pytest.raises(ProtocolError, match="owns frame and mode arguments"):
+        main(
+            [
+                "--preview-and-hold",
+                "--plan",
+                str(plan_path),
+                "--manifest",
+                str(manifest_path),
+                "--continuation-plan",
+                str(continuation_path),
+                "--hold-job",
+                str(tmp_path / "hold-job.json"),
+                "--frame",
+                "1",
+            ]
+        )
+
+    main(
+        [
+            "--preview-and-hold",
+            "--plan",
+            str(plan_path),
+            "--manifest",
+            str(manifest_path),
+            "--continuation-plan",
+            str(continuation_path),
+            "--hold-job",
+            str(tmp_path / "hold-job.json"),
+            "--output",
+            str(tmp_path / "preview.bin"),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "validated preview-and-hold plan" in output
+    assert "dry run only; scanner was not accessed" in output
+    assert not (tmp_path / "preview.bin").exists()
+    assert not (tmp_path / "hold-job.json").exists()
 
 
 def test_batch_cli_refuses_a_topology_rewrite_before_any_usb_access(
@@ -3327,78 +4082,6 @@ def test_batch_selections_accept_a_live_count_several_frames_below_reviewed(
     assert bound_frames == [3, 20]
 
 
-def _synthetic_meter_observation() -> object:
-    meter = worker_module.meter_module
-    yy, xx = np.mgrid[0 : meter.METER_ROWS, 0 : meter.METER_WIDTH]
-    field = 0.08 + 0.82 * (
-        0.55 * xx / (meter.METER_WIDTH - 1)
-        + 0.45 * yy / (meter.METER_ROWS - 1)
-    )
-    image = np.empty(
-        (meter.METER_ROWS, meter.METER_WIDTH, 4),
-        dtype=np.uint16,
-    )
-    for channel_index, peak in enumerate(
-        (28_000, 31_000, 34_000, 29_000)
-    ):
-        image[:, :, channel_index] = np.round(
-            900 + peak * field
-        ).astype(np.uint16)
-    return meter.observe_meter_pass(
-        meter.DecodedMeterPass(
-            image=image,
-            row_tail=np.zeros(
-                (meter.METER_ROWS, meter.METER_TAIL_SAMPLES),
-                dtype=">u2",
-            ),
-        ),
-        worker_module.DEFAULT_EXPOSURES,
-    )
-
-
-def test_nikon_parity_calculation_failure_refuses_the_fine_scan(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Since the guarded parity solve became the RGB command authority, a
-    calculation failure must refuse the fine scan — never fall back silently
-    to the active solve — and must journal exactly what refused."""
-
-    journal: dict[str, object] = {}
-    monkeypatch.setattr(
-        worker_module,
-        "calculate_nikon_parity_shadow",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            ValueError("diagnostic fixture failure")
-        ),
-    )
-
-    final_result = SimpleNamespace(
-        final_exposures=dict(worker_module.DEFAULT_EXPOSURES)
-    )
-    with pytest.raises(
-        worker_module.SynchronizedProtocolError, match="nikon-parity"
-    ):
-        worker_module._resolve_parity_active_exposures(
-            journal,
-            observation=_synthetic_meter_observation(),
-            final_result=final_result,
-        )
-
-    assert journal["meter_shadow_profiles"] == {
-        "nikon-parity": {
-            "profile": "nikon-parity",
-            "status": "calculation-error",
-            "armed": False,
-            "scanner_route": "none",
-            "error": {
-                "type": "ValueError",
-                "message": "diagnostic fixture failure",
-            },
-        }
-    }
-    assert "active_exposure_authority" not in journal
-
-
 def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3549,6 +4232,11 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     monkeypatch.setattr(
         worker_module,
         "observe_meter_pass",
+        # Since the guarded nikon-parity solve became the RGB command
+        # authority, this feeds calculate_nikon_parity_shadow -- a bare
+        # object() no longer type-checks as a MeterObservation. This test
+        # asserts on protocol/journal shape, not exposure values, so any
+        # deterministic real observation satisfies it.
         lambda *_args, **_kwargs: _synthetic_meter_observation(),
     )
     monkeypatch.setattr(
@@ -3593,6 +4281,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
             density_evidence=density_evidence,
             actual_usb_bus=1,
             actual_usb_address=2,
+            expected_calibration_session_id=batch.session_id,
             scanner_identity="Nikon LS-5000 ED 1.03",
         )
     assert not second.output.parent.exists()
@@ -3614,6 +4303,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
         density_evidence=density_evidence,
         actual_usb_bus=1,
         actual_usb_address=2,
+        expected_calibration_session_id=batch.session_id,
         scanner_identity="Nikon LS-5000 ED 1.03",
     )
 
@@ -3626,45 +4316,444 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     assert journal["frame_complete"] is True
     assert journal["session_reservation_retained"] is True
     assert journal["unit_released"] is False
-    assert journal["scanner_identity"] == "Nikon LS-5000 ED 1.03"
     assert journal["density_calibration_session_id"] == batch.session_id
-    shadow = journal["meter_shadow_profiles"]["nikon-parity"]
-    assert shadow["armed"] is True
-    assert shadow["scanner_route"] == "fine-rgb-set-window"
-    assert (
-        shadow["infrared"]["current_metered_exposure_raw_10ns"]
-        == worker_module.DEFAULT_EXPOSURES["IR"]
-    )
-    candidate_rgb = shadow["candidate_rgb_exposures_raw_10ns"]
-    assert candidate_rgb != {
-        channel: worker_module.DEFAULT_EXPOSURES[channel]
-        for channel in ("R", "G", "B")
-    }
-    # The guarded parity candidates (after the journaled device-bound clamp)
-    # ARE the commanded fine RGB exposures; infrared stays with the active
-    # controller.
-    authority = journal["active_exposure_authority"]
-    assert authority["rgb_source"] == "nikon-parity-guarded-v2"
-    assert authority["ir_source"] == "active-controller"
-    commanded = authority["commanded_channels_raw_10ns"]
-    for channel in ("R", "G", "B"):
-        assert commanded[channel] == min(
-            max(candidate_rgb[channel], worker_module.EXPOSURE_MIN),
-            worker_module.EXPOSURE_MAX,
-        )
-    assert {
-        window["color_id"]: window["exposure_raw_10ns"]
-        for window in journal["fine_windows"]
-    } == {
-        1: commanded["R"],
-        2: commanded["G"],
-        3: commanded["B"],
-        9: worker_module.DEFAULT_EXPOSURES["IR"],
-    }
     assert second.output.read_bytes() == b"x"
     assert second.journal.read_text(encoding="utf-8") == (
         json.dumps(journal, indent=2, sort_keys=True) + "\n"
     )
+
+
+def _run_fake_continuation_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    exposure_override_10ns: tuple[int, int, int] | None,
+) -> dict[str, object]:
+    """The same fake-USB harness as
+    test_continuation_executor_runs_all_89_steps_with_fake_usb, parametrized
+    only by the batch job's exposure_override_10ns, so both the
+    override-applied and override-absent (regression pin) exposure tests
+    below exercise an identical USB step sequence -- proving the
+    substitution is purely a plan-build-time swap, not a change to the wire
+    traffic shape itself."""
+
+    records = tuple(
+        TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(6_000)
+    )
+    origins = tuple(
+        NativeFrameOrigin(
+            frame=frame,
+            boundary_index=frame - 1,
+            boundary_output_row=row - 4,
+            lookup_row=row,
+            code=records[row].code,
+            selector=records[row].selector,
+            native_origin=records[row].native_origin,
+            method="direct-gap-trailing-row",
+            automatic=True,
+            manual_review=False,
+            review_reasons=(),
+            affine_residual_rows=0.0,
+        )
+        for frame, row in enumerate(
+            (100 + 143 * index for index in range(37)),
+            start=1,
+        )
+    )
+    mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
+    combined, _resolved = apply_batch_boundary_offsets(
+        mapping,
+        records,
+        ((7, 9), (18, -11)),
+    )
+    plan = load_canonical_plan()
+    geometry = _derive_index_geometry(plan)
+    selection = SimpleNamespace(
+        frame=18,
+        frame_count=len(combined.origins),
+        geometry=geometry,
+        mapping=combined,
+        selected=combined.origins[17],
+        requested_boundary_offset_rows=-11,
+        applied_boundary_offset_rows=-11,
+        diagnostics=lambda: {"frame": 18, "prevalidated": True},
+    )
+    root = tmp_path / "continuation"
+    root.mkdir()
+    second = worker_module.BatchFrameSpec(
+        18,
+        -11,
+        root / "frame-018" / "capture.bin",
+        root / "frame-018" / "journal.json",
+        root / "frame-018" / "parent-ack.json",
+    )
+    batch = worker_module.LiveBatchJob(
+        "continuation-session",
+        root,
+        (
+            worker_module.BatchFrameSpec(
+                7,
+                9,
+                root / "frame-007" / "capture.bin",
+                root / "frame-007" / "journal.json",
+                root / "frame-007" / "parent-ack.json",
+            ),
+            second,
+        ),
+        _reviewed_fingerprint(),
+        1,
+        2,
+        CANONICAL_PLAN_SHA256,
+        worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+        "c" * 64,
+        exposure_override_10ns,
+    )
+    canonical_target = worker_module.validate_plan(plan)
+    tiny_target = {
+        **canonical_target,
+        "repeat": 1,
+        "request_len": 1,
+        "request_parts": [1],
+    }
+    monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", 1)
+    monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
+    monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
+    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+
+    def ready(
+        _ep_out: object,
+        _ep_in: object,
+        entries: list[dict],
+        **_kwargs: object,
+    ) -> tuple[int, int]:
+        return 1, 0
+
+    def perform(
+        _ep_out: object,
+        _ep_in: object,
+        entry: dict,
+        **_kwargs: object,
+    ) -> TransactionResult:
+        sequence = entry["seq"]
+        if sequence in (
+            *worker_module.METER_GET_WINDOW_SEQUENCES,
+            *worker_module.FINE_GET_WINDOW_SEQUENCES,
+        ):
+            payload = bytes.fromhex(entry["expected_data_in"])
+        elif sequence in worker_module.METER_READ_SEQUENCES or sequence == 607:
+            payload = b"x"
+        else:
+            payload = bytes.fromhex(entry.get("expected_data_in", ""))
+        return TransactionResult(
+            phase=entry.get("expected_phase", 1),
+            payload=payload,
+            status=bytes.fromhex(entry.get("expected_status", "00" * 8)),
+            sense=entry.get("expected_sense", "000000"),
+            stall_recoveries=0,
+        )
+
+    accepted_proposal = SimpleNamespace(
+        accepted=True,
+        proposed_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    accepted_final = SimpleNamespace(
+        accepted=True,
+        final_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    monkeypatch.setattr(worker_module, "_perform_ready_group", ready)
+    monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
+    monkeypatch.setattr(
+        worker_module,
+        "observe_meter_pass",
+        # Since the guarded nikon-parity solve became the RGB command
+        # authority, this feeds calculate_nikon_parity_shadow -- a bare
+        # object() (this fixture's own pre-parity placeholder) no longer
+        # type-checks as a MeterObservation. Same synthetic fixture the
+        # nikon-parity tests above use.
+        lambda *_args, **_kwargs: _synthetic_meter_observation(),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "propose_next_exposures",
+        lambda *_args, **_kwargs: accepted_proposal,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "verify_final_convergence",
+        lambda *_args, **_kwargs: accepted_final,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_wait_post_scan_ready",
+        lambda *_args, **_kwargs: (1, 0),
+    )
+    # This fixture is about the continuation executor's exposure-override
+    # plan-build substitution, not density evidence -- fake the boundary
+    # just below it the same way the batch-frame-side tests already do.
+    monkeypatch.setattr(
+        worker_module,
+        "_density_frame_ownership_receipt",
+        lambda *_args, **_kwargs: {"fixture": "owned"},
+    )
+    density_calibration = _density_calibration(batch.session_id)
+    density_evidence = SimpleNamespace(
+        source_binding=SimpleNamespace(session_id=batch.session_id),
+    )
+
+    return worker_module._run_live_continuation_frame(
+        "out",
+        "in",
+        plan,
+        tmp_path / "plan.jsonl",
+        CANONICAL_PLAN_SHA256,
+        load_canonical_continuation_plan(),
+        worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+        second,
+        selection,
+        batch_job=batch,
+        frame_index=2,
+        lifecycle=worker_module.SessionLifecycle(),
+        density_calibration=density_calibration,
+        density_evidence=density_evidence,
+        actual_usb_bus=1,
+        actual_usb_address=2,
+        expected_calibration_session_id=batch.session_id,
+        scanner_identity="Nikon LS-5000 ED 1.03",
+    )
+
+
+def test_continuation_executor_substitutes_forced_ticks_at_fine_plan_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exposure override choke point: worker._apply_exposure_override,
+    called from _run_live_continuation_frame exactly where the accepted
+    meter contract (final_result.final_exposures) would otherwise flow
+    straight into _patch_exposure_contract for the fine SET_WINDOW/GET_WINDOW
+    group. Forcing R/G/B must show up in the real fine wire echo
+    (journal["fine_windows"], decoded from what the fake scanner actually
+    echoed back over "the wire"), not just in a journal label -- IR has no
+    override concept and stays at the metered value."""
+
+    forced = (97_482, 195_597, 180_705)
+    journal = _run_fake_continuation_frame(
+        tmp_path, monkeypatch, exposure_override_10ns=forced
+    )
+
+    metered = dict(worker_module.DEFAULT_EXPOSURES)
+    # Since the guarded nikon-parity solve became the RGB command
+    # authority, _apply_exposure_override's own "metered" baseline (what
+    # the override replaces, and what its provenance records under
+    # metered_10ns) is the guarded candidate _resolve_parity_active_
+    # exposures derives from this fixture's synthetic meter observation --
+    # not the raw AE meter answer (DEFAULT_EXPOSURES) directly. Derived
+    # here via the real production function, against a throwaway journal,
+    # rather than hardcoded, so this pin tracks that calculation instead
+    # of silently drifting from it. IR is untouched by both nikon-parity
+    # and the override, so it alone stays the raw metered value.
+    guarded = worker_module._resolve_parity_active_exposures(
+        {},
+        observation=_synthetic_meter_observation(),
+        final_result=SimpleNamespace(final_exposures=dict(metered)),
+    )
+    assert journal["meter_final_exposures"] == {
+        "controller_channels_raw_10ns": {
+            "R": 97_482,
+            "G": 195_597,
+            "B": 180_705,
+            "IR": metered["IR"],
+        },
+        "wire_colors_raw_10ns": {
+            "1": 97_482,
+            "2": 195_597,
+            "3": 180_705,
+            "9": metered["IR"],
+        },
+    }
+    assert journal["exposure_override"] == {
+        "applied": True,
+        "forced_10ns": {"red": 97_482, "green": 195_597, "blue": 180_705},
+        "metered_10ns": {
+            "red": guarded["R"],
+            "green": guarded["G"],
+            "blue": guarded["B"],
+        },
+    }
+    # The meter's own persisted final-result record is deliberately left
+    # untouched by the override -- it stays this fixture's fake
+    # MeterResult.to_dict() answer verbatim. What must line up with the
+    # contract actually armed for the fine scan (see
+    # single_pass_workflow._validate_completed_capture's and
+    # _read_exact_analyzer_source's shared cross-check against the real
+    # fine GET_WINDOW echo) is nikon-parity's own authority record instead
+    # -- commanded_channels_raw_10ns is patched to the overridden contract
+    # for exactly this reason; active_controller_channels_raw_10ns stays
+    # the true metered answer, never the override.
+    assert journal["meter_controller_final_result"] == {"accepted": True}
+    authority = journal["active_exposure_authority"]
+    assert authority["commanded_channels_raw_10ns"] == {
+        "R": 97_482,
+        "G": 195_597,
+        "B": 180_705,
+        "IR": metered["IR"],
+    }
+    assert authority["active_controller_channels_raw_10ns"] == metered
+    observed_fine = {
+        window["color_id"]: window["exposure_raw_10ns"]
+        for window in journal["fine_windows"]
+    }
+    assert observed_fine == {1: 97_482, 2: 195_597, 3: 180_705, 9: metered["IR"]}
+    observed_preflight = {
+        window["color_id"]: window["exposure_raw_10ns"]
+        for window in journal["fine_set_windows_preflight"]
+    }
+    assert observed_preflight == observed_fine
+    assert journal["status"] == "frame-complete"
+    assert journal["frame_complete"] is True
+
+
+def _synthetic_meter_observation() -> object:
+    meter = worker_module.meter_module
+    yy, xx = np.mgrid[0 : meter.METER_ROWS, 0 : meter.METER_WIDTH]
+    field = 0.08 + 0.82 * (
+        0.55 * xx / (meter.METER_WIDTH - 1)
+        + 0.45 * yy / (meter.METER_ROWS - 1)
+    )
+    image = np.empty(
+        (meter.METER_ROWS, meter.METER_WIDTH, 4),
+        dtype=np.uint16,
+    )
+    for channel_index, peak in enumerate(
+        (28_000, 31_000, 34_000, 29_000)
+    ):
+        image[:, :, channel_index] = np.round(
+            900 + peak * field
+        ).astype(np.uint16)
+    return meter.observe_meter_pass(
+        meter.DecodedMeterPass(
+            image=image,
+            row_tail=np.zeros(
+                (meter.METER_ROWS, meter.METER_TAIL_SAMPLES),
+                dtype=">u2",
+            ),
+        ),
+        worker_module.DEFAULT_EXPOSURES,
+    )
+
+
+def test_nikon_parity_calculation_failure_refuses_the_fine_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Since the guarded parity solve became the RGB command authority, a
+    calculation failure must refuse the fine scan — never fall back silently
+    to the active solve — and must journal exactly what refused."""
+
+    journal: dict[str, object] = {}
+    monkeypatch.setattr(
+        worker_module,
+        "calculate_nikon_parity_shadow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("diagnostic fixture failure")
+        ),
+    )
+
+    final_result = SimpleNamespace(
+        final_exposures=dict(worker_module.DEFAULT_EXPOSURES)
+    )
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError, match="nikon-parity"
+    ):
+        worker_module._resolve_parity_active_exposures(
+            journal,
+            observation=_synthetic_meter_observation(),
+            final_result=final_result,
+        )
+
+    assert journal["meter_shadow_profiles"] == {
+        "nikon-parity": {
+            "profile": "nikon-parity",
+            "status": "calculation-error",
+            "armed": False,
+            "scanner_route": "none",
+            "error": {
+                "type": "ValueError",
+                "message": "diagnostic fixture failure",
+            },
+        }
+    }
+    assert "active_exposure_authority" not in journal
+
+
+def test_continuation_executor_without_override_matches_pre_override_fine_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin: exposure_override_10ns=None must build a
+    byte-identical fine-scan plan/evidence to this feature's pre-existing
+    behavior (test_continuation_executor_runs_all_89_steps_with_fake_usb's
+    own fixture) -- same fake-USB harness, asserting directly on every
+    exposure-contract field this feature touches."""
+
+    journal = _run_fake_continuation_frame(
+        tmp_path, monkeypatch, exposure_override_10ns=None
+    )
+
+    metered = dict(worker_module.DEFAULT_EXPOSURES)
+    # With no override, _apply_exposure_override is a pass-through: the
+    # commanded contract is nikon-parity's own guarded candidate (the RGB
+    # command authority since that feature landed), derived here via the
+    # real production function rather than hardcoded -- see the matching
+    # comment on test_continuation_executor_substitutes_forced_ticks_at_
+    # fine_plan_build. IR alone is untouched by nikon-parity, so it still
+    # equals the raw metered value.
+    guarded = worker_module._resolve_parity_active_exposures(
+        {},
+        observation=_synthetic_meter_observation(),
+        final_result=SimpleNamespace(final_exposures=dict(metered)),
+    )
+    assert "exposure_override" not in journal
+    assert journal["meter_controller_final_result"] == {"accepted": True}
+    assert journal["meter_final_exposures"] == {
+        "controller_channels_raw_10ns": guarded,
+        "wire_colors_raw_10ns": {
+            "1": guarded["R"],
+            "2": guarded["G"],
+            "3": guarded["B"],
+            "9": guarded["IR"],
+        },
+    }
+    authority = journal["active_exposure_authority"]
+    assert authority["commanded_channels_raw_10ns"] == guarded
+    assert authority["active_controller_channels_raw_10ns"] == metered
+    observed_fine = {
+        window["color_id"]: window["exposure_raw_10ns"]
+        for window in journal["fine_windows"]
+    }
+    assert observed_fine == {
+        1: guarded["R"],
+        2: guarded["G"],
+        3: guarded["B"],
+        9: guarded["IR"],
+    }
+    assert journal["status"] == "frame-complete"
+    assert journal["frame_complete"] is True
 
 
 def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
@@ -4370,3 +5459,1163 @@ def test_guarded_candidate_outside_scanner_bounds_is_clamped_and_journaled(
         worker_module.EXPOSURE_MIN,
         worker_module.EXPOSURE_MAX,
     ]
+
+
+def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a)/(b) task requirement, at the wire level -- the only layer in
+    this suite that actually speaks SCSI: preview-and-hold, then two
+    separate scan_many()-shaped resumes on the SAME held child (slot 7,
+    then slot 18), the first ending with a "continue_hold" frame ack (the
+    new multi-batch-per-feed default) and the second ending with
+    "eject" (Roll.scan_many(eject_after=True)'s own mechanism, unchanged).
+    Proves, by direct command-sequence count: exactly one RESERVE_UNIT
+    (sequence 17), exactly one command-64 (VARIABLE_FRAME_TABLE_SEQUENCE)
+    transaction, two fine READs (one per round, sequence 607 in this
+    shrunk plan), and exactly one eject followed by exactly one release at
+    the very end -- zero of any of these between the two rounds."""
+
+    plan = load_canonical_plan()
+    canonical_target = worker_module.validate_plan(plan)
+    tiny_target = {
+        **canonical_target,
+        "repeat": 1,
+        "request_len": 1,
+        "request_parts": [1],
+    }
+    for sequence in worker_module.PREVIEW_READ_SEQUENCES:
+        entry = plan[sequence - 1]
+        entry["request_len"] = 1
+        entry["request_parts"] = [1]
+
+    records = tuple(
+        TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(6_000)
+    )
+    origins = tuple(
+        NativeFrameOrigin(
+            frame=frame,
+            boundary_index=frame - 1,
+            boundary_output_row=row - 4,
+            lookup_row=row,
+            code=records[row].code,
+            selector=records[row].selector,
+            native_origin=records[row].native_origin,
+            method="direct-gap-trailing-row",
+            automatic=True,
+            manual_review=False,
+            review_reasons=(),
+            affine_residual_rows=0.0,
+        )
+        for frame, row in enumerate(
+            (100 + 143 * index for index in range(37)),
+            start=1,
+        )
+    )
+    base_mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
+    combined, resolved = apply_batch_boundary_offsets(
+        base_mapping,
+        records,
+        ((7, 9), (18, -11)),
+    )
+    geometry = SimpleNamespace(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=250_278,
+        width=96,
+        height=len(worker_module.PREVIEW_READ_SEQUENCES),
+        block_bytes=1,
+        expected_stream_bytes=len(worker_module.PREVIEW_READ_SEQUENCES),
+    )
+
+    def selection_for(
+        slot: int,
+        offset: int,
+        pair: tuple,
+    ) -> SimpleNamespace:
+        base, selected, _rebase = pair
+        return SimpleNamespace(
+            frame=slot,
+            frame_count=len(combined.origins),
+            geometry=geometry,
+            mapping=combined,
+            base_selected=base,
+            selected=selected,
+            requested_boundary_offset_rows=offset,
+            applied_boundary_offset_rows=offset,
+            diagnostics=lambda: {
+                "frame": slot,
+                "boundary_offset": {
+                    "requested_rows": offset,
+                    "applied_rows": offset,
+                },
+                "selected": {
+                    "frame": slot,
+                    "lookup_row": selected.lookup_row,
+                    "native_origin": selected.native_origin,
+                },
+            },
+        )
+
+    selection_7 = selection_for(7, 9, resolved[0])
+    selection_18 = selection_for(18, -11, resolved[1])
+
+    root = tmp_path / "held-multi-batch"
+    root.mkdir()
+    hold_job_path = root / "hold-job.json"
+    reviewed_fingerprint = _reviewed_fingerprint()
+
+    def _frame_spec(slot: int, offset: int) -> worker_module.BatchFrameSpec:
+        return worker_module.BatchFrameSpec(
+            slot,
+            offset,
+            root / f"frame-{slot:03d}" / "capture.bin",
+            root / f"frame-{slot:03d}" / "journal.json",
+            root / f"frame-{slot:03d}" / "parent-ack.json",
+        )
+
+    frame_7 = _frame_spec(7, 9)
+    frame_18 = _frame_spec(18, -11)
+
+    def _job_bytes(*, session_id: str, frame: worker_module.BatchFrameSpec) -> bytes:
+        payload = {
+            "apply_all_boundary_offsets_before_first_frame": True,
+            "capture_plan_sha256": CANONICAL_PLAN_SHA256,
+            "continuation_plan_sha256": worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+            "expected_usb_bus": 1,
+            "expected_usb_address": 2,
+            "exposure_override_10ns": None,
+            "frames": [
+                {
+                    "ack": f"frame-{frame.slot:03d}/parent-ack.json",
+                    "boundary_offset_rows": frame.boundary_offset_rows,
+                    "journal": f"frame-{frame.slot:03d}/journal.json",
+                    "manual_review_approval": None,
+                    "output": f"frame-{frame.slot:03d}/capture.bin",
+                    "slot": frame.slot,
+                },
+            ],
+            "parent_ack_required_after_every_frame": True,
+            "release_once_after_last_frame": True,
+            "reviewed_roll_fingerprint": reviewed_fingerprint.to_payload(),
+            "schema_version": 3,
+            "session_contract": "one-process-one-reservation",
+            "session_id": session_id,
+        }
+        return (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+
+    startup = _startup_frame_table(40)
+    header_8e = b"\0\x8e\0\0\0\x06"
+    reserves: list[int] = []
+    variable_frame_table_calls: list[int] = []
+    fine_reads: list[int] = []
+    ready_groups: list[tuple[int, ...]] = []
+    releases: list[tuple[object, object]] = []
+    ejects: list[str] = []
+    hold_decisions: list[str] = []
+
+    ep_out = SimpleNamespace(bEndpointAddress=0x01)
+    ep_in = SimpleNamespace(bEndpointAddress=0x82)
+    interface = SimpleNamespace(bInterfaceNumber=0)
+
+    class USBUtil:
+        @staticmethod
+        def release_interface(_device: object, _number: int) -> None:
+            pass
+
+        @staticmethod
+        def dispose_resources(_device: object) -> None:
+            pass
+
+    def derive_batch(
+        _plan: list[dict],
+        preview: bytes,
+        table: bytes,
+        frames: tuple,
+        *,
+        reviewed_fingerprint: ReviewedRollFingerprint,
+    ) -> tuple:
+        assert len(preview) == len(worker_module.PREVIEW_READ_SEQUENCES)
+        assert table == header_8e
+        assert len(frames) == 1
+        slot = frames[0].slot
+        assert slot in (7, 18)
+        return (selection_7,) if slot == 7 else (selection_18,)
+
+    def perform(
+        _ep_out: object,
+        _ep_in: object,
+        entry: dict,
+        **_kwargs: object,
+    ) -> TransactionResult:
+        sequence = entry["seq"]
+        if sequence == 17:
+            reserves.append(sequence)
+        if sequence in (115, 116, 117):
+            payload = b"window"
+        elif sequence in worker_module.PREVIEW_READ_SEQUENCES:
+            payload = b"p"
+        elif sequence in (171, 172):
+            payload = header_8e
+        elif sequence in (
+            *worker_module.METER_GET_WINDOW_SEQUENCES,
+            *worker_module.FINE_GET_WINDOW_SEQUENCES,
+        ):
+            payload = bytes.fromhex(entry["expected_data_in"])
+        elif sequence in worker_module.METER_READ_SEQUENCES:
+            payload = b"m"
+        elif sequence == 607:
+            fine_reads.append(sequence)
+            payload = b"f"
+        else:
+            payload = bytes.fromhex(entry.get("expected_data_in", ""))
+        return TransactionResult(
+            phase=entry.get("expected_phase", 1),
+            payload=payload,
+            status=bytes.fromhex(entry.get("expected_status", "00" * 8)),
+            sense=entry.get("expected_sense", "000000"),
+            stall_recoveries=0,
+        )
+
+    def perform_startup(
+        _ep_out: object,
+        _ep_in: object,
+        entry: dict,
+        **_kwargs: object,
+    ) -> TransactionResult:
+        assert entry["seq"] == worker_module.VARIABLE_FRAME_TABLE_SEQUENCE
+        variable_frame_table_calls.append(entry["seq"])
+        return TransactionResult(
+            phase=3, payload=startup, status=bytes(8), sense="000000", stall_recoveries=0,
+        )
+
+    def ready(
+        _ep_out: object,
+        _ep_in: object,
+        entries: list[dict],
+        **_kwargs: object,
+    ) -> tuple[int, int]:
+        ready_groups.append(tuple(entry["seq"] for entry in entries))
+        return 1, 0
+
+    def release(ep_out_value: object, ep_in_value: object) -> TransactionResult:
+        releases.append((ep_out_value, ep_in_value))
+        return TransactionResult(1, b"", bytes(8), "000000", 0)
+
+    def fake_perform_vendor_eject(ep_out_value: object, ep_in_value: object) -> dict:
+        assert (ep_out_value, ep_in_value) == (ep_out, ep_in)
+        ejects.append("eject")
+        return {
+            "eject_cdb_status": "0000000000000000",
+            "eject_execute_status": "0000000000000000",
+            "terminal_sense": worker_module.EJECT_TERMINAL_SENSE,
+            "wait_polls": 5,
+            "stall_recoveries": 0,
+        }
+
+    nonce_counter = [0]
+
+    def fake_token_hex(_size: int) -> str:
+        nonce_counter[0] += 1
+        return f"nonce-{nonce_counter[0]:03d}"
+
+    real_wait_for_parent_ack = worker_module.wait_for_parent_ack
+
+    def acknowledge(
+        path: Path,
+        *,
+        session_id: str,
+        frame_index: int,
+        slot: int,
+        nonce: str,
+        timeout_seconds: float = 1_800.0,
+        poll_seconds: float = 0.1,
+    ) -> str:
+        del timeout_seconds, poll_seconds
+        # The parent decides "continue_hold" for slot 7's terminal frame
+        # (this batch's own default -- Roll.scan_many()'s frame_handler
+        # never asks for a safe-stop or eject here), and "eject" for slot
+        # 18's -- eject_after=True on the second (and last) scan_many()
+        # call in this two-batch sequence.
+        action = "continue_hold" if slot == 7 else "eject"
+        path.write_text(
+            json.dumps(
+                {
+                    "ack_nonce": nonce,
+                    "action": action,
+                    "frame_index": frame_index,
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "slot": slot,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return real_wait_for_parent_ack(
+            path,
+            session_id=session_id,
+            frame_index=frame_index,
+            slot=slot,
+            nonce=nonce,
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+    def fake_wait_for_hold_decision(
+        path: Path,
+        *,
+        hold_session_id: str,
+        timeout_seconds: float = 1_800.0,
+        poll_seconds: float = 0.1,
+    ) -> str:
+        del timeout_seconds, poll_seconds
+        hold_decisions.append(str(path))
+        if len(hold_decisions) == 1:
+            # Round 1's own hold-wait: the fixed hold_job_path this
+            # attempt was launched with. Publish slot 7's one-frame job
+            # and resume.
+            hold_job_path.write_text(
+                _job_bytes(session_id=hold_session_id, frame=frame_7).decode("utf-8"),
+                encoding="utf-8",
+            )
+            return "scan"
+        # Round 2's own hold-wait: a fresh path this run minted itself
+        # (worker.py's own round-N naming: hold-job-<id>.json alongside
+        # hold-ack-<id>.json, same directory as the original hold-job).
+        # Derive it the same way rather than hard-coding it, so this test
+        # breaks loudly if that naming ever changes instead of silently
+        # writing to the wrong file.
+        round_job_path = path.parent / f"hold-job-{hold_session_id}.json"
+        round_job_path.write_text(
+            _job_bytes(session_id=hold_session_id, frame=frame_18).decode("utf-8"),
+            encoding="utf-8",
+        )
+        return "scan"
+
+    preview_windows = [
+        {
+            "color_id": color,
+            "resx": 97,
+            "resy": 97,
+            "upper_left_x": 0,
+            "upper_left_y": 0,
+            "width": 3_946,
+            "height": 250_278,
+            "bit_depth": 16,
+            "exposure_raw_10ns": 70_000 + color,
+        }
+        for color in (1, 2, 3)
+    ]
+    accepted_proposal = SimpleNamespace(
+        accepted=True,
+        proposed_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    accepted_final = SimpleNamespace(
+        accepted=True,
+        final_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", 1)
+    monkeypatch.setattr(
+        worker_module,
+        "EXPECTED_PREVIEW_BYTES",
+        len(worker_module.PREVIEW_READ_SEQUENCES),
+    )
+    monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
+    monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
+    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
+    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    monkeypatch.setattr(
+        worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
+    )
+    # Not a density test: this fixture's shrunk plan/geometry/startup table
+    # (request_len=1, height=48) don't satisfy the real startup-record ->
+    # density-source-geometry binding -- fake the boundary just below it,
+    # same as test_live_two_frame_batch_uses_one_combined_table_and_one_
+    # release's own sibling fixture does.
+    monkeypatch.setattr(
+        worker_module, "_validate_preview_density_source_contract", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "build_nikon_density_evidence",
+        lambda *_args, **kwargs: SimpleNamespace(
+            source_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            preview_identity_sha256="d" * 64,
+            to_dict=lambda: {"scope": "reservation-preview", "test_fixture": True},
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_density_frame_ownership_receipt",
+        lambda *_args, **_kwargs: {"fixture": "owned"},
+    )
+    monkeypatch.setattr(worker_module, "_derive_live_batch_selections", derive_batch)
+    monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
+    monkeypatch.setattr(
+        worker_module, "_perform_variable_frame_table_transaction", perform_startup
+    )
+    monkeypatch.setattr(worker_module, "_perform_ready_group", ready)
+    monkeypatch.setattr(worker_module, "_wait_post_scan_ready", lambda *_a, **_k: (1, 0))
+    monkeypatch.setattr(
+        worker_module,
+        "observe_meter_pass",
+        # Since the guarded nikon-parity solve became the RGB command
+        # authority, this feeds calculate_nikon_parity_shadow -- a bare
+        # object() no longer type-checks as a MeterObservation.
+        lambda *_a, **_k: _synthetic_meter_observation(),
+    )
+    monkeypatch.setattr(
+        worker_module, "propose_next_exposures", lambda *_a, **_k: accepted_proposal
+    )
+    monkeypatch.setattr(
+        worker_module, "verify_final_convergence", lambda *_a, **_k: accepted_final
+    )
+    monkeypatch.setattr(worker_module, "wait_for_parent_ack", acknowledge)
+    monkeypatch.setattr(worker_module, "wait_for_hold_decision", fake_wait_for_hold_decision)
+    monkeypatch.setattr(worker_module, "_release_unit", release)
+    monkeypatch.setattr(worker_module, "_perform_vendor_eject", fake_perform_vendor_eject)
+    monkeypatch.setattr(worker_module.secrets, "token_hex", fake_token_hex)
+    monkeypatch.setattr(
+        worker_module,
+        "_connect_device",
+        lambda **_kwargs: (
+            SimpleNamespace(bus=1, address=2),
+            interface,
+            ep_out,
+            ep_in,
+            USBUtil,
+        ),
+    )
+
+    worker_module.run_live_capture(
+        plan,
+        tmp_path / "plan.jsonl",
+        CANONICAL_PLAN_SHA256,
+        root / "preview-placeholder.bin",
+        root / "preview-placeholder.json",
+        1,
+        preview_and_hold=True,
+        hold_job_path=hold_job_path,
+        continuation_plan=load_canonical_continuation_plan(),
+        continuation_plan_sha256=worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+    )
+
+    # --- the wire-level claim itself ---
+    assert reserves == [17], "exactly one RESERVE_UNIT across both rounds"
+    assert len(variable_frame_table_calls) == 1, (
+        "exactly one command-64 frame-table transaction across both rounds"
+    )
+    assert fine_reads == [607, 607], "one fine READ per round, two rounds"
+    assert releases == [(ep_out, ep_in)], "exactly one RELEASE_UNIT, at the very end"
+    assert ejects == ["eject"], "exactly one eject, at the very end"
+
+    # --- ordering and session-shape assertions ---
+    assert len(hold_decisions) == 2, "one hold-wait per round"
+    assert hold_decisions[0] == str(hold_job_path.with_name("hold-ack.json"))
+    assert hold_decisions[1] != hold_decisions[0]
+
+    frame_7_journal = json.loads(frame_7.journal.read_text(encoding="utf-8"))
+    assert frame_7_journal["status"] == "frame-complete"
+    assert frame_7_journal["session_reservation_retained"] is True
+    assert frame_7_journal["unit_released"] is False
+
+    frame_18_journal = json.loads(frame_18.journal.read_text(encoding="utf-8"))
+    assert frame_18_journal["status"] == "frame-complete"
+    assert frame_18_journal["session_reservation_retained"] is True
+    assert frame_18_journal["unit_released"] is False
+
+    # Round two's frame 1 (slot 18) is a *continuation* frame -- this round
+    # captured no preview of its own -- but it is still the frame the parent
+    # reads the reservation's density evidence receipt from, exactly like
+    # round one's frame 1 (slot 7, captured by the in-line preview branch).
+    # Without it, capture_process._validate_batch_frame_result refuses the
+    # second scan_many() of every multi-batch feed with "Nikon density
+    # evidence receipt is missing or malformed".
+    assert "nikon_density_evidence" in frame_18_journal
+    assert (
+        frame_18_journal["nikon_density_evidence"]
+        == frame_7_journal["nikon_density_evidence"]
+    ), "one reservation, one density result -- both rounds own the same one"
+
+    session_journal_path = root / "session-journal.json"
+    session_journal = json.loads(session_journal_path.read_text(encoding="utf-8"))
+    assert session_journal["status"] == "ejected"
+    assert session_journal["completed_slots"] == [18]
+    assert session_journal["selected_slots"] == [18]
+    assert session_journal["unit_released"] is True
+    assert session_journal["unit_release_attempts"] == 1
+    assert "eject" in session_journal
+    assert session_journal["eject"]["terminal_sense"] == worker_module.EJECT_TERMINAL_SENSE
+
+
+def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the density identity mismatch a live preview+hold ->
+    scan_many() resume reproduced on 2026-08-06:
+    ``_density_frame_ownership_receipt`` bound the receipt's
+    ``batch_session_id`` to ``batch_job.session_id``, but a resumed batch's
+    ``batch_job.session_id`` is the independently-minted hold/resume round
+    token (see that function's own docstring), not the reservation-wide
+    ``calibration_session_id`` the held preview's density evidence is
+    actually bound to.  Every resumed batch's first frame therefore failed
+    density.py's reservation/batch identity check with "density reservation
+    and batch session identities disagree" -- reproducibly, on the very
+    first resume, before this test's own fix threaded
+    ``expected_calibration_session_id`` through instead.
+
+    Drives the real state machine one round deep (preview-and-hold, then one
+    scan_many()-shaped resume ending in eject) -- only the USB wire
+    transactions and the geometry-specific density/preview boundary this
+    shrunk fixture can't satisfy are faked, mirroring
+    test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after's
+    own fixture shape. Unlike that test, ``_density_frame_ownership_receipt``
+    is deliberately left unmocked here: the whole point is to exercise its
+    real identity threading end to end.
+    """
+
+    plan = load_canonical_plan()
+    canonical_target = worker_module.validate_plan(plan)
+    tiny_target = {
+        **canonical_target,
+        "repeat": 1,
+        "request_len": 1,
+        "request_parts": [1],
+    }
+    for sequence in worker_module.PREVIEW_READ_SEQUENCES:
+        entry = plan[sequence - 1]
+        entry["request_len"] = 1
+        entry["request_parts"] = [1]
+
+    records = tuple(
+        TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(6_000)
+    )
+    origins = tuple(
+        NativeFrameOrigin(
+            frame=frame,
+            boundary_index=frame - 1,
+            boundary_output_row=row - 4,
+            lookup_row=row,
+            code=records[row].code,
+            selector=records[row].selector,
+            native_origin=records[row].native_origin,
+            method="direct-gap-trailing-row",
+            automatic=True,
+            manual_review=False,
+            review_reasons=(),
+            affine_residual_rows=0.0,
+        )
+        for frame, row in enumerate(
+            (100 + 143 * index for index in range(37)),
+            start=1,
+        )
+    )
+    base_mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
+    combined, resolved = apply_batch_boundary_offsets(
+        base_mapping,
+        records,
+        ((7, 9),),
+    )
+    geometry = SimpleNamespace(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=250_278,
+        width=96,
+        height=len(worker_module.PREVIEW_READ_SEQUENCES),
+        block_bytes=1,
+        expected_stream_bytes=len(worker_module.PREVIEW_READ_SEQUENCES),
+    )
+
+    def selection_for(slot: int, offset: int, pair: tuple) -> SimpleNamespace:
+        base, selected, _rebase = pair
+        return SimpleNamespace(
+            frame=slot,
+            frame_count=len(combined.origins),
+            geometry=geometry,
+            mapping=combined,
+            base_selected=base,
+            selected=selected,
+            requested_boundary_offset_rows=offset,
+            applied_boundary_offset_rows=offset,
+            # _density_frame_ownership_receipt is unmocked in this test (see
+            # module docstring above), so -- unlike the two-round fixture
+            # this one is adapted from -- these fields have to be real
+            # digest-shaped strings: build_nikon_density_frame_ownership
+            # requires preview_sha256 to equal the density evidence's own
+            # wire_sha256 ("e" * 64 below), and reviewed_fingerprint_sha256/
+            # fresh_fingerprint.binding_sha256/table_sha256 all pass through
+            # density.py's `_require_digest` (64 lowercase hex characters).
+            preview_sha256="e" * 64,
+            table_sha256="c" * 64,
+            reviewed_fingerprint_sha256="a" * 64,
+            fresh_fingerprint=SimpleNamespace(binding_sha256="b" * 64),
+            diagnostics=lambda: {
+                "frame": slot,
+                "boundary_offset": {
+                    "requested_rows": offset,
+                    "applied_rows": offset,
+                },
+                "selected": {
+                    "frame": slot,
+                    "lookup_row": selected.lookup_row,
+                    "native_origin": selected.native_origin,
+                },
+            },
+        )
+
+    selection_7 = selection_for(7, 9, resolved[0])
+
+    root = tmp_path / "held-single-resume"
+    root.mkdir()
+    hold_job_path = root / "hold-job.json"
+    reviewed_fingerprint = _reviewed_fingerprint()
+
+    def _frame_spec(slot: int, offset: int) -> worker_module.BatchFrameSpec:
+        return worker_module.BatchFrameSpec(
+            slot,
+            offset,
+            root / f"frame-{slot:03d}" / "capture.bin",
+            root / f"frame-{slot:03d}" / "journal.json",
+            root / f"frame-{slot:03d}" / "parent-ack.json",
+        )
+
+    frame_7 = _frame_spec(7, 9)
+
+    def _job_bytes(*, session_id: str, frame: worker_module.BatchFrameSpec) -> bytes:
+        payload = {
+            "apply_all_boundary_offsets_before_first_frame": True,
+            "capture_plan_sha256": CANONICAL_PLAN_SHA256,
+            "continuation_plan_sha256": worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+            "expected_usb_bus": 1,
+            "expected_usb_address": 2,
+            "exposure_override_10ns": None,
+            "frames": [
+                {
+                    "ack": f"frame-{frame.slot:03d}/parent-ack.json",
+                    "boundary_offset_rows": frame.boundary_offset_rows,
+                    "journal": f"frame-{frame.slot:03d}/journal.json",
+                    "manual_review_approval": None,
+                    "output": f"frame-{frame.slot:03d}/capture.bin",
+                    "slot": frame.slot,
+                },
+            ],
+            "parent_ack_required_after_every_frame": True,
+            "release_once_after_last_frame": True,
+            "reviewed_roll_fingerprint": reviewed_fingerprint.to_payload(),
+            "schema_version": 3,
+            "session_contract": "one-process-one-reservation",
+            "session_id": session_id,
+        }
+        return (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+
+    startup = _startup_frame_table(40)
+    header_8e = b"\0\x8e\0\0\0\x06"
+    reserves: list[int] = []
+    variable_frame_table_calls: list[int] = []
+    fine_reads: list[int] = []
+    ready_groups: list[tuple[int, ...]] = []
+    releases: list[tuple[object, object]] = []
+    ejects: list[str] = []
+    hold_decisions: list[str] = []
+
+    ep_out = SimpleNamespace(bEndpointAddress=0x01)
+    ep_in = SimpleNamespace(bEndpointAddress=0x82)
+    interface = SimpleNamespace(bInterfaceNumber=0)
+
+    class USBUtil:
+        @staticmethod
+        def release_interface(_device: object, _number: int) -> None:
+            pass
+
+        @staticmethod
+        def dispose_resources(_device: object) -> None:
+            pass
+
+    def derive_batch(
+        _plan: list[dict],
+        preview: bytes,
+        table: bytes,
+        frames: tuple,
+        *,
+        reviewed_fingerprint: ReviewedRollFingerprint,
+    ) -> tuple:
+        assert len(preview) == len(worker_module.PREVIEW_READ_SEQUENCES)
+        assert table == header_8e
+        assert len(frames) == 1
+        assert frames[0].slot == 7
+        return (selection_7,)
+
+    def perform(
+        _ep_out: object,
+        _ep_in: object,
+        entry: dict,
+        **_kwargs: object,
+    ) -> TransactionResult:
+        sequence = entry["seq"]
+        if sequence == 17:
+            reserves.append(sequence)
+        if sequence in (115, 116, 117):
+            payload = b"window"
+        elif sequence in worker_module.PREVIEW_READ_SEQUENCES:
+            payload = b"p"
+        elif sequence in (171, 172):
+            payload = header_8e
+        elif sequence in (
+            *worker_module.METER_GET_WINDOW_SEQUENCES,
+            *worker_module.FINE_GET_WINDOW_SEQUENCES,
+        ):
+            payload = bytes.fromhex(entry["expected_data_in"])
+        elif sequence in worker_module.METER_READ_SEQUENCES:
+            payload = b"m"
+        elif sequence == 607:
+            fine_reads.append(sequence)
+            payload = b"f"
+        else:
+            payload = bytes.fromhex(entry.get("expected_data_in", ""))
+        return TransactionResult(
+            phase=entry.get("expected_phase", 1),
+            payload=payload,
+            status=bytes.fromhex(entry.get("expected_status", "00" * 8)),
+            sense=entry.get("expected_sense", "000000"),
+            stall_recoveries=0,
+        )
+
+    def perform_startup(
+        _ep_out: object,
+        _ep_in: object,
+        entry: dict,
+        **_kwargs: object,
+    ) -> TransactionResult:
+        assert entry["seq"] == worker_module.VARIABLE_FRAME_TABLE_SEQUENCE
+        variable_frame_table_calls.append(entry["seq"])
+        return TransactionResult(
+            phase=3, payload=startup, status=bytes(8), sense="000000", stall_recoveries=0,
+        )
+
+    def ready(
+        _ep_out: object,
+        _ep_in: object,
+        entries: list[dict],
+        **_kwargs: object,
+    ) -> tuple[int, int]:
+        ready_groups.append(tuple(entry["seq"] for entry in entries))
+        return 1, 0
+
+    def release(ep_out_value: object, ep_in_value: object) -> TransactionResult:
+        releases.append((ep_out_value, ep_in_value))
+        return TransactionResult(1, b"", bytes(8), "000000", 0)
+
+    def fake_perform_vendor_eject(ep_out_value: object, ep_in_value: object) -> dict:
+        assert (ep_out_value, ep_in_value) == (ep_out, ep_in)
+        ejects.append("eject")
+        return {
+            "eject_cdb_status": "0000000000000000",
+            "eject_execute_status": "0000000000000000",
+            "terminal_sense": worker_module.EJECT_TERMINAL_SENSE,
+            "wait_polls": 5,
+            "stall_recoveries": 0,
+        }
+
+    nonce_counter = [0]
+
+    def fake_token_hex(_size: int) -> str:
+        nonce_counter[0] += 1
+        return f"nonce-{nonce_counter[0]:03d}"
+
+    real_wait_for_parent_ack = worker_module.wait_for_parent_ack
+
+    def acknowledge(
+        path: Path,
+        *,
+        session_id: str,
+        frame_index: int,
+        slot: int,
+        nonce: str,
+        timeout_seconds: float = 1_800.0,
+        poll_seconds: float = 0.1,
+    ) -> str:
+        del timeout_seconds, poll_seconds
+        # One frame in this batch, and this test ends the whole reservation
+        # right there -- eject on its terminal frame ack.
+        path.write_text(
+            json.dumps(
+                {
+                    "ack_nonce": nonce,
+                    "action": "eject",
+                    "frame_index": frame_index,
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "slot": slot,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return real_wait_for_parent_ack(
+            path,
+            session_id=session_id,
+            frame_index=frame_index,
+            slot=slot,
+            nonce=nonce,
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+    # Stashed here, at the same moment the real CaptureProcessAdapter would
+    # learn each value (the hold_session_id it must echo back to resume;
+    # the calibration_session_id it would read from the held preview's own
+    # attempt journal) -- so the parent-validator drive at the bottom of
+    # this test builds its PreparedCaptureBatch from independently-known
+    # values, not from reading back the very journal it is about to check.
+    captured: dict[str, str] = {}
+
+    def fake_wait_for_hold_decision(
+        path: Path,
+        *,
+        hold_session_id: str,
+        timeout_seconds: float = 1_800.0,
+        poll_seconds: float = 0.1,
+    ) -> str:
+        del timeout_seconds, poll_seconds
+        hold_decisions.append(str(path))
+        captured["hold_session_id"] = hold_session_id
+        # The one and only hold-wait: the fixed hold_job_path this attempt
+        # was launched with. Publish slot 7's one-frame job, echoing back
+        # the hold_session_id this held preview minted -- exactly what a
+        # real Roll.scan_many() resume does -- and resume.
+        hold_job_path.write_text(
+            _job_bytes(session_id=hold_session_id, frame=frame_7).decode("utf-8"),
+            encoding="utf-8",
+        )
+        return "scan"
+
+    preview_windows = [
+        {
+            "color_id": color,
+            "resx": 97,
+            "resy": 97,
+            "upper_left_x": 0,
+            "upper_left_y": 0,
+            "width": 3_946,
+            "height": 250_278,
+            "bit_depth": 16,
+            "exposure_raw_10ns": 70_000 + color,
+        }
+        for color in (1, 2, 3)
+    ]
+    accepted_proposal = SimpleNamespace(
+        accepted=True,
+        proposed_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    accepted_final = SimpleNamespace(
+        accepted=True,
+        final_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", 1)
+    monkeypatch.setattr(
+        worker_module,
+        "EXPECTED_PREVIEW_BYTES",
+        len(worker_module.PREVIEW_READ_SEQUENCES),
+    )
+    monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
+    monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
+    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
+    # A revision deliberately unlike the "Nikon LS-5000 ED 1.03" literal
+    # the resumed-batch journal block used to hard-code over it: Lane A
+    # accepts any LS-5000 ED revision, and what the resumed frame
+    # publishes must be the one read off this attempt's own INQUIRY.
+    monkeypatch.setattr(
+        worker_module,
+        "_validate_scanner_identity",
+        lambda _payload: "Nikon LS-5000 ED 2.07",
+    )
+    monkeypatch.setattr(
+        worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
+    )
+    # Not a density-*evidence*-construction test: this fixture's shrunk plan/
+    # geometry/startup table (request_len=1, height=48) don't satisfy the real
+    # startup-record -> density-source-geometry binding, same boundary
+    # test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after's
+    # own fixture fakes. build_nikon_density_evidence still binds
+    # source_binding.session_id to whatever session_id it is actually called
+    # with -- calibration_session_id, in the real code -- so the identity
+    # this test exists to check flows through for real.
+    monkeypatch.setattr(
+        worker_module, "_validate_preview_density_source_contract", lambda *_args: None
+    )
+    def fake_build_nikon_density_evidence(*_args: object, **kwargs: object) -> object:
+        # Stashed for the same reason fake_wait_for_hold_decision stashes
+        # hold_session_id above: the parent-validator drive at the bottom
+        # of this test needs calibration_session_id from an independent
+        # source, not from reading back the journal it is about to check.
+        captured["calibration_session_id"] = kwargs["session_id"]
+        return SimpleNamespace(
+            # NikonDensityFrameOwnershipReceipt.validate_evidence (real,
+            # unmocked -- see below) requires calibration_binding/
+            # source_binding/exposure_binding/result to each carry the same
+            # session_id -- every sub-binding of one reservation's evidence
+            # is bound to that one reservation. All four echo
+            # calibration_session_id here exactly as the real
+            # build_nikon_density_evidence binds every sub-binding to its
+            # own `session_id=` argument.
+            calibration_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            source_binding=SimpleNamespace(
+                session_id=kwargs["session_id"], wire_sha256="e" * 64
+            ),
+            exposure_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            result=SimpleNamespace(session_id=kwargs["session_id"]),
+            preview_identity_sha256="d" * 64,
+            to_dict=lambda: {"scope": "reservation-preview", "test_fixture": True},
+        )
+
+    monkeypatch.setattr(
+        worker_module,
+        "build_nikon_density_evidence",
+        fake_build_nikon_density_evidence,
+    )
+    # build_nikon_density_frame_ownership (real, unmocked -- see below)
+    # requires `isinstance(evidence, NikonDensityEvidence)`; the fixture
+    # above returns a SimpleNamespace stand-in rather than hand-building all
+    # four nested, independently-validated density dataclasses. Widen the
+    # isinstance target for this test only, exactly the same way the fixture
+    # already fakes the geometry/replay boundary above -- everything this
+    # test actually exists to check (the identity comparison and
+    # density.py's own _require_digest/_require_identity/__post_init__
+    # checks on the receipt itself) still runs for real. Patched on
+    # density.py's own module object: build_nikon_density_frame_ownership's
+    # isinstance check resolves NikonDensityEvidence from its defining
+    # module's globals, not from worker_module's imported-name binding.
+    from coolscanpy.protocol.ls5000_single_pass import density as density_module
+
+    monkeypatch.setattr(density_module, "NikonDensityEvidence", SimpleNamespace)
+    # Deliberately NOT mocking _density_frame_ownership_receipt or
+    # build_nikon_density_frame_ownership: that real identity-binding path,
+    # end to end, is what this test exists to exercise.
+    monkeypatch.setattr(worker_module, "_derive_live_batch_selections", derive_batch)
+    monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
+    monkeypatch.setattr(
+        worker_module, "_perform_variable_frame_table_transaction", perform_startup
+    )
+    monkeypatch.setattr(worker_module, "_perform_ready_group", ready)
+    monkeypatch.setattr(worker_module, "_wait_post_scan_ready", lambda *_a, **_k: (1, 0))
+    monkeypatch.setattr(
+        worker_module,
+        "observe_meter_pass",
+        lambda *_a, **_k: _synthetic_meter_observation(),
+    )
+    monkeypatch.setattr(
+        worker_module, "propose_next_exposures", lambda *_a, **_k: accepted_proposal
+    )
+    monkeypatch.setattr(
+        worker_module, "verify_final_convergence", lambda *_a, **_k: accepted_final
+    )
+    monkeypatch.setattr(worker_module, "wait_for_parent_ack", acknowledge)
+    monkeypatch.setattr(worker_module, "wait_for_hold_decision", fake_wait_for_hold_decision)
+    monkeypatch.setattr(worker_module, "_release_unit", release)
+    monkeypatch.setattr(worker_module, "_perform_vendor_eject", fake_perform_vendor_eject)
+    monkeypatch.setattr(worker_module.secrets, "token_hex", fake_token_hex)
+    monkeypatch.setattr(
+        worker_module,
+        "_connect_device",
+        lambda **_kwargs: (
+            SimpleNamespace(bus=1, address=2),
+            interface,
+            ep_out,
+            ep_in,
+            USBUtil,
+        ),
+    )
+
+    worker_module.run_live_capture(
+        plan,
+        tmp_path / "plan.jsonl",
+        CANONICAL_PLAN_SHA256,
+        root / "preview-placeholder.bin",
+        root / "preview-placeholder.json",
+        1,
+        preview_and_hold=True,
+        hold_job_path=hold_job_path,
+        continuation_plan=load_canonical_continuation_plan(),
+        continuation_plan_sha256=worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+    )
+
+    # --- the wire-level claim: one reservation, one resume, no re-reserve ---
+    assert reserves == [17], "exactly one RESERVE_UNIT"
+    assert len(variable_frame_table_calls) == 1, "exactly one command-64 transaction"
+    assert fine_reads == [607], "one fine READ for the resumed frame"
+    assert releases == [(ep_out, ep_in)], "exactly one RELEASE_UNIT"
+    assert ejects == ["eject"], "exactly one eject"
+    assert len(hold_decisions) == 1, "one hold-wait for the one resume"
+
+    # --- the identity claim this test exists to prove ---
+    frame_7_journal = json.loads(frame_7.journal.read_text(encoding="utf-8"))
+    assert frame_7_journal["status"] == "frame-complete"
+    assert frame_7_journal["resumed_from_held_preview"] is True
+    ownership = frame_7_journal["nikon_density_frame_ownership"]
+    assert ownership["reservation_id"] == ownership["batch_session_id"]
+    # The receipt names the directory holding *this frame's* capture, not
+    # the held preview attempt one level up whose empty placeholder output
+    # this resumed attempt was launched with. The parent re-derives exactly
+    # this from the frame paths it published in the batch job
+    # (capture_process._validated_density_frame_ownership's
+    # `output_path.parent.name`), so a resumed frame 1 that names the
+    # attempt directory instead is refused with "density
+    # frame_capture_attempt_id changed at capture boundary" -- while every
+    # continuation frame of the same batch, which sources this from its own
+    # frame_spec.output, is accepted.
+    assert ownership["frame_capture_attempt_id"] == "frame-007"
+    assert frame_7.output.parent.name == "frame-007"
+    assert (root / "preview-placeholder.bin").parent.name != "frame-007"
+
+    # --- the resumed frame's journal says what actually happened ---
+    # The revision this attempt's own INQUIRY reported, not the literal the
+    # resumed-batch journal block used to overwrite it with -- that value
+    # reaches the public Receipt.device_model.
+    assert frame_7_journal["scanner_identity"] == "Nikon LS-5000 ED 2.07"
+    # The preview raster and transport table stay in the held attempt's own
+    # directory (the resume never re-captures them); only the frame map
+    # follows the rebound artifact paths into this frame's directory.
+    artifacts = frame_7_journal["live_index_artifacts"]
+    assert artifacts["preview"] == str((root / "preview-placeholder-preview.bin").resolve())
+    assert artifacts["table"] == str((root / "preview-placeholder-008e.bin").resolve())
+    assert artifacts["mapping"] == str(
+        (frame_7.output.parent / "capture-frame-map.json").resolve()
+    )
+    assert Path(artifacts["mapping"]).is_file()
+
+    session_journal_path = root / "session-journal.json"
+    session_journal = json.loads(session_journal_path.read_text(encoding="utf-8"))
+    assert session_journal["status"] == "ejected"
+    assert session_journal["completed_slots"] == [7]
+    assert session_journal["density_calibration_session_id"] is not None
+    # A cold batch's session journal gets this block the moment its preview
+    # completes; a held preview has no session journal at that moment, so
+    # the resumed shape has to restate it or be the only one without it.
+    preview_identity = session_journal["nikon_density_preview_identity"]
+    assert preview_identity["reservation_id"] == captured["calibration_session_id"]
+    assert preview_identity["batch_session_id"] == captured["calibration_session_id"]
+    assert preview_identity["preview_identity_sha256"] == "d" * 64
+    assert (
+        ownership["batch_session_id"]
+        == session_journal["density_calibration_session_id"]
+    )
+    # The resumed batch's own session id is a separate, independently-minted
+    # per-round hold/resume token by design (see _density_frame_ownership_
+    # receipt's docstring) -- confirm this test actually exercises that
+    # divergence, not a coincidental match that would let the pre-fix bug
+    # slip through undetected.
+    assert (
+        session_journal["session_id"]
+        != session_journal["density_calibration_session_id"]
+    )
+
+    # --- regression for the second live failure of this class (2026-08-06,
+    # attempt 10): worker.py's resumed-batch session_journal used to be
+    # `session_journal = {new dict}`, wholesale replacement that dropped
+    # every field the shared journal already carried unless hand-copied one
+    # at a time -- expected_usb_bus/expected_usb_address next, after
+    # density_calibration_session_id the round before. Rather than asserting
+    # a second hand-written field list here (the same failure mode, one
+    # remove), drive the real parent-side validator -- the actual
+    # authority on what a batch session journal must contain -- against
+    # this real, on-disk session_journal, exactly as CaptureProcessAdapter.
+    # resume_held_session would at the end of a live batch.
+    from coolscanpy.protocol.ls5000_single_pass import capture_process
+
+    fake_adapter_self = SimpleNamespace(
+        _expected_worker_sha256=worker_module.CAPTURE_WORKER_SHA256,
+        _expected_bundle_sha256=None,
+    )
+    prepared = capture_process.PreparedCaptureBatch(
+        request=capture_process.CaptureBatchRequest(
+            (
+                capture_process.CaptureRequest(
+                    capture_process.CaptureMode.FULL, 7, 9
+                ),
+            ),
+            reviewed_fingerprint=reviewed_fingerprint,
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        ),
+        paths=capture_process.BatchSessionPaths(
+            directory=root,
+            job=hold_job_path,
+            first_plan=root / "plan-placeholder.jsonl",
+            continuation_plan=root / "continuation-placeholder.json",
+            manifest=root / "manifest-placeholder.json",
+            bootstrap_status=root / "bootstrap-placeholder.json",
+            session_journal=session_journal_path,
+            stdout=root / "stdout-placeholder.txt",
+            stderr=root / "stderr-placeholder.txt",
+        ),
+        argv=(),
+        # Read back from the exact bytes this test's own fake parent wrote
+        # to hold_job_path -- the same computation the real
+        # CaptureProcessAdapter.resume_held_session does over the payload
+        # it itself writes, not a value borrowed from the journal under
+        # test.
+        job_sha256=hashlib.sha256(hold_job_path.read_bytes()).hexdigest(),
+        session_id=captured["hold_session_id"],
+        calibration_session_id=captured["calibration_session_id"],
+        # Beside the held preview attempt's own output, exactly where
+        # resume_held_session resolves it from -- never beside a frame of
+        # this resumed batch. Unused by
+        # _load_and_validate_batch_session_journal (which reads only the
+        # session journal), but stated rather than defaulted away because
+        # it is part of the contract this stand-in parent represents.
+        density_source_path=root / "preview-placeholder-preview.bin",
+    )
+    handled = (SimpleNamespace(request=SimpleNamespace(selected_slot=7)),)
+
+    validated = capture_process.CaptureProcessAdapter._load_and_validate_batch_session_journal(
+        fake_adapter_self,
+        prepared,
+        returncode=0,
+        handled=handled,
+        stopped=False,
+        ejected=True,
+    )
+
+    assert validated["status"] == "ejected"
+    assert validated["completed_slots"] == [7]

@@ -60,6 +60,11 @@ def _dc4c_prefixed_counter_train(words: np.ndarray) -> None:
     _counter_train(words[4:], 0xD895)
 
 
+def _f6b1_prefixed_counter_train(words: np.ndarray) -> None:
+    words[:4] = (0xF6B1, 0xF6B1, 0xF6B1, 0xD894)
+    _counter_train(words[4:], 0xD895)
+
+
 def _synthetic_full_records(height: int = 3) -> tuple[np.ndarray, np.ndarray]:
     records = (height + 1) // 2
     base = (
@@ -227,6 +232,25 @@ class TestStreamingFrameDecoder:
         np.testing.assert_array_equal(offline, decoded)
         assert offline_report["padding_1_3_counter_dialect"] == "dc4c-prefixed"
 
+    def test_f6b1_prefixed_stream_matches_offline_decode_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        for record in full:
+            _f6b1_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _f6b1_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        stream = full.astype(">u2").tobytes()
+        path = tmp_path / "f6b1-capture.bin"
+        path.write_bytes(stream)
+        offline, offline_report = decode_full_records(path, height=3)
+
+        decoder = StreamingFrameDecoder(height=3)
+        _feed(decoder, stream, 4_096)
+        decoded, _ = decoder.finish()
+
+        np.testing.assert_array_equal(offline, decoded)
+        assert offline_report["padding_1_3_counter_dialect"] == "f6b1-prefixed"
+
     @pytest.mark.parametrize(
         "corrupt_word_offset,match",
         [
@@ -257,6 +281,17 @@ class TestStreamingFrameDecoder:
             _e9ea_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
         decoder = StreamingFrameDecoder(height=3)
         with pytest.raises(ValueError, match="padding 3 counter train mismatch"):
+            _feed(decoder, full.astype(">u2").tobytes(), 65_535)
+
+    def test_cross_record_dialect_change_fails_closed(self) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        record = full[1]
+        _e9ea_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+        _e9ea_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        decoder = StreamingFrameDecoder(height=3)
+        with pytest.raises(
+            ValueError, match="dialect changed at record 1: canonical -> e9ea-prefixed"
+        ):
             _feed(decoder, full.astype(">u2").tobytes(), 65_535)
 
     def test_empty_pushes_are_no_ops(self, tmp_path: Path) -> None:

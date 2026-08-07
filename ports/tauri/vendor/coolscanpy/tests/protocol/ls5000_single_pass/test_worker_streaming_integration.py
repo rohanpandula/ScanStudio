@@ -377,6 +377,7 @@ def _drive_continuation(
         density_evidence=density_evidence,
         actual_usb_bus=1,
         actual_usb_address=2,
+        expected_calibration_session_id=batch.session_id,
         scanner_identity="Nikon LS-5000 ED 1.03",
     )
     return journal, second
