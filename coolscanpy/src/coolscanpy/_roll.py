@@ -42,6 +42,7 @@ from uuid import uuid4
 import numpy as np
 import tifffile
 
+from coolscanpy._logging import get_logger
 from coolscanpy.capture.single_pass_workflow import (
     LS5000SinglePassWorkflow,
     SinglePassAttempt,
@@ -53,11 +54,13 @@ from coolscanpy.exceptions import (
     BatchIntegrityError,
     CaptureWorkerBootstrapFailed,
     DeviceBusy,
+    EjectNotAvailable,
     FeederParked,
     FingerprintRefused,
     GeometryValidationError,
     ManualReviewRequired,
     PyCoolscanError,
+    RefeedRequired,
     RollMismatch,
     SafeStopRequested,
     TransportSmearDetected,
@@ -69,15 +72,23 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     CaptureMode,
     CaptureOutcome,
     CaptureProcessAdapter,
+    CaptureProcessError,
     CaptureRequest,
     CaptureStopped,
+    HeldPreviewSession,
+    HeldSessionExpired,
     ManualFrameApproval,
+    POWER_CYCLE_RECOVERY,
 )
 from coolscanpy.protocol.ls5000_single_pass.density import (
     NikonDensityEvidence,
     NikonDensityFrameOwnershipReceipt,
     NikonExactBuilderEvidence,
     build_nikon_exact_builder_evidence,
+)
+from coolscanpy.protocol.ls5000_single_pass.meter import (
+    EXPOSURE_MAX,
+    EXPOSURE_MIN,
 )
 from coolscanpy.roll.preview_session import (
     CaptureRoute,
@@ -104,6 +115,8 @@ from coolscanpy.types import (
 
 if TYPE_CHECKING:
     from coolscanpy._device import Device
+
+logger = get_logger(__name__)
 
 RECEIPT_VERSION = 1
 LS5000_FINE_DPI = 4_000
@@ -323,6 +336,26 @@ class Roll:
         self._preview_thread_id: int | None = None
         self._callback_threads: set[int] = set()
         self._closed = False
+        # A still-running child holding its reservation open instead of
+        # releasing -- either the one preview() most recently started (see
+        # begin_held_preview's docstring), or one a prior scan_many()/
+        # scan() left held by completing without eject_after (its own
+        # default when resuming a held session -- see scan_many's
+        # docstring; CaptureBatchResult.held_again is what run_batch()
+        # stores back here). Set to None the moment a scan_many()/scan()
+        # call consumes it (each call is single-use), then repopulated
+        # from that same call's own result if the reservation is still
+        # held afterward -- so it is not "None until a fresh preview()"
+        # the way it was before this indefinite-holding behavior existed.
+        # Also None if released/ejected (by release()/eject()/close(), or
+        # eject_after=True) or if no preview() has run yet.
+        self._held_session: HeldPreviewSession | None = None
+        # When set, close() keeps self._attempts_root on disk instead of
+        # deleting it: the journal/preview/table evidence in there is what
+        # explains a refused preview or a held child that could not be
+        # cleanly released. Sticky for the life of this Roll -- one refusal
+        # is enough reason to keep the whole directory.
+        self._evidence_preservation_reason: str | None = None
         self._owns_attempts_root = attempts_root is None
         self._attempts_root = (
             Path(attempts_root)
@@ -354,7 +387,16 @@ class Roll:
         self.close()
 
     def close(self) -> None:
-        """Idempotently stop owned work and end the transport reservation."""
+        """Idempotently stop owned work and end the transport reservation.
+
+        The private attempts directory is normally deleted here (when this
+        Roll owns it); it is kept on disk instead (with a logged warning
+        naming the path) when this Roll flagged its contents as evidence --
+        a preview whose completed transport read was refused, or a held
+        child that could not be cleanly released -- so a real failure
+        leaves its journal and artifacts inspectable rather than destroying
+        them on exit.
+        """
 
         current_thread = threading.get_ident()
         deadline = time.monotonic() + _SCAN_WORKER_JOIN_TIMEOUT_SECONDS
@@ -413,9 +455,17 @@ class Roll:
                 self._state_condition.notify_all()
             raise close_error
 
+        self._release_held_session_best_effort()
         try:
             if self._owns_attempts_root:
-                shutil.rmtree(self._attempts_root, ignore_errors=True)
+                if self._evidence_preservation_reason is None:
+                    shutil.rmtree(self._attempts_root, ignore_errors=True)
+                else:
+                    logger.warning(
+                        "keeping roll capture evidence at %s: %s",
+                        self._attempts_root,
+                        self._evidence_preservation_reason,
+                    )
             self._device._release_roll_lock()
         finally:
             with self._state_condition:
@@ -424,6 +474,61 @@ class Roll:
                 self._state_condition.notify_all()
         if close_error is not None:
             raise close_error
+
+    def release(self) -> None:
+        """Explicitly release a still-held reservation, if any.
+
+        The held session released here may be the one :meth:`preview`
+        left open, or one a prior ``scan_many()``/``scan()`` left held by
+        completing without ``eject_after`` (its own default -- see that
+        method's docstring). A no-op if neither has ever run, or if the
+        held session was already consumed by a ``scan_many()``/``scan()``
+        call that resumed it, ended it (``eject_after=True``), or an
+        earlier ``release()``/:meth:`eject`. Calling this reverts to the
+        pre-holding behavior from here on: the next ``scan_many()``/
+        ``scan()`` call starts a fresh reservation (and needs a real
+        refeed if the transport is parked).
+        """
+
+        self._require_open()
+        held = self._held_session
+        self._held_session = None
+        if held is None or not held.usable:
+            return
+        try:
+            self._ensure_adapter().release_held_session(held)
+        except BaseException as error:
+            self._preserve_evidence(
+                f"explicit release of the held preview child failed: {error}"
+            )
+            raise
+
+    def _release_held_session_best_effort(self) -> None:
+        """Used by close() and a superseding preview(): release a held
+        session, but never raise -- closing a Roll must always succeed even
+        if the held child is already gone or uncooperative. A swallowed
+        release failure still flags the attempts directory as evidence: the
+        journal in there is what can explain a child that would not
+        confirm its release."""
+
+        held = self._held_session
+        self._held_session = None
+        if held is None or not held.usable:
+            return
+        try:
+            self._ensure_adapter().release_held_session(held)
+        except Exception as error:
+            self._preserve_evidence(
+                f"held preview child could not be cleanly released: {error}"
+            )
+
+    def _preserve_evidence(self, reason: str) -> None:
+        """Flag the attempts directory to survive close(). The first
+        reason wins; any one failure already justifies keeping the whole
+        directory."""
+
+        if self._evidence_preservation_reason is None:
+            self._evidence_preservation_reason = reason
 
     # -- preview ---------------------------------------------------------
 
@@ -440,6 +545,20 @@ class Roll:
         Calling ``preview()`` again re-reads the transport, replaces the
         fingerprint and all Thumbnails, and clears any recorded approvals
         (they become stale).
+
+        The reservation this read establishes is kept open (not released)
+        so the following ``scan_many()``/``scan()`` calls can reuse it
+        without a fresh RESERVE_UNIT or frame-table re-read -- the same
+        session shape a single continuous scan on this hardware always
+        uses, and one that stays available across any number of batches
+        (see ``scan_many()``'s own docstring), not just the first. Call
+        :meth:`release` to opt back into releasing immediately instead.
+
+        Calling ``preview()`` again always supersedes whatever reservation
+        is currently held -- whether left open by an earlier ``preview()``
+        or by a prior ``scan_many()``/``scan()`` that completed without
+        ``eject_after`` -- releasing it cleanly before starting the fresh
+        transport read, exactly like an explicit :meth:`release` would.
         """
 
         with self._state_condition:
@@ -460,6 +579,11 @@ class Roll:
             self._device._acquire_io_lock("roll preview")
             io_acquired = True
             adapter = self._ensure_adapter()
+            # A fresh preview always supersedes whatever the previous one was
+            # holding -- mirrors this method's own preexisting "re-reads the
+            # transport, clears approvals" contract, just extended to the
+            # reservation itself.
+            self._release_held_session_best_effort()
             if on_progress is not None:
                 self._invoke_progress(
                     on_progress,
@@ -478,30 +602,70 @@ class Roll:
                 expected_usb_address=(topology[1] if topology is not None else None),
             )
             try:
-                attempt = adapter.run_attempt(request)
+                held = adapter.begin_held_preview(request)
             except CaptureStopped as error:
                 raise SafeStopRequested(str(error)) from error
+            # Track a live held child the moment the adapter hands it back,
+            # before any interpretation of what it produced. Everything below
+            # can raise, and a raise must leave close()/release()/a retried
+            # preview() a handle to tell the still-alive child to let go of its
+            # reservation. Assigning only after validation succeeded (the
+            # previous behavior) orphaned a live child -- still blocked in
+            # wait_for_hold_decision, still holding the scanner -- whenever
+            # build_roll_preview_session refused the journal. An unusable
+            # session is the opposite case (the child exited before the hold
+            # boundary and was already reaped -- see HeldPreviewSession.usable)
+            # and is deliberately not stored, preserving that docstring's
+            # "preview() never stores an unusable session" invariant.
+            if held.usable:
+                self._held_session = held
+            attempt = held.preview_attempt
 
-            if attempt.outcome is CaptureOutcome.BOOTSTRAP_FAILED:
-                raise CaptureWorkerBootstrapFailed(
-                    _bootstrap_error(attempt)
-                    or "CAPTURE_WORKER_BOOTSTRAP_FAILED: bundled capture worker "
-                    "failed before scanner dispatch"
+            try:
+                if attempt.outcome is CaptureOutcome.BOOTSTRAP_FAILED:
+                    raise CaptureWorkerBootstrapFailed(
+                        _bootstrap_error(attempt)
+                        or "CAPTURE_WORKER_BOOTSTRAP_FAILED: bundled capture worker "
+                        "failed before scanner dispatch"
+                    )
+                if attempt.outcome is CaptureOutcome.RECOVERY_REQUIRED:
+                    raise FeederParked(
+                        _journal_error(attempt)
+                        or "scanner requires a power cycle before the next attempt"
+                    )
+                if attempt.outcome is not CaptureOutcome.COMPLETE:
+                    raise PyCoolscanError(
+                        _journal_error(attempt)
+                        or f"preview attempt did not complete: {attempt.outcome}"
+                    )
+                session = build_roll_preview_session(attempt, material=self._material)
+            except BaseException as error:
+                # The hardware ran a whole-roll traversal and produced the
+                # artifacts now being refused (journal, preview raster,
+                # transport table) -- exactly the evidence needed to diagnose
+                # why. Keep them past close() instead of deleting them with the
+                # attempts directory.
+                self._preserve_evidence(
+                    f"preview raised after the transport read: {error}"
                 )
-            if attempt.outcome is CaptureOutcome.RECOVERY_REQUIRED:
-                raise FeederParked(
-                    _journal_error(attempt)
-                    or "scanner requires a power cycle before the next attempt"
+                error.add_note(
+                    f"preview capture evidence preserved at {self._attempts_root}"
                 )
-            if attempt.outcome is not CaptureOutcome.COMPLETE:
-                raise PyCoolscanError(
-                    _journal_error(attempt)
-                    or f"preview attempt did not complete: {attempt.outcome}"
-                )
+                raise
 
-            session = build_roll_preview_session(attempt, material=self._material)
             with self._state_condition:
-                if session.preview.usb_topology != topology:
+                # Both sides are only comparable when both are known: a held
+                # preview's journal legitimately has none recorded yet (see
+                # ``_validated_usb_topology``'s docstring), and this Roll's
+                # own locally-derived topology can be None for a device id
+                # that does not match the expected pattern. Neither absence
+                # is itself a mismatch; a real disagreement between two
+                # present values still fails closed exactly as before.
+                if (
+                    session.preview.usb_topology is not None
+                    and topology is not None
+                    and session.preview.usb_topology != topology
+                ):
                     raise RollMismatch(
                         "completed preview evidence belongs to a different USB "
                         "topology than this Roll"
@@ -640,10 +804,17 @@ class Roll:
 
     # -- scanning --------------------------------------------------------
 
-    def scan(self, slot: int) -> Frame:
+    def scan(
+        self,
+        slot: int,
+        *,
+        exposure_override_10ns: tuple[int, int, int] | None = None,
+    ) -> Frame:
         """Fine-scan one slot. Sugar for ``next(iter(scan_many([slot])))``."""
 
-        iterator = self.scan_many([slot])
+        iterator = self.scan_many(
+            [slot], exposure_override_10ns=exposure_override_10ns
+        )
         try:
             return next(iterator)
         finally:
@@ -656,23 +827,78 @@ class Roll:
         slots: Iterable[int],
         *,
         on_progress: ProgressCallback | None = None,
+        exposure_override_10ns: tuple[int, int, int] | None = None,
+        eject_after: bool = False,
     ) -> Iterator[Frame]:
         """One continuous transport reservation for the whole ordered
         ``slots`` list, yielding a Frame as each completes.
 
-        Color batches run on a background worker thread; each decoded Frame
-        crosses back through a one-frame bounded queue, so the caller receives
-        it immediately without accumulating a whole roll in memory. Abandoning
-        the iterator early (a temporary ``for`` loop that breaks, or explicit
-        ``.close()``) requests the same frame-boundary safe stop as
-        :meth:`safe_stop` and closes the owned transport before releasing the
-        reservation.
+        If this batch resumes a reservation :meth:`preview` (or a prior
+        ``scan_many()``/``scan()``) left held, the *default* ending -- no
+        ``eject_after``, no :meth:`safe_stop` -- is to keep that same
+        reservation held afterward too: same child process, same
+        reservation, same retained frame table, no RESERVE_UNIT, no
+        repeated command 64, no RELEASE_UNIT. This is the vendor's own
+        session shape (one reservation from feed to eject, any number of
+        fine scans in between) and lets a further ``scan_many()``/``scan()``
+        resume it again, indefinitely -- across as many calls as the
+        caller likes -- until :meth:`eject`, an explicit :meth:`release`,
+        ``eject_after=True`` ends it here, or :meth:`close`. A ``Roll``
+        with no preceding ``preview()`` (or one that already
+        released/ejected) has nothing to hold: that batch runs cold and
+        releases immediately after, exactly as before this parameter and
+        this holding behavior existed.
+
+        ``eject_after``, when true, ends this batch by replaying the traced
+        vendor end-of-session eject sequence -- still inside this batch's
+        original reservation -- immediately after the last requested slot's
+        frame is finalized, before releasing. This is the "I'm done with
+        this roll" ending; the alternative -- this method's own default,
+        described above -- leaves the strip parked inside for a later
+        ``preview()``/``scan_many()``/``scan()`` or an explicit
+        :meth:`eject`. A safe-stop requested mid-batch (:meth:`safe_stop`)
+        always takes priority over both: an interrupted batch releases
+        plainly and never ejects or stays held, regardless of
+        ``eject_after``, because ending early is not "done with this
+        roll." A failed eject (the traced sequence deviated -- most often
+        a suspected transport wedge) surfaces as
+        :class:`~coolscanpy.exceptions.FeederParked` once the iterator is
+        fully consumed, exactly like any other recovery-required outcome.
+
+        The batch itself runs on a background worker thread; each decoded
+        Frame crosses back to this iterator through a bounded queue (holding
+        at most one frame at a time), so the caller receives frame N as soon
+        as it is ready instead of waiting for the whole ``slots`` batch to
+        finish. In-flight memory stays capped at about two frames (one
+        queued, one the worker is finalizing) no matter how many slots are
+        requested. Abandoning the iterator early (a ``break`` out of a
+        ``for`` loop, or an explicit ``.close()``) requests the same safe
+        stop as :meth:`safe_stop`, drains the queue, closes the owned
+        transport, and joins the worker before propagating
+        ``GeneratorExit`` -- it never leaves the worker blocked writing a
+        finished frame to a queue nobody is reading.
+
+        ``exposure_override_10ns``, when given, is a ``(red, green, blue)``
+        tuple of raw 10ns hardware exposure ticks (the same unit as
+        ``exposures_raw_10ns``/``wire_colors_raw_10ns`` elsewhere in this
+        package) that replaces the AE meter's own proposal for every frame
+        in this batch -- the meter still runs its full unmodified sequence
+        (same wire traffic, same passes); only the fine-scan plan built from
+        its answer is substituted. ``None`` (the default) is today's
+        behavior: the meter's own accepted values are used, byte-identical
+        to a Roll built before this parameter existed. IR has no override
+        concept and always uses the metered value. Every frame's receipt
+        and evidence record both the metered and the forced values plus an
+        explicit ``applied`` flag; ``receipt.exposure`` itself reflects the
+        forced ticks actually used.
 
         Only ``Material.COLOR_NEGATIVE`` (single-pass RGBI4) is implemented;
         a ``Material.BLACK_AND_WHITE_NEGATIVE`` Roll raises
         ``NotImplementedError`` here (see the module docstring). Argument
-        validation happens eagerly; hardware access begins lazily when the
-        iterator is consumed.
+        validation (slot range, required approvals, material route,
+        exposure override bounds) happens eagerly, before any hardware
+        access; the actual batch runs lazily as the returned iterator is
+        consumed.
         """
 
         with self._state_condition:
@@ -687,7 +913,9 @@ class Roll:
                 raise ValueError(
                     "batch scanner slots must be unique and strictly increasing"
                 )
+        _validate_exposure_override_10ns(exposure_override_10ns)
 
+        with self._state_condition:
             approvals = dict(self._approvals)
             for slot in ordered_slots:
                 if session.slots[slot - 1].manual_review:
@@ -725,11 +953,33 @@ class Roll:
                 reviewed_fingerprint=session.reviewed_fingerprint(),
                 expected_usb_bus=topology[0],
                 expected_usb_address=topology[1],
+                exposure_override_10ns=exposure_override_10ns,
             )
+            # A held session is single-use *per call*: whether this batch
+            # resumes it successfully, fails, is stopped, or is ended by
+            # eject_after, it is consumed either way. If it instead
+            # completes with neither a stop nor eject_after, the worker
+            # keeps the same reservation held and frame_handler's
+            # CONTINUE_HOLD ack tells the adapter to hand back a fresh
+            # HeldPreviewSession, which run_batch() below stores back into
+            # self._held_session -- so a later scan_many()/scan() call
+            # without an intervening preview() resumes it again, exactly
+            # like this one did, rather than falling back to a fresh
+            # reservation. Only a genuinely released/ejected/never-held
+            # Roll falls back to that fresh-reservation path (see the
+            # module docstring / preview()'s own docstring for why a real
+            # refeed is then required). Consumed eagerly here, under the
+            # same lock as everything else above, rather than lazily
+            # inside the generator below.
+            held = self._held_session
+            self._held_session = None
             iterator = self._scan_many(
                 batch_request,
                 ordered_slots,
                 on_progress,
+                exposure_override_10ns,
+                eject_after,
+                held,
             )
             return self._reserve_batch_locked(iterator)
 
@@ -738,6 +988,9 @@ class Roll:
         batch_request: CaptureBatchRequest,
         slots: tuple[int, ...],
         on_progress: ProgressCallback | None,
+        exposure_override_10ns: tuple[int, int, int] | None = None,
+        eject_after: bool = False,
+        held: HeldPreviewSession | None = None,
     ) -> Iterator[Frame]:
         if self._stop_event.is_set():
             raise SafeStopRequested(
@@ -828,18 +1081,63 @@ class Roll:
             # Blocks until the consumer (or an abandonment drain) makes
             # room -- this, not a size counter, is the backpressure.
             frame_queue.put(("frame", frame))
-            return (
-                BatchAckAction.STOP
-                if self._stop_event.is_set()
-                else BatchAckAction.CONTINUE
-            )
+            if self._stop_event.is_set():
+                # A requested safe-stop always wins: ending early is not
+                # "done with this roll," so it releases plainly and never
+                # ejects, regardless of eject_after.
+                return BatchAckAction.STOP
+            if frame.slot == slots[-1]:
+                if eject_after:
+                    return BatchAckAction.EJECT
+                if held is not None:
+                    # This batch resumed a held reservation and the
+                    # operator asked for neither a safe-stop nor an eject:
+                    # the vendor-traced default is to keep the reservation
+                    # held rather than release it, so a later scan_many()/
+                    # scan() can resume it again without a refeed -- see
+                    # this method's own docstring. A cold batch (no
+                    # preceding preview()) has nothing to hold open and
+                    # keeps today's plain release here, unchanged.
+                    return BatchAckAction.CONTINUE_HOLD
+            return BatchAckAction.CONTINUE
 
         def run_batch() -> None:
             try:
                 try:
-                    result = adapter.run_batch_session(
-                        batch_request, frame_handler=frame_handler
-                    )
+                    if held is not None and held.usable:
+                        result = adapter.resume_held_session(
+                            held, batch_request, frame_handler=frame_handler
+                        )
+                    else:
+                        result = adapter.run_batch_session(
+                            batch_request, frame_handler=frame_handler
+                        )
+                except HeldSessionExpired:
+                    # Fail-closed per the held-session contract: a dead or
+                    # already-consumed child cannot prove the reservation is
+                    # still held. This is the one place in this package that
+                    # raises RefeedRequired, and the reason its docstring
+                    # says generic command-status text is not sufficient to
+                    # emit it: a lost held session is a positively-known
+                    # fact about the reservation, not an inference from a
+                    # nonzero status byte. (A command-64 end-stop status is
+                    # deliberately NOT translated here -- see a289074, which
+                    # restored mainline 586f575's taxonomy after the port
+                    # reintroduced that inference; such a status falls
+                    # through to the generic RollMismatch instead.)
+                    # Operator action either way: physically refeed and
+                    # retry.
+                    frame_queue.put((
+                        "error",
+                        RefeedRequired(
+                            "the held preview's reservation is no longer "
+                            "available (the scanner may have auto-ejected, "
+                            "or the held session was already used); pull "
+                            "the strip fully out, reinsert it until the "
+                            "feeder grips, then retry the batch"
+                        ),
+                    ))
+                    return
                 except CaptureStopped as error:
                     try:
                         raise SafeStopRequested(str(error)) from error
@@ -920,6 +1218,20 @@ class Roll:
                     frame_queue.put(("error", RollMismatch(message)))
                     return
 
+                if result.held_again is not None:
+                    # frame_handler asked to keep the reservation held
+                    # (CONTINUE_HOLD on the last requested slot) and the
+                    # worker confirmed it: the same child is parked at a
+                    # fresh hold-wait instead of having released. Store it
+                    # back so the next scan_many()/scan() call -- or
+                    # release()/eject()/close() -- picks up exactly where
+                    # this one left off, the same way preview() first
+                    # populated it. Set before the terminal marker below so
+                    # it is visible to any call made once this iterator is
+                    # exhausted, never mid-batch.
+                    with self._state_condition:
+                        self._held_session = result.held_again
+
                 frame_queue.put(
                     ("stopped", produced_count)
                     if result.stopped
@@ -979,7 +1291,52 @@ class Roll:
         self._stop_event.set()
 
     def eject(self) -> bool:
-        return self._device.eject()
+        """End a held reservation by replaying the traced vendor
+        end-of-session eject sequence, then release.
+
+        Valid whenever a reservation is currently held: after
+        :meth:`preview` and before the next :meth:`scan_many`/:meth:`scan`
+        (either consumes the held session), or equally after a
+        ``scan_many()``/``scan()`` call that itself completed still
+        holding (its own default -- see that method's docstring) and
+        before the next one. This is the "I'm not scanning anything else
+        on this roll, give me the strip back" case -- ending a *batch*
+        this way instead is ``scan_many(..., eject_after=True)``, since a
+        batch's held session is consumed by the batch call itself, not a
+        later call to this method.
+
+        Raises :class:`~coolscanpy.exceptions.EjectNotAvailable` if no
+        reservation is currently held -- no :meth:`preview` has run yet,
+        or the held session was already consumed/released/ejected (by a
+        resuming batch, ``eject_after=True``, or an earlier ``eject()``/
+        :meth:`release`). Raises
+        :class:`~coolscanpy.exceptions.FeederParked` if the traced sequence
+        did not complete as expected (most often a suspected transport
+        wedge), naming the worker's own recorded diagnosis; a power cycle
+        is the only demonstrated recovery for that case.
+        """
+
+        self._require_open()
+        held = self._held_session
+        if held is None or not held.usable:
+            raise EjectNotAvailable(
+                "no held reservation to eject: call preview() first, or "
+                "pass eject_after=True to scan_many() to eject at the end "
+                "of a batch"
+            )
+        self._held_session = None
+        try:
+            self._ensure_adapter().eject_held_session(held)
+        except BaseException as error:
+            self._preserve_evidence(
+                f"eject of the held preview child failed: {error}"
+            )
+            if isinstance(error, CaptureProcessError) and POWER_CYCLE_RECOVERY in str(
+                error
+            ):
+                raise FeederParked(str(error)) from error
+            raise
+        return True
 
     # -- internals -------------------------------------------------------
 
@@ -1275,6 +1632,43 @@ def _receipt_duration_ms(capture: dict[str, Any]) -> int | None:
     if value < 0 or value > ((1 << 64) - 1):
         return None
     return value
+
+
+def _validate_exposure_override_10ns(
+    exposure_override_10ns: tuple[int, int, int] | None,
+) -> None:
+    """Validate a caller-supplied per-channel fine-scan exposure override.
+
+    ``None`` (no override) is always valid. Otherwise this must be a
+    ``(red, green, blue)`` tuple of raw 10ns hardware tick counts, each
+    within the same ``[EXPOSURE_MIN, EXPOSURE_MAX]`` bounds the AE meter
+    contract machinery already enforces on metered ticks (see
+    ``coolscanpy.protocol.ls5000_single_pass.meter``) -- this reuses those
+    limits rather than inventing new ones.
+    """
+
+    if exposure_override_10ns is None:
+        return
+    if (
+        isinstance(exposure_override_10ns, (str, bytes))
+        or not isinstance(exposure_override_10ns, (tuple, list))
+        or len(exposure_override_10ns) != 3
+    ):
+        raise ValueError(
+            "exposure_override_10ns must be a (red, green, blue) 3-tuple of "
+            "raw 10ns tick counts"
+        )
+    for channel, raw in zip(("red", "green", "blue"), exposure_override_10ns):
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(
+                f"exposure_override_10ns {channel} tick count must be an int, "
+                f"got {raw!r}"
+            )
+        if not EXPOSURE_MIN <= raw <= EXPOSURE_MAX:
+            raise ValueError(
+                f"exposure_override_10ns {channel} tick count {raw} is "
+                f"outside the allowed range [{EXPOSURE_MIN}, {EXPOSURE_MAX}]"
+            )
 
 
 def _build_receipt(

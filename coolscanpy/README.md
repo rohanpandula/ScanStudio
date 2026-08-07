@@ -194,21 +194,45 @@ with coolscanpy.open("ls5000") as dev:
                 roll.approve(thumb.slot)
 
         selected = [thumb.slot for thumb in thumbnails[:36]]
-        for frame in roll.scan_many(selected):
+        for frame in roll.scan_many(selected, eject_after=True):
             print(frame.slot, frame.rgb.shape, frame.receipt.transport_smear.verdict)
             # The 285 dpi RGBI meter pass, if present:
             if frame.meter_rgbi is not None:
                 print("  prepass for fauxice:", frame.meter_rgbi.shape)
-
-        # Optional: requires coolscanpy[scanner] and a system SANE backend.
-        # roll.eject()
 ```
 
 `roll.scan_many()` opens one continuous transport reservation for the whole
 list of slots and yields a `Frame` as each completes. `roll.scan(slot)` is
 sugar for scanning one slot. Calling `roll.safe_stop()` from another thread
 lets the frame in flight finish normally; the next one raises
-`SafeStopRequested` instead of starting.
+`SafeStopRequested` instead of starting. The `preview()` call above leaves
+its reservation open, which is why this `scan_many()` resumes it directly
+instead of needing a refeed -- and, left to run without `eject_after`, a
+*further* `scan_many()`/`scan()` call would resume it again, any number of
+times, on the same feed; see Safety model below for the exact scope of that
+hold.
+
+`eject_after=True` ends the batch, once the last requested slot's frame is
+finalized, by replaying the scanner's own traced end-of-session eject
+sequence -- still inside this batch's original reservation -- before
+releasing, instead of the plain release every batch without it already
+performs when it was never holding anything. Leave it off (the default) and
+a batch that resumed a held reservation keeps that same reservation held
+afterward too -- the strip stays parked inside for a later
+`preview()`/`scan_many()`/`scan()` on the same feed, or an explicit
+`roll.eject()` -- rather than releasing. The other way to eject is
+`roll.eject()`, for the "I'm not scanning anything else on this roll" case:
+valid whenever a reservation is currently held, whether that is `preview()`'s
+own (before the first `scan_many()`/`scan()` consumes it) or a later batch's
+(before the next one, or an explicit `release()`). Either path raises
+`FeederParked` instead of completing if the traced sequence does not finish
+as expected -- most often a suspected transport wedge, for which a power
+cycle is the only demonstrated recovery.
+
+Both `scan_many()` and `scan()` also accept an `exposure_override_10ns=(red,
+green, blue)` keyword: raw 10 ns hardware exposure ticks that replace the AE
+meter's own proposal for every frame in the batch, without changing what the
+meter itself measures.
 
 For live diagnostics or acceptance runs, pass an absolute caller-owned
 directory as `dev.roll(attempts_root=...)`. Preview rasters, transport tables,
@@ -244,11 +268,17 @@ entered its terminal `0x81xx`/`0x83xx` suffix, affected trailing slots remain
 visible for review but are deliberately not scanner-addressable on that
 insertion.
 
-Strips shorter than a full roll work for preview and fine scanning. A preview
-traversal can park a short strip at the transport end-stop, so a batch run
-started right after a preview can raise `RefeedRequired`. Pull the strip out,
-reinsert it until the feeder grips, and run the batch again. Treat that refeed
-as a new registration.
+Strips shorter than a full roll work for preview and, as of 0.1.3, for fine
+scanning too. A preview traversal parks a short strip at the transport
+end-stop. `preview()` keeps its reservation open, and every
+`scan_many()`/`scan()` call afterward -- not just the first -- resumes it
+directly instead of re-reading the index, so the ordinary preview-then-scan
+sequence no longer needs a refeed for that reason, on a short strip or a
+full roll. `RefeedRequired` still applies if a held reservation cannot be
+resumed (the scanner may have auto-ejected, or the held child died), if
+`release()` was called first, or to a batch on a feed that was never held
+in the first place: pull the strip out, reinsert it until the feeder grips,
+and run the batch again. Treat that refeed as a new registration.
 
 The converted SA-21 can park or eject a strip after an uncharacterized idle
 interval. Start the intended capture promptly after feeding. A transport-index
@@ -296,6 +326,41 @@ scan_many() call, not one per frame, and releases it exactly once on close.
 Requesting a safe stop never interrupts the frame currently being read; only
 the next one is affected.
 
+`preview()` keeps its own reservation open rather than releasing
+immediately, so every `scan_many()`/`scan()` call that follows resumes it
+directly instead of reacquiring the transport, with no refeed needed, even
+on hardware that parks between reads. This is not limited to the first
+batch after a preview: a batch that completes without `eject_after=True`
+keeps the same reservation held for the next one too -- same child process,
+same reservation, same retained frame table, matching the vendor's own
+traced session shape (one `RESERVE_UNIT` from feed to eject, any number of
+fine scans in between, no repeated frame-table read, no intermediate
+`RELEASE_UNIT`) -- so a whole roll can be scanned across as many
+`scan_many()`/`scan()` calls as the caller wants without a refeed between
+them. `release()` gives up a still-held reservation explicitly at any point
+between batches, reverting to a fresh reservation on the next scan; calling
+`preview()` again always supersedes whatever reservation the one before it
+was holding, whether that was `preview()`'s own or a batch's. A cold batch
+-- no preceding `preview()`, or one whose hold was already
+released/ejected/never established -- opens its own fresh reservation
+exactly as every batch always has, and can still raise `RefeedRequired` if
+the transport has parked by then; a batch resuming a held reservation whose
+child died in the meantime (auto-eject, crash) raises the same
+`RefeedRequired` rather than assuming the reservation is still good.
+
+Ejecting -- `scan_many(..., eject_after=True)` or `roll.eject()` on a
+still-held reservation -- replays the scanner's own traced end-of-session
+sequence inside the reservation already held, the same session shape a
+normal scan already uses, rather than releasing first and re-reserving to
+eject afterward. Every reply is checked against that trace; any deviation
+stops before another motion command is sent and raises `FeederParked`
+instead of reporting success, since a mid-motion failure with film still
+inside is exactly the case a power cycle, not a retry, is the documented
+recovery for. `EjectNotAvailable` is raised instead if nothing is currently
+held to eject -- no `preview()` has run yet, or the hold was already
+consumed by a `scan_many()`/`scan()` call that ended it with
+`eject_after=True`, or was released/ejected explicitly.
+
 Before the first fine scan of a batch, the roll's fingerprint (bound at the
 last preview) is checked against a fresh read of the transport. If the
 comparison doesn't match, `FingerprintRefused` is raised instead of scanning
@@ -323,8 +388,11 @@ inversion and print rendering belong to the application above this library
 (see [cool-colors](https://github.com/rohanpandula/cool-colors) for a
 standalone C-41 inverter, or
 [NegPy](https://github.com/marcinz606/NegPy) for the full desktop app).
-The infrared plane comes back raw as well. Turning it into a defect mask
-and healing the dust it reveals is the job of
+The infrared plane comes back raw as well, and both arrays are stored in
+Nikon Scan's own orientation rather than the scanner's native portrait
+readout, so `frame.rgb`/`frame.ir` line up with what Nikon Scan renders for
+the same frame with no extra rotation downstream. Turning the infrared
+plane into a defect mask and healing the dust it reveals is the job of
 [digital-fauxice](https://github.com/rohanpandula/digital-fauxice), which
 consumes this package's RGBI output directly — the `Frame.meter_rgbi`
 field is the 285 dpi prepass its input contract requires.

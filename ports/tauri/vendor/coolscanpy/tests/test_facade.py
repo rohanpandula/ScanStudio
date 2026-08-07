@@ -17,6 +17,8 @@ import gc
 import hashlib
 import functools
 import json
+import contextvars
+import secrets
 import struct
 import subprocess
 import sys
@@ -50,6 +52,7 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     CaptureOutcome,
     CaptureProcessAdapter,
     CaptureRequest,
+    HeldPreviewSession,
     ManualFrameApproval,
 )
 from coolscanpy.protocol.ls5000_single_pass.continuation_plan import (
@@ -197,6 +200,38 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+# _FakeBatchProcess.__post_init__ eagerly emits frame 1 (mirrors the real
+# worker writing it before any parent code can observe the child), so a
+# _FakeHeldWorkerProcess delegate's calibration_session_id has to be visible
+# *during* that construction, not after -- delegate_factory is an opaque
+# 2-arg callable each test defines, so there is no constructor kwarg to pass
+# it through. Set immediately before delegate_factory(...) and reset in a
+# finally, exactly the "implicit parameter for one specific callback" a
+# contextvar is for.
+@dataclass(frozen=True)
+class _ReservationDensity:
+    """Everything one feed-to-eject reservation establishes exactly once.
+
+    A cold batch establishes all three inside its own child, seeded from
+    that batch's own session id and written beside its own first frame. A
+    preview-and-hold reservation establishes them in the held preview's
+    attempt -- independently-minted calibration identity, raster persisted
+    in the *attempt* directory, f03 exposures read from that one traversal's
+    preview windows -- and every later round inherits all three unchanged.
+    Modelling any of them as per-round is what let the resume path's real
+    divergences pass this suite unnoticed.
+    """
+
+    calibration_session_id: str
+    source_path: Path
+    f03_exposures_raw_10ns: tuple[int, int, int]
+
+
+_AMBIENT_RESERVATION_DENSITY: contextvars.ContextVar[_ReservationDensity | None] = (
+    contextvars.ContextVar("_ambient_reservation_density", default=None)
+)
+
+
 def _density_calibration_provenance(session_id: str) -> dict[str, object]:
     reads = [
         decode_density_calibration_read(
@@ -264,11 +299,40 @@ def _density_batch_frame_provenance(
     output: Path,
     frame_index: int,
     selected_slot: int,
+    calibration_session_id: str | None = None,
+    density_source_path: Path | None = None,
+    density_f03_exposures_raw_10ns: tuple[int, int, int] = (70_307, 136_614, 125_470),
 ) -> tuple[dict[str, object], str, str]:
+    """``calibration_session_id`` defaults to the job's own session id --
+    correct for a cold batch -- so every existing cold-batch caller is
+    unaffected; a held/resumed caller (``_FakeBatchProcess`` acting as
+    ``_FakeHeldWorkerProcess``'s delegate) passes its own separately to
+    model the real divergence between a batch/round's own session id and
+    the reservation-wide calibration identity that held preview minted.
+
+    ``density_source_path`` is that divergence for the reservation's own
+    97-dpi density source raster (and the ``capture_attempt_id`` bound into
+    its evidence). A cold batch writes it inside its own first frame's
+    directory; a held preview wrote it in the preview attempt's directory,
+    and every resume inherits it from there. Defaulting a held caller to
+    the cold layout models a directory shape the real worker never
+    produces -- the exact reason this suite stayed green through the
+    2026-08-06 attempt-11 live failure. When that raster already exists,
+    its real bytes (and the caller's own f03 exposures) are what the
+    evidence is rebuilt from: one reservation has exactly one density
+    result, not one per round.
+    """
+
     job = json.loads(job_path.read_text(encoding="utf-8"))
     session_id = job["session_id"]
+    calibration_session_id = calibration_session_id or session_id
     selected_slots = tuple(frame["slot"] for frame in job["frames"])
     first_output = job_path.parent / job["frames"][0]["output"]
+    source_path = (
+        first_output.with_name(f"{first_output.stem}-preview.bin")
+        if density_source_path is None
+        else density_source_path
+    )
     calibration = assemble_density_calibration(
         [
             decode_density_calibration_read(
@@ -284,24 +348,28 @@ def _density_batch_frame_provenance(
                 start=1,
             )
         ],
-        session_id=session_id,
+        session_id=calibration_session_id,
     )
-    source = _density_source_fixture()
+    source = (
+        source_path.read_bytes()
+        if source_path.exists()
+        else _density_source_fixture()
+    )
     evidence = build_nikon_density_evidence(
         source,
         calibration=calibration,
-        density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
-        session_id=session_id,
-        capture_attempt_id=first_output.parent.name,
-        scan_identity=f"{session_id}:density-97dpi:{_sha256(source)}",
+        density_f03_exposures_raw_10ns=density_f03_exposures_raw_10ns,
+        session_id=calibration_session_id,
+        capture_attempt_id=source_path.parent.name,
+        scan_identity=f"{calibration_session_id}:density-97dpi:{_sha256(source)}",
     )
-    if frame_index == 1:
-        first_output.with_name(f"{first_output.stem}-preview.bin").write_bytes(source)
+    if frame_index == 1 and not source_path.exists():
+        source_path.write_bytes(source)
     table_sha = "2" * 64
     ownership = build_nikon_density_frame_ownership(
         evidence,
-        reservation_id=session_id,
-        batch_session_id=session_id,
+        reservation_id=calibration_session_id,
+        batch_session_id=calibration_session_id,
         transport_table_sha256=table_sha,
         reviewed_fingerprint_sha256=job["reviewed_roll_fingerprint"]["binding_sha256"],
         fresh_fingerprint_sha256=job["reviewed_roll_fingerprint"]["binding_sha256"],
@@ -647,11 +715,52 @@ class _FakeBatchProcess:
     session_journal_path: Path
     events: list[str]
     stop_after_index: int | None = None
+    # Reservation-wide calibration identity, distinct from job["session_id"]
+    # (this batch/round's own, independently-minted id) whenever this
+    # instance is acting as _FakeHeldWorkerProcess's delegate for a resumed
+    # batch -- None (the default) falls back to job["session_id"], correct
+    # for a standalone cold-batch use of this fake.
+    calibration_session_id: str | None = None
+    # The whole reservation-wide density identity (calibration id, source
+    # raster path, f03 exposures), handed over an ambient contextvar
+    # whenever this instance is acting as _FakeHeldWorkerProcess's
+    # delegate. None (the default) is a standalone cold batch, which
+    # establishes all three inside itself.
+    reservation_density: "_ReservationDensity | None" = None
+    # Set by poll() when a frame ack is "continue_hold": the outer
+    # _FakeHeldWorkerProcess (see its own poll()) notices this every poll
+    # and resets itself back to a fresh hold-wait at the paths named here,
+    # mirroring the real worker's own session_journal["hold_resume"]
+    # rendezvous (worker.py's round-N hold transition).
+    held_resume: dict[str, str] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.job = json.loads(self.job_path.read_text(encoding="utf-8"))
         self.index = 0
         self.returncode: int | None = None
+        if self.reservation_density is None:
+            self.reservation_density = _AMBIENT_RESERVATION_DENSITY.get()
+        if self.calibration_session_id is None and self.reservation_density is not None:
+            self.calibration_session_id = (
+                self.reservation_density.calibration_session_id
+            )
+        # The real worker overwrites the session journal to "capturing"
+        # immediately on processing "scan", strictly before it captures
+        # anything -- sequentially before the frame this round's own
+        # frame-complete journal reports. That ordering is what keeps a
+        # later round's own poll (_resolve_held_after_batch, or the plain
+        # completion path) from ever observing a *previous* round's stale
+        # "held" entry still sitting in the same session-journal.json: by
+        # the time the parent sees this round's frame complete,
+        # "capturing" has already superseded it. This session journal path
+        # is reused verbatim across every round on one held reservation
+        # (mirrors CaptureProcessAdapter.resume_held_session's own
+        # `held.directory / "session-journal.json"`), so without this
+        # write a second-or-later round's own continue_hold can race and
+        # validate against the wrong round's session_id.
+        self.session_journal_path.write_text(
+            json.dumps({"status": "capturing"}), encoding="utf-8"
+        )
         self._emit_frame()
 
     def _emit_frame(self) -> None:
@@ -667,18 +776,34 @@ class _FakeBatchProcess:
         meter_path.write_bytes(meter_payload)
         output_sha256 = _zero_stream_sha256(_FULL_STREAM_BYTES)
         reviewed_sha = self.job["reviewed_roll_fingerprint"]["binding_sha256"]
+        wire_exposures, exposure_override_provenance = _fine_exposure_fields(self.job)
         density, density_preview_sha, density_table_sha = (
             _density_batch_frame_provenance(
                 self.job_path,
                 output=output,
                 frame_index=self.index + 1,
                 selected_slot=frame["slot"],
+                calibration_session_id=self.calibration_session_id,
+                **(
+                    {}
+                    if self.reservation_density is None
+                    else {
+                        "density_source_path": (
+                            self.reservation_density.source_path
+                        ),
+                        "density_f03_exposures_raw_10ns": (
+                            self.reservation_density.f03_exposures_raw_10ns
+                        ),
+                    }
+                ),
             )
         )
         if self.index == 0:
             self.density_evidence_receipt = density["nikon_density_evidence"]
         journal = {
-            **_density_calibration_provenance(self.job["session_id"]),
+            **_density_calibration_provenance(
+                self.calibration_session_id or self.job["session_id"]
+            ),
             **density,
             "ack_nonce": f"nonce-{frame['slot']}",
             "batch_session": {
@@ -743,7 +868,7 @@ class _FakeBatchProcess:
                     "origin": [0, 100_000 + frame["slot"]],
                     "size": [3_946, 5_959],
                     "samples": 4,
-                    "exposure_raw_10ns": 100_000 + color,
+                    "exposure_raw_10ns": wire_exposures[color],
                 }
                 for color in (1, 2, 3, 9)
             ],
@@ -754,27 +879,33 @@ class _FakeBatchProcess:
                     "origin": [0, 100_000 + frame["slot"]],
                     "size": [3_946, 5_959],
                     "samples": 4,
-                    "exposure_raw_10ns": 100_000 + color,
+                    "exposure_raw_10ns": wire_exposures[color],
                     "interleave": 64,
                 }
                 for color in (1, 2, 3, 9)
             ],
             "meter_controller_final_result": {
                 "accepted": True,
+                # The meter's own persisted final-result record is never
+                # touched by exposure_override_10ns (see worker.py's own
+                # active_exposure_authority-only patch) -- always the raw
+                # metered answer, same as active_controller_channels_raw_
+                # 10ns below, never wire_exposures (which tracks whatever
+                # actually got commanded/overridden instead).
                 "final_exposures_raw_10ns": {
-                    "R": 100_001,
-                    "G": 100_002,
-                    "B": 100_003,
-                    "IR": 100_009,
+                    "R": _METERED_WIRE_EXPOSURES[1],
+                    "G": _METERED_WIRE_EXPOSURES[2],
+                    "B": _METERED_WIRE_EXPOSURES[3],
+                    "IR": _METERED_WIRE_EXPOSURES[9],
                 },
                 "steps": [
                     {
                         "observation": {
                             "exposures_raw_10ns": {
-                                "R": 100_001,
-                                "G": 100_002,
-                                "B": 100_003,
-                                "IR": 100_009,
+                                "R": _METERED_WIRE_EXPOSURES[1],
+                                "G": _METERED_WIRE_EXPOSURES[2],
+                                "B": _METERED_WIRE_EXPOSURES[3],
+                                "IR": _METERED_WIRE_EXPOSURES[9],
                             }
                         }
                     }
@@ -837,29 +968,35 @@ class _FakeBatchProcess:
             ],
             "meter_final_exposures": {
                 "controller_channels_raw_10ns": {
-                    "R": 100_001,
-                    "G": 100_002,
-                    "B": 100_003,
-                    "IR": 100_009,
+                    "R": wire_exposures[1],
+                    "G": wire_exposures[2],
+                    "B": wire_exposures[3],
+                    "IR": wire_exposures[9],
                 },
                 "wire_colors_raw_10ns": {
-                    "1": 100_001,
-                    "2": 100_002,
-                    "3": 100_003,
-                    "9": 100_009,
+                    "1": wire_exposures[1],
+                    "2": wire_exposures[2],
+                    "3": wire_exposures[3],
+                    "9": wire_exposures[9],
                 },
             },
             # The guarded nikon-parity solve is the RGB command authority;
             # this fixture's parity solve happens to equal the active solve,
-            # which is a legal (unclamped, unguarded) state.
+            # which is a legal (unclamped, unguarded) state. commanded_
+            # channels_raw_10ns must still track wire_exposures (not stay
+            # fixed at the active solve) when exposure_override_10ns is
+            # applied on top -- mirrors worker.py's own
+            # active_exposure_authority["commanded_channels_raw_10ns"]
+            # patch, and is what _read_exact_analyzer_source's binding
+            # check against the real fine GET_WINDOW echo requires.
             "active_exposure_authority": {
                 "rgb_source": "nikon-parity-guarded-v2",
                 "ir_source": "active-controller",
                 "commanded_channels_raw_10ns": {
-                    "R": 100_001,
-                    "G": 100_002,
-                    "B": 100_003,
-                    "IR": 100_009,
+                    "R": wire_exposures[1],
+                    "G": wire_exposures[2],
+                    "B": wire_exposures[3],
+                    "IR": wire_exposures[9],
                 },
                 "active_controller_channels_raw_10ns": {
                     "R": 100_001,
@@ -871,6 +1008,8 @@ class _FakeBatchProcess:
                 "device_exposure_bounds_raw_10ns": [50_000, 400_000],
             },
         }
+        if exposure_override_provenance is not None:
+            journal["exposure_override"] = exposure_override_provenance
         journal_path.write_text(json.dumps(journal), encoding="utf-8")
         self.events.append(f"ready-{frame['slot']}")
 
@@ -895,45 +1034,110 @@ class _FakeBatchProcess:
             self._emit_frame()
             return None
         completed = [item["slot"] for item in self.job["frames"][: self.index + 1]]
-        self.session_journal_path.write_text(
-            json.dumps(
-                {
-                    **_density_calibration_provenance(self.job["session_id"]),
-                    "nikon_density_evidence": self.density_evidence_receipt,
-                    "batch_job_sha256": _sha256(self.job_path.read_bytes()),
-                    "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
-                    "capture_engine_sha256": _sha256(_FAKE_WORKER_SOURCE),
-                    "expected_usb_bus": self.job["expected_usb_bus"],
-                    "expected_usb_address": self.job["expected_usb_address"],
-                    "actual_usb_bus": self.job["expected_usb_bus"],
-                    "actual_usb_address": self.job["expected_usb_address"],
-                    "manual_review_approval_sha256_by_slot": {
-                        str(item["slot"]): (
-                            None
-                            if item["manual_review_approval"] is None
-                            else item["manual_review_approval"]["binding_sha256"]
-                        )
-                        for item in self.job["frames"]
-                    },
-                    "reviewed_roll_fingerprint_sha256": self.job[
-                        "reviewed_roll_fingerprint"
-                    ]["binding_sha256"],
-                    "completed_slots": completed,
-                    "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
-                    "plan_sha256": CANONICAL_PLAN_SHA256,
-                    "recovery_required": "none",
-                    "reservation_acquired": True,
-                    "selected_slots": [item["slot"] for item in self.job["frames"]],
-                    "session_id": self.job["session_id"],
-                    "status": "stopped"
-                    if ack["action"] == "stop" or forced_stop
-                    else "complete",
-                    "unit_release_attempts": 1,
-                    "unit_released": True,
-                }
+        if ack["action"] == "continue_hold" and not forced_stop:
+            next_hold_session_id = secrets.token_hex(16)
+            next_hold_job_path = self.job_path.with_name(
+                f"hold-job-{next_hold_session_id}.json"
+            )
+            next_hold_ack_path = self.job_path.with_name(
+                f"hold-ack-{next_hold_session_id}.json"
+            )
+            resume = {
+                "hold_session_id": next_hold_session_id,
+                "hold_job_path": str(next_hold_job_path),
+                "hold_ack_path": str(next_hold_ack_path),
+                "hold_release_journal_path": str(
+                    self.job_path.with_name(f"hold-release-{next_hold_session_id}.json")
+                ),
+            }
+            session_journal = {
+                **_density_calibration_provenance(
+                    self.calibration_session_id or self.job["session_id"]
+                ),
+                "nikon_density_evidence": self.density_evidence_receipt,
+                "batch_job_sha256": _sha256(self.job_path.read_bytes()),
+                "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
+                "capture_engine_sha256": _sha256(_FAKE_WORKER_SOURCE),
+                "expected_usb_bus": self.job["expected_usb_bus"],
+                "expected_usb_address": self.job["expected_usb_address"],
+                "actual_usb_bus": self.job["expected_usb_bus"],
+                "actual_usb_address": self.job["expected_usb_address"],
+                "manual_review_approval_sha256_by_slot": {
+                    str(item["slot"]): (
+                        None
+                        if item["manual_review_approval"] is None
+                        else item["manual_review_approval"]["binding_sha256"]
+                    )
+                    for item in self.job["frames"]
+                },
+                "reviewed_roll_fingerprint_sha256": self.job[
+                    "reviewed_roll_fingerprint"
+                ]["binding_sha256"],
+                "completed_slots": completed,
+                "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+                "plan_sha256": CANONICAL_PLAN_SHA256,
+                "recovery_required": None,
+                "reservation_acquired": True,
+                "selected_slots": [item["slot"] for item in self.job["frames"]],
+                "session_id": self.job["session_id"],
+                "status": "held",
+                "unit_release_attempts": 0,
+                "unit_released": False,
+                "hold_resume": resume,
+            }
+            self.session_journal_path.write_text(
+                json.dumps(session_journal), encoding="utf-8"
+            )
+            self.held_resume = resume
+            return None
+        ejected = ack["action"] == "eject" and not forced_stop
+        session_journal: dict[str, Any] = {
+            **_density_calibration_provenance(
+                self.calibration_session_id or self.job["session_id"]
             ),
-            encoding="utf-8",
-        )
+            "nikon_density_evidence": self.density_evidence_receipt,
+            "batch_job_sha256": _sha256(self.job_path.read_bytes()),
+            "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
+            "capture_engine_sha256": _sha256(_FAKE_WORKER_SOURCE),
+            "expected_usb_bus": self.job["expected_usb_bus"],
+            "expected_usb_address": self.job["expected_usb_address"],
+            "actual_usb_bus": self.job["expected_usb_bus"],
+            "actual_usb_address": self.job["expected_usb_address"],
+            "manual_review_approval_sha256_by_slot": {
+                str(item["slot"]): (
+                    None
+                    if item["manual_review_approval"] is None
+                    else item["manual_review_approval"]["binding_sha256"]
+                )
+                for item in self.job["frames"]
+            },
+            "reviewed_roll_fingerprint_sha256": self.job["reviewed_roll_fingerprint"][
+                "binding_sha256"
+            ],
+            "completed_slots": completed,
+            "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "recovery_required": "none",
+            "reservation_acquired": True,
+            "selected_slots": [item["slot"] for item in self.job["frames"]],
+            "session_id": self.job["session_id"],
+            "status": (
+                "ejected"
+                if ejected
+                else ("stopped" if ack["action"] == "stop" or forced_stop else "complete")
+            ),
+            "unit_release_attempts": 1,
+            "unit_released": True,
+        }
+        if ejected:
+            session_journal["eject"] = {
+                "eject_cdb_status": "0000000000000000",
+                "eject_execute_status": "0000000000000000",
+                "terminal_sense": "023a00",
+                "wait_polls": 5,
+                "stall_recoveries": 0,
+            }
+        self.session_journal_path.write_text(json.dumps(session_journal), encoding="utf-8")
         self.returncode = 0
         return 0
 
@@ -970,10 +1174,22 @@ class _RefusalBatchProcess:
 
     def __post_init__(self) -> None:
         job = json.loads(self.job_path.read_text(encoding="utf-8"))
+        # Same ambient-identity handoff _FakeBatchProcess.__post_init__
+        # uses: set (only) while this instance is being constructed as
+        # _FakeHeldWorkerProcess's delegate, via delegate_factory -- see
+        # that class's poll(). Falls back to job["session_id"] outside a
+        # held-preview context (a standalone cold-batch refusal), where
+        # the two coincide.
+        reservation_density = _AMBIENT_RESERVATION_DENSITY.get()
+        calibration_session_id = (
+            job["session_id"]
+            if reservation_density is None
+            else reservation_density.calibration_session_id
+        )
         self.session_journal_path.write_text(
             json.dumps(
                 {
-                    **_density_calibration_provenance(job["session_id"]),
+                    **_density_calibration_provenance(calibration_session_id),
                     "batch_job_sha256": _sha256(self.job_path.read_bytes()),
                     "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
                     "capture_engine_sha256": _sha256(_FAKE_WORKER_SOURCE),
@@ -1020,6 +1236,362 @@ class _RefusalBatchProcess:
 
 _FAKE_WORKER_SOURCE = b"# fake external capture worker\n"
 
+# The metered per-wire-color-id ticks this fixture has always faked
+# (100_00{color}), unconditionally, before exposure_override_10ns existed.
+_METERED_WIRE_EXPOSURES: dict[int, int] = {1: 100_001, 2: 100_002, 3: 100_003, 9: 100_009}
+
+
+def _fine_exposure_fields(
+    job: dict[str, Any],
+) -> tuple[dict[int, int], dict[str, Any] | None]:
+    """Mirror worker._apply_exposure_override for this fake batch process:
+    this fixture's own metered wire ticks, with R/G/B (wire colors 1/2/3)
+    replaced by the batch job's exposure_override_10ns when present -- IR
+    (wire color 9) has no override concept and always stays metered."""
+
+    override = job.get("exposure_override_10ns")
+    if override is None:
+        return dict(_METERED_WIRE_EXPOSURES), None
+    forced_red, forced_green, forced_blue = override
+    forced_wire = {
+        1: forced_red,
+        2: forced_green,
+        3: forced_blue,
+        9: _METERED_WIRE_EXPOSURES[9],
+    }
+    provenance = {
+        "applied": True,
+        "forced_10ns": {"red": forced_red, "green": forced_green, "blue": forced_blue},
+        "metered_10ns": {
+            "red": _METERED_WIRE_EXPOSURES[1],
+            "green": _METERED_WIRE_EXPOSURES[2],
+            "blue": _METERED_WIRE_EXPOSURES[3],
+        },
+    }
+    return forced_wire, provenance
+
+
+@dataclass
+class _FakeHeldWorkerProcess:
+    """RunningBatchProcess double for a ``--preview-and-hold`` launch.
+
+    Mirrors ``_PreviewAndBatchWorker``'s preview payload (same synthetic
+    index/table/mapping), but honestly reports ``unit_released=False`` /
+    ``status="awaiting-hold-job"`` instead of a released preview, and stays
+    alive (``poll()`` returns ``None``) until a hold-ack file appears.
+    ``"release"`` finalizes the attempt journal as a plain released preview
+    and exits; ``"scan"`` delegates every later ``poll()``/``wait()`` to
+    whatever ``delegate_factory`` returns for the now-published batch job --
+    by default a plain ``_FakeBatchProcess``, or a refusal/gated variant for
+    tests that need the resumed phase to misbehave -- mirroring the real
+    worker's fall-through from preview into the existing batch frame loop
+    without a new process spawn.
+
+    If that delegate's own terminal frame ack is ``"continue_hold"``, its
+    ``held_resume`` attribute is set instead of it returning a real
+    returncode -- ``poll()`` below notices this on the *next* poll, drops
+    the delegate, and resets itself to hold-wait at the fresh
+    hold_job_path/hold_ack_path/hold_session_id/hold_release_journal_path
+    named there, exactly mirroring the real worker's own round-N hold
+    transition. This can repeat any number of times: each further "scan"
+    hands off to a fresh delegate the same way the first one did.
+    """
+
+    output_path: Path
+    journal_path: Path
+    hold_job_path: Path
+    hold_ack_path: Path
+    worker_sha256: str
+    events: list[str]
+    delegate_factory: Callable[[Path, Path], Any]
+    expected_usb_bus: int | None = None
+    expected_usb_address: int | None = None
+    preview_started: threading.Event | None = None
+    preview_release: threading.Event | None = None
+    hold_session_id: str = field(default_factory=lambda: secrets.token_hex(16))
+    _delegate: Any = field(default=None, init=False, repr=False)
+    _returncode: int | None = field(default=None, init=False)
+    # Where a "release"/"eject" hold-ack's completion receipt is written.
+    # Round 0 (the original preview) is journal_path itself, already
+    # pre-populated by __post_init__ below; a later round (after a
+    # continue_hold reset) is a fresh, dedicated file named by that
+    # round's own hold_resume, matching the real worker's
+    # hold_wait_release_receipt_path.
+    _release_journal_path: Path = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        # Simulates a slow-to-complete preview: the caller's begin_held_preview
+        # keeps polling for the journal's "awaiting-hold-job" status (so
+        # Roll._preview_active stays True) until preview_release is set --
+        # mirroring what _PreviewAndBatchWorker.__call__ used to do for a
+        # plain (non-held) preview, before every preview became a held one.
+        if self.preview_started is not None:
+            self.preview_started.set()
+        if self.preview_release is not None:
+            self.preview_release.wait(timeout=5)
+        rgb = _synthetic_index()
+        preview = _encode_index(rgb)
+        table = _transport_table(len(rgb))
+        directory = self.journal_path.parent
+        preview_path = directory / "capture-preview.bin"
+        table_path = directory / "capture-008e.bin"
+        mapping_path = directory / "capture-frame-map.json"
+        preview_path.write_bytes(preview)
+        table_path.write_bytes(table)
+        self.output_path.write_bytes(b"")
+        preview_binding = {
+            "mode": "canonical-40-record",
+            "startup_records": 40,
+            "native_height": 250_278,
+            "decoded_height": 6_104,
+            "expected_stream_bytes": 6_250_496,
+            "read_count": 48,
+            "active_read_sequence_range": [118, 165],
+            "skipped_read_sequence_range": None,
+        }
+        mapping = {
+            "status": "preview-and-hold-awaiting-job",
+            "slot_capacity_hint": 40,
+            "slot_capacity_semantics": "scanner-addressable preview slots; not an exposure count",
+            "preview_bytes": len(preview),
+            "preview_sha256": _sha256(preview),
+            "table_bytes": len(table),
+            "table_sha256": _sha256(table),
+            "frame_detection": "deferred-offline",
+            "startup_table": {
+                "count": 40,
+                "sha256": "a" * 64,
+                "status": "0000000000000000",
+            },
+            "preview_binding": preview_binding,
+        }
+        mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+        density_session_id = "single-reservation-held-preview"
+        density_exposures = (71_373, 137_524, 126_126)
+        density_provenance = _density_calibration_provenance(density_session_id)
+        density_evidence = build_nikon_density_evidence(
+            preview,
+            calibration=DensityCalibration.from_dict(
+                density_provenance["nikon_density_calibration"]
+            ),
+            density_f03_exposures_raw_10ns=density_exposures,
+            session_id=density_session_id,
+            capture_attempt_id=directory.name,
+            scan_identity=(
+                f"{density_session_id}:density-97dpi:{_sha256(preview)}"
+            ),
+        )
+        journal = {
+            **density_provenance,
+            "status": "awaiting-hold-job",
+            "capture_mode": "preview-and-hold",
+            "hold_session_id": self.hold_session_id,
+            "hold_ready_unix": 0.0,
+            "requested_frame": None,
+            "requested_boundary_offset_rows": 0,
+            "expected_frame_count": None,
+            "expected_usb_bus": self.expected_usb_bus,
+            "expected_usb_address": self.expected_usb_address,
+            "actual_usb_bus": self.expected_usb_bus,
+            "actual_usb_address": self.expected_usb_address,
+            "expected_reads": 0,
+            "completed_reads": 0,
+            "expected_bytes": 0,
+            "completed_bytes": 0,
+            "disk_bytes": 0,
+            "unit_released": False,
+            "recovery_required": None,
+            "output": str(self.output_path.resolve()),
+            "output_sha256": _sha256(b""),
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "capture_engine_sha256": self.worker_sha256,
+            "scanner_identity": "Nikon LS-5000 ED 1.03",
+            "preview_geometry_validated_before_reads": True,
+            "preview_windows": [
+                {
+                    "color_id": color,
+                    "resolution": [97, 97],
+                    "origin": [0, 0],
+                    "size": [3_946, 250_278],
+                    "bit_depth": 16,
+                    "density_f03_exposure_raw_10ns": exposure,
+                }
+                for color, exposure in zip(
+                    (1, 2, 3),
+                    density_exposures,
+                    strict=True,
+                )
+            ],
+            "nikon_density_evidence": density_evidence.to_dict(),
+            "live_startup_0x8f": {"count": 40, "sha256": "a" * 64},
+            "live_startup_0x8f_status": "0000000000000000",
+            "live_preview_binding": preview_binding,
+            "live_index_artifacts": {
+                "mapping": str(mapping_path.resolve()),
+                "preview": str(preview_path.resolve()),
+                "table": str(table_path.resolve()),
+            },
+            "live_index_evidence": {
+                "status": "persisted-before-frame-detection",
+                "preview_bytes": len(preview),
+                "preview_sha256": _sha256(preview),
+                "table_bytes": len(table),
+                "table_sha256": _sha256(table),
+            },
+            "preview_only_receipt": mapping,
+        }
+        self.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+        self.events.append("preview-hold-ready")
+        self._release_journal_path = self.journal_path
+        # Stashed so poll() can hand it to every delegate this held
+        # reservation resumes into, across every round -- see poll()'s own
+        # delegate_factory call below. The source raster is the one
+        # persisted just above, in *this* attempt's directory: no later
+        # round of this reservation writes another, exactly as the real
+        # worker persists it once per feed and reuses it thereafter.
+        self.reservation_density = _ReservationDensity(
+            calibration_session_id=density_session_id,
+            source_path=preview_path,
+            f03_exposures_raw_10ns=density_exposures,
+        )
+
+    def die(self, returncode: int = 1) -> None:
+        """Simulate the held child having already exited (crash, power
+        cycle, or an auto-eject it detected and gave up on) -- discovered
+        only when a resume/release is attempted next."""
+
+        self._returncode = returncode
+
+    def poll(self) -> int | None:
+        # Checked first, ahead of any delegate/reset dispatch below: die()
+        # simulates the child being gone *right now*, regardless of
+        # whatever hold-wait/delegate state this fake was last left in
+        # (e.g. a still-set delegate whose own held_resume the next round
+        # has not yet been polled into resetting away) -- a real dead
+        # process does not care about this fake's own bookkeeping either.
+        if self._returncode is not None:
+            return self._returncode
+        if self._delegate is not None:
+            resume = getattr(self._delegate, "held_resume", None)
+            if resume is not None:
+                # The delegate's own terminal frame ack was "continue_hold":
+                # it is not exiting, it published a fresh hold_resume and
+                # is done polling. Drop it and reset to hold-wait at the
+                # paths it named -- mirroring the real worker looping the
+                # same child back into wait_for_hold_decision.
+                self._delegate = None
+                self.hold_job_path = Path(resume["hold_job_path"])
+                self.hold_ack_path = Path(resume["hold_ack_path"])
+                self.hold_session_id = resume["hold_session_id"]
+                self._release_journal_path = Path(resume["hold_release_journal_path"])
+                return None
+            return self._delegate.poll()
+        if not self.hold_ack_path.exists():
+            return None
+        ack = json.loads(self.hold_ack_path.read_text(encoding="utf-8"))
+        self.events.append(f"hold-ack-{ack['action']}")
+        if ack["action"] == "release":
+            journal = (
+                json.loads(self._release_journal_path.read_text(encoding="utf-8"))
+                if self._release_journal_path.exists()
+                else {}
+            )
+            journal.update(
+                status="complete",
+                capture_mode="preview-and-hold",
+                hold_outcome="released",
+                unit_released=True,
+            )
+            self._release_journal_path.write_text(
+                json.dumps(journal), encoding="utf-8"
+            )
+            self._returncode = 0
+            return 0
+        if ack["action"] == "eject":
+            journal = (
+                json.loads(self._release_journal_path.read_text(encoding="utf-8"))
+                if self._release_journal_path.exists()
+                else {}
+            )
+            journal.update(
+                status="complete",
+                capture_mode="preview-and-hold",
+                hold_outcome="ejected",
+                unit_released=True,
+                eject={
+                    "eject_cdb_status": "0000000000000000",
+                    "eject_execute_status": "0000000000000000",
+                    "terminal_sense": "023a00",
+                    "wait_polls": 5,
+                    "stall_recoveries": 0,
+                },
+            )
+            self._release_journal_path.write_text(
+                json.dumps(journal), encoding="utf-8"
+            )
+            self._returncode = 0
+            return 0
+        # action == "scan": hold_job_path now holds a real batch-job.json,
+        # published by resume_held_session before this ack -- exactly the
+        # ordering the real worker's wait_for_hold_decision/hold-ack.json
+        # handshake requires too.
+        session_journal_path = self.hold_job_path.with_name("session-journal.json")
+        # The delegate is this round's own resumed-batch double: it does not
+        # know the reservation-wide calibration identity this held preview
+        # minted (its own job.json only carries this round's independently-
+        # minted session id -- see PreparedCaptureBatch's docstring for why
+        # those two are not the same thing). _FakeBatchProcess.__post_init__
+        # emits frame 1 eagerly, synchronously inside delegate_factory(...)
+        # below -- there is no "after construction" moment early enough to
+        # set this directly, hence the ambient contextvar instead of a
+        # simple post-construction attribute set.
+        token = _AMBIENT_RESERVATION_DENSITY.set(self.reservation_density)
+        try:
+            self._delegate = self.delegate_factory(self.hold_job_path, session_journal_path)
+        finally:
+            _AMBIENT_RESERVATION_DENSITY.reset(token)
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        while True:
+            code = self.poll()
+            if code is not None:
+                return code
+            time.sleep(0.001)
+
+
+def _held_worker_process(
+    argv: Sequence[str],
+    events: list[str],
+    *,
+    delegate_factory: Callable[[Path, Path], Any],
+    preview_started: threading.Event | None = None,
+    preview_release: threading.Event | None = None,
+) -> _FakeHeldWorkerProcess:
+    hold_job_path = Path(_arg(argv, "--hold-job"))
+    return _FakeHeldWorkerProcess(
+        output_path=Path(_arg(argv, "--output")),
+        journal_path=Path(_arg(argv, "--journal")),
+        hold_job_path=hold_job_path,
+        hold_ack_path=hold_job_path.with_name("hold-ack.json"),
+        worker_sha256=_sha256(_FAKE_WORKER_SOURCE),
+        events=events,
+        delegate_factory=delegate_factory,
+        expected_usb_bus=(
+            int(_arg(argv, "--expected-usb-bus"))
+            if "--expected-usb-bus" in argv
+            else None
+        ),
+        expected_usb_address=(
+            int(_arg(argv, "--expected-usb-address"))
+            if "--expected-usb-address" in argv
+            else None
+        ),
+        preview_started=preview_started,
+        preview_release=preview_release,
+    )
+
 
 def _adapter(
     tmp_path: Path, worker: _PreviewAndBatchWorker, *, batch_spawner
@@ -1044,6 +1616,9 @@ def _adapter(
     )
 
 
+_DEFAULT_ATTEMPTS_ROOT = object()
+
+
 def _make_roll(
     tmp_path: Path,
     device: "coolscanpy.Device",
@@ -1052,6 +1627,7 @@ def _make_roll(
     batch_spawner,
     preview_started: threading.Event | None = None,
     preview_release: threading.Event | None = None,
+    attempts_root: Path | None = _DEFAULT_ATTEMPTS_ROOT,  # type: ignore[assignment]
 ) -> tuple[Roll, _PreviewAndBatchWorker]:
     worker = _PreviewAndBatchWorker(
         worker_sha256="",
@@ -1064,36 +1640,75 @@ def _make_roll(
         material,
         adapter=adapter,
         workflow=_make_workflow(),
-        attempts_root=tmp_path / "attempts",
+        attempts_root=(
+            tmp_path / "attempts"
+            if attempts_root is _DEFAULT_ATTEMPTS_ROOT
+            else attempts_root
+        ),
     )
     return roll, worker
 
 
-def _success_spawner(events: list[str], *, stop_after_index: int | None = None):
+def _success_spawner(
+    events: list[str],
+    *,
+    stop_after_index: int | None = None,
+    preview_started: threading.Event | None = None,
+    preview_release: threading.Event | None = None,
+):
+    def make_batch_process(job_path: Path, session_journal_path: Path) -> _FakeBatchProcess:
+        return _FakeBatchProcess(
+            job_path, session_journal_path, events, stop_after_index=stop_after_index
+        )
+
     def spawn(
         argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object
     ) -> _FakeBatchProcess:
         del cwd, stdout, stderr
+        if "--preview-and-hold" in argv:
+            return _held_worker_process(
+                argv,
+                events,
+                delegate_factory=make_batch_process,
+                preview_started=preview_started,
+                preview_release=preview_release,
+            )
         job_path = Path(_arg(argv, "--batch-job"))
         session_journal_path = Path(_arg(argv, "--session-journal"))
-        return _FakeBatchProcess(
-            job_path, session_journal_path, events, stop_after_index=stop_after_index
-        )
+        return make_batch_process(job_path, session_journal_path)
+
+    return spawn
+
+
+def _counting_spawner(
+    events: list[str],
+    processes: list[Any],
+    inner: Callable[..., Any],
+):
+    """Wrap any ``batch_spawner`` to additionally record every spawned
+    process object, in order -- multi-batch-per-feed's own proxy for "no
+    RESERVE_UNIT/command-64/RELEASE_UNIT between batches" at this
+    hardware-free layer: a resumed batch must never grow this list,
+    exactly like test_capture_process.py's "one spawn total" assertion for
+    the same claim one layer down. ``events`` is accepted (and ignored)
+    only so call sites can pass the same ``events`` list they already
+    threaded into ``inner`` without a second, easy-to-desync copy.
+    """
+
+    del events
+
+    def spawn(argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object) -> Any:
+        process = inner(argv, cwd=cwd, stdout=stdout, stderr=stderr)
+        processes.append(process)
+        return process
 
     return spawn
 
 
 def _tampered_meter_spawner(events: list[str], *, tamper: str):
-    def spawn(
-        argv: Sequence[str],
-        *,
-        cwd: Path,
-        stdout: object,
-        stderr: object,
+    def make_tampered_process(
+        job_path: Path, session_journal_path: Path
     ) -> _FakeBatchProcess:
-        del cwd, stdout, stderr
-        job_path = Path(_arg(argv, "--batch-job"))
-        session_journal_path = Path(_arg(argv, "--session-journal"))
         process = _FakeBatchProcess(job_path, session_journal_path, events)
         frame = process.job["frames"][0]
         output = job_path.parent / frame["output"]
@@ -1113,31 +1728,61 @@ def _tampered_meter_spawner(events: list[str], *, tamper: str):
             raise AssertionError(f"unknown meter tamper {tamper}")
         return process
 
+    def spawn(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        stdout: object,
+        stderr: object,
+    ) -> _FakeBatchProcess:
+        del cwd, stdout, stderr
+        if "--preview-and-hold" in argv:
+            return _held_worker_process(
+                argv, events, delegate_factory=make_tampered_process
+            )
+        job_path = Path(_arg(argv, "--batch-job"))
+        session_journal_path = Path(_arg(argv, "--session-journal"))
+        return make_tampered_process(job_path, session_journal_path)
+
     return spawn
 
 
 def _refusal_spawner(message: str):
+    def make_refusal_process(job_path: Path, session_journal_path: Path) -> _RefusalBatchProcess:
+        return _RefusalBatchProcess(job_path, session_journal_path, message)
+
     def spawn(
         argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object
     ) -> _RefusalBatchProcess:
         del cwd, stdout, stderr
+        if "--preview-and-hold" in argv:
+            # The preview phase always succeeds cleanly here -- only the
+            # resumed batch is refused, mirroring the real defect this
+            # fixture family exercises (a batch that fails to establish its
+            # own fine-scan session), not a failed preview.
+            return _held_worker_process(argv, [], delegate_factory=make_refusal_process)
         job_path = Path(_arg(argv, "--batch-job"))
         session_journal_path = Path(_arg(argv, "--session-journal"))
-        return _RefusalBatchProcess(job_path, session_journal_path, message)
+        return make_refusal_process(job_path, session_journal_path)
 
     return spawn
 
 
 def _gated_spawner(events: list[str], gate: threading.Event):
+    def make_gated_process(job_path: Path, session_journal_path: Path) -> _GatedBatchProcess:
+        return _GatedBatchProcess(
+            job_path, session_journal_path, events, release_after_first=gate
+        )
+
     def spawn(
         argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object
     ) -> _GatedBatchProcess:
         del cwd, stdout, stderr
+        if "--preview-and-hold" in argv:
+            return _held_worker_process(argv, events, delegate_factory=make_gated_process)
         job_path = Path(_arg(argv, "--batch-job"))
         session_journal_path = Path(_arg(argv, "--session-journal"))
-        return _GatedBatchProcess(
-            job_path, session_journal_path, events, release_after_first=gate
-        )
+        return make_gated_process(job_path, session_journal_path)
 
     return spawn
 
@@ -1655,8 +2300,15 @@ class TestRollPreview:
             stderr=attempt_dir / "stderr.txt",
         )
 
-        def bootstrap_failed(request: CaptureRequest) -> CaptureAttemptResult:
-            return CaptureAttemptResult(
+        def bootstrap_failed(request: CaptureRequest) -> HeldPreviewSession:
+            # Roll.preview() always resolves through begin_held_preview now
+            # (see the module docstring / preview()'s own docstring), not
+            # run_attempt -- a BOOTSTRAP_FAILED preview_attempt is what a
+            # real begin_held_preview would return for this case (see
+            # capture_process.py's _interpret_held_preview_launch_failure);
+            # HeldPreviewSession.usable is False for any non-COMPLETE
+            # outcome, so Roll.preview() never stores this as held.
+            attempt = CaptureAttemptResult(
                 outcome=CaptureOutcome.BOOTSTRAP_FAILED,
                 request=request,
                 paths=paths,
@@ -1671,9 +2323,22 @@ class TestRollPreview:
                     "No module named 'coolscanpy'"
                 ),
             )
+            return HeldPreviewSession(
+                preview_attempt=attempt,
+                process=None,  # type: ignore[arg-type]
+                directory=attempt_dir,
+                plan=paths.plan,
+                continuation_plan=attempt_dir / "continuation-plan.jsonl",
+                manifest=paths.manifest,
+                hold_job_path=attempt_dir / "hold-job.json",
+                hold_ack_path=attempt_dir / "hold-ack.json",
+                hold_session_id="0" * 32,
+                stdout_path=paths.stdout,
+                stderr_path=paths.stderr,
+            )
 
         assert roll._adapter is not None
-        roll._adapter.run_attempt = bootstrap_failed  # type: ignore[method-assign]
+        roll._adapter.begin_held_preview = bootstrap_failed  # type: ignore[method-assign]
         try:
             with pytest.raises(coolscanpy.CaptureWorkerBootstrapFailed) as excinfo:
                 roll.preview()
@@ -1718,9 +2383,9 @@ class TestRollPreview:
         roll, _worker = _make_roll(
             tmp_path,
             dev,
-            batch_spawner=_success_spawner([]),
-            preview_started=preview_started,
-            preview_release=preview_release,
+            batch_spawner=_success_spawner(
+                [], preview_started=preview_started, preview_release=preview_release
+            ),
         )
         attempts = roll._attempts_root
         attempts.mkdir(parents=True, exist_ok=True)
@@ -1776,9 +2441,9 @@ class TestRollPreview:
         roll, _worker = _make_roll(
             tmp_path,
             dev,
-            batch_spawner=_success_spawner([]),
-            preview_started=preview_started,
-            preview_release=preview_release,
+            batch_spawner=_success_spawner(
+                [], preview_started=preview_started, preview_release=preview_release
+            ),
         )
         failure: list[BaseException] = []
 
@@ -1813,9 +2478,9 @@ class TestRollPreview:
         roll, _worker = _make_roll(
             tmp_path,
             dev,
-            batch_spawner=_success_spawner([]),
-            preview_started=preview_started,
-            preview_release=preview_release,
+            batch_spawner=_success_spawner(
+                [], preview_started=preview_started, preview_release=preview_release
+            ),
         )
         preview_thread = threading.Thread(target=roll.preview)
         preview_thread.start()
@@ -1860,8 +2525,9 @@ class TestRollPreview:
     def test_restore_preview_session_revalidates_without_hardware_io(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
+        events: list[str] = []
         dev = _open_device(fake_service_factory)
-        roll, worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
         try:
             roll.preview()
             payload = roll._require_session().to_json()
@@ -1870,7 +2536,7 @@ class TestRollPreview:
             restored = roll.restore_preview_session(payload, slots=[2, 5])
 
             assert [thumbnail.slot for thumbnail in restored] == [2, 5]
-            assert worker.events == ["preview"]
+            assert events == ["preview-hold-ready"]
             assert roll._approvals == {}
             assert roll._session_usb_topology == (1, 2)
             assert roll._require_session().preview.usb_topology == (1, 2)
@@ -2178,6 +2844,171 @@ class TestRollPreview:
     # Roll.scan_many() / scan()
     # ===========================================================================
 
+# ===========================================================================
+# Roll.preview() failure cleanup -- the held child and its evidence
+# ===========================================================================
+
+
+def _corrupting_spawner(events: list[str], *, corrupt_first_previews: int = 1):
+    """Like ``_success_spawner``, but the first ``corrupt_first_previews``
+    held-preview children publish a journal whose ``disk_bytes`` is ``None``
+    -- structurally valid enough to pass ``begin_held_preview``'s own
+    awaiting-hold-job checks (which never look at ``disk_bytes``), then
+    refused by ``build_roll_preview_session``'s exact-value validation.
+    Reproduces the real 2026-07-24 hardware failure
+    (``RollSessionIntegrityError: preview journal disk_bytes=None, expected
+    0``) through the real validator, with the child parked at the hold
+    boundary the whole time."""
+
+    spawner = _success_spawner(events)
+    remaining = [corrupt_first_previews]
+
+    def spawn(argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object):
+        process = spawner(argv, cwd=cwd, stdout=stdout, stderr=stderr)
+        if "--preview-and-hold" in argv and remaining[0] > 0:
+            remaining[0] -= 1
+            journal_path = Path(_arg(argv, "--journal"))
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            journal["disk_bytes"] = None
+            journal_path.write_text(json.dumps(journal), encoding="utf-8")
+        return process
+
+    return spawn
+
+
+class TestRollPreviewFailureCleanup:
+    def test_refused_preview_journal_still_releases_the_held_child_on_exit(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """The 2026-07-24 orphaned-hold defect: preview()'s transport read
+        completes and the child pauses at the hold boundary, then
+        build_roll_preview_session refuses the journal. The held session
+        must already be tracked at that point, so context exit -> close()
+        finds it and tells the still-alive child to release -- previously
+        the child was orphaned holding the scanner's reservation, and the
+        refused journal was deleted with the attempts directory."""
+
+        from coolscanpy.roll.preview_session import RollSessionIntegrityError
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path, dev, batch_spawner=_corrupting_spawner(events)
+        )
+        try:
+            with pytest.raises(
+                RollSessionIntegrityError, match="disk_bytes"
+            ) as excinfo:
+                with roll:
+                    roll.preview()
+
+            assert events == ["preview-hold-ready", "hold-ack-release"], (
+                "close() must release the held child a refused preview "
+                "left at the hold boundary, not orphan it"
+            )
+            attempts_root = tmp_path / "attempts"
+            assert attempts_root.exists(), (
+                "the refused journal is forensic evidence; close() must "
+                "not delete it"
+            )
+            note = f"preview capture evidence preserved at {attempts_root}"
+            assert note in getattr(excinfo.value, "__notes__", [])
+        finally:
+            dev.close()
+
+    def test_clean_close_still_removes_the_attempts_directory(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """Evidence preservation is for failures only: a Roll whose preview
+        validated fine still deletes its private (self-owned, temporary)
+        attempts directory on close, exactly as before. This only holds for
+        the self-cleaning default (``attempts_root`` omitted): a
+        caller-owned ``attempts_root`` (every other test in this module
+        passes one explicitly, to inspect evidence after close) always
+        survives close() regardless of outcome -- see
+        ``Roll.__init__``'s ``_owns_attempts_root``."""
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path, dev, batch_spawner=_success_spawner(events), attempts_root=None
+        )
+        attempts_root = roll._attempts_root
+        try:
+            with roll:
+                roll.preview()
+            assert events == ["preview-hold-ready", "hold-ack-release"]
+            assert not attempts_root.exists()
+        finally:
+            dev.close()
+
+    def test_failed_release_on_close_keeps_the_attempts_directory(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """When the held child dies while holding (crash/power cycle) and
+        its release can no longer be confirmed, close() still succeeds --
+        but keeps the attempts directory, because the last journal that
+        child wrote is what can explain the unconfirmed reservation."""
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path, dev, batch_spawner=_success_spawner(events)
+        )
+        try:
+            with roll:
+                roll.preview()
+                held = roll._held_session
+                assert held is not None
+                held.process.die(returncode=3)
+            assert "hold-ack-release" not in events
+            assert (tmp_path / "attempts").exists(), (
+                "an unconfirmed release must leave the journal evidence "
+                "on disk"
+            )
+        finally:
+            dev.close()
+
+    def test_retried_preview_releases_the_previously_refused_child_first(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """A caller that catches the validation failure and calls preview()
+        again must not leak the first child: the retry releases it before
+        spawning its own, and the retry itself works normally."""
+
+        from coolscanpy.roll.preview_session import RollSessionIntegrityError
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_corrupting_spawner(events, corrupt_first_previews=1),
+        )
+        try:
+            with roll:
+                with pytest.raises(RollSessionIntegrityError):
+                    roll.preview()
+                thumbnails = roll.preview()
+                assert len(thumbnails) == 40
+                assert events == [
+                    "preview-hold-ready",
+                    "hold-ack-release",
+                    "preview-hold-ready",
+                ], "the retry must release the refused child before spawning"
+            assert events[-1] == "hold-ack-release", (
+                "close() releases the retry's own held child"
+            )
+        finally:
+            dev.close()
+
+
+# ===========================================================================
+# Roll.scan_many() / scan()
+# ===========================================================================
+
+
+class TestRollScanMany:
     def test_scan_many_yields_frames_in_requested_order(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
@@ -2269,6 +3100,127 @@ class TestRollPreview:
             roll.close()
             dev.close()
 
+    def test_scan_many_without_exposure_override_is_unchanged(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """Regression pin at the facade layer: passing exposure_override_10ns
+        explicitly as None must match today's behavior (the metered
+        1_000.01us this fixture has always produced) exactly -- the same
+        outcome as simply omitting the parameter, as every other test in
+        this module already does."""
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            frames = list(roll.scan_many([1], exposure_override_10ns=None))
+
+            exposure = frames[0].receipt.exposure
+            assert exposure.red_exposure_us == pytest.approx(1_000.01)
+            assert exposure.green_exposure_us == pytest.approx(1_000.02)
+            assert exposure.blue_exposure_us == pytest.approx(1_000.03)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_many_applies_exposure_override_on_the_cold_path(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """The public API surface's cold path: exposure_override_10ns forces
+        every requested frame's receipt.exposure to the caller's raw 10ns
+        ticks (here Nikon's captured R/G/B: 97482/195597/180705) instead of
+        this fixture's usual metered 100_001/100_002/100_003 -- exercising
+        the same accepted_contract/wire_colors_raw_10ns -> ExposureVector
+        conversion _build_receipt always used, now fed by forced rather than
+        metered evidence."""
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+            roll.release()  # exercise the cold (non-held) reservation path
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            frames = list(
+                roll.scan_many(
+                    [1], exposure_override_10ns=(97_482, 195_597, 180_705)
+                )
+            )
+
+            assert len(frames) == 1
+            exposure = frames[0].receipt.exposure
+            assert exposure.red_exposure_us == pytest.approx(974.82)
+            assert exposure.green_exposure_us == pytest.approx(1_955.97)
+            assert exposure.blue_exposure_us == pytest.approx(1_807.05)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_is_sugar_for_scan_many_of_one_and_forwards_exposure_override(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            frame = roll.scan(1, exposure_override_10ns=(97_482, 195_597, 180_705))
+
+            assert frame.slot == 1
+            assert frame.receipt.exposure.red_exposure_us == pytest.approx(974.82)
+        finally:
+            roll.close()
+            dev.close()
+
+    @pytest.mark.parametrize(
+        ("bad_override", "channel"),
+        [
+            ((0, 90_000, 90_000), "red"),
+            ((90_000, 0, 90_000), "green"),
+            ((90_000, 90_000, 0), "blue"),
+            ((90_000, -1, 90_000), "green"),
+            ((49_999, 90_000, 90_000), "red"),
+            ((90_000, 90_000, 400_001), "blue"),
+        ],
+    )
+    def test_scan_many_refuses_exposure_override_ticks_outside_metered_bounds(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+        bad_override: tuple[int, int, int],
+        channel: str,
+    ) -> None:
+        """Validation happens eagerly, before any hardware access -- calling
+        scan_many() itself must raise, without needing the returned iterator
+        to be consumed (see the module's own "eagerly, before any hardware
+        access" contract, exercised the same way by
+        test_scan_many_raises_manual_review_required_when_unapproved)."""
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            with pytest.raises(ValueError, match=channel):
+                next(
+                    iter(
+                        roll.scan_many(
+                            [1], exposure_override_10ns=bad_override
+                        )
+                    )
+                )
+        finally:
+            roll.close()
+            dev.close()
+
     def test_scan_is_sugar_for_scan_many_of_one(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
@@ -2294,18 +3246,32 @@ class TestRollPreview:
         events: list[str] = []
         observed_jobs: list[dict[str, Any]] = []
 
+        def make_observed_process(
+            job_path: Path, session_journal_path: Path
+        ) -> _FakeBatchProcess:
+            observed_jobs.append(json.loads(job_path.read_text(encoding="utf-8")))
+            return _FakeBatchProcess(job_path, session_journal_path, events)
+
         def spawn(
             argv: Sequence[str],
             *,
             cwd: Path,
             stdout: object,
             stderr: object,
-        ) -> _FakeBatchProcess:
+        ):
             del cwd, stdout, stderr
+            # Roll.preview() always resolves through begin_held_preview now
+            # (see the module docstring), which spawns via this same
+            # batch_spawner with a --preview-and-hold argv -- not a
+            # --batch-job one -- before scan_many()'s own resumed batch
+            # ever launches. Mirrors _success_spawner's own branch.
+            if "--preview-and-hold" in argv:
+                return _held_worker_process(
+                    argv, events, delegate_factory=make_observed_process
+                )
             job_path = Path(_arg(argv, "--batch-job"))
             session_journal_path = Path(_arg(argv, "--session-journal"))
-            observed_jobs.append(json.loads(job_path.read_text(encoding="utf-8")))
-            return _FakeBatchProcess(job_path, session_journal_path, events)
+            return make_observed_process(job_path, session_journal_path)
 
         dev = _open_device(fake_service_factory)
         roll, _worker = _make_roll(tmp_path, dev, batch_spawner=spawn)
@@ -2347,6 +3313,12 @@ class TestRollPreview:
         events: list[str] = []
         observed_jobs: list[dict[str, object]] = []
 
+        def make_batch_process(
+            job_path: Path, session_journal_path: Path
+        ) -> _FakeBatchProcess:
+            observed_jobs.append(json.loads(job_path.read_text(encoding="utf-8")))
+            return _FakeBatchProcess(job_path, session_journal_path, events)
+
         def spawn(
             argv: Sequence[str],
             *,
@@ -2355,10 +3327,13 @@ class TestRollPreview:
             stderr: object,
         ) -> _FakeBatchProcess:
             del cwd, stdout, stderr
+            if "--preview-and-hold" in argv:
+                return _held_worker_process(
+                    argv, events, delegate_factory=make_batch_process
+                )
             job_path = Path(_arg(argv, "--batch-job"))
             session_journal_path = Path(_arg(argv, "--session-journal"))
-            observed_jobs.append(json.loads(job_path.read_text(encoding="utf-8")))
-            return _FakeBatchProcess(job_path, session_journal_path, events)
+            return make_batch_process(job_path, session_journal_path)
 
         dev = _open_device(fake_service_factory)
         roll, _worker = _make_roll(tmp_path, dev, batch_spawner=spawn)
@@ -2535,11 +3510,12 @@ class TestRollPreview:
     def test_lazy_color_batch_is_owned_before_return_and_cannot_start_after_close(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
+        events: list[str] = []
         dev = _open_device(fake_service_factory)
-        roll, worker = _make_roll(
+        roll, _worker = _make_roll(
             tmp_path,
             dev,
-            batch_spawner=_success_spawner([]),
+            batch_spawner=_success_spawner(events),
         )
         try:
             roll.preview()
@@ -2554,7 +3530,7 @@ class TestRollPreview:
             roll.close()
 
             assert list(iterator) == []
-            assert worker.events == ["preview"]
+            assert events == ["preview-hold-ready"]
         finally:
             roll.close()
             dev.close()
@@ -2580,7 +3556,7 @@ class TestRollPreview:
             monkeypatch.setattr(
                 roll,
                 "_scan_many",
-                lambda _request, slots, _progress: iter(slots),
+                lambda _request, slots, _progress, *_extra: iter(slots),
             )
             first = roll.scan_many([3])
             assert list(first) == [3]
@@ -2614,7 +3590,7 @@ class TestRollPreview:
             monkeypatch.setattr(
                 roll,
                 "_scan_many",
-                lambda _request, slots, _progress: iter(slots),
+                lambda _request, slots, _progress, *_extra: iter(slots),
             )
             for value in roll.scan_many([3]):
                 assert value == 3
@@ -3363,6 +4339,755 @@ class TestRollPreview:
             roll.close()
             dev.close()
 
+    def test_scan_many_resumes_the_held_preview_without_a_second_spawn(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """The refeed-elimination fix itself: preview() holds its
+        reservation open, and scan_many() resumes that SAME held child
+        instead of spawning a fresh one -- eliminating the second
+        RESERVE_UNIT + command 64 a freshly spawned child would otherwise
+        attempt on a transport that is no longer freshly fed."""
+
+        events: list[str] = []
+        spawn_calls: list[tuple[str, ...]] = []
+        dev = _open_device(fake_service_factory)
+        spawner = _success_spawner(events)
+
+        def counting_spawner(argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object):
+            spawn_calls.append(tuple(argv))
+            return spawner(argv, cwd=cwd, stdout=stdout, stderr=stderr)
+
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=counting_spawner)
+        try:
+            roll.preview()
+            assert len(spawn_calls) == 1
+            assert "--preview-and-hold" in spawn_calls[0]
+            assert events == ["preview-hold-ready"]
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            frames = list(roll.scan_many([1]))
+
+            assert len(spawn_calls) == 1, (
+                "scan_many must resume the held child, not spawn a second one"
+            )
+            assert events[1] == "hold-ack-scan"
+            assert [frame.slot for frame in frames] == [1]
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_many_applies_exposure_override_when_resuming_a_held_preview(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """The same forced-tick substitution as
+        test_scan_many_applies_exposure_override_on_the_cold_path, but on the
+        held-session resume path (Roll._scan_many's
+        ``adapter.resume_held_session`` branch) -- proving
+        exposure_override_10ns reaches receipt.exposure on both scan_many
+        entry points a batch can take, exactly mirroring how
+        test_scan_many_resumes_the_held_preview_without_a_second_spawn
+        proves the held reservation itself is reused on both."""
+
+        events: list[str] = []
+        spawn_calls: list[tuple[str, ...]] = []
+        dev = _open_device(fake_service_factory)
+        spawner = _success_spawner(events)
+
+        def counting_spawner(argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object):
+            spawn_calls.append(tuple(argv))
+            return spawner(argv, cwd=cwd, stdout=stdout, stderr=stderr)
+
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=counting_spawner)
+        try:
+            roll.preview()
+            assert len(spawn_calls) == 1
+            assert "--preview-and-hold" in spawn_calls[0]
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            frames = list(
+                roll.scan_many(
+                    [1], exposure_override_10ns=(97_482, 195_597, 180_705)
+                )
+            )
+
+            assert len(spawn_calls) == 1, (
+                "scan_many must resume the held child, not spawn a second one"
+            )
+            assert events[1] == "hold-ack-scan"
+            assert len(frames) == 1
+            exposure = frames[0].receipt.exposure
+            assert exposure.red_exposure_us == pytest.approx(974.82)
+            assert exposure.green_exposure_us == pytest.approx(1_955.97)
+            assert exposure.blue_exposure_us == pytest.approx(1_807.05)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_many_after_release_falls_back_to_a_fresh_reservation(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """release() opts back into the pre-fix behavior for that preview:
+        the next scan_many() launches its own fresh batch instead of
+        resuming. This only proves the fresh-launch (cold) path still runs
+        unchanged when there is no held session -- it does not assert a
+        real refeed is unnecessary, since this fake never models the
+        transport-parked failure a real second reservation could hit."""
+
+        events: list[str] = []
+        spawn_calls: list[tuple[str, ...]] = []
+        dev = _open_device(fake_service_factory)
+        spawner = _success_spawner(events)
+
+        def counting_spawner(argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object):
+            spawn_calls.append(tuple(argv))
+            return spawner(argv, cwd=cwd, stdout=stdout, stderr=stderr)
+
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=counting_spawner)
+        try:
+            roll.preview()
+            assert len(spawn_calls) == 1
+            roll.release()
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            frames = list(roll.scan_many([1]))
+
+            assert len(spawn_calls) == 2, (
+                "no held session: scan_many must launch its own fresh batch"
+            )
+            assert "--preview-and-hold" not in spawn_calls[1]
+            assert "--batch-job" in spawn_calls[1]
+            assert [frame.slot for frame in frames] == [1]
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_many_eject_after_ejects_only_on_the_last_slot(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(c) task requirement, at the Roll surface: scan_many(...,
+        eject_after=True) must ask the worker to eject only once every
+        requested slot is done -- CONTINUE for every earlier frame,
+        EJECT for the last -- never earlier, and never at all for an
+        ordinary scan_many() call (eject_after defaults to False)."""
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+        try:
+            roll.preview()
+            for slot in (1, 2):
+                if roll.needs_approval(slot):
+                    roll.approve(slot)
+
+            frames = list(roll.scan_many([1, 2], eject_after=True))
+
+            assert [frame.slot for frame in frames] == [1, 2]
+            assert "ack-1-continue" in events
+            assert "ack-2-eject" in events
+            assert "ack-2-continue" not in events
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_many_without_eject_after_never_requests_eject(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(e) regression pin: eject_after defaults to False, and an
+        ordinary scan_many() call must never ask the worker to "eject". A
+        multi-batch-per-feed batch resuming a held preview asks
+        "continue_hold" instead of "continue" on its terminal frame now
+        (see TestRollMultiBatchHold for that behavior's own tests) --
+        never "eject" either way is the invariant this pin actually
+        protects, and it still holds."""
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            list(roll.scan_many([1]))
+
+            assert "ack-1-continue_hold" in events
+            assert not any(event.endswith("-eject") for event in events)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_cold_scan_many_after_release_never_asks_continue_hold(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(e) task requirement: the genuinely cold path -- a batch with
+        no held reservation behind it at all (here, one explicitly
+        released between preview and the scan) -- must stay byte-for-byte
+        what it was before this feature: plain "continue" on every frame,
+        a fresh second child, and no held session afterward. This is the
+        regression pin multi-batch-per-feed must not perturb."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            roll.release()
+            assert roll._held_session is None
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            list(roll.scan_many([1]))
+
+            assert "ack-1-continue" in events
+            assert "ack-1-continue_hold" not in events
+            assert not any(event.endswith("-eject") for event in events)
+            assert roll._held_session is None
+            # The cold batch's own child is a second, independent spawn --
+            # not a resume of the released one.
+            assert len(processes) == 2
+        finally:
+            roll.close()
+            dev.close()
+
+
+class TestRollEject:
+    """Roll.eject(): the held-preview "operator saw the preview, wants
+    out" case. scan_many(..., eject_after=True) covers ending a batch this
+    way; these tests cover the standalone held-preview surface."""
+
+    def test_eject_raises_without_a_held_reservation(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(b) task requirement: no preview() has ever run, so there is
+        nothing held to eject."""
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            with pytest.raises(coolscanpy.EjectNotAvailable):
+                roll.eject()
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_eject_raises_after_an_explicit_release(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(b) task requirement: a released session refuses with the typed
+        error -- release() reverts to "nothing held," the same as if
+        preview() had never run."""
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+        try:
+            roll.preview()
+            roll.release()
+
+            with pytest.raises(coolscanpy.EjectNotAvailable):
+                roll.eject()
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_eject_raises_after_scan_many_eject_after_already_ended_the_session(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(b) task requirement, the other way a reservation stops being
+        held: scan_many(..., eject_after=True) consumes and ends it (ejects
+        then releases), same as an explicit release() -- a later eject()
+        call has nothing left to act on. An *ordinary* scan_many() call
+        (no eject_after) no longer ends the session this way -- see
+        multi-batch-per-feed's own default in
+        TestRollMultiBatchHold, where a held reservation survives an
+        ordinary scan_many() precisely so eject() (or another batch) still
+        has something to act on afterward."""
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            list(roll.scan_many([1], eject_after=True))
+
+            with pytest.raises(coolscanpy.EjectNotAvailable):
+                roll.eject()
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_eject_consumes_the_held_session_and_returns_true(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+        try:
+            roll.preview()
+
+            assert roll.eject() is True
+            assert "hold-ack-eject" in events
+
+            # Single-use, exactly like release(): a second call has
+            # nothing left held to act on.
+            with pytest.raises(coolscanpy.EjectNotAvailable):
+                roll.eject()
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_eject_translates_power_cycle_recovery_into_feeder_parked(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(d) task requirement, at the Roll surface: a suspected
+        transport wedge during eject must surface as FeederParked -- the
+        existing "needs a power cycle" diagnosis -- not a generic
+        adapter-level error, mirroring how Roll already translates the
+        command-64 wedge signature into RefeedRequired."""
+
+        @dataclass
+        class _WedgedHeldWorkerProcess:
+            output_path: Path
+            journal_path: Path
+            hold_job_path: Path
+            hold_ack_path: Path
+            worker_sha256: str
+            events: list[str]
+            expected_usb_bus: int | None = None
+            expected_usb_address: int | None = None
+            hold_session_id: str = field(default_factory=lambda: secrets.token_hex(16))
+            _returncode: int | None = field(default=None, init=False)
+
+            def __post_init__(self) -> None:
+                rgb = _synthetic_index()
+                preview = _encode_index(rgb)
+                table = _transport_table(len(rgb))
+                directory = self.journal_path.parent
+                preview_path = directory / "capture-preview.bin"
+                table_path = directory / "capture-008e.bin"
+                mapping_path = directory / "capture-frame-map.json"
+                preview_path.write_bytes(preview)
+                table_path.write_bytes(table)
+                self.output_path.write_bytes(b"")
+                preview_binding = {
+                    "mode": "canonical-40-record",
+                    "startup_records": 40,
+                    "native_height": 250_278,
+                    "decoded_height": 6_104,
+                    "expected_stream_bytes": 6_250_496,
+                    "read_count": 48,
+                    "active_read_sequence_range": [118, 165],
+                    "skipped_read_sequence_range": None,
+                }
+                mapping = {
+                    "status": "preview-and-hold-awaiting-job",
+                    "slot_capacity_hint": 40,
+                    "slot_capacity_semantics": "scanner-addressable preview slots; not an exposure count",
+                    "preview_bytes": len(preview),
+                    "preview_sha256": _sha256(preview),
+                    "table_bytes": len(table),
+                    "table_sha256": _sha256(table),
+                    "frame_detection": "deferred-offline",
+                    "startup_table": {
+                        "count": 40,
+                        "sha256": "a" * 64,
+                        "status": "0000000000000000",
+                    },
+                    "preview_binding": preview_binding,
+                }
+                mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+                density_session_id = "single-reservation-wedged-eject"
+                density_exposures = (71_373, 137_524, 126_126)
+                density_provenance = _density_calibration_provenance(density_session_id)
+                density_evidence = build_nikon_density_evidence(
+                    preview,
+                    calibration=DensityCalibration.from_dict(
+                        density_provenance["nikon_density_calibration"]
+                    ),
+                    density_f03_exposures_raw_10ns=density_exposures,
+                    session_id=density_session_id,
+                    capture_attempt_id=directory.name,
+                    scan_identity=(
+                        f"{density_session_id}:density-97dpi:{_sha256(preview)}"
+                    ),
+                )
+                self.journal_path.write_text(
+                    json.dumps(
+                        {
+                            **density_provenance,
+                            "status": "awaiting-hold-job",
+                            "capture_mode": "preview-and-hold",
+                            "hold_session_id": self.hold_session_id,
+                            "hold_ready_unix": 0.0,
+                            "requested_frame": None,
+                            "requested_boundary_offset_rows": 0,
+                            "expected_frame_count": None,
+                            "expected_usb_bus": self.expected_usb_bus,
+                            "expected_usb_address": self.expected_usb_address,
+                            "actual_usb_bus": self.expected_usb_bus,
+                            "actual_usb_address": self.expected_usb_address,
+                            "expected_reads": 0,
+                            "completed_reads": 0,
+                            "expected_bytes": 0,
+                            "completed_bytes": 0,
+                            "disk_bytes": 0,
+                            "unit_released": False,
+                            "recovery_required": None,
+                            "output": str(self.output_path.resolve()),
+                            "output_sha256": _sha256(b""),
+                            "plan_sha256": CANONICAL_PLAN_SHA256,
+                            "capture_engine_sha256": self.worker_sha256,
+                            "scanner_identity": "Nikon LS-5000 ED 1.03",
+                            "preview_geometry_validated_before_reads": True,
+                            "preview_windows": [
+                                {
+                                    "color_id": color,
+                                    "resolution": [97, 97],
+                                    "origin": [0, 0],
+                                    "size": [3_946, 250_278],
+                                    "bit_depth": 16,
+                                    "density_f03_exposure_raw_10ns": exposure,
+                                }
+                                for color, exposure in zip(
+                                    (1, 2, 3),
+                                    density_exposures,
+                                    strict=True,
+                                )
+                            ],
+                            "nikon_density_evidence": density_evidence.to_dict(),
+                            "live_startup_0x8f": {"count": 40, "sha256": "a" * 64},
+                            "live_startup_0x8f_status": "0000000000000000",
+                            "live_preview_binding": preview_binding,
+                            "live_index_artifacts": {
+                                "mapping": str(mapping_path.resolve()),
+                                "preview": str(preview_path.resolve()),
+                                "table": str(table_path.resolve()),
+                            },
+                            "live_index_evidence": {
+                                "status": "persisted-before-frame-detection",
+                                "preview_bytes": len(preview),
+                                "preview_sha256": _sha256(preview),
+                                "table_bytes": len(table),
+                                "table_sha256": _sha256(table),
+                            },
+                            "preview_only_receipt": mapping,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.events.append("preview-hold-ready")
+
+            def poll(self) -> int | None:
+                if self._returncode is not None:
+                    return self._returncode
+                if not self.hold_ack_path.exists():
+                    return None
+                ack = json.loads(self.hold_ack_path.read_text(encoding="utf-8"))
+                self.events.append(f"hold-ack-{ack['action']}")
+                assert ack["action"] == "eject"
+                journal = json.loads(self.journal_path.read_text(encoding="utf-8"))
+                journal.update(
+                    status="failed",
+                    capture_mode="preview-and-hold",
+                    error=(
+                        "EjectWedgeSuspected: eject wait: no motion "
+                        "observed within 36s of the eject command (sense "
+                        "stayed 000000); matches the documented "
+                        "accepted-without-actuation wedge signature -- "
+                        "power cycle required, do not retry"
+                    ),
+                    recovery_required="power-cycle scanner before another attempt",
+                    unit_released=True,
+                )
+                self.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+                self._returncode = 1
+                return 1
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                while self.poll() is None:
+                    time.sleep(0.001)
+                return int(self._returncode)
+
+        events: list[str] = []
+
+        def spawn(argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object):
+            del cwd, stdout, stderr
+            hold_job_path = Path(_arg(argv, "--hold-job"))
+            return _WedgedHeldWorkerProcess(
+                output_path=Path(_arg(argv, "--output")),
+                journal_path=Path(_arg(argv, "--journal")),
+                hold_job_path=hold_job_path,
+                hold_ack_path=hold_job_path.with_name("hold-ack.json"),
+                worker_sha256=_sha256(_FAKE_WORKER_SOURCE),
+                events=events,
+                expected_usb_bus=(
+                    int(_arg(argv, "--expected-usb-bus"))
+                    if "--expected-usb-bus" in argv
+                    else None
+                ),
+                expected_usb_address=(
+                    int(_arg(argv, "--expected-usb-address"))
+                    if "--expected-usb-address" in argv
+                    else None
+                ),
+            )
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=spawn)
+        try:
+            roll.preview()
+
+            with pytest.raises(coolscanpy.FeederParked, match="power-cycle"):
+                roll.eject()
+        finally:
+            roll.close()
+            dev.close()
+
+
+# ===========================================================================
+# Multi-batch-per-feed: hold survives across any number of batches
+# ===========================================================================
+
+
+class TestRollMultiBatchHold:
+    """After a batch completes without eject_after, the reservation stays
+    held -- same child, same reservation, same retained frame table -- so
+    a further scan_many()/scan() resumes it again, indefinitely, until
+    eject_after=True, Roll.eject(), Roll.release(), or Roll.close(). See
+    the CHANGELOG's Unreleased entry and scan_many()'s own docstring for
+    the full contract; this class covers it at the Roll surface. The wire-
+    level proof that no RESERVE_UNIT/command-64/RELEASE_UNIT happens
+    between batches lives in test_worker.py, the only layer in this suite
+    that speaks SCSI; "exactly one spawn total" here is this hardware-free
+    facade layer's own faithful proxy for the same claim, matching
+    test_capture_process.py's identical idiom for the original
+    preview-then-first-batch resume."""
+
+    def test_second_scan_many_resumes_the_first_without_a_new_spawn(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(a) task requirement: two sequential scan_many() calls after
+        one preview -- the second resumes the first's own still-held
+        reservation, not a fresh one."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            for slot in (1, 2):
+                if roll.needs_approval(slot):
+                    roll.approve(slot)
+
+            first = list(roll.scan_many([1]))
+            second = list(roll.scan_many([2]))
+
+            assert [frame.slot for frame in first] == [1]
+            assert [frame.slot for frame in second] == [2]
+            assert len(processes) == 1, "the second batch must reuse the held child"
+            assert events.count("preview-hold-ready") == 1
+            assert "ack-1-continue_hold" in events
+            assert "ack-2-continue_hold" in events
+            assert not any(event.endswith("-eject") for event in events)
+            assert "hold-ack-release" not in events
+            # Still held after two batches -- available for a third.
+            assert roll._held_session is not None
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_three_batches_then_eject_after_on_the_third(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(b) task requirement: three batches on one feed, the third
+        ending with eject_after=True -- exactly one eject, one release,
+        and only on the third batch's own terminal frame, sharing the one
+        held child across all three."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            for slot in (1, 2, 3):
+                if roll.needs_approval(slot):
+                    roll.approve(slot)
+
+            list(roll.scan_many([1]))
+            list(roll.scan_many([2]))
+            third = list(roll.scan_many([3], eject_after=True))
+
+            assert [frame.slot for frame in third] == [3]
+            assert len(processes) == 1, "all three batches share the one held child"
+            assert events.count("ready-1") == 1
+            assert events.count("ready-2") == 1
+            assert events.count("ready-3") == 1
+            assert "ack-1-continue_hold" in events
+            assert "ack-2-continue_hold" in events
+            assert "ack-3-eject" in events
+            assert "ack-3-continue_hold" not in events
+            # The worker's own eject-before-release wire ordering is
+            # pinned at the wire level in test_worker.py; here, the
+            # observable fact is that the reservation is gone afterward.
+            assert roll._held_session is None
+
+            with pytest.raises(coolscanpy.EjectNotAvailable):
+                roll.eject()
+            roll.release()  # no-op: nothing left held, must not raise
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_release_between_batches_ends_the_reservation(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(c) task requirement: release() between two scan_many() calls
+        ends the reservation the first one left held, exactly like
+        release() between preview() and the first scan already does."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            list(roll.scan_many([1]))
+            assert roll._held_session is not None
+
+            roll.release()
+
+            assert roll._held_session is None
+            assert "hold-ack-release" in events
+            # release() itself stays idempotent: a second call is a
+            # harmless no-op, not a second release decision.
+            roll.release()
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_close_between_batches_releases_the_still_held_reservation(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(c) task requirement: close() called after a batch left the
+        reservation held must release it cleanly, exactly like it already
+        does for a preview never followed by any scan."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        roll.preview()
+        if roll.needs_approval(1):
+            roll.approve(1)
+        list(roll.scan_many([1]))
+        assert roll._held_session is not None
+
+        roll.close()  # must not raise
+
+        assert "hold-ack-release" in events
+        dev.close()
+
+    def test_child_death_between_batches_raises_refeed_required(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(d) task requirement: if the held child is no longer running by
+        the time a second batch tries to resume it (auto-eject, crash,
+        power cycle), the next scan_many() must fail closed with
+        RefeedRequired rather than assume the reservation is still good --
+        mirroring resume_held_session's own HeldSessionExpired contract,
+        already relied on for the original preview-to-first-batch resume."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            for slot in (1, 2):
+                if roll.needs_approval(slot):
+                    roll.approve(slot)
+            list(roll.scan_many([1]))
+            assert roll._held_session is not None
+
+            held_process = processes[0]
+            held_process.die(returncode=1)
+
+            with pytest.raises(coolscanpy.RefeedRequired):
+                list(roll.scan_many([2]))
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_preview_again_after_a_held_batch_supersedes_it_cleanly(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """(f) task requirement: calling preview() again after a batch left
+        the reservation held must release that reservation cleanly (not
+        orphan it) before starting the fresh transport read, exactly like
+        it already does for a reservation preview() itself left held."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            list(roll.scan_many([1]))
+            assert roll._held_session is not None
+            first_held = roll._held_session
+
+            roll.preview()
+
+            assert "hold-ack-release" in events
+            assert events.count("preview-hold-ready") == 2
+            assert len(processes) == 2
+            assert roll._held_session is not None
+            assert roll._held_session is not first_held
+        finally:
+            roll.close()
+            dev.close()
+
 
 # ===========================================================================
 # Roll batch refusal -> typed exceptions
@@ -3452,6 +5177,34 @@ class TestRollBatchRefusal:
                 next(iter(roll.scan_many([1])))
             assert not isinstance(excinfo.value, coolscanpy.RefeedRequired)
             assert str(excinfo.value) == message
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_many_after_held_child_dies_raises_refeed_required(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """If the held preview's child is no longer running by the time
+        scan_many() tries to resume it (auto-eject, crash, power cycle
+        discovered only now), the adapter's HeldSessionExpired must map to
+        RefeedRequired: the reservation cannot be assumed still held, so
+        this is fail-closed to the exact same operator action a transport
+        that was never held already requires."""
+
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            held = roll._held_session
+            assert held is not None
+            held.process.die(returncode=1)
+
+            with pytest.raises(coolscanpy.RefeedRequired) as excinfo:
+                next(iter(roll.scan_many([1])))
+            assert isinstance(excinfo.value, coolscanpy.RollMismatch)
         finally:
             roll.close()
             dev.close()

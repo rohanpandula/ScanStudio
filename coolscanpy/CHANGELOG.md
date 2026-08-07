@@ -105,6 +105,73 @@ batch call (32 slots through frame 38) against the persisted reread
 artifacts succeeds end-to-end through selection derivation and page
 construction.
 
+Single-pass captures (`Material.COLOR_NEGATIVE`) now store RGB and infrared
+with a plain axis swap instead of the previous 90-degree rotation. The old
+rotation mirrored one axis relative to Nikon Scan's own rendering of the
+same frame; the new orientation matches it exactly. This changes the stored
+pixel layout for every new capture: application code that rotated or
+flipped a coolscanpy frame to compensate for the old orientation should
+remove that step. The capture evidence's `orientation.storage` field
+distinguishes the two, `nikon-render-parity` for frames captured under this
+change and `DIY-upright` for anything captured before it.
+
+`Roll.preview()` keeps its transport reservation open instead of releasing
+it immediately after the read. Every `scan_many()`/`scan()` call
+following a `preview()` now resumes that same reservation -- not just the
+first -- so a whole roll's worth of batches on one feed no longer needs a
+refeed between them in the ordinary case, including the short-strip case
+0.1.3 added `RefeedRequired` for. This matches the vendor's own traced
+session shape: one `RESERVE_UNIT` from feed to eject, any number of fine
+scans in between, never a repeated frame-table read or an intermediate
+`RELEASE_UNIT`. A batch that completes without `eject_after=True` (its own
+default when resuming a held session) keeps the reservation held -- same
+child process, same frame table -- for a further `scan_many()`/`scan()`
+call to resume again, indefinitely, until `eject_after=True`, `Roll.eject()`,
+`Roll.release()`, or `Roll.close()` ends it. Call `roll.release()` at any
+point between batches to opt back into releasing immediately instead; a
+fresh `preview()` call always supersedes whatever reservation the one
+before it was holding, whether that was left open by `preview()` itself or
+by a batch. A cold `scan_many()`/`scan()` (no preceding `preview()`, or one
+whose hold was already released/ejected) is unaffected and still opens a
+fresh reservation, which can still raise `RefeedRequired` if the transport
+has parked in the meantime. A preview whose completed transport read is
+refused, or a held reservation that cannot be confirmed released, now
+preserves its capture evidence on disk instead of deleting it, logging a
+warning that names the path.
+
+`scan_many()` and `scan()` accept a new `exposure_override_10ns=(red,
+green, blue)` keyword argument: raw 10 ns hardware exposure ticks that
+replace the AE meter's own proposal for every frame in the batch. The meter
+still runs its full pass unmodified, the same wire traffic as always; only
+the fine-scan plan built from its answer is substituted. Ticks are
+validated against the same range the meter itself is held to (50,000 to
+400,000 raw 10 ns ticks, 500 to 4,000 microseconds per channel).
+`Receipt.exposure` reflects the forced values actually used, and the
+capture evidence records both the metered and forced ticks with an
+explicit `applied` flag. The default, `None`, reproduces today's behavior
+byte-for-byte.
+
+Software eject, traced byte-exact from the vendor's own end-of-session USB
+sequence rather than derived from the SANE backend's reimplementation of a
+different one. `scan_many(..., eject_after=True)` ends a batch by replaying
+that sequence -- still inside the batch's original reservation -- once the
+last requested slot's frame is finalized, before releasing; the default,
+`False`, keeps the reservation held for a resumed batch (see above) or
+releases plainly for a cold one, in both cases exactly as `eject_after`'s
+absence already behaved before this parameter existed. `Roll.eject()`
+covers the case where the operator decides not to scan (or not to scan
+anything further) on the current held reservation -- valid after
+`preview()` and before the first scan, or equally between any two later
+`scan_many()`/`scan()` calls while the reservation is still held.
+`EjectNotAvailable` is raised if nothing is currently held (no `preview()`
+has run yet, or the hold was already consumed by a `scan_many()`/`scan()`
+call that ended it with `eject_after=True`, or was released/ejected).
+A deviation from the traced sequence -- most often a suspected transport
+wedge, the previously-documented failure mode for every prior eject attempt
+that released and re-reserved before ejecting -- raises `FeederParked` and
+demands a power cycle rather than reporting success or retrying; `Roll.eject`
+does not fall back to the unrelated SANE-based `Device.eject()` in any case.
+
 The scan-time manual-review gate could still refuse an otherwise clean frame
 1 that the operator already reviewed. The five-row leading-anchor cap on the
 physically addressable table only decides which records the scanner can be

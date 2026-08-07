@@ -722,12 +722,12 @@ def test_capture_boundary_rebuilds_density_evidence_from_hash_bound_source(
         capture_attempt_id="slot-4-attempt-1",
         scan_identity="slot-4-attempt-1-density-97dpi-preview",
     )
-    output_path = tmp_path / "capture.bin"
-    output_path.with_name("capture-preview.bin").write_bytes(wire)
+    source_path = tmp_path / "capture-preview.bin"
+    source_path.write_bytes(wire)
 
     rebuilt = _validated_density_evidence(
         {"nikon_density_evidence": evidence.to_dict()},
-        output_path=output_path,
+        source_path=source_path,
     )
 
     assert rebuilt == evidence

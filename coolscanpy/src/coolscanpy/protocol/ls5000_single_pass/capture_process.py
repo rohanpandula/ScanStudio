@@ -32,7 +32,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from importlib.util import find_spec
 from pathlib import Path
@@ -61,6 +61,7 @@ from .density import (
     NikonDensitySourceBinding,
     build_nikon_density_evidence,
 )
+from .meter import EXPOSURE_MAX, EXPOSURE_MIN
 from .plan import (
     CANONICAL_FINE_READ_BYTES,
     CANONICAL_FINE_READ_COUNT,
@@ -191,17 +192,52 @@ def _validated_density_calibration(
     return calibration
 
 
+def _batch_frame_output(batch_directory: Path, selected_slot: object) -> Path:
+    """Return one batch frame's own capture output, as the job names it.
+
+    The single source of truth for the ``frame-NNN/capture.bin`` layout the
+    parent writes into every batch job (``_batch_job_bytes``), hands to the
+    child, and re-derives when validating what came back
+    (``_batch_frame_paths``).
+    """
+
+    if type(selected_slot) is not int:
+        raise AssertionError("validated batch frame has no selected slot")
+    return batch_directory / f"frame-{selected_slot:03d}" / "capture.bin"
+
+
+def _density_source_path(output_path: Path) -> Path:
+    """Return the 97-dpi density source raster written beside ``output_path``.
+
+    The worker persists the reservation's density source (``_live_index_
+    artifact_paths``) next to whichever capture output was open when the
+    preview traversal completed. For a cold batch that is the batch child's
+    own first-frame output, so this derivation is exact. For a
+    preview-and-hold reservation the traversal completed in the *preview*
+    attempt, long before any frame directory existed -- that shape must
+    resolve the source from the held attempt's own output instead, which is
+    what ``PreparedCaptureBatch.density_source_path`` carries.
+    """
+
+    return output_path.with_name(f"{output_path.stem}-preview.bin")
+
+
 def _validated_density_evidence(
     journal: dict[str, Any],
     *,
-    output_path: Path,
+    source_path: Path,
 ) -> NikonDensityEvidence:
-    """Rebuild one bounded session receipt from its hash-bound preview bytes."""
+    """Rebuild one bounded session receipt from its hash-bound preview bytes.
+
+    ``source_path`` is the reservation's own 97-dpi density source raster --
+    always parent-derived, never read out of the journal under validation.
+    See ``_density_source_path`` for why it cannot simply be derived from the
+    frame output being validated.
+    """
 
     receipt = journal.get("nikon_density_evidence")
     if type(receipt) is not dict:
         raise ValueError("Nikon density evidence receipt is missing or malformed")
-    source_path = output_path.with_name(f"{output_path.stem}-preview.bin")
     try:
         stat = source_path.lstat()
     except OSError as error:
@@ -250,14 +286,25 @@ def _validated_density_frame_ownership(
     journal: dict[str, Any],
     *,
     output_path: Path,
-    expected_session_id: str,
+    expected_batch_session_id: str,
+    expected_calibration_session_id: str,
     expected_frame_index: int,
     expected_frame_total: int,
     expected_selected_slots: tuple[int, ...],
     expected_selected_slot: int,
     evidence: NikonDensityEvidence | None = None,
 ) -> NikonDensityFrameOwnershipReceipt:
-    """Validate one frame's exact reservation-preview ownership receipt."""
+    """Validate one frame's exact reservation-preview ownership receipt.
+
+    Two distinct identities, deliberately not one: ``expected_batch_session_id``
+    is this specific batch/round's own session id (a fresh one every held
+    round -- see ``worker._density_frame_ownership_receipt``'s docstring and
+    ``PreparedCaptureBatch``'s), checked against the journal's own
+    ``batch_session`` block. ``expected_calibration_session_id`` is the
+    reservation-wide identity the density receipt itself is bound to, which
+    persists across every round of one feed-to-eject reservation. They
+    coincide for a cold batch and diverge for a resumed one.
+    """
 
     receipt = NikonDensityFrameOwnershipReceipt.from_dict(
         journal.get("nikon_density_frame_ownership")
@@ -266,7 +313,7 @@ def _validated_density_frame_ownership(
         "frame_index": expected_frame_index,
         "frame_total": expected_frame_total,
         "selected_slots": list(expected_selected_slots),
-        "session_id": expected_session_id,
+        "session_id": expected_batch_session_id,
     }
     if journal.get("batch_session") != expected_batch:
         raise ValueError("density ownership batch journal identity is inconsistent")
@@ -277,8 +324,8 @@ def _validated_density_frame_ownership(
     if type(roll_identity) is not dict:
         raise ValueError("density ownership roll identity is missing")
     expected = {
-        "reservation_id": expected_session_id,
-        "batch_session_id": expected_session_id,
+        "reservation_id": expected_calibration_session_id,
+        "batch_session_id": expected_calibration_session_id,
         "preview_sha256": selection.get("preview_sha256"),
         "transport_table_sha256": selection.get("table_sha256"),
         "reviewed_fingerprint_sha256": roll_identity.get("reviewed_fingerprint_sha256"),
@@ -332,6 +379,23 @@ class BatchAckAction(StrEnum):
 
     CONTINUE = "continue"
     STOP = "stop"
+    # Only legal as the terminal decision (see Roll.scan_many's
+    # ``eject_after`` parameter): ends the batch exactly like STOP, but the
+    # worker additionally replays the traced vendor end-of-session eject
+    # sequence, still inside this batch's original reservation, before
+    # releasing.
+    EJECT = "eject"
+    # Only legal as the terminal decision, and only when this batch itself
+    # resumed a held preview (see Roll.scan_many's default -- neither
+    # ``eject_after`` nor a safe-stop): ends this batch's own requested
+    # frames exactly like STOP, but the worker does NOT release. Instead it
+    # loops back into a fresh hold-wait -- same child, same reservation,
+    # same retained frame table -- so a later ``resume_held_session`` can
+    # capture more frames without a refeed. A cold (never-held) batch's
+    # frame_handler must never return this; the worker itself refuses it
+    # when no hold plumbing is available (see worker.py's
+    # ``hold_job_path is None`` guard).
+    CONTINUE_HOLD = "continue_hold"
 
 
 class CaptureProcessError(RuntimeError):
@@ -369,6 +433,17 @@ class CaptureIntegrityError(CaptureProcessError):
 
 class CaptureStopped(CaptureProcessError):
     """A stop request prevented the next attempt from launching."""
+
+
+class HeldSessionExpired(CaptureProcessError):
+    """A held preview's child is no longer available to resume or release.
+
+    The reservation this session was holding cannot be assumed to still be
+    held -- the scanner may have auto-ejected, the child may have crashed,
+    or a prior resume/release attempt may already have consumed it.  The
+    caller must treat this exactly like a fresh reservation attempt that
+    needs a real refeed, not retry the same held session.
+    """
 
 
 class _BatchFrameRefused(CaptureProcessError):
@@ -1019,6 +1094,7 @@ class CaptureBatchRequest:
     reviewed_fingerprint: ReviewedRollFingerprint
     expected_usb_bus: int
     expected_usb_address: int
+    exposure_override_10ns: tuple[int, int, int] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.frames, tuple):
@@ -1058,6 +1134,29 @@ class CaptureBatchRequest:
             raise ValueError(
                 "batch scanner slots must be unique and strictly increasing"
             )
+        if self.exposure_override_10ns is not None:
+            override = self.exposure_override_10ns
+            if (
+                isinstance(override, (str, bytes))
+                or not isinstance(override, (tuple, list))
+                or len(override) != 3
+            ):
+                raise ValueError(
+                    "exposure_override_10ns must be a (red, green, blue) "
+                    "3-tuple of raw 10ns tick counts"
+                )
+            for channel, raw in zip(("red", "green", "blue"), override):
+                if isinstance(raw, bool) or not isinstance(raw, int):
+                    raise ValueError(
+                        f"exposure_override_10ns {channel} tick count must "
+                        f"be an int, got {raw!r}"
+                    )
+                if not EXPOSURE_MIN <= raw <= EXPOSURE_MAX:
+                    raise ValueError(
+                        f"exposure_override_10ns {channel} tick count {raw} "
+                        f"is outside the allowed range "
+                        f"[{EXPOSURE_MIN}, {EXPOSURE_MAX}]"
+                    )
 
     @property
     def selected_slots(self) -> tuple[int, ...]:
@@ -1103,13 +1202,37 @@ class BatchSessionPaths:
 
 @dataclass(frozen=True)
 class PreparedCaptureBatch:
-    """Hardware-free description of exactly one worker process."""
+    """Hardware-free description of exactly one worker process.
+
+    ``session_id`` and ``calibration_session_id`` coincide for a cold batch
+    (calibration runs inside that same batch) but diverge for a
+    preview-and-hold resume: ``session_id`` is this specific batch/round's
+    own identity (a fresh one every hold round, by design -- see
+    ``worker._density_frame_ownership_receipt``'s docstring), while
+    ``calibration_session_id`` is the reservation-wide identity the held
+    preview's density calibration was actually bound to, which persists
+    across every round of the same feed-to-eject reservation. Validators
+    that check the worker's density receipts must compare against
+    ``calibration_session_id``, not ``session_id`` -- confusing the two
+    here is what let a resumed batch's first frame reach the child
+    correctly but still fail this package's own post-hoc validation.
+
+    ``density_source_path`` is that same distinction expressed as a path.
+    The reservation's 97-dpi density source raster is written wherever the
+    traversal that produced it was running: inside a cold batch's own first
+    frame directory, but inside the *held preview's attempt directory* for a
+    preview-and-hold reservation, which completed its traversal before any
+    frame directory existed. Deriving it from the frame under validation is
+    therefore correct only for a cold batch -- see ``_density_source_path``.
+    """
 
     request: CaptureBatchRequest
     paths: BatchSessionPaths
     argv: tuple[str, ...]
     job_sha256: str
     session_id: str
+    calibration_session_id: str
+    density_source_path: Path
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1252,14 @@ class CaptureAttemptResult:
     batch_frame_index: int | None = None
     batch_frame_total: int | None = None
     batch_selected_slots: tuple[int, ...] = ()
+    # Where this attempt's *reservation* wrote its 97-dpi density source
+    # raster. ``None`` means "beside this attempt's own output", which is
+    # exactly right for a standalone attempt, a held preview, and a cold
+    # batch's first frame -- every shape whose own traversal produced it. A
+    # batch frame resumed from a held preview inherits a raster captured in
+    # the held attempt's directory instead, and is handed that path
+    # explicitly (see ``PreparedCaptureBatch.density_source_path``).
+    density_source_path: Path | None = None
 
     @property
     def recovery_required(self) -> bool:
@@ -1142,7 +1273,12 @@ class CaptureAttemptResult:
             return None
         return _validated_density_calibration(
             self.journal,
-            expected_session_id=self.batch_session_id,
+            # Not self.batch_session_id: that is this batch/round's own
+            # session id, which diverges from the calibration's
+            # reservation-wide identity for a resumed batch (see
+            # PreparedCaptureBatch's docstring). The journal's own
+            # top-level field is the reservation-wide one.
+            expected_session_id=self.journal.get("density_calibration_session_id"),
         )
 
     @property
@@ -1153,8 +1289,16 @@ class CaptureAttemptResult:
             return None
         return _validated_density_evidence(
             self.journal,
-            output_path=self.paths.output,
+            source_path=self.reservation_density_source_path,
         )
+
+    @property
+    def reservation_density_source_path(self) -> Path:
+        """Return where this attempt's reservation kept its density source."""
+
+        if self.density_source_path is not None:
+            return self.density_source_path
+        return _density_source_path(self.paths.output)
 
     @property
     def density_ownership(self) -> NikonDensityFrameOwnershipReceipt | None:
@@ -1172,7 +1316,10 @@ class CaptureAttemptResult:
         return _validated_density_frame_ownership(
             self.journal,
             output_path=self.paths.output,
-            expected_session_id=self.batch_session_id,
+            expected_batch_session_id=self.batch_session_id,
+            expected_calibration_session_id=(
+                self.journal.get("density_calibration_session_id")
+            ),
             expected_frame_index=self.batch_frame_index,
             expected_frame_total=self.batch_frame_total,
             expected_selected_slots=self.batch_selected_slots,
@@ -1194,6 +1341,21 @@ class CaptureBatchResult:
     session_journal: dict[str, Any]
     stdout: str
     stderr: str
+    # True only when the terminal frame_handler decision was
+    # BatchAckAction.EJECT: the worker replayed the traced vendor eject
+    # sequence before releasing, instead of releasing directly. Mutually
+    # exclusive with `stopped` by construction (frame_handler never returns
+    # EJECT once the stop event is set -- see Roll._scan_many).
+    ejected: bool = False
+    # Set only when the terminal frame_handler decision was
+    # BatchAckAction.CONTINUE_HOLD: the same child that ran this batch did
+    # NOT release -- it is still running, still holding the reservation,
+    # parked at a fresh hold-wait boundary. Mutually exclusive with
+    # `stopped`/`ejected` by construction. The caller's next
+    # ``resume_held_session``/``release_held_session``/``eject_held_session``
+    # call consumes this exactly like the original ``begin_held_preview``
+    # session -- see ``CaptureProcessAdapter._resolve_held_after_batch``.
+    held_again: HeldPreviewSession | None = None
 
     @property
     def density_evidence(self) -> NikonDensityEvidence | None:
@@ -1241,6 +1403,71 @@ class CaptureBatchResult:
         for receipt in receipts:
             receipt.validate_evidence(evidence)
         return tuple(receipts)
+
+
+@dataclass(frozen=True)
+class HeldPreviewSession:
+    """A still-running preview-and-hold child, paused at the post-preview
+    transaction boundary instead of releasing.
+
+    ``preview_attempt`` mirrors exactly what ``run_attempt`` would have
+    returned for the same request -- the caller (``Roll.preview()``) reads
+    it identically either way.  A session is single-use: exactly one of
+    ``resume_held_session``/``release_held_session`` may be called on it,
+    ever; each publishes its own hold-ack file, which fails closed
+    (``FileExistsError``) on a second attempt.
+    """
+
+    preview_attempt: CaptureAttemptResult
+    process: RunningBatchProcess
+    directory: Path
+    plan: Path
+    continuation_plan: Path
+    manifest: Path
+    hold_job_path: Path
+    hold_ack_path: Path
+    hold_session_id: str
+    stdout_path: Path
+    stderr_path: Path
+    # Where this reservation's 97-dpi density source raster actually lives.
+    # ``None`` means "beside this session's own preview attempt output",
+    # which is the truth for every session ``begin_held_preview`` returns:
+    # that attempt is the traversal that captured it. A session handed back
+    # by ``_resolve_held_after_batch`` (round two and later of the same
+    # feed-to-eject reservation) has no preview attempt of its own -- its
+    # ``preview_attempt`` is a synthesized view of the last completed batch
+    # frame -- so that path is carried forward explicitly instead.
+    density_source_path: Path | None = None
+
+    @property
+    def reservation_density_source_path(self) -> Path:
+        """Return this reservation's own density source raster path."""
+
+        if self.density_source_path is not None:
+            return self.density_source_path
+        return _density_source_path(self.preview_attempt.paths.output)
+
+    @property
+    def usable(self) -> bool:
+        """Whether this session is actually resumable/releasable.
+
+        False when the launch itself failed before reaching the hold
+        boundary (``preview_attempt.outcome`` is not ``COMPLETE``) --
+        ``Roll.preview()`` never stores an unusable session.
+        """
+
+        return self.preview_attempt.outcome is CaptureOutcome.COMPLETE
+
+
+class _HeldPreviewLaunchFailed(Exception):
+    """The held-preview child exited before reaching the hold boundary."""
+
+    def __init__(self, returncode: int) -> None:
+        super().__init__(
+            f"held preview child exited {returncode} before reaching the "
+            "hold boundary"
+        )
+        self.returncode = returncode
 
 
 class ProcessRunner(Protocol):
@@ -1665,6 +1892,20 @@ class CaptureProcessAdapter:
             argv=argv,
             job_sha256=job_sha256,
             session_id=session_id,
+            # Cold launch: calibration runs inside this same batch, seeded
+            # from this batch's own session id (mirrors worker.py's own
+            # `calibration_session_id = batch_job.session_id if batch_job
+            # is not None else ...`) -- the two coincide here by
+            # construction.
+            calibration_session_id=session_id,
+            # Cold launch: the whole-roll traversal that produces the
+            # density source runs inside this batch child, interleaved with
+            # its own first frame, so the raster lands beside that frame's
+            # output (worker.py binds `artifact_paths` to `output_path`,
+            # which main() sets to the first frame spec's output).
+            density_source_path=_density_source_path(
+                _batch_frame_output(paths.directory, request.frames[0].selected_slot)
+            ),
         )
 
     def run_batch_session(
@@ -1702,13 +1943,7 @@ class CaptureProcessAdapter:
         frame_handler: BatchFrameHandler,
     ) -> CaptureBatchResult:
         paths = prepared.paths
-        handled: list[CaptureAttemptResult] = []
-        stopped = False
-        stopped_unhandled_slot: int | None = None
-        handler_error: BaseException | None = None
-        monitor_error: BaseException | None = None
         process: RunningBatchProcess | None = None
-        returncode: int | None = None
         try:
             with (
                 paths.stdout.open("xb") as stdout_handle,
@@ -1728,92 +1963,143 @@ class CaptureProcessAdapter:
                         stdout=stdout_handle,
                         stderr=stderr_handle,
                     )
-                try:
-                    for frame_index, frame_request in enumerate(
-                        prepared.request.frames,
-                        start=1,
-                    ):
-                        frame_result = self._wait_for_batch_frame(
-                            process,
-                            prepared,
-                            frame_request,
-                            frame_index=frame_index,
-                        )
-                        ownership_error: BaseException | None = None
-                        if handled:
-                            try:
-                                first_ownership = handled[0].density_ownership
-                                current_ownership = frame_result.density_ownership
-                                if (
-                                    first_ownership is None
-                                    or current_ownership is None
-                                    or current_ownership.transport_identity_sha256
-                                    != first_ownership.transport_identity_sha256
-                                    or current_ownership.preview_identity_sha256
-                                    != first_ownership.preview_identity_sha256
-                                ):
-                                    raise CaptureProcessError(
-                                        "batch frame density preview/transport identity changed"
-                                    )
-                            except BaseException as error:
-                                ownership_error = error
-                        if ownership_error is not None:
-                            handler_error = ownership_error
+        except OSError as error:
+            raise CaptureProcessError(
+                f"could not launch batch capture worker: {error}"
+            ) from error
+        return self._drive_prepared_batch(prepared, process, frame_handler)
+
+    def _drive_prepared_batch(
+        self,
+        prepared: PreparedCaptureBatch,
+        process: RunningBatchProcess,
+        frame_handler: BatchFrameHandler,
+    ) -> CaptureBatchResult:
+        """Drive one already-running batch child through its frames, ACKing
+        only what the parent has finished consuming, until a durable
+        release receipt is observed.
+
+        Shared by a freshly spawned batch (``_run_prepared_batch``, which
+        only adds the spawn step above) and a resumed held preview
+        (``resume_held_session``, which reuses the still-running child
+        ``begin_held_preview`` already spawned) -- the frame loop, ACK
+        handshake, and terminal journal reconciliation are identical
+        either way; only how ``process`` came to exist differs.
+
+        A terminal ``BatchAckAction.CONTINUE_HOLD`` is a fourth outcome
+        alongside stopped/ejected/complete: the child does not exit, so
+        this method must not join it (that would hang forever waiting for
+        an exit that is not coming) -- see the ``held_after`` branch below
+        and ``_resolve_held_after_batch``.
+        """
+
+        paths = prepared.paths
+        handled: list[CaptureAttemptResult] = []
+        stopped = False
+        ejected = False
+        held_after = False
+        stopped_unhandled_slot: int | None = None
+        handler_error: BaseException | None = None
+        monitor_error: BaseException | None = None
+        returncode: int | None = None
+        try:
+            try:
+                for frame_index, frame_request in enumerate(
+                    prepared.request.frames,
+                    start=1,
+                ):
+                    frame_result = self._wait_for_batch_frame(
+                        process,
+                        prepared,
+                        frame_request,
+                        frame_index=frame_index,
+                    )
+                    ownership_error: BaseException | None = None
+                    if handled:
+                        try:
+                            first_ownership = handled[0].density_ownership
+                            current_ownership = frame_result.density_ownership
+                            if (
+                                first_ownership is None
+                                or current_ownership is None
+                                or current_ownership.transport_identity_sha256
+                                != first_ownership.transport_identity_sha256
+                                or current_ownership.preview_identity_sha256
+                                != first_ownership.preview_identity_sha256
+                            ):
+                                raise CaptureProcessError(
+                                    "batch frame density preview/transport identity changed"
+                                )
+                        except BaseException as error:
+                            ownership_error = error
+                    if ownership_error is not None:
+                        handler_error = ownership_error
+                        action = BatchAckAction.STOP
+                    else:
+                        try:
+                            action = frame_handler(frame_result)
+                            if not isinstance(action, BatchAckAction):
+                                raise TypeError(
+                                    "frame_handler must return BatchAckAction"
+                                )
+                        except BaseException as error:
+                            handler_error = error
                             action = BatchAckAction.STOP
-                        else:
-                            try:
-                                action = frame_handler(frame_result)
-                                if not isinstance(action, BatchAckAction):
-                                    raise TypeError(
-                                        "frame_handler must return BatchAckAction"
-                                    )
-                            except BaseException as error:
-                                handler_error = error
-                                action = BatchAckAction.STOP
-                        handled.append(frame_result)
-                        # Linearize Stop against publishing CONTINUE.  A stop
-                        # that wins this lock changes the current boundary to
-                        # STOP; one arriving after publication applies to the
-                        # newly active frame instead.
-                        with self._stop_gate:
-                            if self._stop_requested.is_set():
-                                action = BatchAckAction.STOP
-                            self._write_batch_ack(
-                                frame_result,
-                                prepared,
-                                action=action,
-                            )
-                        if action is BatchAckAction.STOP:
-                            stopped = True
-                            break
-                except _BatchTerminalReceiptObserved:
-                    # A terminal journal is only a wake-up here.  The parent
-                    # still joins the child below, then validates the complete
-                    # cleanup/release receipt before returning anything to the
-                    # UI.  This avoids depending exclusively on Popen.poll(),
-                    # which can lag behind an already-exited frozen helper.
-                    pass
-                except BaseException as error:
-                    monitor_error = error
-                    if isinstance(error, _BatchFrameRefused):
+                    handled.append(frame_result)
+                    # Linearize Stop against publishing CONTINUE.  A stop
+                    # that wins this lock changes the current boundary to
+                    # STOP; one arriving after publication applies to the
+                    # newly active frame instead.
+                    with self._stop_gate:
+                        if self._stop_requested.is_set():
+                            action = BatchAckAction.STOP
+                        self._write_batch_ack(
+                            frame_result,
+                            prepared,
+                            action=action,
+                        )
+                    if action is BatchAckAction.STOP:
                         stopped = True
-                        stopped_unhandled_slot = error.slot
-                finally:
-                    # Never signal or abandon a child that may own the USB
-                    # reservation.  With no valid ACK it will time out, clean
-                    # up, and release; the parent must remain here to observe
-                    # that receipt.
+                        break
+                    if action is BatchAckAction.EJECT:
+                        ejected = True
+                        break
+                    if action is BatchAckAction.CONTINUE_HOLD:
+                        held_after = True
+                        break
+            except _BatchTerminalReceiptObserved:
+                # A terminal journal is only a wake-up here.  The parent
+                # still joins the child below, then validates the complete
+                # cleanup/release receipt before returning anything to the
+                # UI.  This avoids depending exclusively on Popen.poll(),
+                # which can lag behind an already-exited frozen helper.
+                pass
+            except BaseException as error:
+                monitor_error = error
+                if isinstance(error, _BatchFrameRefused):
+                    stopped = True
+                    stopped_unhandled_slot = error.slot
+            finally:
+                # Never signal or abandon a child that may own the USB
+                # reservation.  With no valid ACK it will time out, clean
+                # up, and release; the parent must remain here to observe
+                # that receipt.
+                #
+                # A clean CONTINUE_HOLD exit is the one case that must NOT
+                # join here: that child is not exiting at all -- it looped
+                # back into a fresh hold-wait, still holding the
+                # reservation -- so waiting for it would block forever.
+                if not (held_after and monitor_error is None):
                     returncode, wait_error = self._wait_for_batch_exit(process)
                     if monitor_error is None:
                         monitor_error = wait_error
         except OSError as error:
-            if process is None:
-                raise CaptureProcessError(
-                    f"could not launch batch capture worker: {error}"
-                ) from error
             monitor_error = monitor_error or error
 
-        if process is None or returncode is None:
+        if held_after and monitor_error is None:
+            return self._resolve_held_after_batch(prepared, process, handled)
+
+        if returncode is None:
             raise CaptureProcessError(
                 "batch capture worker did not leave a completed child process"
             ) from monitor_error
@@ -1841,6 +2127,7 @@ class CaptureProcessAdapter:
                 handled=handled,
                 stopped=stopped,
                 stopped_unhandled_slot=stopped_unhandled_slot,
+                ejected=ejected,
             )
         except BaseException as error:
             cause = error if monitor_error is None else monitor_error
@@ -1897,7 +2184,992 @@ class CaptureProcessAdapter:
             session_journal=session_journal,
             stdout=stdout,
             stderr=stderr,
+            ejected=ejected,
+            held_again=None,
         )
+
+    def _resolve_held_after_batch(
+        self,
+        prepared: PreparedCaptureBatch,
+        process: RunningBatchProcess,
+        handled: Sequence[CaptureAttemptResult],
+    ) -> CaptureBatchResult:
+        """The terminal frame ack was CONTINUE_HOLD: this same still-running
+        child persisted this batch's results, did not release, and is
+        looping back into a fresh hold-wait -- reusing the exact
+        preview-and-hold transaction boundary ``begin_held_preview``'s
+        caller already resumes/releases/ejects, just reached from "after a
+        batch" instead of "after the preview."
+
+        Polls the batch session journal (never ``process.wait()``, which
+        would block forever for a child that is not exiting) for that fresh
+        hold-wait's own published rendezvous (``hold_resume``), validates it
+        fail-closed exactly like ``_wait_for_held_preview_ready`` validates
+        the original one, and returns a ``HeldPreviewSession`` the caller's
+        next ``resume_held_session``/``release_held_session``/
+        ``eject_held_session`` call redeems exactly like the original --
+        those three methods are unmodified and do not know or care whether
+        the session they were handed came from a preview or from a prior
+        batch's own CONTINUE_HOLD.
+
+        Every refusal below happens at the same moment
+        ``begin_held_preview``'s do -- the child is alive, parked at a hold
+        boundary, holding the reservation -- and raises instead of returning
+        the only handle that could release it. So, exactly like
+        ``begin_held_preview``, the child is best-effort released on the way
+        out (``_release_unreturnable_held_child``); without that, a refused
+        journal orphaned a live child on the scanner until
+        ``wait_for_hold_decision``'s own half-hour timeout expired.
+        """
+
+        session_journal_path = prepared.paths.session_journal
+        while True:
+            if session_journal_path.is_file():
+                try:
+                    payload = json.loads(
+                        session_journal_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    payload = None
+                if isinstance(payload, dict) and payload.get("status") == "held":
+                    try:
+                        session_journal = self._validate_held_after_batch_journal(
+                            prepared, payload, handled=handled
+                        )
+                    except BaseException as error:
+                        rendezvous = payload.get("hold_resume")
+                        rendezvous = (
+                            rendezvous if isinstance(rendezvous, dict) else {}
+                        )
+                        # Read straight off the refused payload, not off the
+                        # validated journal there isn't one of: a refusal
+                        # for any *other* reason still names a perfectly
+                        # good rendezvous, and a refusal for a malformed
+                        # rendezvous leaves no way to address the child at
+                        # all -- which _release_unreturnable_held_child
+                        # records rather than guesses at.
+                        ack_path = rendezvous.get("hold_ack_path")
+                        self._release_unreturnable_held_child(
+                            process,
+                            hold_ack_path=(
+                                Path(ack_path)
+                                if isinstance(ack_path, str) and ack_path
+                                else None
+                            ),
+                            hold_session_id=rendezvous.get("hold_session_id"),
+                            error=error,
+                        )
+                        raise
+                    resume = session_journal["hold_resume"]
+                    # A held-after-batch session's "preview attempt" is
+                    # synthetic: nothing here is a preview, but
+                    # HeldPreviewSession.usable only ever reads its
+                    # .outcome, and release_held_session/eject_held_session
+                    # only ever read its .paths.journal (as the release/
+                    # eject terminal-receipt destination) -- never anything
+                    # else about it. A completed batch frame's own paths
+                    # are a safe, already-validated template; its journal
+                    # is swapped for a fresh, dedicated, never-before-used
+                    # file this round's own hold_resume just minted, so
+                    # release/eject never mutates an already-finalized
+                    # per-frame journal (that file is an immutable
+                    # parent/child handoff -- see run_live_capture's own
+                    # comment on frame_journal_finalized).
+                    last = handled[-1]
+                    held_again = HeldPreviewSession(
+                        preview_attempt=replace(
+                            last,
+                            outcome=CaptureOutcome.COMPLETE,
+                            paths=replace(
+                                last.paths,
+                                journal=Path(resume["hold_release_journal_path"]),
+                            ),
+                        ),
+                        process=process,
+                        directory=prepared.paths.directory,
+                        plan=prepared.paths.first_plan,
+                        continuation_plan=prepared.paths.continuation_plan,
+                        manifest=prepared.paths.manifest,
+                        hold_job_path=Path(resume["hold_job_path"]),
+                        hold_ack_path=Path(resume["hold_ack_path"]),
+                        hold_session_id=resume["hold_session_id"],
+                        stdout_path=prepared.paths.stdout,
+                        stderr_path=prepared.paths.stderr,
+                        # Same reservation, same 97-dpi density source: this
+                        # round captured no preview of its own, and neither
+                        # will the next. Carried forward explicitly because
+                        # the synthesized preview_attempt above is a batch
+                        # frame, so the "beside my own output" fallback would
+                        # point at a frame directory that has no raster in it.
+                        density_source_path=prepared.density_source_path,
+                    )
+                    return CaptureBatchResult(
+                        outcome=CaptureOutcome.COMPLETE,
+                        request=prepared.request,
+                        paths=prepared.paths,
+                        frames=tuple(handled),
+                        returncode=0,
+                        stopped=False,
+                        session_journal=session_journal,
+                        stdout="",
+                        stderr="",
+                        ejected=False,
+                        held_again=held_again,
+                    )
+            returncode = process.poll()
+            if returncode is not None:
+                raise CaptureProcessError(
+                    f"batch child exited {returncode} instead of reaching a "
+                    "fresh hold-wait after a CONTINUE_HOLD terminal ack"
+                )
+            if self._batch_poll_seconds:
+                time.sleep(self._batch_poll_seconds)
+
+    def _validate_held_after_batch_journal(
+        self,
+        prepared: PreparedCaptureBatch,
+        payload: dict[str, Any],
+        *,
+        handled: Sequence[CaptureAttemptResult],
+    ) -> dict[str, Any]:
+        """Fail-closed validation for a CONTINUE_HOLD terminal ack's session
+        journal: the reservation must be reported as still held (never
+        released), still bound to this exact batch/session identity, and
+        carrying a well-formed rendezvous (``hold_resume``) for the next
+        hold-wait round. Deliberately a narrower sibling of
+        ``_load_and_validate_batch_session_journal``, not a reuse of it --
+        that method's own *release* invariants (``unit_released`` True,
+        ``unit_release_attempts`` == 1, a status drawn from
+        complete/stopped/ejected) describe a released reservation, the
+        opposite of what "held" means here.
+
+        Its *identity* invariants have no such justification, and are
+        checked here too. A reservation that is about to be handed back for
+        another round has to prove the same things about itself that one
+        being released does -- reservation-wide calibration identity, code
+        and wire-resource identity, USB topology, per-slot approvals -- or
+        the hold boundary is the one place in a feed where an identity can
+        drift unobserved, which is precisely the class of defect the
+        2026-08-06 live session kept finding."""
+
+        invariants: dict[str, object] = {
+            "session_id": prepared.session_id,
+            # Not session_id: reservation-wide, and the whole point of a
+            # multi-round feed (see PreparedCaptureBatch's docstring).
+            "density_calibration_session_id": prepared.calibration_session_id,
+            "batch_job_sha256": prepared.job_sha256,
+            "selected_slots": list(prepared.request.selected_slots),
+            "capture_engine_sha256": self._expected_worker_sha256,
+            "capture_bundle_sha256": (
+                self._expected_bundle_sha256 or CAPTURE_BUNDLE_SHA256
+            ),
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+            "manual_review_approval_sha256_by_slot": {
+                str(frame.selected_slot): (
+                    None
+                    if frame.manual_review_approval is None
+                    else frame.manual_review_approval.binding_sha256
+                )
+                for frame in prepared.request.frames
+            },
+            "reviewed_roll_fingerprint_sha256": (
+                prepared.request.reviewed_fingerprint.binding_sha256
+            ),
+            "expected_usb_bus": prepared.request.expected_usb_bus,
+            "expected_usb_address": prepared.request.expected_usb_address,
+        }
+        for key, expected in invariants.items():
+            if payload.get(key) != expected:
+                raise CaptureProcessError(
+                    f"held-after-batch session journal {key}="
+                    f"{payload.get(key)!r}, expected {expected!r}"
+                )
+        if payload.get("unit_released") is not False:
+            raise CaptureProcessError(
+                "held-after-batch session journal must report the "
+                "reservation still held"
+            )
+        if payload.get("recovery_required") not in (None, "none"):
+            raise CaptureProcessError(
+                "held-after-batch session journal must not request recovery"
+            )
+        completed = payload.get("completed_slots")
+        expected_completed = [result.request.selected_slot for result in handled]
+        if completed != expected_completed:
+            raise CaptureProcessError(
+                f"held-after-batch session journal completed_slots={completed!r} "
+                f"does not match the observed frame prefix {expected_completed!r}"
+            )
+        resume = payload.get("hold_resume")
+        if (
+            not isinstance(resume, dict)
+            or set(resume)
+            != {
+                "hold_session_id",
+                "hold_job_path",
+                "hold_ack_path",
+                "hold_release_journal_path",
+            }
+            or not isinstance(resume["hold_session_id"], str)
+            or not 32 <= len(resume["hold_session_id"]) <= 128
+            or not isinstance(resume["hold_job_path"], str)
+            or not isinstance(resume["hold_ack_path"], str)
+            or not isinstance(resume["hold_release_journal_path"], str)
+        ):
+            raise CaptureProcessError(
+                "held-after-batch session journal has no valid hold_resume "
+                "rendezvous"
+            )
+        return payload
+
+    # -- held preview: hold a reservation across the preview/scan boundary --
+
+    def begin_held_preview(self, request: CaptureRequest) -> HeldPreviewSession:
+        """Like ``run_attempt`` for a preview request, but the worker
+        persists the preview and then pauses at this transaction boundary
+        instead of releasing.
+
+        Reuses the exact spawn-then-poll-a-journal-file shape
+        ``run_batch_session``/``_wait_for_batch_frame`` already use to hold
+        a session between batch frames: a long-lived child is spawned via
+        the same ``batch_spawner`` (not the one-shot ``runner``), and this
+        call returns once its journal reaches the ``awaiting-hold-job``
+        status -- the child keeps running, still holding the reservation.
+        ``resume_held_session``/``release_held_session`` are the only two
+        ways to make further progress with the returned session.
+
+        Raising and returning a session are the only two outcomes, and a
+        raise never leaves a child holding: if this call refuses a child
+        that already reached the hold boundary, it best-effort releases and
+        reaps that child on the way out (see
+        ``_release_unreturnable_held_child``).  It has to happen here --
+        the caller is being handed an exception instead of the session, so
+        it has no handle to release anything with.
+        """
+
+        if not isinstance(request, CaptureRequest):
+            raise TypeError("request must be a CaptureRequest")
+        if request.mode is not CaptureMode.PREVIEW:
+            raise ValueError("begin_held_preview only accepts a preview request")
+        with self._attempt_lock:
+            if self._stop_requested.is_set():
+                raise CaptureStopped(
+                    "capture stopped between attempts; no worker was launched"
+                )
+            paths = self._prepare_attempt_paths(request)
+            self._verify_worker()
+            self._materialize_pinned_plan(paths.plan)
+            self._materialize_pinned_manifest(paths.manifest)
+            continuation_plan_path = (
+                paths.directory / CANONICAL_CONTINUATION_PLAN_FILENAME
+            )
+            self._materialize_pinned_continuation_plan(continuation_plan_path)
+            hold_job_path = paths.directory / "hold-job.json"
+            hold_ack_path = paths.directory / "hold-ack.json"
+            argv = self._build_held_preview_argv(
+                paths,
+                continuation_plan_path=continuation_plan_path,
+                hold_job_path=hold_job_path,
+                expected_usb_bus=request.expected_usb_bus,
+                expected_usb_address=request.expected_usb_address,
+            )
+            if self._stop_requested.is_set():
+                raise CaptureStopped("capture stopped before worker launch")
+            process: RunningBatchProcess | None = None
+            try:
+                with paths.stdout.open("xb") as stdout_handle, paths.stderr.open(
+                    "xb"
+                ) as stderr_handle:
+                    with self._stop_gate:
+                        if self._stop_requested.is_set():
+                            raise CaptureStopped(
+                                "capture stopped before worker launch"
+                            )
+                        process = self._batch_spawner(
+                            argv,
+                            cwd=paths.directory,
+                            stdout=stdout_handle,
+                            stderr=stderr_handle,
+                        )
+            except OSError as error:
+                raise CaptureProcessError(
+                    f"could not launch capture worker: {error}"
+                ) from error
+
+            hold_session_id: str | None = None
+            try:
+                journal, hold_session_id = self._wait_for_held_preview_ready(
+                    process, paths
+                )
+                stdout = paths.stdout.read_text(encoding="utf-8", errors="replace")
+                stderr = paths.stderr.read_text(encoding="utf-8", errors="replace")
+                attempt = CaptureAttemptResult(
+                    outcome=CaptureOutcome.COMPLETE,
+                    request=request,
+                    paths=paths,
+                    argv=argv,
+                    returncode=0,
+                    stdout=stdout,
+                    stderr=stderr,
+                    journal=journal,
+                )
+                return HeldPreviewSession(
+                    preview_attempt=attempt,
+                    process=process,
+                    directory=paths.directory,
+                    plan=paths.plan,
+                    continuation_plan=continuation_plan_path,
+                    manifest=paths.manifest,
+                    hold_job_path=hold_job_path,
+                    hold_ack_path=hold_ack_path,
+                    hold_session_id=hold_session_id,
+                    stdout_path=paths.stdout,
+                    stderr_path=paths.stderr,
+                )
+            except _HeldPreviewLaunchFailed:
+                # The preview itself failed before ever reaching the hold
+                # boundary: interpret it exactly like an ordinary failed
+                # run_attempt(CaptureMode.PREVIEW) so Roll.preview() raises
+                # its usual FeederParked/PyCoolscanError, never a partially
+                # held session.  Only _wait_for_held_preview_ready raises
+                # this, and only while the child is already gone, so there
+                # is nothing here to release -- just reap it.
+                returncode, _wait_error = self._wait_for_batch_exit(process)
+                stdout = paths.stdout.read_text(encoding="utf-8", errors="replace")
+                stderr = paths.stderr.read_text(encoding="utf-8", errors="replace")
+                attempt = self._interpret_held_preview_launch_failure(
+                    request=request,
+                    paths=paths,
+                    argv=argv,
+                    returncode=returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                return HeldPreviewSession(
+                    preview_attempt=attempt,
+                    process=process,
+                    directory=paths.directory,
+                    plan=paths.plan,
+                    continuation_plan=continuation_plan_path,
+                    manifest=paths.manifest,
+                    hold_job_path=hold_job_path,
+                    hold_ack_path=hold_ack_path,
+                    hold_session_id="",
+                    stdout_path=paths.stdout,
+                    stderr_path=paths.stderr,
+                )
+            except BaseException as error:
+                # Everything else that can raise above does so with the
+                # child still alive at the hold boundary, still blocked in
+                # wait_for_hold_decision, still holding the scanner's
+                # reservation -- and this call is about to raise instead of
+                # returning the only handle that could ever release it.
+                # Nothing downstream can clean that up (Roll.preview()'s own
+                # orphan fix needs a returned session to track), so the
+                # release belongs here, before the raise leaves this method.
+                self._release_unreturnable_held_child(
+                    process,
+                    hold_ack_path=hold_ack_path,
+                    # The validated id when the wait got that far, and the
+                    # journal's own already-rejected value when the wait is
+                    # what refused -- either way something the worker can
+                    # act on, which is what unblocks the child.
+                    hold_session_id=(
+                        self._rejected_hold_session_id(paths)
+                        if hold_session_id is None
+                        else hold_session_id
+                    ),
+                    error=error,
+                )
+                raise
+
+    def _build_held_preview_argv(
+        self,
+        paths: AttemptPaths,
+        *,
+        continuation_plan_path: Path,
+        hold_job_path: Path,
+        expected_usb_bus: int | None = None,
+        expected_usb_address: int | None = None,
+    ) -> tuple[str, ...]:
+        """Build a held-preview launch the same way every other launch is
+        built: through ``_worker_launcher``, with the packaged bundle
+        identity asserted on the child's own command line.
+
+        This method used to prepend ``self._launcher`` directly and omit
+        ``--expected-capture-bundle-sha256``, unlike ``_build_argv`` and
+        ``_build_batch_argv``. For the packaged adapter -- where
+        ``_launcher`` is ``(sys.executable,)`` and the stdlib bootstrap is
+        what turns that into a real worker invocation -- the result was
+        ``python --plan ...``, which no interpreter accepts, so a
+        source/wheel install could not start a held preview at all; and
+        because the argv then failed ``_verified_bootstrap_failure``'s own
+        prefix check, the failure could not even be reported as a bootstrap
+        failure. A frozen build (``_bootstrap_module is None``) was
+        unaffected either way, and every test adapter builds without a
+        bootstrap module, which is why the suite never saw it.
+        """
+
+        worker_argv = [
+            "--plan",
+            str(paths.plan),
+            "--manifest",
+            str(paths.manifest),
+            "--continuation-plan",
+            str(continuation_plan_path),
+            "--hold-job",
+            str(hold_job_path),
+            "--output",
+            str(paths.output),
+            "--journal",
+            str(paths.journal),
+            "--live",
+            "--preview-and-hold",
+        ]
+        if expected_usb_bus is not None:
+            assert expected_usb_address is not None
+            worker_argv.extend(
+                (
+                    "--expected-usb-bus",
+                    str(expected_usb_bus),
+                    "--expected-usb-address",
+                    str(expected_usb_address),
+                )
+            )
+        if self._expected_bundle_sha256 is not None:
+            worker_argv.extend(
+                ("--expected-capture-bundle-sha256", self._expected_bundle_sha256)
+            )
+        return tuple(
+            (
+                *self._worker_launcher(
+                    bootstrap_status=paths.bootstrap_status,
+                    bootstrap_nonce=paths.bootstrap_nonce,
+                    worker_argv=worker_argv,
+                ),
+                *worker_argv,
+            )
+        )
+
+    def _wait_for_held_preview_ready(
+        self,
+        process: RunningBatchProcess,
+        paths: AttemptPaths,
+    ) -> tuple[dict[str, Any], str]:
+        """Poll the attempt journal until the child reaches the
+        ``awaiting-hold-job`` transaction boundary, mirroring
+        ``_wait_for_batch_frame``'s own polling shape.  Raises
+        ``_HeldPreviewLaunchFailed`` if the child exits first.
+
+        Every ``CaptureIntegrityError`` below is raised at the opposite
+        moment -- the child is alive, parked at the hold boundary, holding
+        the reservation -- so the caller owes that child a release before
+        letting the refusal out.  ``begin_held_preview`` is the only caller
+        and does exactly that.
+        """
+
+        while True:
+            if paths.journal.is_file():
+                try:
+                    payload = json.loads(paths.journal.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    payload = None
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("status") == "awaiting-hold-job"
+                ):
+                    hold_session_id = payload.get("hold_session_id")
+                    if (
+                        not isinstance(hold_session_id, str)
+                        or not 32 <= len(hold_session_id) <= 128
+                    ):
+                        raise CaptureIntegrityError(
+                            "held preview journal has no valid hold_session_id"
+                        )
+                    if payload.get("capture_mode") != "preview-and-hold":
+                        raise CaptureIntegrityError(
+                            "held preview journal has the wrong capture_mode"
+                        )
+                    if payload.get("output") != str(paths.output.resolve()):
+                        raise CaptureIntegrityError(
+                            "held preview journal output path does not match "
+                            "this attempt"
+                        )
+                    if payload.get("plan_sha256") != CANONICAL_PLAN_SHA256:
+                        raise CaptureIntegrityError(
+                            "held preview journal is not bound to the "
+                            "canonical plan"
+                        )
+                    return payload, hold_session_id
+            returncode = process.poll()
+            if returncode is not None:
+                raise _HeldPreviewLaunchFailed(returncode)
+            if self._batch_poll_seconds:
+                time.sleep(self._batch_poll_seconds)
+
+    def _interpret_held_preview_launch_failure(
+        self,
+        *,
+        request: CaptureRequest,
+        paths: AttemptPaths,
+        argv: tuple[str, ...],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> CaptureAttemptResult:
+        """Interpret a preview-and-hold child that exited before reaching
+        the hold boundary -- i.e., the preview itself failed.
+
+        Conservatively requires recovery unless the journal cleanly reports
+        a synchronized refusal, mirroring ``_interpret_result``'s own
+        fail-closed default for an untrustworthy or missing journal.  This
+        does not reuse ``_load_and_validate_journal`` because that method's
+        ``capture_mode`` invariant is exact-matched per ``CaptureMode`` and
+        does not know about ``"preview-and-hold"``; duplicating its handful
+        of field checks here keeps that shared, heavily-tested validator's
+        contract for every other caller completely unchanged.
+
+        A verified pre-dispatch bootstrap receipt is checked first, exactly
+        as ``_interpret_result`` does for every other launch shape --
+        otherwise a held preview whose child failed before importing the
+        worker is reported as RECOVERY_REQUIRED, telling the operator to
+        power-cycle a scanner that was never touched, instead of the
+        BOOTSTRAP_FAILED ``Roll.preview()`` already knows how to translate.
+        """
+
+        bootstrap_error = self._verified_bootstrap_failure(
+            paths=paths,
+            argv=argv,
+            journal_path=paths.journal,
+            returncode=returncode,
+        )
+        if bootstrap_error is not None:
+            return CaptureAttemptResult(
+                outcome=CaptureOutcome.BOOTSTRAP_FAILED,
+                request=request,
+                paths=paths,
+                argv=argv,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                journal=None,
+                journal_error=bootstrap_error,
+            )
+        try:
+            payload = json.loads(paths.journal.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("worker journal must be a JSON object")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            return CaptureAttemptResult(
+                outcome=CaptureOutcome.RECOVERY_REQUIRED,
+                request=request,
+                paths=paths,
+                argv=argv,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                journal=None,
+                journal_error=str(error),
+            )
+        recovery = payload.get("recovery_required")
+        outcome = (
+            CaptureOutcome.SYNCHRONIZED_REFUSAL
+            if payload.get("status") in ("failed", "interrupted")
+            and recovery == "none"
+            else CaptureOutcome.RECOVERY_REQUIRED
+        )
+        return CaptureAttemptResult(
+            outcome=outcome,
+            request=request,
+            paths=paths,
+            argv=argv,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            journal=payload,
+        )
+
+    def _release_unreturnable_held_child(
+        self,
+        process: RunningBatchProcess,
+        *,
+        hold_ack_path: Path | None,
+        hold_session_id: Any,
+        error: BaseException,
+    ) -> None:
+        """Best-effort release and reap of a child parked at a hold boundary
+        that this adapter can no longer hand back.
+
+        Shared by both refusal paths that leave a live child holding the
+        reservation with nothing returned to release it with:
+        ``begin_held_preview`` refusing the original preview/hold journal,
+        and ``_resolve_held_after_batch`` refusing a CONTINUE_HOLD round's
+        own held-after-batch journal.  Both raise instead of returning a
+        session, so neither caller has a handle afterwards.
+
+        Mirrors ``_release_held_session_locked`` -- publish a release
+        decision, then wait the child out rather than signalling or
+        abandoning it -- but deliberately never raises and never validates
+        the release receipt.  ``error`` is the refusal already on its way
+        out and must stay the exception the caller sees; what happened here
+        is recorded on it as a note instead of replacing it.  A best-effort
+        release that quietly fails is still strictly better than leaving the
+        child alive and holding the scanner with no handle anywhere.
+
+        ``hold_session_id`` is the validated id when the caller got that
+        far, and whatever the child itself published (possibly ``None``)
+        when validating that id is what refused.  A mismatched decision is
+        not accepted by the worker -- it fails the wait closed as a
+        ``SynchronizedProtocolError``, whose synchronized-cleanup path does
+        still release the unit -- so publishing it unblocks a child that
+        would otherwise sit on the reservation until
+        ``wait_for_hold_decision``'s own half-hour timeout expired.
+        ``hold_ack_path`` is ``None`` only when the refused journal did not
+        name a usable rendezvous at all, which is the one case where there
+        is no way to address the child; that is recorded rather than
+        guessed at.
+
+        The child is waited out only once it has actually been unblocked --
+        either it was already gone, or a decision it will act on is now
+        published. ``_wait_for_batch_exit`` deliberately never gives up, so
+        waiting on a child still parked in ``wait_for_hold_decision`` with
+        no decision to read would block this thread for that wait's full
+        half-hour timeout rather than letting the refusal out.
+        """
+
+        told = "reached the hold boundary"
+        unblocked = False
+        try:
+            if process.poll() is None:
+                if hold_ack_path is None:
+                    told = (
+                        "could not be told to release (its journal named no "
+                        "usable hold rendezvous)"
+                    )
+                else:
+                    try:
+                        self._publish_hold_ack_at(
+                            hold_ack_path,
+                            hold_session_id=hold_session_id,
+                            action="release",
+                        )
+                        told = "was told to release"
+                        unblocked = True
+                    except FileExistsError:
+                        told = "already had a hold decision published"
+                        unblocked = True
+                    except BaseException as publish_error:
+                        told = f"could not be told to release ({publish_error})"
+            else:
+                told = "was already gone"
+                unblocked = True
+            if not unblocked:
+                error.add_note(
+                    f"held preview child {told}; it was left running rather "
+                    "than waited on, and the scanner reservation must be "
+                    "assumed still held until it times out"
+                )
+                return
+            returncode, wait_error = self._wait_for_batch_exit(process)
+        except BaseException as cleanup_error:
+            error.add_note(
+                f"held preview child {told} but could not be let go cleanly "
+                f"({cleanup_error}); assume the scanner reservation is still held"
+            )
+            return
+        note = f"held preview child {told} and exited {returncode}"
+        if wait_error is not None:
+            note += f" (reap deferred {wait_error!r})"
+        error.add_note(note)
+
+    def _rejected_hold_session_id(self, paths: AttemptPaths) -> Any:
+        """Read back whatever the held child called its hold session, for a
+        release decision published after that value was refused.  Returns
+        ``None`` when the journal cannot be read at all -- a decision the
+        worker will reject either way, which is the point: it unblocks the
+        wait instead of leaving the reservation held."""
+
+        try:
+            payload = json.loads(paths.journal.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload.get("hold_session_id")
+
+    def _publish_hold_ack(self, held: HeldPreviewSession, *, action: str) -> None:
+        self._publish_hold_ack_at(
+            held.hold_ack_path,
+            hold_session_id=held.hold_session_id,
+            action=action,
+        )
+
+    def _publish_hold_ack_at(
+        self,
+        hold_ack_path: Path,
+        *,
+        hold_session_id: Any,
+        action: str,
+    ) -> None:
+        payload = {
+            "action": action,
+            "hold_session_id": hold_session_id,
+            "schema_version": 1,
+        }
+        _publish_exclusive(
+            hold_ack_path,
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8"),
+        )
+
+    def resume_held_session(
+        self,
+        held: HeldPreviewSession,
+        request: CaptureBatchRequest,
+        *,
+        frame_handler: BatchFrameHandler,
+    ) -> CaptureBatchResult:
+        """Resume a still-held preview directly into its own reservation's
+        fine scan -- no RESERVE_UNIT, no repeated command 64, no repeated
+        preview.  Reuses ``_drive_prepared_batch`` (``run_batch_session``'s
+        own frame loop/ACK handshake/terminal-journal reconciliation)
+        unchanged; only the launch is skipped, because this child already
+        completed it before pausing.
+        """
+
+        if not isinstance(request, CaptureBatchRequest):
+            raise TypeError("request must be a CaptureBatchRequest")
+        if not callable(frame_handler):
+            raise TypeError("frame_handler must be callable")
+        if not held.usable:
+            raise HeldSessionExpired(
+                "this held session's own preview attempt did not complete; "
+                "it was never resumable"
+            )
+        with self._attempt_lock:
+            if held.process.poll() is not None:
+                raise HeldSessionExpired(
+                    "the held preview's child is no longer running; the "
+                    "reservation cannot be assumed to still be held"
+                )
+            if self._stop_requested.is_set():
+                self._release_held_session_locked(held)
+                raise CaptureStopped(
+                    "capture stopped between sessions; the held preview was "
+                    "released instead of resumed"
+                )
+            job_path = held.hold_job_path
+            session_journal_path = held.directory / "session-journal.json"
+            payload = self._batch_job_bytes(request, session_id=held.hold_session_id)
+            # held.hold_session_id is this round's own (fresh, per-round)
+            # identity, not the reservation-wide one this held preview's
+            # density calibration is actually bound to -- see
+            # PreparedCaptureBatch's own docstring. The preview attempt's
+            # journal has carried the real one since preview completed
+            # (worker.py writes it unconditionally, not only in batch mode).
+            calibration_session_id = (
+                None
+                if held.preview_attempt.journal is None
+                else held.preview_attempt.journal.get("density_calibration_session_id")
+            )
+            if not isinstance(calibration_session_id, str) or not calibration_session_id:
+                self._release_held_session_locked(held)
+                raise CaptureProcessError(
+                    "held preview journal has no density calibration identity "
+                    "to resume against"
+                )
+            try:
+                _write_exclusive(job_path, payload)
+            except OSError as error:
+                self._release_held_session_locked(held)
+                raise CaptureProcessError(
+                    f"could not publish resumed batch job: {error}"
+                ) from error
+            prepared = PreparedCaptureBatch(
+                request=request,
+                paths=BatchSessionPaths(
+                    directory=held.directory,
+                    job=job_path,
+                    first_plan=held.plan,
+                    continuation_plan=held.continuation_plan,
+                    manifest=held.manifest,
+                    # No new child launches on a resume -- this is still
+                    # the same already-running process begin_held_preview
+                    # originally bootstrapped. Reused, not fresh, so a
+                    # later bootstrap-failure check on this same argv
+                    # (also reused, below) still resolves against the
+                    # correct on-disk status file/nonce.
+                    bootstrap_status=held.preview_attempt.paths.bootstrap_status,
+                    session_journal=session_journal_path,
+                    stdout=held.stdout_path,
+                    stderr=held.stderr_path,
+                    bootstrap_nonce=held.preview_attempt.paths.bootstrap_nonce,
+                ),
+                argv=held.preview_attempt.argv,
+                job_sha256=hashlib.sha256(payload).hexdigest(),
+                session_id=held.hold_session_id,
+                calibration_session_id=calibration_session_id,
+                # The reservation-wide density source raster, same
+                # distinction as calibration_session_id above expressed as a
+                # path: this resume captures no preview of its own, so the
+                # raster it owns is the one the held preview persisted in
+                # its own attempt directory -- never one beside this batch's
+                # frame outputs, which is where a cold batch's is and where
+                # this validator looked before (live failure 2026-08-06,
+                # attempt 11: "Nikon density source artifact is missing").
+                density_source_path=held.reservation_density_source_path,
+            )
+            try:
+                self._publish_hold_ack(held, action="scan")
+            except OSError as error:
+                raise CaptureProcessError(
+                    f"could not publish resume decision: {error}"
+                ) from error
+            return self._drive_prepared_batch(prepared, held.process, frame_handler)
+
+    def release_held_session(self, held: HeldPreviewSession) -> dict[str, Any]:
+        """Tell a still-held preview's child to release and exit, then wait
+        for it and validate the release actually happened.
+
+        Fail-closed: an already-dead child, or one that refuses to
+        cooperate, still gets fully reaped (never signalled/abandoned)
+        before this raises -- mirroring ``run_batch_session``'s own
+        cleanup discipline.
+        """
+
+        if not held.usable:
+            return {}
+        with self._attempt_lock:
+            return self._release_held_session_locked(held)
+
+    def _release_held_session_locked(
+        self,
+        held: HeldPreviewSession,
+    ) -> dict[str, Any]:
+        if held.process.poll() is None:
+            try:
+                self._publish_hold_ack(held, action="release")
+            except FileExistsError:
+                # A resume already published its own (scan) ack first; this
+                # release lost the race and is a no-op -- the resume path
+                # owns the child's fate now.
+                pass
+            except OSError as error:
+                raise CaptureProcessError(
+                    f"could not publish release decision: {error}"
+                ) from error
+        returncode, wait_error = self._wait_for_batch_exit(held.process)
+        journal_path = held.preview_attempt.paths.journal
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CaptureProcessError(
+                f"held preview left no trustworthy release receipt: {error}"
+            ) from (wait_error if wait_error is not None else error)
+        if wait_error is not None:
+            raise CaptureProcessError(
+                f"held preview release wait failed: {wait_error}"
+            ) from wait_error
+        if not isinstance(journal, dict):
+            raise CaptureProcessError(
+                "held preview release journal must be an object"
+            )
+        if returncode != 0:
+            raise CaptureProcessError(
+                f"held preview child exited {returncode} during release"
+            )
+        for key, expected in (
+            ("status", "complete"),
+            ("capture_mode", "preview-and-hold"),
+            ("hold_outcome", "released"),
+            ("unit_released", True),
+        ):
+            if journal.get(key) != expected:
+                raise CaptureProcessError(
+                    f"held preview release journal {key}={journal.get(key)!r}, "
+                    f"expected {expected!r}"
+                )
+        return journal
+
+    def eject_held_session(self, held: HeldPreviewSession) -> dict[str, Any]:
+        """Tell a still-held preview's child to replay the traced vendor
+        end-of-session eject sequence before releasing and exiting, then
+        wait for it and validate the eject actually happened.
+
+        This is the "operator saw the preview, decided not to scan, and
+        wants the strip back" case. It is deliberately the sibling of
+        :meth:`release_held_session`, not a parameterization of it: the two
+        publish different hold-ack actions (``"eject"`` vs ``"release"``)
+        and validate a different terminal ``hold_outcome``.
+
+        Fail-closed exactly like ``release_held_session``: an already-dead
+        child, or one that refuses to cooperate, still gets fully reaped
+        (never signalled/abandoned) before this raises. A suspected
+        transport wedge (``worker.EjectWedgeSuspected``) raises with the
+        worker's own recorded ``recovery_required`` in the message --
+        callers that need to distinguish a wedge from an ordinary failure
+        should match on ``POWER_CYCLE_RECOVERY`` in the raised message, the
+        same idiom ``Roll`` already uses elsewhere for translating worker
+        diagnoses into typed public exceptions.
+        """
+
+        if not held.usable:
+            return {}
+        with self._attempt_lock:
+            return self._eject_held_session_locked(held)
+
+    def _eject_held_session_locked(
+        self,
+        held: HeldPreviewSession,
+    ) -> dict[str, Any]:
+        if held.process.poll() is None:
+            try:
+                self._publish_hold_ack(held, action="eject")
+            except FileExistsError:
+                # A resume or a competing release/eject already published
+                # its own ack first; this one lost the race and is a no-op.
+                pass
+            except OSError as error:
+                raise CaptureProcessError(
+                    f"could not publish eject decision: {error}"
+                ) from error
+        returncode, wait_error = self._wait_for_batch_exit(held.process)
+        journal_path = held.preview_attempt.paths.journal
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CaptureProcessError(
+                f"held preview left no trustworthy eject receipt: {error}"
+            ) from (wait_error if wait_error is not None else error)
+        if wait_error is not None:
+            raise CaptureProcessError(
+                f"held preview eject wait failed: {wait_error}"
+            ) from wait_error
+        if not isinstance(journal, dict):
+            raise CaptureProcessError(
+                "held preview eject journal must be an object"
+            )
+        if returncode != 0:
+            recovery = journal.get("recovery_required") or "unknown"
+            detail = journal.get("error") or "no error recorded"
+            raise CaptureProcessError(
+                f"held preview child exited {returncode} during eject "
+                f"(recovery_required={recovery!r}): {detail}"
+            )
+        for key, expected in (
+            ("status", "complete"),
+            ("capture_mode", "preview-and-hold"),
+            ("hold_outcome", "ejected"),
+            ("unit_released", True),
+        ):
+            if journal.get(key) != expected:
+                raise CaptureProcessError(
+                    f"held preview eject journal {key}={journal.get(key)!r}, "
+                    f"expected {expected!r}"
+                )
+        return journal
 
     def _wait_for_batch_exit(
         self,
@@ -2228,6 +3500,11 @@ class CaptureProcessAdapter:
             "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
             "expected_usb_address": request.expected_usb_address,
             "expected_usb_bus": request.expected_usb_bus,
+            "exposure_override_10ns": (
+                None
+                if request.exposure_override_10ns is None
+                else list(request.exposure_override_10ns)
+            ),
             "frames": frames,
             "parent_ack_required_after_every_frame": True,
             "release_once_after_last_frame": True,
@@ -2281,13 +3558,13 @@ class CaptureProcessAdapter:
         prepared: PreparedCaptureBatch,
         request: CaptureRequest,
     ) -> AttemptPaths:
-        slot = request.selected_slot
-        if slot is None:
-            raise AssertionError("validated batch frame has no selected slot")
-        directory = prepared.paths.directory / f"frame-{slot:03d}"
+        output = _batch_frame_output(
+            prepared.paths.directory, request.selected_slot
+        )
+        directory = output.parent
         return AttemptPaths(
             directory=directory,
-            output=directory / "capture.bin",
+            output=output,
             journal=directory / "journal.json",
             plan=prepared.paths.first_plan,
             manifest=prepared.paths.manifest,
@@ -2435,7 +3712,7 @@ class CaptureProcessAdapter:
         try:
             _validated_density_calibration(
                 payload,
-                expected_session_id=prepared.session_id,
+                expected_session_id=prepared.calibration_session_id,
             )
         except ValueError as error:
             raise CaptureProcessError(
@@ -2572,14 +3849,18 @@ class CaptureProcessAdapter:
             )
         try:
             density_evidence = (
-                _validated_density_evidence(payload, output_path=paths.output)
+                _validated_density_evidence(
+                    payload,
+                    source_path=prepared.density_source_path,
+                )
                 if frame_index == 1
                 else None
             )
             _validated_density_frame_ownership(
                 payload,
                 output_path=paths.output,
-                expected_session_id=prepared.session_id,
+                expected_batch_session_id=prepared.session_id,
+                expected_calibration_session_id=prepared.calibration_session_id,
                 expected_frame_index=frame_index,
                 expected_frame_total=len(selected_slots),
                 expected_selected_slots=selected_slots,
@@ -2603,6 +3884,11 @@ class CaptureProcessAdapter:
             batch_frame_index=frame_index,
             batch_frame_total=len(selected_slots),
             batch_selected_slots=selected_slots,
+            # So ``CaptureAttemptResult.density_evidence`` -- which Roll's
+            # own frame handler reads on every frame -- resolves the same
+            # reservation raster this method just validated against, rather
+            # than re-deriving a frame-local path that only a cold batch has.
+            density_source_path=prepared.density_source_path,
         )
 
     def _write_batch_ack(
@@ -2699,6 +3985,7 @@ class CaptureProcessAdapter:
         handled: Sequence[CaptureAttemptResult],
         stopped: bool,
         stopped_unhandled_slot: int | None = None,
+        ejected: bool = False,
     ) -> dict[str, Any]:
         try:
             payload = json.loads(
@@ -2710,13 +3997,17 @@ class CaptureProcessAdapter:
             ) from error
         if not isinstance(payload, dict):
             raise CaptureProcessError("batch session journal must be an object")
-        expected_status = "stopped" if stopped else "complete"
+        expected_status = "ejected" if ejected else ("stopped" if stopped else "complete")
         expected_completed = [result.request.selected_slot for result in handled]
         if stopped_unhandled_slot is not None:
             expected_completed.append(stopped_unhandled_slot)
         invariants: dict[str, object] = {
             "session_id": prepared.session_id,
-            "density_calibration_session_id": prepared.session_id,
+            # Not prepared.session_id: the calibration identity is
+            # reservation-wide and diverges from this batch/round's own
+            # session id for a resumed batch -- see PreparedCaptureBatch's
+            # docstring.
+            "density_calibration_session_id": prepared.calibration_session_id,
             "selected_slots": list(prepared.request.selected_slots),
             "batch_job_sha256": prepared.job_sha256,
             "capture_engine_sha256": self._expected_worker_sha256,
@@ -2804,7 +4095,7 @@ class CaptureProcessAdapter:
             try:
                 _validated_density_calibration(
                     payload,
-                    expected_session_id=prepared.session_id,
+                    expected_session_id=prepared.calibration_session_id,
                 )
             except ValueError as error:
                 raise CaptureProcessError(
@@ -2838,7 +4129,19 @@ class CaptureProcessAdapter:
                         "failed pre-reservation batch receipt is inconsistent"
                     )
                 return payload
-            if unit_released is True and (release_attempts != 1 or recovery != "none"):
+            if (
+                unit_released is True
+                and (release_attempts != 1 or recovery != "none")
+                # An eject that suspected a transport wedge (worker.py's
+                # EjectWedgeSuspected) can still cleanly release the SCSI
+                # reservation -- RELEASE_UNIT and physical eject motion are
+                # independent facts, and a clean release must never be read
+                # as "no recovery needed" for a wedge specifically. Only
+                # this one exact combination is tolerated; any other
+                # recovery value together with unit_released=True still
+                # fails closed below.
+                and not (ejected and release_attempts == 1 and recovery == POWER_CYCLE_RECOVERY)
+            ):
                 raise CaptureProcessError(
                     "failed batch release receipt is internally inconsistent"
                 )
@@ -3070,5 +4373,7 @@ __all__ = [
     "CaptureProcessError",
     "CaptureRequest",
     "CaptureStopped",
+    "HeldPreviewSession",
+    "HeldSessionExpired",
     "PreparedCaptureBatch",
 ]
