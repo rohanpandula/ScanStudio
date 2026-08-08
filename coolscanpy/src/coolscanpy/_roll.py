@@ -725,7 +725,11 @@ class Roll:
             if held is not None:
                 if self._held_session is held:
                     self._held_session = None
-                if held.usable and not self._ensure_adapter().teardown_held_session(
+                # The already-resolved adapter local, never _ensure_adapter():
+                # re-resolving inside this handler could itself raise and
+                # replace the propagating exception while skipping teardown
+                # (post-release adversarial review 2026-08-08, T2).
+                if held.usable and not adapter.teardown_held_session(
                     held, error=error
                 ):
                     self._preserve_evidence(
