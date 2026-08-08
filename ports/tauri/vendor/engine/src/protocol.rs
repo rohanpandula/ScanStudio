@@ -352,6 +352,11 @@ pub struct Thumbnail {
     /// Omitted by the simulator and older real backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacing_offset: Option<i64>,
+    /// Lane C, additive: `true` only on a frame whose crop overlaps the
+    /// preview with >=90% of its height inside but not all of it. Forwarded
+    /// verbatim from the bridge; omitted whenever the bridge omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub needs_approval: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -920,6 +925,7 @@ mod tests {
             image_path: None,
             boundary_rows: None,
             spacing_offset: None,
+            partial: None,
             needs_approval: false,
             warnings: vec![],
         };
@@ -1191,6 +1197,7 @@ mod tests {
                     image_path: Some("/tmp/manual/slot-0001.tif".to_string()),
                     boundary_rows: Some((100, 300)),
                     spacing_offset: Some(0),
+                    partial: None,
                     needs_approval: true,
                     warnings: vec!["user-picked".to_string()],
                 },
