@@ -575,6 +575,7 @@ public enum RawExportFormat: String, Codable, CaseIterable, Identifiable, Sendab
 public enum RawTiffInfrared: String, Codable, CaseIterable, Identifiable, Sendable {
     case fourthChannel
     case omitted
+    case sidecar
 
     public var id: String { rawValue }
 }
@@ -656,9 +657,9 @@ public struct ArchiveRecipe: Codable, Equatable, Sendable {
     }
 }
 
-/// An optional untouched 16-bit negative export. Linear DNG embeds the
-/// infrared plane; linear TIFF either carries IR as an unspecified fourth
-/// sample or leaves it out. Missing recipes decode disabled for old projects.
+/// An optional untouched 16-bit negative export. Available IR can be kept in
+/// the main container or written as a paired grayscale TIFF. Missing recipes
+/// decode disabled for old projects.
 public struct RawExportRecipe: Codable, Equatable, Sendable {
     public let enabled: Bool
     public let fileFormat: RawExportFormat
@@ -873,6 +874,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
     public let positivePath: String?
     public let previewPath: String?
     public let rawNegativePath: String?
+    public let rawNegativeIrPath: String?
     /// Exact presentation transform applied to positive/preview derivatives.
     /// The archive/IR/meter capture files are never transformed.
     public let derivativeTransform: DerivativeTransform
@@ -882,17 +884,19 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         positivePath: String?,
         previewPath: String?,
         rawNegativePath: String? = nil,
+        rawNegativeIrPath: String? = nil,
         derivativeTransform: DerivativeTransform = .identity
     ) {
         self.archivePath = archivePath
         self.positivePath = positivePath
         self.previewPath = previewPath
         self.rawNegativePath = rawNegativePath
+        self.rawNegativeIrPath = rawNegativeIrPath
         self.derivativeTransform = derivativeTransform
     }
 
     private enum CodingKeys: String, CodingKey {
-        case archivePath, positivePath, previewPath, rawNegativePath, derivativeTransform
+        case archivePath, positivePath, previewPath, rawNegativePath, rawNegativeIrPath, derivativeTransform
     }
 
     public init(from decoder: Decoder) throws {
@@ -901,6 +905,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         positivePath = try values.decodeIfPresent(String.self, forKey: .positivePath)
         previewPath = try values.decodeIfPresent(String.self, forKey: .previewPath)
         rawNegativePath = try values.decodeIfPresent(String.self, forKey: .rawNegativePath)
+        rawNegativeIrPath = try values.decodeIfPresent(String.self, forKey: .rawNegativeIrPath)
         derivativeTransform = try values.decodeIfPresent(
             DerivativeTransform.self,
             forKey: .derivativeTransform

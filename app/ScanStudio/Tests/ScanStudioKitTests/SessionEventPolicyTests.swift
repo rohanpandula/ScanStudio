@@ -2462,14 +2462,14 @@ struct SessionEventPolicyTests {
         #expect(!model.outputRecipe.rawExport.enabled)
         model.setRawExportEnabled(true)
         model.rawExportFormat = .linearTiff
-        model.rawTiffInfrared = .omitted
+        model.rawTiffInfrared = .sidecar
         model.rawExportFilenameTemplate = "Negative#"
         model.saveEachOutputInOwnFolder = false
 
         let raw = model.outputRecipe.rawExport
         #expect(raw.enabled)
         #expect(raw.fileFormat == .linearTiff)
-        #expect(raw.tiffInfrared == .omitted)
+        #expect(raw.tiffInfrared == .sidecar)
         #expect(raw.filenameTemplate == "Negative#-Raw")
         await client.terminate()
     }

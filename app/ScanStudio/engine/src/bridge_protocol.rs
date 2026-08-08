@@ -216,6 +216,7 @@ pub enum BridgeRawExportFormat {
 pub enum BridgeRawTiffInfrared {
     FourthChannel,
     Omitted,
+    Sidecar,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -478,6 +479,8 @@ pub struct BridgeScanReceipt {
     pub capture_duration_ms: Option<u64>,
     #[serde(default)]
     pub raw_export_path: Option<String>,
+    #[serde(default)]
+    pub raw_export_ir_path: Option<String>,
 }
 
 fn deserialize_exposure_authority_fail_soft<'de, D>(
@@ -908,6 +911,7 @@ mod tests {
             ir_path: None,
             meter_rgbi_path: None,
             raw_export_path: Some("/Scans/Raw/ScanStudio1.dng".into()),
+            raw_export_ir_path: Some("/Scans/Raw/ScanStudio1-ir.tif".into()),
             attempts_root: None,
             exposure_authority: None,
             started_at: Some("2026-07-22T09:00:00+00:00".into()),
@@ -925,6 +929,10 @@ mod tests {
         );
         assert_eq!(value["irPath"], serde_json::Value::Null);
         assert_eq!(value["rawExportPath"], json!("/Scans/Raw/ScanStudio1.dng"));
+        assert_eq!(
+            value["rawExportIrPath"],
+            json!("/Scans/Raw/ScanStudio1-ir.tif")
+        );
         assert_eq!(value["artifacts"]["rgb"]["byteLength"], json!(25165824u64));
         round_trip(&receipt);
 
@@ -936,6 +944,7 @@ mod tests {
         legacy_object.remove("startedAt");
         legacy_object.remove("captureDurationMs");
         legacy_object.remove("rawExportPath");
+        legacy_object.remove("rawExportIrPath");
         let legacy: BridgeScanReceipt =
             serde_json::from_value(legacy_value).expect("legacy receipt must still deserialize");
         assert!(
@@ -945,6 +954,7 @@ mod tests {
         assert!(legacy.started_at.is_none());
         assert!(legacy.capture_duration_ms.is_none());
         assert!(legacy.raw_export_path.is_none());
+        assert!(legacy.raw_export_ir_path.is_none());
     }
 
     #[test]

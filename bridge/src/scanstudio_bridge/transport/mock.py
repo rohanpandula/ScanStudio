@@ -100,6 +100,7 @@ def _synthetic_receipt(
     ir_path: str | None,
     meter_rgbi_path: str | None,
     raw_export_path: str | None,
+    raw_export_ir_path: str | None,
 ) -> domain.ScanReceipt:
     return domain.ScanReceipt(
         version=1,
@@ -151,6 +152,7 @@ def _synthetic_receipt(
         # MockTransport has no persistent CoolscanPy attempts journal.
         attempts_root=None,
         raw_export_path=raw_export_path,
+        raw_export_ir_path=raw_export_ir_path,
     )
 
 
@@ -642,16 +644,19 @@ class MockTransport:
             )
             ir_path_str = str(ir_path)
         raw_export_path_str: str | None = None
+        raw_export_ir_path_str: str | None = None
         raw_export_spec = raw_export_for_slot(output, slot)
         if raw_export_spec is not None:
             raw_export_path = paths.raw_export_path
             assert raw_export_path is not None
+            raw_export_ir_path = paths.raw_export_ir_path
             phased_call(
                 on_call,
                 f"file_write.raw:slot{slot}",
                 lambda: write_raw_export(
                     reservations,
                     raw_export_path,
+                    raw_export_ir_path,
                     raw_export_spec,
                     rgb=rgb_frame,
                     ir=ir_frame,
@@ -660,6 +665,9 @@ class MockTransport:
                 ),
             )
             raw_export_path_str = str(raw_export_path)
+            raw_export_ir_path_str = (
+                str(raw_export_ir_path) if raw_export_ir_path is not None else None
+            )
         meter_rgbi_path_str: str | None = None
         if recipe.channels is domain.Channels.RGBI:
             meter_path = paths.meter_rgbi_path
@@ -678,6 +686,7 @@ class MockTransport:
             ir_path=ir_path_str,
             meter_rgbi_path=meter_rgbi_path_str,
             raw_export_path=raw_export_path_str,
+            raw_export_ir_path=raw_export_ir_path_str,
         )
         on_frame(slot, receipt)
 

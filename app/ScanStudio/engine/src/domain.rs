@@ -293,6 +293,7 @@ pub enum RawTiffInfrared {
     #[default]
     FourthChannel,
     Omitted,
+    Sidecar,
 }
 
 fn default_archive_filename_template() -> String {
@@ -352,8 +353,8 @@ fn default_raw_export_destination() -> String {
 }
 
 /// Optional untouched-negative output. It is disabled by default for wire
-/// and manifest compatibility. DNG always embeds available IR; linear TIFF
-/// uses `tiff_infrared` to choose a fourth sample or an RGB-only file.
+/// and manifest compatibility. `Sidecar` writes available IR to a paired
+/// grayscale TIFF for either format; legacy DNG values retain embedded IR.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RawExportRecipe {
@@ -668,6 +669,8 @@ pub struct WrittenOutputs {
     pub preview_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_negative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_negative_ir_path: Option<String>,
     /// Exact presentation transform used for the finished derivatives.
     /// Identity on legacy receipts whose `outputs` object predates this key.
     #[serde(default)]
@@ -1300,7 +1303,7 @@ mod tests {
             raw_export: RawExportRecipe {
                 enabled: true,
                 file_format: RawExportFormat::LinearTiff,
-                tiff_infrared: RawTiffInfrared::Omitted,
+                tiff_infrared: RawTiffInfrared::Sidecar,
                 filename_template: "Negative_####.tif".into(),
                 destination: "/Scans/Raw".into(),
             },

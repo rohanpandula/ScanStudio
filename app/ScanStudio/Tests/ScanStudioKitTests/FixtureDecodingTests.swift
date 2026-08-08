@@ -101,7 +101,7 @@ struct FixtureDecodingTests {
             rawExport: RawExportRecipe(
                 enabled: true,
                 fileFormat: .linearTiff,
-                tiffInfrared: .omitted,
+                tiffInfrared: .sidecar,
                 filenameTemplate: "N_####.tif",
                 destination: "/tmp/n"
             ),
@@ -113,7 +113,7 @@ struct FixtureDecodingTests {
         let back = try JSONDecoder().decode(OutputRecipe.self, from: encoded)
         #expect(back.autoCrop)
         #expect(back.rawExport.fileFormat == .linearTiff)
-        #expect(back.rawExport.tiffInfrared == .omitted)
+        #expect(back.rawExport.tiffInfrared == .sidecar)
     }
 
     @Test("08: scan.progress event decodes")

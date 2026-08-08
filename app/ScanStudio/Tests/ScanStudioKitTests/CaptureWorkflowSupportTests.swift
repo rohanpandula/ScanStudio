@@ -114,7 +114,7 @@ struct CaptureWorkflowSupportTests {
         ))
     }
 
-    @Test("raw negative size estimate is 16-bit and counts embedded or fourth-channel infrared")
+    @Test("raw negative size estimate is 16-bit and counts embedded, fourth-channel, or sidecar infrared")
     func rawNegativeSizeEstimate() {
         let rgb = ScanSizeEstimator.rawExportBytesPerFrame(
             carrier: .mounted,
@@ -128,8 +128,15 @@ struct CaptureWorkflowSupportTests {
             fileFormat: .linearDng,
             tiffInfrared: .omitted
         )
+        let sidecar = ScanSizeEstimator.rawExportBytesPerFrame(
+            carrier: .mounted,
+            resolutionDpi: 4_000,
+            fileFormat: .linearTiff,
+            tiffInfrared: .sidecar
+        )
         #expect(rgb == 3_946 * 5_782 * 3 * 2)
         #expect(rgbi == 3_946 * 5_782 * 4 * 2)
+        #expect(sidecar == rgbi)
     }
 
     @Test("recipe presets respect real-device multisample limits and expose manual changes as custom")

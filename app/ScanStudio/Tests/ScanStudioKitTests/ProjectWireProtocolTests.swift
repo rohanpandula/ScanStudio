@@ -75,17 +75,19 @@ struct ProjectWireProtocolTests {
         )
         #expect(outputs.archivePath == nil)
         #expect(outputs.rawNegativePath == nil)
+        #expect(outputs.rawNegativeIrPath == nil)
         #expect(outputs.positivePath?.hasSuffix(".tif") == true)
         #expect(outputs.derivativeTransform == .identity)
     }
 
-    @Test("WrittenOutputs preserves a completed raw-negative path")
+    @Test("WrittenOutputs preserves a completed raw-negative sidecar pair")
     func rawNegativeWrittenOutputDecodes() throws {
         let outputs = try JSONDecoder().decode(
             WrittenOutputs.self,
-            from: Data(#"{"rawNegativePath":"/Scans/Raw/ScanStudio1.dng"}"#.utf8)
+            from: Data(#"{"rawNegativePath":"/Scans/Raw/ScanStudio1.dng","rawNegativeIrPath":"/Scans/Raw/ScanStudio1-ir.tif"}"#.utf8)
         )
         #expect(outputs.rawNegativePath == "/Scans/Raw/ScanStudio1.dng")
+        #expect(outputs.rawNegativeIrPath == "/Scans/Raw/ScanStudio1-ir.tif")
     }
 
     @Test("frame geometry and receipts decode exact derivative transforms while legacy values default to identity")

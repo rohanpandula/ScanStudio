@@ -110,6 +110,7 @@ class RawExportFormat(StrEnum):
 class RawTiffInfrared(StrEnum):
     FOURTH_CHANNEL = "fourthChannel"
     OMITTED = "omitted"
+    SIDECAR = "sidecar"
 
 
 @dataclass(frozen=True)
@@ -325,6 +326,9 @@ class ScanReceipt:
     # Bridge-written, user-requested untouched-negative export. Optional for
     # legacy clients and whenever no raw export was requested.
     raw_export_path: str | None = None
+    # Optional grayscale TIFF paired with ``raw_export_path`` when the raw
+    # recipe selects separate infrared and the capture supplied an IR plane.
+    raw_export_ir_path: str | None = None
 
 
 # --- internal (non-wire) types Plan 08-02 needs ---

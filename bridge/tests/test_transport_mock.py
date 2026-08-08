@@ -20,6 +20,7 @@ from scanstudio_bridge import domain, safety
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
 from scanstudio_bridge.transport import FrameRetryExhausted
 from scanstudio_bridge.transport import mock as mock_transport_module
+from scanstudio_bridge.transport import output_reservation as output_reservation_module
 from scanstudio_bridge.transport.mock import MockTransport
 from scanstudio_bridge.transport.output_reservation import (
     OutputReservations,
@@ -176,6 +177,33 @@ def test_fourth_channel_tiff_is_rejected_before_rgb_only_capture(tmp_path: Path)
     assert exc.value.code is ErrorCode.INVALID_PARAMS
     assert "requires recipe.channels=rgbi" in str(exc.value)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_sidecar_mode_reserves_pair_only_when_capture_has_ir(tmp_path: Path) -> None:
+    output = _output_with_raw(
+        tmp_path,
+        file_format=domain.RawExportFormat.LINEAR_DNG,
+        tiff_infrared=domain.RawTiffInfrared.SIDECAR,
+    )
+    rgbi = output_group_for_slot(output, domain.FIXED_COLOR_NEGATIVE_RECIPE, 1)
+    assert rgbi.raw_export_path == tmp_path / "raw" / "negative-0001.dng"
+    assert rgbi.raw_export_ir_path == tmp_path / "raw" / "negative-0001-ir.tif"
+
+    rgb_recipe = dataclasses.replace(
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        channels=domain.Channels.RGB,
+    )
+    rgb = output_group_for_slot(output, rgb_recipe, 1)
+    assert rgb.raw_export_path == rgbi.raw_export_path
+    assert rgb.raw_export_ir_path is None
+
+    rgbi.raw_export_ir_path.parent.mkdir(parents=True)
+    rgbi.raw_export_ir_path.write_bytes(b"existing")
+    with pytest.raises(BridgeError) as exc:
+        OutputReservations.reserve([1], domain.FIXED_COLOR_NEGATIVE_RECIPE, output)
+    assert exc.value.code is ErrorCode.INVALID_PARAMS
+    assert rgbi.raw_export_ir_path.read_bytes() == b"existing"
+    assert not rgbi.raw_export_path.exists()
 
 
 def test_reservation_rejects_existing_symlink_leaf_without_touching_target(
@@ -744,6 +772,108 @@ def test_start_scan_writes_linear_tiff_ir_choice(
             assert page.tags.get(65001) is None
 
 
+@pytest.mark.parametrize(
+    ("file_format", "extension"),
+    [
+        (domain.RawExportFormat.LINEAR_DNG, "dng"),
+        (domain.RawExportFormat.LINEAR_TIFF, "tif"),
+    ],
+)
+def test_start_scan_writes_grayscale_ir_sidecar_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_format: domain.RawExportFormat,
+    extension: str,
+) -> None:
+    rgb = np.arange(3 * 4 * 3, dtype=np.uint16).reshape(3, 4, 3)
+    infrared = np.array(
+        [[0, 1, 65535, 32768], [99, 100, 101, 102], [60000, 7, 8, 9]],
+        dtype=np.uint16,
+    )
+    monkeypatch.setattr(mock_transport_module, "_synthetic_rgb_frame", lambda: rgb)
+    monkeypatch.setattr(mock_transport_module, "_synthetic_ir_frame", lambda: infrared)
+    transport = _opened(slot_count=1)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    receipts: list[domain.ScanReceipt] = []
+
+    transport.start_scan(
+        [1],
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        _output_with_raw(
+            tmp_path,
+            file_format=file_format,
+            tiff_infrared=domain.RawTiffInfrared.SIDECAR,
+        ),
+        lambda _p: None,
+        lambda *_a: None,
+        lambda _slot, receipt: receipts.append(receipt),
+    )
+
+    main_path = tmp_path / "raw" / f"negative-0001.{extension}"
+    ir_path = tmp_path / "raw" / "negative-0001-ir.tif"
+    assert receipts[0].raw_export_path == str(main_path)
+    assert receipts[0].raw_export_ir_path == str(ir_path)
+    with tifffile.TiffFile(main_path) as tiff:
+        main = tiff.pages[0]
+        assert int(main.tags["SamplesPerPixel"].value) == 3
+        assert main.tags.get("SubIFDs") is None
+        assert main.tags.get(65001) is None
+        np.testing.assert_array_equal(main.asarray(), rgb)
+    with tifffile.TiffFile(ir_path) as tiff:
+        sidecar = tiff.pages[0]
+        assert sidecar.shape == infrared.shape
+        assert int(sidecar.tags["BitsPerSample"].value) == 16
+        assert int(sidecar.tags["SamplesPerPixel"].value) == 1
+        assert int(sidecar.tags["PhotometricInterpretation"].value) == 1
+        assert int(sidecar.tags["Orientation"].value) == 1
+        assert sidecar.tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+        assert sidecar.tags["XResolution"].value == (4000, 1)
+        assert sidecar.tags["YResolution"].value == (4000, 1)
+        assert int(sidecar.tags["ResolutionUnit"].value) == 2
+        np.testing.assert_array_equal(sidecar.asarray(), infrared)
+
+
+@pytest.mark.parametrize(
+    ("file_format", "extension"),
+    [
+        (domain.RawExportFormat.LINEAR_DNG, "dng"),
+        (domain.RawExportFormat.LINEAR_TIFF, "tif"),
+    ],
+)
+def test_sidecar_mode_without_captured_ir_matches_no_ir_sibling(
+    tmp_path: Path,
+    file_format: domain.RawExportFormat,
+    extension: str,
+) -> None:
+    recipe = dataclasses.replace(
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        channels=domain.Channels.RGB,
+    )
+    transport = _opened(slot_count=1, enforce_fixed_recipe=False)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    receipts: list[domain.ScanReceipt] = []
+    transport.start_scan(
+        [1],
+        recipe,
+        _output_with_raw(
+            tmp_path,
+            file_format=file_format,
+            tiff_infrared=domain.RawTiffInfrared.SIDECAR,
+        ),
+        lambda _p: None,
+        lambda *_a: None,
+        lambda _slot, receipt: receipts.append(receipt),
+    )
+
+    main_path = tmp_path / "raw" / f"negative-0001.{extension}"
+    assert receipts[0].raw_export_path == str(main_path)
+    assert receipts[0].raw_export_ir_path is None
+    assert not (tmp_path / "raw" / "negative-0001-ir.tif").exists()
+    with tifffile.TiffFile(main_path) as tiff:
+        assert int(tiff.pages[0].tags["SamplesPerPixel"].value) == 3
+        assert tiff.pages[0].tags.get("SubIFDs") is None
+
+
 def test_failed_raw_write_is_not_reported_complete_and_removes_partial_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -751,7 +881,7 @@ def test_failed_raw_write_is_not_reported_complete_and_removes_partial_file(
     transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
     completed: list[domain.ScanReceipt] = []
 
-    def partial_then_fail(reservations, path, spec, **kwargs):
+    def partial_then_fail(reservations, path, ir_path, spec, **kwargs):
         with reservations.open_for_update(path) as file:
             file.write(b"partial raw output")
         raise OSError("simulated raw writer failure")
@@ -770,6 +900,40 @@ def test_failed_raw_write_is_not_reported_complete_and_removes_partial_file(
 
     assert completed == []
     assert not (tmp_path / "raw" / "negative-0001.dng").exists()
+
+
+def test_sidecar_write_failure_removes_synced_main_and_never_reports_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = _opened(slot_count=1)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    completed: list[domain.ScanReceipt] = []
+    real_imwrite = output_reservation_module.tifffile.imwrite
+
+    def fail_raw_ir_sidecar(file, *args, **kwargs):
+        if str(getattr(file, "name", "")).endswith("negative-0001-ir.tif"):
+            raise OSError("simulated raw IR sidecar write failure")
+        return real_imwrite(file, *args, **kwargs)
+
+    monkeypatch.setattr(output_reservation_module.tifffile, "imwrite", fail_raw_ir_sidecar)
+
+    with pytest.raises(OSError, match="raw IR sidecar write failure"):
+        transport.start_scan(
+            [1],
+            domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            _output_with_raw(
+                tmp_path,
+                file_format=domain.RawExportFormat.LINEAR_DNG,
+                tiff_infrared=domain.RawTiffInfrared.SIDECAR,
+            ),
+            lambda _p: None,
+            lambda *_a: None,
+            lambda _slot, receipt: completed.append(receipt),
+        )
+
+    assert completed == []
+    assert not (tmp_path / "raw" / "negative-0001.dng").exists()
+    assert not (tmp_path / "raw" / "negative-0001-ir.tif").exists()
 
 
 # -- request_stop -----------------------------------------------------------------

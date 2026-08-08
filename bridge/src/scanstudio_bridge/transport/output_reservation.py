@@ -30,6 +30,7 @@ class OutputGroup:
     ir_path: Path | None
     meter_rgbi_path: Path | None
     raw_export_path: Path | None
+    raw_export_ir_path: Path | None
 
     @property
     def paths(self) -> tuple[Path, ...]:
@@ -40,6 +41,7 @@ class OutputGroup:
                 self.ir_path,
                 self.meter_rgbi_path,
                 self.raw_export_path,
+                self.raw_export_ir_path,
             )
             if path is not None
         )
@@ -62,6 +64,11 @@ def _normalize_raw_template(
     if path.suffix.casefold() in {".tif", ".tiff", ".dng", ".jpg", ".jpeg"}:
         return f"{filename_template[: -len(path.suffix)]}{desired}"
     return f"{filename_template}{desired}"
+
+
+def raw_export_ir_sidecar_path(raw_export_path: Path) -> Path:
+    """Derive the documented lowercase ``-ir.tif`` paired-artifact name."""
+    return raw_export_path.with_name(f"{raw_export_path.stem}-ir.tif")
 
 
 def _resolve_filename(filename_template: str, slot: int) -> str:
@@ -144,6 +151,7 @@ def output_group_for_slot(
         raw_export = slot_output.raw_export
     rgb_path = _resolve_output_path(destination, template, slot)
     raw_export_path = None
+    raw_export_ir_path = None
     if raw_export is not None:
         raw_export_path = _resolve_output_path(
             raw_export.destination,
@@ -151,6 +159,11 @@ def output_group_for_slot(
             slot,
             normalize_tiff=False,
         )
+        if (
+            recipe.channels is domain.Channels.RGBI
+            and raw_export.tiff_infrared is domain.RawTiffInfrared.SIDECAR
+        ):
+            raw_export_ir_path = raw_export_ir_sidecar_path(raw_export_path)
     if recipe.channels is not domain.Channels.RGBI:
         # Meter data is an auto-exposure prepass, not an IR sidecar. A real
         # frame can therefore supply it independently of the requested RGB
@@ -160,6 +173,7 @@ def output_group_for_slot(
             ir_path=None,
             meter_rgbi_path=rgb_path.with_name(f"{rgb_path.stem}_METER.tif"),
             raw_export_path=raw_export_path,
+            raw_export_ir_path=raw_export_ir_path,
         )
     return OutputGroup(
         rgb_path=rgb_path,
@@ -170,6 +184,7 @@ def output_group_for_slot(
         # reservation.
         meter_rgbi_path=rgb_path.with_name(f"{rgb_path.stem}_METER.tif"),
         raw_export_path=raw_export_path,
+        raw_export_ir_path=raw_export_ir_path,
     )
 
 
@@ -296,6 +311,12 @@ class OutputReservations:
     def mark_written(self, path: Path) -> None:
         self._written.add(path)
 
+    def discard_owned(self, *paths: Path) -> None:
+        """Remove owned paths even after a completed write marked them durable."""
+        for path in paths:
+            self._written.discard(path)
+            self._unlink_if_owned(path)
+
     def release_unused(self, path: Path | None = None) -> None:
         """Remove own untouched placeholders after a successful write/job."""
         candidates = (path,) if path is not None else tuple(self._owned)
@@ -344,6 +365,7 @@ def write_tiff(
 def write_raw_export(
     reservations: OutputReservations,
     path: Path,
+    ir_path: Path | None,
     spec: domain.RawExportSpec,
     *,
     rgb: np.ndarray,
@@ -351,7 +373,7 @@ def write_raw_export(
     dpi: int,
     device_model: str,
 ) -> None:
-    """Write an untouched-negative export through an exclusive reservation."""
+    """Write one untouched-negative export, atomically as a pair when requested."""
     if rgb.dtype != np.uint16 or rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("raw export RGB must be a uint16 (height, width, 3) array")
     if ir is not None and (
@@ -359,44 +381,75 @@ def write_raw_export(
     ):
         raise ValueError("raw export IR must be a uint16 plane matching RGB")
 
-    if spec.file_format is domain.RawExportFormat.LINEAR_DNG:
-        # Lazy imports preserve the bridge's hardware-free module import
-        # boundary; only an actually requested DNG loads CoolscanPy's
-        # scanning-agnostic encoder and result value type.
-        from coolscanpy.io.encoders import write_dng_linear_to_file
-        from coolscanpy.session.result import ScanResult
+    wants_sidecar = spec.tiff_infrared is domain.RawTiffInfrared.SIDECAR
+    if (ir_path is not None) != (wants_sidecar and ir is not None):
+        raise ValueError("raw IR sidecar reservation does not match the captured IR plane")
 
-        result = ScanResult(
-            rgb=rgb,
-            ir=ir,
-            dpi=dpi,
-            device_model=device_model,
-        )
-        with reservations.open_for_update(path) as file:
-            write_dng_linear_to_file(_NamedReservationFile(file, path), result)
-            os.fsync(file.fileno())
-        reservations.mark_written(path)
-        return
+    pair_paths = (path, ir_path) if ir_path is not None else (path,)
+    try:
+        if spec.file_format is domain.RawExportFormat.LINEAR_DNG:
+            # Lazy imports preserve the bridge's hardware-free module import
+            # boundary; only an actually requested DNG loads CoolscanPy's
+            # scanning-agnostic encoder and result value type.
+            from coolscanpy.io.encoders import write_dng_linear_to_file
+            from coolscanpy.session.result import ScanResult
 
-    kwargs: dict[str, object] = {
-        "photometric": "rgb",
-        "compression": None,
-        "metadata": None,
-        "resolution": (dpi, dpi),
-        "resolutionunit": "INCH",
-        "software": "ScanStudio",
-    }
-    data = rgb
-    if spec.tiff_infrared is domain.RawTiffInfrared.FOURTH_CHANNEL:
-        if ir is None:
-            raise ValueError("fourth-channel linear TIFF requires an infrared capture plane")
-        data = np.ascontiguousarray(np.dstack((rgb, ir)))
-        kwargs["extrasamples"] = (0,)
-        kwargs["extratags"] = [
-            (65001, "s", 0, "scanstudio.infrared.linear.uint16.v1", True)
-        ]
-    with reservations.open_for_write(path) as file:
-        tifffile.imwrite(_NamedReservationFile(file, path), data, **kwargs)
-        file.flush()
-        os.fsync(file.fileno())
-    reservations.mark_written(path)
+            result = ScanResult(
+                rgb=rgb,
+                ir=None if wants_sidecar else ir,
+                dpi=dpi,
+                device_model=device_model,
+            )
+            with reservations.open_for_update(path) as file:
+                write_dng_linear_to_file(_NamedReservationFile(file, path), result)
+                os.fsync(file.fileno())
+        else:
+            kwargs: dict[str, object] = {
+                "photometric": "rgb",
+                "compression": None,
+                "metadata": None,
+                "resolution": (dpi, dpi),
+                "resolutionunit": "INCH",
+                "software": "ScanStudio",
+            }
+            data = rgb
+            if spec.tiff_infrared is domain.RawTiffInfrared.FOURTH_CHANNEL:
+                if ir is None:
+                    raise ValueError("fourth-channel linear TIFF requires an infrared capture plane")
+                data = np.ascontiguousarray(np.dstack((rgb, ir)))
+                kwargs["extrasamples"] = (0,)
+                kwargs["extratags"] = [
+                    (65001, "s", 0, "scanstudio.infrared.linear.uint16.v1", True)
+                ]
+            with reservations.open_for_write(path) as file:
+                tifffile.imwrite(_NamedReservationFile(file, path), data, **kwargs)
+                file.flush()
+                os.fsync(file.fileno())
+
+        if ir_path is not None:
+            assert ir is not None
+            with reservations.open_for_write(ir_path) as file:
+                tifffile.imwrite(
+                    _NamedReservationFile(file, ir_path),
+                    ir,
+                    photometric="minisblack",
+                    compression=None,
+                    metadata=None,
+                    resolution=(dpi, dpi),
+                    resolutionunit="INCH",
+                    software="ScanStudio",
+                    extratags=[
+                        (254, "I", 1, 0, True),
+                        (274, "H", 1, 1, True),
+                        (270, "s", 0, "Untouched scanner infrared plane", True),
+                        (65001, "s", 0, "scanstudio.infrared.linear.uint16.v1", True),
+                    ],
+                )
+                file.flush()
+                os.fsync(file.fileno())
+    except BaseException:
+        reservations.discard_owned(*pair_paths)
+        raise
+
+    for pair_path in pair_paths:
+        reservations.mark_written(pair_path)

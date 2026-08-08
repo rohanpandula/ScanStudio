@@ -1157,6 +1157,10 @@ fn build_receipt(
                 .raw_negative_path
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            raw_negative_ir_path: written
+                .raw_negative_ir_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
             derivative_transform: written.derivative_transform,
         }),
         // Bridge-only concepts — the simulator has no bridge subprocess to
@@ -1535,6 +1539,7 @@ fn run_scan_job(
                     height,
                     effective_recipe.bit_depth,
                     effective_recipe.resolution_dpi,
+                    effective_recipe.channels == Channels::Rgbi,
                     &effective_output,
                     Some(detected_boundary),
                     effective_alignment,
@@ -1774,7 +1779,8 @@ mod tests {
             archive_path: None,
             positive_path: None,
             preview_path: None,
-            raw_negative_path: None,
+            raw_negative_path: Some(std::path::PathBuf::from("/tmp/negative.dng")),
+            raw_negative_ir_path: Some(std::path::PathBuf::from("/tmp/negative-ir.tif")),
             nikonlook: Some(provenance.clone()),
             auto_crop: None,
             derivative_transform: crate::domain::DerivativeTransform::default(),
@@ -1791,6 +1797,12 @@ mod tests {
             &written,
         );
         assert_eq!(receipt.nikonlook, Some(provenance));
+        let outputs = receipt.outputs.as_ref().expect("simulated receipt has outputs");
+        assert_eq!(outputs.raw_negative_path.as_deref(), Some("/tmp/negative.dng"));
+        assert_eq!(
+            outputs.raw_negative_ir_path.as_deref(),
+            Some("/tmp/negative-ir.tif")
+        );
 
         // The `None` side must also pass through unchanged -- a C41 render
         // is not guaranteed to have provenance either (e.g. a legacy

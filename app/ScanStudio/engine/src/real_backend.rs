@@ -789,6 +789,7 @@ struct PrivateCaptureWorkingDirectory {
 struct ExpectedCapturePaths {
     rgb: std::path::PathBuf,
     raw_export: Option<std::path::PathBuf>,
+    raw_export_ir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -2596,7 +2597,7 @@ impl ScannerBackend for RealLs5000 {
             ));
         }
 
-        let capture_plan = build_real_capture_plan(&frames, &output, &overrides)?;
+        let capture_plan = build_real_capture_plan(&frames, &recipe, &output, &overrides)?;
         let bridge_params = build_scan_start_params_with_bridge_output(
             frames.clone(),
             &recipe,
@@ -3036,6 +3037,7 @@ fn effective_output_for_slot<'a>(
 /// user output folders never receive an intermediate TIFF or sidecar.
 fn build_real_capture_plan(
     slots: &[u32],
+    recipe: &CaptureRecipe,
     output: &OutputRecipe,
     overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
 ) -> Result<RealCapturePlan, EngineError> {
@@ -3094,7 +3096,19 @@ fn build_real_capture_plan(
             .raw_export
             .enabled
             .then(|| crate::render::resolve_raw_export_output_path(effective, *slot));
-        expected_by_slot.insert(*slot, ExpectedCapturePaths { rgb, raw_export });
+        let raw_export_ir = raw_export.as_ref().and_then(|path| {
+            (recipe.channels == Channels::Rgbi
+                && effective.raw_export.tiff_infrared == domain::RawTiffInfrared::Sidecar)
+                .then(|| crate::render::raw_export_ir_sidecar_path(path))
+        });
+        expected_by_slot.insert(
+            *slot,
+            ExpectedCapturePaths {
+                rgb,
+                raw_export,
+                raw_export_ir,
+            },
+        );
         slot_outputs.insert(slot.to_string(), spec);
     }
 
@@ -3155,6 +3169,7 @@ fn bridge_raw_export_spec(recipe: &domain::RawExportRecipe) -> Option<BridgeRawE
         tiff_infrared: match recipe.tiff_infrared {
             domain::RawTiffInfrared::FourthChannel => BridgeRawTiffInfrared::FourthChannel,
             domain::RawTiffInfrared::Omitted => BridgeRawTiffInfrared::Omitted,
+            domain::RawTiffInfrared::Sidecar => BridgeRawTiffInfrared::Sidecar,
         },
     })
 }
@@ -4869,6 +4884,17 @@ fn run_real_scan_job_inner(
                                         .map(std::path::Path::new),
                                     frame_completed.slot,
                                 )
+                                .and_then(|()| {
+                                    crate::render::validate_bridge_raw_export_receipt_path(
+                                        expected.raw_export_ir.as_deref(),
+                                        frame_completed
+                                            .receipt
+                                            .raw_export_ir_path
+                                            .as_deref()
+                                            .map(std::path::Path::new),
+                                        frame_completed.slot,
+                                    )
+                                })
                             })
                         } else {
                             Err(EngineError::new(
@@ -4973,6 +4999,10 @@ fn run_real_scan_job_inner(
                                     raw_negative_path: frame_completed
                                         .receipt
                                         .raw_export_path
+                                        .clone(),
+                                    raw_negative_ir_path: frame_completed
+                                        .receipt
+                                        .raw_export_ir_path
                                         .clone(),
                                     derivative_transform: written.derivative_transform,
                                 });

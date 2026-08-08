@@ -383,6 +383,7 @@ def _scan_receipt_from_coolscanpy(
     meter_rgbi_path: str | None,
     attempts_root: Path | None,
     raw_export_path: str | None = None,
+    raw_export_ir_path: str | None = None,
 ) -> domain.ScanReceipt:
     exposure_authority = build_exposure_authority(attempts_root=attempts_root, slot=receipt.slot)
     exposure = receipt.exposure
@@ -458,6 +459,7 @@ def _scan_receipt_from_coolscanpy(
         started_at=receipt.started_at,
         capture_duration_ms=receipt.capture_duration_ms,
         raw_export_path=raw_export_path,
+        raw_export_ir_path=raw_export_ir_path,
     )
 
 
@@ -1342,16 +1344,19 @@ class CoolscanPyTransport:
                                     ir_path_str = str(ir_path)
 
                                 raw_export_path_str: str | None = None
+                                raw_export_ir_path_str: str | None = None
                                 raw_export_spec = raw_export_for_slot(output, slot)
                                 if raw_export_spec is not None:
                                     raw_export_path = paths.raw_export_path
                                     assert raw_export_path is not None
+                                    raw_export_ir_path = paths.raw_export_ir_path
                                     phased_call(
                                         on_call,
                                         f"file_write.raw:slot{slot}",
                                         lambda: write_raw_export(
                                             reservations,
                                             raw_export_path,
+                                            raw_export_ir_path,
                                             raw_export_spec,
                                             rgb=frame.rgb,
                                             ir=frame.ir,
@@ -1360,6 +1365,11 @@ class CoolscanPyTransport:
                                         ),
                                     )
                                     raw_export_path_str = str(raw_export_path)
+                                    raw_export_ir_path_str = (
+                                        str(raw_export_ir_path)
+                                        if raw_export_ir_path is not None
+                                        else None
+                                    )
 
                                 meter_rgbi_path_str: str | None = None
                                 if frame.meter_rgbi is not None:
@@ -1388,6 +1398,7 @@ class CoolscanPyTransport:
                                     ir_path=ir_path_str,
                                     meter_rgbi_path=meter_rgbi_path_str,
                                     raw_export_path=raw_export_path_str,
+                                    raw_export_ir_path=raw_export_ir_path_str,
                                     attempts_root=self.attempts_root,
                                 )
                                 on_frame(slot, receipt)

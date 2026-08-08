@@ -47,7 +47,7 @@ def test_output_spec_slot_templates_are_backward_compatible_and_round_trip() -> 
         destination="/tmp/raw",
         filename_template="negative-####",
         file_format=RawExportFormat.LINEAR_TIFF,
-        tiff_infrared=RawTiffInfrared.OMITTED,
+        tiff_infrared=RawTiffInfrared.SIDECAR,
     )
     output = OutputSpec(
         destination="/tmp/scans", filename_template="frame-####.tif",
@@ -130,6 +130,7 @@ def test_to_wire_scan_receipt_uses_camel_case_at_every_nesting_level() -> None:
     assert wire["irPath"] is None
     assert wire["meterRgbiPath"] == "/tmp/scans/frame-0001_METER.tif"
     assert wire["rawExportPath"] is None
+    assert wire["rawExportIrPath"] is None
     assert wire["attemptsRoot"] is None
     assert wire["splitAlignment"] is None
     assert wire["manualApproval"] is None
@@ -154,14 +155,20 @@ def test_scan_receipt_accepts_an_older_wire_payload_without_attempts_root() -> N
 
 def test_scan_receipt_raw_export_path_round_trips_and_legacy_payload_defaults() -> None:
     original = dataclasses.replace(
-        _make_scan_receipt(), raw_export_path="/tmp/raw/frame-0001.dng"
+        _make_scan_receipt(),
+        raw_export_path="/tmp/raw/frame-0001.dng",
+        raw_export_ir_path="/tmp/raw/frame-0001-ir.tif",
     )
     wire = to_wire(original)
     assert wire["rawExportPath"] == "/tmp/raw/frame-0001.dng"
+    assert wire["rawExportIrPath"] == "/tmp/raw/frame-0001-ir.tif"
     assert from_wire(wire, ScanReceipt) == original
 
     del wire["rawExportPath"]
-    assert from_wire(wire, ScanReceipt).raw_export_path is None
+    del wire["rawExportIrPath"]
+    legacy = from_wire(wire, ScanReceipt)
+    assert legacy.raw_export_path is None
+    assert legacy.raw_export_ir_path is None
 
 
 def test_scan_receipt_timing_round_trips_through_wire() -> None:

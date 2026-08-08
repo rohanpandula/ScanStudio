@@ -936,7 +936,7 @@ fn scan_start_emits_completed_receipts_marked_not_simulated() {
 }
 
 #[test]
-fn scan_start_raw_only_maps_dng_recipe_and_preserves_the_bridge_written_path() {
+fn scan_start_raw_only_maps_dng_sidecar_recipe_and_preserves_both_bridge_paths() {
     let backend = Arc::new(
         RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
             .expect("RealLs5000::new should succeed against a healthy mock bridge"),
@@ -951,6 +951,7 @@ fn scan_start_raw_only_maps_dng_recipe_and_preserves_the_bridge_written_path() {
     output.preview.enabled = false;
     output.raw_export.enabled = true;
     output.raw_export.file_format = domain::RawExportFormat::LinearDng;
+    output.raw_export.tiff_infrared = domain::RawTiffInfrared::Sidecar;
     let raw_root = std::path::PathBuf::from(&output.raw_export.destination);
 
     let (tx, rx) = mpsc::channel();
@@ -975,8 +976,14 @@ fn scan_start_raw_only_maps_dng_recipe_and_preserves_the_bridge_written_path() {
         .as_str()
         .expect("completed receipt must expose the bridge-written raw path");
     assert!(raw_path.ends_with(".dng"));
-    assert!(std::path::Path::new(raw_path).starts_with(raw_root));
+    assert!(std::path::Path::new(raw_path).starts_with(&raw_root));
     assert!(std::path::Path::new(raw_path).is_file());
+    let raw_ir_path = receipt["outputs"]["rawNegativeIrPath"]
+        .as_str()
+        .expect("completed receipt must expose the paired raw IR path");
+    assert!(raw_ir_path.ends_with("-ir.tif"));
+    assert!(std::path::Path::new(raw_ir_path).starts_with(&raw_root));
+    assert!(std::path::Path::new(raw_ir_path).is_file());
     assert!(receipt["outputs"]["archivePath"].is_null());
 }
 

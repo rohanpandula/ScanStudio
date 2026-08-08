@@ -341,10 +341,14 @@ struct BatchInspectorView: View {
                         Text("Linear TIFF").tag(RawExportFormat.linearTiff)
                     }
                 }
-                if sessionModel.rawExportFormat == .linearTiff {
-                    InspectorSettingRow(label: "Infrared") {
-                        Picker("Infrared", selection: rawTiffInfraredBinding) {
+                InspectorSettingRow(label: "Infrared") {
+                    Picker("Infrared", selection: rawTiffInfraredBinding) {
+                        if sessionModel.rawExportFormat == .linearDng {
+                            Text("Inside the DNG").tag(RawTiffInfrared.fourthChannel)
+                            Text("Separate grayscale TIFF").tag(RawTiffInfrared.sidecar)
+                        } else {
                             Text("Fourth channel").tag(RawTiffInfrared.fourthChannel)
+                            Text("Separate grayscale TIFF").tag(RawTiffInfrared.sidecar)
                             Text("Omit (RGB only)").tag(RawTiffInfrared.omitted)
                         }
                     }
@@ -864,11 +868,18 @@ struct BatchInspectorView: View {
 
     private var rawOutputExplanation: String {
         if sessionModel.rawExportFormat == .linearDng {
-            return "Saves the untouched 16-bit RGB negative as linear DNG, with the untouched infrared plane embedded inside the file. No inversion, crop, color conversion, or dust removal is applied."
+            return sessionModel.rawTiffInfrared == .sidecar
+                ? "Saves an untouched 16-bit RGB linear DNG plus a 16-bit grayscale infrared TIFF named with the -ir suffix. The DNG contains no embedded infrared."
+                : "Saves the untouched 16-bit RGB negative as linear DNG, with the untouched infrared plane embedded inside the file. No inversion, crop, color conversion, or dust removal is applied."
         }
-        return sessionModel.rawTiffInfrared == .fourthChannel
-            ? "Saves untouched 16-bit RGB plus infrared as an unspecified fourth TIFF channel. Some photo editors ignore or reject four-channel TIFF files."
-            : "Saves untouched 16-bit RGB only. For an IR-cleaned positive, keep the Positive output enabled; infrared is not baked into this raw file."
+        return switch sessionModel.rawTiffInfrared {
+        case .fourthChannel:
+            "Saves untouched 16-bit RGB plus infrared as an unspecified fourth TIFF channel. Some photo editors ignore or reject four-channel TIFF files."
+        case .sidecar:
+            "Saves an untouched 16-bit RGB TIFF plus a 16-bit grayscale infrared TIFF named with the -ir suffix."
+        case .omitted:
+            "Saves untouched 16-bit RGB only. For an IR-cleaned positive, keep the Positive output enabled; infrared is not baked into this raw file."
+        }
     }
 
     private var positiveOutputExplanation: String {
@@ -922,11 +933,26 @@ struct BatchInspectorView: View {
     }
 
     private var rawExportFormatBinding: Binding<RawExportFormat> {
-        Binding(get: { sessionModel.rawExportFormat }, set: { sessionModel.rawExportFormat = $0 })
+        Binding(
+            get: { sessionModel.rawExportFormat },
+            set: {
+                sessionModel.rawExportFormat = $0
+                if $0 == .linearDng && sessionModel.rawTiffInfrared == .omitted {
+                    sessionModel.rawTiffInfrared = .fourthChannel
+                }
+            }
+        )
     }
 
     private var rawTiffInfraredBinding: Binding<RawTiffInfrared> {
-        Binding(get: { sessionModel.rawTiffInfrared }, set: { sessionModel.rawTiffInfrared = $0 })
+        Binding(
+            get: {
+                sessionModel.rawExportFormat == .linearDng
+                    && sessionModel.rawTiffInfrared == .omitted
+                    ? .fourthChannel : sessionModel.rawTiffInfrared
+            },
+            set: { sessionModel.rawTiffInfrared = $0 }
+        )
     }
 
     private var positiveTiffFolderNameBinding: Binding<String> {

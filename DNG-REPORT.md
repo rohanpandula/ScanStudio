@@ -2,152 +2,127 @@
 
 ## Outcome
 
-ScanStudio now has an opt-in **Raw negative** output throughout the macOS app, engine, bridge, and CoolscanPy writer. It can produce:
+Raw export now has a third infrared policy, `sidecar`, for both main formats. With captured IR it writes a fail-closed pair: the untouched RGB main export and a same-size 16-bit grayscale TIFF named `{main-stem}-ir.tif`. The DNG main has no embedded IR SubIFD in this mode; the TIFF main uses the existing RGB-only layout. The sidecar carries the established private ASCII tag 65001 marker `scanstudio.infrared.linear.uint16.v1`, Orientation 1, and capture-matching X/Y resolution in inches.
 
-- a 16-bit, three-channel LinearRaw DNG with the untouched infrared plane embedded as a grayscale SubIFD;
-- a 16-bit linear TIFF with interleaved R, G, B, IR samples and one unspecified `ExtraSamples` channel; or
-- a 16-bit linear RGB TIFF with infrared omitted.
+All established branches remain on their existing encoders and layouts: DNG with embedded IR SubIFD, four-channel RGBI TIFF with `ExtraSamples=0`, and RGB-only TIFF with no IR. Raw export still performs no inversion, color conversion, crop, rotation, flip, Digital ICE, Nikonlook, ICC assignment, rescaling, or requantization.
 
-The real-hardware export is written from the original contiguous `numpy.uint16` RGB and IR arrays before the bridge reports the frame complete. It does not invert, color-convert, crop, rotate, flip, rescale, dust-clean, or requantize those arrays. The existing Positive output remains the honest route for an inverted or IR-cleaned rendered image.
+## Exact option surface
 
-The feature is additive. Raw export defaults off in new and legacy recipes, and existing Master/Positive/Preview writers are not entered through a new code path when it is disabled. Legacy project manifests are migrated to a disabled, project-local Raw Negative destination.
+The serialized recipe remains `OutputRecipe.rawExport` with `fileFormat: linearDng|linearTiff` and the compatibility-preserving field `tiffInfrared: fourthChannel|omitted|sidecar`.
 
-## Container contract and converter expectations
+| App choice | Recipe | Captured-IR artifacts | No-IR behavior |
+| --- | --- | --- | --- |
+| Linear DNG / Inside the DNG | `linearDng` + legacy `fourthChannel` or `omitted` | RGB LinearRaw DNG with grayscale IR SubIFD | RGB LinearRaw DNG without SubIFD |
+| Linear DNG / Separate grayscale TIFF | `linearDng` + `sidecar` | RGB LinearRaw DNG without SubIFD + `{stem}-ir.tif` | Same RGB-only DNG; no sidecar |
+| Linear TIFF / Fourth channel | `linearTiff` + `fourthChannel` | One interleaved RGBI TIFF | Rejected before motion |
+| Linear TIFF / Separate grayscale TIFF | `linearTiff` + `sidecar` | Existing RGB-only TIFF + `{stem}-ir.tif` | Same RGB-only TIFF; no sidecar |
+| Linear TIFF / Omit (RGB only) | `linearTiff` + `omitted` | Existing RGB-only TIFF | Same RGB-only TIFF |
 
-The DNG is classic little-endian TIFF with uncompressed strips. Its first IFD is full-resolution, chunky RGB with `BitsPerSample=16`, `SamplesPerPixel=3`, `PhotometricInterpretation=34892` (`LinearRaw`), DNG version 1.4, backward version 1.1, full-image crop/active-area tags, zero black level, 65535 white level, and scanner identity. `SampleFormat` is unsigned integer through TIFF's default value of 1. An identity `ColorMatrix1`, unknown calibration illuminant, and neutral balance are deliberately transparent interoperability metadata, not a claim of measured scanner calibration.
+The Batch inspector and per-frame output editor use plain-English “Infrared” pickers. DNG shows “Inside the DNG” and “Separate grayscale TIFF”; TIFF additionally shows “Omit (RGB only).” A legacy DNG recipe containing `omitted` is displayed as “Inside the DNG” without rewriting the persisted recipe.
 
-A normal DNG/LibRaw-family importer is expected to open the first IFD as the uninverted RGB negative. It should not need to understand the infrared extension. When IR was captured, TIFF tag 330 points to a same-size, 16-bit BlackIsZero SubIFD. That SubIFD carries private ASCII tag 65001 with `scanstudio.infrared.linear.uint16.v1`; a TIFF-aware NegPy or other scanner converter can follow tag 330 and verify tag 65001 before consuming the IR samples. Generic raw processors are expected to ignore the SubIFD and are not expected to perform IR dust removal from it.
+## Publication and receipts
 
-The four-channel TIFF uses RGB photometric interpretation, `SamplesPerPixel=4`, and `ExtraSamples=0`; its sample order is R, G, B, IR. Software with incomplete multi-sample TIFF support may reject or ignore the IR channel, which is why the explicit RGB-only TIFF choice exists.
+The bridge derives the sidecar name only after normalizing and resolving the main target. Both names join the capture-wide, case-folded collision check and are exclusively reserved before motion. The main is encoded, flushed, and synced first; the sidecar is then encoded, flushed, and synced. Neither reservation is marked written until both operations finish. Any main or sidecar exception identity-checks and removes both raw reservations, including a completely written main, and the frame callback never emits a receipt for the pair.
 
-Unit tests parse the produced IFDs back, follow the DNG SubIFD, assert tag values, and compare nontrivial 16-bit fixtures sample-for-sample, including zero and 65535. Simulator output implements the same observable container layout without adding a dependency.
+Simulator pairs use synced same-directory temporary files and create-only hard-link publication. If sidecar publication fails after the main final name exists, both pair names are removed. Existing single-file simulator branches retain their prior create-only path.
 
-## Fail-closed behavior
+The bridge receipt adds optional `rawExportIrPath` next to `rawExportPath`. The Rust engine validates both reported paths against its preflight plan before persistence or private-capture cleanup, then records them as `WrittenOutputs.rawNegativePath` and `rawNegativeIrPath`. Swift decodes both paths and defaults the new field to absent for older receipts.
 
-Every possible real output path, including raw output and per-frame overrides, is normalized, collision-checked, and exclusively reserved before scanner motion. Encoding uses that reservation's open, identity-checked descriptor. A raw path enters a receipt only after the full encode, DNG LinearRaw patch, flush, and sync succeed. A failed write removes only the bridge-owned incomplete reservation and cannot emit a successful frame completion.
+## Test coverage added
 
-The engine independently validates the bridge's returned raw path against the materialized recipe before it persists success or retires private capture evidence. Simulator publication uses a same-directory temporary file and create-only final publication.
+- Python domain round trips cover the `sidecar` enum and both bridge receipt paths.
+- Bridge reservation tests cover deterministic `-ir.tif` naming, pre-motion sidecar collision cleanup, and no sidecar reservation for RGB capture.
+- Mock and real bridge tests byte-parse DNG and TIFF sidecar pairs, checking three-sample main layout, absent DNG SubIFD, one-sample BlackIsZero sidecar, 16-bit values, marker, orientation, matching DPI, and sample-for-sample round trip.
+- Failure injection makes the DNG main succeed and the sidecar TIFF write fail; the test proves there is no receipt, main orphan, or sidecar orphan.
+- Rust byte parsers cover both sidecar main formats, grayscale sidecar tags/DPI/marker/samples, and the no-IR fallback. A publication hook fails after the main final name exists and proves both final names are removed.
+- Rust bridge-plan and integration coverage proves both real-backend receipt paths are validated, persisted, and point to existing files.
+- Swift recipe, receipt, session-model, and size-estimator tests cover the new policy and paired path.
 
 ## Files changed and current line counts
 
-The user prohibited git commands, so these are current whole-file line counts, not added/deleted diff statistics.
+These are whole-file line counts because Git commands were prohibited; they are not diff statistics.
 
-### Design and protocol documentation
+### Design and protocol
 
-- `DNG-PLAN.md` — 173 lines before this report's final reconciliation check.
-- `app/ScanStudio/protocol/PROTOCOL.md` — 335 lines.
-- `app/ScanStudio/protocol/BRIDGE.md` — 429 lines.
-- `DNG-REPORT.md` — see the final line-count note at the end of this file.
-
-### CoolscanPy writer and tests
-
-- `coolscanpy/src/coolscanpy/io/encoders.py` — 420 lines.
-- `coolscanpy/tests/io/test_encoders.py` — 384 lines.
+- `DNG-PLAN.md` — 189 lines.
+- `DNG-REPORT.md` — see final note.
+- `app/ScanStudio/protocol/PROTOCOL.md` — 336 lines.
+- `app/ScanStudio/protocol/BRIDGE.md` — 453 lines.
 
 ### Python bridge and tests
 
-- `bridge/src/scanstudio_bridge/domain.py` — 416 lines.
-- `bridge/src/scanstudio_bridge/transport/output_reservation.py` — 402 lines.
-- `bridge/src/scanstudio_bridge/transport/coolscanpy_transport.py` — 1,088 lines.
-- `bridge/src/scanstudio_bridge/transport/mock.py` — 577 lines.
-- `bridge/tests/test_domain.py` — 452 lines.
-- `bridge/tests/test_transport_coolscanpy.py` — 2,535 lines.
-- `bridge/tests/test_transport_mock.py` — 868 lines.
+- `bridge/src/scanstudio_bridge/domain.py` — 464 lines.
+- `bridge/src/scanstudio_bridge/transport/output_reservation.py` — 455 lines.
+- `bridge/src/scanstudio_bridge/transport/coolscanpy_transport.py` — 1,611 lines.
+- `bridge/src/scanstudio_bridge/transport/mock.py` — 732 lines.
+- `bridge/tests/test_domain.py` — 459 lines.
+- `bridge/tests/test_transport_coolscanpy.py` — 3,301 lines.
+- `bridge/tests/test_transport_mock.py` — 1,126 lines.
 
 ### Rust engine and tests
 
-- `app/ScanStudio/engine/src/domain.rs` — 2,013 lines.
-- `app/ScanStudio/engine/src/bridge_protocol.rs` — 996 lines.
-- `app/ScanStudio/engine/src/render.rs` — 5,783 lines.
-- `app/ScanStudio/engine/src/real_backend.rs` — 6,218 lines.
-- `app/ScanStudio/engine/src/manifest.rs` — 1,654 lines.
-- `app/ScanStudio/engine/src/sim.rs` — 2,209 lines.
-- `app/ScanStudio/engine/src/exiftool.rs` — 582 lines.
-- `app/ScanStudio/engine/src/server.rs` — 3,839 lines.
-- `app/ScanStudio/engine/src/bin/mock_bridge.rs` — 1,252 lines.
-- `app/ScanStudio/engine/tests/real_backend_mapping.rs` — 2,574 lines.
+- `app/ScanStudio/engine/src/domain.rs` — 2,016 lines.
+- `app/ScanStudio/engine/src/bridge_protocol.rs` — 1,186 lines.
+- `app/ScanStudio/engine/src/render.rs` — 6,151 lines.
+- `app/ScanStudio/engine/src/real_backend.rs` — 6,473 lines.
+- `app/ScanStudio/engine/src/sim.rs` — 2,847 lines.
+- `app/ScanStudio/engine/src/exiftool.rs` — 583 lines.
+- `app/ScanStudio/engine/src/bin/mock_bridge.rs` — 1,351 lines.
+- `app/ScanStudio/engine/tests/real_backend_mapping.rs` — 2,590 lines.
 
 ### Swift app and tests
 
-- `app/ScanStudio/Sources/ScanStudioKit/WireProtocol.swift` — 1,557 lines.
-- `app/ScanStudio/Sources/ScanStudioKit/SessionModel.swift` — 4,596 lines.
-- `app/ScanStudio/Sources/ScanStudioKit/CaptureWorkflowSupport.swift` — 392 lines.
-- `app/ScanStudio/Sources/ScanStudio/BatchInspectorView.swift` — 1,865 lines.
-- `app/ScanStudio/Sources/ScanStudio/FrameDetailWorkspaceView.swift` — 2,043 lines.
+- `app/ScanStudio/Sources/ScanStudioKit/WireProtocol.swift` — 1,624 lines.
+- `app/ScanStudio/Sources/ScanStudioKit/SessionModel.swift` — 4,777 lines.
+- `app/ScanStudio/Sources/ScanStudio/BatchInspectorView.swift` — 1,891 lines.
+- `app/ScanStudio/Sources/ScanStudio/FrameDetailWorkspaceView.swift` — 2,058 lines.
 - `app/ScanStudio/Tests/ScanStudioKitTests/FixtureDecodingTests.swift` — 184 lines.
-- `app/ScanStudio/Tests/ScanStudioKitTests/ProjectWireProtocolTests.swift` — 541 lines.
-- `app/ScanStudio/Tests/ScanStudioKitTests/CaptureWorkflowSupportTests.swift` — 150 lines.
+- `app/ScanStudio/Tests/ScanStudioKitTests/ProjectWireProtocolTests.swift` — 543 lines.
+- `app/ScanStudio/Tests/ScanStudioKitTests/CaptureWorkflowSupportTests.swift` — 157 lines.
 - `app/ScanStudio/Tests/ScanStudioKitTests/SessionEventPolicyTests.swift` — 3,268 lines.
+
+No CoolscanPy source file changed. The sidecar writer is bridge-owned and reuses tifffile already present there; DNG main encoding continues to call the existing CoolscanPy writer.
 
 ## Verification results
 
-Final writer and bridge runs:
+CoolscanPy full suite:
 
 ```text
-1545 passed, 3 skipped, 1 xfailed in 270.70s (0:04:30)
-298 passed in 1.74s
+1648 passed, 4 skipped, 1 xfailed in 286.06s (0:04:46)
+```
+
+Bridge full suite and Ruff over its touched Python source/tests:
+
+```text
+335 passed in 3.13s
 All checks passed!
-All checks passed!
 ```
 
-Those lines are from `uv run pytest` in `coolscanpy`, `uv run pytest` in `bridge`, and Ruff checks of the touched CoolscanPy paths and the complete bridge `src tests` trees.
-
-The Rust engine's complete suite passed. The principal library summary and raw-path real-backend integration summary were:
+Rust full suite, including the principal library, real-backend end-to-end, and real mapping summaries:
 
 ```text
-test result: ok. 369 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.41s
-test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.60s
+test result: ok. 403 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.14s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.70s
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.59s
 ```
 
-Other Rust test binaries also passed; two existing corpus/hardware-dependent tests remained explicitly ignored.
+Every other Rust test binary passed. The two established real-archive tests remained explicitly ignored because their environment variables and corpus captures were not supplied.
 
-The sandbox-compatible Swift run excluding the two disk-image update tests passed:
+Swift used writable `/tmp` caches, `--disable-sandbox`, and an exact skip regex for only the two disk-image tests whose `hdiutil create` operation is blocked in this sandbox. The other 20 `UpdateServiceTests` ran and passed:
 
 ```text
-Test run with 421 tests in 43 suites passed after 0.258 seconds.
+Executed 57 tests, with 0 failures (0 unexpected) in 0.297 (0.301) seconds
+Test run with 459 tests in 46 suites passed after 0.252 seconds.
 ```
-
-The raw/settings-focused Swift filter also passed:
-
-```text
-Test run with 6 tests in 3 suites passed after 0.068 seconds.
-```
-
-The requested top-level `make test` was run. Its Rust phase passed, but its unmodified `/usr/bin/swift test` invocation could not compile the package manifest because the nested SwiftPM sandbox cannot start inside this workspace sandbox:
-
-```text
-sandbox-exec: sandbox_apply: Operation not permitted
-error: ExitCode(rawValue: 1)
-make: *** [app-test] Error 2
-```
-
-Running SwiftPM with `--disable-sandbox` allows the tests to execute. The unfiltered run then had only two failures, both pre-existing update tests whose fixture setup invokes a blocked macOS disk-image operation:
-
-```text
-Executed 59 tests, with 2 failures (2 unexpected) in 2.584 (2.589) seconds
-Error Domain=UpdateServiceTests Code=1 "hdiutil create failed (status 1)"
-Test run with 421 tests in 43 suites passed after 0.248 seconds.
-```
-
-Excluding `UpdateServiceTests` produces the fully green 421-test Swift result above. All feature source and tests compile in both sandbox-compatible invocations.
 
 ## Deliberately not done
 
-- No new Python, Rust, or Swift dependency was added.
-- No existing Master, Positive, or Preview output was rewritten or redirected.
-- No “baked-in raw” mode was added. Dust-cleaning or inversion changes pixels, so the existing Positive output owns that behavior.
-- ExifTool is not run on raw negative files. Post-write metadata mutation would weaken the untouched, fail-closed raw contract; the DNG/TIFF writers supply their structural scanner metadata directly.
-- No compression was introduced. Uncompressed strips keep the writer small and the byte contract easy to validate, at the cost of larger files.
-- No measured scanner-to-XYZ color calibration was invented.
-- No physical scanner capture was attempted in the test environment.
-- NegPy, dcraw, RawTherapee, darktable, and LibRaw executables were not available in the worktree, and network access was forbidden. No external-application smoke-test claim is made.
-- The cross-platform Tauri port was not changed; the requested surface was the macOS SwiftUI app plus its shared Rust engine and Python capture stack.
+- No Git command was run, no GitHub content was posted, and no network access was used.
+- No dependency was added and no existing output compression or color metadata policy changed.
+- No converter or physical-scanner smoke test was attempted. NegPy, LibRaw, RawTherapee, darktable, and dcraw are not vendored here, so compatibility remains a container-shape expectation rather than an external test claim.
+- No standardized DNG meaning for scanner IR was claimed; the existing private, versioned tag remains the opt-in interoperability marker.
+- The serialized field was not renamed from `tiffInfrared`, preserving legacy recipes even though `sidecar` now applies to DNG too.
+- No empty, synthetic, or placeholder sidecar is emitted when IR was not captured.
+- The two `UpdateServiceTests` that require creating disk images were not run; every other Swift test ran green with the sandbox workaround.
 
-## Open questions for the owner
-
-1. Should tag 65001 remain a ScanStudio-private IR marker, or should a future release publish a small external interoperability note and reserve a different tag through an appropriate registry?
-2. Is there a measured LS-5000 scanner-to-XYZ calibration the project wants to ship later? If so, it can replace the identity matrix without changing raw samples or the IR layout.
-3. Which converter/version matrix should be release-gated on real exported frames? A practical manual matrix would include NegPy plus current LibRaw, RawTherapee, and darktable builds.
-4. Is uncompressed output the preferred first release tradeoff, or should lossless compression be a later opt-in after converter testing?
-
-Final report line count: 153 lines.
+Final report line count: 128 lines.

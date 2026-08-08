@@ -461,6 +461,7 @@ mod tests {
                 positive_path: Some("/Scans/Positive/ScanStudio1.tif".into()),
                 preview_path: Some("/Scans/Preview/ScanStudio1.jpg".into()),
                 raw_negative_path: None,
+                raw_negative_ir_path: None,
                 derivative_transform: crate::domain::DerivativeTransform::default(),
             }),
             rgb_path: None,

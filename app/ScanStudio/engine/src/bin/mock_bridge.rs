@@ -1206,7 +1206,21 @@ fn fixed_scan_receipt(
             .expect("mock bridge must create its requested raw output directory");
         tile.save_with_format(&path, image::ImageFormat::Tiff)
             .expect("mock bridge must create its reported raw export fixture");
-        path.display().to_string()
+        path
+    });
+    let raw_export_ir_path = raw_export.zip(raw_export_path.as_ref()).and_then(|(spec, raw)| {
+        (channels == BridgeChannels::Rgbi
+            && spec.tiff_infrared == BridgeRawTiffInfrared::Sidecar)
+            .then(|| {
+                let stem = raw
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .expect("mock raw output has a UTF-8 stem");
+                let path = raw.with_file_name(format!("{stem}-ir.tif"));
+                tile.save_with_format(&path, image::ImageFormat::Tiff)
+                    .expect("mock bridge must create its reported raw IR fixture");
+                path.display().to_string()
+            })
     });
 
     BridgeScanReceipt {
@@ -1257,7 +1271,8 @@ fn fixed_scan_receipt(
         rgb_path: rgb_path.display().to_string(),
         ir_path: ir_path.map(|path| path.display().to_string()),
         meter_rgbi_path: Some(meter_path.display().to_string()),
-        raw_export_path,
+        raw_export_path: raw_export_path.map(|path| path.display().to_string()),
+        raw_export_ir_path,
         attempts_root: None,
         exposure_authority: None,
         started_at: Some("2026-08-02T20:05:00+00:00".to_string()),

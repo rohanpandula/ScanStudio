@@ -968,15 +968,19 @@ struct FrameDetailWorkspaceView: View {
                         Text("Linear TIFF").tag(RawExportFormat.linearTiff)
                     }
                 }
-                if outputDraft?.rawExport.fileFormat == .linearTiff {
-                    InspectorSettingRow(label: "Infrared") {
-                        Picker("Infrared", selection: outputRawTiffInfraredBinding) {
+                InspectorSettingRow(label: "Infrared") {
+                    Picker("Infrared", selection: outputRawTiffInfraredBinding) {
+                        if outputDraft?.rawExport.fileFormat == .linearDng {
+                            Text("Inside the DNG").tag(RawTiffInfrared.fourthChannel)
+                            Text("Separate grayscale TIFF").tag(RawTiffInfrared.sidecar)
+                        } else {
                             Text("Fourth channel").tag(RawTiffInfrared.fourthChannel)
+                            Text("Separate grayscale TIFF").tag(RawTiffInfrared.sidecar)
                             Text("Omit (RGB only)").tag(RawTiffInfrared.omitted)
                         }
                     }
                 }
-                Text("This is the untouched 16-bit negative. DNG embeds infrared; TIFF follows the infrared choice above. Processing and geometry settings do not alter it.")
+                Text("This is the untouched 16-bit negative. Infrared can stay in the main file or use a separate grayscale TIFF with the -ir suffix. Processing and geometry settings do not alter it.")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.scanStudioSecondaryText)
                 InspectorTextFieldRow(label: "Naming", text: outputRawFilenameBinding)
@@ -1476,13 +1480,24 @@ struct FrameDetailWorkspaceView: View {
             get: { outputDraft?.rawExport.fileFormat ?? sessionModel.outputRecipe.rawExport.fileFormat },
             set: { newValue in
                 guard let current = outputDraft else { return }
-                outputDraft = current.with(rawExport: current.rawExport.with(fileFormat: newValue))
+                let infrared: RawTiffInfrared? = newValue == .linearDng
+                    && current.rawExport.tiffInfrared == .omitted ? .fourthChannel : nil
+                outputDraft = current.with(
+                    rawExport: current.rawExport.with(
+                        fileFormat: newValue,
+                        tiffInfrared: infrared
+                    )
+                )
             }
         )
     }
     private var outputRawTiffInfraredBinding: Binding<RawTiffInfrared> {
         Binding(
-            get: { outputDraft?.rawExport.tiffInfrared ?? sessionModel.outputRecipe.rawExport.tiffInfrared },
+            get: {
+                let raw = outputDraft?.rawExport ?? sessionModel.outputRecipe.rawExport
+                return raw.fileFormat == .linearDng && raw.tiffInfrared == .omitted
+                    ? .fourthChannel : raw.tiffInfrared
+            },
             set: { newValue in
                 guard let current = outputDraft else { return }
                 outputDraft = current.with(rawExport: current.rawExport.with(tiffInfrared: newValue))

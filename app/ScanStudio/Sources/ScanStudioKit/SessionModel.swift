@@ -297,15 +297,17 @@ public enum ScanSizeEstimator {
         uncompressedBytes(carrier: carrier, resolutionDpi: resolutionDpi, bitDepth: bitDepth, colorChannels: 3)
     }
 
-    /// Raw negatives are always 16-bit. DNG always embeds IR; TIFF does so
-    /// only in fourth-channel mode. Container metadata is negligible here.
+    /// Raw negatives are always 16-bit. Embedded/fourth-channel and paired
+    /// sidecar modes all retain four total samples. Metadata is negligible.
     public static func rawExportBytesPerFrame(
         carrier: SimulatedFilmCarrier,
         resolutionDpi: Int,
         fileFormat: RawExportFormat,
         tiffInfrared: RawTiffInfrared
     ) -> Int {
-        let channels = fileFormat == .linearDng || tiffInfrared == .fourthChannel ? 4 : 3
+        let channels = fileFormat == .linearDng
+            || tiffInfrared == .fourthChannel
+            || tiffInfrared == .sidecar ? 4 : 3
         return uncompressedBytes(
             carrier: carrier,
             resolutionDpi: resolutionDpi,
