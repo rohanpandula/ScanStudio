@@ -1,6 +1,7 @@
 import AppKit
 import ScanStudioKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct BatchInspectorView: View {
     @Environment(SessionModel.self) private var sessionModel
@@ -326,6 +327,60 @@ struct BatchInspectorView: View {
                 InspectorSettingRow(label: "Color setting") {
                     Picker("Color setting", selection: positiveColorProfileBinding) {
                         Text("Current engine default").tag(OutputColorProfile.adobeRgb1998)
+                    }
+                }
+                if sessionModel.scanFilmProcess == .c41ColorNegative {
+                        InspectorSettingRow(label: "C-41 renderer") {
+                            Picker("C-41 renderer", selection: c41RenderGroupBinding) {
+                                Text("Nikon Scan").tag(C41RenderTarget.nikonlook)
+                                Text("XXX (Testing)").tag(C41RenderTarget.noritsuLs600)
+                        }
+                    }
+                    if sessionModel.c41RenderTarget != .nikonlook {
+                        InspectorSettingRow(label: "Testing pipeline") {
+                            Picker("Testing pipeline", selection: c41RenderTargetBinding) {
+                                Text("Noritsu Lab").tag(C41RenderTarget.noritsuLs600)
+                                Text("Flextight").tag(C41RenderTarget.flexcolorCleanroom)
+                            }
+                        }
+                    }
+                    if sessionModel.c41RenderTarget == .nikonlook {
+                        externalDirectoryField(
+                            label: "Cool Colors folder",
+                            path: coolColorsCheckoutPathBinding,
+                            prompt: "Choose your local Cool Colors checkout"
+                        )
+                        externalPathField(label: "Builder LUT — red", path: coolColorsBuilderRedPathBinding, prompt: "Choose the matching red builder LUT", types: ["npy"])
+                        externalPathField(label: "Builder LUT — green", path: coolColorsBuilderGreenPathBinding, prompt: "Choose the matching green builder LUT", types: ["npy"])
+                        externalPathField(label: "Builder LUT — blue", path: coolColorsBuilderBluePathBinding, prompt: "Choose the matching blue builder LUT", types: ["npy"])
+                        Text("Use the three matching builder files to make ScanStudio Nikon match Nikon Scan. Without them, ScanStudio uses its built-in Nikon look.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.scanStudioSecondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if sessionModel.c41RenderTarget == .flexcolorCleanroom {
+                        externalPathField(
+                            label: "Film recipe",
+                            path: flexColorImageSettingPathBinding,
+                            prompt: "Choose ImageSetting Recipe",
+                            types: ["xml", "plist"]
+                        )
+                        externalPathField(
+                            label: "LUTTable",
+                            path: flexColorLutTablePathBinding,
+                            prompt: "Choose LUTTable Profile",
+                            types: ["xml", "plist"]
+                        )
+                        externalPathField(
+                            label: "Input ICC",
+                            path: flexColorInputIccPathBinding,
+                            prompt: "Choose Flextight Input ICC",
+                            types: ["icc", "icm"]
+                        )
+                        Text("Uses your external FlexColor files; their contents are never copied into the project.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.scanStudioSecondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 Text(positiveOutputExplanation)
@@ -904,6 +959,71 @@ struct BatchInspectorView: View {
     }
 
     @ViewBuilder
+    private func externalPathField(label: String, path: Binding<String>, prompt: String, types: [String]) -> some View {
+        InspectorSettingRow(label: label) {
+            HStack(spacing: 6) {
+                Text(path.wrappedValue.isEmpty ? "Not selected" : URL(fileURLWithPath: path.wrappedValue).lastPathComponent)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(path.wrappedValue.isEmpty ? Color.scanStudioSecondaryText : .primary)
+                Spacer(minLength: 0)
+                Button("Choose…") {
+                    chooseExternalFile(prompt: prompt, types: types, path: path)
+                }
+                .controlSize(.small)
+                if !path.wrappedValue.isEmpty {
+                    Button("Clear") { path.wrappedValue = "" }
+                        .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private func chooseExternalFile(prompt: String, types: [String], path: Binding<String>) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = types.compactMap { UTType(filenameExtension: $0) }
+        panel.prompt = "Use This File"
+        panel.message = prompt
+        if panel.runModal() == .OK, let url = panel.url {
+            path.wrappedValue = url.path
+        }
+    }
+
+    @ViewBuilder
+    private func externalDirectoryField(label: String, path: Binding<String>, prompt: String) -> some View {
+        InspectorSettingRow(label: label) {
+            HStack(spacing: 6) {
+                Text(path.wrappedValue.isEmpty ? "Not selected" : URL(fileURLWithPath: path.wrappedValue).lastPathComponent)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(path.wrappedValue.isEmpty ? Color.scanStudioSecondaryText : .primary)
+                Spacer(minLength: 0)
+                Button("Choose…") { chooseExternalDirectory(prompt: prompt, path: path) }
+                    .controlSize(.small)
+                if !path.wrappedValue.isEmpty {
+                    Button("Clear") { path.wrappedValue = "" }
+                        .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private func chooseExternalDirectory(prompt: String, path: Binding<String>) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use This Folder"
+        panel.message = prompt
+        if panel.runModal() == .OK, let url = panel.url {
+            path.wrappedValue = url.path
+        }
+    }
+
+    @ViewBuilder
     private func outputDisclosure<Content: View>(
         title: String,
         isEnabled: Binding<Bool>,
@@ -1028,6 +1148,59 @@ struct BatchInspectorView: View {
 
     private var positiveColorProfileBinding: Binding<OutputColorProfile> {
         Binding(get: { sessionModel.positiveColorProfile }, set: { sessionModel.positiveColorProfile = $0 })
+    }
+
+    private var c41RenderTargetBinding: Binding<C41RenderTarget> {
+        Binding(get: { sessionModel.c41RenderTarget }, set: { sessionModel.c41RenderTarget = $0 })
+    }
+
+    /// The UI intentionally presents all non-Nikon experimental paths under
+    /// one clearly marked target. Selecting it defaults to the Noritsu style;
+    /// the secondary picker chooses the concrete testing pipeline.
+    private var c41RenderGroupBinding: Binding<C41RenderTarget> {
+        Binding(
+            get: {
+                switch sessionModel.c41RenderTarget {
+                case .nikonlook, .nikonOemReplay: .nikonlook
+                case .noritsuLs600, .flexcolorCleanroom: .noritsuLs600
+                }
+            },
+            set: { target in
+                if target == .nikonlook {
+                    sessionModel.c41RenderTarget = .nikonlook
+                } else if sessionModel.c41RenderTarget == .nikonlook {
+                    sessionModel.c41RenderTarget = .noritsuLs600
+                }
+            }
+        )
+    }
+
+    private var flexColorImageSettingPathBinding: Binding<String> {
+        Binding(get: { sessionModel.flexColorImageSettingPath }, set: { sessionModel.flexColorImageSettingPath = $0 })
+    }
+
+    private var flexColorLutTablePathBinding: Binding<String> {
+        Binding(get: { sessionModel.flexColorLutTablePath }, set: { sessionModel.flexColorLutTablePath = $0 })
+    }
+
+    private var flexColorInputIccPathBinding: Binding<String> {
+        Binding(get: { sessionModel.flexColorInputIccPath }, set: { sessionModel.flexColorInputIccPath = $0 })
+    }
+
+    private var coolColorsCheckoutPathBinding: Binding<String> {
+        Binding(get: { sessionModel.coolColorsCheckoutPath }, set: { sessionModel.coolColorsCheckoutPath = $0 })
+    }
+
+    private var coolColorsBuilderRedPathBinding: Binding<String> {
+        Binding(get: { sessionModel.coolColorsBuilderRedPath }, set: { sessionModel.coolColorsBuilderRedPath = $0 })
+    }
+
+    private var coolColorsBuilderGreenPathBinding: Binding<String> {
+        Binding(get: { sessionModel.coolColorsBuilderGreenPath }, set: { sessionModel.coolColorsBuilderGreenPath = $0 })
+    }
+
+    private var coolColorsBuilderBluePathBinding: Binding<String> {
+        Binding(get: { sessionModel.coolColorsBuilderBluePath }, set: { sessionModel.coolColorsBuilderBluePath = $0 })
     }
 
     private var positiveFilenameTemplateBinding: Binding<String> {
