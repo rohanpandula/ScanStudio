@@ -6569,6 +6569,12 @@ mod tests {
         assert_eq!(params.output.filename_template, "ScanStudio#.tif");
     }
 
+    fn recipe_for_wsl_plan_tests() -> CaptureRecipe {
+        // The staged-plan tests predate the recipe parameter; any valid
+        // recipe works because raw export stays disabled in their outputs.
+        CaptureRecipe::default()
+    }
+
     #[test]
     fn production_wsl_plan_stages_in_linux_and_keeps_native_final_paths() {
         let mut output = OutputRecipe::default();
@@ -6580,6 +6586,7 @@ mod tests {
 
         let plan = build_real_capture_plan(
             &[1, 2],
+            &recipe_for_wsl_plan_tests(),
             &output,
             &std::collections::HashMap::new(),
             Some(&config),
@@ -6606,6 +6613,57 @@ mod tests {
     }
 
     #[test]
+    fn production_wsl_plan_refuses_raw_export_base_and_per_slot() {
+        // Post-release adversarial review C1: the staged lane's raw refusal
+        // must cover both the base output and per-slot overrides -- staging
+        // a capture whose promised raw files would never be written is the
+        // silent half-delivery this lane exists to refuse.
+        let config = crate::wsl_io::WslBridgeConfig {
+            distro: crate::wsl_io::DEFAULT_WSL_DISTRO.to_string(),
+        };
+        let mut output = OutputRecipe::default();
+        output.archive.destination = r"C:\Users\test-user\Scans".into();
+        output.archive.filename_template = "Archive_####".into();
+        output.raw_export.enabled = true;
+        let base_err = build_real_capture_plan(
+            &[1],
+            &recipe_for_wsl_plan_tests(),
+            &output,
+            &std::collections::HashMap::new(),
+            Some(&config),
+        )
+        .expect_err("base raw export must refuse on the staged lane");
+        assert_eq!(base_err.code, ErrorCode::InvalidParams);
+        assert!(base_err.message.contains("raw negative export"));
+
+        let mut base_only = OutputRecipe::default();
+        base_only.archive.destination = r"C:\Users\test-user\Scans".into();
+        base_only.archive.filename_template = "Archive_####".into();
+        let mut override_output = base_only.clone();
+        override_output.raw_export.enabled = true;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            1u32,
+            domain::FrameOverrides {
+                capture: None,
+                processing: None,
+                output: Some(override_output),
+                alignment: None,
+            },
+        );
+        let slot_err = build_real_capture_plan(
+            &[1],
+            &recipe_for_wsl_plan_tests(),
+            &base_only,
+            &overrides,
+            Some(&config),
+        )
+        .expect_err("per-slot raw override must refuse on the staged lane");
+        assert_eq!(slot_err.code, ErrorCode::InvalidParams);
+        assert!(slot_err.message.contains("raw negative export"));
+    }
+
+    #[test]
     fn production_wsl_plan_rejects_unmappable_destination_before_dispatch() {
         let mut output = OutputRecipe::default();
         output.archive.destination = r"relative\Scans".into();
@@ -6615,6 +6673,7 @@ mod tests {
 
         let error = build_real_capture_plan(
             &[1],
+            &recipe_for_wsl_plan_tests(),
             &output,
             &std::collections::HashMap::new(),
             Some(&config),

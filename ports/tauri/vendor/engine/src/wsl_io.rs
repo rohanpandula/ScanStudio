@@ -868,6 +868,8 @@ mod tests {
             version: 1,
             slot: 1,
             spacing_offset: 0,
+            raw_export_path: None,
+            raw_export_ir_path: None,
             dpi: 4000,
             depth: 16,
             device_id: "ls5000-usb-0".into(),
