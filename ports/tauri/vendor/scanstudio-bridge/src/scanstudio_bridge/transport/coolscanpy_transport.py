@@ -12,6 +12,7 @@ level -- every other module stays hardware-library-free.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -456,69 +457,88 @@ def _scan_receipt_from_coolscanpy(
 # -- Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): manual frame placement --
 #
 # manual_frames()/preview_strip() below both need a ValidatedRollPreview from
-# the LAST preview attempt on this Roll -- successful or refused -- purely
+# the CURRENT preview attempt on this Roll -- successful or refused -- purely
 # from what is already on disk under attempts_root, with no hardware call and
 # no dependence on whatever self._roll's own in-memory state currently holds
 # (a refused preview leaves self._roll without a usable session at all). The
-# three helpers below do exactly that, in three separate steps mirroring
-# preview_session.py's own internal shape: locate the attempt directory,
-# reconstruct its CaptureAttemptResult from disk, then validate+decode it
-# into a ValidatedRollPreview without ever calling detect_roll_frames.
+# helpers below do exactly that, in steps mirroring preview_session.py's own
+# internal shape: identify the exact attempt directory, reconstruct its
+# CaptureAttemptResult from disk, then validate+decode it into a
+# ValidatedRollPreview without ever calling detect_roll_frames.
+#
+# 2026-08-08 adversarial review, S5: identifying "the current attempt" used
+# to mean globbing every "preview-*/journal.json" under attempts_root and
+# trusting whichever had the newest st_mtime -- an unrelated process
+# touching an older attempt's journal, or a newer attempt failing before it
+# ever wrote one, could both make that glob silently resolve to stale
+# evidence with no signal anything was wrong. `CoolscanPyTransport.preview()`
+# now records the *identity* of each attempt itself, the moment that attempt
+# is known (see its own comment), instead of asking the filesystem to guess
+# afterward from timestamps. `_sole_new_attempt_journal` below is that
+# recording mechanism's own helper -- a pure before/after set difference,
+# never a modification-time comparison.
 
 
-def _last_preview_attempt_journal_path(attempts_root: Path) -> Path:
-    """The most recently written preview attempt's journal.json under
-    `attempts_root`. Mirrors exposure_authority._find_frame_attempt_
-    directory's own mtime-pick-and-refuse-on-tie pattern, applied to
-    CaptureMode.PREVIEW's own attempt-directory shape (one per roll.preview
-    call on this Roll -- see capture_process._prepare_attempt_paths) instead
-    of a batch frame directory."""
-    candidates = sorted(
-        attempts_root.glob(_PREVIEW_ATTEMPT_GLOB),
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not candidates:
-        raise BridgeError(
-            ErrorCode.NO_PREVIEW,
-            "no preview attempt evidence was found under this roll's "
-            "attempts directory; run roll.preview first",
-        )
-    if (
-        len(candidates) > 1
-        and candidates[-1].stat().st_mtime == candidates[-2].stat().st_mtime
-    ):
-        raise BridgeError(
-            ErrorCode.INTERNAL,
-            f"{len(candidates)} preview attempts under {attempts_root} are "
-            "mtime-indistinguishable; refusing to guess which one is current",
-        )
+def _sole_new_attempt_journal(
+    attempts_root: Path, attempt_journals_before: frozenset[Path]
+) -> Path | None:
+    """The one preview attempt journal that appeared under `attempts_root`
+    since `attempt_journals_before` was captured -- or `None` if the
+    just-finished `Roll.preview()` call left none (a hard failure before any
+    journal was ever written -- e.g. a bootstrap failure or a parked
+    feeder) or, astonishingly, more than one. Pure set membership against a
+    snapshot taken immediately before the call: unlike a modification-time
+    comparison, this cannot be fooled by an unrelated process touching an
+    older attempt's journal, and a newer attempt that never wrote a journal
+    simply never becomes a member of either set."""
+    attempt_journals_after = frozenset(attempts_root.glob(_PREVIEW_ATTEMPT_GLOB))
+    new_journals = attempt_journals_after - attempt_journals_before
+    if len(new_journals) != 1:
+        return None
+    (only,) = new_journals
     try:
         # Fully resolved (symlinks included, e.g. macOS /var -> /private/var)
         # -- preview_session._artifact_path requires every path it validates
         # to already equal its own .resolve() exactly, the same invariant
-        # _restore_roll_preview_session's own reconstruction depends on. A
-        # bare glob() result inherits attempts_root's own possibly-unresolved
-        # form, so it is resolved once, here, before anything downstream
-        # sees it.
-        return candidates[-1].resolve(strict=True)
-    except OSError as exc:
-        raise BridgeError(
-            ErrorCode.INTERNAL,
-            f"preview attempt journal is unavailable: {exc}",
-        ) from exc
+        # _restore_roll_preview_session's own reconstruction depends on.
+        return only.resolve(strict=True)
+    except OSError:
+        return None
 
 
-def _reconstruct_last_preview_attempt(attempts_root: Path) -> CaptureAttemptResult:
-    """Rebuild a CaptureAttemptResult purely from the persisted journal.json
-    of the most recent roll.preview attempt on this Roll -- no film
-    movement, no live coolscanpy.Roll state touched. Mirrors
+def _fsync_path(path: Path) -> None:
+    """fsync one file's own contents, then fsync its containing directory so
+    the directory entry itself is durable too -- the two-step durability a
+    bare write()/close() does not guarantee. 2026-08-08 adversarial review,
+    S1: every manual-placement thumbnail must actually be safely on disk,
+    not merely buffered, before this bridge ever mutates the driver's Roll
+    session state -- see manual_frames()'s own comment."""
+    file_descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+    directory_descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _reconstruct_preview_attempt(journal_path: Path) -> CaptureAttemptResult:
+    """Rebuild a CaptureAttemptResult purely from one already-identified
+    preview attempt's persisted journal.json -- no film movement, no live
+    coolscanpy.Roll state touched, and no selection logic of its own:
+    `journal_path` must already be the exact attempt
+    `CoolscanPyTransport.preview()` itself recorded (S5 fix, see this
+    module's own comment above) -- picking among candidates is the caller's
+    job, not this function's. Mirrors
     coolscanpy.roll.preview_session._restore_roll_preview_session's own
     attempt reconstruction (there, replaying an operator-approved AUTOMATIC
     session restored from RollPreviewSession.to_json()); this is the
     identical shape, sourced from disk directly instead of a saved session
     blob, because a refused preview never produced a session to serialize in
     the first place -- the journal on disk is the only surviving evidence."""
-    journal_path = _last_preview_attempt_journal_path(attempts_root)
     try:
         journal = json.loads(journal_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -628,6 +648,16 @@ class CoolscanPyTransport:
         # own copy is a private attribute) -- this is simply the value we
         # ourselves chose and passed in.
         self.attempts_root: Path | None = None
+        # 2026-08-08 adversarial review, S5: the resolved journal.json path
+        # of the CURRENT preview attempt -- the one this transport's own
+        # preview() call most recently confirmed produced evidence on disk,
+        # successful or completed-but-refused. `None` means either no
+        # preview() has run yet, or the most recent one left no usable
+        # evidence at all (a hard failure before any journal was written).
+        # manual_frames()/preview_strip() read only this recorded identity,
+        # never a fresh glob of attempts_root -- see preview()'s own
+        # comment for why a filesystem scan is no longer trusted here.
+        self._recorded_preview_attempt_journal: Path | None = None
 
     # -- device lifecycle -----------------------------------------------------
 
@@ -702,6 +732,7 @@ class CoolscanPyTransport:
         self._device_id = None
         self._material = None
         self._preview_established = False
+        self._recorded_preview_attempt_journal = None
 
     # -- preview / approve ------------------------------------------------------
 
@@ -728,6 +759,12 @@ class CoolscanPyTransport:
         # the moment a new attempt starts, the old session is gone whether
         # or not this attempt completes.
         self._preview_established = False
+        # S5 fix (see this module's comment above _sole_new_attempt_journal):
+        # invalidate whatever attempt was previously recorded as current the
+        # MOMENT a new attempt starts, before we know whether it will
+        # succeed -- never left pointing at stale evidence if this attempt
+        # fails to produce any of its own.
+        self._recorded_preview_attempt_journal = None
         if self._roll is not None and self._material != material:
             self._roll.close()
             self._roll = None
@@ -757,66 +794,84 @@ class CoolscanPyTransport:
                 material=translated, attempts_root=self.attempts_root
             )
 
+        # S5 fix: a snapshot taken immediately before the call, so the
+        # `finally` below can identify exactly which attempt (if any) THIS
+        # call itself produced -- by set membership, never by trusting
+        # whichever candidate happens to carry the newest mtime.
+        attempt_journals_before = frozenset(
+            self.attempts_root.glob(_PREVIEW_ATTEMPT_GLOB)
+        )
         try:
-            # A SINGLE blocking CoolscanPy call that returns the complete
-            # list once the whole-roll transport read finishes -- there is
-            # no per-thumbnail streaming under the hood. `on_thumbnail` is
-            # invoked once per item below, simulating the bridge's own
-            # one-event-per-slot wire behavior on top of this atomic call.
-            thumbnails = self._roll.preview(slots=slots)
-        except coolscanpy.CaptureWorkerBootstrapFailed as exc:
-            raise BridgeError(ErrorCode.INTERNAL, str(exc)) from exc
-        except coolscanpy.FeederParked as exc:
-            raise BridgeError(ErrorCode.FEEDER_PARKED, str(exc)) from exc
-        except coolscanpy.RefeedRequired as exc:
-            raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
-        except coolscanpy.DeviceBusy as exc:
-            raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
-        except LeadingFrameClippedError as exc:
-            # This is a proven physical-registration condition, unlike the
-            # broader IndexDecodeError bucket below. Preserve its precise
-            # deeper-refeed guidance in both the UI and diagnostics.
-            raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
-        except IndexDecodeError as exc:
-            # Hedged wording (2026-07-25 adversarial-review finding): the
-            # IndexDecodeError class also covers malformed envelopes and
-            # geometry defects, which are capture/driver faults a refeed
-            # cannot fix -- refeed-and-retry stays the first move, but the
-            # message must not sell a software fault as a film problem.
-            raise BridgeError(
-                ErrorCode.REFEED_REQUIRED,
-                "transport read was not one uniform traversal; eject or refeed "
-                "the strip and run the preview again -- if this recurs on "
-                f"clean feeds it may be a capture or driver defect ({exc})",
-            ) from exc
-        except RollSessionIntegrityError:
-            # Artifact/journal integrity faults are driver-side defects, not
-            # operator conditions -- let service.py's boundary report them as
-            # INTERNAL with the exception class preserved in the message.
-            raise
-        except RollSessionError as exc:
-            raise BridgeError(
-                ErrorCode.REFEED_REQUIRED,
-                "preview could not establish a usable roll session; refeed the "
-                "strip and retry -- if this recurs on clean feeds it may be a "
-                f"capture or driver defect ({exc})",
-            ) from exc
-        except coolscanpy.MeterUnusableError as exc:
-            # #17: no usable meter mean for a channel while replaying this
-            # preview's density evidence (density metering runs as part of
-            # Roll.preview, not just scan_many -- see preview_session.py's
-            # _validated_preview_density_evidence). Fail-closed -- no
-            # fabricated exposure -- surfaced as a friendly METER_UNUSABLE
-            # card, never INTERNAL. Guidance text is in the exception.
-            # Mirrors the start_scan handler below.
-            raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
-        except coolscanpy.RollMismatch as exc:
-            # Base-class fallback AFTER every mapped subclass (RefeedRequired
-            # above; FingerprintRefused/ManualReviewRequired are scan-time
-            # concepts that preview() does not raise). CoolscanPy raises the
-            # bare base for e.g. a completed preview whose evidence belongs
-            # to a different USB topology -- typed, never INTERNAL.
-            raise BridgeError(ErrorCode.ROLL_MISMATCH, str(exc)) from exc
+            try:
+                # A SINGLE blocking CoolscanPy call that returns the complete
+                # list once the whole-roll transport read finishes -- there is
+                # no per-thumbnail streaming under the hood. `on_thumbnail` is
+                # invoked once per item below, simulating the bridge's own
+                # one-event-per-slot wire behavior on top of this atomic call.
+                thumbnails = self._roll.preview(slots=slots)
+            except coolscanpy.CaptureWorkerBootstrapFailed as exc:
+                raise BridgeError(ErrorCode.INTERNAL, str(exc)) from exc
+            except coolscanpy.FeederParked as exc:
+                raise BridgeError(ErrorCode.FEEDER_PARKED, str(exc)) from exc
+            except coolscanpy.RefeedRequired as exc:
+                raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
+            except coolscanpy.DeviceBusy as exc:
+                raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
+            except LeadingFrameClippedError as exc:
+                # This is a proven physical-registration condition, unlike the
+                # broader IndexDecodeError bucket below. Preserve its precise
+                # deeper-refeed guidance in both the UI and diagnostics.
+                raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
+            except IndexDecodeError as exc:
+                # Hedged wording (2026-07-25 adversarial-review finding): the
+                # IndexDecodeError class also covers malformed envelopes and
+                # geometry defects, which are capture/driver faults a refeed
+                # cannot fix -- refeed-and-retry stays the first move, but the
+                # message must not sell a software fault as a film problem.
+                raise BridgeError(
+                    ErrorCode.REFEED_REQUIRED,
+                    "transport read was not one uniform traversal; eject or refeed "
+                    "the strip and run the preview again -- if this recurs on "
+                    f"clean feeds it may be a capture or driver defect ({exc})",
+                ) from exc
+            except RollSessionIntegrityError:
+                # Artifact/journal integrity faults are driver-side defects, not
+                # operator conditions -- let service.py's boundary report them as
+                # INTERNAL with the exception class preserved in the message.
+                raise
+            except RollSessionError as exc:
+                raise BridgeError(
+                    ErrorCode.REFEED_REQUIRED,
+                    "preview could not establish a usable roll session; refeed the "
+                    "strip and retry -- if this recurs on clean feeds it may be a "
+                    f"capture or driver defect ({exc})",
+                ) from exc
+            except coolscanpy.MeterUnusableError as exc:
+                # #17: no usable meter mean for a channel while replaying this
+                # preview's density evidence (density metering runs as part of
+                # Roll.preview, not just scan_many -- see preview_session.py's
+                # _validated_preview_density_evidence). Fail-closed -- no
+                # fabricated exposure -- surfaced as a friendly METER_UNUSABLE
+                # card, never INTERNAL. Guidance text is in the exception.
+                # Mirrors the start_scan handler below.
+                raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
+            except coolscanpy.RollMismatch as exc:
+                # Base-class fallback AFTER every mapped subclass (RefeedRequired
+                # above; FingerprintRefused/ManualReviewRequired are scan-time
+                # concepts that preview() does not raise). CoolscanPy raises the
+                # bare base for e.g. a completed preview whose evidence belongs
+                # to a different USB topology -- typed, never INTERNAL.
+                raise BridgeError(ErrorCode.ROLL_MISMATCH, str(exc)) from exc
+        finally:
+            # S5 fix: record the current attempt's identity regardless of
+            # how the block above exited -- a clean return, a typed
+            # BridgeError (a "completed but refused" attempt still writes a
+            # valid journal), or a bare re-raised RollSessionIntegrityError.
+            # Left `None` (its state from the top of this method) if this
+            # call wrote no new journal at all.
+            self._recorded_preview_attempt_journal = _sole_new_attempt_journal(
+                self.attempts_root, attempt_journals_before
+            )
 
         # Fresh UUID directory per roll.preview call, mirroring the
         # existing hw-telemetry/{session_id}.jsonl convention (see
@@ -834,12 +889,34 @@ class CoolscanPyTransport:
         self._preview_established = True
         return domain.PreviewResult(count=len(thumbnails), fingerprint=self._roll.fingerprint.sha256)
 
-    def approve(self, slot: int) -> None:
+    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
         if self._device is None:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
         if not self._preview_established:
             raise BridgeError(
                 ErrorCode.NO_PREVIEW, "roll.approve requires a completed roll.preview first"
+            )
+        # Additive (2026-08-08 adversarial review, S1). `fingerprint`, when
+        # supplied, is the Roll fingerprint the approval being submitted was
+        # minted against -- today only RealLs5000::roll_approve (the engine)
+        # supplies it, and only when its own completed-preview binding
+        # carries one (currently: manual placement's own binding; see
+        # manual_frames() below). `None` is the existing, unchanged
+        # behavior: no comparison, exactly as before this parameter
+        # existed. A caller-supplied value that does not match this Roll's
+        # CURRENT fingerprint means the session moved on since that
+        # approval was computed -- e.g. a replacement manual placement
+        # installed a different session in between -- so it is refused
+        # here, before ever reaching coolscanpy's own Roll.approve(), which
+        # has no way to know the approval's own origin and would otherwise
+        # approve whatever slot number happens to exist in its CURRENT
+        # session.
+        if fingerprint is not None and self._roll.fingerprint.sha256 != fingerprint:
+            raise BridgeError(
+                ErrorCode.FINGERPRINT_REFUSED,
+                "this approval was computed against an earlier preview session "
+                "that no longer matches the roll's current state; acquire a "
+                "fresh preview or placement and approve again",
             )
         try:
             self._roll.approve(slot)
@@ -918,8 +995,8 @@ class CoolscanPyTransport:
         tuple[domain.BoundarySnap, ...],
         domain.Material,
     ]:
-        """Re-slice the last completed preview attempt's already-decoded
-        raster at operator-picked boundary rows.
+        """Re-slice the CURRENT preview attempt's already-decoded raster at
+        operator-picked boundary rows.
 
         No hardware call, no film movement -- this is a pure re-slice of
         bytes already on disk from an earlier roll.preview attempt
@@ -940,7 +1017,18 @@ class CoolscanPyTransport:
                 "manual frame placement requires a completed roll.preview "
                 "attempt first",
             )
-        attempt = _reconstruct_last_preview_attempt(self.attempts_root)
+        # 2026-08-08 adversarial review, S5: only the exact attempt this
+        # transport itself recorded as current is ever used -- never a
+        # fresh filesystem scan, and never a silent fallback to an older
+        # attempt when the current one left no usable evidence.
+        if self._recorded_preview_attempt_journal is None:
+            raise BridgeError(
+                ErrorCode.NO_PREVIEW,
+                "the most recent preview attempt on this roll left no usable "
+                "evidence to place frames from; acquire a fresh preview and "
+                "try again",
+            )
+        attempt = _reconstruct_preview_attempt(self._recorded_preview_attempt_journal)
         try:
             preview = _validated_preview_from_attempt(attempt)
         except coolscanpy.MeterUnusableError as exc:
@@ -977,51 +1065,48 @@ class CoolscanPyTransport:
             # IndexDecodeError branch above.
             raise BridgeError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
 
-        # Arm self._roll's session state exactly like Roll.preview()'s own
-        # success tail does (_roll.py: "self._session = session;
-        # self._session_usb_topology = topology; self._approvals.clear()").
-        # Reaching into these three private fields directly -- never a
-        # public Roll method -- because Roll.restore_preview_session()
-        # explicitly, deliberately refuses a manual session
-        # (preview_session.py's _restore_roll_preview_session: "roll
-        # session was built from manual frame placement; restoring... is
-        # not yet supported. Refuse loudly instead of guessing.") and no
-        # OTHER public Roll API exists for installing an already-built
-        # RollPreviewSession without a fresh hardware read. This is not a
-        # hardware attempt, so it does not acquire the HardwareLane or
-        # require safety.require_armed() the way roll.preview/scan.start/
-        # device.eject do -- self._scanning (checked above) is still
-        # respected as a plain busy-guard against racing an ACTUAL transport
-        # read, but manual_frames() itself never becomes one; a real
-        # preview()/scan_many() call still goes through their own unmodified
-        # code paths, hardware lane, and locking exactly as before. Locked
-        # the same way Roll.preview()/set_spacing_offset()/approve()
-        # themselves protect this exact state, so a concurrent Roll caller
-        # can never observe a half-armed session.
-        with self._roll._state_condition:  # noqa: SLF001
-            self._roll._session = session
-            self._roll._session_usb_topology = preview.usb_topology
-            self._roll._approvals.clear()
-
+        # 2026-08-08 adversarial review, S1 (part 1): render and fsync every
+        # thumbnail this replacement session produces BEFORE touching
+        # self._roll's state at all. Previously the Roll-state swap below
+        # ran FIRST -- if the thumbnail-write loop then failed partway
+        # through, the OLD session/approvals were already gone (replaced
+        # and cleared) while the operator-visible thumbnails for the NEW
+        # one were incomplete or absent, and self._preview_established was
+        # not touched by that failure either -- a stale approve() against
+        # the operation the UI still showed would then silently reach the
+        # NEW session. Ordering this first means a write failure here
+        # raises before any Roll state -- or self._preview_established --
+        # has changed at all: approve()/set_spacing_offset() keep working
+        # exactly as they did before this call, against whatever session
+        # was already installed.
         preview_dir = safety.DEFAULT_BASE_DIR / "previews" / uuid.uuid4().hex
-        preview_dir.mkdir(parents=True, exist_ok=True)
         thumbnails: list[domain.Thumbnail] = []
-        for slot in session.slots:
-            tile_path = preview_dir / f"slot-{slot.slot_id:04d}.tif"
-            tifffile.imwrite(
-                tile_path, _normalize_preview_tile(slot.thumbnail), photometric="rgb"
-            )
-            thumbnails.append(
-                domain.Thumbnail(
-                    slot=slot.slot_id,
-                    boundary_rows=slot.boundary_rows,
-                    spacing_offset=slot.boundary_offset_rows,
-                    needs_approval=slot.manual_review,
-                    warnings=slot.warnings,
-                    image_path=str(tile_path),
-                    partial=slot.partial,
+        try:
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            for slot in session.slots:
+                tile_path = preview_dir / f"slot-{slot.slot_id:04d}.tif"
+                tifffile.imwrite(
+                    tile_path, _normalize_preview_tile(slot.thumbnail), photometric="rgb"
                 )
-            )
+                _fsync_path(tile_path)
+                thumbnails.append(
+                    domain.Thumbnail(
+                        slot=slot.slot_id,
+                        boundary_rows=slot.boundary_rows,
+                        spacing_offset=slot.boundary_offset_rows,
+                        needs_approval=slot.manual_review,
+                        warnings=slot.warnings,
+                        image_path=str(tile_path),
+                        partial=slot.partial,
+                    )
+                )
+        except Exception as exc:
+            raise BridgeError(
+                ErrorCode.INTERNAL,
+                "manual frame placement could not persist its preview "
+                "thumbnails to disk; the previous preview session was left "
+                f"unchanged -- try again ({type(exc).__name__}: {exc})",
+            ) from exc
 
         # Per-boundary snap notes (BRIDGE.md's contract): derived from the
         # session's own boundaries rather than re-running
@@ -1033,7 +1118,10 @@ class CoolscanPyTransport:
         # final_rows[i] != row); `rows[i]` (the operator's own request,
         # already in hand here) and `boundary.output_row` (the resolved,
         # possibly-snapped row) reconstruct the identical BoundarySnap this
-        # module's own manual_frames.py would have returned.
+        # module's own manual_frames.py would have returned. Pure
+        # computation over `session`/`rows`, no I/O, so its position
+        # relative to the thumbnail writes above and the Roll-state install
+        # below has no observable effect either way.
         snaps: list[domain.BoundarySnap] = []
         for index, (requested_row, boundary) in enumerate(
             zip(rows, session.detection.boundaries)
@@ -1049,6 +1137,29 @@ class CoolscanPyTransport:
                     )
                 )
 
+        # S1 (part 3): fail closed the instant a mutation is attempted --
+        # re-armed only after install_manual_session below returns
+        # successfully. If it raises, this stays False rather than keeping
+        # whatever it was before, so a stale approve() against the OLD
+        # operation cannot slip through NO_PREVIEW's own guard while the
+        # Roll's state is ambiguous (busy/mismatch mid-install, never a
+        # partial write -- install_manual_session is itself transactional).
+        self._preview_established = False
+        # S1 (part 2): the transactional install itself -- locked-state and
+        # USB-topology checks, approvals clearing, and the atomic session
+        # swap all live in coolscanpy now (Roll.install_manual_session).
+        # This bridge no longer reaches into _session/_approvals/
+        # _state_condition directly; DeviceBusy/RollMismatch are this
+        # method's own typed mappings for that method's two failure modes,
+        # matching this file's existing DeviceBusy/RollMismatch precedents
+        # elsewhere (preview(), start_scan()).
+        try:
+            self._roll.install_manual_session(session)
+        except coolscanpy.DeviceBusy as exc:
+            raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
+        except coolscanpy.RollMismatch as exc:
+            raise BridgeError(ErrorCode.ROLL_MISMATCH, str(exc)) from exc
+
         material = _COOLSCANPY_TO_MATERIAL[self._roll.material]
         self._material = material
         self._preview_established = True
@@ -1058,13 +1169,14 @@ class CoolscanPyTransport:
         return result, tuple(thumbnails), tuple(snaps), material
 
     def preview_strip(self) -> domain.PreviewStrip:
-        """Render the last completed preview attempt's whole captured raster
-        to one image, for a manual-placement editor to draw boundary lines
-        on before any row has been picked.
+        """Render the CURRENT preview attempt's whole captured raster to one
+        image, for a manual-placement editor to draw boundary lines on
+        before any row has been picked.
 
         Same precondition as manual_frames() (a completed preview attempt,
-        successful or refused, already on disk); no hardware call, and no
-        session/approval state is touched -- purely a read.
+        successful or refused, already on disk, and recorded as the current
+        one -- see manual_frames()'s own S5 comment); no hardware call, and
+        no session/approval state is touched -- purely a read.
         """
         if self._device is None:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
@@ -1073,7 +1185,14 @@ class CoolscanPyTransport:
                 ErrorCode.NO_PREVIEW,
                 "roll.previewStrip requires a completed roll.preview attempt first",
             )
-        attempt = _reconstruct_last_preview_attempt(self.attempts_root)
+        if self._recorded_preview_attempt_journal is None:
+            raise BridgeError(
+                ErrorCode.NO_PREVIEW,
+                "the most recent preview attempt on this roll left no usable "
+                "evidence to render a strip from; acquire a fresh preview and "
+                "try again",
+            )
+        attempt = _reconstruct_preview_attempt(self._recorded_preview_attempt_journal)
         try:
             preview = _validated_preview_from_attempt(attempt)
         except coolscanpy.MeterUnusableError as exc:

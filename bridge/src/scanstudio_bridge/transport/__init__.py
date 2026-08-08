@@ -68,7 +68,16 @@ class Transport(Protocol):
         on_thumbnail: Callable[[domain.Thumbnail], None],
     ) -> domain.PreviewResult: ...
 
-    def approve(self, slot: int) -> None: ...
+    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
+        """Approve `slot`. `fingerprint`, when given, is the Roll
+        fingerprint (BRIDGE.md's `roll.approve`) the approval being
+        submitted was minted against -- additive (2026-08-08 adversarial
+        review, S1): `None` is the pre-existing behavior (no comparison); a
+        given value that no longer matches the roll's CURRENT fingerprint
+        must be refused with `FINGERPRINT_REFUSED` before any underlying
+        approval call, never silently approved against whatever session
+        happens to be current now."""
+        ...
 
     def set_spacing_offset(
         self, slot: int, offset_rows: int

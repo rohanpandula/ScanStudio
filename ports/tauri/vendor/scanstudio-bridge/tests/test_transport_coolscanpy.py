@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import struct
 import tempfile
 import threading
@@ -66,6 +67,7 @@ class _FakeRoll:
         fingerprint_sha256: str = "f" * 64,
         scan_results: dict[int, list[object]] | None = None,
         material: "coolscanpy.Material" = coolscanpy.Material.COLOR_NEGATIVE,
+        install_manual_session_effect: BaseException | None = None,
     ) -> None:
         self._thumbnails = thumbnails or []
         self._fingerprint_sha256 = fingerprint_sha256
@@ -76,19 +78,37 @@ class _FakeRoll:
         self.safe_stop_calls = 0
         self.closed = False
         self._safe_stop_requested = False
-        # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md):
-        # CoolscanPyTransport.manual_frames() arms a manually-built
-        # RollPreviewSession by reaching into these exact private
-        # coolscanpy.Roll attributes directly -- no public Roll API installs
-        # an already-built session without a fresh hardware read (see that
-        # method's own comment). This fake carries the same attribute names,
-        # real types, and locking shape so that code path runs unmodified
-        # against this double, exactly as it would against a real Roll.
+        # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md) / S1 fix
+        # (2026-08-08 adversarial review): _session/_session_usb_topology/
+        # _approvals/_state_condition mirror real coolscanpy.Roll's own
+        # private attribute names, types, and locking shape purely so
+        # install_manual_session() below can behave like the real one
+        # (coolscanpy's own _roll.py) without duplicating it -- nothing in
+        # coolscanpy_transport.py reaches into these directly any more (see
+        # manual_frames()'s own comment); this fake's PUBLIC
+        # install_manual_session is the only thing that touches them now.
         self.material = material
         self._state_condition = threading.Condition(threading.RLock())
         self._session: object | None = None
         self._session_usb_topology: tuple[int, int] | None = None
         self._approvals: dict[int, object] = {}
+        self.install_manual_session_calls: list[object] = []
+        # Test-driven failure injection, mirroring _FakeDevice.eject_effect
+        # below -- lets a test prove manual_frames() maps
+        # coolscanpy.DeviceBusy/RollMismatch from install_manual_session to
+        # the right BridgeError, and that a raise here leaves _session/
+        # _approvals exactly as they were (install_manual_session's own
+        # transactional contract).
+        self._install_manual_session_effect = install_manual_session_effect
+
+    def install_manual_session(self, session: object) -> None:
+        self.install_manual_session_calls.append(session)
+        if self._install_manual_session_effect is not None:
+            raise self._install_manual_session_effect
+        with self._state_condition:
+            self._session = session
+            self._session_usb_topology = session.preview.usb_topology
+            self._approvals.clear()
 
     def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
         if slots is None:
@@ -1317,12 +1337,26 @@ def _transport_with_synthetic_preview_attempt(
     self._roll/self.attempts_root exactly as it would in production; the
     attempt this test actually reads back is a separately-written synthetic
     one, matching how a real refused preview would leave its own evidence
-    on disk without ever producing a _FakeRoll-shaped in-memory session."""
+    on disk without ever producing a _FakeRoll-shaped in-memory session.
+
+    S5 fix (2026-08-08 adversarial review): manual_frames()/preview_strip()
+    now read ONLY `transport._recorded_preview_attempt_journal`, never a
+    fresh glob of attempts_root -- production sets that from what
+    preview()'s own before/after snapshot actually saw appear on disk
+    (see coolscanpy_transport.py's own comment), which is necessarily empty
+    here since `_FakeRoll.preview()` writes nothing at all. This fixture's
+    whole point is a synthetic attempt written OUT OF BAND from any real
+    preview() call, so it sets the recorded identity directly too --
+    exactly the side effect a real preview() call would have performed had
+    this synthetic attempt actually been the product of one."""
     roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
     transport, _device = _opened_transport(monkeypatch, roll)
     transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
     assert transport.attempts_root is not None
     attempt_dir = _write_synthetic_preview_attempt(transport.attempts_root)
+    transport._recorded_preview_attempt_journal = (
+        attempt_dir / "journal.json"
+    ).resolve(strict=True)
     return transport, roll, attempt_dir
 
 
@@ -1388,7 +1422,7 @@ def test_manual_frames_validation_failure_maps_to_invalid_params(
 
     assert excinfo.value.code == ErrorCode.INVALID_PARAMS
     message = str(excinfo.value)
-    assert "outside the 15-75 mm range" in message
+    assert "15 mm floor" in message
     assert "manual placement" in message
 
 
@@ -1425,6 +1459,257 @@ def test_preview_strip_happy_path_renders_whole_raster(
     # _normalize_preview_tile's swapaxes(0,1): the raster's row axis (what
     # roll.manualFrames's rows address) becomes the image's WIDTH axis.
     assert image.shape == (96, 6_104, 3)
+
+
+def test_preview_strip_refuses_when_current_attempt_has_no_recorded_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S5, previewStrip's own half of the same fix: no recorded current
+    attempt means refuse, never a filesystem scan for something older."""
+    transport, _roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch
+    )
+    transport._recorded_preview_attempt_journal = None
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview_strip()
+
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
+    assert "left no usable evidence" in str(excinfo.value)
+    assert "acquire a fresh preview" in str(excinfo.value)
+
+
+# -- 2026-08-08 adversarial review, S1 (manual placement replacement safety) --
+# and S5 (stale-attempt evidence selection) -------------------------------------
+
+
+def test_manual_frames_thumbnail_write_failure_leaves_roll_state_and_preview_established_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S1, part 1: rendering B's thumbnails happens BEFORE any Roll state
+    mutation. A completed placement A is already installed and approved;
+    a replacement placement B passes validation but its thumbnail disk
+    write fails. Roll's session/approvals (A's) must be completely
+    untouched -- install_manual_session must never even be called -- and
+    self._preview_established must stay at its PREVIOUS value (True, from
+    A) rather than being left False or flipped mid-mutation. A subsequent
+    approve() must therefore still cleanly reach A's own (unchanged)
+    session, exactly as if B had never been attempted."""
+    transport, roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch
+    )
+
+    # Placement A: completes cleanly, arms roll._session/approvals and
+    # self._preview_established -- exactly today's already-tested happy
+    # path (test_manual_frames_happy_path_arms_session_for_approve_and_scan).
+    transport.manual_frames([128, 271, 414])
+    assert transport._preview_established is True
+    session_a = roll._session
+    assert session_a is not None
+    # A sentinel approval "on file" for operation A -- proves it survives
+    # byte-for-byte (not just "still non-None") through the failed B
+    # attempt below.
+    roll._approvals[1] = "operation-a-approval-sentinel"
+    approvals_a = dict(roll._approvals)
+    # install_manual_session_calls already holds A's own (legitimate) call
+    # from the successful placement above -- capture that count so the
+    # assertion below proves B added NONE, not that the list is empty.
+    install_calls_after_a = len(roll.install_manual_session_calls)
+
+    def _failing_imwrite(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated disk write failure")
+
+    monkeypatch.setattr(tifffile, "imwrite", _failing_imwrite)
+
+    # Placement B: same evidence, same valid rows -- passes every gate
+    # build_manual_roll_preview_session checks -- but its thumbnail render
+    # fails partway through persisting to disk.
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([128, 271, 414])
+    assert excinfo.value.code == ErrorCode.INTERNAL
+    assert "left unchanged" in str(excinfo.value)
+
+    # Roll state: completely untouched -- the exact same session object,
+    # the exact same approvals, and install_manual_session was never
+    # called again for B (the write failure is caught before any Roll
+    # mutation is attempted at all).
+    assert roll._session is session_a
+    assert roll._approvals == approvals_a
+    assert len(roll.install_manual_session_calls) == install_calls_after_a
+
+    # self._preview_established stayed at its PREVIOUS value (True, from
+    # A's own successful placement) -- never touched by B's failure.
+    assert transport._preview_established is True
+
+    # A subsequent approve() against the operation the UI still shows (A)
+    # must still cleanly reach A's own, unchanged session -- never
+    # NO_PREVIEW, and never silently landing on some half-installed B.
+    transport.approve(1)
+    assert roll.approve_calls == [1]
+
+
+def test_manual_frames_maps_install_failure_without_reporting_partial_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S1, part 2/3: install_manual_session's own failure modes (locked
+    state / USB-topology mismatch, modeled here as DeviceBusy/RollMismatch)
+    must map to typed BridgeErrors, and self._preview_established must be
+    left False (not re-armed) since install is where the fail-closed marker
+    is set immediately before this call."""
+    roll = _FakeRoll(
+        install_manual_session_effect=coolscanpy.DeviceBusy("another roll batch is active")
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert transport.attempts_root is not None
+    attempt_dir = _write_synthetic_preview_attempt(transport.attempts_root)
+    transport._recorded_preview_attempt_journal = (
+        attempt_dir / "journal.json"
+    ).resolve(strict=True)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([128, 271, 414])
+    assert excinfo.value.code == ErrorCode.DEVICE_BUSY
+    assert transport._preview_established is False
+    assert len(roll.install_manual_session_calls) == 1
+
+
+def test_approve_refuses_on_fingerprint_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S1, part 4: an approval computed against an earlier session
+    (identified by its expected fingerprint) must be refused before ever
+    reaching coolscanpy's own Roll.approve() -- a stale click must never
+    silently approve whatever slot number happens to exist in the roll's
+    CURRENT session."""
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)], fingerprint_sha256="c" * 64)
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.approve(1, fingerprint="d" * 64)
+
+    assert excinfo.value.code == ErrorCode.FINGERPRINT_REFUSED
+    assert roll.approve_calls == []
+
+
+def test_approve_succeeds_when_fingerprint_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The additive fingerprint check is a comparison, not a blanket
+    refusal: a caller-supplied value equal to the roll's current
+    fingerprint approves normally."""
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)], fingerprint_sha256="c" * 64)
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    transport.approve(1, fingerprint="c" * 64)
+
+    assert roll.approve_calls == [1]
+
+
+def test_approve_with_no_fingerprint_keeps_pre_existing_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every existing caller (no `fingerprint` argument at all) must be
+    completely unaffected: `None` is the default and skips the comparison
+    entirely, exactly as before this parameter existed."""
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)], fingerprint_sha256="c" * 64)
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    transport.approve(1)
+
+    assert roll.approve_calls == [1]
+
+
+def test_manual_frames_refuses_when_current_attempt_has_no_recorded_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S5: attempt A completed and is still on disk; a NEWER attempt B's
+    directory also exists (a retried preview's transport read started) but
+    B failed before it ever wrote a journal.json of its own. The most
+    recent attempt (B) left no usable evidence, so manual placement must
+    refuse outright -- it must NEVER silently fall back to A's older,
+    physically-superseded evidence, even though A is still present and
+    perfectly well-formed on disk."""
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert transport.attempts_root is not None
+    _write_synthetic_preview_attempt(transport.attempts_root)  # attempt A: complete
+    stale_dir = transport.attempts_root / f"preview-{uuid.uuid4().hex}"
+    stale_dir.mkdir(parents=True)  # attempt B: started, no journal.json ever written
+    # What a real preview() call for B would itself have recorded: its own
+    # before/after snapshot diff finds no new journal at all (B wrote
+    # none), so the previously-invalidated candidate stays None -- see
+    # preview()'s own S5 comment. Never falls back to A.
+    transport._recorded_preview_attempt_journal = None
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([128, 271, 414])
+
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
+    message = str(excinfo.value)
+    assert "left no usable evidence" in message
+    assert "acquire a fresh preview" in message
+    assert roll.install_manual_session_calls == []
+
+
+def test_sole_new_attempt_journal_ignores_mtime_and_identifies_the_new_candidate(
+    tmp_path: Path,
+) -> None:
+    """S5's core selection primitive: identifying the attempt a preview()
+    call itself just produced is pure set membership against a snapshot
+    taken immediately beforehand -- NEVER a modification-time comparison.
+    Here the OLDER attempt's journal is touched (its mtime pushed into the
+    future, past the newer attempt's own) after the newer one is written --
+    exactly the "A's journal is touched later" S5 scenario -- and the
+    correct (new) candidate must still be the one identified."""
+    attempts_root = tmp_path
+    old_dir = attempts_root / "preview-old"
+    old_dir.mkdir()
+    old_journal = old_dir / "journal.json"
+    old_journal.write_text("{}", encoding="utf-8")
+    before = frozenset(
+        attempts_root.glob(coolscanpy_transport_module._PREVIEW_ATTEMPT_GLOB)
+    )
+
+    new_dir = attempts_root / "preview-new"
+    new_dir.mkdir()
+    new_journal = new_dir / "journal.json"
+    new_journal.write_text("{}", encoding="utf-8")
+    # Touch the OLDER journal so it carries a strictly newer mtime than the
+    # attempt that actually just happened -- an mtime-sorting selection
+    # would incorrectly pick this one.
+    future = time.time() + 10_000
+    os.utime(old_journal, (future, future))
+    assert old_journal.stat().st_mtime > new_journal.stat().st_mtime
+
+    resolved = coolscanpy_transport_module._sole_new_attempt_journal(
+        attempts_root, before
+    )
+
+    assert resolved == new_journal.resolve()
+
+
+def test_sole_new_attempt_journal_is_none_when_nothing_new_appeared(
+    tmp_path: Path,
+) -> None:
+    """A hard failure that writes no journal at all (e.g. a bootstrap
+    failure before the transport read even starts) must resolve to `None`,
+    never to whatever older attempt happens to already be on disk."""
+    attempts_root = tmp_path
+    old_dir = attempts_root / "preview-old"
+    old_dir.mkdir()
+    (old_dir / "journal.json").write_text("{}", encoding="utf-8")
+    before = frozenset(
+        attempts_root.glob(coolscanpy_transport_module._PREVIEW_ATTEMPT_GLOB)
+    )
+
+    # Nothing new is written under attempts_root this time.
+
+    resolved = coolscanpy_transport_module._sole_new_attempt_journal(
+        attempts_root, before
+    )
+
+    assert resolved is None
 
 
 def test_start_scan_maps_base_roll_mismatch(

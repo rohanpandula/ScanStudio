@@ -184,6 +184,12 @@ class MockTransport:
         self._spacing_offsets: dict[int, int] = {}
         self._scanning = False
         self._stop_event = threading.Event()
+        # 2026-08-08 adversarial review, S1: the fingerprint the last
+        # successful preview()/manual_frames() call returned -- mirrors the
+        # real transport's `self._roll.fingerprint.sha256`, kept here since
+        # this double has no real Roll object of its own. See approve()'s
+        # own docstring for how this is used.
+        self._fingerprint: str | None = None
 
     # -- device lifecycle -----------------------------------------------------
 
@@ -202,6 +208,7 @@ class MockTransport:
         self._approved_slots.clear()
         self._needs_approval_slots.clear()
         self._spacing_offsets.clear()
+        self._fingerprint = None
         return self._device_info()
 
     def status(self) -> domain.DeviceStatus:
@@ -231,6 +238,7 @@ class MockTransport:
         self._approved_slots.clear()
         self._needs_approval_slots.clear()
         self._spacing_offsets.clear()
+        self._fingerprint = None
 
     # -- preview / approve ------------------------------------------------------
 
@@ -273,10 +281,22 @@ class MockTransport:
         self._preview_established = True
         self._last_preview_material = material
         fingerprint = hashlib.sha256(f"{material}:{self._slot_count}".encode()).hexdigest()
+        self._fingerprint = fingerprint
         return domain.PreviewResult(count=self._slot_count, fingerprint=fingerprint)
 
-    def approve(self, slot: int) -> None:
+    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
         self._require_connected()
+        # Additive (2026-08-08 adversarial review, S1) -- see
+        # transport.Transport.approve's own docstring. `None` (the default,
+        # and every pre-existing caller) skips the comparison entirely,
+        # unchanged from before this parameter existed.
+        if fingerprint is not None and self._fingerprint != fingerprint:
+            raise BridgeError(
+                ErrorCode.FINGERPRINT_REFUSED,
+                "this approval was computed against an earlier preview session "
+                "that no longer matches the roll's current state; acquire a "
+                "fresh preview or placement and approve again",
+            )
         if slot < 1 or slot > self._slot_count or slot not in self._needs_approval_slots:
             raise BridgeError(ErrorCode.INVALID_PARAMS, f"slot {slot} does not need approval")
         self._approved_slots.add(slot)
@@ -410,6 +430,7 @@ class MockTransport:
         fingerprint = hashlib.sha256(
             f"manual:{tuple(rows)}".encode()
         ).hexdigest()
+        self._fingerprint = fingerprint
         self._preview_established = True
         return (
             domain.PreviewResult(count=self._slot_count, fingerprint=fingerprint),

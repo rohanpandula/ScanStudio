@@ -1789,3 +1789,23 @@ def test_failed_preview_does_not_claim_a_preview_material(
             emit,
         )
     assert excinfo.value.code == ErrorCode.NO_PREVIEW
+
+
+def test_roll_manual_frames_rejects_non_integer_rows(tmp_path: Path) -> None:
+    """Wire strictness (adversarial review 2026-08-08, F8a): floats, digit
+    strings, booleans, and non-lists must all refuse as INVALID_PARAMS with
+    a plain sentence -- never truncate, explode into digits, or surface as
+    INTERNAL -- and must never reach the transport."""
+
+    transport = _StubTransport()
+    svc = _opened_service(tmp_path, transport)
+
+    for bad in ([12.5, 200], ["123"], [True, 200], "12,200", [12, "x"]):
+        with pytest.raises(BridgeError) as excinfo:
+            svc.dispatch(
+                {"id": 3, "method": "roll.manualFrames", "params": {"rows": bad}},
+                lambda *_a: None,
+            )
+        assert excinfo.value.code is ErrorCode.INVALID_PARAMS, bad
+        assert "whole numbers" in str(excinfo.value), bad
+    assert transport.manual_frames_calls == []

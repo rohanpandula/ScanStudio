@@ -652,7 +652,20 @@ class BridgeService:
                 "a motion operation is still active; retry after it finishes",
             )
         params = request.get("params") or {}
-        rows = [int(row) for row in _require_param(params, "rows")]
+        raw_rows = _require_param(params, "rows")
+        # Strict wire check (adversarial review 2026-08-08, F8a): int() would
+        # silently truncate JSON floats, explode a string into digits, and
+        # turn a non-numeric into an INTERNAL error. The driver's own gates
+        # are strict; the wire deserves the same.
+        if not isinstance(raw_rows, list) or not all(
+            isinstance(row, int) and not isinstance(row, bool) for row in raw_rows
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "rows must be a list of whole numbers (the preview row of "
+                "each frame boundary)",
+            )
+        rows = list(raw_rows)
         preview_result, thumbnails, snaps, material = self._transport.manual_frames(
             rows
         )
