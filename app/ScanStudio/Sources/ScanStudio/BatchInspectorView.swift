@@ -340,7 +340,7 @@ struct BatchInspectorView: View {
                         InspectorSettingRow(label: "Testing pipeline") {
                             Picker("Testing pipeline", selection: c41RenderTargetBinding) {
                                 Text("Noritsu Lab").tag(C41RenderTarget.noritsuLs600)
-                                Text("Flextight Lab").tag(C41RenderTarget.flexcolorCleanroom)
+                                Text("Flextight").tag(C41RenderTarget.flexcolorCleanroom)
                             }
                         }
                     }
