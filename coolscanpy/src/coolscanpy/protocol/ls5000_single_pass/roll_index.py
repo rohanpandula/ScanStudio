@@ -931,6 +931,28 @@ def _gap_lattice_diagnostics(
     }
 
 
+def _diagnose_refusal_safely(
+    rgb16: np.ndarray, known: np.ndarray, nominal_frame_rows: int
+) -> str | None:
+    """Best-effort probable-cause sentence for a refusal about to be raised.
+
+    Deferred import breaks the two-module cycle -- roll_diagnosis.py imports
+    this module's own private evidence helpers -- and only needs to resolve
+    once a raise is already underway. The broad except is deliberate: a bug
+    in diagnosis must never replace or hide the real IndexDecodeError being
+    raised, so any failure in here is silently treated as "no diagnosis".
+    """
+
+    try:
+        from .roll_diagnosis import diagnose_roll_refusal
+
+        return diagnose_roll_refusal(
+            rgb16, known, nominal_frame_rows=nominal_frame_rows
+        )
+    except Exception:
+        return None
+
+
 def detect_roll_frames(
     rgb16: np.ndarray,
     known: np.ndarray,
@@ -947,6 +969,12 @@ def detect_roll_frames(
     as gap anchors. If recovery also fails, the *original* pass-1 error
     is re-raised with a recovery note appended to its diagnostics so
     field reports stay comparable across versions.
+
+    Both re-raise paths below also attach a best-effort plain-English
+    ``diagnostics["probable_cause"]`` sentence (roll_diagnosis.py) whenever
+    one fires with enough confidence to speak. This only ever adds that one
+    key: the error id, message prefix, and every other diagnostics key are
+    unchanged from today's behavior.
     """
 
     try:
@@ -960,7 +988,16 @@ def detect_roll_frames(
         raise
     except IndexDecodeError as primary:
         if primary.error_id not in _WIDE_GAP_RECOVERY_ERROR_IDS:
-            raise
+            cause = _diagnose_refusal_safely(rgb16, known, nominal_frame_rows)
+            if cause is None:
+                raise
+            diagnostics = dict(primary.diagnostics or {})
+            diagnostics["probable_cause"] = cause
+            raise IndexDecodeError(
+                str(primary).split(" [")[0],
+                error_id=primary.error_id,
+                diagnostics=diagnostics,
+            ) from None
         try:
             return _detect_roll_frames_single(
                 rgb16,
@@ -974,6 +1011,9 @@ def detect_roll_frames(
             diagnostics["wide_gap_recovery"] = (
                 f"attempted and failed: {recovery}"
             )
+            cause = _diagnose_refusal_safely(rgb16, known, nominal_frame_rows)
+            if cause is not None:
+                diagnostics["probable_cause"] = cause
             raise IndexDecodeError(
                 str(primary).split(" [")[0],
                 error_id=primary.error_id,

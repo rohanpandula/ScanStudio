@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
+from coolscanpy.protocol.ls5000_single_pass import manual_frames
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     AttemptPaths,
     CaptureAttemptResult,
@@ -3128,6 +3129,211 @@ def test_derive_live_frame_selection_still_refuses_on_fingerprint_mismatch(
             manual_review_approved=False,
             reviewed_as_automatic=True,
             reviewed_leading_residual_rows=-1.525,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the manual-placement
+# worker gate. build_manual_detection is monkeypatched to a canned result --
+# manual_frames.py's own gates are exercised in test_manual_frames.py; these
+# tests attack _derive_live_frame_selection's gate wiring specifically.
+# ---------------------------------------------------------------------------
+
+
+def _manual_gate_records() -> tuple[TransportRecord, ...]:
+    return tuple(
+        TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(500)
+    )
+
+
+def _manual_gate_mapping() -> TransportMapping:
+    origin = NativeFrameOrigin(
+        frame=1,
+        boundary_index=0,
+        boundary_output_row=10,
+        lookup_row=10,
+        code=6 * (10 % 18),
+        selector=10 // 18,
+        native_origin=420,
+        method="user-picked-row",
+        automatic=False,
+        manual_review=True,
+        review_reasons=("user-picked-origin",),
+        affine_residual_rows=0.0,
+    )
+    return TransportMapping(
+        record_count=500,
+        native_intercept=0.0,
+        native_units_per_preview_row=42.0,
+        anchor_mae_rows=0.0,
+        anchor_max_error_rows=0.0,
+        origins=(origin,),
+    )
+
+
+def _manual_gate_detection(*, confidence: str, user_picked: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        confidence=confidence,
+        warnings=(
+            (manual_frames.MANUAL_PLACEMENT_WARNING,)
+            if user_picked
+            else ("wide-gap-recovery",)
+        ),
+        boundaries=(),
+        intervals=(SimpleNamespace(start_row=0, end_row=100),),
+    )
+
+
+def _wire_manual_gate_common(
+    monkeypatch: pytest.MonkeyPatch, rgb: np.ndarray
+) -> None:
+    geometry = SimpleNamespace(height=500, pitch=41, native_height=250_278)
+    monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, len(rgb)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "decode_full_index_bytes",
+        lambda *_a, **_k: (rgb, np.ones(rgb.shape, dtype=bool), {}),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: _manual_gate_records(),
+    )
+
+
+def test_manual_selection_with_approval_binds_at_medium_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rgb = np.zeros((500, 96, 3), dtype=np.uint16)
+    _wire_manual_gate_common(monkeypatch, rgb)
+    mapping = _manual_gate_mapping()
+    detection = _manual_gate_detection(confidence="medium", user_picked=True)
+    monkeypatch.setattr(
+        worker_module,
+        "build_manual_detection",
+        lambda *_a, **_k: SimpleNamespace(
+            detection=detection, mapping=mapping, snaps=()
+        ),
+    )
+
+    selection = worker_module._derive_live_frame_selection(
+        [],
+        b"fresh-preview",
+        b"fresh-table",
+        frame=1,
+        manual_review_approved=True,
+        manual_boundary_rows=(10, 200),
+    )
+
+    assert selection.detection.confidence == "medium"
+    assert selection.selected.native_origin == 420
+    assert selection.selected.manual_review is True
+    assert selection.selected.automatic is False
+
+
+def test_manual_selection_without_approval_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rgb = np.zeros((500, 96, 3), dtype=np.uint16)
+    _wire_manual_gate_common(monkeypatch, rgb)
+    mapping = _manual_gate_mapping()
+    detection = _manual_gate_detection(confidence="medium", user_picked=True)
+    monkeypatch.setattr(
+        worker_module,
+        "build_manual_detection",
+        lambda *_a, **_k: SimpleNamespace(
+            detection=detection, mapping=mapping, snaps=()
+        ),
+    )
+
+    with pytest.raises(
+        ProtocolError, match="unattended frame binding requires 'high'"
+    ):
+        worker_module._derive_live_frame_selection(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frame=1,
+            manual_review_approved=False,
+            manual_boundary_rows=(10, 200),
+        )
+
+
+def test_non_manual_medium_detection_still_refuses_even_with_approval_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-existing gate is untouched: passing manual_review_approved=True
+    on a NON-manual (e.g. wide-gap-recovery) medium-confidence detection must
+    still refuse -- MANUAL_PLACEMENT_WARNING can only ever come from
+    build_manual_detection, which this call never even reaches.
+    """
+
+    rgb = np.zeros((500, 96, 3), dtype=np.uint16)
+    _wire_manual_gate_common(monkeypatch, rgb)
+    detection = _manual_gate_detection(confidence="medium", user_picked=False)
+    monkeypatch.setattr(worker_module, "detect_roll_frames", lambda *_a, **_k: detection)
+
+    with pytest.raises(
+        ProtocolError, match="unattended frame binding requires 'high'"
+    ):
+        worker_module._derive_live_frame_selection(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frame=1,
+            manual_review_approved=True,
+            # manual_boundary_rows intentionally omitted: the automatic path.
+        )
+
+
+def test_manual_selection_still_refuses_on_fingerprint_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rgb = np.zeros((500, 96, 3), dtype=np.uint16)
+    _wire_manual_gate_common(monkeypatch, rgb)
+    mapping = _manual_gate_mapping()
+    detection = _manual_gate_detection(confidence="medium", user_picked=True)
+    monkeypatch.setattr(
+        worker_module,
+        "build_manual_detection",
+        lambda *_a, **_k: SimpleNamespace(
+            detection=detection, mapping=mapping, snaps=()
+        ),
+    )
+    # A different preview width is an immediate, deterministic mismatch
+    # (compare_reviewed_roll_fingerprints's first check), independent of any
+    # visual-hash heuristics.
+    mismatched_rgb = np.zeros((500, 80, 3), dtype=np.uint16)
+    reviewed = build_reviewed_roll_fingerprint(
+        mismatched_rgb,
+        frame_intervals=((0, 100),),
+        frame_native_origins=(420,),
+        source_preview_sha256="a" * 64,
+        source_table_sha256="b" * 64,
+    )
+
+    with pytest.raises(
+        ProtocolError, match="does not match the reviewed roll fingerprint"
+    ):
+        worker_module._derive_live_frame_selection(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frame=1,
+            reviewed_fingerprint=reviewed,
+            manual_review_approved=True,
+            manual_boundary_rows=(10, 200),
         )
 
 
