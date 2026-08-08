@@ -531,7 +531,7 @@ fn validate_output_retention(
         return Err(EngineError::new(
             ErrorCode::InvalidParams,
             format!(
-                "{label} must retain at least one of master TIFF, positive TIFF, or positive JPEG"
+                "{label} must retain at least one of master TIFF, raw negative, positive TIFF, or positive JPEG"
             ),
         ));
     }

@@ -194,7 +194,14 @@ CaptureRecipe
 OutputSpec
   destination: string
   filenameTemplate: string                // "####" -> zero-padded slot number
-  slotOutputs?: {string: {destination: string, filenameTemplate: string}} // optional exact decimal-slot map for one batch
+  rawExport?: RawExportSpec
+  slotOutputs?: {string: {destination: string, filenameTemplate: string, rawExport?: RawExportSpec}} // optional exact decimal-slot map for one batch
+
+RawExportSpec
+  destination: string
+  filenameTemplate: string
+  fileFormat: "linearDng"|"linearTiff"
+  tiffInfrared: "fourthChannel"|"omitted"|"sidecar"
 
 Thumbnail
   slot: number
@@ -306,6 +313,8 @@ ScanReceipt
   rgbPath: string
   irPath: string|null
   meterRgbiPath: string|null
+  rawExportPath: string|null
+  rawExportIrPath: string|null
   exposureAuthority: ExposureAuthority|null
   startedAt?: string|null                 // ISO-8601 UTC capture start; absent on legacy receipts
   captureDurationMs?: number|null         // nonnegative u64; absent means not recorded
@@ -324,6 +333,8 @@ ScanReceipt
 `DeviceStatus.filmPresent` is a live, no-motion film-presence read, distinct from `previewEstablished` (which only means "a preview has run this session," never "film is physically loaded right now"). The bundled CoolScanPy asks the exact opened LS-5000 with TEST UNIT READY: `true` means the scanner reports medium gripped, `false` means its verified MEDIUM NOT PRESENT sense was observed, and `null` means no trustworthy verdict was available (for example, an active capture owns the interface, an older dependency lacks the method, or the scanner returned an unrecognised/malformed reply). A verified `false` retires the stale preview registration in the same status snapshot (`previewEstablished: false`, `slotCount: null`) and gates the next scan on a fresh preview. `null` is never interpreted as absence. Presence is not motion readiness: a short strip parked at the transport end-stop can still report `true`.
 
 CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanReceipt` as `meterRgbiPath` starting this phase (Phase 10): the bridge writes `frame.meter_rgbi` (an HxWx4 uint16 array) to `{stem}_METER.tif` alongside the RGB/IR files, unconditionally whenever CoolscanPy supplies it — never fabricated; `null` only if absent.
+
+`rawExport` is optional and create-only. When present, the bridge writes directly from the completed frame's original `numpy.uint16` RGB and IR arrays before emitting `scan.frameCompleted`, then returns the validated main file in `rawExportPath`; otherwise that receipt field is `null`. `linearDng` stores RGB in a three-sample DNG `LinearRaw` main IFD and, for the legacy `fourthChannel`/`omitted` values, available IR in a grayscale SubIFD carrying private ASCII tag 65001 (`scanstudio.infrared.linear.uint16.v1`). `linearTiff` either interleaves IR as one `ExtraSamples=0` fourth sample or omits it. For either format, `sidecar` keeps the main RGB-only and writes available IR to `{main-stem}-ir.tif`, returning that path in `rawExportIrPath`. Both pair targets are reserved before motion; neither is accepted as written until both files have been flushed and synced. Failure of either write removes both identity-owned reservations and emits no completed-frame receipt. If the capture has no IR, `sidecar` writes only the format's existing no-IR main file and `rawExportIrPath` is `null`. No path applies inversion, color processing, crop, geometry, or dust removal. A requested fourth-channel TIFF without an IR capture is rejected before motion.
 
 `exposureAuthority` is a best-effort, additive copy of CoolscanPy's per-frame `active_exposure_authority` journal block. It distinguishes the guarded Nikon-parity RGB command from the active controller's accepted solve, preserves the controller-owned IR command, and records any RGB channels clamped to the device exposure window. It is `null` when the journal block is absent, malformed, or cannot be read; that telemetry failure never invalidates an otherwise completed frame receipt.
 

@@ -70,7 +70,13 @@ class TestTiffWriter:
 
 class TestDngWriter:
     def test_writes_linear_dng(self) -> None:
-        rgb = np.random.randint(0, 65535, (200, 300, 3), dtype=np.uint16)
+        rgb = np.array(
+            [
+                [[0, 1, 2], [32767, 32768, 32769], [65533, 65534, 65535]],
+                [[101, 202, 303], [404, 505, 606], [707, 808, 909]],
+            ],
+            dtype=np.uint16,
+        )
         result = ScanResult(rgb=rgb, ir=None, dpi=3600, device_model="TestScanner")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -79,22 +85,55 @@ class TestDngWriter:
             assert path.endswith(".dng")
 
             readback = tifffile.imread(path)
-            assert readback.shape == (200, 300, 3)
+            assert readback.shape == (2, 3, 3)
             assert readback.dtype == np.uint16
             np.testing.assert_array_equal(readback, rgb)
 
             with tifffile.TiffFile(path) as tf:
+                assert len(tf.pages) == 1
                 tags = tf.pages[0].tags
+                assert int(tags["NewSubfileType"].value) == 0
                 assert int(tags["PhotometricInterpretation"].value) == 34892  # LinearRaw
                 assert tuple(tags["DNGVersion"].value) == (1, 4, 0, 0)
+                assert tuple(tags["DNGBackwardVersion"].value) == (1, 1, 0, 0)
                 assert int(tags["SamplesPerPixel"].value) == 3
                 # 3 plain colour samples, no ExtraSamples (matches pidng); marking colour
                 # planes as extra makes some raw processors mis-demosaic the file.
                 assert tags.get("ExtraSamples") is None
+                assert tags["BitsPerSample"].value == (16, 16, 16)
+                assert tags["Make"].value == "Nikon"
+                assert tags["Model"].value == "TestScanner"
+                assert tags["UniqueCameraModel"].value == "Nikon TestScanner"
+                assert tags["Software"].value == "ScanStudio"
+                assert tags["BlackLevel"].dtype == tifffile.DATATYPE.RATIONAL
+                assert tags["BlackLevel"].value == (0, 1, 0, 1, 0, 1)
+                assert tags["WhiteLevel"].value == (65535, 65535, 65535)
+                assert tags["DefaultScale"].value == (1, 1, 1, 1)
+                assert tags["DefaultCropOrigin"].value == (0, 0)
+                assert tags["DefaultCropSize"].value == (3, 2)
+                assert tags["ActiveArea"].value == (0, 0, 2, 3)
+                assert tags["AsShotNeutral"].value == (1, 1, 1, 1, 1, 1)
+                assert int(tags["CalibrationIlluminant1"].value) == 0
+                assert tags["ColorMatrix1"].dtype == tifffile.DATATYPE.SRATIONAL
+                assert tags["ColorMatrix1"].value == (
+                    1, 1, 0, 1, 0, 1,
+                    0, 1, 1, 1, 0, 1,
+                    0, 1, 0, 1, 1, 1,
+                )
+                assert tags.get("SubIFDs") is None
+                assert int(tags["XResolution"].value[0] / tags["XResolution"].value[1]) == 3600
+                assert int(tags["YResolution"].value[0] / tags["YResolution"].value[1]) == 3600
+                assert int(tags["ResolutionUnit"].value) == 2
 
     def test_writes_dng_with_ir(self) -> None:
-        rgb = np.random.randint(0, 65535, (100, 150, 3), dtype=np.uint16)
-        ir = np.random.randint(0, 65535, (100, 150), dtype=np.uint16)
+        rgb = np.array(
+            [
+                [[0, 65535, 1], [2, 3, 4], [5, 6, 7]],
+                [[8, 9, 10], [11, 32768, 13], [14, 15, 16]],
+            ],
+            dtype=np.uint16,
+        )
+        ir = np.array([[65535, 0, 12345], [54321, 32768, 1]], dtype=np.uint16)
         result = ScanResult(rgb=rgb, ir=ir, dpi=3600, device_model="TestScanner")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -102,11 +141,24 @@ class TestDngWriter:
             assert os.path.exists(path)
 
             readback = tifffile.imread(path)
-            assert readback.shape == (100, 150, 4)
-            np.testing.assert_array_equal(readback[:, :, :3], rgb)
-            np.testing.assert_array_equal(readback[:, :, 3], ir)
+            assert readback.shape == (2, 3, 3)
+            np.testing.assert_array_equal(readback, rgb)
             with tifffile.TiffFile(path) as tf:
-                assert int(tf.pages[0].tags["SamplesPerPixel"].value) == 4
+                assert len(tf.pages) == 1, "IR must not become a top-level converter-facing page"
+                main = tf.pages[0]
+                assert int(main.tags["SamplesPerPixel"].value) == 3
+                assert main.tags.get("ExtraSamples") is None
+                assert len(main.pages) == 1
+                assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
+                infrared = main.pages[0]
+                assert infrared.shape == (2, 3)
+                assert int(infrared.tags["NewSubfileType"].value) == 0
+                assert int(infrared.tags["BitsPerSample"].value) == 16
+                assert int(infrared.tags["SamplesPerPixel"].value) == 1
+                assert int(infrared.tags["PhotometricInterpretation"].value) == 1
+                assert infrared.tags["ImageDescription"].value == "Untouched scanner infrared plane"
+                assert infrared.tags[encoders._INFRARED_TAG].value == encoders._INFRARED_MARKER
+                np.testing.assert_array_equal(infrared.asarray(), ir)
 
     def test_adds_dng_extension(self) -> None:
         rgb = np.random.randint(0, 65535, (50, 50, 3), dtype=np.uint16)
@@ -115,6 +167,34 @@ class TestDngWriter:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = write_dng_linear(result, os.path.join(tmpdir, "noext"))
             assert path.endswith(".dng")
+
+    def test_rejects_mismatched_ir_without_publishing_a_file(self, tmp_path) -> None:
+        rgb = np.zeros((3, 4, 3), dtype=np.uint16)
+        ir = np.zeros((2, 4), dtype=np.uint16)
+        result = ScanResult(rgb=rgb, ir=ir, dpi=4000, device_model="TestScanner")
+        target = tmp_path / "bad.dng"
+
+        with pytest.raises(ValueError, match="IR must match"):
+            write_dng_linear(result, str(target))
+
+        assert not target.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_failed_replacement_preserves_existing_dng(self, monkeypatch, tmp_path) -> None:
+        target = tmp_path / "existing.dng"
+        target.write_bytes(b"old complete file")
+
+        def fail_after_reservation(file, result):
+            file.write(b"partial")
+            raise OSError("simulated encode failure")
+
+        monkeypatch.setattr(encoders, "write_dng_linear_to_file", fail_after_reservation)
+
+        with pytest.raises(OSError, match="simulated encode failure"):
+            write_dng_linear(_result(with_ir=True), str(target))
+
+        assert target.read_bytes() == b"old complete file"
+        assert [entry.name for entry in tmp_path.iterdir()] == ["existing.dng"]
 
 
 def _result(with_ir: bool = True) -> ScanResult:
