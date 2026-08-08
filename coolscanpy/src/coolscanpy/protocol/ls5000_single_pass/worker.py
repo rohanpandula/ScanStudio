@@ -1571,11 +1571,24 @@ def _derive_live_frame_selection(
                 f"frame {frame} transport origin requires manual review; "
                 "refusing an unattended fine scan"
             )
+    # F4 rework: a manual placement is never eligible for the leading-anchor
+    # rebase, no matter how well its fingerprints match. Rebase exists for
+    # ONE narrow, physically-understood case -- Nikon's own leading-record
+    # wobble, bounded and reviewed elsewhere -- and it works by keeping the
+    # ALREADY-DERIVED origin even when a fresh table read disagrees with it
+    # (see apply_boundary_offset's own docstring/rebase_info handling). A
+    # manual origin's own resolution (manual_frames._resolve_boundary_
+    # transport_origin, F1) already re-derives from THIS traversal's live
+    # table every time it runs; a fresh disagreement there is not leading-
+    # anchor wobble, it is this specific placement failing to reproduce
+    # itself, and rebasing would launder that into a silently accepted,
+    # possibly displaced origin instead of the refusal it should be.
     origin_rebase_allowed = (
         fingerprint_comparison is not None
         and fingerprint_comparison.matches
         and selected_fingerprint_comparison is not None
         and selected_fingerprint_comparison.matches
+        and not manual_placement
     )
     mapping, selected, origin_rebase_info = apply_boundary_offset(
         mapping,
@@ -1701,10 +1714,55 @@ def _derive_live_batch_selections(
     # apply_boundary_offset can rebase a frame-1 leading offset onto the fresh
     # traversal's own detected origin when the resolved record lands outside
     # the two-row affine bound but inside the five-row leading-anchor bound.
+    #
+    # F4 rework: never for a manual placement, no matter how well its
+    # fingerprints match -- same reasoning as _derive_live_frame_selection's
+    # own origin_rebase_allowed (single-frame path); see that comment. Every
+    # frame in a manual batch shares the one manual_boundary_rows this
+    # function received, so this is a single placement-wide flag, not a
+    # per-slot one.
+    manual_placement = (
+        manual_boundary_rows is not None
+        and MANUAL_PLACEMENT_WARNING in context.detection.warnings
+    )
+    # S6 hardening (FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1 rework):
+    # load_validated_batch_job already checked each approval's own
+    # self-digest, slot, offset, reviewed-fingerprint digest, and (as of
+    # this same hardening) manual_boundary_rows_sha256 -- all proving the
+    # receipt is internally consistent and was signed for THIS placement.
+    # None of that proves the receipt's own CLAIMED per-slot values
+    # (reviewed_lookup_row, reviewed_native_origin, review_reasons) are
+    # what this exact traversal's fresh resolution actually produces for
+    # that slot -- context.mapping, built above from manual_boundary_rows
+    # by this rework's own lattice-aware resolution
+    # (manual_frames._resolve_boundary_transport_origin), is the only
+    # thing that can prove that, and only once it exists. thumbnail_sha256
+    # is deliberately not re-verified here: it is not derivable from the
+    # mapping alone (it needs the raster plus the app's own cropping
+    # logic, a layer this protocol worker does not have), so re-checking
+    # it belongs at the layer that already recomputes it, not here.
+    if manual_placement:
+        for spec in frames:
+            approval = spec.manual_review_approval
+            if approval is None:
+                continue
+            if not 1 <= spec.slot <= len(context.mapping.origins):
+                continue  # refused elsewhere (addressable-count checks)
+            fresh_origin = context.mapping.origins[spec.slot - 1]
+            if (
+                approval.reviewed_lookup_row != fresh_origin.lookup_row
+                or approval.reviewed_native_origin != fresh_origin.native_origin
+                or not set(fresh_origin.review_reasons) <= set(approval.review_reasons)
+            ):
+                raise ProtocolError(
+                    f"frame {spec.slot} manual review approval does not match "
+                    "this traversal's freshly resolved origin"
+                )
     origin_rebase_slots = frozenset(
         spec.slot
         for spec in frames
-        if context.fingerprint_comparison is not None
+        if not manual_placement
+        and context.fingerprint_comparison is not None
         and context.fingerprint_comparison.matches
         and selected_fingerprint_comparisons.get(spec.slot) is not None
         and selected_fingerprint_comparisons[spec.slot].matches
@@ -2009,6 +2067,24 @@ def load_validated_batch_job(
             ):
                 raise ProtocolError(
                     f"batch frame {index} manual review approval belongs to another preview"
+                )
+            # S6 hardening (FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1
+            # rework): same defense-in-depth shape as the checks just
+            # above, cheap and available before any scanner/table access.
+            # reviewed_fingerprint_sha256 alone is not enough: fingerprint
+            # comparison has deliberate tolerance for a legitimate re-read
+            # (compare_reviewed_roll_fingerprints), so two DIFFERENT
+            # placements of the same physical roll could still compare as
+            # matching. This job's own manual_boundary_rows (parsed above)
+            # is the exact placement this attempt is about to bind against;
+            # the receipt must have been signed for that exact placement,
+            # not merely "a" placement whose fingerprint happens to match.
+            if approval.manual_boundary_rows_sha256 != ManualFrameApproval.digest_manual_boundary_rows(
+                manual_boundary_rows
+            ):
+                raise ProtocolError(
+                    f"batch frame {index} manual review approval belongs to a "
+                    "different set of placed boundaries"
                 )
         expected_directory = f"frame-{slot:03d}"
         expected_paths = {

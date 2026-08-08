@@ -1,5 +1,6 @@
 """Regression contracts for whole-roll index decoding and dynamic frame origins."""
 
+import hashlib
 import json
 import math
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from coolscanpy.protocol.ls5000_single_pass import manual_frames
 from coolscanpy.protocol.ls5000_single_pass import roll_index as roll
 
 
@@ -36,6 +38,20 @@ LIVE_PREVIEW = (
     LIVE_PREVIEW_ATTEMPT / "capture-preview.bin" if LIVE_PREVIEW_ATTEMPT else None
 )
 LIVE_TABLE = LIVE_PREVIEW_ATTEMPT / "capture-008e.bin" if LIVE_PREVIEW_ATTEMPT else None
+
+# Manual-placement rework (FEEDING-UX-LADDER-OVERNIGHT-20260807.md, F1/F4):
+# the 51-table regression. Every capture-preview.bin/capture-008e.bin pair
+# anywhere under this root is a real archived LS-5000 traversal from this
+# project's own reverse-engineering and live-validation work -- exactly the
+# corpus the adversarial review used to prove the pre-rework gate 4 refused
+# 51 of 51 real captures at the first frame edge. Defaults to this
+# developer machine's own copy (present for this project's own contributor;
+# absent everywhere else, including CI), and skips cleanly either way,
+# following the same convention as COOLSCANPY_SINGLE_PASS_WIRE_DIR and
+# COOLSCANPY_LIVE_PREVIEW_ATTEMPT_DIR above.
+_ARCHIVE_ROOT_ENV = "COOLSCANPY_ARCHIVE_ROOT"
+_default_archive_root = "/Users/rohan/Downloads/digital-ice-2026"
+ARCHIVE_ROOT = Path(os.environ.get(_ARCHIVE_ROOT_ENV, _default_archive_root))
 
 
 def _encode_index(rgb16: np.ndarray) -> bytes:
@@ -1507,3 +1523,197 @@ def test_all_wide_no_narrow_anchors_refuses_mapping() -> None:
 
     with pytest.raises(roll.IndexDecodeError, match="three direct physical gaps"):
         roll.derive_transport_mapping(boundaries, 3, records)
+
+
+# ---------------------------------------------------------------------------
+# Manual placement rework (FEEDING-UX-LADDER-OVERNIGHT-20260807.md, F1/F4):
+# the 51-table archive regression.
+# ---------------------------------------------------------------------------
+
+
+def _archive_capture_pairs(root: Path) -> list[tuple[Path, Path]]:
+    """Every (preview, table) pair under root, deduped by preview SHA-256."""
+
+    if not root.is_dir():
+        return []
+    seen: set[str] = set()
+    pairs: list[tuple[Path, Path]] = []
+    for preview_path in sorted(root.rglob("capture-preview.bin")):
+        table_path = preview_path.with_name("capture-008e.bin")
+        if not table_path.is_file():
+            continue
+        digest = hashlib.sha256(preview_path.read_bytes()).hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        pairs.append((preview_path, table_path))
+    return pairs
+
+
+_ARCHIVE_PAIRS = _archive_capture_pairs(ARCHIVE_ROOT)
+
+
+@pytest.mark.skipif(
+    not _ARCHIVE_PAIRS,
+    reason=(
+        "no archived capture-preview.bin/capture-008e.bin pairs found; set "
+        f"{_ARCHIVE_ROOT_ENV} to a directory tree containing them to run "
+        "this regression"
+    ),
+)
+def test_manual_placement_accepts_every_archived_automatic_boundary_set() -> None:
+    """F1/F4 acceptance gate: feed every real archived capture's own
+    AUTOMATIC boundary rows into build_manual_detection, using the exact
+    same same-traversal transport table. The placement must be accepted --
+    this is the specific defect the pre-rework gate 4 had: adversarial
+    review measured it refusing 51 of 51 real captures at the first frame
+    edge, because a real live 0x8e table's deterministic ~18-row code
+    lattice (selector-rollover jumps of roughly +798/-700 native units,
+    smaller sub-rollover jumps within each cycle -- see manual_frames.py's
+    own module docstring) fails a per-step "every row within 3 of a pick
+    must be 40..45 units" guard almost everywhere.
+
+    Every resolved origin must also land close to derive_transport_
+    mapping's own origin for the same boundary. Origins derive_transport_
+    mapping itself marks "automatic" (a clean, directly-read narrow gap --
+    the overwhelming majority in this corpus) must match within 2.0
+    preview rows (~85 native units), the same interior-anchor bound the
+    automatic path enforces on itself. Origins it marks manual_review (a
+    broad or weak-evidence region even automatic could not read directly --
+    a small minority) are held to a looser, still-bounded 5.0 rows, the
+    same wobble allowance this codebase already grants its own
+    leading-anchor divergence (MAXIMUM_LEADING_ANCHOR_ERROR_ROWS in this
+    module) -- comparing two independent estimates of an already-uncertain
+    position is not the same claim as comparing against a proven direct
+    read, and this test does not pretend otherwise.
+    """
+
+    accepted = 0
+    expected_ceiling_refusals = 0
+    trusted_deltas: list[float] = []
+    inferred_deltas: list[float] = []
+
+    for preview_path, table_path in _ARCHIVE_PAIRS:
+        preview_bytes = preview_path.read_bytes()
+        table_bytes = table_path.read_bytes()
+        # IndexGeometry derived purely from the preview file's own byte
+        # length (decode_full_index_bytes needs nothing more than height,
+        # width, block_bytes, and their product) -- this corpus spans many
+        # independent capture campaigns with different allocated preview
+        # heights, and native_height is not needed by anything this test
+        # calls (it matters to worker.py's own fine-window-overflow check,
+        # out of scope here).
+        height = len(preview_bytes) // (roll.INDEX_ROW_WORDS * 2)
+        geometry = roll.IndexGeometry(
+            requested_resolution=97,
+            native_resolution=4_000,
+            pitch=41,
+            native_width=3_946,
+            native_height=height * 41,
+            width=96,
+            height=height,
+            block_bytes=2_048,
+            expected_stream_bytes=height * roll.INDEX_ROW_WORDS * 2,
+        )
+        table, usable_rows = roll.validate_live_0x8e_bytes(table_bytes, geometry.height)
+        rgb, known, _report = roll.decode_full_index_bytes(
+            preview_bytes, geometry, usable_rows=usable_rows
+        )
+        try:
+            detection = roll.detect_roll_frames(
+                rgb, known, nominal_frame_rows=5_959 // geometry.pitch
+            )
+        except roll.IndexDecodeError:
+            # Automatic detection itself refused this capture (e.g. the
+            # vendored tree's leading-frame-clip gate on a strip whose
+            # first frame starts before the raster) -- out of this gate's
+            # scope exactly like a below-high confidence result.
+            continue
+        if detection.confidence != "high":
+            continue  # automatic did not succeed; out of this gate's scope
+        records = roll.parse_live_transport_records_bytes(
+            table, maximum_rows=geometry.height
+        )
+        scanner_frame_count = roll.scanner_addressable_interval_count(detection.intervals)
+        try:
+            auto_mapping = roll.derive_transport_mapping(
+                detection.boundaries, scanner_frame_count, records
+            )
+        except roll.IndexDecodeError:
+            continue  # automatic itself did not succeed; out of scope
+
+        boundary_rows = [
+            b.output_row for b in detection.boundaries[: scanner_frame_count + 1]
+        ]
+        try:
+            manual_result = manual_frames.build_manual_detection(
+                rgb,
+                known,
+                boundary_rows,
+                nominal_frame_rows=5_959 // geometry.pitch,
+                records=records,
+            )
+        except roll.IndexDecodeError as error:
+            # F2 (this same rework) is a deliberate NEW restriction: a
+            # frame taller than the fine capture window now refuses rather
+            # than silently truncating. If automatic's own high-confidence
+            # lattice fit happened to place two boundaries far enough apart
+            # to trip that new ceiling, refusing here is correct, not a
+            # regression -- count it, but do not let it slip past as an
+            # unnoticed acceptance failure either.
+            if "there is no way to capture a taller frame" in str(error):
+                expected_ceiling_refusals += 1
+                continue
+            pytest.fail(
+                f"{preview_path}: manual placement refused automatic's own "
+                f"boundary rows: {error}"
+            )
+
+        accepted += 1
+        scale = auto_mapping.native_units_per_preview_row
+        for auto_origin, manual_origin in zip(
+            auto_mapping.origins, manual_result.mapping.origins
+        ):
+            delta_rows = (manual_origin.native_origin - auto_origin.native_origin) / scale
+            if auto_origin.automatic:
+                trusted_deltas.append(delta_rows)
+            else:
+                inferred_deltas.append(delta_rows)
+
+    total_eligible = accepted + expected_ceiling_refusals
+    print(
+        f"\ngate A: {len(_ARCHIVE_PAIRS)} unique archived captures; "
+        f"{total_eligible} automatic-high-confidence and eligible; "
+        f"{accepted} accepted, {expected_ceiling_refusals} correctly refused "
+        "(F2 fine-capture-window ceiling)"
+    )
+    assert accepted > 0, "no eligible archived captures were accepted -- check ARCHIVE_ROOT"
+
+    trusted = np.abs(np.asarray(trusted_deltas, dtype=np.float64))
+    inferred = np.abs(np.asarray(inferred_deltas, dtype=np.float64))
+    if len(trusted):
+        print(
+            f"origin deltas vs automatic, preview rows -- trusted: n={len(trusted)} "
+            f"mean={trusted.mean():.4f} p95={np.percentile(trusted, 95):.4f} "
+            f"max={trusted.max():.4f}"
+        )
+    if len(inferred):
+        print(
+            f"origin deltas vs automatic, preview rows -- inferred: n={len(inferred)} "
+            f"mean={inferred.mean():.4f} median={np.median(inferred):.4f} "
+            f"max={inferred.max():.4f}"
+        )
+
+    if len(trusted):
+        assert trusted.max() <= 2.0, (
+            f"an automatic-trusted origin diverged {trusted.max():.3f} rows "
+            "from derive_transport_mapping's own answer for the same "
+            "boundary -- expected <= 2.0"
+        )
+    if len(inferred):
+        assert inferred.max() <= 5.0, (
+            f"an automatic-inferred origin diverged {inferred.max():.3f} "
+            "rows from derive_transport_mapping's own answer for the same "
+            "boundary -- expected <= 5.0 (this codebase's own leading-"
+            "anchor wobble allowance)"
+        )

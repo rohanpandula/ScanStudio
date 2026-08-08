@@ -746,6 +746,68 @@ class Roll:
                 if wanted is None or slot.slot_id in wanted
             ]
 
+    def install_manual_session(self, session: RollPreviewSession) -> None:
+        """Install an already-built, already-validated manual-placement
+        preview session as this Roll's current review state (Rung 4 of the
+        feeding UX ladder; 2026-08-08 adversarial review, S1/S5).
+
+        No film moves and no evidence is read from disk here: the caller
+        (``coolscanpy_transport.manual_frames()``) has already produced
+        ``session`` from a validated, decoded ``ValidatedRollPreview`` via
+        :func:`coolscanpy.roll.preview_session.build_manual_roll_preview_session`.
+        This method's whole job is the same locked, atomic state transition
+        every other in-place mutator on this class already performs --
+        :meth:`preview`'s own success tail, :meth:`restore_preview_session`,
+        :meth:`set_spacing_offset`, :meth:`approve` -- so a manual-placement
+        caller never has to reach into ``_session``/``_approvals`` directly
+        (previously the only way to arm a manual session at all, since
+        neither of those two existing methods accepts one: ``preview()``
+        always re-reads the transport, and ``restore_preview_session()``
+        explicitly refuses a session serialized from manual placement).
+
+        Checks run in this order, all under one lock, before anything is
+        mutated:
+
+        1. This Roll must not be closing, mid-preview, or hold an active
+           batch -- the same "review state is frozen" contract
+           ``_require_mutable_review_locked`` enforces for every other
+           mutator here.
+        2. ``session``'s material must match this Roll's own material.
+        3. ``session.preview.usb_topology`` -- the USB bus/address recorded
+           when the underlying evidence was originally captured, which may
+           be considerably older than this exact call -- must match this
+           Roll's CURRENT device topology, verified fresh here the same way
+           a live :meth:`preview` or :meth:`restore_preview_session` call
+           already does. Never trusted bare: a manual session built from a
+           stale attempt must not silently bind to whatever scanner happens
+           to be attached now.
+
+        Raises ``TypeError`` if ``session`` is not a ``RollPreviewSession``,
+        ``DeviceBusy`` if check 1 fails, or ``RollMismatch`` if check 2 or 3
+        fails. Every check runs before any mutation, and a raise leaves the
+        existing session and approvals (if any) exactly as they were --
+        this method never partially installs a session.
+        """
+
+        if not isinstance(session, RollPreviewSession):
+            raise TypeError("session must be a RollPreviewSession")
+        with self._state_condition:
+            self._require_mutable_review_locked()
+            if session.material is not self._material:
+                raise RollMismatch(
+                    "manual placement session material does not match this "
+                    "Roll's material"
+                )
+            topology = self._preview_topology_locked()
+            if session.preview.usb_topology != topology:
+                raise RollMismatch(
+                    "manual placement evidence belongs to a different USB "
+                    "topology than this Roll"
+                )
+            self._session = session
+            self._session_usb_topology = topology
+            self._approvals.clear()
+
     # -- spacing offset ----------------------------------------------------
 
     def spacing_offset(self, slot: int) -> int:

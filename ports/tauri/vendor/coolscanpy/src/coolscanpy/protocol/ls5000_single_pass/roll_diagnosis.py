@@ -91,6 +91,36 @@ _APERTURE_EDGE_FRACTION = 0.20
 # obstructed (measured cliff: 15/96 cols @ 70% transmission fails detection,
 # 10 columns does not -- FEEDING-ROBUSTNESS-20260805.md Sec 3.3).
 _APERTURE_OBSTRUCTION_RATIO = 0.85
+# The fog/dense-base sentence requires both aperture edges within this
+# fraction of the middle: below it, the transmission depression is
+# one-sided (an obstruction-shaped signal, whatever its depth), and the
+# contrast check stays silent rather than blaming the film stock.
+_CONTRAST_FLOOR_SYMMETRY_FLOOR = 0.90
+# The obstruction profile is judged over clear-film candidate rows: rows
+# whose middle-column level reaches this fraction of the raster's own
+# clear-base reference (p99 of row middles -- the same self-normalising
+# shape the detector's clear_base uses). A fixed top-percentile cut is
+# wrong here: on a full roll only ~6% of rows are clear film, so any
+# percentile wide enough to be robust also admits bright FRAME rows,
+# whose scene content carries per-column structure that median-stacks
+# into a false one-sided depression (caught by the healthy-roll
+# regression, 2026-08-08). A minimum count of candidate rows is still
+# required before the check may speak at all.
+_OBSTRUCTION_CLEAR_LEVEL_FRACTION = 0.75
+_OBSTRUCTION_MIN_BRIGHT_ROWS = 6
+# ...and the p99 reference itself must stand clearly apart from the typical
+# row before those candidates are believed to be clear film at all: on a
+# roll with NO clear rows (dense/gapless refusals -- exactly when diagnosis
+# runs), p99 lands on bright FRAME rows whose one-sided scene content then
+# resurrects the phantom-obstruction sentence (re-review 2026-08-08, F-C).
+# Real clear film reads several times brighter than frame content; a p99
+# within this ratio of the median row means there is no clear-film
+# population to judge from, and the check stays silent. 1.8 sits between
+# frame texture's own p99/median spread (~1.5-1.6 measured on the synthetic
+# fixtures) and real clear film's ~3x separation; dense film whose clear
+# rows barely clear its frames loses obstruction diagnosis rather than
+# risking a wrong sentence.
+_OBSTRUCTION_CLEAR_SEPARATION_RATIO = 1.8
 # Below this aperture width, edge/middle columns cannot be split usefully.
 _APERTURE_MIN_WIDTH_FOR_OBSTRUCTION_CHECK = 10
 
@@ -279,14 +309,42 @@ def _diagnose_gap_geometry(direct: np.ndarray, nominal_frame_rows: int) -> str |
 
 
 def _diagnose_contrast_floor(
-    transmission: np.ndarray, nonuniformity: np.ndarray, direct: np.ndarray
+    transmission: np.ndarray,
+    nonuniformity: np.ndarray,
+    direct: np.ndarray,
+    rgb16: np.ndarray,
+    aperture: tuple[int, int],
 ) -> str | None:
     """Rows that fail only the transmission half of the direct gap gate.
 
     ``nonuniformity`` is held to the same ceiling the detector's own direct
     gate uses, so this isolates rows that are flat (not scene content) but
     simply too dim -- fog or a dense film base, not noise.
+
+    Fog and a dense base are whole-film properties, so the depression must
+    be roughly column-symmetric before this speaks (adversarial review
+    2026-08-08, F5): a one-sided aperture band can drag gap rows into the
+    same 0.80-0.87 near-miss window while sitting just above the
+    obstruction check's own ratio, and the fog sentence would then send
+    the reporter chasing their film stock when the real problem is holder
+    seating. An asymmetric profile stays silent -- no sentence beats a
+    wrong one.
     """
+
+    lo, hi = aperture
+    width = hi - lo
+    if width >= _APERTURE_MIN_WIDTH_FOR_OBSTRUCTION_CHECK:
+        column_level = np.median(
+            rgb16[:, lo:hi].astype(np.float64).mean(axis=2), axis=0
+        )
+        edge = max(1, round(width * _APERTURE_EDGE_FRACTION))
+        if width - 2 * edge >= edge:
+            middle = float(np.median(column_level[edge:-edge]))
+            if middle > 0:
+                leading = float(np.median(column_level[:edge])) / middle
+                trailing = float(np.median(column_level[-edge:])) / middle
+                if min(leading, trailing) < _CONTRAST_FLOOR_SYMMETRY_FLOOR:
+                    return None
 
     near_miss = (
         ~direct
@@ -318,23 +376,38 @@ def _diagnose_aperture_obstruction(
 ) -> str | None:
     """Column-wise brightness profile: one aperture edge depressed against the middle.
 
-    Uses every row, not just clear-film rows: a real physical obstruction
-    -- carrier mask edge, curl shadow, tape, heavy edge fog -- depresses a
-    fixed band of columns whether that row is a gap or a photographed
-    frame, so the median over all rows is the more reliable read (a
-    genuine obstruction can push transmission on affected rows below the
-    direct gate everywhere, leaving too few clear-film rows to trust on
-    their own).
+    Measured over the raster's BRIGHTEST rows by middle-column level -- the
+    clear-film candidates. A real physical obstruction -- carrier mask
+    edge, curl shadow, tape, heavy edge fog -- depresses a fixed band of
+    columns on every row including the clear ones, while a roll whose
+    photographs simply carry dark content along one side (2026-08-08
+    review, S9) depresses that side only where there is picture. Judging
+    on bright rows keeps the first and drops the second: an obstruction
+    still shows there (its columns stay dark even when the film is clear),
+    but composition cannot (a bright/clear row has no dark subject edge).
     """
 
     lo, hi = aperture
     width = hi - lo
     if width < _APERTURE_MIN_WIDTH_FOR_OBSTRUCTION_CHECK:
         return None
-    column_level = np.median(rgb16[:, lo:hi].astype(np.float64).mean(axis=2), axis=0)
+    levels = rgb16[:, lo:hi].astype(np.float64).mean(axis=2)
     edge = max(1, round(width * _APERTURE_EDGE_FRACTION))
     if width - 2 * edge < edge:
         return None
+    row_middle = np.median(levels[:, edge:-edge], axis=1)
+    clear_reference = float(np.percentile(row_middle, 99.0))
+    if clear_reference <= 0:
+        return None
+    typical_row = float(np.median(row_middle))
+    if typical_row > 0 and clear_reference < (
+        _OBSTRUCTION_CLEAR_SEPARATION_RATIO * typical_row
+    ):
+        return None
+    bright_rows = row_middle >= _OBSTRUCTION_CLEAR_LEVEL_FRACTION * clear_reference
+    if int(bright_rows.sum()) < _OBSTRUCTION_MIN_BRIGHT_ROWS:
+        return None
+    column_level = np.median(levels[bright_rows], axis=0)
     middle = float(np.median(column_level[edge:-edge]))
     if middle <= 0:
         return None
@@ -387,11 +460,19 @@ def diagnose_roll_refusal(
         # nothing trustworthy left to diagnose.
         return None
 
+    # Obstruction runs BEFORE the contrast floor (adversarial review
+    # 2026-08-08, F5): a one-sided aperture band dims gap rows into the
+    # contrast check's 0.80-0.87 near-miss window, and the fog/dense-base
+    # sentence would then send the reporter chasing their film stock when
+    # the physically correct advice is to reseat the holder. The
+    # obstruction check is the more specific signal, so it speaks first.
     checks = (
         lambda: _diagnose_alternate_pitch(evidence, direct, nominal_frame_rows),
         lambda: _diagnose_gap_geometry(direct, nominal_frame_rows),
-        lambda: _diagnose_contrast_floor(transmission, nonuniformity, direct),
         lambda: _diagnose_aperture_obstruction(rgb16, aperture),
+        lambda: _diagnose_contrast_floor(
+            transmission, nonuniformity, direct, rgb16, aperture
+        ),
     )
     for check in checks:
         try:

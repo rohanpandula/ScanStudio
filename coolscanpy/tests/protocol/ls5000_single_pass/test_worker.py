@@ -1467,6 +1467,11 @@ def test_batch_job_loader_binds_ordered_frame_paths_and_parent_ack_contract(
         reviewed_lookup_row=2_400,
         reviewed_native_origin=100_000,
         review_reasons=("transport-origin-inferred",),
+        # Matches this job payload's own "manual_boundary_rows": None below
+        # -- load_validated_batch_job cross-checks the two (S6 hardening).
+        manual_boundary_rows_sha256=ManualFrameApproval.digest_manual_boundary_rows(
+            None
+        ),
     )
     job_path = tmp_path / "batch-job.json"
     job_path.write_text(
@@ -1608,6 +1613,56 @@ def test_batch_job_loader_parses_valid_manual_boundary_rows(tmp_path: Path) -> N
     )
 
     assert job.manual_boundary_rows == (128, 271, 414)
+
+
+def test_batch_job_loader_refuses_a_receipt_bound_to_different_boundary_rows(
+    tmp_path: Path,
+) -> None:
+    """S6 hardening (FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1 rework): a
+    manual approval receipt is only valid for the EXACT set of boundary
+    rows it was signed for. reviewed_fingerprint_sha256 alone is not
+    enough -- fingerprint comparison has deliberate tolerance for a
+    legitimate re-read (compare_reviewed_roll_fingerprints), so two
+    DIFFERENT placements of the same physical roll could still compare as
+    matching. Here the receipt was signed for [128, 271, 414] (matching
+    test_batch_job_loader_parses_valid_manual_boundary_rows's own honest
+    case) but the job claims a different placement, [128, 271, 500] --
+    same slot, same offset, same reviewed_fingerprint_sha256, everything
+    the pre-hardening checks looked at unchanged, only the actual placed
+    rows different.
+    """
+
+    fingerprint = _reviewed_fingerprint()
+    approval = ManualFrameApproval(
+        reviewed_fingerprint_sha256=fingerprint.binding_sha256,
+        slot=1,
+        boundary_offset_rows=0,
+        thumbnail_sha256="5" * 64,
+        reviewed_lookup_row=2_400,
+        reviewed_native_origin=100_000,
+        review_reasons=("user-picked-origin",),
+        manual_boundary_rows_sha256=ManualFrameApproval.digest_manual_boundary_rows(
+            (128, 271, 414)
+        ),
+    )
+    payload = _one_frame_job_payload(
+        fingerprint,
+        exposure_override_10ns=None,
+        manual_boundary_rows=[128, 271, 500],
+    )
+    payload["frames"][0]["manual_review_approval"] = approval.to_payload()
+    job_path = tmp_path / "batch-job.json"
+    job_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ProtocolError, match="different set of placed boundaries"
+    ):
+        load_validated_batch_job(
+            job_path,
+            expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+            expected_plan_sha256="a" * 64,
+            expected_continuation_sha256="b" * 64,
+        )
 
 
 def test_batch_job_loader_refuses_malformed_manual_boundary_rows(
@@ -3392,6 +3447,101 @@ def test_manual_selection_still_refuses_on_fingerprint_mismatch(
         )
 
 
+def test_manual_selection_never_qualifies_for_origin_rebase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4 rework, single-frame path: a manual placement must not be
+    granted the leading-anchor rebase, no matter how well its fingerprints
+    match. Frame 1's live record is displaced by ~3.5 rows (inside the
+    2..5-row band that WOULD rebase for an automatic origin with matching
+    fingerprints) while every other condition for rebase is satisfied
+    (operator approval given, whole-roll and selected-slot fingerprints
+    both matching this exact displaced table); only origin_rebase_allowed
+    excluding this manual placement stands between that and a silently
+    displaced bound origin. See test_manual_batch_selection_never_
+    qualifies_for_origin_rebase for the batch-path equivalent.
+    """
+
+    # Textured, not all-zero: the reviewed fingerprint's visual signature
+    # needs real dynamic range in the signed frame region (rows 0..99) or
+    # the comparison below reports "visual-signature-indeterminate" rather
+    # than matching -- and this test needs it to match, on purpose, so
+    # origin_rebase_allowed is the only thing left to decide the outcome.
+    y = np.arange(500, dtype=np.int64)[:, None]
+    x = np.arange(96, dtype=np.int64)[None, :]
+    texture = (x * 173 + y * 71 + (x * y) % 997) % 7_000
+    rgb = np.stack([texture, texture // 2, texture // 3], axis=2).astype(np.uint16)
+    _wire_manual_gate_common(monkeypatch, rgb)
+
+    # Frame 1's OWN live record (lookup_row=10, see _manual_gate_mapping)
+    # displaced by +147 native units (~3.5 rows). A different, still
+    # internally-consistent code (147 = 7 * 21, a reachable subposition
+    # step) keeps transport_native_origin's own identity check satisfied,
+    # the same way test_manual_batch_selection_never_qualifies_for_origin_
+    # rebase's displacement does.
+    base_records = _manual_gate_records()
+    victim = base_records[10]
+    displaced_code = victim.code + 21
+    displaced_records = (
+        base_records[:10]
+        + (
+            TransportRecord(
+                row=victim.row,
+                code=displaced_code,
+                selector=victim.selector,
+                native_origin=worker_module.transport_native_origin(
+                    displaced_code, victim.selector
+                ),
+            ),
+        )
+        + base_records[11:]
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: displaced_records,
+    )
+
+    mapping = _manual_gate_mapping()
+    detection = _manual_gate_detection(confidence="medium", user_picked=True)
+    monkeypatch.setattr(
+        worker_module,
+        "build_manual_detection",
+        lambda *_a, **_k: SimpleNamespace(
+            detection=detection, mapping=mapping, snaps=()
+        ),
+    )
+
+    # A reviewed fingerprint built from exactly the same inputs
+    # _derive_live_frame_selection will freshly recompute (mapping.origins
+    # is unchanged -- only the raw records table was displaced above, the
+    # same way a real reviewed session's own signed origin would not move
+    # just because a LATER traversal's table read differently) --
+    # constructed to match on purpose, so origin_rebase_allowed is the
+    # only thing left to decide whether this binds.
+    reviewed = build_reviewed_roll_fingerprint(
+        rgb,
+        frame_intervals=((0, 100),),
+        frame_native_origins=(420,),
+        source_preview_sha256=hashlib.sha256(b"fresh-preview").hexdigest(),
+        source_table_sha256=hashlib.sha256(b"fresh-table").hexdigest(),
+    )
+
+    with pytest.raises(
+        ProtocolError,
+        match=r"frame 1 boundary offset resolves to a transport origin",
+    ):
+        worker_module._derive_live_frame_selection(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frame=1,
+            reviewed_fingerprint=reviewed,
+            manual_review_approved=True,
+            manual_boundary_rows=(10, 200),
+        )
+
+
 def test_live8_frame_table_is_the_exact_firmware_accepted_payload() -> None:
     payload = build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS))
     send = next(entry for entry in load_canonical_plan() if entry["seq"] == 174)
@@ -4273,6 +4423,231 @@ def test_batch_selections_accept_one_addressable_sliver_beyond_reviewed(
 
     assert [selection.frame for selection in selections] == [1]
     assert bound_frames == [1]
+
+
+def test_manual_batch_selection_never_qualifies_for_origin_rebase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4 rework: a manual placement must not be granted the leading-anchor
+    rebase, no matter how well its fingerprints match. Frame 1's live
+    record is displaced by ~3.6 rows (inside the 2..5-row band that WOULD
+    rebase for an automatic origin -- see
+    test_leading_anchor_divergence_narrowly_auto_accepted_when_reviewed_
+    automatic for that accepted case); with every other condition for
+    rebase satisfied, only origin_rebase_slots excluding this manual
+    placement stands between that and a silently displaced bound origin.
+    """
+
+    mapping, records = _short_strip_mapping(6)
+    # Every origin manual: automatic=False, manual_review=True, exactly
+    # build_manual_detection's own shape for every frame it places.
+    mapping = replace(
+        mapping,
+        origins=tuple(
+            replace(
+                origin,
+                automatic=False,
+                manual_review=True,
+                method="user-picked-row",
+            )
+            for origin in mapping.origins
+        ),
+    )
+    # Frame 1's OWN live record (lookup_row=100, see _short_strip_mapping)
+    # displaced by +147 native units (~3.5 rows) -- apply_boundary_offset
+    # re-reads this fresh, it does not trust the origin's own stored value.
+    # A different, still internally-consistent code (147 = 7 * 21, so this
+    # stays a reachable subposition) keeps transport_native_origin's own
+    # identity check satisfied -- a real live record could not desync from
+    # that identity, and this displacement should look exactly like one.
+    records = list(records)
+    victim = records[100]
+    displaced_code = victim.code + 21
+    records[100] = TransportRecord(
+        row=victim.row,
+        code=displaced_code,
+        selector=victim.selector,
+        native_origin=worker_module.transport_native_origin(
+            displaced_code, victim.selector
+        ),
+    )
+    records = tuple(records)
+
+    reviewed = _reviewed_fingerprint_with_count(6)
+    context = _batch_selection_context(mapping, records, reviewed)
+    context.detection = SimpleNamespace(
+        warnings=(manual_frames.MANUAL_PLACEMENT_WARNING,)
+    )
+    frame_root = tmp_path / "manual-rebase-attempt"
+    # A genuine (self-consistent) receipt whose claimed values match the
+    # MAPPING's own (undisplaced) origin -- exactly what an honest approval
+    # would have recorded, since the operator reviewed this before the
+    # live table above was displaced. This is what lets the scenario reach
+    # the rebase decision this test is actually about, rather than
+    # tripping the S6 fresh-recomputation cross-check first.
+    approval = ManualFrameApproval(
+        reviewed_fingerprint_sha256=reviewed.binding_sha256,
+        slot=1,
+        boundary_offset_rows=0,
+        thumbnail_sha256="4" * 64,
+        reviewed_lookup_row=mapping.origins[0].lookup_row,
+        reviewed_native_origin=mapping.origins[0].native_origin,
+        review_reasons=("user-picked-origin",),
+        manual_boundary_rows_sha256=ManualFrameApproval.digest_manual_boundary_rows(
+            (10, 200)
+        ),
+    )
+    frames = (
+        worker_module.BatchFrameSpec(
+            slot=1,
+            boundary_offset_rows=0,
+            manual_review_approval=approval,
+            output=frame_root / "frame-001" / "capture.bin",
+            journal=frame_root / "frame-001" / "journal.json",
+            ack=frame_root / "frame-001" / "parent-ack.json",
+        ),
+    )
+
+    monkeypatch.setattr(
+        worker_module, "_derive_live_frame_selection", lambda *_a, **_k: context
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "compare_selected_roll_fingerprint",
+        lambda *_a, **_k: SimpleNamespace(matches=True, reason="matched"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, len(records)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: records,
+    )
+
+    with pytest.raises(
+        ProtocolError,
+        match=r"frame 1 boundary offset resolves to a transport origin",
+    ):
+        worker_module._derive_live_batch_selections(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frames,
+            reviewed_fingerprint=reviewed,
+            # Required for the manual_placement check itself (worker.py
+            # cannot infer "this batch is manual" from context.detection
+            # alone -- see the comment at that computation site): without
+            # this, the fix under test would not even engage, and the old,
+            # buggy rebase-eligible path would silently pass instead.
+            manual_boundary_rows=(10, 200),
+        )
+
+
+def test_manual_batch_selection_refuses_when_approval_disagrees_with_fresh_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S6 hardening: load_validated_batch_job proves a receipt is
+    internally consistent and was signed for this exact placement's
+    boundary rows (see test_batch_job_loader_refuses_a_receipt_bound_to_
+    different_boundary_rows), but proves nothing about whether its
+    CLAIMED per-slot values (reviewed_lookup_row, reviewed_native_origin,
+    review_reasons) match what this traversal's fresh manual resolution
+    actually produced for that slot -- only context.mapping, built from
+    this rework's own lattice-aware resolution
+    (manual_frames._resolve_boundary_transport_origin), can prove that.
+    Here the receipt claims frame 1's reviewed_native_origin is 4200 + 147
+    -- disagreeing with the mapping's own (undisplaced, correctly
+    resolved) native_origin of 4200 -- with every job-file-level check
+    otherwise satisfied (matching fingerprint, matching manual_boundary_
+    rows digest, matching slot/offset). A malformed trusted-parent job
+    fabricating this field is exactly the attack this closes.
+    """
+
+    mapping, records = _short_strip_mapping(6)
+    mapping = replace(
+        mapping,
+        origins=tuple(
+            replace(
+                origin,
+                automatic=False,
+                manual_review=True,
+                method="user-picked-row",
+            )
+            for origin in mapping.origins
+        ),
+    )
+    reviewed = _reviewed_fingerprint_with_count(6)
+    context = _batch_selection_context(mapping, records, reviewed)
+    context.detection = SimpleNamespace(
+        warnings=(manual_frames.MANUAL_PLACEMENT_WARNING,)
+    )
+    frame_root = tmp_path / "manual-fresh-mismatch"
+    fresh_origin = mapping.origins[0]
+    approval = ManualFrameApproval(
+        reviewed_fingerprint_sha256=reviewed.binding_sha256,
+        slot=1,
+        boundary_offset_rows=0,
+        thumbnail_sha256="6" * 64,
+        # Disagrees with fresh_origin.native_origin (4_200) by 147 native
+        # units (~3.5 rows) -- everything else about this receipt is
+        # genuine and self-consistent.
+        reviewed_lookup_row=fresh_origin.lookup_row,
+        reviewed_native_origin=fresh_origin.native_origin + 147,
+        review_reasons=("user-picked-origin",),
+        manual_boundary_rows_sha256=ManualFrameApproval.digest_manual_boundary_rows(
+            (10, 200)
+        ),
+    )
+    frames = (
+        worker_module.BatchFrameSpec(
+            slot=1,
+            boundary_offset_rows=0,
+            manual_review_approval=approval,
+            output=frame_root / "frame-001" / "capture.bin",
+            journal=frame_root / "frame-001" / "journal.json",
+            ack=frame_root / "frame-001" / "parent-ack.json",
+        ),
+    )
+
+    monkeypatch.setattr(
+        worker_module, "_derive_live_frame_selection", lambda *_a, **_k: context
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "compare_selected_roll_fingerprint",
+        lambda *_a, **_k: SimpleNamespace(matches=True, reason="matched"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, len(records)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: records,
+    )
+
+    with pytest.raises(
+        ProtocolError,
+        match=r"frame 1 manual review approval does not match this traversal's "
+        r"freshly resolved origin",
+    ):
+        worker_module._derive_live_batch_selections(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frames,
+            reviewed_fingerprint=reviewed,
+            manual_boundary_rows=(10, 200),
+        )
 
 
 def test_batch_selections_accept_a_live_count_several_frames_below_reviewed(

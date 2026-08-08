@@ -452,6 +452,7 @@ def _manual_approval(
     *,
     slot: int,
     offset: int,
+    manual_boundary_rows: tuple[int, ...] | None = None,
 ) -> capture.ManualFrameApproval:
     return capture.ManualFrameApproval(
         reviewed_fingerprint_sha256=fingerprint.binding_sha256,
@@ -461,6 +462,9 @@ def _manual_approval(
         reviewed_lookup_row=2_400,
         reviewed_native_origin=100_000,
         review_reasons=("transport-origin-inferred",),
+        manual_boundary_rows_sha256=capture.ManualFrameApproval.digest_manual_boundary_rows(
+            manual_boundary_rows
+        ),
     )
 
 

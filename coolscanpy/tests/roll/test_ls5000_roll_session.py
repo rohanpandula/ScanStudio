@@ -972,13 +972,22 @@ def test_manual_session_yields_slots_with_boundary_offset_still_working() -> Non
     assert len(session.slots) == 6
     assert session.detection.confidence == "medium"
     assert all(slot.manual_review for slot in session.slots)
-    for frame, (slot, boundary_row) in enumerate(
-        zip(session.slots, boundaries), start=1
+    # Boundary 0 sits in the wide (128-row) leader run -- not a narrow
+    # inter-frame gap -- so it resolves at the picked row itself. The rest
+    # each sit at the center of an ordinary 6-row inter-frame gap, so each
+    # resolves at that run's OWN trailing edge (boundary + 3), mirroring
+    # derive_transport_mapping's "direct-gap-trailing-row" convention (see
+    # manual_frames.py's own docstring for why manual placement's F1
+    # rework does the same).
+    expected_lookup_rows = [boundaries[0]] + [b + 3 for b in boundaries[1:6]]
+    for frame, (slot, lookup_row) in enumerate(
+        zip(session.slots, expected_lookup_rows), start=1
     ):
-        assert slot.base_origin.native_origin == 42 * boundary_row
+        assert slot.base_origin.lookup_row == lookup_row
+        assert slot.base_origin.native_origin == 42 * lookup_row
         assert slot.base_origin.method == "user-picked-row"
 
-    picked_slot = session.slots[1]  # frame 2, base lookup row = boundaries[1]
+    picked_slot = session.slots[1]  # frame 2, base lookup row = boundaries[1] + 3
     adjusted = session.with_boundary_offset(2, -10)
 
     assert adjusted.slots[1].boundary_offset_rows == -10
@@ -1022,6 +1031,42 @@ def test_automatic_session_json_has_no_manual_provenance(tmp_path: Path) -> None
     # now that the schema carries this additive key.
     restored = type(session).from_json(session.to_json())
     assert restored.preview.preview_artifact == session.preview.preview_artifact
+
+
+def test_pre_rework_session_json_without_manual_boundary_rows_key_still_restores(
+    tmp_path: Path,
+) -> None:
+    """F7 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): to_json() started always
+    emitting "manual_boundary_rows" the same night manual placement shipped.
+    A session persisted by the PREVIOUS build never had that key at all --
+    simulated here by deleting it from an otherwise-real payload -- and must
+    restore exactly as it always did, not refuse on an unsupported schema.
+    """
+
+    session = build_roll_preview_session(_preview_fixture(tmp_path).result)
+    payload = json.loads(session.to_json())
+    assert "manual_boundary_rows" in payload
+    del payload["manual_boundary_rows"]
+    pre_rework_json = json.dumps(payload)
+
+    restored = type(session).from_json(pre_rework_json)
+
+    assert restored.preview.preview_artifact == session.preview.preview_artifact
+    assert restored.selected_slots == session.selected_slots
+
+
+def test_session_json_with_an_unrelated_missing_key_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """The tolerance above is scoped to exactly one additive key -- any
+    OTHER missing key is still an unsupported schema."""
+
+    session = build_roll_preview_session(_preview_fixture(tmp_path).result)
+    payload = json.loads(session.to_json())
+    del payload["slot_count"]
+
+    with pytest.raises(RollSessionIntegrityError, match="unsupported schema"):
+        type(session).from_json(json.dumps(payload))
 
 
 def test_session_json_round_trip_revalidates_sources_and_restores_operator_state(

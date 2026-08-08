@@ -988,6 +988,16 @@ def detect_roll_frames(
         raise
     except IndexDecodeError as primary:
         if primary.error_id not in _WIDE_GAP_RECOVERY_ERROR_IDS:
+            # Reconstructing to attach the sentence is only safe for the
+            # exact base class: subclasses (e.g. a vendored tree's
+            # LeadingFrameClippedError) carry their own constructor
+            # signatures, structured fields, and dedicated downstream
+            # handling that a plain IndexDecodeError rebuild would silently
+            # erase. Those re-raise untouched -- their messages are already
+            # specific -- and only a bare IndexDecodeError gains the
+            # probable-cause key.
+            if type(primary) is not IndexDecodeError:
+                raise
             cause = _diagnose_refusal_safely(rgb16, known, nominal_frame_rows)
             if cause is None:
                 raise

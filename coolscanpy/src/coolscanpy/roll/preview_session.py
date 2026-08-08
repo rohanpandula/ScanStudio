@@ -340,6 +340,21 @@ class RollPreviewSession:
             source_table_sha256=self.preview.table_artifact.sha256,
         )
 
+    @property
+    def manual_boundary_rows(self) -> tuple[int, ...] | None:
+        """This session's exact picked boundary rows, or None if automatic.
+
+        Single source of truth for "what did the operator pick" -- to_json
+        (persisted provenance) and approve_manual_origin (S6 hardening:
+        ManualFrameApproval.manual_boundary_rows_sha256) both read this
+        instead of each re-deriving it from self.detection, so the two can
+        never independently drift on what counts as "this session's rows".
+        """
+
+        if MANUAL_PLACEMENT_WARNING not in self.detection.warnings:
+            return None
+        return tuple(boundary.output_row for boundary in self.detection.boundaries)
+
     def approve_manual_origin(
         self,
         slot_id: int,
@@ -373,6 +388,12 @@ class RollPreviewSession:
             reviewed_lookup_row=origin.lookup_row,
             reviewed_native_origin=origin.native_origin,
             review_reasons=reasons,
+            # S6 hardening: ties this receipt to the exact placement this
+            # whole session reviewed, not just this one slot's own
+            # resolved position -- see ManualFrameApproval's own docstring.
+            manual_boundary_rows_sha256=ManualFrameApproval.digest_manual_boundary_rows(
+                self.manual_boundary_rows
+            ),
         )
 
     def validate_manual_approval(
@@ -463,8 +484,8 @@ class RollPreviewSession:
             # session from this JSON is deliberately refused rather than
             # silently re-run through automatic detection.
             "manual_boundary_rows": (
-                [boundary.output_row for boundary in self.detection.boundaries]
-                if MANUAL_PLACEMENT_WARNING in self.detection.warnings
+                list(self.manual_boundary_rows)
+                if self.manual_boundary_rows is not None
                 else None
             ),
         }
@@ -1436,7 +1457,21 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
         "boundary_offsets",
         "manual_boundary_rows",
     }
-    if set(state) != expected_keys or state.get("version") != SESSION_VERSION:
+    # F7 rework (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): to_json() always
+    # emits "manual_boundary_rows" now, but every session saved before this
+    # key existed has neither it nor anything to migrate -- manual
+    # placement did not exist yet, so an absent key means exactly the same
+    # thing an explicit null does below (state.get returns None either
+    # way). SESSION_VERSION stays 1: nothing about any OTHER field's
+    # meaning changed, so a pre-rework session still restores byte-for-byte
+    # the way it always did. Only an unsupported schema in some OTHER way
+    # -- missing/extra keys beyond this one additive field, or a value for
+    # this key that is neither absent, null, nor a row list -- still
+    # refuses exactly as before.
+    if (
+        set(state) not in (expected_keys, expected_keys - {"manual_boundary_rows"})
+        or state.get("version") != SESSION_VERSION
+    ):
         raise RollSessionIntegrityError("roll session JSON has an unsupported schema")
     manual_boundary_rows_value = state.get("manual_boundary_rows")
     if manual_boundary_rows_value is not None and (

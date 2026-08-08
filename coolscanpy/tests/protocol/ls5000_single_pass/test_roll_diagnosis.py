@@ -387,3 +387,127 @@ def test_healthy_roll_succeeds_normally_through_the_wrapper_with_no_probable_cau
         rgb, known, nominal_frame_rows=NOMINAL_FRAME_ROWS
     )
     assert detection.confidence == "high"
+
+
+def test_one_sided_band_never_reads_as_fog(synthetic_roll_factory=None) -> None:
+    """Adversarial review 2026-08-08, F5: a mild one-sided aperture band
+    (84% brightness, sitting just above the obstruction check's own ratio)
+    dragged gap rows into the contrast near-miss window and fired the
+    fog/dense-base sentence -- physically wrong advice. The contrast check
+    now requires column symmetry, so this construction yields either the
+    obstruction sentence or silence, never fog."""
+
+    rgb, _boundaries = _synthetic_roll(6)
+    banded = rgb.astype(np.float64)
+    banded[:, 2:16] *= 0.84
+    banded = banded.astype(rgb.dtype)
+
+    sentence = diagnosis.diagnose_roll_refusal(
+        banded, np.ones_like(banded, dtype=bool), nominal_frame_rows=145
+    )
+
+    assert sentence is None or "partly blocked" in sentence
+    assert sentence is None or "fog" not in sentence
+
+
+def test_uniform_dimming_still_reads_as_fog_when_clustered() -> None:
+    """The symmetry guard must not silence the genuine fog case: a
+    column-uniform near-miss depression keeps its sentence."""
+
+    rgb, boundaries = _synthetic_roll(6)
+    dimmed = rgb.astype(np.float64)
+    for boundary in boundaries:
+        lo = max(0, boundary - 3)
+        hi = min(len(dimmed), boundary + 3)
+        dimmed[lo:hi] *= 0.86
+    dimmed = dimmed.astype(rgb.dtype)
+
+    sentence = diagnosis.diagnose_roll_refusal(
+        dimmed, np.ones_like(dimmed, dtype=bool), nominal_frame_rows=145
+    )
+
+    assert sentence is not None and "fog" in sentence
+
+
+def test_subclassed_refusals_pass_through_unreconstructed(monkeypatch) -> None:
+    """Adversarial review 2026-08-08, F6: attaching a probable-cause
+    sentence must never rebuild an IndexDecodeError SUBCLASS into the bare
+    base class -- subclasses carry their own constructor signatures,
+    structured fields, and dedicated downstream handling."""
+
+    class StructuredRefusal(roll.IndexDecodeError):
+        def __init__(self) -> None:
+            super().__init__("structured refusal with its own contract")
+            self.structured_field = 42
+
+    def raise_structured(*args, **kwargs):
+        raise StructuredRefusal()
+
+    monkeypatch.setattr(roll, "_detect_roll_frames_single", raise_structured)
+    rgb, _boundaries = _synthetic_roll(4)
+
+    with pytest.raises(StructuredRefusal) as excinfo:
+        roll.detect_roll_frames(
+            rgb,
+            np.ones_like(rgb, dtype=bool),
+            nominal_frame_rows=145,
+            expected_frame_count=None,
+        )
+    assert excinfo.value.structured_field == 42
+    assert "probable_cause" not in str(excinfo.value)
+
+
+def test_dark_image_composition_along_one_side_is_not_an_obstruction() -> None:
+    """Adversarial review 2026-08-08, S9: a roll whose photographs carry
+    dark content along one side must not read as a blocked film window --
+    the depression exists only where there is picture, so the brightest
+    (clear-film) rows show no one-sided dip and the check stays silent."""
+
+    rgb, boundaries = _synthetic_roll(6)
+    composed = rgb.astype(np.float64)
+    for start, end in zip(boundaries, boundaries[1:]):
+        frame_lo = start + 5
+        frame_hi = end - 5
+        composed[frame_lo:frame_hi, 2:20] *= 0.55  # dark subject edge, frames only
+    composed = composed.astype(rgb.dtype)
+
+    sentence = diagnosis.diagnose_roll_refusal(
+        composed, np.ones_like(composed, dtype=bool), nominal_frame_rows=145
+    )
+
+    assert sentence is None or "partly blocked" not in sentence
+
+
+def test_true_obstruction_on_clear_rows_still_reads_as_blocked() -> None:
+    """The bright-row restriction must not silence a genuine obstruction:
+    a fixed 70% band across every row (gaps included) keeps its sentence."""
+
+    rgb, _boundaries = _synthetic_roll(6)
+    blocked = rgb.astype(np.float64)
+    blocked[:, 2:20] *= 0.70
+    blocked = blocked.astype(rgb.dtype)
+
+    sentence = diagnosis.diagnose_roll_refusal(
+        blocked, np.ones_like(blocked, dtype=bool), nominal_frame_rows=145
+    )
+
+    assert sentence is not None and "partly blocked" in sentence
+
+
+def test_gapless_roll_never_reads_as_obstruction() -> None:
+    """Re-review 2026-08-08, F-C: on a roll with NO clear rows at all, the
+    p99 'clear' reference lands on bright frame rows, and one-sided scene
+    content resurrected the phantom blocked-window sentence. With the
+    separation floor, a raster whose brightest rows are not clearly apart
+    from typical rows stays silent on obstruction."""
+
+    gapless_rgb = _synthetic_roll_with_gap_rows([], height=6 * 145)
+    gapless = gapless_rgb.astype(np.float64)
+    gapless[:, 2:20] *= 0.55  # one-sided dark composition
+    gapless = gapless.astype(gapless_rgb.dtype)
+
+    sentence = diagnosis.diagnose_roll_refusal(
+        gapless, np.ones_like(gapless, dtype=bool), nominal_frame_rows=145
+    )
+
+    assert sentence is None or "partly blocked" not in sentence

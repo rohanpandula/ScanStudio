@@ -80,7 +80,19 @@ WORKER_BOOTSTRAP_SCHEMA_VERSION = 1
 WORKER_BOOTSTRAP_FAILED = "failed-before-ready"
 WORKER_BOOTSTRAP_STATUS_FILENAME = "worker-bootstrap.json"
 REVIEWED_ROLL_FINGERPRINT_VERSION = 2
-MANUAL_FRAME_APPROVAL_VERSION = 1
+# Bumped 2 (S6 hardening, FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1
+# rework): adds manual_boundary_rows_sha256, a required field, so this is a
+# breaking schema change on purpose. A genuine version-1 payload is refused
+# by from_payload's exact key-set check first (its key set no longer
+# matches); only a fabricated payload carrying version 1 WITH version-2
+# keys reaches __post_init__'s schema_version check. Both paths refuse --
+# the ordering is recorded here so nobody expects the version check to be
+# the gate that ordinary stale receipts hit (re-review 2026-08-08). Approval
+# receipts are ephemeral (created and consumed within one reviewed-session
+# -> scan-time flow, never persisted the way RollPreviewSession.to_json()
+# is), so there is no backward-compatibility case to preserve here the way
+# F7 preserved one for session JSON.
+MANUAL_FRAME_APPROVAL_VERSION = 2
 MAX_VISUAL_MEDIAN_HAMMING = 24
 MAX_VISUAL_P90_HAMMING = 48
 MAX_SELECTED_VISUAL_HAMMING = 48
@@ -596,7 +608,22 @@ class ReviewedRollFingerprint:
 
 @dataclass(frozen=True)
 class ManualFrameApproval:
-    """Operator approval bound to one reviewed thumbnail and transport choice."""
+    """Operator approval bound to one reviewed thumbnail and transport choice.
+
+    ``manual_boundary_rows_sha256`` (S6 hardening, FEEDING-UX-LADDER-
+    OVERNIGHT-20260807.md F1 rework): binds this approval to the EXACT set
+    of boundary rows the operator's whole session reviewed, not just this
+    one slot's own resolved position. Without it, a receipt legitimately
+    signed for slot N of one placement carries nothing that distinguishes
+    it from a receipt for slot N of a DIFFERENT placement of the same
+    physical roll whose fingerprint happens to still compare as matching
+    (fingerprint comparison has deliberate tolerance for legitimate re-
+    reads; see compare_reviewed_roll_fingerprints) -- this digest has none.
+    Use ``digest_manual_boundary_rows`` to compute it, both when creating a
+    receipt (RollPreviewSession.approve_manual_origin) and when verifying
+    one against a batch job's own manual_boundary_rows (worker.py), so the
+    two sides can never independently drift on how it is derived.
+    """
 
     reviewed_fingerprint_sha256: str
     slot: int
@@ -605,7 +632,23 @@ class ManualFrameApproval:
     reviewed_lookup_row: int
     reviewed_native_origin: int
     review_reasons: tuple[str, ...]
+    manual_boundary_rows_sha256: str
     schema_version: int = MANUAL_FRAME_APPROVAL_VERSION
+
+    @staticmethod
+    def digest_manual_boundary_rows(rows: Sequence[int] | None) -> str:
+        """Canonical digest of a placement's manual boundary rows.
+
+        ``rows`` is ``None`` for an automatic (non-manual) reviewed slot --
+        still given a fixed, well-defined digest rather than an empty
+        string, so this field is never optional/absent on the receipt
+        itself and a caller cannot bypass the check by omitting it.
+        """
+
+        payload = {
+            "manual_boundary_rows": list(rows) if rows is not None else None
+        }
+        return _canonical_json_sha256(payload)
 
     def __post_init__(self) -> None:
         if self.schema_version != MANUAL_FRAME_APPROVAL_VERSION:
@@ -630,6 +673,10 @@ class ManualFrameApproval:
             or self.reviewed_native_origin < 0
         ):
             raise ValueError("manual frame approval native origin is invalid")
+        if not _lower_sha256(self.manual_boundary_rows_sha256):
+            raise ValueError(
+                "manual frame approval manual-boundary-rows identity is invalid"
+            )
         if (
             not isinstance(self.review_reasons, tuple)
             or not self.review_reasons
@@ -640,6 +687,7 @@ class ManualFrameApproval:
     def binding_payload(self) -> dict[str, Any]:
         return {
             "boundary_offset_rows": self.boundary_offset_rows,
+            "manual_boundary_rows_sha256": self.manual_boundary_rows_sha256,
             "review_reasons": list(self.review_reasons),
             "reviewed_fingerprint_sha256": self.reviewed_fingerprint_sha256,
             "reviewed_lookup_row": self.reviewed_lookup_row,
@@ -664,6 +712,7 @@ class ManualFrameApproval:
         if not isinstance(payload, dict) or set(payload) != {
             "binding_sha256",
             "boundary_offset_rows",
+            "manual_boundary_rows_sha256",
             "review_reasons",
             "reviewed_fingerprint_sha256",
             "reviewed_lookup_row",
@@ -684,6 +733,7 @@ class ManualFrameApproval:
             reviewed_lookup_row=payload.get("reviewed_lookup_row"),  # type: ignore[arg-type]
             reviewed_native_origin=payload.get("reviewed_native_origin"),  # type: ignore[arg-type]
             review_reasons=tuple(reasons),
+            manual_boundary_rows_sha256=payload.get("manual_boundary_rows_sha256"),  # type: ignore[arg-type]
             schema_version=payload.get("schema_version"),  # type: ignore[arg-type]
         )
         if payload.get("binding_sha256") != value.binding_sha256:
