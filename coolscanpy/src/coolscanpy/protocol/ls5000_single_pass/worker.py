@@ -57,6 +57,10 @@ from .capture_process import (
     compare_reviewed_roll_fingerprints,
     compare_selected_roll_fingerprint,
 )
+from .manual_frames import (
+    MANUAL_PLACEMENT_WARNING,
+    build_manual_detection,
+)
 from .meter import (
     DEFAULT_EXPOSURES,
     EXPOSURE_MAX,
@@ -515,6 +519,12 @@ class LiveBatchJob:
     continuation_plan_sha256: str
     job_sha256: str
     exposure_override_10ns: tuple[int, int, int] | None = None
+    # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): see
+    # capture_process.CaptureBatchRequest.manual_boundary_rows -- the exact
+    # same value, carried through load_validated_batch_job's own parse of
+    # this untrusted job JSON, for _derive_live_batch_selections to replay
+    # fresh against this call's own live re-read bytes.
+    manual_boundary_rows: tuple[int, ...] | None = None
 
     @property
     def selected_slots(self) -> tuple[int, ...]:
@@ -1369,35 +1379,125 @@ def _derive_live_frame_selection(
     manual_review_approved: bool = False,
     reviewed_as_automatic: bool = False,
     reviewed_leading_residual_rows: float | None = None,
+    manual_boundary_rows: tuple[int, ...] | None = None,
 ) -> LiveFrameSelection:
-    """Resolve one automatic frame origin from same-traversal live data."""
+    """Resolve one frame origin from same-traversal live data.
+
+    Automatic (default, ``manual_boundary_rows`` omitted): resolves via
+    ``detect_roll_frames``/``derive_transport_mapping`` exactly as this
+    function has always worked. See the gate comment below for the one new
+    path manual placement adds to this function's confidence gate.
+
+    Manual (Rung 4, FEEDING-UX-LADDER-OVERNIGHT-20260807.md):
+    ``manual_boundary_rows`` is never trusted as a serialized detection
+    blob. It is the small list of row numbers a human picked while
+    reviewing this same physical traversal's preview, replayed here through
+    the exact same pure ``manual_frames.build_manual_detection`` call the
+    review session used -- fresh, against THIS call's own freshly-decoded
+    ``rgb16``/``known``/``records``, exactly the way the automatic branch
+    below always re-derives ``detect_roll_frames`` from scratch rather than
+    trusting anything cached. If the bytes changed since the operator
+    reviewed them, this recompute reflects that change (it may now refuse,
+    or resolve to different origins); the reviewed_fingerprint comparison
+    further below independently proves the bytes still match what a human
+    actually reviewed before anything can bind.
+    """
 
     geometry = _derive_index_geometry(plan)
     validated_table, usable_rows = validate_live_0x8e_bytes(table_data, geometry.height)
     rgb16, known, decode_report = decode_full_index_bytes(
         preview_data, geometry, usable_rows=usable_rows
     )
-    detection = detect_roll_frames(
-        rgb16,
-        known,
-        nominal_frame_rows=FINE_NATIVE_HEIGHT // geometry.pitch,
-        expected_frame_count=expected_frame_count,
+
+    if manual_boundary_rows is not None:
+        records = parse_live_transport_records_bytes(
+            validated_table, maximum_rows=geometry.height
+        )
+        manual_result = build_manual_detection(
+            rgb16,
+            known,
+            manual_boundary_rows,
+            nominal_frame_rows=FINE_NATIVE_HEIGHT // geometry.pitch,
+            records=records,
+        )
+        detection = manual_result.detection
+        mapping = manual_result.mapping
+        scanner_frame_count = len(mapping.origins)
+        scanner_intervals = detection.intervals[:scanner_frame_count]
+    else:
+        detection = detect_roll_frames(
+            rgb16,
+            known,
+            nominal_frame_rows=FINE_NATIVE_HEIGHT // geometry.pitch,
+            expected_frame_count=expected_frame_count,
+        )
+        # Deferred to the "records is None" branch below, exactly where
+        # they were computed before this change, so a non-manual call never
+        # does this work when the gate is about to refuse anyway.
+        records = None
+        mapping = None
+        scanner_frame_count = None
+        scanner_intervals = None
+
+    # ------------------------------------------------------------------
+    # THE GATE (FEEDING-UX-LADDER-OVERNIGHT-20260807.md, Rung 4 worker gate
+    # change -- deliberate, in scope by owner instruction. Adversarial
+    # review must attack this specifically).
+    #
+    # Unattended behavior for every NON-manual detection is byte-for-byte
+    # unchanged: any confidence below "high" refuses here, exactly as this
+    # function has always refused, full stop. The one new path this change
+    # adds: a detection carrying manual_frames' explicit
+    # MANUAL_PLACEMENT_WARNING marker -- which only build_manual_detection
+    # above can ever attach to a RollDetection.warnings tuple, never
+    # detect_roll_frames -- may bind at "medium" (build_manual_detection
+    # never emits anything higher; see manual_frames.py), but only when
+    # BOTH:
+    #   (a) this call actually took the manual branch above
+    #       (manual_boundary_rows is not None), and
+    #   (b) this call's caller also passes manual_review_approved=True: an
+    #       operator-approval receipt the caller must already hold (e.g.
+    #       from RollPreviewSession.approve_manual_origin on every
+    #       manual_review slot -- see BatchFrameSpec.manual_review_approval
+    #       and how _derive_live_batch_selections derives this flag).
+    # A caller cannot forge condition (a) by simply passing
+    # manual_review_approved=True against an automatic (wide-gap-recovery or
+    # any other) medium/low-confidence detection: MANUAL_PLACEMENT_WARNING
+    # is never present unless build_manual_detection itself ran and
+    # produced it, so the pre-existing refusal is intact for every
+    # non-manual detection no matter what approval flags a caller passes.
+    #
+    # Binding here is not the same as looking automatic: every manually
+    # placed origin already carries automatic=False, manual_review=True
+    # (build_manual_detection), so the per-origin manual-review handling
+    # later in this function -- and apply_batch_boundary_offsets's own
+    # approved_manual_slots gate, for the batch caller -- still applies to
+    # every one of these frames independently. This gate only decides
+    # whether the ROLL-level confidence check may be attempted at all; it
+    # grants no exemption from any other check in this function.
+    manual_placement = (
+        manual_boundary_rows is not None
+        and MANUAL_PLACEMENT_WARNING in detection.warnings
     )
-    if detection.confidence != "high":
+    if detection.confidence != "high" and not (
+        manual_placement and manual_review_approved
+    ):
         raise ProtocolError(
             f"roll boundary lattice confidence is {detection.confidence!r}; "
             "unattended frame binding requires 'high'"
         )
-    records = parse_live_transport_records_bytes(
-        validated_table, maximum_rows=geometry.height
-    )
-    scanner_frame_count = scanner_addressable_interval_count(detection.intervals)
-    scanner_intervals = detection.intervals[:scanner_frame_count]
-    mapping = derive_transport_mapping(
-        detection.boundaries,
-        scanner_frame_count,
-        records,
-    )
+
+    if records is None:
+        records = parse_live_transport_records_bytes(
+            validated_table, maximum_rows=geometry.height
+        )
+        scanner_frame_count = scanner_addressable_interval_count(detection.intervals)
+        scanner_intervals = detection.intervals[:scanner_frame_count]
+        mapping = derive_transport_mapping(
+            detection.boundaries,
+            scanner_frame_count,
+            records,
+        )
     fresh_fingerprint: ReviewedRollFingerprint | None = None
     fingerprint_comparison: RollFingerprintComparison | None = None
     if reviewed_fingerprint is not None:
@@ -1471,11 +1571,24 @@ def _derive_live_frame_selection(
                 f"frame {frame} transport origin requires manual review; "
                 "refusing an unattended fine scan"
             )
+    # F4 rework: a manual placement is never eligible for the leading-anchor
+    # rebase, no matter how well its fingerprints match. Rebase exists for
+    # ONE narrow, physically-understood case -- Nikon's own leading-record
+    # wobble, bounded and reviewed elsewhere -- and it works by keeping the
+    # ALREADY-DERIVED origin even when a fresh table read disagrees with it
+    # (see apply_boundary_offset's own docstring/rebase_info handling). A
+    # manual origin's own resolution (manual_frames._resolve_boundary_
+    # transport_origin, F1) already re-derives from THIS traversal's live
+    # table every time it runs; a fresh disagreement there is not leading-
+    # anchor wobble, it is this specific placement failing to reproduce
+    # itself, and rebasing would launder that into a silently accepted,
+    # possibly displaced origin instead of the refusal it should be.
     origin_rebase_allowed = (
         fingerprint_comparison is not None
         and fingerprint_comparison.matches
         and selected_fingerprint_comparison is not None
         and selected_fingerprint_comparison.matches
+        and not manual_placement
     )
     mapping, selected, origin_rebase_info = apply_boundary_offset(
         mapping,
@@ -1524,8 +1637,21 @@ def _derive_live_batch_selections(
     frames: Sequence[BatchFrameSpec],
     *,
     reviewed_fingerprint: ReviewedRollFingerprint,
+    manual_boundary_rows: tuple[int, ...] | None = None,
 ) -> tuple[LiveFrameSelection, ...]:
-    """Pre-bind every batch frame to one same-traversal transport table."""
+    """Pre-bind every batch frame to one same-traversal transport table.
+
+    ``manual_boundary_rows`` (Rung 4, FEEDING-UX-LADDER-OVERNIGHT-20260807.md):
+    the batch caller's one hook into the same manual-placement gate
+    ``_derive_live_frame_selection`` implements -- passed straight through to
+    the single context-establishing call below. Every other line in this
+    function is unchanged: the per-frame manual-review gate a manual batch
+    still has to pass lives in ``apply_batch_boundary_offsets``'s existing
+    ``approved_manual_slots`` check (every manually placed origin carries
+    ``automatic=False, manual_review=True``, so every frame in a manual
+    batch already has to appear in ``approved_manual_slots`` or that
+    pre-existing, unmodified check refuses it).
+    """
 
     if not frames:
         raise ProtocolError("live batch has no selected frames")
@@ -1555,6 +1681,7 @@ def _derive_live_batch_selections(
         reviewed_fingerprint=reviewed_fingerprint,
         manual_review_approved=frames[0].manual_review_approval is not None,
         reviewed_as_automatic=frames[0].slot in reviewed_automatic_slots,
+        manual_boundary_rows=manual_boundary_rows,
     )
     if context.fresh_fingerprint is None:
         raise ProtocolError("fresh batch roll fingerprint was not retained")
@@ -1587,10 +1714,55 @@ def _derive_live_batch_selections(
     # apply_boundary_offset can rebase a frame-1 leading offset onto the fresh
     # traversal's own detected origin when the resolved record lands outside
     # the two-row affine bound but inside the five-row leading-anchor bound.
+    #
+    # F4 rework: never for a manual placement, no matter how well its
+    # fingerprints match -- same reasoning as _derive_live_frame_selection's
+    # own origin_rebase_allowed (single-frame path); see that comment. Every
+    # frame in a manual batch shares the one manual_boundary_rows this
+    # function received, so this is a single placement-wide flag, not a
+    # per-slot one.
+    manual_placement = (
+        manual_boundary_rows is not None
+        and MANUAL_PLACEMENT_WARNING in context.detection.warnings
+    )
+    # S6 hardening (FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1 rework):
+    # load_validated_batch_job already checked each approval's own
+    # self-digest, slot, offset, reviewed-fingerprint digest, and (as of
+    # this same hardening) manual_boundary_rows_sha256 -- all proving the
+    # receipt is internally consistent and was signed for THIS placement.
+    # None of that proves the receipt's own CLAIMED per-slot values
+    # (reviewed_lookup_row, reviewed_native_origin, review_reasons) are
+    # what this exact traversal's fresh resolution actually produces for
+    # that slot -- context.mapping, built above from manual_boundary_rows
+    # by this rework's own lattice-aware resolution
+    # (manual_frames._resolve_boundary_transport_origin), is the only
+    # thing that can prove that, and only once it exists. thumbnail_sha256
+    # is deliberately not re-verified here: it is not derivable from the
+    # mapping alone (it needs the raster plus the app's own cropping
+    # logic, a layer this protocol worker does not have), so re-checking
+    # it belongs at the layer that already recomputes it, not here.
+    if manual_placement:
+        for spec in frames:
+            approval = spec.manual_review_approval
+            if approval is None:
+                continue
+            if not 1 <= spec.slot <= len(context.mapping.origins):
+                continue  # refused elsewhere (addressable-count checks)
+            fresh_origin = context.mapping.origins[spec.slot - 1]
+            if (
+                approval.reviewed_lookup_row != fresh_origin.lookup_row
+                or approval.reviewed_native_origin != fresh_origin.native_origin
+                or not set(fresh_origin.review_reasons) <= set(approval.review_reasons)
+            ):
+                raise ProtocolError(
+                    f"frame {spec.slot} manual review approval does not match "
+                    "this traversal's freshly resolved origin"
+                )
     origin_rebase_slots = frozenset(
         spec.slot
         for spec in frames
-        if context.fingerprint_comparison is not None
+        if not manual_placement
+        and context.fingerprint_comparison is not None
         and context.fingerprint_comparison.matches
         and selected_fingerprint_comparisons.get(spec.slot) is not None
         and selected_fingerprint_comparisons[spec.slot].matches
@@ -1755,6 +1927,7 @@ def load_validated_batch_job(
         "expected_usb_bus",
         "exposure_override_10ns",
         "frames",
+        "manual_boundary_rows",
         "reviewed_roll_fingerprint",
         "session_id",
     }
@@ -1794,6 +1967,27 @@ def load_validated_batch_job(
                 )
             parsed_ticks.append(raw)
         exposure_override_10ns = (parsed_ticks[0], parsed_ticks[1], parsed_ticks[2])
+    # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): same
+    # defense-in-depth stance as exposure_override_10ns above -- the worker
+    # subprocess trusts nothing it reads from this job file, even though
+    # Roll/CaptureBatchRequest already only ever emit rows a manual session
+    # itself produced.
+    raw_manual_boundary_rows = payload.get("manual_boundary_rows")
+    manual_boundary_rows: tuple[int, ...] | None = None
+    if raw_manual_boundary_rows is not None:
+        if not isinstance(raw_manual_boundary_rows, list) or not raw_manual_boundary_rows:
+            raise ProtocolError(
+                "batch job manual_boundary_rows must be a nonempty array of "
+                "integer preview rows"
+            )
+        parsed_rows: list[int] = []
+        for row in raw_manual_boundary_rows:
+            if isinstance(row, bool) or not isinstance(row, int):
+                raise ProtocolError(
+                    "batch job manual_boundary_rows entries must be integers"
+                )
+            parsed_rows.append(row)
+        manual_boundary_rows = tuple(parsed_rows)
     session_id = payload.get("session_id")
     if (
         not isinstance(session_id, str)
@@ -1874,6 +2068,24 @@ def load_validated_batch_job(
                 raise ProtocolError(
                     f"batch frame {index} manual review approval belongs to another preview"
                 )
+            # S6 hardening (FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1
+            # rework): same defense-in-depth shape as the checks just
+            # above, cheap and available before any scanner/table access.
+            # reviewed_fingerprint_sha256 alone is not enough: fingerprint
+            # comparison has deliberate tolerance for a legitimate re-read
+            # (compare_reviewed_roll_fingerprints), so two DIFFERENT
+            # placements of the same physical roll could still compare as
+            # matching. This job's own manual_boundary_rows (parsed above)
+            # is the exact placement this attempt is about to bind against;
+            # the receipt must have been signed for that exact placement,
+            # not merely "a" placement whose fingerprint happens to match.
+            if approval.manual_boundary_rows_sha256 != ManualFrameApproval.digest_manual_boundary_rows(
+                manual_boundary_rows
+            ):
+                raise ProtocolError(
+                    f"batch frame {index} manual review approval belongs to a "
+                    "different set of placed boundaries"
+                )
         expected_directory = f"frame-{slot:03d}"
         expected_paths = {
             "output": f"{expected_directory}/capture.bin",
@@ -1907,6 +2119,7 @@ def load_validated_batch_job(
         continuation_plan_sha256=expected_continuation_sha256,
         job_sha256=actual_job_sha256,
         exposure_override_10ns=exposure_override_10ns,
+        manual_boundary_rows=manual_boundary_rows,
     )
 
 
@@ -5943,6 +6156,7 @@ def run_live_capture(
                                 live_sub_8e_table,
                                 batch_job.frames,
                                 reviewed_fingerprint=(batch_job.reviewed_fingerprint),
+                                manual_boundary_rows=batch_job.manual_boundary_rows,
                             )
                             live_selection = batch_selections[0]
                             journal["batch_prevalidated_frame_selections"] = [
@@ -6695,6 +6909,7 @@ def run_live_capture(
                     live_sub_8e_table,
                     batch_job.frames,
                     reviewed_fingerprint=batch_job.reviewed_fingerprint,
+                    manual_boundary_rows=batch_job.manual_boundary_rows,
                 )
                 session_journal.update(
                     {

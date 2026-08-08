@@ -296,6 +296,13 @@ fn main() {
         .map(|v| !v.is_empty())
         .unwrap_or(false);
     let call_log_path = std::env::var_os("MOCK_BRIDGE_CALL_LOG").map(PathBuf::from);
+    // Rung 4 validation-passthrough seam: when set, `roll.manualFrames`
+    // refuses every request with this exact `INVALID_PARAMS` message,
+    // unmodified -- proves the real engine forwards the bridge's
+    // plain-English validation text verbatim rather than reshaping it.
+    let manual_frames_error = std::env::var("MOCK_BRIDGE_MANUAL_FRAMES_ERROR")
+        .ok()
+        .filter(|v| !v.is_empty());
 
     let (tx, rx) = mpsc::channel::<String>();
 
@@ -411,6 +418,7 @@ fn main() {
             &preview_approval_slots,
             inter_frame_delay_extra_ms,
             scan_upfront_burst,
+            manual_frames_error.clone(),
         ) {
             Ok(result) => {
                 if request.method == "bridge.hello" {
@@ -431,6 +439,17 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Lane C mock: exactly one designated slot reports `partial: true` so
+/// integration tests can assert the field survives the engine unmangled;
+/// every other slot omits it, like a real bridge on a fully-inside frame.
+/// Slot 3 -- the last of the mock's standard 1..3 preview trio -- is the
+/// natural edge frame.
+const MOCK_PARTIAL_SLOT: u32 = 3;
+
+fn mock_partial_for(slot: u32) -> Option<bool> {
+    (slot == MOCK_PARTIAL_SLOT).then_some(true)
+}
+
 fn handle_request(
     tx: &mpsc::Sender<String>,
     request: &BridgeRequest,
@@ -453,6 +472,7 @@ fn handle_request(
     preview_approval_slots: &[u32],
     inter_frame_delay_extra_ms: u64,
     scan_upfront_burst: bool,
+    manual_frames_error: Option<String>,
 ) -> Result<serde_json::Value, (BridgeErrorCode, String)> {
     match request.method.as_str() {
         "bridge.hello" => {
@@ -582,7 +602,70 @@ fn handle_request(
                     needs_approval: false,
                     warnings: vec![],
                     image_path: path.to_string_lossy().into_owned(),
+                    partial: mock_partial_for(params.slot),
                 },
+            })
+        }
+        "roll.manualFrames" => {
+            require_open(state)?;
+            let params: BridgeManualFramesParams = parse_params(&request.params)?;
+            if let Some(message) = manual_frames_error.as_ref() {
+                return Err((BridgeErrorCode::InvalidParams, message.clone()));
+            }
+            if params.rows.len() < 2 {
+                return Err((
+                    BridgeErrorCode::InvalidParams,
+                    "manual frame placement needs at least 2 boundary rows".to_string(),
+                ));
+            }
+            let frame_count = (params.rows.len() - 1) as u32;
+            let thumbnails: Vec<BridgeThumbnail> = params
+                .rows
+                .windows(2)
+                .enumerate()
+                .map(|(index, pair)| {
+                    let slot = (index + 1) as u32;
+                    state.thumbnail_counter += 1;
+                    let path = std::env::temp_dir().join(format!(
+                        "mock-bridge-manual-frame-slot-{:04}-{:08}.tif",
+                        slot, state.thumbnail_counter
+                    ));
+                    BridgeThumbnail {
+                        slot,
+                        boundary_rows: (pair[0], pair[1]),
+                        spacing_offset: 0,
+                        needs_approval: true,
+                        warnings: vec!["user-picked".to_string()],
+                        image_path: path.to_string_lossy().into_owned(),
+                        partial: mock_partial_for(slot),
+                    }
+                })
+                .collect();
+            // manual_frames() arms a usable bridge-side session exactly
+            // like a successful roll.preview does (BRIDGE.md), without a
+            // prior roll.preview ever having run this session -- mirrored
+            // here so a following scan.start is no longer refused with
+            // NO_PREVIEW purely because of test ordering.
+            state.preview_established.store(true, Ordering::Release);
+            state.preview_slot_count.store(frame_count, Ordering::Release);
+            to_json(&BridgeManualFramesResult {
+                count: frame_count,
+                fingerprint: "mock-manual-fp".to_string(),
+                thumbnails,
+                snaps: vec![],
+            })
+        }
+        "roll.previewStrip" => {
+            require_open(state)?;
+            state.thumbnail_counter += 1;
+            let path = std::env::temp_dir().join(format!(
+                "mock-bridge-preview-strip-{:08}.tif",
+                state.thumbnail_counter
+            ));
+            to_json(&BridgePreviewStripResult {
+                image_path: path.to_string_lossy().into_owned(),
+                row_count: 4800,
+                pixels_per_row: 1,
             })
         }
         "scan.start" => {
@@ -816,6 +899,7 @@ fn spawn_roll_preview_worker(
                         // save error above) so the wire shape is never
                         // missing this required field.
                         image_path: path.to_string_lossy().into_owned(),
+                        partial: mock_partial_for(slot),
                     },
                 },
             );

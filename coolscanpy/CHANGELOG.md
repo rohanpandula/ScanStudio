@@ -20,6 +20,26 @@ bridge delivery, and derivative rendering. The timing survives CoolscanPy,
 bridge, engine, manifest, and app boundaries. Legacy receipts remain valid and
 show their absent timing as not recorded rather than inventing a value.
 
+A failed roll preview can no longer strand its capture worker holding the
+scanner's USB claim. `Roll.preview()` spawns the `--preview-and-hold` child,
+and when the completed traversal's evidence was then refused parent-side
+(journal validation, index decode, topology mismatch, or a raising progress
+callback), the raise left the child parked at its hold boundary waiting for
+a decision — so a caller that exited on that raise orphaned a worker that
+kept the libusb device claim, failing every subsequent `coolscanpy.open`
+with `USBError` errno 13 for the hold wait's remaining half-hour timeout.
+Observed live 2026-08-08 (attempt preview-g7w8t49z): the parent died on
+`IndexDecodeError: index row framing mismatch at usable row 5317` and the
+worker PID had to be killed by hand. Every preview-failure exit now tears
+the held child down fail-closed before the exception escapes: a release
+decision is published first (a healthy child releases the unit cleanly and
+exits 0 — the live incident's child would have), then a bounded wait, then
+terminate, then kill. The adapter's own internal refusals ride the same
+ladder, including the no-rendezvous case that was previously left running
+by design. An unclean teardown preserves the attempts directory as evidence,
+and the propagating exception is annotated with exactly what happened to
+the child.
+
 Whole-roll preview now keeps a content-supported leading frame when an
 otherwise valid feed places its fitted start exactly one 97-dpi preview row
 before the captured raster. The thumbnail is clamped to row zero, its

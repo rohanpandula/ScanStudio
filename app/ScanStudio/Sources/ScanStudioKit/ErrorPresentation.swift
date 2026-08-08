@@ -72,17 +72,27 @@ public struct ErrorPresentation: Equatable, Sendable {
     public let guidance: String
     public let technicalDetails: String
     public let issueURL: URL
+    /// Rung 3 of the feeding UX ladder's plain-English diagnosis sentence
+    /// (FEEDING-UX-LADDER-OVERNIGHT-20260807.md), extracted from the raw
+    /// engine detail text by `ProbableCauseExtractor` -- never raw JSON,
+    /// never the surrounding diagnostic prose. `nil` for the common case
+    /// (most errors, including most REFEED_REQUIREDs, carry no Rung-3
+    /// diagnosis). When present, the workspace error card shows it
+    /// prominently and offers "Place frames manually" alongside it.
+    public let probableCause: String?
 
     public init(
         title: String,
         guidance: String,
         technicalDetails: String,
-        issueURL: URL
+        issueURL: URL,
+        probableCause: String? = nil
     ) {
         self.title = title
         self.guidance = guidance
         self.technicalDetails = technicalDetails
         self.issueURL = issueURL
+        self.probableCause = probableCause
     }
 }
 
@@ -200,7 +210,19 @@ public enum ErrorPresentationPolicy {
                 copy: copy,
                 lastErrorMessage: lastErrorMessage,
                 context: context
-            )
+            ),
+            // Adversarial review S8 (2026-08-08): only ever extracted for
+            // the outer TYPED error code this policy itself classified as
+            // REFEED_REQUIRED -- never merely because the raw text happens
+            // to contain a probable_cause-shaped fragment. An INTERNAL (or
+            // any other) error carrying an embedded, coincidental, or
+            // adversarial-looking fragment must never surface a sentence or
+            // the "Place frames manually" action; `copy.code` is this
+            // policy's own already-computed classification, not a second,
+            // independent guess.
+            probableCause: copy.code == "REFEED_REQUIRED"
+                ? ProbableCauseExtractor.extract(from: lastErrorMessage)
+                : nil
         )
     }
 

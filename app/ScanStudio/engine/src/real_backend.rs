@@ -726,6 +726,16 @@ struct CompletedPreviewApproval {
     session_epoch: u64,
     bridge_generation: u64,
     thumbnails: HashMap<u32, BridgeThumbnail>,
+    /// Additive (2026-08-08 adversarial review, S1): the bridge-reported
+    /// Roll fingerprint (`PreviewResult.fingerprint`, BRIDGE.md) this exact
+    /// binding was minted against, threaded through `roll_approve` to the
+    /// bridge so it can refuse a stale approval instead of silently
+    /// honoring it against whatever session is current now. `None` for a
+    /// binding armed by the automatic-preview path
+    /// (`finalize_active_preview_terminal`) -- that path's own approval
+    /// flow is unaffected by this field's existence; only
+    /// `roll_manual_frames`'s own binding populates it today.
+    fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1392,6 +1402,12 @@ impl RealLs5000 {
                     session_epoch,
                     bridge_generation,
                     thumbnails,
+                    // The automatic-preview path mints no fingerprint
+                    // binding of its own (see CompletedPreviewApproval's
+                    // own field comment) -- roll_approve's wire call omits
+                    // the additive param entirely for this binding,
+                    // byte-identical to before it existed.
+                    fingerprint: None,
                 });
             }
         }
@@ -1719,7 +1735,29 @@ impl RealLs5000 {
                 "operationId does not match a successfully completed preview in the current bridge session",
             ));
         }
-        let params = BridgeRollApproveParams { slot: frame_index };
+        // Adversarial review S3 (2026-08-08): matching operationId/session
+        // identity is not enough on its own -- without this, any frame
+        // index could be "approved" under a valid operationId, including
+        // one the completed preview never returned at all, or one that was
+        // never flagged for review in the first place. `binding` is `Some`
+        // here (proven by the check immediately above).
+        let thumbnail = binding
+            .as_ref()
+            .and_then(|binding| binding.thumbnails.get(&frame_index));
+        if !thumbnail.is_some_and(|thumbnail| thumbnail.needs_approval) {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                "frameIndex is not a frame the completed preview flagged for manual review",
+            ));
+        }
+        // S1: carry the binding's own expected fingerprint (if any) through
+        // to the bridge -- `None` for an automatic-preview binding, which
+        // keeps this wire call byte-identical to before this field
+        // existed (see BridgeRollApproveParams's own field comment).
+        let params = BridgeRollApproveParams {
+            slot: frame_index,
+            fingerprint: binding.as_ref().and_then(|binding| binding.fingerprint.clone()),
+        };
         let value = serde_json::to_value(params).expect("BridgeRollApproveParams serializes");
         self.call_session_scoped(
             session_epoch,
@@ -1782,8 +1820,155 @@ impl RealLs5000 {
             image_path: Some(result.thumbnail.image_path),
             boundary_rows: Some(result.thumbnail.boundary_rows),
             spacing_offset: Some(result.thumbnail.spacing_offset),
+            partial: result.thumbnail.partial,
             needs_approval: result.thumbnail.needs_approval,
             warnings: result.thumbnail.warnings,
+        })
+    }
+
+    /// Re-slices the last completed preview attempt's already-decoded
+    /// raster at operator-picked boundary rows (BRIDGE.md
+    /// `roll.manualFrames`, additive 2026-08-07 -- Rung 4 of the feeding UX
+    /// ladder). Usable any time a preview attempt exists on disk --
+    /// including one that ended in `roll.previewError` -- so, unlike
+    /// `roll_approve`/`roll_set_spacing_offset` above, this deliberately
+    /// does NOT require an operator-reviewed "completed" preview binding
+    /// before it can run: the bridge's own `manual_frames()` re-arms a
+    /// usable session from whatever attempt is on disk and answers
+    /// `NO_PREVIEW` itself when none exists (BRIDGE.md: "no partial
+    /// acceptance" is about the placement's own validity, not about
+    /// requiring a prior success here). Not motion-capable: no film moves,
+    /// no transport read happens, nothing is re-fed.
+    ///
+    /// On success, this mints a fresh `operationId` and arms this backend's
+    /// own `preview_approval_state.completed` binding with it -- exactly as
+    /// a successful `roll.preview`'s `finalize_active_preview_terminal`
+    /// would have -- so the existing `roll.approve`/`roll.setSpacingOffset`/
+    /// manual-review-sheet flow keeps working completely unchanged on the
+    /// resulting frames. There is no client-supplied operation id to reuse
+    /// here (BRIDGE.md's `roll.manualFrames` has no such param), so the
+    /// engine mints one and reports it back via
+    /// `RollManualFramesResult.operationId` for the app to bind subsequent
+    /// calls to.
+    ///
+    /// 2026-08-08 adversarial review, S1 (part 4): whatever completed
+    /// binding this session currently holds is retired BEFORE the
+    /// `roll.manualFrames` request is even issued, and stays retired on any
+    /// failure below (nothing here ever restores it) -- only a full, clean
+    /// success re-arms a completed binding, with this call's own fresh
+    /// operationId and fingerprint. Without this, a stale approval for an
+    /// earlier completed preview/placement could still be honored by
+    /// `roll_approve` while a replacement placement is in flight or has
+    /// just failed, even though the UI has moved on to a different
+    /// operation entirely.
+    pub fn roll_manual_frames(
+        &self,
+        rows: Vec<u32>,
+    ) -> Result<crate::protocol::RollManualFramesResult, EngineError> {
+        let (session_epoch, bridge_generation) = self.active_session_identity()?;
+        self.clear_completed_preview_approval_for_epoch(session_epoch);
+        let value = self.call_session_scoped(
+            session_epoch,
+            bridge_generation,
+            "roll.manualFrames",
+            serde_json::to_value(BridgeManualFramesParams { rows })
+                .expect("BridgeManualFramesParams serializes"),
+        )?;
+        let result: BridgeManualFramesResult = serde_json::from_value(value).map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!("malformed roll.manualFrames result: {error}"),
+            )
+        })?;
+
+        // Reuses the existing per-preview token counter purely as a source
+        // of a fresh, monotonically unique integer -- `CompletedPreviewApproval`
+        // has no `token` field of its own to collide with, so this never
+        // interacts with `ActivePreviewApproval`/`PoisonedPreviewStream`'s
+        // own token matching.
+        let operation_suffix = self.next_preview_token.fetch_add(1, Ordering::AcqRel) + 1;
+        let operation_id = format!("manual-{operation_suffix}");
+
+        let mut thumbnails_by_slot: HashMap<u32, BridgeThumbnail> = HashMap::new();
+        let mut thumbnails = Vec::with_capacity(result.thumbnails.len());
+        for thumbnail in result.thumbnails {
+            thumbnails_by_slot.insert(thumbnail.slot, thumbnail.clone());
+            thumbnails.push(crate::protocol::ManualFrameThumbnail {
+                frame_index: thumbnail.slot,
+                thumbnail: crate::protocol::Thumbnail {
+                    brightness: None,
+                    tint: None,
+                    image_path: Some(thumbnail.image_path),
+                    boundary_rows: Some(thumbnail.boundary_rows),
+                    spacing_offset: Some(thumbnail.spacing_offset),
+                    partial: thumbnail.partial,
+                    needs_approval: thumbnail.needs_approval,
+                    warnings: thumbnail.warnings,
+                },
+            });
+        }
+
+        // Arm the SAME approval binding a successful preview's own
+        // `finalize_active_preview_terminal` would have -- only while this
+        // exact session is still current, mirroring that function's own
+        // defensive re-check immediately before it commits state.
+        if self.session_identity_is_current(session_epoch, bridge_generation) {
+            let mut state = self.preview_approval_state.lock().unwrap();
+            state.active = None;
+            state.completed = Some(CompletedPreviewApproval {
+                operation_id: operation_id.clone(),
+                session_epoch,
+                bridge_generation,
+                thumbnails: thumbnails_by_slot,
+                // S1 (part 4): this is the one binding source that DOES
+                // supply an expected fingerprint -- roll_approve threads it
+                // through to the bridge, which refuses the approval if the
+                // roll's fingerprint has since moved on.
+                fingerprint: Some(result.fingerprint.clone()),
+            });
+        }
+
+        Ok(crate::protocol::RollManualFramesResult {
+            count: result.count,
+            fingerprint: result.fingerprint,
+            operation_id,
+            thumbnails,
+            snaps: result
+                .snaps
+                .into_iter()
+                .map(|snap| crate::protocol::BoundarySnap {
+                    boundary_index: snap.boundary_index,
+                    requested_row: snap.requested_row,
+                    snapped_row: snap.snapped_row,
+                    evidence_run: snap.evidence_run,
+                })
+                .collect(),
+        })
+    }
+
+    /// Renders the last completed preview attempt's whole captured raster
+    /// to one image (BRIDGE.md `roll.previewStrip`, additive 2026-08-07).
+    /// Same precondition and non-motion-capable contract as
+    /// `roll_manual_frames` above; touches no session or approval state,
+    /// purely a read.
+    pub fn roll_preview_strip(&self) -> Result<crate::protocol::PreviewStripResult, EngineError> {
+        let (session_epoch, bridge_generation) = self.active_session_identity()?;
+        let value = self.call_session_scoped(
+            session_epoch,
+            bridge_generation,
+            "roll.previewStrip",
+            serde_json::json!({}),
+        )?;
+        let result: BridgePreviewStripResult = serde_json::from_value(value).map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!("malformed roll.previewStrip result: {error}"),
+            )
+        })?;
+        Ok(crate::protocol::PreviewStripResult {
+            image_path: result.image_path,
+            row_count: result.row_count,
+            pixels_per_row: result.pixels_per_row,
         })
     }
 }
@@ -2006,6 +2191,7 @@ impl ScannerBackend for RealLs5000 {
                                     image_path: Some(bridge_thumbnail.image_path.clone()),
                                     boundary_rows: Some(bridge_thumbnail.boundary_rows),
                                     spacing_offset: Some(bridge_thumbnail.spacing_offset),
+                                    partial: bridge_thumbnail.partial,
                                     needs_approval: bridge_thumbnail.needs_approval,
                                     warnings: bridge_thumbnail.warnings.clone(),
                                 };
@@ -2348,6 +2534,45 @@ impl ScannerBackend for RealLs5000 {
     ) -> Result<String, EngineError> {
         let (session_epoch, bridge_generation) = backend.active_session_identity()?;
         backend.ensure_preview_stream_allows_scan(session_epoch, bridge_generation)?;
+        // Adversarial review S3 (2026-08-08): when this exact session has a
+        // completed-preview binding (BRIDGE.md's own "slots must be a
+        // subset of the last preview's detected slots" is bridge-enforced,
+        // but the engine must not rely on the bridge alone to catch a
+        // "hidden slot" request), every requested frame must be one the
+        // binding's own completed preview actually returned -- otherwise a
+        // caller could request a frame the operator was never shown at all.
+        //
+        // Deliberately conditional on a binding actually existing, not an
+        // unconditional requirement: a preview whose thumbnail STREAM
+        // partially failed to decode (`dropped_count > 0` in
+        // `acquire_thumbnails`'s worker) still lets `scan.start` proceed
+        // today for the frames that DID decode, even though this backend's
+        // own `completed` binding is deliberately left unset for that
+        // narrow case (see `finalize_active_preview_terminal`'s caller).
+        // Falling through here for a `None` binding keeps that existing,
+        // already-shipped path byte-identical; the bridge's own subset
+        // check still applies to it exactly as before.
+        {
+            let binding = backend.preview_approval_state.lock().unwrap().completed.clone();
+            let binding_is_current_session = binding.as_ref().is_some_and(|binding| {
+                binding.session_epoch == session_epoch
+                    && binding.bridge_generation == bridge_generation
+            });
+            if binding_is_current_session {
+                let binding = binding.expect("checked by binding_is_current_session above");
+                if let Some(&missing_frame) = frames
+                    .iter()
+                    .find(|frame_index| !binding.thumbnails.contains_key(frame_index))
+                {
+                    return Err(EngineError::new(
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "frame {missing_frame} was never returned by the completed preview and cannot be scanned"
+                        ),
+                    ));
+                }
+            }
+        }
         let processing = processing.effective();
         let recipe = recipe.effective_for_process(processing.film_process);
         // Device-sourced, model-agnostic (see

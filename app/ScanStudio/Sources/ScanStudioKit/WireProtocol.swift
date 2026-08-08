@@ -455,6 +455,68 @@ public struct RollApproveParams: Codable, Sendable {
     }
 }
 
+// MARK: - roll.manualFrames / roll.previewStrip
+
+/// Rung 4 of the feeding UX ladder (additive, 2026-08-07). Re-slices the
+/// last completed preview attempt's already-decoded raster at
+/// operator-picked boundary rows, in place of automatic detection. Usable
+/// any time a preview attempt exists -- including one that ended in
+/// `scanner.thumbnailsFailed` (REFEED_REQUIRED) -- so, unlike
+/// `RollApproveParams`/`RollSetSpacingOffsetParams`, this carries no
+/// `operationId`: there is no "exact completed preview" to bind to yet.
+/// `rows` must be at least 2 strictly increasing values in
+/// `0..PreviewStripResult.rowCount-1` (N rows define N-1 frames).
+public struct RollManualFramesParams: Codable, Sendable {
+    public let rows: [Int]
+
+    public init(rows: [Int]) {
+        self.rows = rows
+    }
+}
+
+/// One resulting slot from `roll.manualFrames`, paired with its frame
+/// index -- mirrors `ThumbnailPayload`'s own frameIndex+thumbnail pairing
+/// for the ordinary preview-event path.
+public struct ManualFrameThumbnail: Decodable, Sendable {
+    public let frameIndex: Int
+    public let thumbnail: Thumbnail
+}
+
+/// One snap-assist adjustment `roll.manualFrames` applied to a picked
+/// boundary row: a pick within a few rows of a clear-film run edge snapped
+/// to it. `evidenceRun` is the `[start, end]` clear-film run that pick
+/// snapped against.
+public struct BoundarySnap: Decodable, Equatable, Sendable {
+    public let boundaryIndex: Int
+    public let requestedRow: Int
+    public let snappedRow: Int
+    public let evidenceRun: [Int]
+}
+
+public struct RollManualFramesResult: Decodable, Sendable {
+    public let count: Int
+    public let fingerprint: String
+    /// Engine-minted, not client-supplied -- `roll.manualFrames` has no
+    /// `operationId` param of its own (see this type's own doc comment).
+    /// Bind subsequent `roll.approve`/`roll.setSpacingOffset` calls on the
+    /// resulting frames to this id, exactly as a normal preview's own
+    /// completion `operationId` is already used for.
+    public let operationId: String
+    public let thumbnails: [ManualFrameThumbnail]
+    public let snaps: [BoundarySnap]
+}
+
+/// `roll.previewStrip`'s result: the whole captured preview raster
+/// rendered to one image, in the same row coordinate space
+/// `roll.manualFrames`'s `rows` are given in. `pixelsPerRow` is carried
+/// explicitly so a future downsampled strip cannot silently break
+/// row<->pixel math; it is always `1` today (native resolution).
+public struct PreviewStripResult: Decodable, Sendable {
+    public let imagePath: String
+    public let rowCount: Int
+    public let pixelsPerRow: Int
+}
+
 // MARK: - scan.start / scan.stop / scan.skipCurrentFrame
 
 public struct CaptureRecipe: Codable, Equatable, Sendable {

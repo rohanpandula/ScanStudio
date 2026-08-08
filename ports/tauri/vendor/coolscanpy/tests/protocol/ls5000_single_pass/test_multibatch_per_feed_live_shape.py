@@ -298,6 +298,15 @@ class _RealWorkerChild:
             raise TimeoutError("real worker child did not exit")
         return self._returncode
 
+    def terminate(self) -> None:
+        """A thread cannot be signalled; the failed-preview teardown ladder
+        treats an ignored terminate exactly like a wedged child, which is
+        the honest stand-in behavior (this suite never exercises it -- a
+        parked real worker takes the ladder's release decision first)."""
+
+    def kill(self) -> None:
+        """See terminate()."""
+
 
 class _DeviceDouble:
     """The handful of private hooks ``Roll`` uses on its owning Device.

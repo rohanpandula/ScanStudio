@@ -866,3 +866,97 @@ def test_close_device_then_reopen_resets_preview_state() -> None:
 
 def test_eject_always_returns_true() -> None:
     assert MockTransport().eject() is True
+
+
+# -- manual frame placement (Rung 4) -----------------------------------------------
+
+
+def test_manual_frames_without_any_preview_is_no_preview() -> None:
+    transport = _opened(slot_count=4)
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([100, 300])
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
+
+
+def test_manual_frames_rejects_fewer_than_two_rows() -> None:
+    transport = _opened(slot_count=4)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([100])
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert "at least 2 boundary rows" in str(excinfo.value)
+
+
+def test_manual_frames_rejects_non_increasing_rows() -> None:
+    transport = _opened(slot_count=4)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([300, 100, 500])
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert "strictly increasing" in str(excinfo.value)
+
+
+def test_manual_frames_happy_path_replaces_slot_lattice_and_rearms_approve() -> None:
+    transport = _opened(slot_count=6)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    # None of these rows is a multiple of 100 -- the mock's deterministic
+    # "snap" trigger (see test_manual_frames_reports_deterministic_snap_notes
+    # below) never fires, so this is the plain no-snap happy path.
+    result, thumbnails, snaps, material = transport.manual_frames([101, 301, 501])
+
+    assert material is domain.Material.COLOR_NEGATIVE
+    assert result.count == 2
+    assert [t.slot for t in thumbnails] == [1, 2]
+    assert thumbnails[0].boundary_rows == (101, 301)
+    assert thumbnails[1].boundary_rows == (301, 501)
+    assert all(t.needs_approval for t in thumbnails)
+    assert all("user-picked" in t.warnings for t in thumbnails)
+    assert snaps == ()
+
+    # The manual placement replaces the roll's own slot lattice: status now
+    # reports the manual frame count, and approve()/set_spacing_offset() work
+    # unchanged against the new 1-based slot numbering.
+    assert transport.status().slot_count == 2
+    transport.approve(1)
+    transport.approve(2)
+    adjusted = transport.set_spacing_offset(1, 0)
+    assert adjusted.slot == 1
+
+
+def test_manual_frames_reports_deterministic_snap_notes() -> None:
+    transport = _opened(slot_count=4)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    _result, _thumbnails, snaps, _material = transport.manual_frames([100, 250])
+
+    assert snaps == (
+        domain.BoundarySnap(
+            boundary_index=0,
+            requested_row=100,
+            snapped_row=99,
+            evidence_run=(96, 104),
+        ),
+    )
+
+
+def test_preview_strip_without_any_preview_is_no_preview() -> None:
+    transport = _opened(slot_count=4)
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview_strip()
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
+
+
+def test_preview_strip_happy_path_returns_row_count_and_image() -> None:
+    transport = _opened(slot_count=4)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    strip = transport.preview_strip()
+
+    assert strip.row_count == min(4 * 1200, 4_096)  # honest cap: width == rows
+    import tifffile as _tifffile
+
+    written = _tifffile.imread(strip.image_path)
+    assert written.shape[1] == strip.row_count  # width axis == reported rows
+    assert strip.pixels_per_row == 1
+    assert Path(strip.image_path).is_file()

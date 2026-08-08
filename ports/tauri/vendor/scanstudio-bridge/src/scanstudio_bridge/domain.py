@@ -24,6 +24,8 @@ __all__ = [
     "OutputSpec",
     "SlotOutputSpec",
     "Thumbnail",
+    "BoundarySnap",
+    "PreviewStrip",
     "ScanProgress",
     "ExposureVector",
     "ClippingTelemetry",
@@ -124,6 +126,48 @@ class Thumbnail:
     # but not all of it. Emitted only when true (strictly additive); see
     # service._thumbnail_to_wire for why it is not a plain to_wire field.
     partial: bool | None = None
+
+
+# Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): manual frame placement.
+
+
+@dataclass(frozen=True)
+class BoundarySnap:
+    """One snap-assist adjustment `roll.manualFrames` applied to a picked
+    boundary row -- bridge-wire mirror of CoolscanPy's own
+    `manual_frames.BoundarySnap` (coolscanpy never crosses the wire
+    directly; see `_thumbnail_from_coolscanpy`/`_approval_receipt_from_coolscanpy`
+    for the same translate-not-passthrough pattern elsewhere in this
+    codebase)."""
+
+    boundary_index: int
+    requested_row: int
+    snapped_row: int
+    evidence_run: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class PreviewStrip:
+    """One rendered image of the whole captured preview raster, for the
+    manual-placement editor to draw draggable boundary lines on before any
+    row has been picked (`roll.manualFrames` requires at least 2 rows, so it
+    cannot itself hand back a "nothing picked yet" view). Same
+    normalize-and-write tile path a slot `Thumbnail` uses, applied once to
+    the entire raster instead of one frame's crop.
+
+    `row_count` is the coordinate space `roll.manualFrames`'s `rows` are
+    given in -- every picked row must lie in `0..row_count-1`.
+    `pixels_per_row` is how many image pixels (along the image axis that
+    corresponds to a preview row -- the same axis `Thumbnail.imagePath`'s
+    existing swapaxes orientation already uses) one preview row occupies;
+    always `1` today (the strip is written at native resolution, never
+    resized), carried explicitly so a future downsampled strip does not
+    silently break row<->pixel math on either side of the wire.
+    """
+
+    image_path: str
+    row_count: int
+    pixels_per_row: int = 1
 
 
 @dataclass(frozen=True)

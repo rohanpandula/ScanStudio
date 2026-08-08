@@ -65,6 +65,32 @@ def _synthetic_preview_tile(slot: int, offset_rows: int = 0) -> np.ndarray:
     return np.roll(tile, -offset_rows, axis=1)
 
 
+def _validate_manual_rows(rows: object) -> None:
+    """Mock-only structural check -- a deliberately loose shadow of
+    coolscanpy's real `manual_frames.build_manual_detection` gates (structure,
+    physical frame-height range, transport-table sanity). This mock has no
+    raster or transport table to check against, so it only enforces what it
+    can: at least 2 plain-integer rows, strictly increasing. See
+    coolscanpy_transport.py's `manual_frames` for the real physical gates."""
+    if not isinstance(rows, list) or len(rows) < 2:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "manual frame placement needs at least 2 boundary rows (1 frame); "
+            f"only {len(rows) if isinstance(rows, list) else 0} were given",
+        )
+    if any(type(row) is not int or isinstance(row, bool) for row in rows):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "manual frame boundary rows must be plain integers",
+        )
+    if any(a >= b for a, b in zip(rows, rows[1:])):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frame boundary rows must be placed in strictly increasing order, "
+            "top to bottom of the preview",
+        )
+
+
 def _synthetic_receipt(
     *,
     slot: int,
@@ -165,6 +191,12 @@ class MockTransport:
         self._spacing_offsets: dict[int, int] = {}
         self._scanning = False
         self._stop_event = threading.Event()
+        # 2026-08-08 adversarial review, S1: the fingerprint the last
+        # successful preview()/manual_frames() call returned -- mirrors the
+        # real transport's `self._roll.fingerprint.sha256`, kept here since
+        # this double has no real Roll object of its own. See approve()'s
+        # own docstring for how this is used.
+        self._fingerprint: str | None = None
 
     # -- device lifecycle -----------------------------------------------------
 
@@ -183,6 +215,7 @@ class MockTransport:
         self._approved_slots.clear()
         self._needs_approval_slots.clear()
         self._spacing_offsets.clear()
+        self._fingerprint = None
         return self._device_info()
 
     def status(self) -> domain.DeviceStatus:
@@ -212,6 +245,7 @@ class MockTransport:
         self._approved_slots.clear()
         self._needs_approval_slots.clear()
         self._spacing_offsets.clear()
+        self._fingerprint = None
 
     # -- preview / approve ------------------------------------------------------
 
@@ -254,10 +288,22 @@ class MockTransport:
         self._preview_established = True
         self._last_preview_material = material
         fingerprint = hashlib.sha256(f"{material}:{self._slot_count}".encode()).hexdigest()
+        self._fingerprint = fingerprint
         return domain.PreviewResult(count=self._slot_count, fingerprint=fingerprint)
 
-    def approve(self, slot: int) -> None:
+    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
         self._require_connected()
+        # Additive (2026-08-08 adversarial review, S1) -- see
+        # transport.Transport.approve's own docstring. `None` (the default,
+        # and every pre-existing caller) skips the comparison entirely,
+        # unchanged from before this parameter existed.
+        if fingerprint is not None and self._fingerprint != fingerprint:
+            raise BridgeError(
+                ErrorCode.FINGERPRINT_REFUSED,
+                "this approval was computed against an earlier preview session "
+                "that no longer matches the roll's current state; acquire a "
+                "fresh preview or placement and approve again",
+            )
         if slot < 1 or slot > self._slot_count or slot not in self._needs_approval_slots:
             raise BridgeError(ErrorCode.INVALID_PARAMS, f"slot {slot} does not need approval")
         self._approved_slots.add(slot)
@@ -320,6 +366,106 @@ class MockTransport:
             needs_approval=is_last,
             warnings=("ambiguous-content-tail-boundary",) if is_last else (),
             image_path=str(tile_path),
+        )
+
+    # -- manual frame placement (Rung 4) -----------------------------------------
+
+    def manual_frames(
+        self, rows: list[int]
+    ) -> tuple[
+        domain.PreviewResult,
+        tuple[domain.Thumbnail, ...],
+        tuple[domain.BoundarySnap, ...],
+        domain.Material,
+    ]:
+        self._require_connected()
+        if self._scanning:
+            raise BridgeError(
+                ErrorCode.HARDWARE_LANE_BUSY,
+                "a scan job holds the hardware lane",
+            )
+        if not self._preview_established:
+            raise BridgeError(
+                ErrorCode.NO_PREVIEW,
+                "manual frame placement requires a completed roll.preview attempt first",
+            )
+        _validate_manual_rows(rows)
+
+        # A manual placement replaces the whole roll's addressable slot
+        # lattice -- mirrors preview()'s own clear-and-rebuild of approval/
+        # offset bookkeeping (real CoolscanPy: a fresh RollPreviewSession
+        # with its own fixed, 1-based, contiguous slots).
+        self._slot_count = len(rows) - 1
+        self._approved_slots.clear()
+        self._needs_approval_slots.clear()
+        self._spacing_offsets.clear()
+
+        thumbnails: list[domain.Thumbnail] = []
+        snaps: list[domain.BoundarySnap] = []
+        for i in range(self._slot_count):
+            slot = i + 1
+            self._needs_approval_slots.add(slot)
+            tile_path = self._preview_dir / f"slot-{slot:04d}-manual.tif"
+            tifffile.imwrite(
+                tile_path, _synthetic_preview_tile(slot), photometric="rgb"
+            )
+            thumbnails.append(
+                domain.Thumbnail(
+                    slot=slot,
+                    boundary_rows=(rows[i], rows[i + 1]),
+                    spacing_offset=0,
+                    needs_approval=True,
+                    warnings=("user-picked",),
+                    image_path=str(tile_path),
+                )
+            )
+        # Deterministic, mock-only "snap": a picked row exactly divisible by
+        # 100 is reported as having snapped 1 row -- exercises the wire
+        # shape without needing real clear-film evidence. Real snap
+        # detection lives entirely in coolscanpy_transport.py.
+        for index, row in enumerate(rows):
+            if row % 100 == 0 and row > 0:
+                snaps.append(
+                    domain.BoundarySnap(
+                        boundary_index=index,
+                        requested_row=row,
+                        snapped_row=row - 1,
+                        evidence_run=(row - 4, row + 4),
+                    )
+                )
+
+        fingerprint = hashlib.sha256(
+            f"manual:{tuple(rows)}".encode()
+        ).hexdigest()
+        self._fingerprint = fingerprint
+        self._preview_established = True
+        return (
+            domain.PreviewResult(count=self._slot_count, fingerprint=fingerprint),
+            tuple(thumbnails),
+            tuple(snaps),
+            self._last_preview_material,
+        )
+
+    def preview_strip(self) -> domain.PreviewStrip:
+        self._require_connected()
+        if not self._preview_established:
+            raise BridgeError(
+                ErrorCode.NO_PREVIEW,
+                "roll.previewStrip requires a completed roll.preview attempt first",
+            )
+        # The wire contract promises the image's width axis carries exactly
+        # row_count columns at pixels_per_row=1 (the real transport writes
+        # the raster unresized). The mock keeps the file small by capping
+        # the synthetic strip, so its REPORTED row_count is the written
+        # width -- an honest miniature, never a contradiction the editor's
+        # row-to-pixel mapping would silently mis-scale on (2026-08-08
+        # second-opinion review, finding 2).
+        row_count = min(self._slot_count * 1200, 4_096)
+        tile_path = self._preview_dir / f"strip-{uuid.uuid4().hex}.tif"
+        strip = np.zeros((_SYNTHETIC_PREVIEW_WIDTH, row_count, 3), dtype=np.uint8)
+        tifffile.imwrite(tile_path, strip, photometric="rgb")
+        return domain.PreviewStrip(
+            image_path=str(tile_path), row_count=row_count, pixels_per_row=1
         )
 
     # -- scanning -----------------------------------------------------------------

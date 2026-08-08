@@ -54,6 +54,8 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | `roll.preview` | `{material: "colorNegative"\|"blackAndWhiteNegative", slots?: [number]}` | `{accepted: true}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`; via `roll.previewError`: `FEEDER_PARKED`, `REFEED_REQUIRED`, `DEVICE_BUSY`, `ROLL_MISMATCH` |
 | `roll.approve` | `{slot: number}` | `{}` | `NOT_CONNECTED`, `NO_PREVIEW` |
 | `roll.setSpacingOffset` | `{slot: number, offsetRows: number}` | `{thumbnail: Thumbnail}` | `NOT_CONNECTED`, `NO_PREVIEW`, `INVALID_PARAMS` |
+| `roll.manualFrames` | `{rows: [number]}` | `{count: number, fingerprint: string, thumbnails: [Thumbnail], snaps: [BoundarySnap]}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `METER_UNUSABLE` |
+| `roll.previewStrip` | `{}` | `PreviewStrip` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `METER_UNUSABLE` |
 | `scan.start` | `{slots: [number], recipe: CaptureRecipe, output: OutputSpec}` | `{jobId: string}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `REFEED_REQUIRED`; via `scan.error`/`scan.frameFailed`: `ROLL_MISMATCH` |
 | `scan.stop` | `{jobId: string}` | `{acknowledged: bool}` | `UNKNOWN_JOB` |
 | `device.eject` | `{}` | `{}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED` |
@@ -89,6 +91,14 @@ the same offset when that slot is captured. It is non-motion-capable, so it
 does not check the motion latch or move film. Valid offsets are `0...144` for
 slot 1 and `-144...144` for every other slot. Changing an offset invalidates
 that slot's prior manual approval.
+
+### `roll.manualFrames` (additive, 2026-08-07)
+
+Rung 4 of the feeding UX ladder: re-slices the last completed preview attempt's already-decoded whole-roll raster at operator-picked boundary rows, in place of automatic detection. Usable any time a preview attempt exists on disk — including one whose `roll.previewComplete`/`roll.previewError` already fired, successful or refused; this is the intended recovery path for a `REFEED_REQUIRED` whose message names a `probable_cause` the operator can work around by hand. Not motion-capable: no film moves, no transport read happens, nothing is re-fed. `rows` is at least 2 strictly increasing row numbers in `0..PreviewStrip.rowCount-1` (N rows define N-1 frames); each resulting frame's height must fall inside 15–75 mm, deliberately wider than automatic detection's tolerance so half-frame and panoramic film work. A pick within a few rows of a clear-film edge snaps to it by default (reported per-boundary in `snaps`); the underlying same-traversal transport table must still confirm the picks are physically plausible, or the whole placement is refused together — no partial acceptance. Every resulting slot arrives `needsApproval: true` with a `"user-picked"` warning: `roll.approve`, `roll.setSpacingOffset`, and `scan.start` all work on the resulting slots exactly as they do after a normal `roll.preview`, with no wire-shape difference. A validation failure (structure, frame height, or transport-table sanity) is `INVALID_PARAMS` naming the operator's own pick, in plain English — distinct from `REFEED_REQUIRED`, which means "the physical strip," not "try different rows here."
+
+### `roll.previewStrip` (additive, 2026-08-07)
+
+Renders the last completed preview attempt's whole captured raster to one image, for a manual-placement editor to draw draggable boundary lines on before any row has been picked (`roll.manualFrames` itself requires at least 2 rows, so it cannot answer "what does the film look like" on its own). Same precondition, same non-motion-capable contract, and the same underlying attempt-on-disk as `roll.manualFrames` — call this first to seed the editor, then `roll.manualFrames` once the operator has picked rows. Touches no session or approval state; purely a read.
 
 ### `scan.start` (MOTION-CAPABLE)
 
@@ -210,6 +220,17 @@ Strictly-below-90% coverage is not a thumbnail at all: it is a `REFEED_REQUIRED`
 failure. An absent/omitted `partial` means a full frame; old readers ignore the
 additive key.
 
+BoundarySnap
+  boundaryIndex: number
+  requestedRow: number
+  snappedRow: number
+  evidenceRun: [number, number]
+
+PreviewStrip
+  imagePath: string
+  rowCount: number
+  pixelsPerRow: number
+
 ScanProgress
   jobId: string
   slot: number
@@ -305,6 +326,8 @@ ScanReceipt
 `storageTransform` is mandatory, never `null` or empty: it is the versioned identifier for the numpy transform CoolscanPy applied between the scanner-native RGB/IR planes it captured and this receipt's `rgbPath`/`irPath` orientation, mirrored verbatim from CoolscanPy's own `Receipt.storage_transform`. Today every live capture reports exactly one value, `"swapaxes01-scanner-native-to-nikon-render-parity-v2"` (`coolscanpy.types.DIGITAL_ICE_STORAGE_TRANSFORM`). A historical value, `"rot90k1-scanner-native-to-storage-v1"`, may appear in archives whose provenance predates this field, but it is never emitted by a live bridge. A consumer that needs to bring CoolscanPy's main raster (`rgbPath`/`irPath`) into the same coordinate system as `meterRgbiPath` (scanner-native) MUST branch on this value and MUST refuse rather than guess when it sees a value it does not recognize. The two known transforms differ by a vertical flip, so silently picking one is worse than refusing.
 
 `Thumbnail.imagePath` is also bridge-added, not a CoolscanPy path: the bridge transposes that slot's raw scanner-linear HxWx3 uint16 preview crop with `swapaxes(0,1)` (the same scanner-native-to-Nikon-render orientation as a saved capture; no axis is flipped), applies a 0.5th/99.5th percentile stretch, and writes the already-thumbnail-sized result as an 8-bit TIFF. A `roll.preview` uses `~/.scanstudio/previews/{preview-session-uuid}/slot-{NNNN}.tif`; every `roll.setSpacingOffset` response uses another fresh UUID path so image caches cannot keep showing the previous crop. This does not relax "Image payloads"'s no-bytes-on-the-wire rule: only a path crosses the wire, exactly like `rgbPath`/`irPath` already do.
+
+`PreviewStrip.imagePath` (additive, 2026-08-07) is rendered through the identical transform `Thumbnail.imagePath` already uses (`swapaxes(0,1)`, 0.5th/99.5th percentile stretch, 8-bit TIFF) applied once to the whole captured raster instead of one frame's crop — so the raster's row axis (the coordinate space `roll.manualFrames`'s `rows` are given in, `0..rowCount-1`) is the image's WIDTH axis, not its height, exactly like every existing `Thumbnail` crop already is. `pixelsPerRow` is always `1` today (native resolution, never resized); carried explicitly so a future downsampled strip cannot silently break row-to-pixel math on either side of the wire.
 
 `DeviceStatus.filmPresent` is a live, no-motion film-presence read, distinct from `previewEstablished` (which only means "a preview has run this session," never "film is physically loaded right now"). The bundled CoolScanPy asks the exact opened LS-5000 with TEST UNIT READY: `true` means the scanner reports medium gripped, `false` means its verified MEDIUM NOT PRESENT sense was observed, and `null` means no trustworthy verdict was available (for example, an active capture owns the interface, an older dependency lacks the method, or the scanner returned an unrecognised/malformed reply). A verified `false` retires the stale preview registration in the same status snapshot (`previewEstablished: false`, `slotCount: null`) and gates the next scan on a fresh preview. `null` is never interpreted as absence. Presence is not motion readiness: a short strip parked at the transport end-stop can still report `true`.
 

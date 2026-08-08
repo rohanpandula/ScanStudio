@@ -48,6 +48,15 @@ jobs:
       UV_PYTHON_PREFERENCE: only-managed
     steps:
       - uses: actions/checkout@v4
+      - name: coolscanpy PyPI sync gate
+        # Owner policy (2026-08-08): a release may not ship driver code that
+        # standalone `pip install coolscanpy` users would not have -- version
+        # skew between the two makes field reports for the same film
+        # incomparable. Content-compared against the latest published sdist
+        # (version strings are checked second; an unbumped version with
+        # changed code is exactly the failure mode). Publish the matching
+        # coolscanpy release from the canonical repo first, then re-tag.
+        run: bash scripts/check_coolscanpy_pypi_sync.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
         with:

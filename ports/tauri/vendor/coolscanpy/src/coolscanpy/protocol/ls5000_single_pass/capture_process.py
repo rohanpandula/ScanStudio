@@ -80,7 +80,19 @@ WORKER_BOOTSTRAP_SCHEMA_VERSION = 1
 WORKER_BOOTSTRAP_FAILED = "failed-before-ready"
 WORKER_BOOTSTRAP_STATUS_FILENAME = "worker-bootstrap.json"
 REVIEWED_ROLL_FINGERPRINT_VERSION = 2
-MANUAL_FRAME_APPROVAL_VERSION = 1
+# Bumped 2 (S6 hardening, FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1
+# rework): adds manual_boundary_rows_sha256, a required field, so this is a
+# breaking schema change on purpose. A genuine version-1 payload is refused
+# by from_payload's exact key-set check first (its key set no longer
+# matches); only a fabricated payload carrying version 1 WITH version-2
+# keys reaches __post_init__'s schema_version check. Both paths refuse --
+# the ordering is recorded here so nobody expects the version check to be
+# the gate that ordinary stale receipts hit (re-review 2026-08-08). Approval
+# receipts are ephemeral (created and consumed within one reviewed-session
+# -> scan-time flow, never persisted the way RollPreviewSession.to_json()
+# is), so there is no backward-compatibility case to preserve here the way
+# F7 preserved one for session JSON.
+MANUAL_FRAME_APPROVAL_VERSION = 2
 MAX_VISUAL_MEDIAN_HAMMING = 24
 MAX_VISUAL_P90_HAMMING = 48
 MAX_SELECTED_VISUAL_HAMMING = 48
@@ -596,7 +608,22 @@ class ReviewedRollFingerprint:
 
 @dataclass(frozen=True)
 class ManualFrameApproval:
-    """Operator approval bound to one reviewed thumbnail and transport choice."""
+    """Operator approval bound to one reviewed thumbnail and transport choice.
+
+    ``manual_boundary_rows_sha256`` (S6 hardening, FEEDING-UX-LADDER-
+    OVERNIGHT-20260807.md F1 rework): binds this approval to the EXACT set
+    of boundary rows the operator's whole session reviewed, not just this
+    one slot's own resolved position. Without it, a receipt legitimately
+    signed for slot N of one placement carries nothing that distinguishes
+    it from a receipt for slot N of a DIFFERENT placement of the same
+    physical roll whose fingerprint happens to still compare as matching
+    (fingerprint comparison has deliberate tolerance for legitimate re-
+    reads; see compare_reviewed_roll_fingerprints) -- this digest has none.
+    Use ``digest_manual_boundary_rows`` to compute it, both when creating a
+    receipt (RollPreviewSession.approve_manual_origin) and when verifying
+    one against a batch job's own manual_boundary_rows (worker.py), so the
+    two sides can never independently drift on how it is derived.
+    """
 
     reviewed_fingerprint_sha256: str
     slot: int
@@ -605,7 +632,23 @@ class ManualFrameApproval:
     reviewed_lookup_row: int
     reviewed_native_origin: int
     review_reasons: tuple[str, ...]
+    manual_boundary_rows_sha256: str
     schema_version: int = MANUAL_FRAME_APPROVAL_VERSION
+
+    @staticmethod
+    def digest_manual_boundary_rows(rows: Sequence[int] | None) -> str:
+        """Canonical digest of a placement's manual boundary rows.
+
+        ``rows`` is ``None`` for an automatic (non-manual) reviewed slot --
+        still given a fixed, well-defined digest rather than an empty
+        string, so this field is never optional/absent on the receipt
+        itself and a caller cannot bypass the check by omitting it.
+        """
+
+        payload = {
+            "manual_boundary_rows": list(rows) if rows is not None else None
+        }
+        return _canonical_json_sha256(payload)
 
     def __post_init__(self) -> None:
         if self.schema_version != MANUAL_FRAME_APPROVAL_VERSION:
@@ -630,6 +673,10 @@ class ManualFrameApproval:
             or self.reviewed_native_origin < 0
         ):
             raise ValueError("manual frame approval native origin is invalid")
+        if not _lower_sha256(self.manual_boundary_rows_sha256):
+            raise ValueError(
+                "manual frame approval manual-boundary-rows identity is invalid"
+            )
         if (
             not isinstance(self.review_reasons, tuple)
             or not self.review_reasons
@@ -640,6 +687,7 @@ class ManualFrameApproval:
     def binding_payload(self) -> dict[str, Any]:
         return {
             "boundary_offset_rows": self.boundary_offset_rows,
+            "manual_boundary_rows_sha256": self.manual_boundary_rows_sha256,
             "review_reasons": list(self.review_reasons),
             "reviewed_fingerprint_sha256": self.reviewed_fingerprint_sha256,
             "reviewed_lookup_row": self.reviewed_lookup_row,
@@ -664,6 +712,7 @@ class ManualFrameApproval:
         if not isinstance(payload, dict) or set(payload) != {
             "binding_sha256",
             "boundary_offset_rows",
+            "manual_boundary_rows_sha256",
             "review_reasons",
             "reviewed_fingerprint_sha256",
             "reviewed_lookup_row",
@@ -684,6 +733,7 @@ class ManualFrameApproval:
             reviewed_lookup_row=payload.get("reviewed_lookup_row"),  # type: ignore[arg-type]
             reviewed_native_origin=payload.get("reviewed_native_origin"),  # type: ignore[arg-type]
             review_reasons=tuple(reasons),
+            manual_boundary_rows_sha256=payload.get("manual_boundary_rows_sha256"),  # type: ignore[arg-type]
             schema_version=payload.get("schema_version"),  # type: ignore[arg-type]
         )
         if payload.get("binding_sha256") != value.binding_sha256:
@@ -1095,6 +1145,16 @@ class CaptureBatchRequest:
     expected_usb_bus: int
     expected_usb_address: int
     exposure_override_10ns: tuple[int, int, int] | None = None
+    # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the exact operator-
+    # picked boundary rows from a manual-placement preview session, carried
+    # across the process boundary so the batch child can replay
+    # manual_frames.build_manual_detection fresh against its own live re-read
+    # bytes -- never trusted as a serialized detection result (see worker.py's
+    # _derive_live_frame_selection docstring). None for an ordinary,
+    # automatically-detected session -- see Roll.scan_many, which derives
+    # this from its own reviewed session rather than accepting it from a
+    # caller.
+    manual_boundary_rows: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.frames, tuple):
@@ -1482,11 +1542,22 @@ class ProcessRunner(Protocol):
 
 
 class RunningBatchProcess(Protocol):
-    """The non-signalled subset of ``subprocess.Popen`` used by the adapter."""
+    """The subset of ``subprocess.Popen`` used by the adapter.
+
+    ``terminate()``/``kill()`` exist for exactly one caller -- the
+    fail-closed teardown of a held child whose preview this parent has
+    already refused (``_release_unreturnable_held_child``) -- and stay
+    unused everywhere else: a healthy capture child is never signalled
+    mid-attempt, it is always waited out (``_wait_for_batch_exit``).
+    """
 
     def poll(self) -> int | None: ...
 
     def wait(self, timeout: float | None = None) -> int: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
 
 
 class BatchProcessSpawner(Protocol):
@@ -1534,7 +1605,12 @@ def _spawn_batch_subprocess(
     stdout: Any,
     stderr: Any,
 ) -> RunningBatchProcess:
-    """Start one isolated child without exposing any signal/kill seam."""
+    """Start one isolated child in its own session.
+
+    ``start_new_session`` keeps an application-level SIGINT/SIGTERM from
+    reaching the scanner child implicitly; the returned handle's own
+    ``terminate()``/``kill()`` remain reserved for the failed-preview
+    teardown (see ``RunningBatchProcess``)."""
 
     return subprocess.Popen(
         list(argv),
@@ -1760,6 +1836,7 @@ class CaptureProcessAdapter:
         manifest_payload: bytes | None = None,
         batch_spawner: BatchProcessSpawner = _spawn_batch_subprocess,
         batch_poll_seconds: float = 0.1,
+        held_teardown_wait_seconds: float = 5.0,
     ) -> None:
         if not _is_sha256(expected_worker_sha256):
             raise ValueError("expected worker SHA-256 is not a lowercase digest")
@@ -1800,6 +1877,9 @@ class CaptureProcessAdapter:
             raise ValueError("batch_poll_seconds cannot be negative")
         self._batch_spawner = batch_spawner
         self._batch_poll_seconds = float(batch_poll_seconds)
+        if held_teardown_wait_seconds < 0:
+            raise ValueError("held_teardown_wait_seconds cannot be negative")
+        self._held_teardown_wait_seconds = float(held_teardown_wait_seconds)
         self._stop_requested = threading.Event()
         self._stop_gate = threading.Lock()
         self._attempt_lock = threading.Lock()
@@ -2216,9 +2296,9 @@ class CaptureProcessAdapter:
         ``begin_held_preview``'s do -- the child is alive, parked at a hold
         boundary, holding the reservation -- and raises instead of returning
         the only handle that could release it. So, exactly like
-        ``begin_held_preview``, the child is best-effort released on the way
-        out (``_release_unreturnable_held_child``); without that, a refused
-        journal orphaned a live child on the scanner until
+        ``begin_held_preview``, the child is torn down fail-closed on the
+        way out (``_release_unreturnable_held_child``); without that, a
+        refused journal orphaned a live child on the scanner until
         ``wait_for_hold_decision``'s own half-hour timeout expired.
         """
 
@@ -2441,8 +2521,9 @@ class CaptureProcessAdapter:
 
         Raising and returning a session are the only two outcomes, and a
         raise never leaves a child holding: if this call refuses a child
-        that already reached the hold boundary, it best-effort releases and
-        reaps that child on the way out (see
+        that already reached the hold boundary, it tears that child down
+        fail-closed on the way out -- release decision first, then a
+        bounded wait, then terminate/kill (see
         ``_release_unreturnable_held_child``).  It has to happen here --
         the caller is being handed an exception instead of the session, so
         it has no handle to release anything with.
@@ -2566,8 +2647,9 @@ class CaptureProcessAdapter:
                 # reservation -- and this call is about to raise instead of
                 # returning the only handle that could ever release it.
                 # Nothing downstream can clean that up (Roll.preview()'s own
-                # orphan fix needs a returned session to track), so the
-                # release belongs here, before the raise leaves this method.
+                # failure teardown needs a returned session to act on), so
+                # the teardown belongs here, before the raise leaves this
+                # method.
                 self._release_unreturnable_held_child(
                     process,
                     hold_ack_path=hold_ack_path,
@@ -2797,25 +2879,34 @@ class CaptureProcessAdapter:
         hold_ack_path: Path | None,
         hold_session_id: Any,
         error: BaseException,
-    ) -> None:
-        """Best-effort release and reap of a child parked at a hold boundary
-        that this adapter can no longer hand back.
+    ) -> bool:
+        """Fail-closed teardown of a child parked at a hold boundary that
+        this adapter can no longer hand back (or that the caller has already
+        refused).
 
-        Shared by both refusal paths that leave a live child holding the
-        reservation with nothing returned to release it with:
-        ``begin_held_preview`` refusing the original preview/hold journal,
-        and ``_resolve_held_after_batch`` refusing a CONTINUE_HOLD round's
-        own held-after-batch journal.  Both raise instead of returning a
-        session, so neither caller has a handle afterwards.
+        Shared by every preview-failure exit that would otherwise strand a
+        live child holding the reservation: ``begin_held_preview`` refusing
+        the original preview/hold journal, ``_resolve_held_after_batch``
+        refusing a CONTINUE_HOLD round's own held-after-batch journal, and
+        ``teardown_held_session`` (``Roll.preview()``'s own failure path,
+        where the session was returned but its evidence was then refused).
+        All of them are propagating ``error`` -- and the propagating parent
+        may well be about to die with it, taking every later chance to
+        release the child along (live failure 2026-08-08, attempt
+        preview-g7w8t49z: the parent exited on an ``IndexDecodeError`` and
+        the parked child kept the libusb device claim, failing every
+        subsequent open with ``USBError`` errno 13 for
+        ``wait_for_hold_decision``'s remaining half-hour timeout).
 
-        Mirrors ``_release_held_session_locked`` -- publish a release
-        decision, then wait the child out rather than signalling or
-        abandoning it -- but deliberately never raises and never validates
-        the release receipt.  ``error`` is the refusal already on its way
-        out and must stay the exception the caller sees; what happened here
-        is recorded on it as a note instead of replacing it.  A best-effort
-        release that quietly fails is still strictly better than leaving the
-        child alive and holding the scanner with no handle anywhere.
+        So, unlike ``_release_held_session_locked`` -- the operator-facing
+        path, which waits indefinitely for a validated release receipt --
+        this teardown is bounded and always ends with the child gone:
+        publish a release decision (the cooperative unblock the worker
+        releases the unit cleanly for), give the child
+        ``held_teardown_wait_seconds`` to act on it, then ``terminate()``,
+        wait the same bound again, then ``kill()``.  Never raises; ``error``
+        stays the exception the caller sees, with what happened here
+        recorded on it as a note.
 
         ``hold_session_id`` is the validated id when the caller got that
         far, and whatever the child itself published (possibly ``None``)
@@ -2823,65 +2914,85 @@ class CaptureProcessAdapter:
         not accepted by the worker -- it fails the wait closed as a
         ``SynchronizedProtocolError``, whose synchronized-cleanup path does
         still release the unit -- so publishing it unblocks a child that
-        would otherwise sit on the reservation until
-        ``wait_for_hold_decision``'s own half-hour timeout expired.
-        ``hold_ack_path`` is ``None`` only when the refused journal did not
-        name a usable rendezvous at all, which is the one case where there
-        is no way to address the child; that is recorded rather than
-        guessed at.
+        would otherwise sit on the reservation.  ``hold_ack_path`` is
+        ``None`` only when the refused journal did not name a usable
+        rendezvous at all; that child cannot be told anything and goes
+        straight to the terminate/kill ladder.
 
-        The child is waited out only once it has actually been unblocked --
-        either it was already gone, or a decision it will act on is now
-        published. ``_wait_for_batch_exit`` deliberately never gives up, so
-        waiting on a child still parked in ``wait_for_hold_decision`` with
-        no decision to read would block this thread for that wait's full
-        half-hour timeout rather than letting the refusal out.
+        Returns ``True`` when the child ended on its own (already gone, or
+        exited after taking the release decision) -- ``False`` when it had
+        to be signalled or could not be confirmed dead, which callers
+        should treat as evidence-preserving.
         """
 
         told = "reached the hold boundary"
-        unblocked = False
         try:
-            if process.poll() is None:
-                if hold_ack_path is None:
-                    told = (
-                        "could not be told to release (its journal named no "
-                        "usable hold rendezvous)"
-                    )
-                else:
-                    try:
-                        self._publish_hold_ack_at(
-                            hold_ack_path,
-                            hold_session_id=hold_session_id,
-                            action="release",
-                        )
-                        told = "was told to release"
-                        unblocked = True
-                    except FileExistsError:
-                        told = "already had a hold decision published"
-                        unblocked = True
-                    except BaseException as publish_error:
-                        told = f"could not be told to release ({publish_error})"
-            else:
-                told = "was already gone"
-                unblocked = True
-            if not unblocked:
-                error.add_note(
-                    f"held preview child {told}; it was left running rather "
-                    "than waited on, and the scanner reservation must be "
-                    "assumed still held until it times out"
+            if process.poll() is not None:
+                returncode, wait_error = self._wait_for_batch_exit(process)
+                note = f"held preview child was already gone and exited {returncode}"
+                if wait_error is not None:
+                    note += f" (reap deferred {wait_error!r})"
+                error.add_note(note)
+                return True
+            if hold_ack_path is None:
+                told = (
+                    "could not be told to release (its journal named no "
+                    "usable hold rendezvous)"
                 )
-                return
-            returncode, wait_error = self._wait_for_batch_exit(process)
+            else:
+                try:
+                    self._publish_hold_ack_at(
+                        hold_ack_path,
+                        hold_session_id=hold_session_id,
+                        action="release",
+                    )
+                    told = "was told to release"
+                except FileExistsError:
+                    told = "already had a hold decision published"
+                except BaseException as publish_error:
+                    told = f"could not be told to release ({publish_error})"
+            returncode = self._wait_for_exit_bounded(process)
+            if returncode is not None:
+                error.add_note(f"held preview child {told} and exited {returncode}")
+                return True
+            wait = self._held_teardown_wait_seconds
+            try:
+                process.terminate()
+            except BaseException:
+                # A child that vanished between poll() and the signal shows
+                # up as an exit code on the next bounded wait; anything else
+                # still has the kill rung below.
+                pass
+            returncode = self._wait_for_exit_bounded(process)
+            if returncode is not None:
+                error.add_note(
+                    f"held preview child {told}, did not exit within {wait:g}s, "
+                    f"and was terminated (exit {returncode})"
+                )
+                return False
+            try:
+                process.kill()
+            except BaseException:
+                pass
+            returncode = self._wait_for_exit_bounded(process)
         except BaseException as cleanup_error:
             error.add_note(
                 f"held preview child {told} but could not be let go cleanly "
                 f"({cleanup_error}); assume the scanner reservation is still held"
             )
-            return
-        note = f"held preview child {told} and exited {returncode}"
-        if wait_error is not None:
-            note += f" (reap deferred {wait_error!r})"
-        error.add_note(note)
+            return False
+        if returncode is not None:
+            error.add_note(
+                f"held preview child {told}, survived terminate, and was "
+                f"killed (exit {returncode})"
+            )
+            return False
+        error.add_note(
+            f"held preview child {told} and could not be confirmed dead even "
+            "after terminate and kill; assume the scanner reservation and its "
+            "USB device claim are still held"
+        )
+        return False
 
     def _rejected_hold_session_id(self, paths: AttemptPaths) -> Any:
         """Read back whatever the held child called its hold session, for a
@@ -3171,6 +3282,32 @@ class CaptureProcessAdapter:
                 )
         return journal
 
+    def teardown_held_session(
+        self,
+        held: HeldPreviewSession,
+        *,
+        error: BaseException,
+    ) -> bool:
+        """Fail-closed teardown of a held session whose completed preview
+        evidence the caller has refused.
+
+        ``Roll.preview()`` calls this on every failure exit after
+        ``begin_held_preview`` returned a usable session: the raise about to
+        propagate may be the last thing the parent process does, so the
+        still-parked child cannot be left for a ``close()``/``release()``
+        that may never come.  Bounded and never raises -- see
+        ``_release_unreturnable_held_child`` for the release-then-terminate-
+        then-kill ladder and the return value's meaning.
+        """
+
+        with self._attempt_lock:
+            return self._release_unreturnable_held_child(
+                held.process,
+                hold_ack_path=held.hold_ack_path,
+                hold_session_id=held.hold_session_id,
+                error=error,
+            )
+
     def _wait_for_batch_exit(
         self,
         process: RunningBatchProcess,
@@ -3192,6 +3329,23 @@ class CaptureProcessAdapter:
                     return returncode, deferred
                 if self._batch_poll_seconds:
                     time.sleep(self._batch_poll_seconds)
+
+    def _wait_for_exit_bounded(self, process: RunningBatchProcess) -> int | None:
+        """Poll for exit like ``_wait_for_held_preview_ready`` does, but give
+        up after ``held_teardown_wait_seconds`` instead of never: the one
+        caller (``_release_unreturnable_held_child``) escalates on ``None``
+        rather than blocking a failure exit behind an uncooperative child."""
+
+        deadline = time.monotonic() + self._held_teardown_wait_seconds
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                return returncode
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if self._batch_poll_seconds:
+                time.sleep(min(self._batch_poll_seconds, remaining))
 
     def run_attempt(self, request: CaptureRequest) -> CaptureAttemptResult:
         """Run and validate one worker attempt synchronously."""
@@ -3506,6 +3660,14 @@ class CaptureProcessAdapter:
                 else list(request.exposure_override_10ns)
             ),
             "frames": frames,
+            # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): same optional,
+            # always-present, nullable-array shape as exposure_override_10ns
+            # above -- see CaptureBatchRequest.manual_boundary_rows.
+            "manual_boundary_rows": (
+                None
+                if request.manual_boundary_rows is None
+                else list(request.manual_boundary_rows)
+            ),
             "parent_ack_required_after_every_frame": True,
             "release_once_after_last_frame": True,
             "reviewed_roll_fingerprint": request.reviewed_fingerprint.to_payload(),

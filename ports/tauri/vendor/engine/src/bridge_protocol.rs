@@ -239,6 +239,11 @@ pub struct BridgeThumbnail {
     /// bridge writes for this slot's preview crop (BRIDGE.md "Types" note
     /// under `Thumbnail`) — a path, never image bytes on the wire.
     pub image_path: String,
+    /// Lane C, additive (BRIDGE.md): `true` only on a frame whose crop
+    /// overlaps the preview with >=90% of its height inside but not all of
+    /// it. Absent everywhere else; older bridges never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -252,6 +257,48 @@ pub struct BridgeRollSetSpacingOffsetParams {
 #[serde(rename_all = "camelCase")]
 pub struct BridgeRollSetSpacingOffsetResult {
     pub thumbnail: BridgeThumbnail,
+}
+
+// ---------------------------------------------------------------------
+// roll.manualFrames / roll.previewStrip (additive, 2026-08-07 -- Rung 4 of
+// the feeding UX ladder, BRIDGE.md "roll.manualFrames"/"roll.previewStrip").
+// ---------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeManualFramesParams {
+    pub rows: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeManualFramesResult {
+    pub count: u32,
+    pub fingerprint: String,
+    pub thumbnails: Vec<BridgeThumbnail>,
+    pub snaps: Vec<BridgeBoundarySnap>,
+}
+
+/// One snap-assist adjustment `roll.manualFrames` applied to a picked
+/// boundary row (BRIDGE.md "Types" -> `BoundarySnap`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeBoundarySnap {
+    pub boundary_index: u32,
+    pub requested_row: u32,
+    pub snapped_row: u32,
+    pub evidence_run: (u32, u32),
+}
+
+/// `roll.previewStrip`'s result (BRIDGE.md "Types" -> `PreviewStrip`). No
+/// params type: the request carries `{}` on the wire, same as
+/// `device.eject`/`bridge.shutdown`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgePreviewStripResult {
+    pub image_path: String,
+    pub row_count: u32,
+    pub pixels_per_row: u32,
 }
 
 // ---------------------------------------------------------------------
@@ -501,6 +548,17 @@ pub struct BridgeRollPreviewAck {
 #[serde(rename_all = "camelCase")]
 pub struct BridgeRollApproveParams {
     pub slot: u32,
+    /// Additive (2026-08-08 adversarial review, S1): the Roll fingerprint
+    /// the approval being submitted was minted against. `None` for the
+    /// existing automatic-preview approval path -- omitted from the wire
+    /// entirely (`skip_serializing_if`) so a bridge or bridge test double
+    /// that predates this field sees byte-identical params to before it
+    /// existed. Only `RealLs5000::roll_manual_frames`'s own binding
+    /// populates this today; the bridge refuses the approval with
+    /// `FINGERPRINT_REFUSED` when it is present and does not match the
+    /// roll's current fingerprint (BRIDGE.md `roll.approve`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -744,6 +802,7 @@ mod tests {
                 "possible-double-exposure".to_string(),
             ],
             image_path: "/tmp/slot-0007.tif".to_string(),
+            partial: None,
         };
         let value = serde_json::to_value(&thumbnail).unwrap();
         assert_eq!(value["needsApproval"], json!(true));
@@ -959,5 +1018,126 @@ mod tests {
         }))
         .expect("an unrecognized code string must not fail deserialization");
         assert_eq!(future_code.code, "SOME_FUTURE_CODE_NOT_YET_INVENTED");
+    }
+
+    /// Field values taken from `bridge/tests/test_service_dispatch.py`'s own
+    /// `test_roll_manual_frames_dispatch_routes_rows_and_rearms_scan_gate` --
+    /// pins the Rust mirror to the exact wire shape the real Python bridge
+    /// emits, not just an internally-consistent round trip.
+    #[test]
+    fn bridge_manual_frames_result_matches_python_bridge_worked_example() {
+        let result = BridgeManualFramesResult {
+            count: 2,
+            fingerprint: "stub-manual-fp".to_string(),
+            thumbnails: vec![
+                BridgeThumbnail {
+                    slot: 1,
+                    boundary_rows: (100, 300),
+                    spacing_offset: 0,
+                    needs_approval: true,
+                    warnings: vec!["user-picked".to_string()],
+                    image_path: "/tmp/stub-manual/slot-0001.tif".to_string(),
+                    partial: None,
+                },
+                BridgeThumbnail {
+                    slot: 2,
+                    boundary_rows: (300, 500),
+                    spacing_offset: 0,
+                    needs_approval: true,
+                    warnings: vec!["user-picked".to_string()],
+                    image_path: "/tmp/stub-manual/slot-0002.tif".to_string(),
+                    partial: None,
+                },
+            ],
+            snaps: vec![BridgeBoundarySnap {
+                boundary_index: 0,
+                requested_row: 100,
+                snapped_row: 100,
+                evidence_run: (98, 102),
+            }],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["count"], json!(2));
+        assert_eq!(value["fingerprint"], json!("stub-manual-fp"));
+        assert_eq!(
+            value["thumbnails"].as_array().unwrap().iter().map(|t| t["slot"].clone()).collect::<Vec<_>>(),
+            vec![json!(1), json!(2)]
+        );
+        assert_eq!(value["thumbnails"][0]["boundaryRows"], json!([100, 300]));
+        assert_eq!(value["thumbnails"][0]["needsApproval"], json!(true));
+        assert_eq!(
+            value["snaps"],
+            json!([{
+                "boundaryIndex": 0,
+                "requestedRow": 100,
+                "snappedRow": 100,
+                "evidenceRun": [98, 102],
+            }])
+        );
+        round_trip(&result);
+    }
+
+    /// Field values taken from `bridge/tests/test_service_dispatch.py`'s own
+    /// `test_roll_preview_strip_dispatch_returns_wire_shape`.
+    #[test]
+    fn bridge_preview_strip_result_matches_python_bridge_worked_example() {
+        let result = BridgePreviewStripResult {
+            image_path: "/tmp/stub-preview/strip.tif".to_string(),
+            row_count: 4800,
+            pixels_per_row: 1,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "imagePath": "/tmp/stub-preview/strip.tif",
+                "rowCount": 4800,
+                "pixelsPerRow": 1,
+            })
+        );
+        round_trip(&result);
+    }
+
+    #[test]
+    fn bridge_manual_frames_params_round_trips_rows() {
+        let params = BridgeManualFramesParams {
+            rows: vec![100, 300, 500],
+        };
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            json!({"rows": [100, 300, 500]})
+        );
+        round_trip(&params);
+    }
+
+    #[test]
+    fn bridge_thumbnail_partial_round_trips_and_defaults_absent() {
+        let with_partial = BridgeThumbnail {
+            slot: 39,
+            boundary_rows: (10, 800),
+            spacing_offset: 0,
+            needs_approval: true,
+            warnings: vec![],
+            image_path: "/tmp/t.tif".to_string(),
+            partial: Some(true),
+        };
+        let value = serde_json::to_value(&with_partial).unwrap();
+        assert_eq!(value["partial"], serde_json::json!(true));
+        round_trip(&with_partial);
+
+        let without: BridgeThumbnail = serde_json::from_value(serde_json::json!({
+            "slot": 1,
+            "boundaryRows": [10, 800],
+            "spacingOffset": 0,
+            "needsApproval": false,
+            "warnings": [],
+            "imagePath": "/tmp/t.tif",
+        }))
+        .unwrap();
+        assert_eq!(without.partial, None);
+        assert!(serde_json::to_value(&without)
+            .unwrap()
+            .get("partial")
+            .is_none());
     }
 }

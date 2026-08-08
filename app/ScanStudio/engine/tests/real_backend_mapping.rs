@@ -502,6 +502,15 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
                 ("MOCK_BRIDGE_PREVIEW_DELAY_MS", "2000"),
                 ("MOCK_BRIDGE_HANG_ON_STATUS_WHILE_PREVIEW_PENDING", "1"),
                 ("MOCK_BRIDGE_CALL_LOG", call_log_path_string.as_str()),
+                // Adversarial review S3 (2026-08-08): roll_approve now
+                // requires the approved frame to be one the completed
+                // preview flagged `needsApproval: true` -- flag frame 1
+                // (the one both the predecessor and replacement preview
+                // approve below) so this test keeps exercising its own
+                // actual subject (stale vs. current vs. premature
+                // approval across a bridge restart) rather than tripping
+                // the new gate.
+                ("MOCK_BRIDGE_PREVIEW_APPROVAL_SLOTS", "1"),
             ],
         )
         .expect("preview-status fault does not affect bridge startup")

@@ -27,11 +27,14 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
 )
 from coolscanpy.roll.preview_session import (
     PARTIAL_FRAME_MIN_COVERAGE,
+    ArtifactIdentity,
     CaptureRoute,
     RollSessionIntegrityError,
+    ValidatedRollPreview,
     _crop_coverage,
     _crop_state,
     _preview_binding_contract,
+    build_manual_roll_preview_session,
     build_roll_preview_session,
     reload_thumbnail,
 )
@@ -895,6 +898,175 @@ def test_boundary_offset_reloads_only_that_slot_and_resolves_exact_table_record(
         adjusted.slots[17].thumbnail,
         reload_thumbnail(session.preview, base, -21),
     )
+
+
+def _clean_transport_records(count: int) -> tuple[roll_index.TransportRecord, ...]:
+    """Same-traversal table stepping at exactly 42 native units/row (matches
+    test_manual_frames.py's convention: ``code=6*(row%18), selector=row//18``
+    decodes to ``native_origin = 42 * row`` exactly).
+    """
+
+    return tuple(
+        roll_index.TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(count)
+    )
+
+
+def _synthetic_validated_preview(
+    *, frame_count: int = 6, leader: int = 128
+) -> tuple[ValidatedRollPreview, list[int]]:
+    """A directly-constructed ValidatedRollPreview, bypassing the full
+    attempt-journal simulation _preview_fixture uses -- Rung 4 manual
+    placement's whole premise is that this object already exists (from an
+    earlier, possibly failed, preview attempt) by the time a human places
+    boundaries, so tests exercise build_manual_roll_preview_session against
+    it directly.
+    """
+
+    pitch = 143
+    boundaries = [leader + index * pitch for index in range(frame_count + 1)]
+    height = boundaries[-1] + 24
+    rgb = _synthetic_index(height=height, frame_count=frame_count, leader=leader)
+    records = _clean_transport_records(height)
+    geometry = roll_index.IndexGeometry(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=height * 41,
+        width=96,
+        height=height,
+        block_bytes=2_048,
+        expected_stream_bytes=height * roll_index.INDEX_ROW_WORDS * 2,
+    )
+    preview = ValidatedRollPreview(
+        preview_artifact=ArtifactIdentity(
+            path=Path("/fake/capture-preview.bin"), byte_length=0, sha256="a" * 64
+        ),
+        table_artifact=ArtifactIdentity(
+            path=Path("/fake/capture-008e.bin"), byte_length=0, sha256="b" * 64
+        ),
+        journal_artifact=ArtifactIdentity(
+            path=Path("/fake/journal.json"), byte_length=0, sha256="c" * 64
+        ),
+        usb_topology=(1, 2),
+        geometry=geometry,
+        usable_rows=height,
+        rgb=rgb,
+        transport_records=records,
+        decode_report={},
+    )
+    return preview, boundaries
+
+
+def test_manual_session_yields_slots_with_boundary_offset_still_working() -> None:
+    preview, boundaries = _synthetic_validated_preview()
+
+    session = build_manual_roll_preview_session(preview, boundaries)
+
+    assert len(session.slots) == 6
+    assert session.detection.confidence == "medium"
+    assert all(slot.manual_review for slot in session.slots)
+    # Boundary 0 sits in the wide (128-row) leader run -- not a narrow
+    # inter-frame gap -- so it resolves at the picked row itself. The rest
+    # each sit at the center of an ordinary 6-row inter-frame gap, so each
+    # resolves at that run's OWN trailing edge (boundary + 3), mirroring
+    # derive_transport_mapping's "direct-gap-trailing-row" convention (see
+    # manual_frames.py's own docstring for why manual placement's F1
+    # rework does the same).
+    expected_lookup_rows = [boundaries[0]] + [b + 3 for b in boundaries[1:6]]
+    for frame, (slot, lookup_row) in enumerate(
+        zip(session.slots, expected_lookup_rows), start=1
+    ):
+        assert slot.base_origin.lookup_row == lookup_row
+        assert slot.base_origin.native_origin == 42 * lookup_row
+        assert slot.base_origin.method == "user-picked-row"
+
+    picked_slot = session.slots[1]  # frame 2, base lookup row = boundaries[1] + 3
+    adjusted = session.with_boundary_offset(2, -10)
+
+    assert adjusted.slots[1].boundary_offset_rows == -10
+    resolved = adjusted.resolve_origin(2, -10)
+    assert resolved.lookup_row == picked_slot.base_origin.lookup_row - 10
+    assert resolved.native_origin == 42 * resolved.lookup_row
+    np.testing.assert_array_equal(
+        adjusted.slots[1].thumbnail,
+        reload_thumbnail(session.preview, picked_slot, -10),
+    )
+    # The unmodified session and its other slots are untouched (RollPreviewSession
+    # is immutable, same contract build_roll_preview_session's own sessions have).
+    assert session.slots[1].boundary_offset_rows == 0
+    assert adjusted.slots[0] is session.slots[0]
+
+
+def test_manual_session_provenance_round_trips_through_to_json_only() -> None:
+    """to_json persists the picked boundary rows (additive field); from_json
+    deliberately refuses to restore a manual session rather than silently
+    re-running automatic detection against it.
+    """
+
+    preview, boundaries = _synthetic_validated_preview()
+    session = build_manual_roll_preview_session(preview, boundaries)
+
+    payload = json.loads(session.to_json())
+
+    assert payload["manual_boundary_rows"] == boundaries
+
+    with pytest.raises(RollSessionIntegrityError, match="manual frame placement"):
+        type(session).from_json(session.to_json())
+
+
+def test_automatic_session_json_has_no_manual_provenance(tmp_path: Path) -> None:
+    session = build_roll_preview_session(_preview_fixture(tmp_path).result)
+
+    payload = json.loads(session.to_json())
+
+    assert payload["manual_boundary_rows"] is None
+    # And the ordinary round trip (already covered above) still restores fine
+    # now that the schema carries this additive key.
+    restored = type(session).from_json(session.to_json())
+    assert restored.preview.preview_artifact == session.preview.preview_artifact
+
+
+def test_pre_rework_session_json_without_manual_boundary_rows_key_still_restores(
+    tmp_path: Path,
+) -> None:
+    """F7 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): to_json() started always
+    emitting "manual_boundary_rows" the same night manual placement shipped.
+    A session persisted by the PREVIOUS build never had that key at all --
+    simulated here by deleting it from an otherwise-real payload -- and must
+    restore exactly as it always did, not refuse on an unsupported schema.
+    """
+
+    session = build_roll_preview_session(_preview_fixture(tmp_path).result)
+    payload = json.loads(session.to_json())
+    assert "manual_boundary_rows" in payload
+    del payload["manual_boundary_rows"]
+    pre_rework_json = json.dumps(payload)
+
+    restored = type(session).from_json(pre_rework_json)
+
+    assert restored.preview.preview_artifact == session.preview.preview_artifact
+    assert restored.selected_slots == session.selected_slots
+
+
+def test_session_json_with_an_unrelated_missing_key_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """The tolerance above is scoped to exactly one additive key -- any
+    OTHER missing key is still an unsupported schema."""
+
+    session = build_roll_preview_session(_preview_fixture(tmp_path).result)
+    payload = json.loads(session.to_json())
+    del payload["slot_count"]
+
+    with pytest.raises(RollSessionIntegrityError, match="unsupported schema"):
+        type(session).from_json(json.dumps(payload))
 
 
 def test_session_json_round_trip_revalidates_sources_and_restores_operator_state(

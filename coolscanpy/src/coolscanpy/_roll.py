@@ -86,6 +86,9 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
     NikonExactBuilderEvidence,
     build_nikon_exact_builder_evidence,
 )
+from coolscanpy.protocol.ls5000_single_pass.manual_frames import (
+    MANUAL_PLACEMENT_WARNING,
+)
 from coolscanpy.protocol.ls5000_single_pass.meter import (
     EXPOSURE_MAX,
     EXPOSURE_MIN,
@@ -559,6 +562,14 @@ class Roll:
         or by a prior ``scan_many()``/``scan()`` that completed without
         ``eject_after`` -- releasing it cleanly before starting the fresh
         transport read, exactly like an explicit :meth:`release` would.
+
+        A ``preview()`` that raises never leaves the reservation held: the
+        capture child a failed preview would otherwise strand at its hold
+        boundary is told to release -- and terminated, then killed, if it
+        will not -- before the exception propagates, so a caller that dies
+        on the raise cannot leak a worker holding the scanner's USB claim.
+        The next ``scan_many()``/``scan()`` after a failed preview starts a
+        fresh reservation.
         """
 
         with self._state_condition:
@@ -575,6 +586,7 @@ class Roll:
             self._preview_thread_id = threading.get_ident()
 
         io_acquired = False
+        held: HeldPreviewSession | None = None
         try:
             self._device._acquire_io_lock("roll preview")
             io_acquired = True
@@ -606,17 +618,19 @@ class Roll:
             except CaptureStopped as error:
                 raise SafeStopRequested(str(error)) from error
             # Track a live held child the moment the adapter hands it back,
-            # before any interpretation of what it produced. Everything below
-            # can raise, and a raise must leave close()/release()/a retried
-            # preview() a handle to tell the still-alive child to let go of its
-            # reservation. Assigning only after validation succeeded (the
-            # previous behavior) orphaned a live child -- still blocked in
-            # wait_for_hold_decision, still holding the scanner -- whenever
-            # build_roll_preview_session refused the journal. An unusable
-            # session is the opposite case (the child exited before the hold
-            # boundary and was already reaped -- see HeldPreviewSession.usable)
-            # and is deliberately not stored, preserving that docstring's
-            # "preview() never stores an unusable session" invariant.
+            # before any interpretation of what it produced. On the success
+            # path this is the reservation scan_many()/scan() resumes without
+            # a refeed; on any raise below it is what the failure handler at
+            # the bottom of this method tears down, fail-closed, before the
+            # exception escapes. Assigning only after validation succeeded
+            # (the original behavior) orphaned a live child -- still blocked
+            # in wait_for_hold_decision, still holding the scanner --
+            # whenever build_roll_preview_session refused the journal. An
+            # unusable session is the opposite case (the child exited before
+            # the hold boundary and was already reaped -- see
+            # HeldPreviewSession.usable) and is deliberately not stored,
+            # preserving that docstring's "preview() never stores an unusable
+            # session" invariant.
             if held.usable:
                 self._held_session = held
             attempt = held.preview_attempt
@@ -693,6 +707,32 @@ class Roll:
                 for slot in session.slots
                 if wanted is None or slot.slot_id in wanted
             ]
+        except BaseException as error:
+            # A raise leaving preview() may be the last thing this process
+            # ever runs: the caller can die on it without reaching close()
+            # or release() (live failure 2026-08-08, attempt
+            # preview-g7w8t49z -- the parent exited on IndexDecodeError
+            # "index row framing mismatch" and the parked child kept the
+            # libusb device claim, failing every subsequent open with
+            # USBError errno 13 until it was killed by hand). So a failed
+            # preview never relies on a later call: its held child is torn
+            # down here, fail-closed, before the exception escapes --
+            # release decision, bounded wait, then terminate/kill (see
+            # CaptureProcessAdapter.teardown_held_session). An unusable
+            # session's child already exited and was reaped inside
+            # begin_held_preview; a raise before the adapter handed
+            # anything back has nothing to tear down.
+            if held is not None:
+                if self._held_session is held:
+                    self._held_session = None
+                if held.usable and not self._ensure_adapter().teardown_held_session(
+                    held, error=error
+                ):
+                    self._preserve_evidence(
+                        "held preview child did not end cleanly after the "
+                        f"failed preview: {error}"
+                    )
+            raise
         finally:
             if io_acquired:
                 self._device._release_io_lock()
@@ -742,6 +782,68 @@ class Roll:
                 for slot in session.slots
                 if wanted is None or slot.slot_id in wanted
             ]
+
+    def install_manual_session(self, session: RollPreviewSession) -> None:
+        """Install an already-built, already-validated manual-placement
+        preview session as this Roll's current review state (Rung 4 of the
+        feeding UX ladder; 2026-08-08 adversarial review, S1/S5).
+
+        No film moves and no evidence is read from disk here: the caller
+        (``coolscanpy_transport.manual_frames()``) has already produced
+        ``session`` from a validated, decoded ``ValidatedRollPreview`` via
+        :func:`coolscanpy.roll.preview_session.build_manual_roll_preview_session`.
+        This method's whole job is the same locked, atomic state transition
+        every other in-place mutator on this class already performs --
+        :meth:`preview`'s own success tail, :meth:`restore_preview_session`,
+        :meth:`set_spacing_offset`, :meth:`approve` -- so a manual-placement
+        caller never has to reach into ``_session``/``_approvals`` directly
+        (previously the only way to arm a manual session at all, since
+        neither of those two existing methods accepts one: ``preview()``
+        always re-reads the transport, and ``restore_preview_session()``
+        explicitly refuses a session serialized from manual placement).
+
+        Checks run in this order, all under one lock, before anything is
+        mutated:
+
+        1. This Roll must not be closing, mid-preview, or hold an active
+           batch -- the same "review state is frozen" contract
+           ``_require_mutable_review_locked`` enforces for every other
+           mutator here.
+        2. ``session``'s material must match this Roll's own material.
+        3. ``session.preview.usb_topology`` -- the USB bus/address recorded
+           when the underlying evidence was originally captured, which may
+           be considerably older than this exact call -- must match this
+           Roll's CURRENT device topology, verified fresh here the same way
+           a live :meth:`preview` or :meth:`restore_preview_session` call
+           already does. Never trusted bare: a manual session built from a
+           stale attempt must not silently bind to whatever scanner happens
+           to be attached now.
+
+        Raises ``TypeError`` if ``session`` is not a ``RollPreviewSession``,
+        ``DeviceBusy`` if check 1 fails, or ``RollMismatch`` if check 2 or 3
+        fails. Every check runs before any mutation, and a raise leaves the
+        existing session and approvals (if any) exactly as they were --
+        this method never partially installs a session.
+        """
+
+        if not isinstance(session, RollPreviewSession):
+            raise TypeError("session must be a RollPreviewSession")
+        with self._state_condition:
+            self._require_mutable_review_locked()
+            if session.material is not self._material:
+                raise RollMismatch(
+                    "manual placement session material does not match this "
+                    "Roll's material"
+                )
+            topology = self._preview_topology_locked()
+            if session.preview.usb_topology != topology:
+                raise RollMismatch(
+                    "manual placement evidence belongs to a different USB "
+                    "topology than this Roll"
+                )
+            self._session = session
+            self._session_usb_topology = topology
+            self._approvals.clear()
 
     # -- spacing offset ----------------------------------------------------
 
@@ -954,6 +1056,21 @@ class Roll:
                 expected_usb_bus=topology[0],
                 expected_usb_address=topology[1],
                 exposure_override_10ns=exposure_override_10ns,
+                # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the same
+                # computation RollPreviewSession.to_json() already uses to
+                # decide whether ITS OWN provenance is a manual session's
+                # (preview_session.py) -- MANUAL_PLACEMENT_WARNING is only
+                # ever attached by manual_frames.build_manual_detection,
+                # never by the automatic detector, so this is None for
+                # every ordinary session, unchanged from before this batch
+                # gained the field.
+                manual_boundary_rows=(
+                    tuple(
+                        boundary.output_row for boundary in session.detection.boundaries
+                    )
+                    if MANUAL_PLACEMENT_WARNING in session.detection.warnings
+                    else None
+                ),
             )
             # A held session is single-use *per call*: whether this batch
             # resumes it successfully, fails, is stopped, or is ended by

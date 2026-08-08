@@ -468,4 +468,62 @@ struct ErrorPresentationPolicyTests {
         #expect(body.hasSuffix("\n[technical message truncated]"))
         #expect(presentation.technicalDetails == rawMessage)
     }
+
+    // MARK: - Rung 3/4 probable-cause wiring (FEEDING-UX-LADDER-OVERNIGHT-20260807.md)
+
+    @Test("a REFEED_REQUIRED carrying a Rung-3 diagnosis surfaces its probableCause")
+    func probableCauseIsExtractedThroughThePolicy() {
+        let sentence = "this looks like half-frame film (frames about every 19 mm); "
+            + "this driver expects standard 35 mm spacing"
+        let rawMessage = "bridge error REFEED_REQUIRED: transport read was not one uniform "
+            + "traversal; eject or refeed the strip and run the preview again -- if this "
+            + "recurs on clean feeds it may be a capture or driver defect (transport anchor "
+            + "residual is inconsistent with one affine preview traversal (MAE 4.447 rows, "
+            + "max 11.241 rows) [gap-lattice-anchor] {\"probable_cause\": \"\(sentence)\"})"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.probableCause == sentence)
+        // This message names REFEED_REQUIRED but not ROLL_MISMATCH (it
+        // comes from IndexDecodeError via the bridge's generic transport-
+        // read wrapper, not the ROLL_MISMATCH-tagged transport-slip family
+        // `FilmTransportFailurePolicy.requiresPhysicalRefeed` recognizes),
+        // so it resolves through the plain REFEED_REQUIRED known-copy entry.
+        #expect(presentation.title == "Film needs to be reloaded")
+        #expect(presentation.technicalDetails == rawMessage)
+    }
+
+    @Test("an ordinary error without a Rung-3 diagnosis has no probableCause")
+    func noProbableCauseWhenAbsent() {
+        let rawMessage = "REFEED_REQUIRED: preview could not establish a usable roll session"
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+        #expect(presentation.probableCause == nil)
+    }
+
+    @Test("a completely unrelated error never fabricates a probableCause")
+    func unrelatedErrorHasNoProbableCause() {
+        let presentation = ErrorPresentationPolicy.make(
+            lastErrorMessage: "NOT_CONNECTED: scanner is not connected"
+        )
+        #expect(presentation.probableCause == nil)
+    }
+
+    /// S8 (adversarial review round 2, 2026-08-08): extraction must be
+    /// gated on the CLASSIFIED error code, not merely on whether the raw
+    /// text happens to contain a probable_cause-shaped fragment. An
+    /// INTERNAL error carrying an embedded fragment -- coincidental,
+    /// echoed, or adversarially crafted -- must extract nothing, and the
+    /// workspace error card must therefore never offer "Place frames
+    /// manually" for it.
+    @Test("an INTERNAL error with an embedded probable_cause fragment extracts nothing and offers no manual-placement action")
+    func internalErrorWithEmbeddedFragmentExtractsNothing() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): unexpected driver fault "
+            + "[some-id] {\"probable_cause\": \"this should never surface for an INTERNAL error\"}"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.probableCause == nil)
+        #expect(presentation.title != "Film shifted—refeed required")
+        #expect(presentation.title != "Film needs to be reloaded")
+    }
 }

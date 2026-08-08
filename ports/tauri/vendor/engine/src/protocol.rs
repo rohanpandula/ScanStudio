@@ -352,10 +352,89 @@ pub struct Thumbnail {
     /// Omitted by the simulator and older real backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacing_offset: Option<i64>,
+    /// Lane C, additive: `true` only on a frame whose crop overlaps the
+    /// preview with >=90% of its height inside but not all of it. Forwarded
+    /// verbatim from the bridge; omitted whenever the bridge omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub needs_approval: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------
+// roll.manualFrames / roll.previewStrip (additive, 2026-08-07 -- Rung 4 of
+// the feeding UX ladder). Both are non-motion-capable and synchronous (no
+// events): `roll.previewStrip` renders the last completed preview attempt's
+// whole captured raster to one image for a manual-placement editor;
+// `roll.manualFrames` re-slices that raster at operator-picked boundary
+// rows in place of automatic detection. Usable any time a preview attempt
+// exists on disk -- including one that ended in `scanner.thumbnailsFailed`
+// (REFEED_REQUIRED) -- see BRIDGE.md's own "roll.manualFrames" section.
+// Unlike `roll.approve`/`roll.setSpacingOffset`, neither method takes an
+// `operationId` param: BRIDGE.md's bridge-level contract has none (no
+// "exact completed preview" binding is required to call them), so
+// `RollManualFramesResult.operationId` is engine-minted, not
+// client-supplied -- it arms the SAME approval binding a successful
+// `roll.preview` would have, so the existing `roll.approve`/
+// `roll.setSpacingOffset`/manual-review-sheet flow keeps working unchanged
+// on the resulting frames (see `RealLs5000::roll_manual_frames`).
+// ---------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollManualFramesParams {
+    /// At least 2 strictly increasing preview rows (N rows define N-1
+    /// frames), in the same `0..PreviewStripResult.rowCount-1` coordinate
+    /// space `PreviewStripResult` reports.
+    pub rows: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollManualFramesResult {
+    pub count: u32,
+    pub fingerprint: String,
+    /// Fresh operation id the engine minted for this placement, binding the
+    /// resulting slots the same way a normal preview's operationId does --
+    /// pass it to `roll.approve`/`roll.setSpacingOffset` for these frames.
+    pub operation_id: String,
+    pub thumbnails: Vec<ManualFrameThumbnail>,
+    pub snaps: Vec<BoundarySnap>,
+}
+
+/// One resulting slot from `roll.manualFrames`, paired with its frame
+/// index -- BRIDGE.md's wire `Thumbnail.slot` maps one-to-one onto the
+/// public engine protocol's `frameIndex` vocabulary, the same translation
+/// `ThumbnailPayload` already performs for the ordinary preview-event path.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualFrameThumbnail {
+    pub frame_index: u32,
+    pub thumbnail: Thumbnail,
+}
+
+/// One snap-assist adjustment `roll.manualFrames` applied to a picked
+/// boundary row (BRIDGE.md "Types" -> `BoundarySnap`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundarySnap {
+    pub boundary_index: u32,
+    pub requested_row: u32,
+    pub snapped_row: u32,
+    pub evidence_run: (u32, u32),
+}
+
+/// `roll.previewStrip`'s result (BRIDGE.md "Types" -> `PreviewStrip`). No
+/// params type: the request carries `{}` on the wire, matching
+/// `scanner.status`'s existing no-params dispatch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewStripResult {
+    pub image_path: String,
+    pub row_count: u32,
+    pub pixels_per_row: u32,
 }
 
 // ---------------------------------------------------------------------
@@ -846,6 +925,7 @@ mod tests {
             image_path: None,
             boundary_rows: None,
             spacing_offset: None,
+            partial: None,
             needs_approval: false,
             warnings: vec![],
         };
@@ -1087,5 +1167,81 @@ mod tests {
 
         assert_eq!(failed["operationId"], serde_json::json!("preview-op-456"));
         assert_eq!(complete["operationId"], serde_json::json!("preview-op-456"));
+    }
+
+    #[test]
+    fn roll_manual_frames_params_round_trips_rows() {
+        let params = RollManualFramesParams {
+            rows: vec![100, 300, 500],
+        };
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            json!({"rows": [100, 300, 500]})
+        );
+        let decoded: RollManualFramesParams =
+            serde_json::from_value(json!({"rows": [100, 300, 500]})).unwrap();
+        assert_eq!(decoded, params);
+    }
+
+    #[test]
+    fn roll_manual_frames_result_carries_frame_index_and_operation_id() {
+        let result = RollManualFramesResult {
+            count: 1,
+            fingerprint: "manual-fp".to_string(),
+            operation_id: "manual-1".to_string(),
+            thumbnails: vec![ManualFrameThumbnail {
+                frame_index: 1,
+                thumbnail: Thumbnail {
+                    brightness: None,
+                    tint: None,
+                    image_path: Some("/tmp/manual/slot-0001.tif".to_string()),
+                    boundary_rows: Some((100, 300)),
+                    spacing_offset: Some(0),
+                    partial: None,
+                    needs_approval: true,
+                    warnings: vec!["user-picked".to_string()],
+                },
+            }],
+            snaps: vec![BoundarySnap {
+                boundary_index: 0,
+                requested_row: 100,
+                snapped_row: 102,
+                evidence_run: (98, 106),
+            }],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["operationId"], json!("manual-1"));
+        assert_eq!(value["thumbnails"][0]["frameIndex"], json!(1));
+        assert_eq!(
+            value["thumbnails"][0]["thumbnail"]["needsApproval"],
+            json!(true)
+        );
+        assert_eq!(
+            value["thumbnails"][0]["thumbnail"]["warnings"],
+            json!(["user-picked"])
+        );
+        assert_eq!(value["snaps"][0]["snappedRow"], json!(102));
+        let decoded: RollManualFramesResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn preview_strip_result_round_trips_camel_case() {
+        let result = PreviewStripResult {
+            image_path: "/tmp/strip.tif".to_string(),
+            row_count: 4800,
+            pixels_per_row: 1,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "imagePath": "/tmp/strip.tif",
+                "rowCount": 4800,
+                "pixelsPerRow": 1,
+            })
+        );
+        let decoded: PreviewStripResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, result);
     }
 }
