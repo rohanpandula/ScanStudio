@@ -4369,3 +4369,47 @@ fn scan_start_rejects_a_frame_the_completed_preview_never_returned() {
     let _ = reader_handle.join();
     let _ = std::fs::remove_dir_all(output_directory);
 }
+
+#[test]
+fn partial_frame_marker_survives_bridge_to_engine_wire() {
+    // Lane C: the bridge marks a frame `partial: true` when its crop runs
+    // off the preview edge. The engine used to drop the field silently
+    // (BridgeThumbnail had no such field, serde discarded it); this pins
+    // the whole path: mock bridge -> engine -> public wire. The mock's
+    // designated partial slot is 39 (outside the standard 1..3 preview
+    // trio, so no other test's thumbnail expectations change).
+    let (mut child, mut stdin, rx, reader_handle) =
+        spawn_connected_engine_with_bridge_env("e2e-partial-marker", &[]);
+
+    send(
+        &mut stdin,
+        3,
+        "scanner.acquireThumbnails",
+        json!({"frames": [1, 2, 3], "operationId": "partial-preview"}),
+    );
+    assert!(recv_response_for(&rx, 3, |_| {}).get("error").is_none());
+    let events = drain_until(&rx, Duration::from_secs(5), |event| {
+        event["event"] == "scanner.thumbnail" && event["payload"]["frameIndex"] == 1
+    });
+    let thumbnail_event = events.last().expect("slot 1 thumbnail event");
+    assert!(
+        thumbnail_event["payload"]["thumbnail"].get("partial").is_none(),
+        "an ordinary fully-inside frame must not carry the marker: {thumbnail_event}"
+    );
+
+    let events = drain_until(&rx, Duration::from_secs(5), |event| {
+        event["event"] == "scanner.thumbnail" && event["payload"]["frameIndex"] == 3
+    });
+    let partial_event = events.last().expect("slot 3 thumbnail event");
+    assert_eq!(
+        partial_event["payload"]["thumbnail"]["partial"],
+        json!(true),
+        "the mock's designated partial slot must reach the public wire intact: {partial_event}"
+    );
+
+    send(&mut stdin, 5, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 5, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+}

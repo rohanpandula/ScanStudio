@@ -546,20 +546,41 @@ def _validate_full_index_rows(rows: np.ndarray, usable_rows: int) -> dict:
         parity: rows[parity, INDEX_RGB_WORDS_PER_ROW:].copy()
         for parity in range(min(2, len(rows)))
     }
+    housekeeping_suffix_start: int | None = None
+    final_housekeeping = dict(parity_housekeeping)
     for parity, expected in parity_housekeeping.items():
         actual = prefix[parity::2, INDEX_RGB_WORDS_PER_ROW:]
         if len(actual) == 0:
             continue
         matches = np.all(actual == expected, axis=1)
-        if not bool(matches.all()):
-            local = int(np.flatnonzero(~matches)[0])
-            row = parity + 2 * local
-            raise IndexDecodeError(f"index row framing mismatch at usable row {row}")
+        if bool(matches.all()):
+            continue
+        local = int(np.flatnonzero(~matches)[0])
+        row = parity + 2 * local
+        # Power-on housekeeping collapse (first live observation 2026-08-08,
+        # attempt preview-g7w8t49z, the first preview after a scanner power
+        # cycle; same per-power-on precedent class as the fine-scan padding
+        # dialects). Partway through the capture -- observed just past the
+        # film's trailing edge -- the odd parity's housekeeping record
+        # collapses into the OTHER parity's own record and stays there.
+        # Accepted only in exactly that shape, fail-closed on everything
+        # else: at most one transition per parity, and the entire remainder
+        # must byte-equal the other parity's template from this same
+        # capture -- self-referential, no magic constants, so arbitrary
+        # corruption (which cannot reproduce the other parity's exact
+        # 224-word record) still refuses with today's message.
+        other = parity_housekeeping.get(1 - parity)
+        suffix = actual[local:]
+        if other is not None and bool(np.all(suffix == other)):
+            housekeeping_suffix_start = row
+            final_housekeeping[parity] = other.copy()
+            continue
+        raise IndexDecodeError(f"index row framing mismatch at usable row {row}")
 
     padding = rows[usable_rows:]
     padding_record_type = None
     if len(padding):
-        expected_housekeeping = parity_housekeeping[usable_rows % 2]
+        expected_housekeeping = final_housekeeping[usable_rows % 2]
         first = padding[0]
         if bool(np.any(first[:INDEX_RGB_WORDS_PER_ROW])) or not np.array_equal(
             first[INDEX_RGB_WORDS_PER_ROW:], expected_housekeeping
@@ -587,6 +608,9 @@ def _validate_full_index_rows(rows: np.ndarray, usable_rows: int) -> dict:
             if np.array_equal(parity_housekeeping[1], canonical_sync)
             else "stable-observed"
         ),
+        # Additive: absent (None) on every capture without the power-on
+        # housekeeping collapse; the first affected usable row otherwise.
+        "housekeeping_suffix_start": housekeeping_suffix_start,
     }
 
 

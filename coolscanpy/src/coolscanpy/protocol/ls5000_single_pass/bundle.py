@@ -31,7 +31,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # Resealed 2026-08-07 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md, Rung 4
     # scan-side wiring): both files gained CaptureBatchRequest/LiveBatchJob's
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
-    "capture_process.py": "31485687011afad5dcf3470d72da26bc090ec43398518c7c9b85c42841fc97ef",
+    "capture_process.py": "6208a95b23bba84ee0903a07a0d583a9840c5332cbdc60f38a4b574a050d24e2",
     "worker.py": "f625057c5619c9ddf94d7e233c6ac9d2a86e300c1a8b1bd8d7f5f03d0eac8c24",
     "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
@@ -40,7 +40,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c",
-    "roll_index.py": "ee4320ac7f71f42db57d6a7a8c1c103226635f1214fb9f4a6271c8ef2ff0d812",
+    "roll_index.py": "d444d40f0bfb66e63ccf5467b6b153036eeac63c37c7b34b8d44bbc78dbfe2fa",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,
     f"data/{CANONICAL_CONTINUATION_PLAN_FILENAME}": (

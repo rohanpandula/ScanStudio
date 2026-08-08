@@ -1851,6 +1851,7 @@ impl RealLs5000 {
             image_path: Some(result.thumbnail.image_path),
             boundary_rows: Some(result.thumbnail.boundary_rows),
             spacing_offset: Some(result.thumbnail.spacing_offset),
+            partial: result.thumbnail.partial,
             needs_approval: result.thumbnail.needs_approval,
             warnings: result.thumbnail.warnings,
         })
@@ -1931,6 +1932,7 @@ impl RealLs5000 {
                     image_path: Some(thumbnail.image_path),
                     boundary_rows: Some(thumbnail.boundary_rows),
                     spacing_offset: Some(thumbnail.spacing_offset),
+                    partial: thumbnail.partial,
                     needs_approval: thumbnail.needs_approval,
                     warnings: thumbnail.warnings,
                 },
@@ -2220,6 +2222,7 @@ impl ScannerBackend for RealLs5000 {
                                     image_path: Some(bridge_thumbnail.image_path.clone()),
                                     boundary_rows: Some(bridge_thumbnail.boundary_rows),
                                     spacing_offset: Some(bridge_thumbnail.spacing_offset),
+                                    partial: bridge_thumbnail.partial,
                                     needs_approval: bridge_thumbnail.needs_approval,
                                     warnings: bridge_thumbnail.warnings.clone(),
                                 };

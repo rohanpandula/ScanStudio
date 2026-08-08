@@ -239,6 +239,11 @@ pub struct BridgeThumbnail {
     /// bridge writes for this slot's preview crop (BRIDGE.md "Types" note
     /// under `Thumbnail`) — a path, never image bytes on the wire.
     pub image_path: String,
+    /// Lane C, additive (BRIDGE.md): `true` only on a frame whose crop
+    /// overlaps the preview with >=90% of its height inside but not all of
+    /// it. Absent everywhere else; older bridges never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -797,6 +802,7 @@ mod tests {
                 "possible-double-exposure".to_string(),
             ],
             image_path: "/tmp/slot-0007.tif".to_string(),
+            partial: None,
         };
         let value = serde_json::to_value(&thumbnail).unwrap();
         assert_eq!(value["needsApproval"], json!(true));
@@ -1031,6 +1037,7 @@ mod tests {
                     needs_approval: true,
                     warnings: vec!["user-picked".to_string()],
                     image_path: "/tmp/stub-manual/slot-0001.tif".to_string(),
+                    partial: None,
                 },
                 BridgeThumbnail {
                     slot: 2,
@@ -1039,6 +1046,7 @@ mod tests {
                     needs_approval: true,
                     warnings: vec!["user-picked".to_string()],
                     image_path: "/tmp/stub-manual/slot-0002.tif".to_string(),
+                    partial: None,
                 },
             ],
             snaps: vec![BridgeBoundarySnap {
@@ -1100,5 +1108,36 @@ mod tests {
             json!({"rows": [100, 300, 500]})
         );
         round_trip(&params);
+    }
+
+    #[test]
+    fn bridge_thumbnail_partial_round_trips_and_defaults_absent() {
+        let with_partial = BridgeThumbnail {
+            slot: 39,
+            boundary_rows: (10, 800),
+            spacing_offset: 0,
+            needs_approval: true,
+            warnings: vec![],
+            image_path: "/tmp/t.tif".to_string(),
+            partial: Some(true),
+        };
+        let value = serde_json::to_value(&with_partial).unwrap();
+        assert_eq!(value["partial"], serde_json::json!(true));
+        round_trip(&with_partial);
+
+        let without: BridgeThumbnail = serde_json::from_value(serde_json::json!({
+            "slot": 1,
+            "boundaryRows": [10, 800],
+            "spacingOffset": 0,
+            "needsApproval": false,
+            "warnings": [],
+            "imagePath": "/tmp/t.tif",
+        }))
+        .unwrap();
+        assert_eq!(without.partial, None);
+        assert!(serde_json::to_value(&without)
+            .unwrap()
+            .get("partial")
+            .is_none());
     }
 }

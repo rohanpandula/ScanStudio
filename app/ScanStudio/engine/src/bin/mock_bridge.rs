@@ -439,6 +439,17 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Lane C mock: exactly one designated slot reports `partial: true` so
+/// integration tests can assert the field survives the engine unmangled;
+/// every other slot omits it, like a real bridge on a fully-inside frame.
+/// Slot 3 -- the last of the mock's standard 1..3 preview trio -- is the
+/// natural edge frame.
+const MOCK_PARTIAL_SLOT: u32 = 3;
+
+fn mock_partial_for(slot: u32) -> Option<bool> {
+    (slot == MOCK_PARTIAL_SLOT).then_some(true)
+}
+
 fn handle_request(
     tx: &mpsc::Sender<String>,
     request: &BridgeRequest,
@@ -591,6 +602,7 @@ fn handle_request(
                     needs_approval: false,
                     warnings: vec![],
                     image_path: path.to_string_lossy().into_owned(),
+                    partial: mock_partial_for(params.slot),
                 },
             })
         }
@@ -625,6 +637,7 @@ fn handle_request(
                         needs_approval: true,
                         warnings: vec!["user-picked".to_string()],
                         image_path: path.to_string_lossy().into_owned(),
+                        partial: mock_partial_for(slot),
                     }
                 })
                 .collect();
@@ -886,6 +899,7 @@ fn spawn_roll_preview_worker(
                         // save error above) so the wire shape is never
                         // missing this required field.
                         image_path: path.to_string_lossy().into_owned(),
+                        partial: mock_partial_for(slot),
                     },
                 },
             );

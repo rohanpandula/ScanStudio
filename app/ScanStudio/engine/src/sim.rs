@@ -58,6 +58,9 @@ pub fn thumbnail_for(device_id: &str, frame_index: u32) -> Thumbnail {
         image_path: None,
         boundary_rows: None,
         spacing_offset: None,
+        // The simulator has no preview raster for a frame to run off the
+        // edge of; simulated frames are never partial.
+        partial: None,
         needs_approval: false,
         warnings: vec![],
     }

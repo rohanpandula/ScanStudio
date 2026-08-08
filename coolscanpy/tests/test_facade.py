@@ -406,6 +406,26 @@ def _encode_index(rgb16: np.ndarray) -> bytes:
     return blocks.astype(">u2", copy=False).tobytes()
 
 
+def _corrupt_index_framing(preview: bytes, row: int) -> bytes:
+    """Overwrite one housekeeping word of ``row``'s record in an encoded
+    index stream, upstream of every hash: ``_FakeHeldWorkerProcess`` computes
+    its journal sha256s and density evidence over the returned bytes (the
+    corruption happened "on the wire", not after publication), so every
+    artifact validation passes and only ``decode_full_index_bytes``'s
+    parity-framing repetition check refuses -- ``IndexDecodeError: index row
+    framing mismatch at usable row {row}``, the exact live 2026-08-08
+    preview-g7w8t49z failure shape.  ``row`` must be odd: in
+    ``_encode_index``'s block layout the AA55 trailer that framing
+    validation exact-matches belongs to the odd row's record."""
+
+    if row % 2 != 1:
+        raise ValueError("corrupt an odd row: that parity carries the AA55 trailer")
+    offset = (row // 2) * roll_index.INDEX_BLOCK_WORDS * 2 + 800 * 2
+    corrupted = bytearray(preview)
+    corrupted[offset : offset + 2] = (0x0BAD).to_bytes(2, "big")
+    return bytes(corrupted)
+
+
 def _synthetic_index(*, height: int = 6_104) -> np.ndarray:
     """40 textured cells separated by clear-film gaps (adapted from
     tests/roll/test_ls5000_roll_session.py's ``_synthetic_index``)."""
@@ -1308,6 +1328,11 @@ class _FakeHeldWorkerProcess:
     expected_usb_address: int | None = None
     preview_started: threading.Event | None = None
     preview_release: threading.Event | None = None
+    # Odd preview row whose housekeeping record gets corrupted at encode
+    # time (see _corrupt_index_framing): every downstream hash and density
+    # artifact stays self-consistent, so the refusal surfaces exactly where
+    # the live 2026-08-08 failure did -- decode_full_index_bytes.
+    corrupt_framing_at_row: int | None = None
     hold_session_id: str = field(default_factory=lambda: secrets.token_hex(16))
     _delegate: Any = field(default=None, init=False, repr=False)
     _returncode: int | None = field(default=None, init=False)
@@ -1331,6 +1356,8 @@ class _FakeHeldWorkerProcess:
             self.preview_release.wait(timeout=5)
         rgb = _synthetic_index()
         preview = _encode_index(rgb)
+        if self.corrupt_framing_at_row is not None:
+            preview = _corrupt_index_framing(preview, self.corrupt_framing_at_row)
         table = _transport_table(len(rgb))
         directory = self.journal_path.parent
         preview_path = directory / "capture-preview.bin"
@@ -1462,6 +1489,19 @@ class _FakeHeldWorkerProcess:
 
         self._returncode = returncode
 
+    def terminate(self) -> None:
+        """SIGTERM from the failed-preview teardown ladder. The real worker
+        installs no handler, so a parked child dies to it."""
+
+        self.events.append("terminate")
+        if self._returncode is None:
+            self._returncode = -15
+
+    def kill(self) -> None:
+        self.events.append("kill")
+        if self._returncode is None:
+            self._returncode = -9
+
     def poll(self) -> int | None:
         # Checked first, ahead of any delegate/reset dispatch below: die()
         # simulates the child being gone *right now*, regardless of
@@ -1568,6 +1608,7 @@ def _held_worker_process(
     delegate_factory: Callable[[Path, Path], Any],
     preview_started: threading.Event | None = None,
     preview_release: threading.Event | None = None,
+    corrupt_framing_at_row: int | None = None,
 ) -> _FakeHeldWorkerProcess:
     hold_job_path = Path(_arg(argv, "--hold-job"))
     return _FakeHeldWorkerProcess(
@@ -1578,6 +1619,7 @@ def _held_worker_process(
         worker_sha256=_sha256(_FAKE_WORKER_SOURCE),
         events=events,
         delegate_factory=delegate_factory,
+        corrupt_framing_at_row=corrupt_framing_at_row,
         expected_usb_bus=(
             int(_arg(argv, "--expected-usb-bus"))
             if "--expected-usb-bus" in argv
@@ -2876,17 +2918,47 @@ def _corrupting_spawner(events: list[str], *, corrupt_first_previews: int = 1):
     return spawn
 
 
+def _framing_corrupting_spawner(events: list[str], *, row: int):
+    """Held-preview children whose index stream carries a parity-framing
+    corruption at ``row`` (see ``_corrupt_index_framing``): every hash and
+    density artifact is computed over the corrupted bytes, so
+    ``begin_held_preview`` accepts the journal (it never decodes the
+    stream), the child parks at the hold boundary, and
+    ``build_roll_preview_session``'s ``decode_full_index_bytes`` is what
+    refuses -- the exact live 2026-08-08 preview-g7w8t49z failure shape."""
+
+    def make_batch_process(job_path: Path, session_journal_path: Path):
+        raise AssertionError(
+            "a preview refused at decode must never resume into a batch"
+        )
+
+    def spawn(argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object):
+        del cwd, stdout, stderr
+        assert "--preview-and-hold" in argv
+        return _held_worker_process(
+            argv,
+            events,
+            delegate_factory=make_batch_process,
+            corrupt_framing_at_row=row,
+        )
+
+    return spawn
+
+
 class TestRollPreviewFailureCleanup:
-    def test_refused_preview_journal_still_releases_the_held_child_on_exit(
+    def test_refused_preview_journal_tears_down_the_held_child_in_preview_itself(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
-        """The 2026-07-24 orphaned-hold defect: preview()'s transport read
-        completes and the child pauses at the hold boundary, then
-        build_roll_preview_session refuses the journal. The held session
-        must already be tracked at that point, so context exit -> close()
-        finds it and tells the still-alive child to release -- previously
-        the child was orphaned holding the scanner's reservation, and the
-        refused journal was deleted with the attempts directory."""
+        """The 2026-07-24 orphaned-hold defect, at its current, stronger
+        contract: preview()'s transport read completes and the child pauses
+        at the hold boundary, then build_roll_preview_session refuses the
+        journal. Tracking the held session for close() to release (the
+        original fix) was not enough -- a parent that dies on the raise
+        never calls close() (live 2026-08-08: the orphan kept the libusb
+        device claim, failing every subsequent open with USBError errno 13)
+        -- so the failing preview() call itself must release and reap the
+        child before its raise escapes, and a close() that does run later
+        must find nothing left to release."""
 
         from coolscanpy.roll.preview_session import RollSessionIntegrityError
 
@@ -2899,12 +2971,25 @@ class TestRollPreviewFailureCleanup:
             with pytest.raises(
                 RollSessionIntegrityError, match="disk_bytes"
             ) as excinfo:
-                with roll:
-                    roll.preview()
+                roll.preview()
 
+            # No close() has run yet: the failing preview() call already
+            # told the child to release and reaped it.
             assert events == ["preview-hold-ready", "hold-ack-release"], (
-                "close() must release the held child a refused preview "
-                "left at the hold boundary, not orphan it"
+                "the failed preview() itself must release the held child "
+                "it left at the hold boundary, not defer to a close() that "
+                "a dying parent never reaches"
+            )
+            assert roll._held_session is None
+            notes = getattr(excinfo.value, "__notes__", [])
+            assert any(
+                "was told to release and exited 0" in note for note in notes
+            ), notes
+
+            roll.close()
+            assert events == ["preview-hold-ready", "hold-ack-release"], (
+                "close() must not publish a second release for a child the "
+                "failed preview already tore down"
             )
             attempts_root = tmp_path / "attempts"
             assert attempts_root.exists(), (
@@ -2912,9 +2997,66 @@ class TestRollPreviewFailureCleanup:
                 "not delete it"
             )
             note = f"preview capture evidence preserved at {attempts_root}"
-            assert note in getattr(excinfo.value, "__notes__", [])
+            assert note in notes
         finally:
             dev.close()
+
+    def test_decode_refusal_reaps_the_held_child_with_no_close_at_all(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """Live failure 2026-08-08 ~09:29, attempt preview-g7w8t49z: preview()
+        raised IndexDecodeError "index row framing mismatch at usable row
+        5317" after the --preview-and-hold child was already parked at its
+        hold boundary, and the parent's failure path exited without
+        terminating it. The orphaned worker kept the libusb device claim,
+        so every subsequent coolscanpy.open failed with USBError errno 13
+        until the PID was killed by hand. Reproduced through the real
+        validation path with the same corruption shape (one odd row's
+        housekeeping record breaking parity-framing repetition at row
+        5317): every hash and density artifact is self-consistent, so
+        decode_full_index_bytes is what refuses -- and the child must be
+        dead before that raise ever escapes preview()."""
+
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(
+                events, processes, _framing_corrupting_spawner(events, row=5_317)
+            ),
+        )
+        try:
+            with pytest.raises(
+                roll_index.IndexDecodeError,
+                match="index row framing mismatch at usable row 5317",
+            ) as excinfo:
+                roll.preview()
+
+            assert len(processes) == 1
+            child = processes[0]
+            assert child.poll() == 0, (
+                "the held child must already be released and reaped when "
+                "preview() raises -- the parent may never run another line"
+            )
+            assert events == ["preview-hold-ready", "hold-ack-release"], (
+                "a cooperative child is released, never signalled"
+            )
+            assert roll._held_session is None
+            notes = getattr(excinfo.value, "__notes__", [])
+            assert any(
+                "was told to release and exited 0" in note for note in notes
+            ), notes
+            assert (tmp_path / "attempts").exists(), (
+                "the refused index stream is forensic evidence"
+            )
+        finally:
+            roll.close()
+            dev.close()
+        assert events == ["preview-hold-ready", "hold-ack-release"], (
+            "close() after the teardown must be a no-op for the held child"
+        )
 
     def test_clean_close_still_removes_the_attempts_directory(
         self, fake_service_factory, tmp_path: Path
