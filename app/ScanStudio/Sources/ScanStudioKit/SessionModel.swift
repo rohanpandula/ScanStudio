@@ -726,6 +726,10 @@ public final class SessionModel {
     public var flexColorImageSettingPath = ""
     public var flexColorLutTablePath = ""
     public var flexColorInputIccPath = ""
+    public var coolColorsCheckoutPath = ""
+    public var coolColorsBuilderRedPath = ""
+    public var coolColorsBuilderGreenPath = ""
+    public var coolColorsBuilderBluePath = ""
     public var positiveFilenameTemplate = FilenameTemplate.defaultTemplate
     public var positiveDestination = SessionModel.defaultOutputDestination(subfolder: "Positive")
     public var previewEnabled = true
@@ -923,6 +927,12 @@ public final class SessionModel {
                     imageSettingPath: flexColorImageSettingPath.isEmpty ? nil : flexColorImageSettingPath,
                     lutTablePath: flexColorLutTablePath.isEmpty ? nil : flexColorLutTablePath,
                     inputIccPath: flexColorInputIccPath.isEmpty ? nil : flexColorInputIccPath
+                ),
+                coolColors: CoolColorsInputs(
+                    checkoutPath: coolColorsCheckoutPath.isEmpty ? nil : coolColorsCheckoutPath,
+                    builderRedPath: coolColorsBuilderRedPath.isEmpty ? nil : coolColorsBuilderRedPath,
+                    builderGreenPath: coolColorsBuilderGreenPath.isEmpty ? nil : coolColorsBuilderGreenPath,
+                    builderBluePath: coolColorsBuilderBluePath.isEmpty ? nil : coolColorsBuilderBluePath
                 )
             )
         )
@@ -2653,6 +2663,10 @@ public final class SessionModel {
         flexColorImageSettingPath = recipes.c41Render.flexcolor.imageSettingPath ?? ""
         flexColorLutTablePath = recipes.c41Render.flexcolor.lutTablePath ?? ""
         flexColorInputIccPath = recipes.c41Render.flexcolor.inputIccPath ?? ""
+        coolColorsCheckoutPath = recipes.c41Render.coolColors.checkoutPath ?? ""
+        coolColorsBuilderRedPath = recipes.c41Render.coolColors.builderRedPath ?? ""
+        coolColorsBuilderGreenPath = recipes.c41Render.coolColors.builderGreenPath ?? ""
+        coolColorsBuilderBluePath = recipes.c41Render.coolColors.builderBluePath ?? ""
         positiveFilenameTemplate = recipes.positive.filenameTemplate
         positiveDestination = recipes.positive.destination
         previewEnabled = recipes.preview.enabled

@@ -569,6 +569,7 @@ public enum OutputColorProfile: String, Codable, CaseIterable, Identifiable, Sen
 /// independent and always remains untouched scanner RGB.
 public enum C41RenderTarget: String, Codable, CaseIterable, Identifiable, Sendable {
     case nikonlook
+    case nikonOemReplay
     case noritsuLs600
     case flexcolorCleanroom
 
@@ -589,20 +590,48 @@ public struct FlexColorInputs: Codable, Equatable, Sendable {
     }
 }
 
+/// Local paths for the experimental Nikon Scan replay. The Cool Colors
+/// checkout and per-frame builder LUTs remain outside the ScanStudio project.
+public struct CoolColorsInputs: Codable, Equatable, Sendable {
+    public let checkoutPath: String?
+    public let builderRedPath: String?
+    public let builderGreenPath: String?
+    public let builderBluePath: String?
+
+    public init(
+        checkoutPath: String? = nil,
+        builderRedPath: String? = nil,
+        builderGreenPath: String? = nil,
+        builderBluePath: String? = nil
+    ) {
+        self.checkoutPath = checkoutPath
+        self.builderRedPath = builderRedPath
+        self.builderGreenPath = builderGreenPath
+        self.builderBluePath = builderBluePath
+    }
+}
+
 public struct C41RenderRecipe: Codable, Equatable, Sendable {
     public let target: C41RenderTarget
     public let flexcolor: FlexColorInputs
+    public let coolColors: CoolColorsInputs
 
-    public init(target: C41RenderTarget = .nikonlook, flexcolor: FlexColorInputs = FlexColorInputs()) {
+    public init(
+        target: C41RenderTarget = .nikonlook,
+        flexcolor: FlexColorInputs = FlexColorInputs(),
+        coolColors: CoolColorsInputs = CoolColorsInputs()
+    ) {
         self.target = target
         self.flexcolor = flexcolor
+        self.coolColors = coolColors
     }
 
-    private enum CodingKeys: String, CodingKey { case target, flexcolor }
+    private enum CodingKeys: String, CodingKey { case target, flexcolor, coolColors }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         target = try values.decodeIfPresent(C41RenderTarget.self, forKey: .target) ?? .nikonlook
         flexcolor = try values.decodeIfPresent(FlexColorInputs.self, forKey: .flexcolor) ?? FlexColorInputs()
+        coolColors = try values.decodeIfPresent(CoolColorsInputs.self, forKey: .coolColors) ?? CoolColorsInputs()
     }
 }
 

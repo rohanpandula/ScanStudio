@@ -286,8 +286,28 @@ pub enum OutputColorProfile {
 pub enum C41RenderTarget {
     #[default]
     Nikonlook,
+    /// Local-only Nikon Scan CML4 replay. It requires a user-selected
+    /// Cool Colors checkout and the three builder LUTs produced for this
+    /// exact acquisition; no LUT or profile bytes are embedded here.
+    NikonOemReplay,
     NoritsuLs600,
     FlexcolorCleanroom,
+}
+
+/// Operator-owned inputs for the experimental Nikon Scan replay. The
+/// checkout is deliberately external: ScanStudio does not redistribute its
+/// captured CML assets, and all three LUTs are tied to one raw scan.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CoolColorsInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_red_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_green_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_blue_path: Option<String>,
 }
 
 /// Optional paths to user-owned FlexColor calibration inputs.  These are
@@ -312,6 +332,8 @@ pub struct C41RenderRecipe {
     pub target: C41RenderTarget,
     #[serde(default)]
     pub flexcolor: FlexcolorInputs,
+    #[serde(default)]
+    pub cool_colors: CoolColorsInputs,
 }
 
 impl Default for C41RenderRecipe {
@@ -319,6 +341,7 @@ impl Default for C41RenderRecipe {
         Self {
             target: C41RenderTarget::Nikonlook,
             flexcolor: FlexcolorInputs::default(),
+            cool_colors: CoolColorsInputs::default(),
         }
     }
 }
