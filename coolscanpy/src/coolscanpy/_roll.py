@@ -562,6 +562,14 @@ class Roll:
         or by a prior ``scan_many()``/``scan()`` that completed without
         ``eject_after`` -- releasing it cleanly before starting the fresh
         transport read, exactly like an explicit :meth:`release` would.
+
+        A ``preview()`` that raises never leaves the reservation held: the
+        capture child a failed preview would otherwise strand at its hold
+        boundary is told to release -- and terminated, then killed, if it
+        will not -- before the exception propagates, so a caller that dies
+        on the raise cannot leak a worker holding the scanner's USB claim.
+        The next ``scan_many()``/``scan()`` after a failed preview starts a
+        fresh reservation.
         """
 
         with self._state_condition:
@@ -578,6 +586,7 @@ class Roll:
             self._preview_thread_id = threading.get_ident()
 
         io_acquired = False
+        held: HeldPreviewSession | None = None
         try:
             self._device._acquire_io_lock("roll preview")
             io_acquired = True
@@ -609,17 +618,19 @@ class Roll:
             except CaptureStopped as error:
                 raise SafeStopRequested(str(error)) from error
             # Track a live held child the moment the adapter hands it back,
-            # before any interpretation of what it produced. Everything below
-            # can raise, and a raise must leave close()/release()/a retried
-            # preview() a handle to tell the still-alive child to let go of its
-            # reservation. Assigning only after validation succeeded (the
-            # previous behavior) orphaned a live child -- still blocked in
-            # wait_for_hold_decision, still holding the scanner -- whenever
-            # build_roll_preview_session refused the journal. An unusable
-            # session is the opposite case (the child exited before the hold
-            # boundary and was already reaped -- see HeldPreviewSession.usable)
-            # and is deliberately not stored, preserving that docstring's
-            # "preview() never stores an unusable session" invariant.
+            # before any interpretation of what it produced. On the success
+            # path this is the reservation scan_many()/scan() resumes without
+            # a refeed; on any raise below it is what the failure handler at
+            # the bottom of this method tears down, fail-closed, before the
+            # exception escapes. Assigning only after validation succeeded
+            # (the original behavior) orphaned a live child -- still blocked
+            # in wait_for_hold_decision, still holding the scanner --
+            # whenever build_roll_preview_session refused the journal. An
+            # unusable session is the opposite case (the child exited before
+            # the hold boundary and was already reaped -- see
+            # HeldPreviewSession.usable) and is deliberately not stored,
+            # preserving that docstring's "preview() never stores an unusable
+            # session" invariant.
             if held.usable:
                 self._held_session = held
             attempt = held.preview_attempt
@@ -696,6 +707,32 @@ class Roll:
                 for slot in session.slots
                 if wanted is None or slot.slot_id in wanted
             ]
+        except BaseException as error:
+            # A raise leaving preview() may be the last thing this process
+            # ever runs: the caller can die on it without reaching close()
+            # or release() (live failure 2026-08-08, attempt
+            # preview-g7w8t49z -- the parent exited on IndexDecodeError
+            # "index row framing mismatch" and the parked child kept the
+            # libusb device claim, failing every subsequent open with
+            # USBError errno 13 until it was killed by hand). So a failed
+            # preview never relies on a later call: its held child is torn
+            # down here, fail-closed, before the exception escapes --
+            # release decision, bounded wait, then terminate/kill (see
+            # CaptureProcessAdapter.teardown_held_session). An unusable
+            # session's child already exited and was reaped inside
+            # begin_held_preview; a raise before the adapter handed
+            # anything back has nothing to tear down.
+            if held is not None:
+                if self._held_session is held:
+                    self._held_session = None
+                if held.usable and not self._ensure_adapter().teardown_held_session(
+                    held, error=error
+                ):
+                    self._preserve_evidence(
+                        "held preview child did not end cleanly after the "
+                        f"failed preview: {error}"
+                    )
+            raise
         finally:
             if io_acquired:
                 self._device._release_io_lock()

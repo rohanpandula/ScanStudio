@@ -2914,6 +2914,19 @@ class FakeHeldBatchProcess:
 
         self._returncode = returncode
 
+    def terminate(self) -> None:
+        """SIGTERM from the failed-preview teardown ladder. The real
+        worker installs no handler, so a parked child dies to it."""
+
+        self.events.append("terminate")
+        if self._returncode is None:
+            self._returncode = -15
+
+    def kill(self) -> None:
+        self.events.append("kill")
+        if self._returncode is None:
+            self._returncode = -9
+
     def poll(self) -> int | None:
         if self._returncode is not None:
             return self._returncode
@@ -3214,6 +3227,7 @@ def _held_spawner(
     children: list[FakeHeldBatchProcess] | None = None,
     journal_overrides: dict[str, Any] | None = None,
     held_after_batch_journal_overrides: dict[str, Any] | None = None,
+    child_class: type[FakeHeldBatchProcess] = FakeHeldBatchProcess,
 ):
     def spawn(
         argv: Sequence[str],
@@ -3225,7 +3239,7 @@ def _held_spawner(
         del cwd, stdout, stderr
         spawn_calls.append(tuple(argv))
         hold_job_path = Path(_argument(argv, "--hold-job"))
-        child = FakeHeldBatchProcess(
+        child = child_class(
             output_path=Path(_argument(argv, "--output")),
             journal_path=Path(_argument(argv, "--journal")),
             hold_job_path=hold_job_path,
@@ -3249,6 +3263,8 @@ def _held_adapter(
     children: list[FakeHeldBatchProcess] | None = None,
     journal_overrides: dict[str, Any] | None = None,
     held_after_batch_journal_overrides: dict[str, Any] | None = None,
+    child_class: type[FakeHeldBatchProcess] = FakeHeldBatchProcess,
+    held_teardown_wait_seconds: float = 5.0,
 ) -> capture.CaptureProcessAdapter:
     return capture.CaptureProcessAdapter(
         worker_path=binding.worker,
@@ -3263,8 +3279,10 @@ def _held_adapter(
             held_after_batch_journal_overrides=(
                 held_after_batch_journal_overrides
             ),
+            child_class=child_class,
         ),
         batch_poll_seconds=0,
+        held_teardown_wait_seconds=held_teardown_wait_seconds,
     )
 
 
@@ -3672,6 +3690,9 @@ def test_refused_held_after_batch_journal_releases_the_child_instead_of_orphanin
         spawn_calls,
         children=children,
         held_after_batch_journal_overrides=overrides,
+        # The no-rendezvous case cannot publish a decision, so its child
+        # rides the teardown ladder's bounded waits; keep them short.
+        held_teardown_wait_seconds=0.05,
     )
     held = adapter.begin_held_preview(
         capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
@@ -3705,11 +3726,145 @@ def test_refused_held_after_batch_journal_releases_the_child_instead_of_orphanin
         assert any("exited 0" in note for note in notes), notes
     else:
         # No rendezvous to publish a decision at, so the child cannot be
-        # unblocked -- and must therefore not be waited on either, or the
-        # refusal would sit here for wait_for_hold_decision's own half-hour
-        # timeout instead of reaching the caller.
+        # told to release -- which the fail-closed ladder answers by
+        # signalling it instead of leaving it holding the scanner for
+        # wait_for_hold_decision's own half-hour timeout (the pre-teardown
+        # behavior, and exactly the 2026-08-08 orphaned-worker leak).
+        assert child.poll() is not None, (
+            "an unaddressable child must still end dead, not orphaned"
+        )
+        assert "terminate" in child.events, child.events
         assert any("no usable hold rendezvous" in note for note in notes), notes
-        assert any("left running rather than waited on" in note for note in notes), notes
+        assert any("was terminated" in note for note in notes), notes
+
+
+class _AckIgnoringHeldProcess(FakeHeldBatchProcess):
+    """A child wedged past cooperation: parked while holding the
+    reservation but never consuming the release decision (e.g. blocked
+    mid-USB transfer rather than in ``wait_for_hold_decision``'s poll
+    loop). SIGTERM still lands, exactly as it does on the real worker,
+    which installs no handler."""
+
+    def poll(self) -> int | None:
+        return self._returncode
+
+
+class _TermIgnoringHeldProcess(_AckIgnoringHeldProcess):
+    """A child that survives SIGTERM too (e.g. uninterruptible in a USB
+    ioctl); only SIGKILL ends it."""
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+
+
+def _teardown_held(
+    tmp_path: Path,
+    binding: Binding,
+    *,
+    child_class: type[FakeHeldBatchProcess] = FakeHeldBatchProcess,
+) -> tuple[FakeHeldBatchProcess, capture.CaptureProcessError, bool]:
+    """Begin a held preview, then tear it down the way ``Roll.preview()``'s
+    failure exit does, returning (child, error-with-notes, clean)."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    children: list[FakeHeldBatchProcess] = []
+    adapter = _held_adapter(
+        tmp_path,
+        binding,
+        spawn_calls,
+        children=children,
+        child_class=child_class,
+        held_teardown_wait_seconds=0.05,
+    )
+    held = adapter.begin_held_preview(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
+    error = capture.CaptureProcessError("synthetic preview evidence refusal")
+    clean = adapter.teardown_held_session(held, error=error)
+    assert len(children) == 1
+    return children[0], error, clean
+
+
+def test_teardown_held_session_releases_a_cooperative_child(
+    tmp_path: Path, binding: Binding
+) -> None:
+    """Roll.preview()'s failure exit for the common case -- the live
+    2026-08-08 orphan was a perfectly healthy child whose parent simply
+    died without telling it anything: one release decision, the child
+    releases the unit and exits 0, no signal anywhere near it."""
+
+    child, error, clean = _teardown_held(tmp_path, binding)
+
+    assert clean is True
+    assert child.poll() == 0
+    assert child.events[-1] == "hold-ack-release", child.events
+    assert "terminate" not in child.events and "kill" not in child.events
+    notes = getattr(error, "__notes__", [])
+    assert any("was told to release and exited 0" in note for note in notes), notes
+    receipt = json.loads(child.journal_path.read_text(encoding="utf-8"))
+    assert receipt["hold_outcome"] == "released"
+    assert receipt["unit_released"] is True
+
+
+def test_teardown_held_session_terminates_a_child_that_ignores_the_release(
+    tmp_path: Path, binding: Binding
+) -> None:
+    child, error, clean = _teardown_held(
+        tmp_path, binding, child_class=_AckIgnoringHeldProcess
+    )
+
+    assert clean is False
+    assert child.poll() == -15
+    assert "terminate" in child.events, child.events
+    assert "kill" not in child.events, child.events
+    notes = getattr(error, "__notes__", [])
+    assert any("did not exit within" in note for note in notes), notes
+    assert any("was terminated (exit -15)" in note for note in notes), notes
+
+
+def test_teardown_held_session_kills_a_child_that_survives_terminate(
+    tmp_path: Path, binding: Binding
+) -> None:
+    child, error, clean = _teardown_held(
+        tmp_path, binding, child_class=_TermIgnoringHeldProcess
+    )
+
+    assert clean is False
+    assert child.poll() == -9
+    assert child.events[-2:] == ["terminate", "kill"], child.events
+    notes = getattr(error, "__notes__", [])
+    assert any("survived terminate" in note for note in notes), notes
+    assert any("killed (exit -9)" in note for note in notes), notes
+
+
+def test_teardown_held_session_reaps_an_already_dead_child(
+    tmp_path: Path, binding: Binding
+) -> None:
+    spawn_calls: list[tuple[str, ...]] = []
+    children: list[FakeHeldBatchProcess] = []
+    adapter = _held_adapter(
+        tmp_path,
+        binding,
+        spawn_calls,
+        children=children,
+        held_teardown_wait_seconds=0.05,
+    )
+    held = adapter.begin_held_preview(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
+    children[0].die(returncode=3)
+    error = capture.CaptureProcessError("synthetic preview evidence refusal")
+
+    assert adapter.teardown_held_session(held, error=error) is True
+
+    notes = getattr(error, "__notes__", [])
+    assert any(
+        "was already gone and exited 3" in note for note in notes
+    ), notes
+    assert "terminate" not in children[0].events
+    assert "hold-ack-release" not in children[0].events, (
+        "a dead child gets no decision published"
+    )
 
 
 def test_batch_result_density_accessors_survive_the_held_preview_port(
