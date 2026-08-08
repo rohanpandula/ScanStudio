@@ -42,6 +42,26 @@ GAP_COUNT_FLOOR_ERROR_ID = "gap-count-floor"
 GAP_LATTICE_ANCHOR_ERROR_ID = "gap-lattice-anchor-floor"
 GAP_DIRECT_SUPPORT_ERROR_ID = "gap-direct-support-floor"
 
+# Wide-gap recovery (FEEDING-DETECTOR-ROUND-20260807): a clear-film run
+# wider than the 12-row narrow ceiling but no wider than this is treated
+# as a candidate *wide* inter-frame gap during the recovery pass only.
+# 20 preview rows is ~5.3 mm of film: comfortably above the widest field-
+# reported gap (14 rows, ScanStudio #23/#24) and comfortably below
+# leader/trailer runs (38 rows observed) and any blank-frame-scale run
+# (~130 rows). Recovery can never produce an automatic, unattended, or
+# high-confidence result: slots anchored on wide runs are always manual
+# review and detection confidence is capped at medium.
+WIDE_GAP_CEILING_ROWS = 20
+WIDE_GAP_RECOVERY_WARNING = "wide-gap-recovery"
+WIDE_GAP_ANCHOR_REVIEW_REASON = "wide-gap-anchor"
+_WIDE_GAP_RECOVERY_ERROR_IDS = frozenset(
+    {
+        GAP_COUNT_FLOOR_ERROR_ID,
+        GAP_LATTICE_ANCHOR_ERROR_ID,
+        GAP_DIRECT_SUPPORT_ERROR_ID,
+    }
+)
+
 
 class IndexDecodeError(ValueError):
     """Input is not a self-consistent LS-5000 roll-index capture.
@@ -911,12 +931,113 @@ def _gap_lattice_diagnostics(
     }
 
 
+def _diagnose_refusal_safely(
+    rgb16: np.ndarray, known: np.ndarray, nominal_frame_rows: int
+) -> str | None:
+    """Best-effort probable-cause sentence for a refusal about to be raised.
+
+    Deferred import breaks the two-module cycle -- roll_diagnosis.py imports
+    this module's own private evidence helpers -- and only needs to resolve
+    once a raise is already underway. The broad except is deliberate: a bug
+    in diagnosis must never replace or hide the real IndexDecodeError being
+    raised, so any failure in here is silently treated as "no diagnosis".
+    """
+
+    try:
+        from .roll_diagnosis import diagnose_roll_refusal
+
+        return diagnose_roll_refusal(
+            rgb16, known, nominal_frame_rows=nominal_frame_rows
+        )
+    except Exception:
+        return None
+
+
 def detect_roll_frames(
     rgb16: np.ndarray,
     known: np.ndarray,
     *,
     nominal_frame_rows: int,
     expected_frame_count: int | None = None,
+) -> RollDetection:
+    """Two-pass wrapper: stock detection first, wide-gap recovery second.
+
+    Pass 1 is the unmodified stock detector; any raster it resolves is
+    returned bit-identically. Only when it raises one of the three
+    physical-gap floor errors is a single recovery pass attempted with
+    wide clear-film runs (12 < width <= WIDE_GAP_CEILING_ROWS) admitted
+    as gap anchors. If recovery also fails, the *original* pass-1 error
+    is re-raised with a recovery note appended to its diagnostics so
+    field reports stay comparable across versions.
+
+    Both re-raise paths below also attach a best-effort plain-English
+    ``diagnostics["probable_cause"]`` sentence (roll_diagnosis.py) whenever
+    one fires with enough confidence to speak. This only ever adds that one
+    key: the error id, message prefix, and every other diagnostics key are
+    unchanged from today's behavior.
+    """
+
+    try:
+        return _detect_roll_frames_single(
+            rgb16,
+            known,
+            nominal_frame_rows=nominal_frame_rows,
+            expected_frame_count=expected_frame_count,
+        )
+    except IncompleteIndexError:
+        raise
+    except IndexDecodeError as primary:
+        if primary.error_id not in _WIDE_GAP_RECOVERY_ERROR_IDS:
+            # Reconstructing to attach the sentence is only safe for the
+            # exact base class: subclasses (e.g. a vendored tree's
+            # LeadingFrameClippedError) carry their own constructor
+            # signatures, structured fields, and dedicated downstream
+            # handling that a plain IndexDecodeError rebuild would silently
+            # erase. Those re-raise untouched -- their messages are already
+            # specific -- and only a bare IndexDecodeError gains the
+            # probable-cause key.
+            if type(primary) is not IndexDecodeError:
+                raise
+            cause = _diagnose_refusal_safely(rgb16, known, nominal_frame_rows)
+            if cause is None:
+                raise
+            diagnostics = dict(primary.diagnostics or {})
+            diagnostics["probable_cause"] = cause
+            raise IndexDecodeError(
+                str(primary).split(" [")[0],
+                error_id=primary.error_id,
+                diagnostics=diagnostics,
+            ) from None
+        try:
+            return _detect_roll_frames_single(
+                rgb16,
+                known,
+                nominal_frame_rows=nominal_frame_rows,
+                expected_frame_count=expected_frame_count,
+                wide_gap_ceiling=WIDE_GAP_CEILING_ROWS,
+            )
+        except IndexDecodeError as recovery:
+            diagnostics = dict(primary.diagnostics or {})
+            diagnostics["wide_gap_recovery"] = (
+                f"attempted and failed: {recovery}"
+            )
+            cause = _diagnose_refusal_safely(rgb16, known, nominal_frame_rows)
+            if cause is not None:
+                diagnostics["probable_cause"] = cause
+            raise IndexDecodeError(
+                str(primary).split(" [")[0],
+                error_id=primary.error_id,
+                diagnostics=diagnostics,
+            ) from None
+
+
+def _detect_roll_frames_single(
+    rgb16: np.ndarray,
+    known: np.ndarray,
+    *,
+    nominal_frame_rows: int,
+    expected_frame_count: int | None = None,
+    wide_gap_ceiling: int | None = None,
 ) -> RollDetection:
     """Detect arbitrary roll frames from physical clear-film gap evidence.
 
@@ -948,7 +1069,16 @@ def detect_roll_frames(
     narrow_runs = [
         (start, end) for start, end in evidence_runs if 3 <= end - start <= 12
     ]
-    if len(narrow_runs) < 3:
+    wide_runs = (
+        [
+            (start, end)
+            for start, end in evidence_runs
+            if 12 < end - start <= wide_gap_ceiling
+        ]
+        if wide_gap_ceiling is not None
+        else []
+    )
+    if len(narrow_runs) + len(wide_runs) < 3:
         raise IndexDecodeError(
             "roll detector found too few distinct physical gaps",
             error_id=GAP_COUNT_FLOOR_ERROR_ID,
@@ -964,7 +1094,7 @@ def detect_roll_frames(
         )
     anchor_signal = np.zeros_like(evidence)
     anchor_centers = []
-    for start, end in narrow_runs:
+    for start, end in narrow_runs + wide_runs:
         anchor_signal[start:end] = evidence[start:end]
         anchor_centers.append((start + end - 1) / 2.0)
 
@@ -1104,6 +1234,13 @@ def detect_roll_frames(
             if 3 <= width <= 12:
                 support = "direct"
                 output_row = int(math.floor((run[0] + run[1] - 1) / 2.0 + 0.5))
+            elif (
+                wide_gap_ceiling is not None
+                and 12 < width <= wide_gap_ceiling
+            ):
+                support = "direct-wide"
+                output_row = int(math.floor((run[0] + run[1] - 1) / 2.0 + 0.5))
+                reasons.append(WIDE_GAP_ANCHOR_REVIEW_REASON)
             elif width > 12:
                 support = "cadence-broad"
                 reasons.append("broad-clear-region")
@@ -1128,7 +1265,7 @@ def detect_roll_frames(
 
     def boundary_is_supported(boundary: GapBoundary) -> bool:
         return bool(
-            boundary.support in {"direct", "cadence-broad"}
+            boundary.support in {"direct", "direct-wide", "cadence-broad"}
             and boundary.evidence >= 0.40
             and boundary.transmission >= 0.82
             and boundary.nonuniformity <= 0.22
@@ -1297,7 +1434,8 @@ def detect_roll_frames(
     alignment_boundary_count = alignment_end - cell_start + 1
     alignment_boundaries = boundaries[:alignment_boundary_count]
     direct_support_count = sum(
-        item.support == "direct" for item in alignment_boundaries
+        item.support in {"direct", "direct-wide"}
+        for item in alignment_boundaries
     )
     if direct_support_count < 3:
         raise IndexDecodeError(
@@ -1363,8 +1501,10 @@ def detect_roll_frames(
         [item.evidence for item in supported_alignment_boundaries], dtype=np.float64
     )
     direct_fraction = sum(
-        item.support == "direct" for item in alignment_boundaries[:-1]
+        item.support in {"direct", "direct-wide"}
+        for item in alignment_boundaries[:-1]
     ) / max(1, len(alignment_boundaries) - 1)
+    recovered_wide_gap = wide_gap_ceiling is not None
     if (
         lattice_score >= 0.65
         and lattice_margin >= 0.08
@@ -1376,9 +1516,13 @@ def detect_roll_frames(
         confidence = "medium"
     else:
         confidence = "low"
+    if recovered_wide_gap and confidence == "high":
+        confidence = "medium"
 
     expected_frame_count_matches: bool | None = None
     warnings: list[str] = []
+    if recovered_wide_gap:
+        warnings.append(WIDE_GAP_RECOVERY_WARNING)
     if expected_frame_count is not None:
         expected_frame_count_matches = expected_frame_count in content_end_candidates
         if expected_frame_count_matches:
@@ -1561,18 +1705,87 @@ def derive_transport_mapping(
         if leading_anchor is not None and len(fit_candidates) > 4
         else fit_candidates
     )
-    if len(fit_direct) < 3:
+    # Wide-gap recovery: a strip anchored on wide clear-film runs can
+    # carry fewer than three narrow direct gaps. Only in that case --
+    # never to perturb a fit that already has its three narrow anchors --
+    # admit direct-wide boundaries as additional fit anchors. A wide
+    # run's center is not offset from its trailing edge the way a narrow
+    # run's is, so its anchor x is its trailing edge translated into the
+    # narrow anchors' center space by their own measured center-to-
+    # trailing offset (3 rows on 90% of 1,272 archived direct anchors;
+    # per-capture median used here). Wide anchors never become
+    # automatic and every fit gate below is unchanged.
+    narrow_offsets = [
+        float(item.evidence_run[1] - item.output_row)
+        for item, _record in fit_direct
+        if item.evidence_run is not None
+    ]
+    # 3 rows on 1,146 of 1,272 archived direct anchors (min 2, max 6).
+    # The constant fallback is unreachable in practice -- every path to
+    # the affine fit carries at least one narrow anchor with an evidence
+    # run -- and exists as belt-and-braces only.
+    narrow_anchor_offset = (
+        float(np.median(narrow_offsets)) if narrow_offsets else 3.0
+    )
+    wide_fit: list[tuple[GapBoundary, TransportRecord, float]] = []
+    if len(fit_direct) < 3 and narrow_offsets:
+        for boundary in frame_boundaries:
+            if boundary.support != "direct-wide":
+                continue
+            if boundary.evidence_run is None:
+                continue
+            if (
+                boundary.evidence < 0.40
+                or boundary.transmission < 0.82
+                or boundary.nonuniformity > 0.22
+            ):
+                continue
+            lookup_row = boundary.evidence_run[1]
+            if not 0 <= lookup_row < len(records):
+                continue
+            record = records[lookup_row]
+            if tail_start is not None and record.row >= tail_start:
+                continue
+            # The last interior gap of a short strip can sit right
+            # where the live 0x8e ramp degrades (observed on the
+            # phoenix capture: clean 42/row through the gap's leading
+            # side, then -70/+154/-714 jitter immediately after,
+            # well before terminal_transport_tail_start). A wide
+            # anchor is admitted only when every single-row step of
+            # the table across its trailing edge is affine at the
+            # transport scale -- an endpoint chord would pass the
+            # observed single-record spikes (F2, adversarial review
+            # 2026-08-07). Otherwise the anchor is unusable and the
+            # mapping refuses rather than fitting to noise.
+            lo = max(0, lookup_row - 3)
+            hi = min(len(records) - 1, lookup_row + 3)
+            if hi <= lo:
+                continue
+            ramp_is_affine = all(
+                minimum_scale
+                <= records[r + 1].native_origin - records[r].native_origin
+                <= maximum_scale
+                for r in range(lo, hi)
+            )
+            if not ramp_is_affine:
+                continue
+            wide_fit.append(
+                (boundary, record, lookup_row - narrow_anchor_offset)
+            )
+    if len(fit_direct) + len(wide_fit) < 3:
         raise IndexDecodeError(
             "transport mapping requires at least three direct physical gaps "
             "before the terminal transport tail"
         )
 
     x = np.asarray(
-        [item.output_row for item, _record in fit_direct],
+        [item.output_row for item, _record in fit_direct]
+        + [anchor_x for _b, _r, anchor_x in wide_fit],
         dtype=np.float64,
     )
     y = np.asarray(
-        [record.native_origin for _item, record in fit_direct],
+        [record.native_origin for _item, record in fit_direct]
+        + [record.native_origin for _b, record, _x in wide_fit],
         dtype=np.float64,
     )
     design = np.column_stack((np.ones(len(x)), x))
@@ -1605,21 +1818,48 @@ def derive_transport_mapping(
         leading_anchor_requires_review = leading_error > maximum_anchor_error_rows
 
     direct_by_index = {item.index: record for item, record in direct}
+    wide_by_index = {
+        boundary.index: (record, anchor_x)
+        for boundary, record, anchor_x in wide_fit
+    }
     origins: list[NativeFrameOrigin] = []
     terminal_boundary_index: int | None = None
     for frame, boundary in enumerate(frame_boundaries, start=1):
         prediction = float(intercept + scale * boundary.output_row)
         record = direct_by_index.get(boundary.index)
+        wide_record = wide_by_index.get(boundary.index)
         if record is not None:
             method = "direct-gap-trailing-row"
             reasons = list(boundary.review_reasons)
             automatic = not boundary.manual_review
+        elif wide_record is not None:
+            record, wide_anchor_x = wide_record
+            # A wide gap's output_row is its run center, which sits
+            # farther from the frame's true start than the narrow-run
+            # convention the affine intercept absorbed. Predict (and, if
+            # the clamp fires, extrapolate) at the same translated
+            # trailing-edge x this anchor used in the fit, so the origin
+            # lands on the frame's actual leading edge.
+            prediction = float(intercept + scale * wide_anchor_x)
+            method = "wide-gap-trailing-row"
+            reasons = list(boundary.review_reasons)
+            automatic = False
         else:
             # The canonical Nikon detector selects roughly 2..5 rows after a
             # physical gap centre.  Restrict the search to that local trailing
             # neighborhood, then use the direct-anchor line only to choose a
             # record already supplied by this capture's transport table.
             centre = int(math.floor(boundary.fitted_row + 0.5))
+            if (
+                boundary.support == "direct-wide"
+                and boundary.evidence_run is not None
+            ):
+                centre = int(boundary.evidence_run[1]) - 1
+                prediction = float(
+                    intercept
+                    + scale
+                    * (boundary.evidence_run[1] - narrow_anchor_offset)
+                )
             start = max(0, centre + 1)
             end = min(len(records), centre + 8)
             if start >= end:

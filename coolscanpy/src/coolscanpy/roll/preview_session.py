@@ -14,7 +14,7 @@ import stat
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping, cast
+from typing import Any, Iterable, Literal, Mapping, Sequence, cast
 
 import numpy as np
 
@@ -34,6 +34,10 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
     NikonDensityExposureBinding,
     NikonDensitySourceBinding,
     density_source_geometry_for_startup_records,
+)
+from coolscanpy.protocol.ls5000_single_pass.manual_frames import (
+    MANUAL_PLACEMENT_WARNING,
+    build_manual_detection,
 )
 from coolscanpy.protocol.ls5000_single_pass.plan import (
     CANONICAL_PLAN_SHA256,
@@ -336,6 +340,21 @@ class RollPreviewSession:
             source_table_sha256=self.preview.table_artifact.sha256,
         )
 
+    @property
+    def manual_boundary_rows(self) -> tuple[int, ...] | None:
+        """This session's exact picked boundary rows, or None if automatic.
+
+        Single source of truth for "what did the operator pick" -- to_json
+        (persisted provenance) and approve_manual_origin (S6 hardening:
+        ManualFrameApproval.manual_boundary_rows_sha256) both read this
+        instead of each re-deriving it from self.detection, so the two can
+        never independently drift on what counts as "this session's rows".
+        """
+
+        if MANUAL_PLACEMENT_WARNING not in self.detection.warnings:
+            return None
+        return tuple(boundary.output_row for boundary in self.detection.boundaries)
+
     def approve_manual_origin(
         self,
         slot_id: int,
@@ -369,6 +388,12 @@ class RollPreviewSession:
             reviewed_lookup_row=origin.lookup_row,
             reviewed_native_origin=origin.native_origin,
             review_reasons=reasons,
+            # S6 hardening: ties this receipt to the exact placement this
+            # whole session reviewed, not just this one slot's own
+            # resolved position -- see ManualFrameApproval's own docstring.
+            manual_boundary_rows_sha256=ManualFrameApproval.digest_manual_boundary_rows(
+                self.manual_boundary_rows
+            ),
         )
 
     def validate_manual_approval(
@@ -451,6 +476,18 @@ class RollPreviewSession:
             "material": self.material.value,
             "selected_slots": list(self.selected_slots),
             "boundary_offsets": [item.boundary_offset_rows for item in self.slots],
+            # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): additive-only
+            # provenance. None for an ordinary automatically-detected
+            # session; the exact final (post-snap-assist) boundary rows a
+            # human placed for a manual one. See
+            # _restore_roll_preview_session for why restoring a manual
+            # session from this JSON is deliberately refused rather than
+            # silently re-run through automatic detection.
+            "manual_boundary_rows": (
+                list(self.manual_boundary_rows)
+                if self.manual_boundary_rows is not None
+                else None
+            ),
         }
         return json.dumps(
             payload,
@@ -1282,6 +1319,120 @@ def build_roll_preview_session(
     )
 
 
+def build_manual_roll_preview_session(
+    preview: ValidatedRollPreview,
+    boundary_rows: Sequence[int],
+    *,
+    material: ScanMaterial = ScanMaterial.COLOR_NEGATIVE,
+    selected_slots: Iterable[int] = (),
+    snap_assist: bool = True,
+) -> RollPreviewSession:
+    """Build a reviewed roll session from operator-placed frame boundaries.
+
+    Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md). ``preview`` is a
+    ``ValidatedRollPreview`` already produced by an earlier preview attempt
+    on this same physical traversal -- typically one whose automatic
+    ``detect_roll_frames`` pass failed or scored low confidence, which is
+    exactly when manual placement applies. No film moves here, and the
+    persisted preview raster/table are not re-read or re-validated: this
+    function only re-slices the same already-decoded raster ``preview``
+    holds, at the rows a human picked, through ``manual_frames.
+    build_manual_detection``.
+
+    Everything downstream of frame geometry -- thumbnails, boundary-offset
+    re-cropping, manual-origin approval, JSON serialization -- reuses the
+    exact same ``RollPreviewSession``/``RollPreviewSlot`` machinery
+    ``build_roll_preview_session`` produces, unchanged.
+
+    ``known`` is not part of ``ValidatedRollPreview`` (its own
+    ``__post_init__`` already only accepts a fully decoded raster), so this
+    passes an all-True completeness mask -- exactly the value
+    ``decode_full_index_bytes`` itself always produces
+    (``known = np.ones(rgb16.shape, dtype=bool)``, unconditionally, in
+    roll_index.py), not an approximation of it.
+    """
+
+    if not isinstance(preview, ValidatedRollPreview):
+        raise TypeError("preview must be a ValidatedRollPreview")
+    if not isinstance(material, ScanMaterial):
+        raise TypeError("material must be a ScanMaterial")
+
+    result = build_manual_detection(
+        preview.rgb,
+        np.ones(preview.rgb.shape, dtype=bool),
+        tuple(boundary_rows),
+        nominal_frame_rows=LS5000_FINE_NATIVE_HEIGHT // preview.geometry.pitch,
+        records=preview.transport_records,
+        snap_assist=snap_assist,
+    )
+    detection = result.detection
+    mapping = result.mapping
+
+    scanner_frame_count = scanner_addressable_interval_count(detection.intervals)
+    slot_count = min(
+        SA30_ADAPTER_FRAME_CAPACITY,
+        scanner_frame_count,
+        len(mapping.origins),
+    )
+    if slot_count < 1:
+        raise RollSessionError(
+            "manual frame placement produced no scanner-addressable slots: "
+            + _roll_session_diagnostics(detection)
+        )
+
+    slots = []
+    for interval, origin in zip(
+        detection.intervals[:slot_count],
+        mapping.origins[:slot_count],
+    ):
+        warnings = _slot_warnings(interval.frame, interval, origin, detection)
+        # Same partial-frame computation build_roll_preview_session uses
+        # (#19/Lane C D2). manual_frames.build_manual_detection always sets
+        # unclamped_start_row/unclamped_end_row equal to the (raster-
+        # in-bounds, gate-checked) start_row/end_row, so this always
+        # resolves "full" for a manual slot -- written out in full anyway so
+        # a future change to either builder cannot silently diverge.
+        coverage_start = (
+            interval.unclamped_start_row
+            if interval.unclamped_start_row is not None
+            else interval.start_row
+        )
+        coverage_end = (
+            interval.unclamped_end_row
+            if interval.unclamped_end_row is not None
+            else interval.end_row
+        )
+        state = _crop_state(coverage_start, coverage_end, len(preview.rgb))
+        slots.append(
+            RollPreviewSlot(
+                slot_id=interval.frame,
+                start_boundary_row=interval.start_row,
+                end_boundary_row=interval.end_row,
+                base_origin=origin,
+                thumbnail=_thumbnail(
+                    preview.rgb, interval.start_row, interval.end_row
+                ),
+                warnings=warnings,
+                manual_review=bool(
+                    interval.manual_review or origin.manual_review or warnings
+                ),
+                partial=(True if state == "partial" else None),
+            )
+        )
+    selected = _validate_selected_slots(selected_slots, len(slots))
+    return RollPreviewSession(
+        preview=preview,
+        geometry=preview.geometry,
+        detection=detection,
+        mapping=mapping,
+        slots=tuple(slots),
+        material=material,
+        recipe=recipe_for_material(material),
+        selected_slots=selected,
+        warnings=tuple(detection.warnings),
+    )
+
+
 def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
     if type(payload) is not str:
         raise TypeError("roll session JSON must be a string")
@@ -1304,9 +1455,45 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
         "material",
         "selected_slots",
         "boundary_offsets",
+        "manual_boundary_rows",
     }
-    if set(state) != expected_keys or state.get("version") != SESSION_VERSION:
+    # F7 rework (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): to_json() always
+    # emits "manual_boundary_rows" now, but every session saved before this
+    # key existed has neither it nor anything to migrate -- manual
+    # placement did not exist yet, so an absent key means exactly the same
+    # thing an explicit null does below (state.get returns None either
+    # way). SESSION_VERSION stays 1: nothing about any OTHER field's
+    # meaning changed, so a pre-rework session still restores byte-for-byte
+    # the way it always did. Only an unsupported schema in some OTHER way
+    # -- missing/extra keys beyond this one additive field, or a value for
+    # this key that is neither absent, null, nor a row list -- still
+    # refuses exactly as before.
+    if (
+        set(state) not in (expected_keys, expected_keys - {"manual_boundary_rows"})
+        or state.get("version") != SESSION_VERSION
+    ):
         raise RollSessionIntegrityError("roll session JSON has an unsupported schema")
+    manual_boundary_rows_value = state.get("manual_boundary_rows")
+    if manual_boundary_rows_value is not None and (
+        not isinstance(manual_boundary_rows_value, list)
+        or any(type(item) is not int for item in manual_boundary_rows_value)
+    ):
+        raise RollSessionIntegrityError(
+            "roll session manual boundary rows are malformed"
+        )
+    if manual_boundary_rows_value is not None:
+        # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): to_json() persists
+        # a manual session's picked boundary rows as pure provenance --
+        # restoring one is deliberately NOT implemented yet. Everything below
+        # this point always replays through build_roll_preview_session's
+        # algorithmic detector, never build_manual_roll_preview_session's
+        # operator picks, so silently continuing here would hand back a
+        # session whose frame lattice does not match what a human actually
+        # reviewed. Refuse loudly instead of guessing.
+        raise RollSessionIntegrityError(
+            "roll session was built from manual frame placement; restoring "
+            "a manual session from JSON is not yet supported"
+        )
     journal_identity = state.get("journal")
     if type(journal_identity) is not dict or set(journal_identity) != {
         "path",
@@ -1417,6 +1604,7 @@ __all__ = [
     "RollSessionError",
     "RollSessionIntegrityError",
     "ValidatedRollPreview",
+    "build_manual_roll_preview_session",
     "build_roll_preview_session",
     "reload_thumbnail",
     "recipe_for_material",

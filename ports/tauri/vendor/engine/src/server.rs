@@ -319,10 +319,13 @@ impl Backends {
                 .as_ref()
                 .unwrap()
                 .roll_approve(frame_index, operation_id),
-            Some(ActiveDevice::Sim) => Err(EngineError::new(
-                ErrorCode::InvalidParams,
-                "roll.approve is available only for an active real-device preview; the simulator has no manual-review gate",
-            )),
+            // S7a (adversarial review, 2026-08-08): the simulator now has
+            // exactly one manual-review gate -- a frame its own last
+            // successful `manual_frames()` call returned, under that exact
+            // operationId (see `SimulatedLs5000::roll_approve`'s own doc
+            // comment). Every other case is refused with the same
+            // "no manual-review gate" message as before this change.
+            Some(ActiveDevice::Sim) => self.sim.roll_approve(frame_index, operation_id),
             None => Err(EngineError::new(
                 ErrorCode::NotConnected,
                 "scanner is not connected",
@@ -374,6 +377,39 @@ impl Backends {
                 ErrorCode::InvalidParams,
                 "roll.setSpacingOffset is available only for an active real-device preview",
             )),
+            None => Err(EngineError::new(
+                ErrorCode::NotConnected,
+                "scanner is not connected",
+            )),
+        }
+    }
+
+    /// `roll.manualFrames` (additive, 2026-08-07 -- Rung 4): unlike
+    /// `roll_approve`/`roll_set_spacing_offset`, this has sim parity rather
+    /// than a real-device-only refusal -- BRIDGE.md's contract requires no
+    /// prior successful preview (it works after a refused one too), so the
+    /// simulator can honestly answer it from a synthesized strip instead of
+    /// needing a real bridge-owned manual-review gate the way approval does.
+    fn roll_manual_frames(
+        &self,
+        rows: Vec<u32>,
+    ) -> Result<protocol::RollManualFramesResult, EngineError> {
+        match self.active {
+            Some(ActiveDevice::Sim) => self.sim.manual_frames(rows),
+            Some(ActiveDevice::Real) => self.real.as_ref().unwrap().roll_manual_frames(rows),
+            None => Err(EngineError::new(
+                ErrorCode::NotConnected,
+                "scanner is not connected",
+            )),
+        }
+    }
+
+    /// `roll.previewStrip` (additive, 2026-08-07 -- Rung 4): same sim-parity
+    /// reasoning as `roll_manual_frames` above.
+    fn roll_preview_strip(&self) -> Result<protocol::PreviewStripResult, EngineError> {
+        match self.active {
+            Some(ActiveDevice::Sim) => self.sim.preview_strip(),
+            Some(ActiveDevice::Real) => self.real.as_ref().unwrap().roll_preview_strip(),
             None => Err(EngineError::new(
                 ErrorCode::NotConnected,
                 "scanner is not connected",
@@ -802,6 +838,15 @@ fn handle_request(
                 &params.operation_id,
             )?;
             to_json(&protocol::RollSetSpacingOffsetResult { thumbnail })
+        }
+        "roll.manualFrames" => {
+            let params: protocol::RollManualFramesParams = parse_params(&request.params)?;
+            let result = backends.roll_manual_frames(params.rows)?;
+            to_json(&result)
+        }
+        "roll.previewStrip" => {
+            let result = backends.roll_preview_strip()?;
+            to_json(&result)
         }
         "scan.start" => {
             let mut params: protocol::ScanStartParams = parse_params(&request.params)?;
@@ -3835,5 +3880,134 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidParams);
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Connects and loads a 36-frame roll on the simulator only -- shared
+    /// setup for the `roll.manualFrames`/`roll.previewStrip` dispatch tests
+    /// below, which need no project (both methods are project-independent).
+    fn connected_sim_backends_with_media() -> (Backends, mpsc::Sender<String>, ProjectState) {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+
+        let connect_request = Request {
+            id: 1,
+            method: "scanner.connect".into(),
+            params: serde_json::json!({ "deviceId": "sim-ls5000-0" }),
+        };
+        handle_request(&mut backends, &tx, &connect_request, &mut project_state)
+            .expect("scanner.connect");
+
+        let load_media_request = Request {
+            id: 2,
+            method: "sim.loadMedia".into(),
+            params: serde_json::json!({ "carrier": "roll36" }),
+        };
+        handle_request(&mut backends, &tx, &load_media_request, &mut project_state)
+            .expect("sim.loadMedia");
+
+        (backends, tx, project_state)
+    }
+
+    #[test]
+    fn roll_preview_strip_returns_a_synthesized_image_through_dispatch() {
+        let (mut backends, tx, mut project_state) = connected_sim_backends_with_media();
+
+        let request = Request {
+            id: 3,
+            method: "roll.previewStrip".into(),
+            params: serde_json::Value::Null,
+        };
+        let result = handle_request(&mut backends, &tx, &request, &mut project_state)
+            .expect("roll.previewStrip");
+
+        assert_eq!(result["pixelsPerRow"], serde_json::json!(1));
+        let row_count = result["rowCount"].as_u64().expect("rowCount is a number");
+        assert!(row_count > 0, "a loaded 36-frame roll must report a positive rowCount");
+        let image_path = result["imagePath"].as_str().expect("imagePath is a string");
+        assert!(
+            std::path::Path::new(image_path).is_file(),
+            "roll.previewStrip must write a real, readable file: {image_path}"
+        );
+
+        let _ = std::fs::remove_file(image_path);
+    }
+
+    #[test]
+    fn roll_manual_frames_returns_needs_approval_thumbnails_through_dispatch() {
+        let (mut backends, tx, mut project_state) = connected_sim_backends_with_media();
+
+        let request = Request {
+            id: 3,
+            method: "roll.manualFrames".into(),
+            params: serde_json::json!({ "rows": [0, 135, 270] }),
+        };
+        let result = handle_request(&mut backends, &tx, &request, &mut project_state)
+            .expect("roll.manualFrames with structurally valid rows");
+
+        assert_eq!(result["count"], serde_json::json!(2));
+        assert!(result["operationId"].as_str().is_some_and(|s| !s.is_empty()));
+        let thumbnails = result["thumbnails"].as_array().expect("thumbnails array");
+        assert_eq!(thumbnails.len(), 2);
+        assert_eq!(thumbnails[0]["frameIndex"], serde_json::json!(1));
+        assert_eq!(thumbnails[0]["thumbnail"]["needsApproval"], serde_json::json!(true));
+        assert_eq!(
+            thumbnails[0]["thumbnail"]["warnings"],
+            serde_json::json!(["user-picked"])
+        );
+        // The simulator has no clear-film evidence signal to snap against;
+        // it must honestly report zero snaps rather than fabricate one.
+        assert_eq!(result["snaps"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn roll_manual_frames_rejects_too_few_rows_through_dispatch() {
+        let (mut backends, tx, mut project_state) = connected_sim_backends_with_media();
+
+        let request = Request {
+            id: 3,
+            method: "roll.manualFrames".into(),
+            params: serde_json::json!({ "rows": [42] }),
+        };
+        let err = handle_request(&mut backends, &tx, &request, &mut project_state).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("at least 2"),
+            "expected a plain-English explanation, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn roll_manual_frames_and_preview_strip_require_a_connection() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+
+        let manual_request = Request {
+            id: 1,
+            method: "roll.manualFrames".into(),
+            params: serde_json::json!({ "rows": [0, 200] }),
+        };
+        let err =
+            handle_request(&mut backends, &tx, &manual_request, &mut project_state).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotConnected);
+
+        let strip_request = Request {
+            id: 2,
+            method: "roll.previewStrip".into(),
+            params: serde_json::Value::Null,
+        };
+        let err =
+            handle_request(&mut backends, &tx, &strip_request, &mut project_state).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotConnected);
     }
 }

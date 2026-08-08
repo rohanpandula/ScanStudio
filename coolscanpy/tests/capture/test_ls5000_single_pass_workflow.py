@@ -64,6 +64,9 @@ def _journal(
         reviewed_lookup_row=2_580 + boundary_offset_rows,
         reviewed_native_origin=origin,
         review_reasons=("transport-origin-inferred",),
+        manual_boundary_rows_sha256=ManualFrameApproval.digest_manual_boundary_rows(
+            None
+        ),
     ).to_payload()
     roll_comparison = RollFingerprintComparison(
         matches=True,

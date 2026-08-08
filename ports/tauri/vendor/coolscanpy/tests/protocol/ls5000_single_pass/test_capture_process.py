@@ -452,6 +452,7 @@ def _manual_approval(
     *,
     slot: int,
     offset: int,
+    manual_boundary_rows: tuple[int, ...] | None = None,
 ) -> capture.ManualFrameApproval:
     return capture.ManualFrameApproval(
         reviewed_fingerprint_sha256=fingerprint.binding_sha256,
@@ -461,6 +462,9 @@ def _manual_approval(
         reviewed_lookup_row=2_400,
         reviewed_native_origin=100_000,
         review_reasons=("transport-origin-inferred",),
+        manual_boundary_rows_sha256=capture.ManualFrameApproval.digest_manual_boundary_rows(
+            manual_boundary_rows
+        ),
     )
 
 
@@ -931,6 +935,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "expected_usb_address": 2,
         "expected_usb_bus": 1,
         "exposure_override_10ns": None,
+        "manual_boundary_rows": None,
         "frames": [
             {
                 "ack": "frame-017/parent-ack.json",
@@ -998,6 +1003,37 @@ def test_prepare_batch_session_threads_exposure_override_into_the_batch_job(
     job = json.loads(prepared.paths.job.read_text(encoding="utf-8"))
 
     assert job["exposure_override_10ns"] == [97_482, 195_597, 180_705]
+
+
+def test_prepare_batch_session_threads_manual_boundary_rows_into_the_batch_job(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): same choke point as
+    exposure_override_10ns above, for the operator-picked rows a manual
+    placement session hands Roll.scan_many() -- must reach the published
+    batch-job.json unchanged (as a plain array; JSON has no tuple type)."""
+
+    runner = FakeRunner(binding.worker_sha256)
+    adapter = _adapter(tmp_path, binding, runner)
+    request = capture.CaptureBatchRequest(
+        frames=(
+            capture.CaptureRequest(
+                mode=capture.CaptureMode.FULL,
+                selected_slot=1,
+                boundary_offset_rows=0,
+            ),
+        ),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+        manual_boundary_rows=(128, 271, 414),
+    )
+
+    prepared = adapter.prepare_batch_session(request)
+    job = json.loads(prepared.paths.job.read_text(encoding="utf-8"))
+
+    assert job["manual_boundary_rows"] == [128, 271, 414]
 
 
 @pytest.mark.parametrize(

@@ -68,11 +68,48 @@ class Transport(Protocol):
         on_thumbnail: Callable[[domain.Thumbnail], None],
     ) -> domain.PreviewResult: ...
 
-    def approve(self, slot: int) -> None: ...
+    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
+        """Approve `slot`. `fingerprint`, when given, is the Roll
+        fingerprint (BRIDGE.md's `roll.approve`) the approval being
+        submitted was minted against -- additive (2026-08-08 adversarial
+        review, S1): `None` is the pre-existing behavior (no comparison); a
+        given value that no longer matches the roll's CURRENT fingerprint
+        must be refused with `FINGERPRINT_REFUSED` before any underlying
+        approval call, never silently approved against whatever session
+        happens to be current now."""
+        ...
 
     def set_spacing_offset(
         self, slot: int, offset_rows: int
     ) -> domain.Thumbnail: ...
+
+    def manual_frames(
+        self, rows: list[int]
+    ) -> tuple[
+        domain.PreviewResult,
+        tuple[domain.Thumbnail, ...],
+        tuple[domain.BoundarySnap, ...],
+        domain.Material,
+    ]:
+        """Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): re-slice the
+        last completed preview attempt's already-decoded raster at
+        operator-picked boundary rows -- no hardware call, no film
+        movement. Usable only when a preview attempt (successful or
+        refused) already exists this session; raises `NO_PREVIEW`
+        otherwise. Leaves roll/session state armed exactly like a
+        successful `preview()` -- the returned `domain.Material` is what
+        the caller must re-arm `scan.start`'s own NO_PREVIEW gate with,
+        since this call carries no `material` param of its own (the
+        session already has one)."""
+        ...
+
+    def preview_strip(self) -> domain.PreviewStrip:
+        """Rung 4: render the last completed preview attempt's whole
+        captured raster to one image, for a manual-placement editor to
+        draw boundary lines on before any row has been picked. Same
+        precondition and NO_PREVIEW failure as `manual_frames`; no hardware
+        call."""
+        ...
 
     def start_scan(
         self,

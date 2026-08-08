@@ -666,7 +666,9 @@ def _drive_two_frame_batch(
         def dispose_resources(_device):
             pass
 
-    def derive_batch(_plan, preview, table, frames, *, reviewed_fingerprint):
+    def derive_batch(
+        _plan, preview, table, frames, *, reviewed_fingerprint, manual_boundary_rows=None
+    ):
         state["prevalidated"] = True
         return selections
 

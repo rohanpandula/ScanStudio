@@ -77,6 +77,35 @@ public enum ManualReviewDecision: Equatable, Sendable {
     case dontScan
 }
 
+/// Rung 4 of the feeding UX ladder (FEEDING-UX-LADDER-OVERNIGHT-20260807.md):
+/// `roll.previewStrip`'s rendered whole-roll raster, ready for a
+/// manual-placement editor. `id` is the image path, which is always fresh
+/// per call (mirrors every other bridge-written preview tile's own
+/// fresh-path-per-response convention), so it doubles as a stable
+/// `Identifiable` key for `.sheet(item:)`.
+public struct ManualPlacementStrip: Identifiable, Equatable, Sendable {
+    public var id: String { imagePath }
+    public let imagePath: String
+    public let rowCount: Int
+    public let pixelsPerRow: Int
+
+    public init(imagePath: String, rowCount: Int, pixelsPerRow: Int) {
+        self.imagePath = imagePath
+        self.rowCount = rowCount
+        self.pixelsPerRow = pixelsPerRow
+    }
+}
+
+/// Drives the "Place frames manually" sheet. `.loading` covers the
+/// `roll.previewStrip` round trip; a failure there is reported through the
+/// ordinary `lastErrorMessage` banner rather than a dedicated failure case,
+/// so the app has exactly one error-display surface.
+public enum ManualPlacementStripState: Equatable, Sendable {
+    case idle
+    case loading
+    case ready(ManualPlacementStrip)
+}
+
 /// The exact scan request paused at the pre-motion manual-review boundary.
 ///
 /// `frames` is the original complete batch, not only the ambiguous frames.
@@ -617,6 +646,24 @@ public final class SessionModel {
     /// describes). Cleared when a new preview starts, on a successful
     /// eject, and on connect/disconnect/engine-termination.
     public private(set) var refeedRequired = false
+    /// Rung 4 of the feeding UX ladder: drives the "Place frames manually"
+    /// sheet. `.ready` is the only state the sheet is presented for; see
+    /// `beginManualFramePlacement()`/`cancelManualFramePlacement()`/
+    /// `submitManualFrames(rows:)`.
+    public private(set) var manualPlacementStripState: ManualPlacementStripState = .idle
+    /// True while a `roll.manualFrames` confirm is in flight. Disables the
+    /// editor's Confirm/Cancel while a submit could still resolve.
+    public private(set) var isSubmittingManualPlacement = false
+    /// The plain-English message from the last rejected `roll.manualFrames`
+    /// confirm (typically `INVALID_PARAMS`), shown inline in the editor
+    /// without dismissing it. Cleared on every new submit attempt and
+    /// whenever the editor opens, succeeds, or is cancelled.
+    public private(set) var manualPlacementSubmitError: String?
+    /// One-line summary of the last successful `roll.manualFrames`'s
+    /// `snaps`, surfaced subtly after the editor closes. `nil` whenever the
+    /// last placement had no snapped boundaries, or none has completed yet
+    /// this session.
+    public private(set) var manualPlacementSnapNote: String?
     /// Per-frame derivative rotation intent, in degrees
     /// (0/90/180/270). Read/written by `rotateFrame(_:by:)`/
     /// `resetFrameOrientation(_:)`; frames absent from this dictionary are
@@ -1402,6 +1449,131 @@ public final class SessionModel {
         lastErrorMessage =
             "This scan already ended, so retrying from here could start a second film traversal. "
             + "Acquire a fresh preview, confirm any flagged frame there, then start the batch again."
+    }
+
+    // MARK: - Manual frame placement (Rung 4 of the feeding UX ladder)
+
+    /// Starts "Place frames manually" by rendering the last completed
+    /// preview attempt's whole raster (`roll.previewStrip`). Usable any
+    /// time a preview attempt exists -- including one that just failed
+    /// with REFEED_REQUIRED, which is the intended entry point (the
+    /// workspace error card's own "Place frames manually" button, shown
+    /// whenever `errorPresentation.probableCause` is present).
+    public func beginManualFramePlacement() async {
+        guard manualPlacementStripState != .loading else { return }
+        manualPlacementStripState = .loading
+        manualPlacementSubmitError = nil
+        let epoch = connectionEpoch
+        recordDiagnostic(event: "manualFrames.previewStrip.requested")
+        do {
+            let result: PreviewStripResult = try await engineClient.request(
+                "roll.previewStrip",
+                params: EmptyParams()
+            )
+            guard epoch == connectionEpoch else { return }
+            manualPlacementStripState = .ready(
+                ManualPlacementStrip(
+                    imagePath: result.imagePath,
+                    rowCount: result.rowCount,
+                    pixelsPerRow: result.pixelsPerRow
+                )
+            )
+        } catch {
+            guard epoch == connectionEpoch else { return }
+            recordOperationFailure(error, operation: "roll.previewStrip")
+            manualPlacementStripState = .idle
+            lastErrorMessage = Self.describe(error)
+        }
+    }
+
+    /// Closes the manual-placement editor without submitting anything. Safe
+    /// to call from the sheet's own dismissal binding as well as an
+    /// explicit Cancel button.
+    public func cancelManualFramePlacement() {
+        manualPlacementStripState = .idle
+        manualPlacementSubmitError = nil
+        isSubmittingManualPlacement = false
+    }
+
+    /// Submits operator-picked boundary rows (`roll.manualFrames`).
+    ///
+    /// On success, the resulting thumbnails and their fresh `operationId`
+    /// flow into the exact same state a normal completed preview populates
+    /// (`thumbnails`, `latestCompletedPreviewOperationId`), so the existing
+    /// approval + scan-start flow (`ManualReviewScanSheet`,
+    /// `startScanOrRequestManualReview`) picks them up with no further
+    /// wiring -- every resulting frame arrives `needsApproval: true` with a
+    /// `"user-picked"` warning, exactly as BRIDGE.md documents, and reads
+    /// as an ordinary manual-review requirement from there on.
+    ///
+    /// On an `INVALID_PARAMS` rejection (the operator's own picks failed a
+    /// physical or structural gate), `manualPlacementSubmitError` is set
+    /// and `manualPlacementStripState` is left `.ready` -- the editor stays
+    /// open so the operator can adjust the picks and retry without losing
+    /// their place, rather than being dismissed out from under them.
+    @discardableResult
+    public func submitManualFrames(rows: [Int]) async -> Bool {
+        guard !isSubmittingManualPlacement else { return false }
+        isSubmittingManualPlacement = true
+        manualPlacementSubmitError = nil
+        defer { isSubmittingManualPlacement = false }
+
+        let epoch = connectionEpoch
+        do {
+            let result: RollManualFramesResult = try await engineClient.request(
+                "roll.manualFrames",
+                params: RollManualFramesParams(rows: rows)
+            )
+            guard epoch == connectionEpoch else { return false }
+            // Adversarial review S2 (2026-08-08): a materially different
+            // placement is about to replace whatever frame-indexed UI
+            // state exists today. `manualReviewDecisions` is keyed by
+            // frameIndex alone with no notion of which placement produced
+            // it, so a prior "Use anyway" for frame 3 under an EARLIER
+            // placement must never silently authorize frame 3 of THIS one
+            // just because the index number matches -- frame 3 in the old
+            // placement and frame 3 here can be entirely different
+            // physical film regions. The same reasoning applies to any
+            // pending review sheet, stale thumbnail, selection, or
+            // alignment/orientation choice. `clearMediaState()` is the
+            // exact same atomic "this is new media" reset every other
+            // new-registration path (eject, disconnect, engine
+            // termination) already uses -- installing the new placement's
+            // own state below is what re-populates it, never a partial
+            // carry-over from before.
+            clearMediaState()
+            for entry in result.thumbnails {
+                thumbnails[entry.frameIndex] = entry.thumbnail
+            }
+            latestCompletedPreviewOperationId = result.operationId
+            // The situation `refeedRequired` describes -- the current
+            // physical registration cannot be trusted -- is exactly what a
+            // successful manual placement resolves: a fresh, usable
+            // session is now armed for these frames without an eject.
+            refeedRequired = false
+            lastErrorMessage = nil
+            manualPlacementStripState = .idle
+            manualPlacementSnapNote = Self.manualPlacementSnapNote(for: result.snaps)
+            recordDiagnostic(
+                event: "manualFrames.accepted",
+                fields: [
+                    "count": String(result.count),
+                    "snapCount": String(result.snaps.count),
+                ]
+            )
+            return true
+        } catch {
+            guard epoch == connectionEpoch else { return false }
+            recordOperationFailure(error, operation: "roll.manualFrames")
+            manualPlacementSubmitError = Self.describe(error)
+            return false
+        }
+    }
+
+    private static func manualPlacementSnapNote(for snaps: [BoundarySnap]) -> String? {
+        guard !snaps.isEmpty else { return nil }
+        let count = snaps.count
+        return "ScanStudio nudged \(count) boundary \(count == 1 ? "line" : "lines") to a clearer edge."
     }
 
     /// Cancels the UI-visible pre-scan review without approving or moving the
@@ -3168,6 +3340,13 @@ public final class SessionModel {
     /// anything in flight.
     public func dismissLastError() {
         lastErrorMessage = nil
+    }
+
+    /// Clears the subtle post-placement snap note (Rung 4). Never affects
+    /// `lastErrorMessage`/`thumbnails`/approval state -- purely a UI
+    /// dismissal for one transient piece of feedback.
+    public func dismissManualPlacementSnapNote() {
+        manualPlacementSnapNote = nil
     }
 
     // MARK: - Frame derivative transform

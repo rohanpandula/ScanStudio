@@ -20,9 +20,10 @@ use crate::domain::{
 };
 use crate::protocol::{
     ConnectOptions, ConnectResult, ErrorCode, ErrorPayload, Event, FaultInjection,
-    FrameCompletedPayload, FrameStatePayload, JobStatePayload, Lamp, ScanCompletedPayload,
-    ScanProgressPayload, ScanSummary, ScannerStatus, StopMode, Thumbnail, ThumbnailPayload,
-    ThumbnailsCompletePayload, Transport,
+    FrameCompletedPayload, FrameStatePayload, JobStatePayload, Lamp, ManualFrameThumbnail,
+    PreviewStripResult, RollManualFramesResult, ScanCompletedPayload, ScanProgressPayload,
+    ScanSummary, ScannerStatus, StopMode, Thumbnail, ThumbnailPayload, ThumbnailsCompletePayload,
+    Transport,
 };
 
 const DEVICE_ID: &str = "sim-ls5000-0";
@@ -60,6 +61,117 @@ pub fn thumbnail_for(device_id: &str, frame_index: u32) -> Thumbnail {
         needs_approval: false,
         warnings: vec![],
     }
+}
+
+// ---------------------------------------------------------------------
+// roll.manualFrames / roll.previewStrip sim parity (additive, 2026-08-07 --
+// Rung 4 of the feeding UX ladder). Unlike `roll.approve`/
+// `roll.setSpacingOffset` (real-device-only: the simulator has no
+// bridge-owned manual-review gate to arm), BRIDGE.md's contract for these
+// two methods requires no prior successful preview at all -- they work
+// after a refused one too -- so the simulator can honestly answer them
+// without needing that gate. Deliberately minimal: no clear-film evidence
+// signal exists in sim data, so snap assist is never simulated (an honest
+// empty `snaps`, never fabricated); the synthesized strip image exists only
+// so a manual-placement editor has *something* plausible to draw boundary
+// lines on, and is never claimed to be real film content.
+// ---------------------------------------------------------------------
+
+/// Rows-per-nominal-frame the simulator assumes when it has no real
+/// transport table to consult -- matches coolscanpy's own documented
+/// approximation (`manual_frames.py`: `MANUAL_FRAME_HEIGHT_MM_PER_ROW =
+/// 0.267`, so ~36mm / 0.267mm-per-row =~ 135 rows for a standard 35mm
+/// frame).
+const SIM_NOMINAL_FRAME_PITCH_ROWS: u32 = 135;
+/// Floor mirrors coolscanpy's `manual_frames.py`
+/// `MINIMUM_MANUAL_FRAME_HEIGHT_ROWS`/`MANUAL_FRAME_HEIGHT_MM_PER_ROW`
+/// verbatim -- a real, physical fact about film, deliberately wider than
+/// automatic detection's tolerance.
+const SIM_MINIMUM_MANUAL_FRAME_HEIGHT_ROWS: u32 = 56;
+/// Ceiling is tighter than `manual_frames.py`'s own (still 280 today) --
+/// adversarial review S7b (2026-08-08): 280 rows is not the scanner's real
+/// per-frame limit for something that must actually be fine-scanned
+/// afterward. The fixed single-pass fine capture window is
+/// `worker.py`'s `FINE_NATIVE_HEIGHT = 5_959` native pixels, which divided
+/// by this same driver's 40-45 native-units-per-row transport pitch lands
+/// at roughly 132-149 preview rows -- ~145 at the middle of that range.
+/// See `Sources/ScanStudioKit/ManualFramePlacementValidation.swift`'s own
+/// doc comment for the identical derivation and reasoning; this constant
+/// and that one must stay in lockstep so the simulator's own gate matches
+/// what the client-side editor already refuses to build.
+const SIM_MAXIMUM_MANUAL_FRAME_HEIGHT_ROWS: u32 = 145;
+const SIM_MAXIMUM_MANUAL_FRAMES: usize = 40;
+const SIM_MANUAL_FRAME_HEIGHT_MM_PER_ROW: f64 = 0.267;
+/// Cross-strip axis of the synthesized preview strip image, in pixels.
+/// Arbitrary but fixed -- the simulator has no real frame width to derive
+/// this from.
+const SIM_STRIP_HEIGHT_PX: u32 = 96;
+/// Every `GAP_ROWS`-wide slice at the start of each nominal frame pitch
+/// renders as a brighter "clear film" band, purely so the synthesized strip
+/// has some visible structure to place boundaries against.
+const SIM_STRIP_GAP_ROWS: u32 = 10;
+
+/// The coordinate space every `roll.manualFrames`/`roll.previewStrip` row
+/// is validated/rendered against: `frame_count` nominal frames end to end,
+/// each `SIM_NOMINAL_FRAME_PITCH_ROWS` rows tall. Shared by both methods so
+/// a row `roll.previewStrip` reports as in-bounds is the exact same row
+/// `roll.manualFrames` will accept.
+fn sim_strip_row_count(frame_count: Option<u32>) -> u32 {
+    frame_count.unwrap_or(1).max(1) * SIM_NOMINAL_FRAME_PITCH_ROWS
+}
+
+fn sim_manual_frame_ordinal(index: usize) -> String {
+    format!("frame {}", index + 1)
+}
+
+/// Writes a small synthesized "whole roll" preview strip image for
+/// `roll.previewStrip`'s sim parity. The transport/row axis is the image's
+/// WIDTH axis, exactly like a real bridge-rendered strip (BRIDGE.md
+/// `PreviewStrip.imagePath`'s own doc note: "the raster's row axis... is
+/// the image's WIDTH axis, not its height, exactly like every existing
+/// `Thumbnail` crop already is") -- getting this backwards would silently
+/// break every row<->pixel calculation a manual-placement editor makes.
+/// Alternating bands are driven by the same `thumbnail_for` hash already
+/// used for simulated thumbnails, purely so the strip has *some* visible
+/// structure; this never claims to be real film content.
+fn synthesize_preview_strip(
+    device_id: &str,
+    row_count: u32,
+) -> Result<std::path::PathBuf, EngineError> {
+    let width = row_count.max(1);
+    let image = image::RgbImage::from_fn(width, SIM_STRIP_HEIGHT_PX, |x, _y| {
+        let cycle = x % SIM_NOMINAL_FRAME_PITCH_ROWS;
+        if cycle < SIM_STRIP_GAP_ROWS {
+            image::Rgb([228, 228, 228])
+        } else {
+            let nominal_frame = x / SIM_NOMINAL_FRAME_PITCH_ROWS + 1;
+            let h = fnv1a64(&format!("{device_id}:strip:{nominal_frame}"));
+            let gray = (80 + (h >> 8) % 120) as u8;
+            image::Rgb([gray, gray, gray])
+        }
+    });
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir()
+        .join("scanstudio-sim-previews")
+        .join(format!("strip-{nanos:x}"));
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to create simulator preview strip directory: {err}"),
+        )
+    })?;
+    let path = dir.join("strip.png");
+    image.save(&path).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to write simulator preview strip image: {err}"),
+        )
+    })?;
+    Ok(path)
 }
 
 /// Lowercase 16-hex-char FNV-1a 64 of
@@ -139,6 +251,17 @@ fn is_job_terminal(state: JobState) -> bool {
     )
 }
 
+/// The most recent successful `manual_frames()` call's operator-approval
+/// binding (adversarial review S7a, 2026-08-08). The simulator otherwise
+/// has no manual-review gate at all; this exists solely so a simulated
+/// manual placement -- which always arrives `needsApproval: true` -- is
+/// not a permanent dead end with nothing that could ever clear it.
+#[derive(Debug, Clone)]
+struct ManualApprovalBinding {
+    operation_id: String,
+    frame_indices: HashSet<u32>,
+}
+
 struct State {
     connected: bool,
     adapter: Option<String>,
@@ -152,6 +275,7 @@ struct State {
     fault_injection: FaultInjection,
     job_seq: u64,
     thumbnail_operation_active: bool,
+    manual_approval_binding: Option<ManualApprovalBinding>,
 }
 
 impl Default for State {
@@ -169,6 +293,7 @@ impl Default for State {
             fault_injection: FaultInjection::NoFault,
             job_seq: 0,
             thumbnail_operation_active: false,
+            manual_approval_binding: None,
         }
     }
 }
@@ -265,6 +390,201 @@ impl SimulatedLs5000 {
             )),
         }
     }
+
+    /// `roll.previewStrip` sim parity (additive, 2026-08-07). Renders a
+    /// synthesized whole-roll strip sized from the loaded carrier's frame
+    /// count, purely so a manual-placement editor has something to draw on
+    /// without a real bridge attached. Not part of `ScannerBackend`: like
+    /// `roll_approve`/`roll_set_spacing_offset`, this is dispatched
+    /// directly from `Backends` rather than through the trait.
+    pub fn preview_strip(&self) -> Result<PreviewStripResult, EngineError> {
+        let (device_id, frame_count) = {
+            let state = self.state.lock().unwrap();
+            if !state.connected {
+                return Err(EngineError::new(
+                    ErrorCode::NotConnected,
+                    "scanner is not connected",
+                ));
+            }
+            if !state.media_loaded {
+                return Err(EngineError::new(ErrorCode::NoMedia, "no media is loaded"));
+            }
+            if transport_is_busy(&state) {
+                return Err(EngineError::new(
+                    ErrorCode::ScannerBusy,
+                    "a scanner transport operation is active",
+                ));
+            }
+            (self.device.device_id.clone(), state.frame_count)
+        };
+        let row_count = sim_strip_row_count(frame_count);
+        let path = synthesize_preview_strip(&device_id, row_count)?;
+        Ok(PreviewStripResult {
+            image_path: path.display().to_string(),
+            row_count,
+            pixels_per_row: 1,
+        })
+    }
+
+    /// `roll.manualFrames` sim parity (additive, 2026-08-07). Validates the
+    /// same structural and frame-height gates coolscanpy's
+    /// `manual_frames.py` enforces server-side (count, strictly increasing,
+    /// in-raster, frame count, 15-75mm height); deliberately does NOT
+    /// attempt the snap-assist or same-traversal transport-table sanity
+    /// gates, since the simulator has no clear-film evidence signal or real
+    /// transport table to check either against -- an honest `snaps: []`
+    /// rather than a fabricated one. Deterministic per-frame thumbnails
+    /// reuse `thumbnail_for`, exactly like a normal `acquire_thumbnails`
+    /// tile, with `needsApproval`/`warnings` overridden to match BRIDGE.md's
+    /// "every resulting slot arrives `needsApproval: true` with a
+    /// `\"user-picked\"` warning" contract.
+    pub fn manual_frames(&self, rows: Vec<u32>) -> Result<RollManualFramesResult, EngineError> {
+        let (device_id, frame_count_hint) = {
+            let state = self.state.lock().unwrap();
+            if !state.connected {
+                return Err(EngineError::new(
+                    ErrorCode::NotConnected,
+                    "scanner is not connected",
+                ));
+            }
+            if !state.media_loaded {
+                return Err(EngineError::new(ErrorCode::NoMedia, "no media is loaded"));
+            }
+            if transport_is_busy(&state) {
+                return Err(EngineError::new(
+                    ErrorCode::ScannerBusy,
+                    "a scanner transport operation is active",
+                ));
+            }
+            (self.device.device_id.clone(), state.frame_count)
+        };
+        let row_count = sim_strip_row_count(frame_count_hint);
+
+        if rows.len() < 2 {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                format!(
+                    "manual frame placement needs at least 2 boundary rows (1 frame); only {} were given",
+                    rows.len()
+                ),
+            ));
+        }
+        if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                "frame boundary rows must be placed in strictly increasing order, top to bottom of the preview",
+            ));
+        }
+        if rows.iter().any(|&row| row >= row_count) {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                format!(
+                    "every boundary row must lie inside the captured preview (0..{}); a boundary was placed outside it",
+                    row_count.saturating_sub(1)
+                ),
+            ));
+        }
+        let frame_count = rows.len() - 1;
+        if frame_count > SIM_MAXIMUM_MANUAL_FRAMES {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                format!(
+                    "manual placement supports at most {SIM_MAXIMUM_MANUAL_FRAMES} frames; {} boundary rows would create {frame_count}",
+                    rows.len()
+                ),
+            ));
+        }
+        for (index, pair) in rows.windows(2).enumerate() {
+            let height_rows = pair[1] - pair[0];
+            if height_rows < SIM_MINIMUM_MANUAL_FRAME_HEIGHT_ROWS
+                || height_rows > SIM_MAXIMUM_MANUAL_FRAME_HEIGHT_ROWS
+            {
+                let approx_mm = f64::from(height_rows) * SIM_MANUAL_FRAME_HEIGHT_MM_PER_ROW;
+                let ceiling_mm = f64::from(SIM_MAXIMUM_MANUAL_FRAME_HEIGHT_ROWS)
+                    * SIM_MANUAL_FRAME_HEIGHT_MM_PER_ROW;
+                let reason = if height_rows < SIM_MINIMUM_MANUAL_FRAME_HEIGHT_ROWS {
+                    "real frames are at least 15 mm".to_string()
+                } else {
+                    format!("the scanner captures about {ceiling_mm:.0} mm per frame")
+                };
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "the {} you placed is about {approx_mm:.0} mm tall (between rows {} and {}) -- {reason}",
+                        sim_manual_frame_ordinal(index),
+                        pair[0],
+                        pair[1]
+                    ),
+                ));
+            }
+        }
+
+        let thumbnails: Vec<ManualFrameThumbnail> = (1..=frame_count as u32)
+            .map(|frame_index| {
+                let mut thumbnail = thumbnail_for(&device_id, frame_index);
+                thumbnail.needs_approval = true;
+                thumbnail.warnings = vec!["user-picked".to_string()];
+                ManualFrameThumbnail {
+                    frame_index,
+                    thumbnail,
+                }
+            })
+            .collect();
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let operation_id = format!("manual-sim-{nanos:x}");
+        let fingerprint = format!("{:016x}", fnv1a64(&format!("{device_id}:manual:{rows:?}")));
+
+        // Arm the sim-side approval binding (S7a) only after every gate
+        // above has passed -- a refused placement must never leave a
+        // binding an operator could later approve against.
+        self.state.lock().unwrap().manual_approval_binding = Some(ManualApprovalBinding {
+            operation_id: operation_id.clone(),
+            frame_indices: (1..=frame_count as u32).collect(),
+        });
+
+        Ok(RollManualFramesResult {
+            count: frame_count as u32,
+            fingerprint,
+            operation_id,
+            thumbnails,
+            // The simulator has no clear-film evidence signal to snap
+            // against (see `synthesize_preview_strip`'s own doc comment) --
+            // it never fabricates a snap; every real snap comes only from a
+            // real bridge.
+            snaps: vec![],
+        })
+    }
+
+    /// `roll.approve` sim parity for manually-placed frames (adversarial
+    /// review S7a, 2026-08-08). The simulator otherwise has NO
+    /// manual-review gate -- every other case is refused with the same
+    /// message as before this change. Only a frame this backend's own
+    /// last successful `manual_frames()` call actually returned, under
+    /// that exact `operation_id`, can be approved; the binding is cleared
+    /// on connect/disconnect/load_media/eject so a stale approval can
+    /// never survive a session or media change (mirrors the S2 fix's own
+    /// "never let frame-indexed state silently outlive the placement that
+    /// produced it" principle). Not part of `ScannerBackend`: dispatched
+    /// directly from `Backends::roll_approve`, exactly like every other
+    /// roll.* method that is real-only or sim-only.
+    pub fn roll_approve(&self, frame_index: u32, operation_id: &str) -> Result<(), EngineError> {
+        let state = self.state.lock().unwrap();
+        let approvable = state.manual_approval_binding.as_ref().is_some_and(|binding| {
+            binding.operation_id == operation_id && binding.frame_indices.contains(&frame_index)
+        });
+        if approvable {
+            return Ok(());
+        }
+        Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            "roll.approve is available on the simulator only for a frame returned by this \
+             session's own manual frame placement; the simulator has no other manual-review gate",
+        ))
+    }
 }
 
 impl Default for SimulatedLs5000 {
@@ -302,6 +622,10 @@ impl ScannerBackend for SimulatedLs5000 {
         state.lamp = Lamp::Stable;
         state.transport = Transport::Idle;
         state.job_slot = None;
+        // A fresh session starts with no manual-placement approval binding
+        // (S7a/S2 principle): a stale one from an earlier connection must
+        // never carry over.
+        state.manual_approval_binding = None;
         state.time_scale = if options.time_scale > 0.0 {
             options.time_scale
         } else {
@@ -338,6 +662,7 @@ impl ScannerBackend for SimulatedLs5000 {
         state.frame_count = None;
         state.lamp = Lamp::Off;
         state.transport = Transport::Idle;
+        state.manual_approval_binding = None;
         Ok(status_snapshot(&state))
     }
 
@@ -375,6 +700,9 @@ impl ScannerBackend for SimulatedLs5000 {
         state.carrier = Some(carrier);
         state.frame_count = Some(frame_count);
         state.adapter = Some(adapter.to_string());
+        // Newly loaded media invalidates any manual placement made against
+        // whatever was loaded before.
+        state.manual_approval_binding = None;
         Ok(status_snapshot(&state))
     }
 
@@ -406,6 +734,7 @@ impl ScannerBackend for SimulatedLs5000 {
         state.carrier = None;
         state.frame_count = None;
         state.adapter = None;
+        state.manual_approval_binding = None;
         Ok(status_snapshot(&state))
     }
 
@@ -2200,5 +2529,299 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&project_dir);
         let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    // -- roll.previewStrip / roll.manualFrames sim parity (Rung 4) ---------
+
+    #[test]
+    fn preview_strip_reports_row_count_from_loaded_frame_count_and_writes_a_real_file() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        let strip = sim.preview_strip().expect("preview_strip");
+        assert_eq!(strip.row_count, 36 * SIM_NOMINAL_FRAME_PITCH_ROWS);
+        assert_eq!(strip.pixels_per_row, 1);
+        let metadata = std::fs::metadata(&strip.image_path)
+            .unwrap_or_else(|err| panic!("preview strip file must exist: {err}"));
+        assert!(metadata.len() > 0, "preview strip file must not be empty");
+
+        let _ = std::fs::remove_file(&strip.image_path);
+    }
+
+    #[test]
+    fn preview_strip_two_calls_write_two_distinct_files() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Strip6).expect("load media");
+
+        let first = sim.preview_strip().expect("first preview_strip");
+        let second = sim.preview_strip().expect("second preview_strip");
+        assert_ne!(
+            first.image_path, second.image_path,
+            "every preview_strip call must write a fresh file so no image cache reuses a stale one"
+        );
+
+        let _ = std::fs::remove_file(&first.image_path);
+        let _ = std::fs::remove_file(&second.image_path);
+    }
+
+    #[test]
+    fn preview_strip_requires_connection() {
+        let sim = SimulatedLs5000::new();
+        let err = sim.preview_strip().unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotConnected);
+    }
+
+    #[test]
+    fn preview_strip_requires_loaded_media() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        let err = sim.preview_strip().unwrap_err();
+        assert_eq!(err.code, ErrorCode::NoMedia);
+    }
+
+    #[test]
+    fn manual_frames_accepts_valid_rows_and_marks_every_slot_user_picked() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("structurally valid rows");
+        assert_eq!(result.count, 2);
+        assert!(!result.operation_id.is_empty());
+        assert!(!result.fingerprint.is_empty());
+        assert_eq!(result.thumbnails.len(), 2);
+        assert_eq!(result.thumbnails[0].frame_index, 1);
+        assert_eq!(result.thumbnails[1].frame_index, 2);
+        for entry in &result.thumbnails {
+            assert!(entry.thumbnail.needs_approval);
+            assert_eq!(entry.thumbnail.warnings, vec!["user-picked".to_string()]);
+            // Simulator thumbnails stay simulator-shaped (brightness/tint,
+            // never imagePath) -- the same one-of contract every other
+            // simulated thumbnail already honors.
+            assert!(entry.thumbnail.brightness.is_some());
+            assert!(entry.thumbnail.image_path.is_none());
+        }
+        assert!(
+            result.snaps.is_empty(),
+            "the simulator must never fabricate a snap"
+        );
+    }
+
+    #[test]
+    fn manual_frames_two_calls_return_stable_deterministic_thumbnails() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        let first = sim.manual_frames(vec![0, 135, 270]).expect("first call");
+        let second = sim.manual_frames(vec![0, 135, 270]).expect("second call");
+        assert_eq!(
+            first.thumbnails[0].thumbnail.brightness,
+            second.thumbnails[0].thumbnail.brightness,
+            "D-08/SIM-03 determinism: identical rows must hash to identical simulated tiles"
+        );
+        assert_ne!(
+            first.operation_id, second.operation_id,
+            "each placement arms its own fresh approval binding"
+        );
+    }
+
+    #[test]
+    fn manual_frames_rejects_fewer_than_two_rows() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        let err = sim.manual_frames(vec![100]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("at least 2"));
+    }
+
+    #[test]
+    fn manual_frames_rejects_non_increasing_rows() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        let err = sim.manual_frames(vec![200, 100, 400]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("strictly increasing"));
+    }
+
+    #[test]
+    fn manual_frames_rejects_a_row_outside_the_raster() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Mounted).expect("load media");
+
+        let row_count = sim_strip_row_count(Some(1));
+        let err = sim.manual_frames(vec![0, row_count + 50]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("lie inside the captured preview"));
+    }
+
+    #[test]
+    fn manual_frames_rejects_a_frame_shorter_than_the_15mm_floor() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        // 10 rows =~ 2.7 mm, well under the 15 mm floor.
+        let err = sim.manual_frames(vec![0, 10]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("real frames are at least 15 mm"));
+    }
+
+    /// S7b (adversarial review round 2, 2026-08-08): the ceiling is now the
+    /// scanner's fine-scan capture window (145 rows), tighter than
+    /// `manual_frames.py`'s own still-280-row gate -- proves the sim
+    /// refuses a frame between the two with the hardware-framed message,
+    /// not the old "real frames are at most 75 mm" film-framed one.
+    #[test]
+    fn manual_frames_rejects_a_frame_taller_than_the_scanner_capture_window() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        // 200 rows =~ 53.4 mm: comfortably a real film frame height, but
+        // past the 145-row capture-window ceiling.
+        let err = sim.manual_frames(vec![0, 200]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("the scanner captures about"));
+        assert!(!err.message.contains("real frames are at most"));
+    }
+
+    #[test]
+    fn manual_frames_accepts_exactly_at_the_145_row_capture_window_ceiling() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        sim.manual_frames(vec![0, SIM_MAXIMUM_MANUAL_FRAME_HEIGHT_ROWS])
+            .expect("exactly at the ceiling must still be accepted");
+        let err = sim
+            .manual_frames(vec![0, SIM_MAXIMUM_MANUAL_FRAME_HEIGHT_ROWS + 1])
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn manual_frames_requires_connection() {
+        let sim = SimulatedLs5000::new();
+        let err = sim.manual_frames(vec![0, 200]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotConnected);
+    }
+
+    #[test]
+    fn manual_frames_requires_loaded_media() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        let err = sim.manual_frames(vec![0, 200]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NoMedia);
+    }
+
+    // -- S7a (adversarial review round 2, 2026-08-08): sim manual-approval --
+    // -- binding, so a simulated manual placement is not a dead end --------
+
+    #[test]
+    fn a_manually_placed_frame_is_approvable_through_sim_roll_approve() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        sim.roll_approve(1, &result.operation_id)
+            .expect("a frame this placement returned must be approvable");
+        sim.roll_approve(2, &result.operation_id)
+            .expect("every returned frame is individually approvable");
+    }
+
+    #[test]
+    fn sim_roll_approve_still_refuses_every_non_manual_case_unchanged() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        // No manual_frames() call was ever made this session -- the
+        // simulator's pre-existing "no manual-review gate" refusal must be
+        // completely unchanged.
+        let err = sim.roll_approve(1, "some-operation-id").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("no other manual-review gate"));
+    }
+
+    #[test]
+    fn sim_roll_approve_rejects_a_frame_outside_the_manual_binding() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        let result = sim.manual_frames(vec![0, 135, 270]).expect("2-frame placement");
+        let err = sim.roll_approve(99, &result.operation_id).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn sim_roll_approve_rejects_a_mismatched_operation_id() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+
+        sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        let err = sim.roll_approve(1, "not-the-real-operation-id").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn sim_manual_approval_binding_does_not_survive_a_fresh_load_media() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+
+        // A different carrier loaded afterward invalidates the old binding
+        // (S2's own "stale frame-indexed state must never survive a
+        // materially different registration" principle, applied here to
+        // the simulator's session-scoped approval binding).
+        sim.load_media(MediaCarrier::Strip6).expect("reload media");
+        let err = sim.roll_approve(1, &result.operation_id).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn sim_manual_approval_binding_does_not_survive_reconnect() {
+        let sim = SimulatedLs5000::new();
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+
+        sim.disconnect().expect("disconnect");
+        sim.connect(DEVICE_ID, &ConnectOptions::default())
+            .expect("reconnect");
+        sim.load_media(MediaCarrier::Roll36).expect("reload media");
+        let err = sim.roll_approve(1, &result.operation_id).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 }
