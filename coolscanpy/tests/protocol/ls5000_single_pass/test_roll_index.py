@@ -1718,3 +1718,77 @@ def test_manual_placement_accepts_every_archived_automatic_boundary_set() -> Non
             "boundary -- expected <= 5.0 (this codebase's own leading-"
             "anchor wobble allowance)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Power-on housekeeping collapse (first observed 2026-08-08, the first
+# preview after a scanner power cycle): partway through the capture the odd
+# parity's housekeeping record collapses into the even parity's record and
+# stays there. Accepted in exactly that shape only.
+
+
+def _collapse_odd_housekeeping(stream: bytes, from_row: int) -> bytes:
+    rows = np.frombuffer(stream, dtype=">u2").copy().reshape(-1, roll.INDEX_ROW_WORDS)
+    even_record = rows[0, roll.INDEX_RGB_WORDS_PER_ROW :].copy()
+    for row in range(from_row, len(rows)):
+        if row % 2 == 1:
+            rows[row, roll.INDEX_RGB_WORDS_PER_ROW :] = even_record
+    return rows.astype(">u2", copy=False).tobytes()
+
+
+def test_power_on_housekeeping_collapse_suffix_is_accepted() -> None:
+    rgb = np.arange(20 * 96 * 3, dtype=np.uint16).reshape(20, 96, 3)
+    stream = _collapse_odd_housekeeping(_encode_index(rgb), from_row=13)
+    geometry = roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, len(stream))
+
+    decoded, known, report = roll.decode_full_index_bytes(stream, geometry)
+
+    np.testing.assert_array_equal(decoded, rgb)
+    assert known.all()
+    assert report["housekeeping_suffix_start"] == 13
+    assert report["odd_housekeeping"] == "canonical-aa55-counter"
+
+
+def test_power_on_collapse_to_garbage_still_refuses() -> None:
+    rgb = np.arange(20 * 96 * 3, dtype=np.uint16).reshape(20, 96, 3)
+    rows = (
+        np.frombuffer(_encode_index(rgb), dtype=">u2")
+        .copy()
+        .reshape(-1, roll.INDEX_ROW_WORDS)
+    )
+    for row in range(13, len(rows), 2):  # odd rows only: not the even record
+        rows[row, roll.INDEX_RGB_WORDS_PER_ROW :] = 0x1234
+    stream = rows.astype(">u2", copy=False).tobytes()
+    geometry = roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, len(stream))
+
+    with pytest.raises(roll.IndexDecodeError, match="framing mismatch at usable row 13"):
+        roll.decode_full_index_bytes(stream, geometry)
+
+
+def test_power_on_collapse_with_reversion_still_refuses() -> None:
+    """One transition only: collapse then back to canonical must refuse."""
+
+    rgb = np.arange(24 * 96 * 3, dtype=np.uint16).reshape(24, 96, 3)
+    stream = _collapse_odd_housekeeping(_encode_index(rgb), from_row=13)
+    rows = np.frombuffer(stream, dtype=">u2").copy().reshape(-1, roll.INDEX_ROW_WORDS)
+    canonical = np.frombuffer(_encode_index(rgb), dtype=">u2").reshape(
+        -1, roll.INDEX_ROW_WORDS
+    )
+    rows[21, roll.INDEX_RGB_WORDS_PER_ROW :] = canonical[
+        21, roll.INDEX_RGB_WORDS_PER_ROW :
+    ]
+    stream = rows.astype(">u2", copy=False).tobytes()
+    geometry = roll.IndexGeometry(97, 4000, 41, 3946, 24, 96, 24, 2048, len(stream))
+
+    with pytest.raises(roll.IndexDecodeError, match="framing mismatch"):
+        roll.decode_full_index_bytes(stream, geometry)
+
+
+def test_healthy_captures_report_no_housekeeping_suffix() -> None:
+    rgb = np.arange(20 * 96 * 3, dtype=np.uint16).reshape(20, 96, 3)
+    stream = _encode_index(rgb)
+    geometry = roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, len(stream))
+
+    _decoded, _known, report = roll.decode_full_index_bytes(stream, geometry)
+
+    assert report["housekeeping_suffix_start"] is None
