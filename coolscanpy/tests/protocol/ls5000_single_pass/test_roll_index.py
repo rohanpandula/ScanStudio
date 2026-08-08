@@ -44,14 +44,15 @@ LIVE_TABLE = LIVE_PREVIEW_ATTEMPT / "capture-008e.bin" if LIVE_PREVIEW_ATTEMPT e
 # anywhere under this root is a real archived LS-5000 traversal from this
 # project's own reverse-engineering and live-validation work -- exactly the
 # corpus the adversarial review used to prove the pre-rework gate 4 refused
-# 51 of 51 real captures at the first frame edge. Defaults to this
-# developer machine's own copy (present for this project's own contributor;
-# absent everywhere else, including CI), and skips cleanly either way,
-# following the same convention as COOLSCANPY_SINGLE_PASS_WIRE_DIR and
+# 51 of 51 real captures at the first frame edge. Env-only, no baked-in
+# default: the packaged-bridge self-containment check rightly refuses any
+# bundle retaining a private source path, so the archive location lives
+# solely in the contributor's environment. Unset skips cleanly, following
+# the same convention as COOLSCANPY_SINGLE_PASS_WIRE_DIR and
 # COOLSCANPY_LIVE_PREVIEW_ATTEMPT_DIR above.
 _ARCHIVE_ROOT_ENV = "COOLSCANPY_ARCHIVE_ROOT"
-_default_archive_root = "/Users/rohan/Downloads/digital-ice-2026"
-ARCHIVE_ROOT = Path(os.environ.get(_ARCHIVE_ROOT_ENV, _default_archive_root))
+_archive_root_value = os.environ.get(_ARCHIVE_ROOT_ENV)
+ARCHIVE_ROOT = Path(_archive_root_value) if _archive_root_value else None
 
 
 def _encode_index(rgb16: np.ndarray) -> bytes:
@@ -1531,10 +1532,10 @@ def test_all_wide_no_narrow_anchors_refuses_mapping() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _archive_capture_pairs(root: Path) -> list[tuple[Path, Path]]:
+def _archive_capture_pairs(root: Path | None) -> list[tuple[Path, Path]]:
     """Every (preview, table) pair under root, deduped by preview SHA-256."""
 
-    if not root.is_dir():
+    if root is None or not root.is_dir():
         return []
     seen: set[str] = set()
     pairs: list[tuple[Path, Path]] = []
