@@ -353,7 +353,7 @@ struct BatchInspectorView: View {
                         externalPathField(label: "Builder LUT — red", path: coolColorsBuilderRedPathBinding, prompt: "Choose the matching red builder LUT", types: ["npy"])
                         externalPathField(label: "Builder LUT — green", path: coolColorsBuilderGreenPathBinding, prompt: "Choose the matching green builder LUT", types: ["npy"])
                         externalPathField(label: "Builder LUT — blue", path: coolColorsBuilderBluePathBinding, prompt: "Choose the matching blue builder LUT", types: ["npy"])
-                        Text("Optional exact Nikon source: when all three matching builder LUTs are supplied, ScanStudio uses the Cool Colors Nikon replay. Otherwise it uses the built-in NikonLook renderer.")
+                        Text("Use the three matching builder files to make ScanStudio Nikon match Nikon Scan. Without them, ScanStudio uses its built-in Nikon look.")
                             .font(.system(size: 10))
                             .foregroundStyle(Color.scanStudioSecondaryText)
                             .fixedSize(horizontal: false, vertical: true)
