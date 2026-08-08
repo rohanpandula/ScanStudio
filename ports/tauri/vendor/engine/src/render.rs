@@ -6,6 +6,9 @@
 //! regenerable derivatives, by design.
 
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain;
 use crate::parity::image_io;
@@ -1988,6 +1991,133 @@ fn render_positive(
     }
 }
 
+/// Runs the operator-selected local Cool Colors checkout for the experimental
+/// Nikon OEM replay. This is deliberately an adapter, not a second guessed
+/// color fit: the checkout owns the captured CML4 assets and verifies the
+/// three builder LUTs. The source archive and every supplied path stay local.
+fn render_nikon_oem_replay(
+    archive_rgb_path: &Path,
+    inputs: &domain::CoolColorsInputs,
+) -> Result<(Vec<[f64; 3]>, u32, u32), domain::EngineError> {
+    let required = |value: &Option<String>, label: &str| -> Result<PathBuf, domain::EngineError> {
+        let path = value.as_ref().filter(|value| !value.is_empty()).map(PathBuf::from).ok_or_else(|| {
+            domain::EngineError::new(
+                protocol::ErrorCode::InvalidParams,
+                format!("XXX (Testing) Nikon OEM replay needs {label}"),
+            )
+        })?;
+        if !path.exists() {
+            return Err(domain::EngineError::new(
+                protocol::ErrorCode::InvalidParams,
+                format!("XXX (Testing) Nikon OEM replay cannot find {label}: {}", path.display()),
+            ));
+        }
+        Ok(path)
+    };
+    let checkout = required(&inputs.checkout_path, "a local Cool Colors folder")?;
+    let red = required(&inputs.builder_red_path, "the red builder LUT")?;
+    let green = required(&inputs.builder_green_path, "the green builder LUT")?;
+    let blue = required(&inputs.builder_blue_path, "the blue builder LUT")?;
+    let entrypoint = checkout.join("invert_c41.py");
+    if !entrypoint.is_file() {
+        return Err(domain::EngineError::new(
+            protocol::ErrorCode::InvalidParams,
+            format!("XXX (Testing) expected Cool Colors' invert_c41.py in {}", checkout.display()),
+        ));
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let output = std::env::temp_dir().join(format!(
+        "scanstudio-nikon-oem-{}-{nonce}.tif",
+        std::process::id()
+    ));
+    let receipt = PathBuf::from(format!("{}.receipt.json", output.display()));
+    let command = Command::new("python3")
+        .arg(&entrypoint)
+        .arg(archive_rgb_path)
+        .arg(&output)
+        .arg("--builder")
+        .arg(red)
+        .arg(green)
+        .arg(blue)
+        .arg("--nikon-cms")
+        .output()
+        .map_err(|error| domain::EngineError::new(
+            protocol::ErrorCode::Internal,
+            format!("XXX (Testing) could not start local Cool Colors: {error}"),
+        ))?;
+    if !command.status.success() {
+        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(&receipt);
+        return Err(domain::EngineError::new(
+            protocol::ErrorCode::InvalidParams,
+            format!(
+                "XXX (Testing) Nikon OEM replay refused this scan: {}",
+                String::from_utf8_lossy(&command.stderr).trim()
+            ),
+        ));
+    }
+    let image = image_io::read_rgb16(&output).map_err(|error| domain::EngineError::new(
+        protocol::ErrorCode::Internal,
+        format!("XXX (Testing) could not read the local Nikon replay: {error}"),
+    ));
+    let _ = std::fs::remove_file(&output);
+    let _ = std::fs::remove_file(&receipt);
+    let image = image?;
+    let pixels = image.pixels.into_iter().map(|pixel| [
+        pixel[0] as f64 / 65535.0,
+        pixel[1] as f64 / 65535.0,
+        pixel[2] as f64 / 65535.0,
+    ]).collect();
+    Ok((pixels, image.width, image.height))
+}
+
+fn exact_nikon_requested(inputs: &domain::CoolColorsInputs) -> bool {
+    [
+        &inputs.checkout_path,
+        &inputs.builder_red_path,
+        &inputs.builder_green_path,
+        &inputs.builder_blue_path,
+    ]
+    .iter()
+    .any(|path| path.as_ref().is_some_and(|path| !path.is_empty()))
+}
+
+/// Noritsu's recovered output curve is deliberately strong on its own. Lab
+/// operators normally temper it with exposure and print adjustments, so this
+/// export mode mixes only a restrained portion over the Nikon-positive base.
+/// That retains the warmer, denser Noritsu character without crushing the
+/// frame into the high-contrast display look.
+const NORITSU_LAB_CURVE: [f64; 20] = [
+    0.0, 76.0 / 65535.0, 203.0 / 65535.0, 445.0 / 65535.0, 880.0 / 65535.0,
+    1583.0 / 65535.0, 2633.0 / 65535.0, 4108.0 / 65535.0, 6187.0 / 65535.0,
+    9214.0 / 65535.0, 13545.0 / 65535.0, 19538.0 / 65535.0, 27390.0 / 65535.0,
+    36346.0 / 65535.0, 45295.0 / 65535.0, 53128.0 / 65535.0, 58736.0 / 65535.0,
+    61539.0 / 65535.0, 63657.0 / 65535.0, 1.0,
+];
+const NORITSU_LAB_STRENGTH: f64 = 0.30;
+
+fn apply_noritsu_lab_mode(pixels: Vec<[f64; 3]>) -> Vec<[f64; 3]> {
+    pixels
+        .into_iter()
+        .map(|pixel| {
+            pixel.map(|value| {
+                let clamped = value.clamp(0.0, 1.0);
+                let position = clamped * (NORITSU_LAB_CURVE.len() - 1) as f64;
+                let left = position.floor() as usize;
+                let right = (left + 1).min(NORITSU_LAB_CURVE.len() - 1);
+                let mapped = NORITSU_LAB_CURVE[left]
+                    + (NORITSU_LAB_CURVE[right] - NORITSU_LAB_CURVE[left])
+                        * (position - left as f64);
+                value * (1.0 - NORITSU_LAB_STRENGTH) + mapped * NORITSU_LAB_STRENGTH
+            })
+        })
+        .collect()
+}
+
 /// Conservative RGB-only, classical-CV cleanup for isolated bright/dark B&W
 /// dust impulses. Runs after B&W inversion on derivatives only; archive pixels
 /// are never passed here. A low-variance 5×5 outer ring supplies the local
@@ -2328,8 +2458,80 @@ pub fn render_derivative_from_archive_with_processing(
         None
     };
 
-    let (positive_full, nikonlook) =
-        render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?;
+    let (positive_full, nikonlook) = match recipes.c41_render.target {
+        domain::C41RenderTarget::NikonOemReplay => {
+            if processing.film_process != domain::FilmProcess::C41ColorNegative {
+                return Err(domain::EngineError::new(
+                    protocol::ErrorCode::InvalidParams,
+                    "XXX (Testing) Nikon OEM replay only supports C-41 color-negative scans".to_string(),
+                ));
+            }
+            let (positive, replay_width, replay_height) =
+                render_nikon_oem_replay(archive_rgb_path, &recipes.c41_render.cool_colors)?;
+            if replay_width != width || replay_height != height {
+                return Err(domain::EngineError::new(
+                    protocol::ErrorCode::Internal,
+                    format!(
+                        "XXX (Testing) Nikon OEM replay changed the frame dimensions from {width}x{height} to {replay_width}x{replay_height}"
+                    ),
+                ));
+            }
+            (positive, None)
+        }
+        domain::C41RenderTarget::Nikonlook => {
+            let cool_colors = &recipes.c41_render.cool_colors;
+            if exact_nikon_requested(cool_colors) {
+                if processing.film_process != domain::FilmProcess::C41ColorNegative {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::InvalidParams,
+                        "exact Nikon replay only supports C-41 color-negative scans".to_string(),
+                    ));
+                }
+                let (positive, replay_width, replay_height) =
+                    render_nikon_oem_replay(archive_rgb_path, cool_colors)?;
+                if replay_width != width || replay_height != height {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::Internal,
+                        format!(
+                            "exact Nikon replay changed the frame dimensions from {width}x{height} to {replay_width}x{replay_height}"
+                        ),
+                    ));
+                }
+                (positive, None)
+            } else {
+                render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?
+            }
+        }
+        domain::C41RenderTarget::NoritsuLs600 => {
+            let cool_colors = &recipes.c41_render.cool_colors;
+            let (nikon, provenance) = if exact_nikon_requested(cool_colors) {
+                if processing.film_process != domain::FilmProcess::C41ColorNegative {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::InvalidParams,
+                        "Noritsu Lab Mode only supports C-41 color-negative scans".to_string(),
+                    ));
+                }
+                let (positive, replay_width, replay_height) =
+                    render_nikon_oem_replay(archive_rgb_path, cool_colors)?;
+                if replay_width != width || replay_height != height {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::Internal,
+                        "exact Nikon replay changed the frame dimensions before Noritsu Lab Mode".to_string(),
+                    ));
+                }
+                (positive, None)
+            } else {
+                render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?
+            };
+            (apply_noritsu_lab_mode(nikon), provenance)
+        }
+        target => {
+            return Err(domain::EngineError::new(
+                protocol::ErrorCode::InvalidParams,
+                format!("XXX (Testing) {target:?} export is not wired yet; choose Noritsu Lab Mode or ScanStudio NikonLook"),
+            ));
+        }
+    };
     drop(raw_linear);
     let positive_full = if processing.film_process == domain::FilmProcess::BwNegative
         && processing.software_dust_removal_bw

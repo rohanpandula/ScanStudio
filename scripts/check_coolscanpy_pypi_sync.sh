@@ -22,10 +22,23 @@ set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 VENDORED_DIRS="coolscanpy/src/coolscanpy"
+# Each entry names WHY it diverges; anything not listed must match the
+# published package byte-for-byte, which is how this gate catches sync lag.
 KNOWN_VENDORED_DIVERGENCE=(
+  # required scanner_identity + capture-timing feature
   "protocol/ls5000_single_pass/worker.py"
+  # LeadingFrameClippedError + confident-clear-film gate
   "protocol/ls5000_single_pass/roll_index.py"
+  # its export surface for the class above
+  "protocol/ls5000_single_pass/__init__.py"
+  # pins differ because the two files above differ
   "protocol/ls5000_single_pass/bundle.py"
+  # packaged-app libusb resolution (app bundles its own signed binary)
+  "protocol/ls5000_single_pass/usb_backend.py"
+  # capture-timing receipt fields (started_at/duration)
+  "src/coolscanpy/_roll.py"
+  "capture/single_pass_workflow.py"
+  "src/coolscanpy/types.py"
 )
 
 workdir="$(mktemp -d)"

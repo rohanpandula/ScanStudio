@@ -350,6 +350,7 @@ pub fn create_project(
     // computed just above — never a shared, project-unaware location.
     let recipes = OutputRecipe {
         auto_crop: false,
+        c41_render: crate::domain::C41RenderRecipe::default(),
         archive: ArchiveRecipe {
             destination: directory.join("Archive").display().to_string(),
             ..ArchiveRecipe::default()

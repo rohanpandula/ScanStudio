@@ -572,12 +572,82 @@ public enum RawExportFormat: String, Codable, CaseIterable, Identifiable, Sendab
     public var id: String { rawValue }
 }
 
+/// Renderer for C-41 positive/preview derivatives. The archive master is
+/// independent and always remains untouched scanner RGB.
+public enum C41RenderTarget: String, Codable, CaseIterable, Identifiable, Sendable {
+    case nikonlook
+    case nikonOemReplay
+    case noritsuLs600
+    case flexcolorCleanroom
+
+    public var id: String { rawValue }
+}
+
 public enum RawTiffInfrared: String, Codable, CaseIterable, Identifiable, Sendable {
     case fourthChannel
     case omitted
     case sidecar
 
     public var id: String { rawValue }
+}
+
+/// Operator-owned clean-room FlexColor inputs. Only paths are persisted; no
+/// profile, LUT, or ICC bytes are copied into the project manifest.
+public struct FlexColorInputs: Codable, Equatable, Sendable {
+    public let imageSettingPath: String?
+    public let lutTablePath: String?
+    public let inputIccPath: String?
+
+    public init(imageSettingPath: String? = nil, lutTablePath: String? = nil, inputIccPath: String? = nil) {
+        self.imageSettingPath = imageSettingPath
+        self.lutTablePath = lutTablePath
+        self.inputIccPath = inputIccPath
+    }
+}
+
+/// Local paths for the experimental Nikon Scan replay. The Cool Colors
+/// checkout and per-frame builder LUTs remain outside the ScanStudio project.
+public struct CoolColorsInputs: Codable, Equatable, Sendable {
+    public let checkoutPath: String?
+    public let builderRedPath: String?
+    public let builderGreenPath: String?
+    public let builderBluePath: String?
+
+    public init(
+        checkoutPath: String? = nil,
+        builderRedPath: String? = nil,
+        builderGreenPath: String? = nil,
+        builderBluePath: String? = nil
+    ) {
+        self.checkoutPath = checkoutPath
+        self.builderRedPath = builderRedPath
+        self.builderGreenPath = builderGreenPath
+        self.builderBluePath = builderBluePath
+    }
+}
+
+public struct C41RenderRecipe: Codable, Equatable, Sendable {
+    public let target: C41RenderTarget
+    public let flexcolor: FlexColorInputs
+    public let coolColors: CoolColorsInputs
+
+    public init(
+        target: C41RenderTarget = .nikonlook,
+        flexcolor: FlexColorInputs = FlexColorInputs(),
+        coolColors: CoolColorsInputs = CoolColorsInputs()
+    ) {
+        self.target = target
+        self.flexcolor = flexcolor
+        self.coolColors = coolColors
+    }
+
+    private enum CodingKeys: String, CodingKey { case target, flexcolor, coolColors }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        target = try values.decodeIfPresent(C41RenderTarget.self, forKey: .target) ?? .nikonlook
+        flexcolor = try values.decodeIfPresent(FlexColorInputs.self, forKey: .flexcolor) ?? FlexColorInputs()
+        coolColors = try values.decodeIfPresent(CoolColorsInputs.self, forKey: .coolColors) ?? CoolColorsInputs()
+    }
 }
 
 public struct ProcessingRecipe: Codable, Equatable, Sendable {
@@ -746,22 +816,27 @@ public struct OutputRecipe: Codable, Equatable, Sendable {
     /// on their historic uncropped behavior. Mirrors
     /// `domain.rs::OutputRecipe.auto_crop`.
     public let autoCrop: Bool
+    public let c41Render: C41RenderRecipe
 
     public init(
         archive: ArchiveRecipe,
         rawExport: RawExportRecipe = RawExportRecipe(),
         positive: PositiveRecipe,
         preview: PreviewRecipe,
-        autoCrop: Bool = false
+        autoCrop: Bool = false,
+        c41Render: C41RenderRecipe = C41RenderRecipe()
     ) {
         self.archive = archive
         self.rawExport = rawExport
         self.positive = positive
         self.preview = preview
         self.autoCrop = autoCrop
+        self.c41Render = c41Render
     }
 
-    private enum CodingKeys: String, CodingKey { case archive, rawExport, positive, preview, autoCrop }
+    private enum CodingKeys: String, CodingKey {
+        case archive, rawExport, positive, preview, autoCrop, c41Render
+    }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         archive = try values.decode(ArchiveRecipe.self, forKey: .archive)
@@ -769,6 +844,7 @@ public struct OutputRecipe: Codable, Equatable, Sendable {
         positive = try values.decode(PositiveRecipe.self, forKey: .positive)
         preview = try values.decode(PreviewRecipe.self, forKey: .preview)
         autoCrop = try values.decodeIfPresent(Bool.self, forKey: .autoCrop) ?? false
+        c41Render = try values.decodeIfPresent(C41RenderRecipe.self, forKey: .c41Render) ?? C41RenderRecipe()
     }
 }
 
