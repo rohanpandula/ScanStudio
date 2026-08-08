@@ -94,9 +94,17 @@ struct FixtureDecodingTests {
         """.utf8)
         let decoded = try JSONDecoder().decode(OutputRecipe.self, from: legacy)
         #expect(!decoded.autoCrop, "older recipes without the key stay uncropped")
+        #expect(!decoded.rawExport.enabled, "older recipes do not silently start writing raw files")
 
         let enabled = OutputRecipe(
             archive: decoded.archive,
+            rawExport: RawExportRecipe(
+                enabled: true,
+                fileFormat: .linearTiff,
+                tiffInfrared: .sidecar,
+                filenameTemplate: "N_####.tif",
+                destination: "/tmp/n"
+            ),
             positive: decoded.positive,
             preview: decoded.preview,
             autoCrop: true
@@ -104,6 +112,8 @@ struct FixtureDecodingTests {
         let encoded = try JSONEncoder().encode(enabled)
         let back = try JSONDecoder().decode(OutputRecipe.self, from: encoded)
         #expect(back.autoCrop)
+        #expect(back.rawExport.fileFormat == .linearTiff)
+        #expect(back.rawExport.tiffInfrared == .sidecar)
     }
 
     @Test("08: scan.progress event decodes")

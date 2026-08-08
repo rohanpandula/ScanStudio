@@ -2453,6 +2453,27 @@ struct SessionEventPolicyTests {
         await client.terminate()
     }
 
+    @Test("raw export settings flow into the roll-wide output recipe and remain opt-in")
+    @MainActor
+    func rawExportSettingsFlowIntoOutputRecipe() async throws {
+        let client = try EngineClient(engineURL: URL(fileURLWithPath: "/bin/cat"))
+        let model = SessionModel(engineClient: client)
+
+        #expect(!model.outputRecipe.rawExport.enabled)
+        model.setRawExportEnabled(true)
+        model.rawExportFormat = .linearTiff
+        model.rawTiffInfrared = .sidecar
+        model.rawExportFilenameTemplate = "Negative#"
+        model.saveEachOutputInOwnFolder = false
+
+        let raw = model.outputRecipe.rawExport
+        #expect(raw.enabled)
+        #expect(raw.fileFormat == .linearTiff)
+        #expect(raw.tiffInfrared == .sidecar)
+        #expect(raw.filenameTemplate == "Negative#-Raw")
+        await client.terminate()
+    }
+
     @Test("scan.frameState stores per-frame attempt and error")
     @MainActor
     func frameStateStoresAttemptAndError() async throws {

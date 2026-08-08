@@ -279,6 +279,90 @@ pub enum OutputColorProfile {
     ProPhotoRgb,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RawExportFormat {
+    #[default]
+    LinearDng,
+    LinearTiff,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RawTiffInfrared {
+    #[default]
+    FourthChannel,
+    Omitted,
+    Sidecar,
+}
+
+/// The C-41 renderer used for regenerable positive and preview derivatives.
+/// The archive always retains the untouched scanner RGB master.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum C41RenderTarget {
+    #[default]
+    Nikonlook,
+    /// Local-only Nikon Scan CML4 replay. It requires a user-selected
+    /// Cool Colors checkout and the three builder LUTs produced for this
+    /// exact acquisition; no LUT or profile bytes are embedded here.
+    NikonOemReplay,
+    NoritsuLs600,
+    FlexcolorCleanroom,
+}
+
+/// Operator-owned inputs for the experimental Nikon Scan replay. The
+/// checkout is deliberately external: ScanStudio does not redistribute its
+/// captured CML assets, and all three LUTs are tied to one raw scan.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CoolColorsInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_red_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_green_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_blue_path: Option<String>,
+}
+
+/// Optional paths to user-owned FlexColor calibration inputs.  These are
+/// deliberately paths, never embedded profile/LUT/ICC bytes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FlexcolorInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_setting_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lut_table_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_icc_path: Option<String>,
+}
+
+/// Selects the C-41 derivative renderer and, for the clean-room FlexColor
+/// path, identifies the operator-owned inputs it may read.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct C41RenderRecipe {
+    #[serde(default)]
+    pub target: C41RenderTarget,
+    #[serde(default)]
+    pub flexcolor: FlexcolorInputs,
+    #[serde(default)]
+    pub cool_colors: CoolColorsInputs,
+}
+
+impl Default for C41RenderRecipe {
+    fn default() -> Self {
+        Self {
+            target: C41RenderTarget::Nikonlook,
+            flexcolor: FlexcolorInputs::default(),
+            cool_colors: CoolColorsInputs::default(),
+        }
+    }
+}
+
 fn default_archive_filename_template() -> String {
     "ScanStudio#".to_string()
 }
@@ -295,11 +379,11 @@ fn default_archive_filename_template() -> String {
 /// This is only ever a *generic, project-directory-unaware* fallback: the
 /// `#[serde(default = ...)]` path for a manifest missing this key entirely
 /// (old schema versions predating recipes — see manifest.rs's migration
-/// tests) and `ArchiveRecipe`/`PositiveRecipe`/`PreviewRecipe`'s `Default`
-/// impl for any construction site with no project directory in scope
+/// tests) and the output sub-recipes' `Default` implementations for any
+/// construction site with no project directory in scope
 /// (e.g. `OutputRecipe::default()` in tests). `manifest::create_project`
 /// never actually ships this value for a real project — it overwrites all
-/// three destinations with paths rooted under the new project's own
+/// four destinations with paths rooted under the new project's own
 /// directory immediately after constructing them.
 ///
 /// Defect 8 (2026-07-25): this function and its two siblings previously
@@ -322,6 +406,47 @@ fn default_archive_destination() -> String {
         .join("Archive")
         .display()
         .to_string()
+}
+
+fn default_raw_export_filename_template() -> String {
+    "ScanStudio#".to_string()
+}
+
+fn default_raw_export_destination() -> String {
+    fallback_unfiled_root()
+        .join("Raw Negative")
+        .display()
+        .to_string()
+}
+
+/// Optional untouched-negative output. It is disabled by default for wire
+/// and manifest compatibility. `Sidecar` writes available IR to a paired
+/// grayscale TIFF for either format; legacy DNG values retain embedded IR.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawExportRecipe {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub file_format: RawExportFormat,
+    #[serde(default)]
+    pub tiff_infrared: RawTiffInfrared,
+    #[serde(default = "default_raw_export_filename_template")]
+    pub filename_template: String,
+    #[serde(default = "default_raw_export_destination")]
+    pub destination: String,
+}
+
+impl Default for RawExportRecipe {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            file_format: RawExportFormat::default(),
+            tiff_infrared: RawTiffInfrared::default(),
+            filename_template: default_raw_export_filename_template(),
+            destination: default_raw_export_destination(),
+        }
+    }
 }
 
 /// An optional, never-touched capture master ("archive-grade capture
@@ -443,7 +568,7 @@ impl Default for PreviewRecipe {
     }
 }
 
-/// Container holding the three independent recipes. Kept named
+/// Container holding the four independent recipes. Kept named
 /// `OutputRecipe` (not renamed) so `ScannerBackend::scan_start`'s
 /// signature stays textually unchanged — only the internal shape nests.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -455,16 +580,23 @@ pub struct OutputRecipe {
     pub positive: PositiveRecipe,
     #[serde(default)]
     pub preview: PreviewRecipe,
+    /// Optional, full-resolution untouched scanner-negative export.
+    #[serde(default)]
+    pub raw_export: RawExportRecipe,
     /// Non-destructive scan-time auto-crop. When true, each frame's derived
     /// outputs (positive/preview) are cropped to that frame's own detected
     /// film ROI via the parity-proven NegPy AUTO_FRAME_EDGE port. The
-    /// retained archive master is never cropped; the decision and ROI are
-    /// recorded per frame in `ScanReceipt.auto_crop`. An approved manual
-    /// frame alignment takes precedence, and a detection failure falls back
+    /// retained archive master and raw negative are never cropped; the
+    /// decision and ROI are recorded per frame in `ScanReceipt.auto_crop`.
+    /// An approved manual frame alignment takes precedence, and a detection failure falls back
     /// to the uncropped derivative with the outcome recorded. Missing key
     /// keeps older projects and clients uncropped.
     #[serde(default)]
     pub auto_crop: bool,
+    /// C-41 target for regenerable positive/preview exports. Missing keys
+    /// preserve the historic nikonlook output of existing projects.
+    #[serde(default)]
+    pub c41_render: C41RenderRecipe,
 }
 
 impl Default for OutputRecipe {
@@ -473,7 +605,9 @@ impl Default for OutputRecipe {
             archive: ArchiveRecipe::default(),
             positive: PositiveRecipe::default(),
             preview: PreviewRecipe::default(),
+            raw_export: RawExportRecipe::default(),
             auto_crop: false,
+            c41_render: C41RenderRecipe::default(),
         }
     }
 }
@@ -488,6 +622,7 @@ impl OutputRecipe {
             self.archive.filename_template.as_str(),
             self.positive.filename_template.as_str(),
             self.preview.filename_template.as_str(),
+            self.raw_export.filename_template.as_str(),
         ]
         .into_iter()
         .any(|template| template.contains(Self::RESERVED_FILENAME_MARKER_PREFIX))
@@ -497,7 +632,10 @@ impl OutputRecipe {
     /// engine's private capture workspace. The archive is optional, but an
     /// all-off recipe is never safe to dispatch.
     pub fn has_retained_output(&self) -> bool {
-        self.archive.enabled || self.positive.enabled || self.preview.enabled
+        self.archive.enabled
+            || self.positive.enabled
+            || self.preview.enabled
+            || self.raw_export.enabled
     }
 
     /// Full capture packages copy a retained master and its sidecars; they
@@ -511,7 +649,7 @@ impl OutputRecipe {
 /// finished positive/preview derivatives. Quarter-turn rotation is clockwise,
 /// and mirrors are evaluated in the unrotated source axes before rotation --
 /// the same ordering SwiftUI uses for ScanStudio's preview tiles. Capture
-/// masters and their IR/meter sidecars never consume this value.
+/// masters, raw negatives, and their IR/meter sidecars never consume this value.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DerivativeTransform {
@@ -601,6 +739,10 @@ pub struct WrittenOutputs {
     pub positive_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_negative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_negative_ir_path: Option<String>,
     /// Exact presentation transform used for the finished derivatives.
     /// Identity on legacy receipts whose `outputs` object predates this key.
     #[serde(default)]
@@ -1224,11 +1366,19 @@ mod tests {
     fn output_recipe_round_trips() {
         round_trip(&OutputRecipe {
             auto_crop: false,
+            c41_render: C41RenderRecipe::default(),
             archive: ArchiveRecipe {
                 enabled: true,
                 filename_template: "Archive_####".into(),
                 destination: "/Scans/Archive".into(),
                 full_capture_package: true,
+            },
+            raw_export: RawExportRecipe {
+                enabled: true,
+                file_format: RawExportFormat::LinearTiff,
+                tiff_infrared: RawTiffInfrared::Sidecar,
+                filename_template: "Negative_####.tif".into(),
+                destination: "/Scans/Raw".into(),
             },
             positive: PositiveRecipe {
                 enabled: false,
@@ -1249,10 +1399,22 @@ mod tests {
     }
 
     #[test]
+    fn output_recipe_missing_raw_export_defaults_to_disabled_for_legacy_projects() {
+        let mut value = serde_json::to_value(OutputRecipe::default()).unwrap();
+        value.as_object_mut().unwrap().remove("rawExport");
+        let output: OutputRecipe = serde_json::from_value(value).unwrap();
+        assert_eq!(output.raw_export, RawExportRecipe::default());
+        assert!(!output.raw_export.enabled);
+    }
+
+    #[test]
     fn output_recipe_detects_reserved_engine_filename_markers_even_when_the_role_is_disabled() {
         let mut output = OutputRecipe::default();
         output.preview.enabled = false;
         output.preview.filename_template = "Hidden$ScanStudioSequence(8)".into();
+        assert!(output.contains_reserved_filename_marker());
+        output.preview.filename_template = "Preview_####".into();
+        output.raw_export.filename_template = "Hidden$ScanStudioSequence(9)".into();
         assert!(output.contains_reserved_filename_marker());
         assert!(!OutputRecipe::default().contains_reserved_filename_marker());
     }

@@ -1192,6 +1192,36 @@ fn fixed_scan_receipt(
     let meter_path = sidecar("METER");
     tile.save(&meter_path)
         .expect("mock bridge must write its reported meter sidecar fixture");
+    let raw_export = match output.slot_outputs.as_ref() {
+        Some(slot_outputs) => slot_outputs
+            .get(&slot.to_string())
+            .and_then(|slot_output| slot_output.raw_export.as_ref()),
+        None => output.raw_export.as_ref(),
+    };
+    let raw_export_path = raw_export.map(|spec| {
+        let path = std::path::Path::new(&spec.destination).join(
+            scanstudio_engine::render::resolve_filename(&spec.filename_template, slot),
+        );
+        std::fs::create_dir_all(path.parent().expect("mock raw output has a parent"))
+            .expect("mock bridge must create its requested raw output directory");
+        tile.save_with_format(&path, image::ImageFormat::Tiff)
+            .expect("mock bridge must create its reported raw export fixture");
+        path
+    });
+    let raw_export_ir_path = raw_export.zip(raw_export_path.as_ref()).and_then(|(spec, raw)| {
+        (channels == BridgeChannels::Rgbi
+            && spec.tiff_infrared == BridgeRawTiffInfrared::Sidecar)
+            .then(|| {
+                let stem = raw
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .expect("mock raw output has a UTF-8 stem");
+                let path = raw.with_file_name(format!("{stem}-ir.tif"));
+                tile.save_with_format(&path, image::ImageFormat::Tiff)
+                    .expect("mock bridge must create its reported raw IR fixture");
+                path.display().to_string()
+            })
+    });
 
     BridgeScanReceipt {
         version: 1,
@@ -1241,6 +1271,8 @@ fn fixed_scan_receipt(
         rgb_path: rgb_path.display().to_string(),
         ir_path: ir_path.map(|path| path.display().to_string()),
         meter_rgbi_path: Some(meter_path.display().to_string()),
+        raw_export_path: raw_export_path.map(|path| path.display().to_string()),
+        raw_export_ir_path,
         attempts_root: None,
         exposure_authority: None,
         started_at: Some("2026-08-02T20:05:00+00:00".to_string()),

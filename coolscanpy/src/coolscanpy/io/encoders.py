@@ -1,9 +1,8 @@
-import io
 import os
 import struct
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import BinaryIO
 
 import numpy as np
 import tifffile
@@ -258,84 +257,164 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
     return path
 
 
-def write_dng_linear(result: ScanResult, path: str) -> str:
-    """Write ScanResult to an uncompressed 16-bit LinearRaw DNG via tifffile.
+_DNG_VERSION = (1, 4, 0, 0)
+_DNG_BACKWARD_VERSION = (1, 1, 0, 0)
+_INFRARED_TAG = 65001
+_INFRARED_MARKER = "scanstudio.infrared.linear.uint16.v1"
 
-    A LinearRaw DNG is a single-IFD TIFF plus a few DNG tags. If result.ir is
-    present it is stacked as an extra sample. Atomic write; returns final path.
+
+class _NamedBinaryFile:
+    """Give descriptor-backed streams the path-like name tifffile requires."""
+
+    def __init__(self, file: BinaryIO) -> None:
+        self._file = file
+        name = getattr(file, "name", None)
+        self.name = name if isinstance(name, (str, bytes, os.PathLike)) else "scanstudio.dng"
+
+    def __getattr__(self, name: str):
+        return getattr(self._file, name)
+
+
+def _ascii_scanner_model(value: str) -> str:
+    """Return a non-empty TIFF-ASCII model without inventing a different device."""
+
+    model = value.encode("ascii", "replace").decode("ascii").strip()
+    return model or "Unknown Coolscan"
+
+
+def _dng_main_extratags(*, width: int, height: int, model: str) -> list[tuple]:
+    unique_model = model if model.casefold().startswith("nikon") else f"Nikon {model}"
+    return [
+        (254, 4, 1, 0, True),  # NewSubfileType: full-resolution image
+        (50706, 1, 4, _DNG_VERSION, True),
+        (50707, 1, 4, _DNG_BACKWARD_VERSION, True),
+        (274, 3, 1, 1, True),  # Orientation: stored pixels are not transformed
+        (271, 2, 0, "Nikon", True),
+        (272, 2, 0, model, True),
+        (50708, 2, 0, unique_model, True),
+        (50714, "2I", 3, (0, 1, 0, 1, 0, 1), True),  # BlackLevel
+        (50717, 4, 3, (65535, 65535, 65535), True),  # WhiteLevel
+        (50718, "2I", 2, (1, 1, 1, 1), True),  # DefaultScale
+        (50719, 4, 2, (0, 0), True),  # DefaultCropOrigin
+        (50720, 4, 2, (width, height), True),  # DefaultCropSize
+        (50829, 4, 4, (0, 0, height, width), True),  # ActiveArea
+        (50728, "2I", 3, (1, 1, 1, 1, 1, 1), True),  # AsShotNeutral
+        (50778, 3, 1, 0, True),  # CalibrationIlluminant1: unknown
+        # No measured scanner-to-XYZ calibration exists. Identity is an
+        # explicit interoperability placeholder, paired with the unknown
+        # illuminant above, rather than a false sRGB/camera profile claim.
+        (
+            50721,
+            "2i",
+            9,
+            (1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1),
+            True,
+        ),
+    ]
+
+
+def _dng_ir_extratags() -> list[tuple]:
+    return [
+        (254, 4, 1, 0, True),
+        (274, 3, 1, 1, True),
+        (270, 2, 0, "Untouched scanner infrared plane", True),
+        (_INFRARED_TAG, 2, 0, _INFRARED_MARKER, True),
+    ]
+
+
+def write_dng_linear_to_file(file: BinaryIO, result: ScanResult) -> None:
+    """Encode one uncompressed LinearRaw DNG into a readable, seekable file.
+
+    The converter-facing main IFD is always three plain RGB samples. Infrared,
+    when present, is a same-size grayscale SubIFD carrying a versioned private
+    marker. Keeping IR out of the main image avoids the ambiguous four-sample
+    LinearRaw layout that raw processors commonly interpret as one color
+    sample plus three auxiliaries.
+
+    ``file`` is not closed. The caller owns publication and durability.
+    """
+
+    rgb = np.ascontiguousarray(_to_uint16(result.rgb))
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("Linear DNG RGB must have shape (height, width, 3)")
+    height, width, _ = rgb.shape
+    ir: np.ndarray | None = None
+    if result.ir is not None:
+        ir = np.ascontiguousarray(_to_uint16(result.ir))
+        if ir.ndim == 3 and ir.shape[2] == 1:
+            ir = ir[:, :, 0]
+        if ir.ndim != 2 or ir.shape != (height, width):
+            raise ValueError("Linear DNG IR must match the RGB height and width")
+
+    model = _ascii_scanner_model(result.device_model)
+    named_file = _NamedBinaryFile(file)
+    with tifffile.TiffWriter(named_file, byteorder="<") as writer:
+        writer.write(
+            rgb,
+            photometric=tifffile.PHOTOMETRIC.RGB,
+            compression=None,
+            metadata=None,
+            subifds=1 if ir is not None else None,
+            extratags=_dng_main_extratags(width=width, height=height, model=model),
+            resolution=(result.dpi, result.dpi),
+            resolutionunit="INCH",
+            software="ScanStudio",
+        )
+        if ir is not None:
+            writer.write(
+                ir,
+                photometric=tifffile.PHOTOMETRIC.MINISBLACK,
+                compression=None,
+                metadata=None,
+                extratags=_dng_ir_extratags(),
+                resolution=(result.dpi, result.dpi),
+                resolutionunit="INCH",
+                software="ScanStudio",
+            )
+
+    # tifffile models LinearRaw as one photometric sample. Writing the RGB
+    # page with RGB first is what produces three color samples and no
+    # ExtraSamples; patching only the already-emitted SHORT tag then gives
+    # DNG its required LinearRaw value without changing any strip bytes.
+    file.flush()
+    file.seek(0)
+    with tifffile.TiffFile(named_file) as tiff:
+        page = tiff.pages[0]
+        if page.samplesperpixel != 3 or page.extrasamples:
+            raise RuntimeError("Linear DNG main IFD did not encode as three plain RGB samples")
+        photometric_offset = page.tags["PhotometricInterpretation"].valueoffset
+        byteorder = tiff.byteorder
+    file.seek(photometric_offset)
+    written = file.write(struct.pack(byteorder + "H", 34892))
+    if written != 2:
+        raise OSError("short write while setting LinearRaw photometric tag")
+    file.flush()
+
+
+def write_dng_linear(result: ScanResult, path: str) -> str:
+    """Atomically write an uncompressed 16-bit LinearRaw DNG.
+
+    The final name is replaced only after the complete RGB main IFD, optional
+    embedded IR SubIFD, and LinearRaw tag patch are flushed and synced.
     """
     if not path.lower().endswith(".dng"):
         path = path + ".dng"
-
-    rgb = _to_uint16(result.rgb)
-
-    if result.ir is not None:
-        ir = result.ir
-        if ir.ndim == 2:
-            ir = ir[:, :, np.newaxis]
-        ir = _to_uint16(ir)
-        full_array = np.dstack([rgb, ir])
-    else:
-        full_array = np.ascontiguousarray(rgb)
-
-    model = result.device_model
-    # (code, dtype, count, value, writeonce); NewSubfileType=0 is required or LibRaw rejects the DNG.
-    extratags = [
-        (254, 4, 1, 0, True),  # NewSubfileType
-        (50706, 1, 4, (1, 4, 0, 0), True),  # DNGVersion
-        (50707, 1, 4, (1, 0, 0, 0), True),  # DNGBackwardVersion
-        (274, 3, 1, 1, True),  # Orientation
-        (271, 2, len(model) + 1, model, True),  # Make
-        (272, 2, len(model) + 1, model, True),  # Model
-    ]
-    payload = _encode_dng(full_array, extratags)
-
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(suffix=".dng", dir=os.path.dirname(path) or ".")
-    os.close(fd)
     try:
-        with open(tmp_path, "wb") as fh:
-            fh.write(payload)
+        with os.fdopen(fd, "w+b") as file:
+            write_dng_linear_to_file(file, result)
+            os.fsync(file.fileno())
         os.replace(tmp_path, path)
+        _fsync_directory(target.parent)
     except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
 
     return path
-
-
-def _encode_dng(full_array: np.ndarray, extratags: list) -> bytes:
-    """Encode an RGB(+IR) uint16 array as LinearRaw DNG bytes.
-
-    RGB is written with the RGB photometric so tifffile emits a clean 3 *color*
-    samples with no ExtraSamples (matching pidng); the PhotometricInterpretation
-    tag is then patched to LinearRaw (34892), which DNG requires. Marking colour
-    planes as ExtraSamples instead makes some raw processors treat the file as a
-    1-channel sensor + aux planes and mis-demosaic it.
-
-    The IR (4-sample) case keeps the LINEAR_RAW photometric with the extra planes
-    declared as extra samples — there the 4th plane genuinely is infrared, and
-    tifffile has no clean 4-colour-sample form.
-    """
-    buf = io.BytesIO()
-    if full_array.shape[-1] == 3:
-        tifffile.imwrite(buf, full_array, photometric=tifffile.PHOTOMETRIC.RGB, compression=None, metadata=None, extratags=extratags)
-        data = bytearray(buf.getvalue())
-        with tifffile.TiffFile(io.BytesIO(bytes(data))) as tf:
-            page = cast(tifffile.TiffPage, tf.pages[0])
-            offset = page.tags["PhotometricInterpretation"].valueoffset
-            byteorder = tf.byteorder
-        struct.pack_into(byteorder + "H", data, offset, 34892)  # RGB(2) → LinearRaw(34892)
-        return bytes(data)
-
-    extrasamples = (0,) * (full_array.shape[-1] - 1)
-    tifffile.imwrite(
-        buf,
-        full_array,
-        photometric=tifffile.PHOTOMETRIC.LINEAR_RAW,
-        compression=None,
-        metadata=None,
-        extrasamples=extrasamples,
-        extratags=extratags,
-    )
-    return buf.getvalue()

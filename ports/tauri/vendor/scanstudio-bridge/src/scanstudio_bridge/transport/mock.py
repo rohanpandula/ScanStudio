@@ -22,7 +22,12 @@ import tifffile
 from scanstudio_bridge import domain, safety
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
 from scanstudio_bridge.transport import FrameRetryExhausted, OnCall, phased_call, timed_call
-from scanstudio_bridge.transport.output_reservation import OutputReservations, write_tiff
+from scanstudio_bridge.transport.output_reservation import (
+    OutputReservations,
+    raw_export_for_slot,
+    write_raw_export,
+    write_tiff,
+)
 
 _DEVICE_ID = "mock-ls5000-0"
 _SYNTHETIC_FRAME_SIDE = 64
@@ -94,6 +99,8 @@ def _synthetic_receipt(
     rgb_path: str,
     ir_path: str | None,
     meter_rgbi_path: str | None,
+    raw_export_path: str | None,
+    raw_export_ir_path: str | None,
 ) -> domain.ScanReceipt:
     return domain.ScanReceipt(
         version=1,
@@ -144,6 +151,8 @@ def _synthetic_receipt(
         meter_rgbi_path=meter_rgbi_path,
         # MockTransport has no persistent CoolscanPy attempts journal.
         attempts_root=None,
+        raw_export_path=raw_export_path,
+        raw_export_ir_path=raw_export_ir_path,
     )
 
 
@@ -521,6 +530,7 @@ class MockTransport:
                 self._write_slot_output(
                     slot=slot,
                     recipe=recipe,
+                    output=output,
                     reservations=reservations,
                     on_frame=on_frame,
                     on_call=on_call,
@@ -596,6 +606,7 @@ class MockTransport:
         *,
         slot: int,
         recipe: domain.CaptureRecipe,
+        output: domain.OutputSpec,
         reservations: OutputReservations,
         on_frame: Callable[[int, domain.ScanReceipt], None],
         on_call: OnCall | None = None,
@@ -608,6 +619,7 @@ class MockTransport:
         caller's loop instead of returning."""
         paths = reservations.groups[slot]
         rgb_path = paths.rgb_path
+        rgb_frame = _synthetic_rgb_frame()
         # Plan 10-09: phased_call tags each file write as BOTH "scan.call"
         # (Plan 10-04, unchanged) AND "scan.phase" (this plan's addition)
         # -- mirrors CoolscanPyTransport.start_scan's identical file-write
@@ -616,19 +628,46 @@ class MockTransport:
             on_call,
             f"file_write.rgb:slot{slot}",
             lambda: write_tiff(
-                reservations, rgb_path, _synthetic_rgb_frame(), photometric="rgb"
+                reservations, rgb_path, rgb_frame, photometric="rgb"
             ),
         )
         ir_path_str: str | None = None
+        ir_frame: np.ndarray | None = None
         if recipe.channels is domain.Channels.RGBI:
             ir_path = paths.ir_path
             assert ir_path is not None
+            ir_frame = _synthetic_ir_frame()
             phased_call(
                 on_call,
                 f"file_write.ir:slot{slot}",
-                lambda: write_tiff(reservations, ir_path, _synthetic_ir_frame()),
+                lambda: write_tiff(reservations, ir_path, ir_frame),
             )
             ir_path_str = str(ir_path)
+        raw_export_path_str: str | None = None
+        raw_export_ir_path_str: str | None = None
+        raw_export_spec = raw_export_for_slot(output, slot)
+        if raw_export_spec is not None:
+            raw_export_path = paths.raw_export_path
+            assert raw_export_path is not None
+            raw_export_ir_path = paths.raw_export_ir_path
+            phased_call(
+                on_call,
+                f"file_write.raw:slot{slot}",
+                lambda: write_raw_export(
+                    reservations,
+                    raw_export_path,
+                    raw_export_ir_path,
+                    raw_export_spec,
+                    rgb=rgb_frame,
+                    ir=ir_frame,
+                    dpi=recipe.resolution_dpi,
+                    device_model="SUPER COOLSCAN 5000 ED (mock)",
+                ),
+            )
+            raw_export_path_str = str(raw_export_path)
+            raw_export_ir_path_str = (
+                str(raw_export_ir_path) if raw_export_ir_path is not None else None
+            )
         meter_rgbi_path_str: str | None = None
         if recipe.channels is domain.Channels.RGBI:
             meter_path = paths.meter_rgbi_path
@@ -646,6 +685,8 @@ class MockTransport:
             rgb_path=str(rgb_path),
             ir_path=ir_path_str,
             meter_rgbi_path=meter_rgbi_path_str,
+            raw_export_path=raw_export_path_str,
+            raw_export_ir_path=raw_export_ir_path_str,
         )
         on_frame(slot, receipt)
 

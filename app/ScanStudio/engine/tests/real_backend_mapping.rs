@@ -67,6 +67,7 @@ fn isolated_output_recipe() -> domain::OutputRecipe {
     };
     let mut output = domain::OutputRecipe::default();
     output.archive.destination = root.join("Archive").display().to_string();
+    output.raw_export.destination = root.join("Raw Negative").display().to_string();
     output.positive.destination = root.join("Positive").display().to_string();
     output.preview.destination = root.join("Preview").display().to_string();
     output
@@ -932,6 +933,58 @@ fn scan_start_emits_completed_receipts_marked_not_simulated() {
         .collect();
     completed_slots.sort_unstable();
     assert_eq!(completed_slots, vec![1, 2]);
+}
+
+#[test]
+fn scan_start_raw_only_maps_dng_sidecar_recipe_and_preserves_both_bridge_paths() {
+    let backend = Arc::new(
+        RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
+            .expect("RealLs5000::new should succeed against a healthy mock bridge"),
+    );
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect should succeed");
+
+    let mut output = isolated_output_recipe();
+    output.archive.enabled = false;
+    output.positive.enabled = false;
+    output.preview.enabled = false;
+    output.raw_export.enabled = true;
+    output.raw_export.file_format = domain::RawExportFormat::LinearDng;
+    output.raw_export.tiff_infrared = domain::RawTiffInfrared::Sidecar;
+    let raw_root = std::path::PathBuf::from(&output.raw_export.destination);
+
+    let (tx, rx) = mpsc::channel();
+    RealLs5000::scan_start(
+        &backend,
+        vec![1],
+        valid_capture_recipe(),
+        domain::ProcessingRecipe::default(),
+        output,
+        std::collections::HashMap::new(),
+        None,
+        tx,
+    )
+    .expect("a raw-only scan should be retained and accepted");
+
+    let events = drain_events(&rx, "scan.completed", GENEROUS_TIMEOUT);
+    let receipt = &events
+        .iter()
+        .find(|event| event["event"] == "scan.frameCompleted")
+        .expect("scan.frameCompleted must be present")["payload"]["receipt"];
+    let raw_path = receipt["outputs"]["rawNegativePath"]
+        .as_str()
+        .expect("completed receipt must expose the bridge-written raw path");
+    assert!(raw_path.ends_with(".dng"));
+    assert!(std::path::Path::new(raw_path).starts_with(&raw_root));
+    assert!(std::path::Path::new(raw_path).is_file());
+    let raw_ir_path = receipt["outputs"]["rawNegativeIrPath"]
+        .as_str()
+        .expect("completed receipt must expose the paired raw IR path");
+    assert!(raw_ir_path.ends_with("-ir.tif"));
+    assert!(std::path::Path::new(raw_ir_path).starts_with(&raw_root));
+    assert!(std::path::Path::new(raw_ir_path).is_file());
+    assert!(receipt["outputs"]["archivePath"].is_null());
 }
 
 /// Proves `build_real_receipt` forwards `BridgeScanReceipt`'s capture-file

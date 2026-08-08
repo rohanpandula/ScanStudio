@@ -618,6 +618,7 @@ pub(crate) fn receipt_output_recipe(output: &domain::OutputRecipe) -> domain::Ou
         &mut receipt_output.archive.filename_template,
         &mut receipt_output.positive.filename_template,
         &mut receipt_output.preview.filename_template,
+        &mut receipt_output.raw_export.filename_template,
     ] {
         *template = restore_reserved_sequence_template(template);
     }
@@ -701,6 +702,7 @@ pub fn resolve_filename(template: &str, frame_index: u32) -> String {
                 .is_some_and(|value| {
                     OutputNameKind::Tiff.recognizes_extension(value)
                         || OutputNameKind::Jpeg.recognizes_extension(value)
+                        || OutputNameKind::Dng.recognizes_extension(value)
                 });
             if recognized_output_extension {
                 let stem = path
@@ -731,6 +733,9 @@ fn reserve_auto_sequence_templates(recipes: &mut domain::OutputRecipe, number: u
     if recipes.preview.enabled {
         templates.push(&mut recipes.preview.filename_template);
     }
+    if recipes.raw_export.enabled {
+        templates.push(&mut recipes.raw_export.filename_template);
+    }
     for template in templates {
         if is_auto_sequence_template(template) {
             *template = reserve_sequence_template(template, number);
@@ -742,6 +747,8 @@ fn has_auto_sequence_template(recipes: &domain::OutputRecipe) -> bool {
     (recipes.archive.enabled && is_auto_sequence_template(&recipes.archive.filename_template))
         || (recipes.positive.enabled && is_auto_sequence_template(&recipes.positive.filename_template))
         || (recipes.preview.enabled && is_auto_sequence_template(&recipes.preview.filename_template))
+        || (recipes.raw_export.enabled
+            && is_auto_sequence_template(&recipes.raw_export.filename_template))
 }
 
 /// Returns the planned auto-numbered names, including archive sidecars. The
@@ -778,6 +785,17 @@ fn reserved_sequence_paths(
             0,
             recipes.preview.file_format,
         ));
+    }
+    if recipes.raw_export.enabled
+        && is_reserved_sequence_template(&recipes.raw_export.filename_template)
+    {
+        let raw = resolve_raw_export_output_path(recipes, 0);
+        paths.push(raw.clone());
+        if include_ir_sidecar
+            && recipes.raw_export.tiff_infrared == domain::RawTiffInfrared::Sidecar
+        {
+            paths.push(raw_export_ir_sidecar_path(&raw));
+        }
     }
     Ok(paths)
 }
@@ -880,6 +898,60 @@ fn highest_existing_sequence_number(
     }
 }
 
+fn highest_existing_raw_sequence_number(
+    destination: &str,
+    template: &str,
+    format: domain::RawExportFormat,
+) -> Result<u32, domain::EngineError> {
+    if !is_auto_sequence_template(template) {
+        return Ok(0);
+    }
+    let normalized = normalize_raw_export_filename_template(template, format);
+    let stem_template = std::path::Path::new(&normalized)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            domain::EngineError::new(
+                protocol::ErrorCode::InvalidParams,
+                format!("sequence template has no usable file name: {template}"),
+            )
+        })?;
+    let marker = stem_template.find('#').expect("single-hash template has marker");
+    let prefix = stem_template[..marker].to_ascii_lowercase();
+    let suffix = stem_template[marker + 1..].to_ascii_lowercase();
+    let parent = std::path::Path::new(destination);
+    match std::fs::read_dir(parent) {
+        Ok(mut entries) => entries.try_fold(0_u32, |highest, entry| {
+            let entry = entry.map_err(|error| {
+                domain::EngineError::new(
+                    protocol::ErrorCode::InvalidParams,
+                    format!("read output destination {}: {error}", parent.display()),
+                )
+            })?;
+            let stem = entry
+                .path()
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let Some(number) = stem
+                .strip_prefix(&prefix)
+                .and_then(|remaining| remaining.strip_suffix(&suffix))
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .filter(|number| *number > 0)
+            else {
+                return Ok(highest);
+            };
+            Ok(highest.max(number))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(domain::EngineError::new(
+            protocol::ErrorCode::InvalidParams,
+            format!("read output destination {}: {error}", parent.display()),
+        )),
+    }
+}
+
 fn highest_existing_sequence_for_recipe(
     recipes: &domain::OutputRecipe,
 ) -> Result<u32, domain::EngineError> {
@@ -903,6 +975,13 @@ fn highest_existing_sequence_for_recipe(
             &recipes.preview.destination,
             &recipes.preview.filename_template,
             recipes.preview.file_format,
+        )?);
+    }
+    if recipes.raw_export.enabled {
+        highest = highest.max(highest_existing_raw_sequence_number(
+            &recipes.raw_export.destination,
+            &recipes.raw_export.filename_template,
+            recipes.raw_export.file_format,
         )?);
     }
     Ok(highest)
@@ -1004,6 +1083,7 @@ pub fn validate_user_output_recipe_paths(
             recipes.archive.filename_template.as_str(),
             recipes.positive.filename_template.as_str(),
             recipes.preview.filename_template.as_str(),
+            recipes.raw_export.filename_template.as_str(),
         ]
         .into_iter()
         .any(is_reserved_sequence_template)
@@ -1012,6 +1092,7 @@ pub fn validate_user_output_recipe_paths(
         ("archive", recipes.archive.filename_template.as_str()),
         ("positive", recipes.positive.filename_template.as_str()),
         ("preview", recipes.preview.filename_template.as_str()),
+        ("raw export", recipes.raw_export.filename_template.as_str()),
     ] {
         if is_reserved_sequence_template(template) {
             return Err(domain::EngineError::new(
@@ -1035,6 +1116,13 @@ pub fn validate_output_recipe_paths(recipes: &domain::OutputRecipe) -> Result<()
     }
     if recipes.preview.enabled {
         outputs.push(("preview", recipes.preview.destination.as_str(), recipes.preview.filename_template.as_str()));
+    }
+    if recipes.raw_export.enabled {
+        outputs.push((
+            "raw export",
+            recipes.raw_export.destination.as_str(),
+            recipes.raw_export.filename_template.as_str(),
+        ));
     }
     for (label, destination, template) in outputs {
         let path = std::path::Path::new(template);
@@ -1061,6 +1149,7 @@ pub fn validate_output_recipe_paths(recipes: &domain::OutputRecipe) -> Result<()
 enum OutputNameKind {
     Tiff,
     Jpeg,
+    Dng,
 }
 
 impl OutputNameKind {
@@ -1068,6 +1157,7 @@ impl OutputNameKind {
         match self {
             Self::Tiff => "tif",
             Self::Jpeg => "jpg",
+            Self::Dng => "dng",
         }
     }
 
@@ -1081,6 +1171,7 @@ impl OutputNameKind {
                 extension.eq_ignore_ascii_case("jpg")
                     || extension.eq_ignore_ascii_case("jpeg")
             }
+            Self::Dng => extension.eq_ignore_ascii_case("dng"),
         }
     }
 }
@@ -1112,6 +1203,31 @@ pub(crate) fn normalize_output_filename_template(
     }
 }
 
+pub(crate) fn normalize_raw_export_filename_template(
+    filename_template: &str,
+    format: domain::RawExportFormat,
+) -> String {
+    let kind = match format {
+        domain::RawExportFormat::LinearDng => OutputNameKind::Dng,
+        domain::RawExportFormat::LinearTiff => OutputNameKind::Tiff,
+    };
+    let path = std::path::Path::new(filename_template);
+    let extension = path.extension().and_then(|value| value.to_str());
+    if extension.is_some_and(|value| kind.recognizes_extension(value)) {
+        return filename_template.to_string();
+    }
+    let is_known_output_extension = extension.is_some_and(|value| {
+        OutputNameKind::Tiff.recognizes_extension(value)
+            || OutputNameKind::Jpeg.recognizes_extension(value)
+            || OutputNameKind::Dng.recognizes_extension(value)
+    });
+    if is_known_output_extension {
+        let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or(filename_template);
+        return format!("{stem}.{}", kind.chosen_extension());
+    }
+    format!("{filename_template}.{}", kind.chosen_extension())
+}
+
 pub(crate) fn resolve_output_path(
     destination: &str,
     filename_template: &str,
@@ -1132,6 +1248,28 @@ pub(crate) fn resolve_archive_output_path(
         frame_index,
         domain::OutputFileFormat::Tiff,
     )
+}
+
+pub(crate) fn resolve_raw_export_output_path(
+    recipes: &domain::OutputRecipe,
+    frame_index: u32,
+) -> std::path::PathBuf {
+    let normalized = normalize_raw_export_filename_template(
+        &recipes.raw_export.filename_template,
+        recipes.raw_export.file_format,
+    );
+    std::path::Path::new(&recipes.raw_export.destination)
+        .join(resolve_filename(&normalized, frame_index))
+}
+
+pub(crate) fn raw_export_ir_sidecar_path(
+    raw_export_path: &std::path::Path,
+) -> std::path::PathBuf {
+    let stem = raw_export_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("raw-negative");
+    raw_export_path.with_file_name(format!("{stem}-ir.tif"))
 }
 
 pub(crate) fn archive_sidecar_path(
@@ -1360,6 +1498,7 @@ fn frame_target_candidates(
     frame_index: u32,
     include_ir_sidecar: bool,
     include_meter_sidecar: bool,
+    include_raw_ir_sidecar: bool,
 ) -> Result<Vec<TargetCandidate>, domain::EngineError> {
     validate_output_recipe_paths(recipes)?;
     let archive = recipes.archive.enabled.then(|| resolve_archive_output_path(recipes, frame_index));
@@ -1414,6 +1553,25 @@ fn frame_target_candidates(
             create_only: is_reserved_sequence_template(&recipes.preview.filename_template),
         });
     }
+    if recipes.raw_export.enabled {
+        let raw = resolve_raw_export_output_path(recipes, frame_index);
+        candidates.push(TargetCandidate {
+            slot: frame_index,
+            role: "raw negative",
+            path: raw.clone(),
+            create_only: true,
+        });
+        if include_raw_ir_sidecar
+            && recipes.raw_export.tiff_infrared == domain::RawTiffInfrared::Sidecar
+        {
+            candidates.push(TargetCandidate {
+                slot: frame_index,
+                role: "raw infrared sidecar",
+                path: raw_export_ir_sidecar_path(&raw),
+                create_only: true,
+            });
+        }
+    }
     Ok(candidates)
 }
 
@@ -1453,6 +1611,7 @@ pub fn validate_batch_output_paths(
             *frame_index,
             include_ir,
             true,
+            include_ir,
         )?);
     }
     validate_target_candidates(&candidates)
@@ -1575,11 +1734,79 @@ pub(crate) fn validate_bridge_capture_receipt_paths_for_expected(
     Ok(())
 }
 
+pub(crate) fn validate_bridge_raw_export_receipt_path(
+    expected: Option<&std::path::Path>,
+    actual: Option<&std::path::Path>,
+    frame_index: u32,
+) -> Result<(), domain::EngineError> {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) if targets_match(expected, actual)? => Ok(()),
+        (Some(expected), Some(actual)) => Err(domain::EngineError::new(
+            protocol::ErrorCode::InvalidParams,
+            format!(
+                "bridge raw export receipt path {} does not match the reserved frame {} output {}",
+                actual.display(),
+                frame_index,
+                expected.display()
+            ),
+        )),
+        (Some(expected), None) => Err(domain::EngineError::new(
+            protocol::ErrorCode::InvalidParams,
+            format!(
+                "bridge receipt omitted frame {} raw export {}",
+                frame_index,
+                expected.display()
+            ),
+        )),
+        (None, Some(actual)) => Err(domain::EngineError::new(
+            protocol::ErrorCode::InvalidParams,
+            format!(
+                "bridge receipt unexpectedly supplied raw export {} for frame {}",
+                actual.display(),
+                frame_index
+            ),
+        )),
+        (None, None) => Ok(()),
+    }
+}
+
 pub fn validate_frame_output_paths(
     recipes: &domain::OutputRecipe,
     frame_index: u32,
-) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>, Option<std::path::PathBuf>), domain::EngineError> {
-    let candidates = frame_target_candidates(recipes, frame_index, false, false)?;
+) -> Result<
+    (
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+    ),
+    domain::EngineError,
+> {
+    validate_frame_output_paths_with_raw_ir(recipes, frame_index, true)
+}
+
+fn validate_frame_output_paths_with_raw_ir(
+    recipes: &domain::OutputRecipe,
+    frame_index: u32,
+    raw_ir_available: bool,
+) -> Result<
+    (
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+    ),
+    domain::EngineError,
+> {
+    let candidates = frame_target_candidates(
+        recipes,
+        frame_index,
+        false,
+        false,
+        raw_ir_available,
+    )?;
     validate_target_candidates(&candidates)?;
     let archive = recipes.archive.enabled.then(|| resolve_archive_output_path(recipes, frame_index));
     let positive = recipes.positive.enabled.then(|| {
@@ -1598,7 +1825,16 @@ pub fn validate_frame_output_paths(
             recipes.preview.file_format,
         )
     });
-    Ok((archive, positive, preview))
+    let raw_export = recipes
+        .raw_export
+        .enabled
+        .then(|| resolve_raw_export_output_path(recipes, frame_index));
+    let raw_export_ir = raw_export.as_ref().and_then(|path| {
+        (raw_ir_available
+            && recipes.raw_export.tiff_infrared == domain::RawTiffInfrared::Sidecar)
+            .then(|| raw_export_ir_sidecar_path(path))
+    });
+    Ok((archive, positive, preview, raw_export, raw_export_ir))
 }
 
 /// Resolves the roll-level naming tokens before a backend starts work. The
@@ -1613,6 +1849,7 @@ pub fn materialize_output_filename_tokens(
         &mut recipes.archive.filename_template,
         &mut recipes.positive.filename_template,
         &mut recipes.preview.filename_template,
+        &mut recipes.raw_export.filename_template,
     ] {
         *template = materialize_filename_tokens(template, metadata);
     }
@@ -2139,6 +2376,8 @@ pub fn render_derivative_from_archive_with_processing(
             archive_path: recipes.archive.enabled.then(|| archive_rgb_path.to_path_buf()),
             positive_path: None,
             preview_path: None,
+            raw_negative_path: None,
+            raw_negative_ir_path: None,
             nikonlook: None,
             auto_crop: None,
             derivative_transform,
@@ -2386,6 +2625,8 @@ pub fn render_derivative_from_archive_with_processing(
         archive_path,
         positive_path,
         preview_path,
+        raw_negative_path: None,
+        raw_negative_ir_path: None,
         nikonlook,
         auto_crop: auto_crop_outcome,
         derivative_transform,
@@ -2641,6 +2882,562 @@ fn write_tiff_create_only(
         )
     })?;
     Ok(())
+}
+
+const RAW_IR_TAG: u16 = 65_001;
+const RAW_IR_MARKER: &[u8] = b"scanstudio.infrared.linear.uint16.v1\0";
+
+#[derive(Debug, Clone)]
+struct RawTiffEntry {
+    tag: u16,
+    field_type: u16,
+    count: u32,
+    value: Vec<u8>,
+}
+
+impl RawTiffEntry {
+    fn byte(tag: u16, values: &[u8]) -> Self {
+        Self { tag, field_type: 1, count: values.len() as u32, value: values.to_vec() }
+    }
+
+    fn ascii(tag: u16, value: &str) -> Self {
+        let mut bytes = value.as_bytes().to_vec();
+        if !bytes.ends_with(&[0]) {
+            bytes.push(0);
+        }
+        Self { tag, field_type: 2, count: bytes.len() as u32, value: bytes }
+    }
+
+    fn short(tag: u16, values: &[u16]) -> Self {
+        Self {
+            tag,
+            field_type: 3,
+            count: values.len() as u32,
+            value: values.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        }
+    }
+
+    fn long(tag: u16, values: &[u32]) -> Self {
+        Self {
+            tag,
+            field_type: 4,
+            count: values.len() as u32,
+            value: values.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        }
+    }
+
+    fn rational(tag: u16, values: &[(u32, u32)]) -> Self {
+        let value = values
+            .iter()
+            .flat_map(|(numerator, denominator)| {
+                numerator.to_le_bytes().into_iter().chain(denominator.to_le_bytes())
+            })
+            .collect();
+        Self { tag, field_type: 5, count: values.len() as u32, value }
+    }
+
+    fn signed_rational(tag: u16, values: &[(i32, i32)]) -> Self {
+        let value = values
+            .iter()
+            .flat_map(|(numerator, denominator)| {
+                numerator.to_le_bytes().into_iter().chain(denominator.to_le_bytes())
+            })
+            .collect();
+        Self { tag, field_type: 10, count: values.len() as u32, value }
+    }
+}
+
+fn align_four(value: usize) -> usize {
+    (value + 3) & !3
+}
+
+fn raw_ifd_storage_len(entries: &[RawTiffEntry], ifd_offset: usize) -> usize {
+    let fixed_len = 2 + entries.len() * 12 + 4;
+    let mut cursor = ifd_offset + fixed_len;
+    for entry in entries {
+        if entry.value.len() > 4 {
+            cursor = align_four(cursor);
+            cursor += entry.value.len();
+        }
+    }
+    cursor - ifd_offset
+}
+
+fn serialize_raw_ifd(entries: &[RawTiffEntry], ifd_offset: usize) -> Vec<u8> {
+    let mut entries = entries.to_vec();
+    entries.sort_by_key(|entry| entry.tag);
+    let fixed_len = 2 + entries.len() * 12 + 4;
+    let mut bytes = vec![0_u8; fixed_len];
+    bytes[0..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+
+    for (index, entry) in entries.iter().enumerate() {
+        let base = 2 + index * 12;
+        bytes[base..base + 2].copy_from_slice(&entry.tag.to_le_bytes());
+        bytes[base + 2..base + 4].copy_from_slice(&entry.field_type.to_le_bytes());
+        bytes[base + 4..base + 8].copy_from_slice(&entry.count.to_le_bytes());
+        if entry.value.len() <= 4 {
+            bytes[base + 8..base + 8 + entry.value.len()].copy_from_slice(&entry.value);
+        } else {
+            let aligned = align_four(ifd_offset + bytes.len());
+            bytes.resize(aligned - ifd_offset, 0);
+            bytes[base + 8..base + 12].copy_from_slice(&(aligned as u32).to_le_bytes());
+            bytes.extend_from_slice(&entry.value);
+        }
+    }
+    bytes
+}
+
+fn raw_baseline_entries(
+    width: u32,
+    height: u32,
+    dpi: u32,
+    samples_per_pixel: u16,
+    photometric: u16,
+    strip_offset: u32,
+    strip_byte_count: u32,
+) -> Vec<RawTiffEntry> {
+    vec![
+        RawTiffEntry::long(254, &[0]),
+        RawTiffEntry::long(256, &[width]),
+        RawTiffEntry::long(257, &[height]),
+        RawTiffEntry::short(258, &vec![16; samples_per_pixel as usize]),
+        RawTiffEntry::short(259, &[1]),
+        RawTiffEntry::short(262, &[photometric]),
+        RawTiffEntry::long(273, &[strip_offset]),
+        RawTiffEntry::short(274, &[1]),
+        RawTiffEntry::short(277, &[samples_per_pixel]),
+        RawTiffEntry::long(278, &[height]),
+        RawTiffEntry::long(279, &[strip_byte_count]),
+        RawTiffEntry::rational(282, &[(dpi, 1)]),
+        RawTiffEntry::rational(283, &[(dpi, 1)]),
+        RawTiffEntry::short(284, &[1]),
+        RawTiffEntry::short(296, &[2]),
+        RawTiffEntry::ascii(305, "ScanStudio"),
+    ]
+}
+
+fn dng_main_entries(
+    width: u32,
+    height: u32,
+    dpi: u32,
+    strip_offset: u32,
+    strip_byte_count: u32,
+    infrared_ifd_offset: Option<u32>,
+) -> Vec<RawTiffEntry> {
+    let mut entries = raw_baseline_entries(
+        width,
+        height,
+        dpi,
+        3,
+        34_892,
+        strip_offset,
+        strip_byte_count,
+    );
+    entries.extend([
+        RawTiffEntry::ascii(271, "Nikon"),
+        RawTiffEntry::ascii(272, "Nikon Coolscan Simulator"),
+    ]);
+    if let Some(infrared_ifd_offset) = infrared_ifd_offset {
+        entries.push(RawTiffEntry::long(330, &[infrared_ifd_offset]));
+    }
+    entries.extend([
+        RawTiffEntry::byte(50_706, &[1, 4, 0, 0]),
+        RawTiffEntry::byte(50_707, &[1, 1, 0, 0]),
+        RawTiffEntry::ascii(50_708, "Nikon Coolscan Simulator"),
+        RawTiffEntry::rational(50_714, &[(0, 1), (0, 1), (0, 1)]),
+        RawTiffEntry::long(50_717, &[65_535, 65_535, 65_535]),
+        RawTiffEntry::rational(50_718, &[(1, 1), (1, 1)]),
+        RawTiffEntry::long(50_719, &[0, 0]),
+        RawTiffEntry::long(50_720, &[width, height]),
+        RawTiffEntry::signed_rational(
+            50_721,
+            &[
+                (1, 1), (0, 1), (0, 1),
+                (0, 1), (1, 1), (0, 1),
+                (0, 1), (0, 1), (1, 1),
+            ],
+        ),
+        RawTiffEntry::rational(50_728, &[(1, 1), (1, 1), (1, 1)]),
+        RawTiffEntry::short(50_778, &[0]),
+        RawTiffEntry::long(50_829, &[0, 0, height, width]),
+    ]);
+    entries
+}
+
+fn dng_infrared_entries(
+    width: u32,
+    height: u32,
+    dpi: u32,
+    strip_offset: u32,
+    strip_byte_count: u32,
+) -> Vec<RawTiffEntry> {
+    let mut entries = raw_baseline_entries(
+        width,
+        height,
+        dpi,
+        1,
+        1,
+        strip_offset,
+        strip_byte_count,
+    );
+    entries.extend([
+        RawTiffEntry::ascii(270, "Untouched Nikon Coolscan infrared plane"),
+        RawTiffEntry::ascii(RAW_IR_TAG, std::str::from_utf8(RAW_IR_MARKER).expect("marker is ASCII")),
+    ]);
+    entries
+}
+
+fn encoded_simulated_raw(
+    raw: &[[f64; 3]],
+    width: u32,
+    height: u32,
+    dpi: u32,
+    recipe: &domain::RawExportRecipe,
+    ir_available: bool,
+) -> Result<Vec<u8>, domain::EngineError> {
+    let pixel_count = (width as usize).checked_mul(height as usize).ok_or_else(|| {
+        domain::EngineError::new(protocol::ErrorCode::Internal, "raw export dimensions overflow")
+    })?;
+    if raw.len() != pixel_count {
+        return Err(domain::EngineError::new(
+            protocol::ErrorCode::Internal,
+            "raw export pixel buffer does not match its dimensions",
+        ));
+    }
+    let rgb_byte_count = u32::try_from(pixel_count.checked_mul(6).ok_or_else(|| {
+        domain::EngineError::new(protocol::ErrorCode::Internal, "raw RGB byte count overflow")
+    })?)
+    .map_err(|_| domain::EngineError::new(protocol::ErrorCode::Internal, "raw RGB exceeds classic TIFF"))?;
+    let ir_byte_count = u32::try_from(pixel_count.checked_mul(2).ok_or_else(|| {
+        domain::EngineError::new(protocol::ErrorCode::Internal, "raw IR byte count overflow")
+    })?)
+    .map_err(|_| domain::EngineError::new(protocol::ErrorCode::Internal, "raw IR exceeds classic TIFF"))?;
+
+    let mut bytes = b"II*\0\x08\0\0\0".to_vec();
+    match recipe.file_format {
+        domain::RawExportFormat::LinearDng => {
+            let embed_infrared = ir_available
+                && recipe.tiff_infrared != domain::RawTiffInfrared::Sidecar;
+            let main_dummy = dng_main_entries(
+                width,
+                height,
+                dpi,
+                0,
+                rgb_byte_count,
+                embed_infrared.then_some(0),
+            );
+            let main_end = align_four(8 + raw_ifd_storage_len(&main_dummy, 8));
+            let (infrared_ifd_offset, rgb_offset, infrared_offset) = if embed_infrared {
+                let infrared_ifd_offset = main_end;
+                let infrared_dummy =
+                    dng_infrared_entries(width, height, dpi, 0, ir_byte_count);
+                let rgb_offset = align_four(
+                    infrared_ifd_offset
+                        + raw_ifd_storage_len(&infrared_dummy, infrared_ifd_offset),
+                );
+                let infrared_offset = rgb_offset
+                    .checked_add(rgb_byte_count as usize)
+                    .ok_or_else(|| {
+                        domain::EngineError::new(
+                            protocol::ErrorCode::Internal,
+                            "DNG offset overflow",
+                        )
+                    })?;
+                (Some(infrared_ifd_offset), rgb_offset, Some(infrared_offset))
+            } else {
+                (None, main_end, None)
+            };
+            let main = dng_main_entries(
+                width,
+                height,
+                dpi,
+                rgb_offset as u32,
+                rgb_byte_count,
+                infrared_ifd_offset.map(|value| value as u32),
+            );
+            bytes.extend_from_slice(&serialize_raw_ifd(&main, 8));
+            if let (Some(infrared_ifd_offset), Some(infrared_offset)) =
+                (infrared_ifd_offset, infrared_offset)
+            {
+                bytes.resize(infrared_ifd_offset, 0);
+                let infrared = dng_infrared_entries(
+                    width,
+                    height,
+                    dpi,
+                    infrared_offset as u32,
+                    ir_byte_count,
+                );
+                bytes.extend_from_slice(&serialize_raw_ifd(&infrared, infrared_ifd_offset));
+            }
+            bytes.resize(rgb_offset, 0);
+            for pixel in raw {
+                for sample in pixel {
+                    bytes.extend_from_slice(&quantize_u16(*sample).to_le_bytes());
+                }
+            }
+            if embed_infrared {
+                for pixel in raw {
+                    let infrared = quantize_u16((pixel[0] + pixel[1] + pixel[2]) / 3.0);
+                    bytes.extend_from_slice(&infrared.to_le_bytes());
+                }
+            }
+        }
+        domain::RawExportFormat::LinearTiff => {
+            if !ir_available
+                && recipe.tiff_infrared == domain::RawTiffInfrared::FourthChannel
+            {
+                return Err(domain::EngineError::new(
+                    protocol::ErrorCode::InvalidParams,
+                    "fourth-channel linear TIFF requires an infrared capture plane",
+                ));
+            }
+            let include_infrared =
+                recipe.tiff_infrared == domain::RawTiffInfrared::FourthChannel;
+            let samples_per_pixel = if include_infrared { 4 } else { 3 };
+            let strip_byte_count = if include_infrared {
+                rgb_byte_count.checked_add(ir_byte_count).ok_or_else(|| {
+                    domain::EngineError::new(protocol::ErrorCode::Internal, "raw TIFF byte count overflow")
+                })?
+            } else {
+                rgb_byte_count
+            };
+            let mut dummy = raw_baseline_entries(
+                width,
+                height,
+                dpi,
+                samples_per_pixel,
+                2,
+                0,
+                strip_byte_count,
+            );
+            if include_infrared {
+                dummy.push(RawTiffEntry::short(338, &[0]));
+                dummy.push(RawTiffEntry::ascii(
+                    RAW_IR_TAG,
+                    std::str::from_utf8(RAW_IR_MARKER).expect("marker is ASCII"),
+                ));
+            }
+            let strip_offset = align_four(8 + raw_ifd_storage_len(&dummy, 8));
+            let mut entries = raw_baseline_entries(
+                width,
+                height,
+                dpi,
+                samples_per_pixel,
+                2,
+                strip_offset as u32,
+                strip_byte_count,
+            );
+            if include_infrared {
+                entries.push(RawTiffEntry::short(338, &[0]));
+                entries.push(RawTiffEntry::ascii(
+                    RAW_IR_TAG,
+                    std::str::from_utf8(RAW_IR_MARKER).expect("marker is ASCII"),
+                ));
+            }
+            bytes.extend_from_slice(&serialize_raw_ifd(&entries, 8));
+            bytes.resize(strip_offset, 0);
+            for pixel in raw {
+                for sample in pixel {
+                    bytes.extend_from_slice(&quantize_u16(*sample).to_le_bytes());
+                }
+                if include_infrared {
+                    let infrared = quantize_u16((pixel[0] + pixel[1] + pixel[2]) / 3.0);
+                    bytes.extend_from_slice(&infrared.to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn encoded_simulated_raw_ir(
+    raw: &[[f64; 3]],
+    width: u32,
+    height: u32,
+    dpi: u32,
+) -> Result<Vec<u8>, domain::EngineError> {
+    let pixel_count = (width as usize).checked_mul(height as usize).ok_or_else(|| {
+        domain::EngineError::new(protocol::ErrorCode::Internal, "raw IR dimensions overflow")
+    })?;
+    let strip_byte_count = u32::try_from(pixel_count.checked_mul(2).ok_or_else(|| {
+        domain::EngineError::new(protocol::ErrorCode::Internal, "raw IR byte count overflow")
+    })?)
+    .map_err(|_| {
+        domain::EngineError::new(
+            protocol::ErrorCode::Internal,
+            "raw IR exceeds classic TIFF",
+        )
+    })?;
+    let dummy = dng_infrared_entries(width, height, dpi, 0, strip_byte_count);
+    let strip_offset = align_four(8 + raw_ifd_storage_len(&dummy, 8));
+    let entries = dng_infrared_entries(
+        width,
+        height,
+        dpi,
+        strip_offset as u32,
+        strip_byte_count,
+    );
+    let mut bytes = b"II*\0\x08\0\0\0".to_vec();
+    bytes.extend_from_slice(&serialize_raw_ifd(&entries, 8));
+    bytes.resize(strip_offset, 0);
+    for pixel in raw {
+        let infrared = quantize_u16((pixel[0] + pixel[1] + pixel[2]) / 3.0);
+        bytes.extend_from_slice(&infrared.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn write_raw_export_create_only(
+    path: &std::path::Path,
+    raw: &[[f64; 3]],
+    width: u32,
+    height: u32,
+    dpi: u32,
+    recipe: &domain::RawExportRecipe,
+    ir_available: bool,
+) -> Result<Option<std::path::PathBuf>, domain::EngineError> {
+    let parent = path.parent().ok_or_else(|| {
+        domain::EngineError::new(protocol::ErrorCode::InvalidParams, "raw export has no parent directory")
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        domain::EngineError::new(
+            protocol::ErrorCode::Internal,
+            format!("failed to create raw export directory {}: {error}", parent.display()),
+        )
+    })?;
+    let sidecar_path = (ir_available
+        && recipe.tiff_infrared == domain::RawTiffInfrared::Sidecar)
+        .then(|| raw_export_ir_sidecar_path(path));
+    if path.exists() || sidecar_path.as_ref().is_some_and(|sidecar| sidecar.exists()) {
+        return Err(domain::EngineError::new(
+            protocol::ErrorCode::ArchiveCollision,
+            format!(
+                "raw export pair already exists at {}",
+                sidecar_path.as_deref().unwrap_or(path).display()
+            ),
+        ));
+    }
+    let encoded = encoded_simulated_raw(raw, width, height, dpi, recipe, ir_available)?;
+    static TEMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let write_temporary = |target: &std::path::Path,
+                           encoded: &[u8]|
+     -> Result<std::path::PathBuf, domain::EngineError> {
+        let counter = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{}.{}.{}.partial",
+            target
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("raw-export"),
+            std::process::id(),
+            counter,
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| {
+                domain::EngineError::new(
+                    protocol::ErrorCode::Internal,
+                    format!("failed to create raw export temporary file: {error}"),
+                )
+            })?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(&encoded).map_err(|error| {
+            domain::EngineError::new(protocol::ErrorCode::Internal, format!("failed to write raw export: {error}"))
+        })?;
+        writer.flush().map_err(|error| {
+            domain::EngineError::new(protocol::ErrorCode::Internal, format!("failed to flush raw export: {error}"))
+        })?;
+        writer.get_ref().sync_all().map_err(|error| {
+            domain::EngineError::new(protocol::ErrorCode::Internal, format!("failed to sync raw export: {error}"))
+        })?;
+        Ok(temporary)
+    };
+    let publish = |temporary: &std::path::Path,
+                   target: &std::path::Path|
+     -> Result<(), domain::EngineError> {
+        std::fs::hard_link(temporary, target).map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                protocol::ErrorCode::ArchiveCollision
+            } else {
+                protocol::ErrorCode::Internal
+            };
+            domain::EngineError::new(
+                code,
+                format!("failed to publish raw export {}: {error}", target.display()),
+            )
+        })
+    };
+
+    let main_temporary = write_temporary(path, &encoded)?;
+    let result = if let Some(sidecar_path) = sidecar_path.as_ref() {
+        let sidecar_encoded = encoded_simulated_raw_ir(raw, width, height, dpi)?;
+        let sidecar_temporary = match write_temporary(sidecar_path, &sidecar_encoded) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = std::fs::remove_file(&main_temporary);
+                return Err(error);
+            }
+        };
+        let result = publish_raw_pair_with_hook(
+            &main_temporary,
+            path,
+            &sidecar_temporary,
+            sidecar_path,
+            &publish,
+            || Ok(()),
+        );
+        let _ = std::fs::remove_file(&sidecar_temporary);
+        result
+    } else {
+        publish(&main_temporary, path)
+    };
+    let _ = std::fs::remove_file(&main_temporary);
+    result.map(|()| sidecar_path)
+}
+
+fn publish_raw_pair_with_hook<Publish, Hook>(
+    main_temporary: &std::path::Path,
+    main_path: &std::path::Path,
+    sidecar_temporary: &std::path::Path,
+    sidecar_path: &std::path::Path,
+    publish: Publish,
+    before_sidecar_publish: Hook,
+) -> Result<(), domain::EngineError>
+where
+    Publish: Fn(&std::path::Path, &std::path::Path) -> Result<(), domain::EngineError>,
+    Hook: FnOnce() -> Result<(), domain::EngineError>,
+{
+    let mut main_published = false;
+    let mut sidecar_published = false;
+    let result = (|| {
+        publish(main_temporary, main_path)?;
+        main_published = true;
+        before_sidecar_publish()?;
+        publish(sidecar_temporary, sidecar_path)?;
+        sidecar_published = true;
+        if let Some(parent) = main_path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    domain::EngineError::new(
+                        protocol::ErrorCode::Internal,
+                        format!("failed to sync raw export pair directory: {error}"),
+                    )
+                })?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        if sidecar_published {
+            let _ = std::fs::remove_file(sidecar_path);
+        }
+        if main_published {
+            let _ = std::fs::remove_file(main_path);
+        }
+    }
+    result
 }
 
 /// Color/metadata to attach to a rendered derivative. It distinguishes two
@@ -3017,6 +3814,8 @@ pub struct WrittenPaths {
     pub archive_path: Option<std::path::PathBuf>,
     pub positive_path: Option<std::path::PathBuf>,
     pub preview_path: Option<std::path::PathBuf>,
+    pub raw_negative_path: Option<std::path::PathBuf>,
+    pub raw_negative_ir_path: Option<std::path::PathBuf>,
     /// See `render_positive`'s own doc comment. `None` whenever no
     /// positive/preview was rendered this call, or the rendered frame
     /// wasn't C41.
@@ -3050,7 +3849,7 @@ pub fn render_and_write_frame(
     let processing = domain::ProcessingRecipe { film_process, ..domain::ProcessingRecipe::default() };
     render_and_write_frame_with_processing(
         device_id, frame_index, &processing, width, height, bit_depth,
-        domain::CaptureRecipe::default().resolution_dpi, recipes,
+        domain::CaptureRecipe::default().resolution_dpi, true, recipes,
         detected_boundary, alignment,
     )
 }
@@ -3065,6 +3864,7 @@ pub fn render_and_write_frame_with_processing(
     height: u32,
     bit_depth: u32,
     resolution_dpi: u32,
+    raw_ir_available: bool,
     recipes: &domain::OutputRecipe,
     detected_boundary: Option<(u32, u32)>,
     alignment: Option<&domain::FrameAlignment>,
@@ -3074,12 +3874,32 @@ pub fn render_and_write_frame_with_processing(
         .unwrap_or_default();
     validate_derivative_transform(derivative_transform)?;
     validate_output_recipe_paths(recipes)?;
-    let (archive_path, preflight_positive_path, preflight_preview_path) =
-        validate_frame_output_paths(recipes, frame_index)?;
+    let (
+        archive_path,
+        preflight_positive_path,
+        preflight_preview_path,
+        preflight_raw_path,
+        preflight_raw_ir_path,
+    ) = validate_frame_output_paths_with_raw_ir(recipes, frame_index, raw_ir_available)?;
     let raw = generate_sim_frame(device_id, frame_index, width, height);
     if let Some(archive_path) = archive_path.as_ref() {
         write_tiff_create_only(archive_path, &raw, width, height, bit_depth)?;
     }
+    let (raw_negative_path, raw_negative_ir_path) = if let Some(path) = preflight_raw_path {
+        let written_ir_path = write_raw_export_create_only(
+            path.as_path(),
+            &raw,
+            width,
+            height,
+            resolution_dpi,
+            &recipes.raw_export,
+            raw_ir_available,
+        )?;
+        debug_assert_eq!(written_ir_path, preflight_raw_ir_path);
+        (Some(path), written_ir_path)
+    } else {
+        (None, None)
+    };
 
     let mut positive_path: Option<std::path::PathBuf> = None;
     let mut preview_path: Option<std::path::PathBuf> = None;
@@ -3163,6 +3983,8 @@ pub fn render_and_write_frame_with_processing(
         archive_path,
         positive_path,
         preview_path,
+        raw_negative_path,
+        raw_negative_ir_path,
         nikonlook: nikonlook_provenance,
         auto_crop: auto_crop_outcome,
         derivative_transform,
@@ -3306,6 +4128,247 @@ mod tests {
         None
     }
 
+    fn classic_tiff_entry(
+        bytes: &[u8],
+        ifd_offset: usize,
+        wanted_tag: u16,
+    ) -> Option<(u16, u32, [u8; 4])> {
+        let entry_count = u16::from_le_bytes(bytes.get(ifd_offset..ifd_offset + 2)?.try_into().ok()?)
+            as usize;
+        for index in 0..entry_count {
+            let start = ifd_offset + 2 + index * 12;
+            if u16::from_le_bytes(bytes.get(start..start + 2)?.try_into().ok()?) == wanted_tag {
+                return Some((
+                    u16::from_le_bytes(bytes.get(start + 2..start + 4)?.try_into().ok()?),
+                    u32::from_le_bytes(bytes.get(start + 4..start + 8)?.try_into().ok()?),
+                    bytes.get(start + 8..start + 12)?.try_into().ok()?,
+                ));
+            }
+        }
+        None
+    }
+
+    fn classic_tiff_value(bytes: &[u8], ifd_offset: usize, tag: u16) -> Option<Vec<u8>> {
+        let (field_type, count, inline) = classic_tiff_entry(bytes, ifd_offset, tag)?;
+        let unit = match field_type {
+            1 | 2 => 1,
+            3 => 2,
+            4 => 4,
+            5 | 10 => 8,
+            _ => return None,
+        };
+        let len = usize::try_from(count).ok()?.checked_mul(unit)?;
+        if len <= 4 {
+            Some(inline[..len].to_vec())
+        } else {
+            let offset = u32::from_le_bytes(inline) as usize;
+            Some(bytes.get(offset..offset.checked_add(len)?)?.to_vec())
+        }
+    }
+
+    fn classic_tiff_short(bytes: &[u8], ifd_offset: usize, tag: u16) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            classic_tiff_value(bytes, ifd_offset, tag)?.get(0..2)?.try_into().ok()?,
+        ))
+    }
+
+    fn classic_tiff_long(bytes: &[u8], ifd_offset: usize, tag: u16) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            classic_tiff_value(bytes, ifd_offset, tag)?.get(0..4)?.try_into().ok()?,
+        ))
+    }
+
+    fn u16_samples(bytes: &[u8]) -> Vec<u16> {
+        bytes
+            .chunks_exact(2)
+            .map(|sample| u16::from_le_bytes(sample.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn simulated_linear_dng_has_rgb_linear_raw_main_ifd_and_exact_ir_sub_ifd() {
+        let raw = vec![[0.0, 0.5, 1.0], [0.25, 0.75, 0.125]];
+        let recipe = domain::RawExportRecipe::default();
+        let bytes = encoded_simulated_raw(&raw, 2, 1, 4_000, &recipe, true).unwrap();
+        let main_ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+
+        assert_eq!(classic_tiff_short(&bytes, main_ifd, 262), Some(34_892));
+        assert_eq!(classic_tiff_short(&bytes, main_ifd, 277), Some(3));
+        assert!(classic_tiff_entry(&bytes, main_ifd, 338).is_none());
+        assert_eq!(classic_tiff_value(&bytes, main_ifd, 50_706).unwrap(), [1, 4, 0, 0]);
+        assert_eq!(classic_tiff_value(&bytes, main_ifd, 282).unwrap(), 4_000_u32.to_le_bytes().into_iter().chain(1_u32.to_le_bytes()).collect::<Vec<_>>());
+        assert_eq!(classic_tiff_short(&bytes, main_ifd, 296), Some(2));
+        let infrared_ifd = classic_tiff_long(&bytes, main_ifd, 330).unwrap() as usize;
+        assert_eq!(classic_tiff_short(&bytes, infrared_ifd, 262), Some(1));
+        assert_eq!(classic_tiff_short(&bytes, infrared_ifd, 277), Some(1));
+        assert_eq!(
+            classic_tiff_value(&bytes, infrared_ifd, RAW_IR_TAG).unwrap(),
+            RAW_IR_MARKER
+        );
+
+        let rgb_offset = classic_tiff_long(&bytes, main_ifd, 273).unwrap() as usize;
+        let rgb_len = classic_tiff_long(&bytes, main_ifd, 279).unwrap() as usize;
+        assert_eq!(
+            u16_samples(&bytes[rgb_offset..rgb_offset + rgb_len]),
+            [0, 32_768, 65_535, 16_384, 49_151, 8_192]
+        );
+        let ir_offset = classic_tiff_long(&bytes, infrared_ifd, 273).unwrap() as usize;
+        let ir_len = classic_tiff_long(&bytes, infrared_ifd, 279).unwrap() as usize;
+        assert_eq!(
+            u16_samples(&bytes[ir_offset..ir_offset + ir_len]),
+            [32_768, 24_576]
+        );
+    }
+
+    #[test]
+    fn simulated_linear_tiff_fourth_channel_and_omitted_modes_are_unambiguous() {
+        let raw = vec![[0.0, 0.5, 1.0], [0.25, 0.75, 0.125]];
+        for (infrared, expected_spp, expected_samples) in [
+            (
+                domain::RawTiffInfrared::FourthChannel,
+                4,
+                vec![0, 32_768, 65_535, 32_768, 16_384, 49_151, 8_192, 24_576],
+            ),
+            (
+                domain::RawTiffInfrared::Omitted,
+                3,
+                vec![0, 32_768, 65_535, 16_384, 49_151, 8_192],
+            ),
+        ] {
+            let recipe = domain::RawExportRecipe {
+                enabled: true,
+                file_format: domain::RawExportFormat::LinearTiff,
+                tiff_infrared: infrared,
+                ..domain::RawExportRecipe::default()
+            };
+            let bytes = encoded_simulated_raw(&raw, 2, 1, 4_000, &recipe, true).unwrap();
+            let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            assert_eq!(classic_tiff_short(&bytes, ifd, 262), Some(2));
+            assert_eq!(classic_tiff_short(&bytes, ifd, 277), Some(expected_spp));
+            assert_eq!(classic_tiff_entry(&bytes, ifd, 338).is_some(), expected_spp == 4);
+            assert_eq!(classic_tiff_entry(&bytes, ifd, RAW_IR_TAG).is_some(), expected_spp == 4);
+            let offset = classic_tiff_long(&bytes, ifd, 273).unwrap() as usize;
+            let len = classic_tiff_long(&bytes, ifd, 279).unwrap() as usize;
+            assert_eq!(u16_samples(&bytes[offset..offset + len]), expected_samples);
+        }
+    }
+
+    #[test]
+    fn simulated_sidecar_modes_keep_rgb_main_and_round_trip_grayscale_ir_tags() {
+        let raw = vec![[0.0, 0.5, 1.0], [0.25, 0.75, 0.125]];
+        for format in [
+            domain::RawExportFormat::LinearDng,
+            domain::RawExportFormat::LinearTiff,
+        ] {
+            let recipe = domain::RawExportRecipe {
+                enabled: true,
+                file_format: format,
+                tiff_infrared: domain::RawTiffInfrared::Sidecar,
+                ..domain::RawExportRecipe::default()
+            };
+            let main = encoded_simulated_raw(&raw, 2, 1, 4_000, &recipe, true).unwrap();
+            let main_ifd = u32::from_le_bytes(main[4..8].try_into().unwrap()) as usize;
+            assert_eq!(classic_tiff_short(&main, main_ifd, 277), Some(3));
+            assert!(classic_tiff_entry(&main, main_ifd, 330).is_none());
+            assert!(classic_tiff_entry(&main, main_ifd, RAW_IR_TAG).is_none());
+            let main_offset = classic_tiff_long(&main, main_ifd, 273).unwrap() as usize;
+            let main_len = classic_tiff_long(&main, main_ifd, 279).unwrap() as usize;
+            assert_eq!(
+                u16_samples(&main[main_offset..main_offset + main_len]),
+                [0, 32_768, 65_535, 16_384, 49_151, 8_192]
+            );
+
+            let sidecar = encoded_simulated_raw_ir(&raw, 2, 1, 4_000).unwrap();
+            let sidecar_ifd =
+                u32::from_le_bytes(sidecar[4..8].try_into().unwrap()) as usize;
+            assert_eq!(classic_tiff_short(&sidecar, sidecar_ifd, 258), Some(16));
+            assert_eq!(classic_tiff_short(&sidecar, sidecar_ifd, 262), Some(1));
+            assert_eq!(classic_tiff_short(&sidecar, sidecar_ifd, 277), Some(1));
+            assert_eq!(classic_tiff_short(&sidecar, sidecar_ifd, 274), Some(1));
+            assert_eq!(classic_tiff_short(&sidecar, sidecar_ifd, 296), Some(2));
+            assert_eq!(
+                classic_tiff_value(&sidecar, sidecar_ifd, 282).unwrap(),
+                4_000_u32
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(1_u32.to_le_bytes())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                classic_tiff_value(&sidecar, sidecar_ifd, RAW_IR_TAG).unwrap(),
+                RAW_IR_MARKER
+            );
+            let ir_offset =
+                classic_tiff_long(&sidecar, sidecar_ifd, 273).unwrap() as usize;
+            let ir_len = classic_tiff_long(&sidecar, sidecar_ifd, 279).unwrap() as usize;
+            assert_eq!(
+                u16_samples(&sidecar[ir_offset..ir_offset + ir_len]),
+                [32_768, 24_576]
+            );
+        }
+    }
+
+    #[test]
+    fn simulated_sidecar_without_ir_matches_single_rgb_sibling() {
+        let raw = vec![[0.0, 0.5, 1.0], [0.25, 0.75, 0.125]];
+        for format in [
+            domain::RawExportFormat::LinearDng,
+            domain::RawExportFormat::LinearTiff,
+        ] {
+            let recipe = domain::RawExportRecipe {
+                file_format: format,
+                tiff_infrared: domain::RawTiffInfrared::Sidecar,
+                ..domain::RawExportRecipe::default()
+            };
+            let main = encoded_simulated_raw(&raw, 2, 1, 4_000, &recipe, false).unwrap();
+            let ifd = u32::from_le_bytes(main[4..8].try_into().unwrap()) as usize;
+            assert_eq!(classic_tiff_short(&main, ifd, 277), Some(3));
+            assert!(classic_tiff_entry(&main, ifd, 330).is_none());
+            assert!(classic_tiff_entry(&main, ifd, RAW_IR_TAG).is_none());
+        }
+    }
+
+    #[test]
+    fn simulated_pair_failure_after_main_publication_removes_both_finals() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_temporary = dir.join("main.partial");
+        let sidecar_temporary = dir.join("sidecar.partial");
+        let main = dir.join("negative.dng");
+        let sidecar = dir.join("negative-ir.tif");
+        std::fs::write(&main_temporary, b"complete main").unwrap();
+        std::fs::write(&sidecar_temporary, b"complete sidecar").unwrap();
+        let publish = |source: &std::path::Path, target: &std::path::Path| {
+            std::fs::hard_link(source, target).map_err(|error| {
+                domain::EngineError::new(
+                    protocol::ErrorCode::Internal,
+                    format!("test publish failure: {error}"),
+                )
+            })
+        };
+
+        let error = publish_raw_pair_with_hook(
+            &main_temporary,
+            &main,
+            &sidecar_temporary,
+            &sidecar,
+            publish,
+            || {
+                assert!(main.exists(), "main publication must precede injected failure");
+                Err(domain::EngineError::new(
+                    protocol::ErrorCode::Internal,
+                    "simulated sidecar publication failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("simulated sidecar publication failure"));
+        assert!(!main.exists());
+        assert!(!sidecar.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn frame_dimensions_matches_scan_size_estimator_constants() {
         assert_eq!(
@@ -3357,6 +4420,9 @@ mod tests {
         let mut recipes = domain::OutputRecipe::default();
         recipes.archive.destination = dir.display().to_string();
         recipes.archive.filename_template = "ScanStudio#".into();
+        recipes.raw_export.enabled = true;
+        recipes.raw_export.destination = dir.display().to_string();
+        recipes.raw_export.filename_template = "ScanStudio#".into();
         recipes.positive.destination = dir.display().to_string();
         recipes.positive.filename_template = "ScanStudio#".into();
         recipes.preview.destination = dir.display().to_string();
@@ -3395,6 +4461,10 @@ mod tests {
             ),
             dir.join("ScanStudio3.jpg")
         );
+        assert_eq!(
+            resolve_raw_export_output_path(output, 1),
+            dir.join("ScanStudio3.dng")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3402,12 +4472,14 @@ mod tests {
     fn receipt_recipe_restores_job_local_sequence_markers_to_the_user_template() {
         let mut output = domain::OutputRecipe::default();
         output.archive.filename_template = "Master$ScanStudioSequence(12)".into();
+        output.raw_export.filename_template = "Raw$ScanStudioSequence(12).dng".into();
         output.positive.filename_template = "Positive$ScanStudioSequence(12).tif".into();
         output.preview.filename_template = "Preview$ScanStudioSequence(12).jpg".into();
 
         let receipt_output = receipt_output_recipe(&output);
 
         assert_eq!(receipt_output.archive.filename_template, "Master#");
+        assert_eq!(receipt_output.raw_export.filename_template, "Raw#.dng");
         assert_eq!(receipt_output.positive.filename_template, "Positive#.tif");
         assert_eq!(receipt_output.preview.filename_template, "Preview#.jpg");
         assert!(
@@ -3804,6 +4876,37 @@ mod tests {
             .code,
             protocol::ErrorCode::InvalidParams
         );
+
+        let mut raw_alias = domain::OutputRecipe::default();
+        raw_alias.archive.destination = dir.display().to_string();
+        raw_alias.archive.filename_template = "Raw_####.tif".into();
+        raw_alias.raw_export.enabled = true;
+        raw_alias.raw_export.file_format = domain::RawExportFormat::LinearTiff;
+        raw_alias.raw_export.destination = dir.display().to_string();
+        raw_alias.raw_export.filename_template = "Raw_####.tif".into();
+        raw_alias.positive.enabled = false;
+        raw_alias.preview.enabled = false;
+        assert_eq!(
+            validate_frame_output_paths(&raw_alias, 1).unwrap_err().code,
+            protocol::ErrorCode::InvalidParams
+        );
+
+        let mut raw_sidecar_alias = domain::OutputRecipe::default();
+        raw_sidecar_alias.archive.enabled = false;
+        raw_sidecar_alias.raw_export.enabled = true;
+        raw_sidecar_alias.raw_export.file_format = domain::RawExportFormat::LinearDng;
+        raw_sidecar_alias.raw_export.tiff_infrared = domain::RawTiffInfrared::Sidecar;
+        raw_sidecar_alias.raw_export.destination = dir.display().to_string();
+        raw_sidecar_alias.raw_export.filename_template = "Negative_####.dng".into();
+        raw_sidecar_alias.positive.destination = dir.display().to_string();
+        raw_sidecar_alias.positive.filename_template = "Negative_####-ir.tif".into();
+        raw_sidecar_alias.preview.enabled = false;
+        assert_eq!(
+            validate_frame_output_paths(&raw_sidecar_alias, 1)
+                .unwrap_err()
+                .code,
+            protocol::ErrorCode::InvalidParams
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3882,6 +4985,27 @@ mod tests {
             .code,
             protocol::ErrorCode::InvalidParams
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bridge_raw_receipt_path_must_match_the_reserved_output() {
+        let dir = unique_test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = dir.join("frame-0001.dng");
+        let wrong = dir.join("other.dng");
+        std::fs::write(&expected, b"fixture").unwrap();
+        std::fs::write(&wrong, b"fixture").unwrap();
+        validate_bridge_raw_export_receipt_path(Some(&expected), Some(&expected), 1).unwrap();
+        assert_eq!(
+            validate_bridge_raw_export_receipt_path(Some(&expected), Some(&wrong), 1)
+                .unwrap_err()
+                .code,
+            protocol::ErrorCode::InvalidParams
+        );
+        assert!(validate_bridge_raw_export_receipt_path(Some(&expected), None, 1).is_err());
+        assert!(validate_bridge_raw_export_receipt_path(None, Some(&wrong), 1).is_err());
+        validate_bridge_raw_export_receipt_path(None, None, 1).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4742,6 +5866,7 @@ mod tests {
             12,
             16,
             4000,
+            true,
             &recipes,
             None,
             None,

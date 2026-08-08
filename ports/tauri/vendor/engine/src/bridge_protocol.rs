@@ -204,6 +204,30 @@ pub struct BridgeCaptureRecipe {
     pub auto_exposure: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BridgeRawExportFormat {
+    LinearDng,
+    LinearTiff,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BridgeRawTiffInfrared {
+    FourthChannel,
+    Omitted,
+    Sidecar,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeRawExportSpec {
+    pub destination: String,
+    pub filename_template: String,
+    pub file_format: BridgeRawExportFormat,
+    pub tiff_infrared: BridgeRawTiffInfrared,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeOutputSpec {
@@ -214,6 +238,8 @@ pub struct BridgeOutputSpec {
     /// Keys are decimal slot strings because JSON object keys are strings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_outputs: Option<std::collections::HashMap<String, BridgeSlotOutputSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_export: Option<BridgeRawExportSpec>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -221,6 +247,8 @@ pub struct BridgeOutputSpec {
 pub struct BridgeSlotOutputSpec {
     pub destination: String,
     pub filename_template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_export: Option<BridgeRawExportSpec>,
 }
 
 // ---------------------------------------------------------------------
@@ -449,6 +477,10 @@ pub struct BridgeScanReceipt {
     pub started_at: Option<String>,
     #[serde(default)]
     pub capture_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub raw_export_path: Option<String>,
+    #[serde(default)]
+    pub raw_export_ir_path: Option<String>,
 }
 
 fn deserialize_exposure_authority_fail_soft<'de, D>(
@@ -878,6 +910,8 @@ mod tests {
             rgb_path: "/tmp/scanstudio-test-output/roll-042/frame-0001.tif".into(),
             ir_path: None,
             meter_rgbi_path: None,
+            raw_export_path: Some("/Scans/Raw/ScanStudio1.dng".into()),
+            raw_export_ir_path: Some("/Scans/Raw/ScanStudio1-ir.tif".into()),
             attempts_root: None,
             exposure_authority: None,
             started_at: Some("2026-07-22T09:00:00+00:00".into()),
@@ -894,6 +928,11 @@ mod tests {
             json!("swapaxes01-scanner-native-to-nikon-render-parity-v2")
         );
         assert_eq!(value["irPath"], serde_json::Value::Null);
+        assert_eq!(value["rawExportPath"], json!("/Scans/Raw/ScanStudio1.dng"));
+        assert_eq!(
+            value["rawExportIrPath"],
+            json!("/Scans/Raw/ScanStudio1-ir.tif")
+        );
         assert_eq!(value["artifacts"]["rgb"]["byteLength"], json!(25165824u64));
         round_trip(&receipt);
 
@@ -904,6 +943,8 @@ mod tests {
         legacy_object.remove("storageTransform");
         legacy_object.remove("startedAt");
         legacy_object.remove("captureDurationMs");
+        legacy_object.remove("rawExportPath");
+        legacy_object.remove("rawExportIrPath");
         let legacy: BridgeScanReceipt =
             serde_json::from_value(legacy_value).expect("legacy receipt must still deserialize");
         assert!(
@@ -912,6 +953,8 @@ mod tests {
         );
         assert!(legacy.started_at.is_none());
         assert!(legacy.capture_duration_ms.is_none());
+        assert!(legacy.raw_export_path.is_none());
+        assert!(legacy.raw_export_ir_path.is_none());
     }
 
     #[test]

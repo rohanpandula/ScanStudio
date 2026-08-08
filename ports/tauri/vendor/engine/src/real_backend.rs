@@ -793,6 +793,8 @@ struct PrivateCaptureWorkingDirectory {
 #[derive(Debug, Clone)]
 struct ExpectedCapturePaths {
     rgb: std::path::PathBuf,
+    raw_export: Option<std::path::PathBuf>,
+    raw_export_ir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -2629,6 +2631,7 @@ impl ScannerBackend for RealLs5000 {
 
         let capture_plan = build_real_capture_plan(
             &frames,
+            &recipe,
             &output,
             &overrides,
             backend.wsl_bridge.as_ref(),
@@ -2991,6 +2994,7 @@ fn build_scan_start_params(
             destination: output.archive.destination.clone(),
             filename_template: bridge_archive_template(&output.archive.filename_template),
             slot_outputs,
+            raw_export: bridge_raw_export_spec(&output.raw_export),
         },
     )
 }
@@ -3044,6 +3048,9 @@ fn bridge_slot_outputs(
                 BridgeSlotOutputSpec {
                     destination,
                     filename_template: template,
+                    raw_export: bridge_raw_export_spec(
+                        &override_output.unwrap_or(output).raw_export,
+                    ),
                 },
             )
         })
@@ -3068,6 +3075,7 @@ fn effective_output_for_slot<'a>(
 /// user output folders never receive an intermediate TIFF or sidecar.
 fn build_real_capture_plan(
     slots: &[u32],
+    recipe: &CaptureRecipe,
     output: &OutputRecipe,
     overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
     wsl_bridge: Option<&crate::wsl_io::WslBridgeConfig>,
@@ -3086,12 +3094,14 @@ fn build_real_capture_plan(
         BridgeSlotOutputSpec {
             destination: base_output.archive.destination.clone(),
             filename_template: bridge_archive_template(&base_output.archive.filename_template),
+            raw_export: bridge_raw_export_spec(&base_output.raw_export),
         }
     } else {
         let working = private_working_directory.as_ref().expect("private slot has working directory");
         BridgeSlotOutputSpec {
             destination: working.root.display().to_string(),
             filename_template: format!("capture-{}-####.tif", working.owner_token),
+            raw_export: bridge_raw_export_spec(&base_output.raw_export),
         }
     };
 
@@ -3104,12 +3114,14 @@ fn build_real_capture_plan(
             BridgeSlotOutputSpec {
                 destination: effective.archive.destination.clone(),
                 filename_template: bridge_archive_template(&effective.archive.filename_template),
+                raw_export: bridge_raw_export_spec(&effective.raw_export),
             }
         } else {
             let working = private_working_directory.as_ref().expect("private slot has working directory");
             BridgeSlotOutputSpec {
                 destination: working.root.display().to_string(),
                 filename_template: format!("capture-{}-####.tif", working.owner_token),
+                raw_export: bridge_raw_export_spec(&effective.raw_export),
             }
         };
         if wsl_bridge.is_some() {
@@ -3131,11 +3143,40 @@ fn build_real_capture_plan(
         // while receipt validation below derives the same exact paths.
         let _ = crate::render::archive_sidecar_path(&rgb, "IR")?;
         let _ = crate::render::archive_sidecar_path(&rgb, "METER")?;
-        final_by_slot.insert(*slot, ExpectedCapturePaths { rgb });
+        let raw_export = effective
+            .raw_export
+            .enabled
+            .then(|| crate::render::resolve_raw_export_output_path(effective, *slot));
+        let raw_export_ir = raw_export.as_ref().and_then(|path| {
+            (recipe.channels == Channels::Rgbi
+                && effective.raw_export.tiff_infrared == domain::RawTiffInfrared::Sidecar)
+                .then(|| crate::render::raw_export_ir_sidecar_path(path))
+        });
+        final_by_slot.insert(
+            *slot,
+            ExpectedCapturePaths {
+                rgb,
+                raw_export,
+                raw_export_ir,
+            },
+        );
         final_slot_outputs.insert(slot.to_string(), final_spec);
     }
 
     if let Some(config) = wsl_bridge {
+        // Raw negative export is deliberately not built for the staged WSL
+        // capture path yet (the macOS lane shipped it first); refusing here
+        // beats staging a capture whose promised raw files would never be
+        // written or validated.
+        for slot in slots {
+            let effective = effective_output_for_slot(*slot, output, overrides);
+            if effective.raw_export.enabled {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "raw negative export is not yet supported on this platform's staged capture path",
+                ));
+            }
+        }
         let owner_token = next_wsl_capture_token();
         let stage_root = crate::wsl_io::staging_root(&owner_token).map_err(|reason| {
             EngineError::new(ErrorCode::Internal, format!("build WSL staging root: {reason}"))
@@ -3146,7 +3187,14 @@ fn build_real_capture_plan(
             .map(|slot| {
                 let rgb = std::path::Path::new(&stage_root)
                     .join(crate::render::resolve_filename(&stage_template, *slot));
-                (*slot, ExpectedCapturePaths { rgb })
+                (
+                    *slot,
+                    ExpectedCapturePaths {
+                        rgb,
+                        raw_export: None,
+                        raw_export_ir: None,
+                    },
+                )
             })
             .collect();
         return Ok(RealCapturePlan {
@@ -3154,6 +3202,7 @@ fn build_real_capture_plan(
                 destination: stage_root,
                 filename_template: stage_template,
                 slot_outputs: None,
+                raw_export: None,
             },
             expected_by_slot,
             final_by_slot,
@@ -3172,6 +3221,7 @@ fn build_real_capture_plan(
             destination: final_base_spec.destination,
             filename_template: final_base_spec.filename_template,
             slot_outputs: use_slot_outputs.then_some(final_slot_outputs),
+            raw_export: final_base_spec.raw_export,
         },
         expected_by_slot: final_by_slot.clone(),
         final_by_slot,
@@ -3203,6 +3253,40 @@ fn bridge_archive_template(filename_template: &str) -> String {
     let extension_start = normalized
         .rfind('.')
         .expect("TIFF normalization always supplies a terminal extension");
+    format!(
+        "{}_####{}",
+        &normalized[..extension_start],
+        &normalized[extension_start..]
+    )
+}
+
+fn bridge_raw_export_spec(recipe: &domain::RawExportRecipe) -> Option<BridgeRawExportSpec> {
+    recipe.enabled.then(|| BridgeRawExportSpec {
+        destination: recipe.destination.clone(),
+        filename_template: bridge_raw_export_template(recipe),
+        file_format: match recipe.file_format {
+            domain::RawExportFormat::LinearDng => BridgeRawExportFormat::LinearDng,
+            domain::RawExportFormat::LinearTiff => BridgeRawExportFormat::LinearTiff,
+        },
+        tiff_infrared: match recipe.tiff_infrared {
+            domain::RawTiffInfrared::FourthChannel => BridgeRawTiffInfrared::FourthChannel,
+            domain::RawTiffInfrared::Omitted => BridgeRawTiffInfrared::Omitted,
+            domain::RawTiffInfrared::Sidecar => BridgeRawTiffInfrared::Sidecar,
+        },
+    })
+}
+
+fn bridge_raw_export_template(recipe: &domain::RawExportRecipe) -> String {
+    let normalized = crate::render::normalize_raw_export_filename_template(
+        &recipe.filename_template,
+        recipe.file_format,
+    );
+    if normalized.contains('#') || crate::render::is_reserved_sequence_template(&normalized) {
+        return normalized;
+    }
+    let extension_start = normalized
+        .rfind('.')
+        .expect("raw export normalization always supplies a terminal extension");
     format!(
         "{}_####{}",
         &normalized[..extension_start],
@@ -5049,6 +5133,28 @@ fn run_real_scan_job_inner(
                                             .as_deref()
                                             .map(std::path::Path::new),
                                     )
+                                    .and_then(|()| {
+                                        crate::render::validate_bridge_raw_export_receipt_path(
+                                            expected.raw_export.as_deref(),
+                                            frame_completed
+                                                .receipt
+                                                .raw_export_path
+                                                .as_deref()
+                                                .map(std::path::Path::new),
+                                            frame_completed.slot,
+                                        )
+                                    })
+                                    .and_then(|()| {
+                                        crate::render::validate_bridge_raw_export_receipt_path(
+                                            expected.raw_export_ir.as_deref(),
+                                            frame_completed
+                                                .receipt
+                                                .raw_export_ir_path
+                                                .as_deref()
+                                                .map(std::path::Path::new),
+                                            frame_completed.slot,
+                                        )
+                                    })
                                 })
                             } else {
                                 crate::render::validate_bridge_capture_receipt_paths_for_expected(
@@ -5067,6 +5173,28 @@ fn run_real_scan_job_inner(
                                         .as_deref()
                                         .map(std::path::Path::new),
                                 )
+                                .and_then(|()| {
+                                    crate::render::validate_bridge_raw_export_receipt_path(
+                                        expected.raw_export.as_deref(),
+                                        frame_completed
+                                            .receipt
+                                            .raw_export_path
+                                            .as_deref()
+                                            .map(std::path::Path::new),
+                                        frame_completed.slot,
+                                    )
+                                })
+                                .and_then(|()| {
+                                    crate::render::validate_bridge_raw_export_receipt_path(
+                                        expected.raw_export_ir.as_deref(),
+                                        frame_completed
+                                            .receipt
+                                            .raw_export_ir_path
+                                            .as_deref()
+                                            .map(std::path::Path::new),
+                                        frame_completed.slot,
+                                    )
+                                })
                             }
                         } else {
                             Err(EngineError::new(
@@ -5168,6 +5296,14 @@ fn run_real_scan_job_inner(
                                     preview_path: written
                                         .preview_path
                                         .map(|path| path.display().to_string()),
+                                    raw_negative_path: frame_completed
+                                        .receipt
+                                        .raw_export_path
+                                        .clone(),
+                                    raw_negative_ir_path: frame_completed
+                                        .receipt
+                                        .raw_export_ir_path
+                                        .clone(),
                                     derivative_transform: written.derivative_transform,
                                 });
                                 // Which nikonlook bundle/path/gains actually
@@ -6433,6 +6569,12 @@ mod tests {
         assert_eq!(params.output.filename_template, "ScanStudio#.tif");
     }
 
+    fn recipe_for_wsl_plan_tests() -> CaptureRecipe {
+        // The staged-plan tests predate the recipe parameter; any valid
+        // recipe works because raw export stays disabled in their outputs.
+        CaptureRecipe::default()
+    }
+
     #[test]
     fn production_wsl_plan_stages_in_linux_and_keeps_native_final_paths() {
         let mut output = OutputRecipe::default();
@@ -6444,6 +6586,7 @@ mod tests {
 
         let plan = build_real_capture_plan(
             &[1, 2],
+            &recipe_for_wsl_plan_tests(),
             &output,
             &std::collections::HashMap::new(),
             Some(&config),
@@ -6470,6 +6613,57 @@ mod tests {
     }
 
     #[test]
+    fn production_wsl_plan_refuses_raw_export_base_and_per_slot() {
+        // Post-release adversarial review C1: the staged lane's raw refusal
+        // must cover both the base output and per-slot overrides -- staging
+        // a capture whose promised raw files would never be written is the
+        // silent half-delivery this lane exists to refuse.
+        let config = crate::wsl_io::WslBridgeConfig {
+            distro: crate::wsl_io::DEFAULT_WSL_DISTRO.to_string(),
+        };
+        let mut output = OutputRecipe::default();
+        output.archive.destination = r"C:\Users\test-user\Scans".into();
+        output.archive.filename_template = "Archive_####".into();
+        output.raw_export.enabled = true;
+        let base_err = build_real_capture_plan(
+            &[1],
+            &recipe_for_wsl_plan_tests(),
+            &output,
+            &std::collections::HashMap::new(),
+            Some(&config),
+        )
+        .expect_err("base raw export must refuse on the staged lane");
+        assert_eq!(base_err.code, ErrorCode::InvalidParams);
+        assert!(base_err.message.contains("raw negative export"));
+
+        let mut base_only = OutputRecipe::default();
+        base_only.archive.destination = r"C:\Users\test-user\Scans".into();
+        base_only.archive.filename_template = "Archive_####".into();
+        let mut override_output = base_only.clone();
+        override_output.raw_export.enabled = true;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            1u32,
+            domain::FrameOverrides {
+                capture: None,
+                processing: None,
+                output: Some(override_output),
+                alignment: None,
+            },
+        );
+        let slot_err = build_real_capture_plan(
+            &[1],
+            &recipe_for_wsl_plan_tests(),
+            &base_only,
+            &overrides,
+            Some(&config),
+        )
+        .expect_err("per-slot raw override must refuse on the staged lane");
+        assert_eq!(slot_err.code, ErrorCode::InvalidParams);
+        assert!(slot_err.message.contains("raw negative export"));
+    }
+
+    #[test]
     fn production_wsl_plan_rejects_unmappable_destination_before_dispatch() {
         let mut output = OutputRecipe::default();
         output.archive.destination = r"relative\Scans".into();
@@ -6479,6 +6673,7 @@ mod tests {
 
         let error = build_real_capture_plan(
             &[1],
+            &recipe_for_wsl_plan_tests(),
             &output,
             &std::collections::HashMap::new(),
             Some(&config),

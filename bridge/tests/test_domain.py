@@ -27,6 +27,9 @@ from scanstudio_bridge.domain import (
     FocusDetailTelemetry,
     Material,
     OutputSpec,
+    RawExportFormat,
+    RawExportSpec,
+    RawTiffInfrared,
     SlotOutputSpec,
     ScanReceipt,
     Thumbnail,
@@ -39,9 +42,17 @@ from scanstudio_bridge.protocol import BridgeError, ErrorCode, from_wire, to_wir
 def test_output_spec_slot_templates_are_backward_compatible_and_round_trip() -> None:
     legacy = from_wire({"destination": "/tmp/scans", "filenameTemplate": "frame-####.tif"}, OutputSpec)
     assert legacy.slot_outputs is None
+    assert legacy.raw_export is None
+    raw = RawExportSpec(
+        destination="/tmp/raw",
+        filename_template="negative-####",
+        file_format=RawExportFormat.LINEAR_TIFF,
+        tiff_infrared=RawTiffInfrared.SIDECAR,
+    )
     output = OutputSpec(
         destination="/tmp/scans", filename_template="frame-####.tif",
-        slot_outputs={"1": SlotOutputSpec("/tmp/scans", "CanonA-####.tif"), "2": SlotOutputSpec("/tmp/scans", "CanonB-####.tif")},
+        slot_outputs={"1": SlotOutputSpec("/tmp/scans", "CanonA-####.tif", raw), "2": SlotOutputSpec("/tmp/scans", "CanonB-####.tif")},
+        raw_export=raw,
     )
     assert from_wire(to_wire(output), OutputSpec) == output
 
@@ -118,6 +129,8 @@ def test_to_wire_scan_receipt_uses_camel_case_at_every_nesting_level() -> None:
     assert wire["rgbPath"] == "/tmp/scans/frame-0001.tif"
     assert wire["irPath"] is None
     assert wire["meterRgbiPath"] == "/tmp/scans/frame-0001_METER.tif"
+    assert wire["rawExportPath"] is None
+    assert wire["rawExportIrPath"] is None
     assert wire["attemptsRoot"] is None
     assert wire["splitAlignment"] is None
     assert wire["manualApproval"] is None
@@ -138,6 +151,24 @@ def test_scan_receipt_accepts_an_older_wire_payload_without_attempts_root() -> N
     restored = from_wire(wire, ScanReceipt)
 
     assert restored.attempts_root is None
+
+
+def test_scan_receipt_raw_export_path_round_trips_and_legacy_payload_defaults() -> None:
+    original = dataclasses.replace(
+        _make_scan_receipt(),
+        raw_export_path="/tmp/raw/frame-0001.dng",
+        raw_export_ir_path="/tmp/raw/frame-0001-ir.tif",
+    )
+    wire = to_wire(original)
+    assert wire["rawExportPath"] == "/tmp/raw/frame-0001.dng"
+    assert wire["rawExportIrPath"] == "/tmp/raw/frame-0001-ir.tif"
+    assert from_wire(wire, ScanReceipt) == original
+
+    del wire["rawExportPath"]
+    del wire["rawExportIrPath"]
+    legacy = from_wire(wire, ScanReceipt)
+    assert legacy.raw_export_path is None
+    assert legacy.raw_export_ir_path is None
 
 
 def test_scan_receipt_timing_round_trips_through_wire() -> None:

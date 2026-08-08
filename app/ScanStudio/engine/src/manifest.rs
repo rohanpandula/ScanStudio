@@ -346,7 +346,7 @@ pub fn create_project(
     // generic `~/ScanStudio Projects/_Unfiled/<subfolder>` (see
     // `domain::fallback_unfiled_root`), and previously fell back to the OS
     // temp directory. Every brand-new project must instead default its
-    // three output destinations under *this* project's own `directory`,
+    // four output destinations under *this* project's own `directory`,
     // computed just above — never a shared, project-unaware location.
     let recipes = OutputRecipe {
         auto_crop: false,
@@ -354,6 +354,10 @@ pub fn create_project(
         archive: ArchiveRecipe {
             destination: directory.join("Archive").display().to_string(),
             ..ArchiveRecipe::default()
+        },
+        raw_export: crate::domain::RawExportRecipe {
+            destination: directory.join("Raw Negative").display().to_string(),
+            ..crate::domain::RawExportRecipe::default()
         },
         positive: PositiveRecipe {
             destination: directory.join("Positive").display().to_string(),
@@ -418,7 +422,12 @@ fn is_under_os_temp_dir(path: &str) -> bool {
 /// `create_project` would have written for this project in the first
 /// place. Returns whether anything changed, so callers only pay for a
 /// re-write when one is actually needed.
-fn migrate_temp_destinations(project: &mut ScanProject, directory: &Path) -> bool {
+fn migrate_temp_destinations(
+    project: &mut ScanProject,
+    directory: &Path,
+    missing_raw_export: bool,
+    frame_overrides_missing_raw_export: &std::collections::HashSet<u32>,
+) -> bool {
     let mut changed = false;
     if is_under_os_temp_dir(&project.recipes.archive.destination) {
         project.recipes.archive.destination = directory.join("Archive").display().to_string();
@@ -432,7 +441,54 @@ fn migrate_temp_destinations(project: &mut ScanProject, directory: &Path) -> boo
         project.recipes.preview.destination = directory.join("Preview").display().to_string();
         changed = true;
     }
+    if missing_raw_export {
+        project.recipes.raw_export.destination = directory.join("Raw Negative").display().to_string();
+        changed = true;
+    }
+    for frame in &mut project.frames {
+        if frame_overrides_missing_raw_export.contains(&frame.index) {
+            if let Some(output) = frame.output_override.as_mut() {
+                output.raw_export.destination = directory.join("Raw Negative").display().to_string();
+                changed = true;
+            }
+        }
+    }
     changed
+}
+
+fn legacy_raw_export_presence(
+    directory: &Path,
+) -> Result<(bool, std::collections::HashSet<u32>), EngineError> {
+    let path = directory.join(MANIFEST_FILE_NAME);
+    let contents = fs::read_to_string(&path).map_err(|error| {
+        EngineError::new(
+            ErrorCode::ManifestInvalid,
+            format!("failed to read manifest at {}: {error}", directory.display()),
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
+        EngineError::new(
+            ErrorCode::ManifestInvalid,
+            format!("failed to parse manifest at {}: {error}", directory.display()),
+        )
+    })?;
+    let missing_project_raw = value
+        .get("recipes")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|recipes| !recipes.contains_key("rawExport"));
+    let missing_frame_raw = value
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|frame| {
+            let output = frame.get("outputOverride")?.as_object()?;
+            (!output.contains_key("rawExport"))
+                .then(|| frame.get("index")?.as_u64().and_then(|index| u32::try_from(index).ok()))
+                .flatten()
+        })
+        .collect();
+    Ok((missing_project_raw, missing_frame_raw))
 }
 
 /// Thin wrapper over `read_manifest` — the seam name that mirrors the
@@ -444,7 +500,14 @@ fn migrate_temp_destinations(project: &mut ScanProject, directory: &Path) -> boo
 /// mutation to happen to get fixed.
 pub fn open_project(directory: &Path) -> Result<ScanProject, EngineError> {
     let mut project = read_manifest(directory)?;
-    if migrate_temp_destinations(&mut project, directory) {
+    let (missing_raw_export, frame_overrides_missing_raw_export) =
+        legacy_raw_export_presence(directory)?;
+    if migrate_temp_destinations(
+        &mut project,
+        directory,
+        missing_raw_export,
+        &frame_overrides_missing_raw_export,
+    ) {
         write_manifest_atomically(directory, &project)?;
     }
     Ok(project)
@@ -750,7 +813,7 @@ mod tests {
     /// OS temporary directory
     /// because `create_project` used to build recipes via a
     /// project-directory-unaware `OutputRecipe::default()`. Every new
-    /// project's three destinations must instead resolve under its own
+    /// project's four destinations must instead resolve under its own
     /// directory, never the OS temp dir and never the generic
     /// `_Unfiled` fallback either (that fallback is for construction
     /// sites with no project directory in scope at all).
@@ -775,12 +838,17 @@ mod tests {
             returned_dir.join("Positive").display().to_string()
         );
         assert_eq!(
+            project.recipes.raw_export.destination,
+            returned_dir.join("Raw Negative").display().to_string()
+        );
+        assert_eq!(
             project.recipes.preview.destination,
             returned_dir.join("Preview").display().to_string()
         );
 
         for destination in [
             &project.recipes.archive.destination,
+            &project.recipes.raw_export.destination,
             &project.recipes.positive.destination,
             &project.recipes.preview.destination,
         ] {
@@ -1181,6 +1249,11 @@ mod tests {
             dir.join("Positive").display().to_string()
         );
         assert_eq!(
+            opened.recipes.raw_export.destination,
+            dir.join("Raw Negative").display().to_string(),
+            "a legacy manifest's new disabled recipe must still get a project-local future destination"
+        );
+        assert_eq!(
             opened.recipes.preview.destination,
             dir.join("Preview").display().to_string()
         );
@@ -1193,6 +1266,10 @@ mod tests {
         assert_eq!(
             reread.recipes.archive.destination,
             opened.recipes.archive.destination
+        );
+        assert_eq!(
+            reread.recipes.raw_export.destination,
+            opened.recipes.raw_export.destination
         );
         assert!(
             !is_under_os_temp_dir(&reread.recipes.archive.destination),

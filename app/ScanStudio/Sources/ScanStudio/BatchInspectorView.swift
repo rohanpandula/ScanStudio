@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct BatchInspectorView: View {
     @Environment(SessionModel.self) private var sessionModel
     @State private var masterSettingsExpanded = false
+    @State private var rawSettingsExpanded = false
     @State private var positiveTiffSettingsExpanded = false
     @State private var positiveJPEGSettingsExpanded = false
     @FocusState private var focusedGearField: GearField?
@@ -252,6 +253,17 @@ struct BatchInspectorView: View {
                         : "Off"
                 )
                 InspectorRow(
+                    label: "Raw negative (per frame)",
+                    value: sessionModel.rawExportEnabled
+                        ? formattedSize(bytes: ScanSizeEstimator.rawExportBytesPerFrame(
+                            carrier: sessionModel.loadedCarrier ?? .roll36,
+                            resolutionDpi: sessionModel.scanResolutionDpi,
+                            fileFormat: sessionModel.rawExportFormat,
+                            tiffInfrared: sessionModel.rawTiffInfrared
+                        ))
+                        : "Off"
+                )
+                InspectorRow(
                     label: "\(positiveTiffOutputTitle) (per frame)",
                     value: sessionModel.positiveEnabled
                         ? formattedSize(bytes: ScanSizeEstimator.positiveBytesPerFrame(
@@ -317,13 +329,34 @@ struct BatchInspectorView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Color.scanStudioSecondaryText)
 
-            outputDisclosure(title: "Keep master TIFF", isEnabled: masterTIFFEnabledBinding, canToggle: !sessionModel.masterTIFFEnabled || sessionModel.positiveEnabled || sessionModel.previewEnabled, folderName: masterFolderNameBinding, expanded: $masterSettingsExpanded) {
+            outputDisclosure(title: "Keep master TIFF", isEnabled: masterTIFFEnabledBinding, canToggle: !sessionModel.masterTIFFEnabled || sessionModel.rawExportEnabled || sessionModel.positiveEnabled || sessionModel.previewEnabled, folderName: masterFolderNameBinding, expanded: $masterSettingsExpanded) {
                 if sessionModel.masterTIFFEnabled {
                     InspectorToggleRow(label: "Full capture package", isOn: fullCapturePackageBinding)
                     Text(fullCapturePackageExplanation)
                 }
             }
-            outputDisclosure(title: positiveTiffOutputTitle, isEnabled: positiveEnabledBinding, canToggle: !sessionModel.positiveEnabled || sessionModel.masterTIFFEnabled || sessionModel.previewEnabled, folderName: positiveTiffFolderNameBinding, expanded: $positiveTiffSettingsExpanded) {
+            outputDisclosure(title: rawOutputTitle, isEnabled: rawExportEnabledBinding, canToggle: !sessionModel.rawExportEnabled || sessionModel.masterTIFFEnabled || sessionModel.positiveEnabled || sessionModel.previewEnabled, folderName: rawExportFolderNameBinding, expanded: $rawSettingsExpanded) {
+                InspectorSettingRow(label: "File format") {
+                    Picker("File format", selection: rawExportFormatBinding) {
+                        Text("Linear DNG").tag(RawExportFormat.linearDng)
+                        Text("Linear TIFF").tag(RawExportFormat.linearTiff)
+                    }
+                }
+                InspectorSettingRow(label: "Infrared") {
+                    Picker("Infrared", selection: rawTiffInfraredBinding) {
+                        if sessionModel.rawExportFormat == .linearDng {
+                            Text("Inside the DNG").tag(RawTiffInfrared.fourthChannel)
+                            Text("Separate grayscale TIFF").tag(RawTiffInfrared.sidecar)
+                        } else {
+                            Text("Fourth channel").tag(RawTiffInfrared.fourthChannel)
+                            Text("Separate grayscale TIFF").tag(RawTiffInfrared.sidecar)
+                            Text("Omit (RGB only)").tag(RawTiffInfrared.omitted)
+                        }
+                    }
+                }
+                Text(rawOutputExplanation)
+            }
+            outputDisclosure(title: positiveTiffOutputTitle, isEnabled: positiveEnabledBinding, canToggle: !sessionModel.positiveEnabled || sessionModel.masterTIFFEnabled || sessionModel.rawExportEnabled || sessionModel.previewEnabled, folderName: positiveTiffFolderNameBinding, expanded: $positiveTiffSettingsExpanded) {
                 InspectorSettingRow(label: "Color setting") {
                     Picker("Color setting", selection: positiveColorProfileBinding) {
                         Text("Current engine default").tag(OutputColorProfile.adobeRgb1998)
@@ -385,7 +418,7 @@ struct BatchInspectorView: View {
                 }
                 Text(positiveOutputExplanation)
             }
-            outputDisclosure(title: positiveJPEGOutputTitle, isEnabled: previewEnabledBinding, canToggle: !sessionModel.previewEnabled || sessionModel.masterTIFFEnabled || sessionModel.positiveEnabled, folderName: positiveJPEGFolderNameBinding, expanded: $positiveJPEGSettingsExpanded) {
+            outputDisclosure(title: positiveJPEGOutputTitle, isEnabled: previewEnabledBinding, canToggle: !sessionModel.previewEnabled || sessionModel.masterTIFFEnabled || sessionModel.rawExportEnabled || sessionModel.positiveEnabled, folderName: positiveJPEGFolderNameBinding, expanded: $positiveJPEGSettingsExpanded) {
                 InspectorSettingRow(label: "Long edge") {
                     Picker("Long edge", selection: previewMaxLongEdgePxBinding) {
                         Text("Full resolution").tag(0)
@@ -453,6 +486,9 @@ struct BatchInspectorView: View {
                 }
                 if sessionModel.masterTIFFEnabled {
                     InspectorRow(label: "Master TIFF", value: sessionModel.outputRecipe.archive.destination)
+                }
+                if sessionModel.rawExportEnabled {
+                    InspectorRow(label: rawOutputTitle, value: sessionModel.outputRecipe.rawExport.destination)
                 }
                 if sessionModel.positiveEnabled {
                     InspectorRow(label: positiveTiffOutputTitle, value: sessionModel.outputRecipe.positive.destination)
@@ -570,6 +606,14 @@ struct BatchInspectorView: View {
                 bitDepth: sessionModel.scanBitDepth
             )
         }
+        if sessionModel.rawExportEnabled {
+            total += ScanSizeEstimator.rawExportBytesPerFrame(
+                carrier: carrier,
+                resolutionDpi: sessionModel.scanResolutionDpi,
+                fileFormat: sessionModel.rawExportFormat,
+                tiffInfrared: sessionModel.rawTiffInfrared
+            )
+        }
         if sessionModel.positiveEnabled {
             total += ScanSizeEstimator.positiveBytesPerFrame(
                 carrier: carrier,
@@ -596,18 +640,19 @@ struct BatchInspectorView: View {
     }
 
     private var sizeExplanation: String {
-        sessionModel.masterTIFFEnabled
-            ? "Master TIFF uses uncompressed capture resolution; Positive and Preview use their own format and size settings above."
+        sessionModel.masterTIFFEnabled || sessionModel.rawExportEnabled
+            ? "Master TIFF and raw negatives use uncompressed capture resolution; Positive and Preview use their own format and size settings above."
             : "Estimate includes only retained derivatives. The internal temporary capture is not saved as an output and is held only if recovery is needed."
     }
 
     /// A real, always-current summary of which outputs this batch will
-    /// write — the Archive master plus whichever derivatives are enabled —
+    /// write — the Master, Raw negative, and whichever derivatives are enabled —
     /// replacing the old single "Save image" three-way choice now that the
-    /// three outputs are independent (REC-01/02/03).
+    /// four outputs are independent (REC-01/02/03).
     private var activeOutputsSummary: String {
         var parts: [String] = []
         if sessionModel.masterTIFFEnabled { parts.append("Master TIFF") }
+        if sessionModel.rawExportEnabled { parts.append(rawOutputTitle) }
         if sessionModel.positiveEnabled { parts.append(positiveTiffOutputTitle) }
         if sessionModel.previewEnabled { parts.append(positiveJPEGOutputTitle) }
         return parts.joined(separator: " + ")
@@ -872,6 +917,26 @@ struct BatchInspectorView: View {
         }
     }
 
+    private var rawOutputTitle: String {
+        sessionModel.rawExportFormat == .linearDng ? "Raw negative (DNG)" : "Raw negative (TIFF)"
+    }
+
+    private var rawOutputExplanation: String {
+        if sessionModel.rawExportFormat == .linearDng {
+            return sessionModel.rawTiffInfrared == .sidecar
+                ? "Saves an untouched 16-bit RGB linear DNG plus a 16-bit grayscale infrared TIFF named with the -ir suffix. The DNG contains no embedded infrared."
+                : "Saves the untouched 16-bit RGB negative as linear DNG, with the untouched infrared plane embedded inside the file. No inversion, crop, color conversion, or dust removal is applied."
+        }
+        return switch sessionModel.rawTiffInfrared {
+        case .fourthChannel:
+            "Saves untouched 16-bit RGB plus infrared as an unspecified fourth TIFF channel. Some photo editors ignore or reject four-channel TIFF files."
+        case .sidecar:
+            "Saves an untouched 16-bit RGB TIFF plus a 16-bit grayscale infrared TIFF named with the -ir suffix."
+        case .omitted:
+            "Saves untouched 16-bit RGB only. For an IR-cleaned positive, keep the Positive output enabled; infrared is not baked into this raw file."
+        }
+    }
+
     private var positiveOutputExplanation: String {
         switch sessionModel.scanFilmProcess {
         case .c41ColorNegative:
@@ -910,8 +975,39 @@ struct BatchInspectorView: View {
         Binding(get: { sessionModel.masterFolderName }, set: { sessionModel.masterFolderName = $0 })
     }
 
+    private var rawExportFolderNameBinding: Binding<String> {
+        Binding(get: { sessionModel.rawExportFolderName }, set: { sessionModel.rawExportFolderName = $0 })
+    }
+
     private var masterTIFFEnabledBinding: Binding<Bool> {
         Binding(get: { sessionModel.masterTIFFEnabled }, set: { sessionModel.setMasterTIFFEnabled($0) })
+    }
+
+    private var rawExportEnabledBinding: Binding<Bool> {
+        Binding(get: { sessionModel.rawExportEnabled }, set: { sessionModel.setRawExportEnabled($0) })
+    }
+
+    private var rawExportFormatBinding: Binding<RawExportFormat> {
+        Binding(
+            get: { sessionModel.rawExportFormat },
+            set: {
+                sessionModel.rawExportFormat = $0
+                if $0 == .linearDng && sessionModel.rawTiffInfrared == .omitted {
+                    sessionModel.rawTiffInfrared = .fourthChannel
+                }
+            }
+        )
+    }
+
+    private var rawTiffInfraredBinding: Binding<RawTiffInfrared> {
+        Binding(
+            get: {
+                sessionModel.rawExportFormat == .linearDng
+                    && sessionModel.rawTiffInfrared == .omitted
+                    ? .fourthChannel : sessionModel.rawTiffInfrared
+            },
+            set: { sessionModel.rawTiffInfrared = $0 }
+        )
     }
 
     private var positiveTiffFolderNameBinding: Binding<String> {
