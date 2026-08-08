@@ -1859,6 +1859,42 @@ def test_start_scan_write_failure_keeps_rgb_and_releases_unwritten_sidecars(
     assert not (output_root / "frame-0001_METER.tif").exists()
 
 
+def test_start_scan_real_adapter_writes_requested_raw_before_completing_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rgb = np.arange(8 * 8 * 3, dtype=np.uint16).reshape(8, 8, 3)
+    infrared = (np.arange(8 * 8, dtype=np.uint16).reshape(8, 8) + 30000)
+    frame = dataclasses.replace(_fake_frame(1), rgb=rgb, ir=infrared)
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)], scan_results={1: [frame]})
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    receipts: list[domain.ScanReceipt] = []
+    output = domain.OutputSpec(
+        destination=str(tmp_path / "capture"),
+        filename_template="frame-####.tif",
+        raw_export=domain.RawExportSpec(
+            destination=str(tmp_path / "raw"),
+            filename_template="negative-####",
+            file_format=domain.RawExportFormat.LINEAR_DNG,
+        ),
+    )
+
+    transport.start_scan(
+        [1],
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        output,
+        lambda _p: None,
+        lambda *_a: None,
+        lambda _slot, receipt: receipts.append(receipt),
+    )
+
+    raw_path = tmp_path / "raw" / "negative-0001.dng"
+    assert receipts[0].raw_export_path == str(raw_path)
+    with tifffile.TiffFile(raw_path) as tiff:
+        np.testing.assert_array_equal(tiff.pages[0].asarray(), rgb)
+        np.testing.assert_array_equal(tiff.pages[0].pages[0].asarray(), infrared)
+
+
 # -- start_scan: other coolscanpy exception mappings --------------------------------
 
 

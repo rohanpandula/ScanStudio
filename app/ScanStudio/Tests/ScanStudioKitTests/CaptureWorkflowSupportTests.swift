@@ -83,6 +83,22 @@ struct CaptureWorkflowSupportTests {
             previewEnabled: false
         ) == false)
         #expect(OutputRetentionPolicy.allowsChange(
+            .archive,
+            to: false,
+            archiveEnabled: true,
+            rawExportEnabled: true,
+            positiveEnabled: false,
+            previewEnabled: false
+        ))
+        #expect(OutputRetentionPolicy.allowsChange(
+            .rawExport,
+            to: false,
+            archiveEnabled: false,
+            rawExportEnabled: true,
+            positiveEnabled: false,
+            previewEnabled: false
+        ) == false)
+        #expect(OutputRetentionPolicy.allowsChange(
             .positive,
             to: false,
             archiveEnabled: true,
@@ -96,6 +112,24 @@ struct CaptureWorkflowSupportTests {
             positiveEnabled: false,
             previewEnabled: false
         ))
+    }
+
+    @Test("raw negative size estimate is 16-bit and counts embedded or fourth-channel infrared")
+    func rawNegativeSizeEstimate() {
+        let rgb = ScanSizeEstimator.rawExportBytesPerFrame(
+            carrier: .mounted,
+            resolutionDpi: 4_000,
+            fileFormat: .linearTiff,
+            tiffInfrared: .omitted
+        )
+        let rgbi = ScanSizeEstimator.rawExportBytesPerFrame(
+            carrier: .mounted,
+            resolutionDpi: 4_000,
+            fileFormat: .linearDng,
+            tiffInfrared: .omitted
+        )
+        #expect(rgb == 3_946 * 5_782 * 3 * 2)
+        #expect(rgbi == 3_946 * 5_782 * 4 * 2)
     }
 
     @Test("recipe presets respect real-device multisample limits and expose manual changes as custom")

@@ -268,6 +268,23 @@ public enum ScanSizeEstimator {
         uncompressedBytes(carrier: carrier, resolutionDpi: resolutionDpi, bitDepth: bitDepth, colorChannels: 3)
     }
 
+    /// Raw negatives are always 16-bit. DNG always embeds IR; TIFF does so
+    /// only in fourth-channel mode. Container metadata is negligible here.
+    public static func rawExportBytesPerFrame(
+        carrier: SimulatedFilmCarrier,
+        resolutionDpi: Int,
+        fileFormat: RawExportFormat,
+        tiffInfrared: RawTiffInfrared
+    ) -> Int {
+        let channels = fileFormat == .linearDng || tiffInfrared == .fourthChannel ? 4 : 3
+        return uncompressedBytes(
+            carrier: carrier,
+            resolutionDpi: resolutionDpi,
+            bitDepth: 16,
+            colorChannels: channels
+        )
+    }
+
     /// Positive TIFF rendering is fixed at 16-bit; JPEG is fixed at 8-bit.
     /// JPEG uses the same rough compression-ratio estimate the old
     /// `estimatedOutputBytes` used (~0.18 of the uncompressed size).
@@ -528,12 +545,13 @@ public final class SessionModel {
         } + [project?.name].compactMap { $0 }
 
         let frameOutputPaths = project?.frames.compactMap(\.outputOverride).flatMap {
-            [$0.archive.destination, $0.positive.destination, $0.preview.destination]
+            [$0.archive.destination, $0.rawExport.destination, $0.positive.destination, $0.preview.destination]
         } ?? []
         let selectedPaths = [
             saveLocation,
             projectDirectory,
             outputRecipe.archive.destination,
+            outputRecipe.rawExport.destination,
             outputRecipe.positive.destination,
             outputRecipe.preview.destination,
         ].compactMap { $0 }.filter { !$0.isEmpty } + frameOutputPaths
@@ -669,6 +687,11 @@ public final class SessionModel {
     public var archiveFilenameTemplate = FilenameTemplate.defaultTemplate
     public var archiveDestination = SessionModel.defaultOutputDestination(subfolder: "Archive")
     public var fullCapturePackageEnabled = true
+    public var rawExportEnabled = false
+    public var rawExportFormat: RawExportFormat = .linearDng
+    public var rawTiffInfrared: RawTiffInfrared = .fourthChannel
+    public var rawExportFilenameTemplate = FilenameTemplate.defaultTemplate
+    public var rawExportDestination = SessionModel.defaultOutputDestination(subfolder: "Raw Negative")
     public var positiveEnabled = true
     public var positiveFileFormat: OutputFileFormat = .tiff
     public var positiveColorProfile: OutputColorProfile = .adobeRgb1998
@@ -691,6 +714,7 @@ public final class SessionModel {
     public var saveLocation = ""
     public var saveEachOutputInOwnFolder = true
     public var masterFolderName = "Master TIFF"
+    public var rawExportFolderName = "Raw Negative"
     public var positiveTiffFolderName = "Positive TIFF"
     public var positiveJPEGFolderName = "Positive JPEG"
     public var saveFilenameTemplateAsDefault = false
@@ -711,7 +735,7 @@ public final class SessionModel {
     /// `MetadataSet()`'s default init is already the correct empty starting
     /// point; `createProject`/`openProject` re-sync this from
     /// `project?.rollMetadata` whenever a project loads, exactly the same
-    /// shape `applyRecipes` already uses for the three output-recipe state
+    /// shape `applyRecipes` already uses for the four output-recipe state
     /// groups above.
     public var rollMetadataDraft = MetadataSet()
 
@@ -824,6 +848,11 @@ public final class SessionModel {
             subfolder: saveEachOutputInOwnFolder ? positiveTiffFolderName : nil,
             fallback: self.positiveDestination
         )
+        let rawDestination = OutputDestination.destination(
+            base: saveLocation,
+            subfolder: saveEachOutputInOwnFolder ? rawExportFolderName : nil,
+            fallback: rawExportDestination
+        )
         let jpegDestination = OutputDestination.destination(
             base: saveLocation,
             subfolder: saveEachOutputInOwnFolder ? positiveJPEGFolderName : nil,
@@ -839,6 +868,17 @@ public final class SessionModel {
                 ),
                 destination: masterDestination,
                 fullCapturePackage: masterTIFFEnabled && fullCapturePackageEnabled
+            ),
+            rawExport: RawExportRecipe(
+                enabled: rawExportEnabled,
+                fileFormat: rawExportFormat,
+                tiffInfrared: rawTiffInfrared,
+                filenameTemplate: OutputNamingTemplate.template(
+                    rawExportFilenameTemplate,
+                    roleSuffix: "Raw",
+                    separateFolders: saveEachOutputInOwnFolder
+                ),
+                destination: rawDestination
             ),
             positive: PositiveRecipe(
                 enabled: positiveEnabled,
@@ -1774,7 +1814,7 @@ public final class SessionModel {
         }
     }
 
-    /// REC-03: sets current values for all three outputs at once. This does
+    /// REC-03: sets current values for the three legacy outputs at once. This does
     /// not lock or otherwise distinguish them from manual edits — every
     /// field remains a plain `@Observable var`, immediately editable
     /// afterward.
@@ -1840,6 +1880,7 @@ public final class SessionModel {
 
     public func setSharedFilenameTemplate(_ template: String) {
         archiveFilenameTemplate = template
+        rawExportFilenameTemplate = template
         positiveFilenameTemplate = template
         previewFilenameTemplate = template
         if saveFilenameTemplateAsDefault {
@@ -1855,6 +1896,7 @@ public final class SessionModel {
             .archive,
             to: enabled,
             archiveEnabled: masterTIFFEnabled,
+            rawExportEnabled: rawExportEnabled,
             positiveEnabled: positiveEnabled,
             previewEnabled: previewEnabled
         ) else { return }
@@ -1862,11 +1904,24 @@ public final class SessionModel {
         if !enabled { fullCapturePackageEnabled = false }
     }
 
+    public func setRawExportEnabled(_ enabled: Bool) {
+        guard OutputRetentionPolicy.allowsChange(
+            .rawExport,
+            to: enabled,
+            archiveEnabled: masterTIFFEnabled,
+            rawExportEnabled: rawExportEnabled,
+            positiveEnabled: positiveEnabled,
+            previewEnabled: previewEnabled
+        ) else { return }
+        rawExportEnabled = enabled
+    }
+
     public func setPositiveEnabled(_ enabled: Bool) {
         guard OutputRetentionPolicy.allowsChange(
             .positive,
             to: enabled,
             archiveEnabled: masterTIFFEnabled,
+            rawExportEnabled: rawExportEnabled,
             positiveEnabled: positiveEnabled,
             previewEnabled: previewEnabled
         ) else { return }
@@ -1878,6 +1933,7 @@ public final class SessionModel {
             .preview,
             to: enabled,
             archiveEnabled: masterTIFFEnabled,
+            rawExportEnabled: rawExportEnabled,
             positiveEnabled: positiveEnabled,
             previewEnabled: previewEnabled
         ) else { return }
@@ -1983,6 +2039,7 @@ public final class SessionModel {
         let draftOutputOrganization = (
             separateFolders: saveEachOutputInOwnFolder,
             masterFolder: masterFolderName,
+            rawFolder: rawExportFolderName,
             positiveFolder: positiveTiffFolderName,
             jpegFolder: positiveJPEGFolderName
         )
@@ -2027,11 +2084,15 @@ public final class SessionModel {
             // unchanged.
             applyRecipes(result.project.recipes)
             if draftOutput.archive.enabled
+                || draftOutput.rawExport.enabled
                 || draftOutput.positive.enabled
                 || draftOutput.preview.enabled {
                 masterTIFFEnabled = draftOutput.archive.enabled
                 fullCapturePackageEnabled = draftOutput.archive.enabled
                     && draftOutput.archive.fullCapturePackage
+                rawExportEnabled = draftOutput.rawExport.enabled
+                rawExportFormat = draftOutput.rawExport.fileFormat
+                rawTiffInfrared = draftOutput.rawExport.tiffInfrared
                 positiveEnabled = draftOutput.positive.enabled
                 positiveFileFormat = draftOutput.positive.fileFormat
                 positiveColorProfile = draftOutput.positive.colorProfile
@@ -2041,6 +2102,7 @@ public final class SessionModel {
                 autoCropEnabled = draftOutput.autoCrop
                 saveEachOutputInOwnFolder = draftOutputOrganization.separateFolders
                 masterFolderName = draftOutputOrganization.masterFolder
+                rawExportFolderName = draftOutputOrganization.rawFolder
                 positiveTiffFolderName = draftOutputOrganization.positiveFolder
                 positiveJPEGFolderName = draftOutputOrganization.jpegFolder
             }
@@ -2048,6 +2110,7 @@ public final class SessionModel {
                 .flatMap { $0.isEmpty ? nil : $0 }
                 ?? FilenameTemplate.defaultTemplate
             archiveFilenameTemplate = template
+            rawExportFilenameTemplate = template
             positiveFilenameTemplate = template
             previewFilenameTemplate = template
             if prefillBlankRollMetadataFromRecentGear() {
@@ -2441,24 +2504,30 @@ public final class SessionModel {
         _ = await startScanOrRequestManualReview(frames: pendingFrames)
     }
 
-    /// Seeds the three output-recipe state groups from a just-created or
+    /// Seeds the four output-recipe state groups from a just-created or
     /// just-opened project's persisted recipes, so the Batch Settings
-    /// inspector reflects that project's own archive/positive/preview
+    /// inspector reflects that project's own archive/raw/positive/preview
     /// choices rather than whatever was left over from a previous project
     /// (or this class's fresh-launch defaults).
     private func applyRecipes(_ recipes: OutputRecipe) {
         // This organization UI is intentionally per-session rather than a
-        // hidden fourth project recipe. Clear it before loading every
+        // hidden fifth project recipe. Clear it before loading every
         // project so project A's chosen base can never redirect project B.
         saveLocation = ""
         saveEachOutputInOwnFolder = true
         masterFolderName = "Master TIFF"
+        rawExportFolderName = "Raw Negative"
         positiveTiffFolderName = "Positive TIFF"
         positiveJPEGFolderName = "Positive JPEG"
         archiveFilenameTemplate = recipes.archive.filenameTemplate
         archiveDestination = recipes.archive.destination
         masterTIFFEnabled = recipes.archive.enabled
         fullCapturePackageEnabled = recipes.archive.enabled && recipes.archive.fullCapturePackage
+        rawExportEnabled = recipes.rawExport.enabled
+        rawExportFormat = recipes.rawExport.fileFormat
+        rawTiffInfrared = recipes.rawExport.tiffInfrared
+        rawExportFilenameTemplate = recipes.rawExport.filenameTemplate
+        rawExportDestination = recipes.rawExport.destination
         positiveEnabled = recipes.positive.enabled
         positiveFileFormat = recipes.positive.fileFormat
         positiveColorProfile = recipes.positive.colorProfile

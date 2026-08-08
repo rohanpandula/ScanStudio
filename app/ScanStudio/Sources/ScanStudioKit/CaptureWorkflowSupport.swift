@@ -247,6 +247,7 @@ public enum OutputNamingTemplate {
 public enum OutputRetentionPolicy {
     public enum Role: Sendable {
         case archive
+        case rawExport
         case positive
         case preview
     }
@@ -257,17 +258,20 @@ public enum OutputRetentionPolicy {
         _ role: Role,
         to enabled: Bool,
         archiveEnabled: Bool,
+        rawExportEnabled: Bool = false,
         positiveEnabled: Bool,
         previewEnabled: Bool
     ) -> Bool {
         guard !enabled else { return true }
         return switch role {
         case .archive:
-            positiveEnabled || previewEnabled
+            rawExportEnabled || positiveEnabled || previewEnabled
+        case .rawExport:
+            archiveEnabled || positiveEnabled || previewEnabled
         case .positive:
-            archiveEnabled || previewEnabled
+            archiveEnabled || rawExportEnabled || previewEnabled
         case .preview:
-            archiveEnabled || positiveEnabled
+            archiveEnabled || rawExportEnabled || positiveEnabled
         }
     }
 }

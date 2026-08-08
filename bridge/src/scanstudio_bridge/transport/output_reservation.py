@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import tifffile
 
 from scanstudio_bridge import domain
@@ -28,12 +29,18 @@ class OutputGroup:
     rgb_path: Path
     ir_path: Path | None
     meter_rgbi_path: Path | None
+    raw_export_path: Path | None
 
     @property
     def paths(self) -> tuple[Path, ...]:
         return tuple(
             path
-            for path in (self.rgb_path, self.ir_path, self.meter_rgbi_path)
+            for path in (
+                self.rgb_path,
+                self.ir_path,
+                self.meter_rgbi_path,
+                self.raw_export_path,
+            )
             if path is not None
         )
 
@@ -43,6 +50,18 @@ def _normalize_tiff_template(filename_template: str) -> str:
     if suffix in {".tif", ".tiff"}:
         return filename_template
     return f"{filename_template}.tif"
+
+
+def _normalize_raw_template(
+    filename_template: str, file_format: domain.RawExportFormat
+) -> str:
+    desired = ".dng" if file_format is domain.RawExportFormat.LINEAR_DNG else ".tif"
+    path = Path(filename_template)
+    if path.suffix.casefold() == desired:
+        return filename_template
+    if path.suffix.casefold() in {".tif", ".tiff", ".dng", ".jpg", ".jpeg"}:
+        return f"{filename_template[: -len(path.suffix)]}{desired}"
+    return f"{filename_template}{desired}"
 
 
 def _resolve_filename(filename_template: str, slot: int) -> str:
@@ -62,16 +81,23 @@ def _resolve_filename(filename_template: str, slot: int) -> str:
             + filename_template[match.end() :]
         )
     path = Path(filename_template)
-    if path.suffix.casefold() in {".tif", ".tiff", ".jpg", ".jpeg"}:
+    if path.suffix.casefold() in {".tif", ".tiff", ".dng", ".jpg", ".jpeg"}:
         return f"{path.stem}_{slot}{path.suffix}"
     return f"{filename_template}_{slot}"
 
 
-def _resolve_output_path(destination: str, filename_template: str, slot: int) -> Path:
+def _resolve_output_path(
+    destination: str,
+    filename_template: str,
+    slot: int,
+    *,
+    normalize_tiff: bool = True,
+) -> Path:
     """Resolve one RGB artifact path without allowing template escape."""
     if not destination.strip():
         raise BridgeError(ErrorCode.INVALID_PARAMS, "output.destination must not be empty")
-    filename = _resolve_filename(_normalize_tiff_template(filename_template), slot)
+    normalized = _normalize_tiff_template(filename_template) if normalize_tiff else filename_template
+    filename = _resolve_filename(normalized, slot)
     filename_path = Path(filename)
     if (
         not filename
@@ -110,11 +136,21 @@ def output_group_for_slot(
     """Return every path this slot may write, including an optional meter TIFF."""
     template = output.filename_template
     destination = output.destination
+    raw_export = output.raw_export
     if output.slot_outputs is not None:
         slot_output = output.slot_outputs[str(slot)]
         template = slot_output.filename_template
         destination = slot_output.destination
+        raw_export = slot_output.raw_export
     rgb_path = _resolve_output_path(destination, template, slot)
+    raw_export_path = None
+    if raw_export is not None:
+        raw_export_path = _resolve_output_path(
+            raw_export.destination,
+            _normalize_raw_template(raw_export.filename_template, raw_export.file_format),
+            slot,
+            normalize_tiff=False,
+        )
     if recipe.channels is not domain.Channels.RGBI:
         # Meter data is an auto-exposure prepass, not an IR sidecar. A real
         # frame can therefore supply it independently of the requested RGB
@@ -123,6 +159,7 @@ def output_group_for_slot(
             rgb_path=rgb_path,
             ir_path=None,
             meter_rgbi_path=rgb_path.with_name(f"{rgb_path.stem}_METER.tif"),
+            raw_export_path=raw_export_path,
         )
     return OutputGroup(
         rgb_path=rgb_path,
@@ -132,7 +169,16 @@ def output_group_for_slot(
         # scan_many begins. A successful no-meter frame releases this empty
         # reservation.
         meter_rgbi_path=rgb_path.with_name(f"{rgb_path.stem}_METER.tif"),
+        raw_export_path=raw_export_path,
     )
+
+
+def raw_export_for_slot(
+    output: domain.OutputSpec, slot: int
+) -> domain.RawExportSpec | None:
+    if output.slot_outputs is not None:
+        return output.slot_outputs[str(slot)].raw_export
+    return output.raw_export
 
 
 class OutputReservations:
@@ -160,6 +206,21 @@ class OutputReservations:
                     ErrorCode.INVALID_PARAMS,
                     "output.slotOutputs must contain exactly the requested slots",
                 )
+        raw_specs = (
+            [slot.raw_export for slot in output.slot_outputs.values()]
+            if output.slot_outputs is not None
+            else [output.raw_export]
+        )
+        if recipe.channels is not domain.Channels.RGBI and any(
+            spec is not None
+            and spec.file_format is domain.RawExportFormat.LINEAR_TIFF
+            and spec.tiff_infrared is domain.RawTiffInfrared.FOURTH_CHANNEL
+            for spec in raw_specs
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "fourth-channel linear TIFF requires recipe.channels=rgbi",
+            )
         groups = {slot: output_group_for_slot(output, recipe, slot) for slot in slots}
         seen_targets: dict[str, tuple[int, Path]] = {}
         for slot, group in groups.items():
@@ -214,6 +275,24 @@ class OutputReservations:
         os.ftruncate(fd, 0)
         return os.fdopen(fd, "wb")
 
+    def open_for_update(self, path: Path):
+        """Open written reservation bytes read/write without truncating them."""
+        expected = self._owned.get(path)
+        if expected is None:
+            raise RuntimeError(f"output path was not reserved by this call: {path}")
+        flags = os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        stat = os.fstat(fd)
+        if (stat.st_dev, stat.st_ino) != expected:
+            os.close(fd)
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                f"output artifact changed after reservation: {path}",
+            )
+        return os.fdopen(fd, "r+b")
+
     def mark_written(self, path: Path) -> None:
         self._written.add(path)
 
@@ -259,4 +338,65 @@ def write_tiff(
     """Write TIFF data only through this call's exclusive reservation."""
     with reservations.open_for_write(path) as file:
         tifffile.imwrite(_NamedReservationFile(file, path), data, **kwargs)
+    reservations.mark_written(path)
+
+
+def write_raw_export(
+    reservations: OutputReservations,
+    path: Path,
+    spec: domain.RawExportSpec,
+    *,
+    rgb: np.ndarray,
+    ir: np.ndarray | None,
+    dpi: int,
+    device_model: str,
+) -> None:
+    """Write an untouched-negative export through an exclusive reservation."""
+    if rgb.dtype != np.uint16 or rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("raw export RGB must be a uint16 (height, width, 3) array")
+    if ir is not None and (
+        ir.dtype != np.uint16 or ir.ndim != 2 or ir.shape != rgb.shape[:2]
+    ):
+        raise ValueError("raw export IR must be a uint16 plane matching RGB")
+
+    if spec.file_format is domain.RawExportFormat.LINEAR_DNG:
+        # Lazy imports preserve the bridge's hardware-free module import
+        # boundary; only an actually requested DNG loads CoolscanPy's
+        # scanning-agnostic encoder and result value type.
+        from coolscanpy.io.encoders import write_dng_linear_to_file
+        from coolscanpy.session.result import ScanResult
+
+        result = ScanResult(
+            rgb=rgb,
+            ir=ir,
+            dpi=dpi,
+            device_model=device_model,
+        )
+        with reservations.open_for_update(path) as file:
+            write_dng_linear_to_file(_NamedReservationFile(file, path), result)
+            os.fsync(file.fileno())
+        reservations.mark_written(path)
+        return
+
+    kwargs: dict[str, object] = {
+        "photometric": "rgb",
+        "compression": None,
+        "metadata": None,
+        "resolution": (dpi, dpi),
+        "resolutionunit": "INCH",
+        "software": "ScanStudio",
+    }
+    data = rgb
+    if spec.tiff_infrared is domain.RawTiffInfrared.FOURTH_CHANNEL:
+        if ir is None:
+            raise ValueError("fourth-channel linear TIFF requires an infrared capture plane")
+        data = np.ascontiguousarray(np.dstack((rgb, ir)))
+        kwargs["extrasamples"] = (0,)
+        kwargs["extratags"] = [
+            (65001, "s", 0, "scanstudio.infrared.linear.uint16.v1", True)
+        ]
+    with reservations.open_for_write(path) as file:
+        tifffile.imwrite(_NamedReservationFile(file, path), data, **kwargs)
+        file.flush()
+        os.fsync(file.fileno())
     reservations.mark_written(path)

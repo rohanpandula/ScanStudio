@@ -778,6 +778,7 @@ struct PrivateCaptureWorkingDirectory {
 #[derive(Debug, Clone)]
 struct ExpectedCapturePaths {
     rgb: std::path::PathBuf,
+    raw_export: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -2729,6 +2730,7 @@ fn build_scan_start_params(
             destination: output.archive.destination.clone(),
             filename_template: bridge_archive_template(&output.archive.filename_template),
             slot_outputs,
+            raw_export: bridge_raw_export_spec(&output.raw_export),
         },
     )
 }
@@ -2782,6 +2784,9 @@ fn bridge_slot_outputs(
                 BridgeSlotOutputSpec {
                     destination,
                     filename_template: template,
+                    raw_export: bridge_raw_export_spec(
+                        &override_output.unwrap_or(output).raw_export,
+                    ),
                 },
             )
         })
@@ -2823,12 +2828,14 @@ fn build_real_capture_plan(
         BridgeSlotOutputSpec {
             destination: base_output.archive.destination.clone(),
             filename_template: bridge_archive_template(&base_output.archive.filename_template),
+            raw_export: bridge_raw_export_spec(&base_output.raw_export),
         }
     } else {
         let working = private_working_directory.as_ref().expect("private slot has working directory");
         BridgeSlotOutputSpec {
             destination: working.root.display().to_string(),
             filename_template: format!("capture-{}-####.tif", working.owner_token),
+            raw_export: bridge_raw_export_spec(&base_output.raw_export),
         }
     };
 
@@ -2841,12 +2848,14 @@ fn build_real_capture_plan(
             BridgeSlotOutputSpec {
                 destination: effective.archive.destination.clone(),
                 filename_template: bridge_archive_template(&effective.archive.filename_template),
+                raw_export: bridge_raw_export_spec(&effective.raw_export),
             }
         } else {
             let working = private_working_directory.as_ref().expect("private slot has working directory");
             BridgeSlotOutputSpec {
                 destination: working.root.display().to_string(),
                 filename_template: format!("capture-{}-####.tif", working.owner_token),
+                raw_export: bridge_raw_export_spec(&effective.raw_export),
             }
         };
         differs_from_base |= spec != base_spec;
@@ -2856,7 +2865,11 @@ fn build_real_capture_plan(
         // while receipt validation below derives the same exact paths.
         let _ = crate::render::archive_sidecar_path(&rgb, "IR")?;
         let _ = crate::render::archive_sidecar_path(&rgb, "METER")?;
-        expected_by_slot.insert(*slot, ExpectedCapturePaths { rgb });
+        let raw_export = effective
+            .raw_export
+            .enabled
+            .then(|| crate::render::resolve_raw_export_output_path(effective, *slot));
+        expected_by_slot.insert(*slot, ExpectedCapturePaths { rgb, raw_export });
         slot_outputs.insert(slot.to_string(), spec);
     }
 
@@ -2869,6 +2882,7 @@ fn build_real_capture_plan(
             destination: base_spec.destination,
             filename_template: base_spec.filename_template,
             slot_outputs: use_slot_outputs.then_some(slot_outputs),
+            raw_export: base_spec.raw_export,
         },
         expected_by_slot,
         private_working_directory,
@@ -2898,6 +2912,39 @@ fn bridge_archive_template(filename_template: &str) -> String {
     let extension_start = normalized
         .rfind('.')
         .expect("TIFF normalization always supplies a terminal extension");
+    format!(
+        "{}_####{}",
+        &normalized[..extension_start],
+        &normalized[extension_start..]
+    )
+}
+
+fn bridge_raw_export_spec(recipe: &domain::RawExportRecipe) -> Option<BridgeRawExportSpec> {
+    recipe.enabled.then(|| BridgeRawExportSpec {
+        destination: recipe.destination.clone(),
+        filename_template: bridge_raw_export_template(recipe),
+        file_format: match recipe.file_format {
+            domain::RawExportFormat::LinearDng => BridgeRawExportFormat::LinearDng,
+            domain::RawExportFormat::LinearTiff => BridgeRawExportFormat::LinearTiff,
+        },
+        tiff_infrared: match recipe.tiff_infrared {
+            domain::RawTiffInfrared::FourthChannel => BridgeRawTiffInfrared::FourthChannel,
+            domain::RawTiffInfrared::Omitted => BridgeRawTiffInfrared::Omitted,
+        },
+    })
+}
+
+fn bridge_raw_export_template(recipe: &domain::RawExportRecipe) -> String {
+    let normalized = crate::render::normalize_raw_export_filename_template(
+        &recipe.filename_template,
+        recipe.file_format,
+    );
+    if normalized.contains('#') || crate::render::is_reserved_sequence_template(&normalized) {
+        return normalized;
+    }
+    let extension_start = normalized
+        .rfind('.')
+        .expect("raw export normalization always supplies a terminal extension");
     format!(
         "{}_####{}",
         &normalized[..extension_start],
@@ -4587,6 +4634,17 @@ fn run_real_scan_job_inner(
                                     .as_deref()
                                     .map(std::path::Path::new),
                             )
+                            .and_then(|()| {
+                                crate::render::validate_bridge_raw_export_receipt_path(
+                                    expected.raw_export.as_deref(),
+                                    frame_completed
+                                        .receipt
+                                        .raw_export_path
+                                        .as_deref()
+                                        .map(std::path::Path::new),
+                                    frame_completed.slot,
+                                )
+                            })
                         } else {
                             Err(EngineError::new(
                                 ErrorCode::InvalidParams,
@@ -4687,6 +4745,10 @@ fn run_real_scan_job_inner(
                                     preview_path: written
                                         .preview_path
                                         .map(|path| path.display().to_string()),
+                                    raw_negative_path: frame_completed
+                                        .receipt
+                                        .raw_export_path
+                                        .clone(),
                                     derivative_transform: written.derivative_transform,
                                 });
                                 // Which nikonlook bundle/path/gains actually

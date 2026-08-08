@@ -39,6 +39,24 @@ def _output(destination: Path, filename_template: str = "frame-####.tif") -> dom
     return domain.OutputSpec(destination=str(destination), filename_template=filename_template)
 
 
+def _output_with_raw(
+    destination: Path,
+    *,
+    file_format: domain.RawExportFormat,
+    tiff_infrared: domain.RawTiffInfrared = domain.RawTiffInfrared.FOURTH_CHANNEL,
+) -> domain.OutputSpec:
+    return domain.OutputSpec(
+        destination=str(destination / "capture"),
+        filename_template="frame-####.tif",
+        raw_export=domain.RawExportSpec(
+            destination=str(destination / "raw"),
+            filename_template="negative-####",
+            file_format=file_format,
+            tiff_infrared=tiff_infrared,
+        ),
+    )
+
+
 # -- list_devices ---------------------------------------------------------------
 
 
@@ -124,6 +142,40 @@ def test_reservation_rejects_cross_slot_casefolded_and_sidecar_aliases_before_wr
     with pytest.raises(BridgeError) as exc:
         OutputReservations.reserve([1, 2], recipe, sidecar_alias)
     assert exc.value.code is ErrorCode.INVALID_PARAMS
+
+
+def test_reservation_rejects_raw_export_aliasing_capture_before_write(tmp_path: Path) -> None:
+    recipe = domain.FIXED_COLOR_NEGATIVE_RECIPE
+    output = domain.OutputSpec(
+        destination=str(tmp_path),
+        filename_template="same-####.tif",
+        raw_export=domain.RawExportSpec(
+            destination=str(tmp_path),
+            filename_template="same-####.tif",
+            file_format=domain.RawExportFormat.LINEAR_TIFF,
+        ),
+    )
+
+    with pytest.raises(BridgeError) as exc:
+        OutputReservations.reserve([1], recipe, output)
+
+    assert exc.value.code is ErrorCode.INVALID_PARAMS
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fourth_channel_tiff_is_rejected_before_rgb_only_capture(tmp_path: Path) -> None:
+    recipe = dataclasses.replace(domain.FIXED_COLOR_NEGATIVE_RECIPE, channels=domain.Channels.RGB)
+    output = _output_with_raw(
+        tmp_path,
+        file_format=domain.RawExportFormat.LINEAR_TIFF,
+    )
+
+    with pytest.raises(BridgeError) as exc:
+        OutputReservations.reserve([1], recipe, output)
+
+    assert exc.value.code is ErrorCode.INVALID_PARAMS
+    assert "requires recipe.channels=rgbi" in str(exc.value)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_reservation_rejects_existing_symlink_leaf_without_touching_target(
@@ -605,6 +657,119 @@ def test_start_scan_writes_meter_rgbi_sidecar_for_rgbi_recipe(tmp_path: Path) ->
     assert frames[0].meter_rgbi_path == str(meter_path)
     assert meter_path.exists()
     assert tifffile.imread(meter_path).shape == (64, 64, 4)
+
+
+def test_start_scan_writes_linear_dng_with_embedded_ir_subifd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rgb = np.arange(3 * 4 * 3, dtype=np.uint16).reshape(3, 4, 3)
+    infrared = np.array(
+        [[0, 1, 65535, 32768], [99, 100, 101, 102], [60000, 7, 8, 9]],
+        dtype=np.uint16,
+    )
+    monkeypatch.setattr(mock_transport_module, "_synthetic_rgb_frame", lambda: rgb)
+    monkeypatch.setattr(mock_transport_module, "_synthetic_ir_frame", lambda: infrared)
+    transport = _opened(slot_count=1)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    receipts: list[domain.ScanReceipt] = []
+
+    transport.start_scan(
+        [1],
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        _output_with_raw(tmp_path, file_format=domain.RawExportFormat.LINEAR_DNG),
+        lambda _p: None,
+        lambda *_a: None,
+        lambda _slot, receipt: receipts.append(receipt),
+    )
+
+    path = tmp_path / "raw" / "negative-0001.dng"
+    assert receipts[0].raw_export_path == str(path)
+    with tifffile.TiffFile(path) as tiff:
+        main = tiff.pages[0]
+        assert int(main.tags["PhotometricInterpretation"].value) == 34892
+        assert int(main.tags["SamplesPerPixel"].value) == 3
+        assert main.tags.get("ExtraSamples") is None
+        np.testing.assert_array_equal(main.asarray(), rgb)
+        assert len(main.pages) == 1
+        assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
+        np.testing.assert_array_equal(main.pages[0].asarray(), infrared)
+        assert main.pages[0].tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+
+
+@pytest.mark.parametrize(
+    ("infrared_mode", "expected_shape", "has_extra_sample"),
+    [
+        (domain.RawTiffInfrared.FOURTH_CHANNEL, (3, 4, 4), True),
+        (domain.RawTiffInfrared.OMITTED, (3, 4, 3), False),
+    ],
+)
+def test_start_scan_writes_linear_tiff_ir_choice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    infrared_mode: domain.RawTiffInfrared,
+    expected_shape: tuple[int, ...],
+    has_extra_sample: bool,
+) -> None:
+    rgb = np.arange(3 * 4 * 3, dtype=np.uint16).reshape(3, 4, 3)
+    infrared = (np.arange(3 * 4, dtype=np.uint16).reshape(3, 4) + 40000)
+    monkeypatch.setattr(mock_transport_module, "_synthetic_rgb_frame", lambda: rgb)
+    monkeypatch.setattr(mock_transport_module, "_synthetic_ir_frame", lambda: infrared)
+    transport = _opened(slot_count=1)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    transport.start_scan(
+        [1],
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        _output_with_raw(
+            tmp_path,
+            file_format=domain.RawExportFormat.LINEAR_TIFF,
+            tiff_infrared=infrared_mode,
+        ),
+        lambda _p: None,
+        lambda *_a: None,
+        lambda *_a: None,
+    )
+
+    path = tmp_path / "raw" / "negative-0001.tif"
+    with tifffile.TiffFile(path) as tiff:
+        page = tiff.pages[0]
+        assert page.shape == expected_shape
+        np.testing.assert_array_equal(page.asarray()[..., :3], rgb)
+        if has_extra_sample:
+            assert tuple(int(value) for value in page.extrasamples) == (0,)
+            np.testing.assert_array_equal(page.asarray()[..., 3], infrared)
+            assert page.tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+        else:
+            assert page.extrasamples == ()
+            assert page.tags.get(65001) is None
+
+
+def test_failed_raw_write_is_not_reported_complete_and_removes_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = _opened(slot_count=1)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    completed: list[domain.ScanReceipt] = []
+
+    def partial_then_fail(reservations, path, spec, **kwargs):
+        with reservations.open_for_update(path) as file:
+            file.write(b"partial raw output")
+        raise OSError("simulated raw writer failure")
+
+    monkeypatch.setattr(mock_transport_module, "write_raw_export", partial_then_fail)
+
+    with pytest.raises(OSError, match="simulated raw writer failure"):
+        transport.start_scan(
+            [1],
+            domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            _output_with_raw(tmp_path, file_format=domain.RawExportFormat.LINEAR_DNG),
+            lambda _p: None,
+            lambda *_a: None,
+            lambda _slot, receipt: completed.append(receipt),
+        )
+
+    assert completed == []
+    assert not (tmp_path / "raw" / "negative-0001.dng").exists()
 
 
 # -- request_stop -----------------------------------------------------------------

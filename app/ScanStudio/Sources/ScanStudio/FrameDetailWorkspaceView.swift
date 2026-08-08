@@ -957,6 +957,32 @@ struct FrameDetailWorkspaceView: View {
                 InspectorTextFieldRow(label: "Destination", text: outputArchiveDestinationBinding)
             }
 
+            subHeading("Raw negative").padding(.top, 8)
+            InspectorToggleRow(label: "Untouched negative", isOn: outputRawEnabledBinding)
+                .disabled(!canToggleOutput(.rawExport))
+                .help(OutputRetentionPolicy.helpText)
+            if outputDraft?.rawExport.enabled == true {
+                InspectorSettingRow(label: "File format") {
+                    Picker("File format", selection: outputRawFormatBinding) {
+                        Text("Linear DNG").tag(RawExportFormat.linearDng)
+                        Text("Linear TIFF").tag(RawExportFormat.linearTiff)
+                    }
+                }
+                if outputDraft?.rawExport.fileFormat == .linearTiff {
+                    InspectorSettingRow(label: "Infrared") {
+                        Picker("Infrared", selection: outputRawTiffInfraredBinding) {
+                            Text("Fourth channel").tag(RawTiffInfrared.fourthChannel)
+                            Text("Omit (RGB only)").tag(RawTiffInfrared.omitted)
+                        }
+                    }
+                }
+                Text("This is the untouched 16-bit negative. DNG embeds infrared; TIFF follows the infrared choice above. Processing and geometry settings do not alter it.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.scanStudioSecondaryText)
+                InspectorTextFieldRow(label: "Naming", text: outputRawFilenameBinding)
+                InspectorTextFieldRow(label: "Destination", text: outputRawDestinationBinding)
+            }
+
             subHeading("Positive").padding(.top, 8)
             InspectorToggleRow(label: "Positive derivative", isOn: outputPositiveEnabledBinding)
                 .disabled(!canToggleOutput(.positive))
@@ -1061,8 +1087,8 @@ struct FrameDetailWorkspaceView: View {
         }
     }
 
-    /// A smaller, dimmer sibling of `SectionEyebrow` for the three
-    /// archive/positive/preview sub-groups nested inside the single
+    /// A smaller, dimmer sibling of `SectionEyebrow` for the four
+    /// archive/raw/positive/preview sub-groups nested inside the single
     /// "Output" collapsible section — visually subordinate to that
     /// section's own `SectionEyebrow`-style disclosure title, so the two
     /// heading levels stay distinguishable rather than reusing the exact
@@ -1362,6 +1388,7 @@ struct FrameDetailWorkspaceView: View {
         guard let current = outputDraft else { return false }
         let currentlyEnabled = switch role {
         case .archive: current.archive.enabled
+        case .rawExport: current.rawExport.enabled
         case .positive: current.positive.enabled
         case .preview: current.preview.enabled
         }
@@ -1369,6 +1396,7 @@ struct FrameDetailWorkspaceView: View {
             role,
             to: !currentlyEnabled,
             archiveEnabled: current.archive.enabled,
+            rawExportEnabled: current.rawExport.enabled,
             positiveEnabled: current.positive.enabled,
             previewEnabled: current.preview.enabled
         )
@@ -1393,6 +1421,7 @@ struct FrameDetailWorkspaceView: View {
                           .archive,
                           to: newValue,
                           archiveEnabled: current.archive.enabled,
+                          rawExportEnabled: current.rawExport.enabled,
                           positiveEnabled: current.positive.enabled,
                           previewEnabled: current.preview.enabled
                       )
@@ -1424,6 +1453,60 @@ struct FrameDetailWorkspaceView: View {
             }
         )
     }
+    private var outputRawEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { outputDraft?.rawExport.enabled ?? sessionModel.outputRecipe.rawExport.enabled },
+            set: { newValue in
+                guard let current = outputDraft,
+                      OutputRetentionPolicy.allowsChange(
+                          .rawExport,
+                          to: newValue,
+                          archiveEnabled: current.archive.enabled,
+                          rawExportEnabled: current.rawExport.enabled,
+                          positiveEnabled: current.positive.enabled,
+                          previewEnabled: current.preview.enabled
+                      )
+                else { return }
+                outputDraft = current.with(rawExport: current.rawExport.with(enabled: newValue))
+            }
+        )
+    }
+    private var outputRawFormatBinding: Binding<RawExportFormat> {
+        Binding(
+            get: { outputDraft?.rawExport.fileFormat ?? sessionModel.outputRecipe.rawExport.fileFormat },
+            set: { newValue in
+                guard let current = outputDraft else { return }
+                outputDraft = current.with(rawExport: current.rawExport.with(fileFormat: newValue))
+            }
+        )
+    }
+    private var outputRawTiffInfraredBinding: Binding<RawTiffInfrared> {
+        Binding(
+            get: { outputDraft?.rawExport.tiffInfrared ?? sessionModel.outputRecipe.rawExport.tiffInfrared },
+            set: { newValue in
+                guard let current = outputDraft else { return }
+                outputDraft = current.with(rawExport: current.rawExport.with(tiffInfrared: newValue))
+            }
+        )
+    }
+    private var outputRawFilenameBinding: Binding<String> {
+        Binding(
+            get: { outputDraft?.rawExport.filenameTemplate ?? sessionModel.outputRecipe.rawExport.filenameTemplate },
+            set: { newValue in
+                guard let current = outputDraft else { return }
+                outputDraft = current.with(rawExport: current.rawExport.with(filenameTemplate: newValue))
+            }
+        )
+    }
+    private var outputRawDestinationBinding: Binding<String> {
+        Binding(
+            get: { outputDraft?.rawExport.destination ?? sessionModel.outputRecipe.rawExport.destination },
+            set: { newValue in
+                guard let current = outputDraft else { return }
+                outputDraft = current.with(rawExport: current.rawExport.with(destination: newValue))
+            }
+        )
+    }
 
     private var outputArchiveFilenameBinding: Binding<String> {
         Binding(
@@ -1452,6 +1535,7 @@ struct FrameDetailWorkspaceView: View {
                           .positive,
                           to: newValue,
                           archiveEnabled: current.archive.enabled,
+                          rawExportEnabled: current.rawExport.enabled,
                           positiveEnabled: current.positive.enabled,
                           previewEnabled: current.preview.enabled
                       )
@@ -1505,6 +1589,7 @@ struct FrameDetailWorkspaceView: View {
                           .preview,
                           to: newValue,
                           archiveEnabled: current.archive.enabled,
+                          rawExportEnabled: current.rawExport.enabled,
                           positiveEnabled: current.positive.enabled,
                           previewEnabled: current.preview.enabled
                       )
@@ -1903,6 +1988,24 @@ private extension PositiveRecipe {
     }
 }
 
+private extension RawExportRecipe {
+    func with(
+        enabled: Bool? = nil,
+        fileFormat: RawExportFormat? = nil,
+        tiffInfrared: RawTiffInfrared? = nil,
+        filenameTemplate: String? = nil,
+        destination: String? = nil
+    ) -> RawExportRecipe {
+        RawExportRecipe(
+            enabled: enabled ?? self.enabled,
+            fileFormat: fileFormat ?? self.fileFormat,
+            tiffInfrared: tiffInfrared ?? self.tiffInfrared,
+            filenameTemplate: filenameTemplate ?? self.filenameTemplate,
+            destination: destination ?? self.destination
+        )
+    }
+}
+
 private extension PreviewRecipe {
     func with(
         enabled: Bool? = nil,
@@ -1924,12 +2027,14 @@ private extension PreviewRecipe {
 private extension OutputRecipe {
     func with(
         archive: ArchiveRecipe? = nil,
+        rawExport: RawExportRecipe? = nil,
         positive: PositiveRecipe? = nil,
         preview: PreviewRecipe? = nil,
         autoCrop: Bool? = nil
     ) -> OutputRecipe {
         OutputRecipe(
             archive: archive ?? self.archive,
+            rawExport: rawExport ?? self.rawExport,
             positive: positive ?? self.positive,
             preview: preview ?? self.preview,
             autoCrop: autoCrop ?? self.autoCrop

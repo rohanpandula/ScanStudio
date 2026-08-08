@@ -21,6 +21,9 @@ __all__ = [
     "DeviceInfo",
     "DeviceStatus",
     "CaptureRecipe",
+    "RawExportFormat",
+    "RawTiffInfrared",
+    "RawExportSpec",
     "OutputSpec",
     "SlotOutputSpec",
     "Thumbnail",
@@ -97,10 +100,29 @@ class CaptureRecipe:
     auto_exposure: bool
 
 
+class RawExportFormat(StrEnum):
+    LINEAR_DNG = "linearDng"
+    LINEAR_TIFF = "linearTiff"
+
+
+class RawTiffInfrared(StrEnum):
+    FOURTH_CHANNEL = "fourthChannel"
+    OMITTED = "omitted"
+
+
+@dataclass(frozen=True)
+class RawExportSpec:
+    destination: str
+    filename_template: str
+    file_format: RawExportFormat
+    tiff_infrared: RawTiffInfrared = RawTiffInfrared.FOURTH_CHANNEL
+
+
 @dataclass(frozen=True)
 class SlotOutputSpec:
     destination: str
     filename_template: str
+    raw_export: RawExportSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +132,9 @@ class OutputSpec:
     # Optional decimal-slot -> template mapping. Absent preserves the
     # established one-template batch wire shape.
     slot_outputs: dict[str, SlotOutputSpec] | None = None
+    # Optional untouched-negative output. Absent preserves the historical
+    # RGB/IR/meter capture group byte-for-byte.
+    raw_export: RawExportSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +278,9 @@ class ScanReceipt:
     # None (never an engine-receipt-arrival time).
     started_at: str | None = None
     capture_duration_ms: int | None = None
+    # Bridge-written, user-requested untouched-negative export. Optional for
+    # legacy clients and whenever no raw export was requested.
+    raw_export_path: str | None = None
 
 
 # --- internal (non-wire) types Plan 08-02 needs ---

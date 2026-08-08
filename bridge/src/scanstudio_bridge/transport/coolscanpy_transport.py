@@ -47,7 +47,12 @@ from scanstudio_bridge import domain, safety
 from scanstudio_bridge.exposure_authority import build_exposure_authority
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
 from scanstudio_bridge.transport import FrameRetryExhausted, OnCall, phased_call
-from scanstudio_bridge.transport.output_reservation import OutputReservations, write_tiff
+from scanstudio_bridge.transport.output_reservation import (
+    OutputReservations,
+    raw_export_for_slot,
+    write_raw_export,
+    write_tiff,
+)
 
 # Plan 10-09: how long `coolscanpy_provenance()`'s `git rev-parse HEAD`
 # subprocess is allowed to run before being treated the same as "git is
@@ -321,6 +326,7 @@ def _scan_receipt_from_coolscanpy(
     ir_path: str | None,
     meter_rgbi_path: str | None,
     attempts_root: Path | None,
+    raw_export_path: str | None = None,
 ) -> domain.ScanReceipt:
     exposure_authority = build_exposure_authority(attempts_root=attempts_root, slot=receipt.slot)
     exposure = receipt.exposure
@@ -395,6 +401,7 @@ def _scan_receipt_from_coolscanpy(
         exposure_authority=exposure_authority,
         started_at=receipt.started_at,
         capture_duration_ms=receipt.capture_duration_ms,
+        raw_export_path=raw_export_path,
     )
 
 
@@ -822,6 +829,26 @@ class CoolscanPyTransport:
                                     )
                                     ir_path_str = str(ir_path)
 
+                                raw_export_path_str: str | None = None
+                                raw_export_spec = raw_export_for_slot(output, slot)
+                                if raw_export_spec is not None:
+                                    raw_export_path = paths.raw_export_path
+                                    assert raw_export_path is not None
+                                    phased_call(
+                                        on_call,
+                                        f"file_write.raw:slot{slot}",
+                                        lambda: write_raw_export(
+                                            reservations,
+                                            raw_export_path,
+                                            raw_export_spec,
+                                            rgb=frame.rgb,
+                                            ir=frame.ir,
+                                            dpi=recipe.resolution_dpi,
+                                            device_model=frame.receipt.device_model,
+                                        ),
+                                    )
+                                    raw_export_path_str = str(raw_export_path)
+
                                 meter_rgbi_path_str: str | None = None
                                 if frame.meter_rgbi is not None:
                                     meter_path = paths.meter_rgbi_path
@@ -848,6 +875,7 @@ class CoolscanPyTransport:
                                     rgb_path=str(rgb_path),
                                     ir_path=ir_path_str,
                                     meter_rgbi_path=meter_rgbi_path_str,
+                                    raw_export_path=raw_export_path_str,
                                     attempts_root=self.attempts_root,
                                 )
                                 on_frame(slot, receipt)

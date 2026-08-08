@@ -503,6 +503,20 @@ public enum OutputColorProfile: String, Codable, CaseIterable, Identifiable, Sen
     public var id: String { rawValue }
 }
 
+public enum RawExportFormat: String, Codable, CaseIterable, Identifiable, Sendable {
+    case linearDng
+    case linearTiff
+
+    public var id: String { rawValue }
+}
+
+public enum RawTiffInfrared: String, Codable, CaseIterable, Identifiable, Sendable {
+    case fourthChannel
+    case omitted
+
+    public var id: String { rawValue }
+}
+
 public struct ProcessingRecipe: Codable, Equatable, Sendable {
     public let filmProcess: FilmProcess
     public let autofocusEachFrame: Bool
@@ -580,6 +594,31 @@ public struct ArchiveRecipe: Codable, Equatable, Sendable {
     }
 }
 
+/// An optional untouched 16-bit negative export. Linear DNG embeds the
+/// infrared plane; linear TIFF either carries IR as an unspecified fourth
+/// sample or leaves it out. Missing recipes decode disabled for old projects.
+public struct RawExportRecipe: Codable, Equatable, Sendable {
+    public let enabled: Bool
+    public let fileFormat: RawExportFormat
+    public let tiffInfrared: RawTiffInfrared
+    public let filenameTemplate: String
+    public let destination: String
+
+    public init(
+        enabled: Bool = false,
+        fileFormat: RawExportFormat = .linearDng,
+        tiffInfrared: RawTiffInfrared = .fourthChannel,
+        filenameTemplate: String = "ScanStudio#",
+        destination: String = "\(NSHomeDirectory())/ScanStudio Projects/_Unfiled/Raw Negative"
+    ) {
+        self.enabled = enabled
+        self.fileFormat = fileFormat
+        self.tiffInfrared = tiffInfrared
+        self.filenameTemplate = filenameTemplate
+        self.destination = destination
+    }
+}
+
 /// A regenerable derivative: format/profile choices here never touch
 /// `ArchiveRecipe` — different Swift types, not just different UI labels.
 /// Mirrors `domain.rs::PositiveRecipe`.
@@ -631,35 +670,39 @@ public struct PreviewRecipe: Codable, Equatable, Sendable {
     }
 }
 
-/// Container holding the three independent recipes. Kept named
+/// Container holding the four independent recipes. Kept named
 /// `OutputRecipe` (not renamed) to mirror `domain.rs::OutputRecipe`'s own
 /// pre-existing name — only its internal shape nests.
 public struct OutputRecipe: Codable, Equatable, Sendable {
     public let archive: ArchiveRecipe
+    public let rawExport: RawExportRecipe
     public let positive: PositiveRecipe
     public let preview: PreviewRecipe
     /// Non-destructive scan-time auto-crop of derived outputs; the archive
-    /// master is never cropped. Missing key keeps older projects and engines
+    /// master and raw negative are never cropped. Missing key keeps older projects and engines
     /// on their historic uncropped behavior. Mirrors
     /// `domain.rs::OutputRecipe.auto_crop`.
     public let autoCrop: Bool
 
     public init(
         archive: ArchiveRecipe,
+        rawExport: RawExportRecipe = RawExportRecipe(),
         positive: PositiveRecipe,
         preview: PreviewRecipe,
         autoCrop: Bool = false
     ) {
         self.archive = archive
+        self.rawExport = rawExport
         self.positive = positive
         self.preview = preview
         self.autoCrop = autoCrop
     }
 
-    private enum CodingKeys: String, CodingKey { case archive, positive, preview, autoCrop }
+    private enum CodingKeys: String, CodingKey { case archive, rawExport, positive, preview, autoCrop }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         archive = try values.decode(ArchiveRecipe.self, forKey: .archive)
+        rawExport = try values.decodeIfPresent(RawExportRecipe.self, forKey: .rawExport) ?? RawExportRecipe()
         positive = try values.decode(PositiveRecipe.self, forKey: .positive)
         preview = try values.decode(PreviewRecipe.self, forKey: .preview)
         autoCrop = try values.decodeIfPresent(Bool.self, forKey: .autoCrop) ?? false
@@ -767,6 +810,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
     public let archivePath: String?
     public let positivePath: String?
     public let previewPath: String?
+    public let rawNegativePath: String?
     /// Exact presentation transform applied to positive/preview derivatives.
     /// The archive/IR/meter capture files are never transformed.
     public let derivativeTransform: DerivativeTransform
@@ -775,16 +819,18 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         archivePath: String?,
         positivePath: String?,
         previewPath: String?,
+        rawNegativePath: String? = nil,
         derivativeTransform: DerivativeTransform = .identity
     ) {
         self.archivePath = archivePath
         self.positivePath = positivePath
         self.previewPath = previewPath
+        self.rawNegativePath = rawNegativePath
         self.derivativeTransform = derivativeTransform
     }
 
     private enum CodingKeys: String, CodingKey {
-        case archivePath, positivePath, previewPath, derivativeTransform
+        case archivePath, positivePath, previewPath, rawNegativePath, derivativeTransform
     }
 
     public init(from decoder: Decoder) throws {
@@ -792,6 +838,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         archivePath = try values.decodeIfPresent(String.self, forKey: .archivePath)
         positivePath = try values.decodeIfPresent(String.self, forKey: .positivePath)
         previewPath = try values.decodeIfPresent(String.self, forKey: .previewPath)
+        rawNegativePath = try values.decodeIfPresent(String.self, forKey: .rawNegativePath)
         derivativeTransform = try values.decodeIfPresent(
             DerivativeTransform.self,
             forKey: .derivativeTransform
@@ -986,8 +1033,8 @@ public struct MetadataSet: Codable, Equatable, Sendable {
 
 /// Reproducible display geometry for finished Positive/Preview files.
 /// Rotation is clockwise; horizontal/vertical mirrors are applied in the
-/// unrotated source axes before the quarter-turn. Capture masters remain
-/// byte-untouched.
+/// unrotated source axes before the quarter-turn. Capture masters and raw
+/// negatives remain byte-untouched.
 public struct DerivativeTransform: Codable, Equatable, Sendable {
     public let rotationDegrees: Int
     public let horizontalMirror: Bool

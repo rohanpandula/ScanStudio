@@ -821,6 +821,10 @@ fn build_receipt(
                 .preview_path
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            raw_negative_path: written
+                .raw_negative_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
             derivative_transform: written.derivative_transform,
         }),
         // Bridge-only concepts — the simulator has no bridge subprocess to
@@ -1438,6 +1442,7 @@ mod tests {
             archive_path: None,
             positive_path: None,
             preview_path: None,
+            raw_negative_path: None,
             nikonlook: Some(provenance.clone()),
             auto_crop: None,
             derivative_transform: crate::domain::DerivativeTransform::default(),
