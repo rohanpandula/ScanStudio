@@ -46,6 +46,9 @@ the available capture context: per-frame effective settings, receipts,
 checksums, and optional infrared or meter material. Attempt journals are
 included only when the bridge supplies exact journal roots.
 
+For a plain-language guide to the Nikon Scan, Noritsu Lab, and Flextight
+color choices, see [COLOR.md](COLOR.md).
+
 ## Architecture
 
 ```
