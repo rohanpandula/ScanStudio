@@ -114,6 +114,18 @@ struct FixtureDecodingTests {
         #expect(back.autoCrop)
         #expect(back.rawExport.fileFormat == .linearTiff)
         #expect(back.rawExport.tiffInfrared == .sidecar)
+
+        let both = OutputRecipe(
+            archive: decoded.archive,
+            rawExport: enabled.rawExport,
+            positive: decoded.positive,
+            preview: decoded.preview,
+            autoCrop: true,
+            c41Render: C41RenderRecipe(target: .noritsuLs600)
+        )
+        let bothBack = try JSONDecoder().decode(OutputRecipe.self, from: JSONEncoder().encode(both))
+        #expect(bothBack.rawExport.tiffInfrared == .sidecar, "raw export survives alongside a c41 style")
+        #expect(bothBack.c41Render.target == .noritsuLs600, "c41 style survives alongside raw export")
     }
 
     @Test("08: scan.progress event decodes")
