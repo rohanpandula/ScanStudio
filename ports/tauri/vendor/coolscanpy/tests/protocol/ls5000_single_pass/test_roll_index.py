@@ -526,13 +526,14 @@ def _synthetic_roll_with_gap_rows(
 
 
 def test_wide_gaps_raise_gap_count_floor_with_numeric_diagnostics() -> None:
-    """P1, site :810.  Six gaps widened to 20 rows (>12, discarded as "wide")
-    leaves zero narrow runs -- confirms the id and every field the predicate
-    actually evaluated.
+    """P1, site :810.  Six gaps widened to 26 rows -- past even the recovery
+    ceiling (FEEDING-DETECTOR-ROUND-20260807) -- leaves zero anchorable runs
+    in both passes: confirms the id, every field the predicate evaluated,
+    and the recovery note the failed second pass appends.
     """
     boundary_rows = [200 + index * 143 for index in range(6)]
     rgb = _synthetic_roll_with_gap_rows(
-        boundary_rows, height=6 * 145 + 200, band_halfwidth=10
+        boundary_rows, height=6 * 145 + 200, band_halfwidth=13
     )
 
     with pytest.raises(roll.IndexDecodeError) as excinfo:
@@ -545,10 +546,11 @@ def test_wide_gaps_raise_gap_count_floor_with_numeric_diagnostics() -> None:
     assert diagnostics["narrow_run_count"] == 0
     assert diagnostics["narrow_run_count_required"] == 3
     assert diagnostics["evidence_run_count"] == 6
-    assert diagnostics["discarded_wide_widths"] == [20] * 6
+    assert diagnostics["discarded_wide_widths"] == [26] * 6
     assert diagnostics["discarded_narrow_widths"] == []
     assert diagnostics["raster_rows"] == rgb.shape[0]
     assert diagnostics["aperture_width"] == 90
+    assert "wide_gap_recovery" in diagnostics
     assert json.dumps(diagnostics, sort_keys=True) in str(error)
 
 
@@ -1258,3 +1260,250 @@ def test_persisted_gold36_expected_count_and_frame18_origin() -> None:
     )
     assert mismatched.frame_starts == detection.frame_starts
     assert not mismatched.expected_frame_count_matches
+
+
+# ---------------------------------------------------------------------------
+# Wide-gap recovery (FEEDING-DETECTOR-ROUND-20260807): pass 1 is the stock
+# detector, byte-identical; a single recovery pass runs only when pass 1
+# raises one of the three physical-gap floors, admits wide clear-film runs
+# (12 < width <= WIDE_GAP_CEILING_ROWS) as gap anchors, and can never
+# produce an automatic, unattended, or high-confidence result.
+
+
+def _synthetic_roll_with_mixed_gap_rows(
+    gaps: list[tuple[int, int]],
+    *,
+    height: int,
+) -> np.ndarray:
+    """Like ``_synthetic_roll_with_gap_rows`` but with a per-gap half-width,
+    so one raster can carry narrow, wide, and sliver clear-film runs at once
+    (the webmogul1 beta.3 field signature, ScanStudio #23/#24)."""
+
+    y = np.arange(height, dtype=np.int64)[:, None]
+    x = np.arange(90, dtype=np.int64)[None, :]
+    texture = (x * 173 + y * 71 + (x * y) % 997) % 7_000
+    aperture = np.empty((height, 90, 3), dtype=np.int64)
+    for channel, base in enumerate((7_000, 5_500, 4_000)):
+        aperture[:, :, channel] = base + texture * (3 - channel) // 2
+    clear_base = np.asarray((34_200, 25_500, 17_800), dtype=np.int64)
+    clear_noise = ((x * 19 + y * 13) % 301 - 150)[:, :, None]
+    for boundary, half_width in gaps:
+        lo = max(0, boundary - half_width)
+        hi = min(height, boundary + half_width)
+        aperture[lo:hi] = clear_base + clear_noise[lo:hi]
+    rgb = np.empty((height, 96, 3), dtype=np.int64)
+    rgb[:, 2:92] = aperture
+    rgb[:, :2] = np.asarray((1_300, 1_000, 700))
+    rgb[:, 92:] = np.asarray((1_100, 850, 600))
+    return rgb.clip(0, 65_535).astype(np.uint16)
+
+
+def test_wide_gap_recovery_rescues_two_narrow_plus_one_wide_gap() -> None:
+    """The field signature: two narrow gaps plus one wide (14-row) gap on a
+    short strip. Pass 1 refuses at the count floor; the recovery pass
+    resolves it -- capped at medium, wide slot under manual review, recovery
+    warning present, and the wide boundary carries the distinct support
+    class instead of ``cadence-broad``."""
+
+    gaps = [(200, 2), (343, 3), (486, 7)]  # widths 4, 6, 14
+    rgb = _synthetic_roll_with_mixed_gap_rows(gaps, height=4 * 145 + 200)
+
+    detection = _detect(rgb)
+
+    assert detection.confidence == "medium"
+    assert "wide-gap-recovery" in detection.warnings
+    supports = [boundary.support for boundary in detection.boundaries]
+    assert supports.count("direct-wide") == 1
+    wide = next(b for b in detection.boundaries if b.support == "direct-wide")
+    assert wide.manual_review
+    assert "wide-gap-anchor" in wide.review_reasons
+    assert wide.evidence_run is not None
+    assert wide.evidence_run[1] - wide.evidence_run[0] == 14
+
+
+def test_pass_one_success_never_enters_recovery_even_with_a_wide_gap() -> None:
+    """Strict superset: a roll pass 1 already resolves -- plenty of narrow
+    gaps, one broad clear region -- must return the stock single-pass result
+    exactly, bit-identical: no recovery warning, no direct-wide support, no
+    confidence cap."""
+
+    rgb, boundaries = _synthetic_roll(8)
+    lo, hi = boundaries[4] - 8, boundaries[4] + 8  # broaden one gap to 16 rows
+    clear = rgb[boundaries[4]].copy()
+    rgb[lo:hi] = clear
+
+    detection = _detect(rgb)
+    stock = roll._detect_roll_frames_single(
+        rgb,
+        np.ones_like(rgb, dtype=bool),
+        nominal_frame_rows=145,
+        expected_frame_count=None,
+    )
+
+    assert detection == stock
+    assert "wide-gap-recovery" not in detection.warnings
+    supports = {boundary.support for boundary in detection.boundaries}
+    assert "direct-wide" not in supports
+    assert "cadence-broad" in supports
+
+
+def test_recovery_slivers_never_anchor_and_failure_keeps_the_original_error() -> None:
+    """F1 (adversarial review 2026-08-07): 1-2-row slivers are not wide gaps.
+    Two narrow gaps plus slivers must still refuse -- with the pass-1 error
+    id and the recovery note -- rather than letting slivers vote. And a gap
+    past the recovery ceiling (26 rows) must refuse identically."""
+
+    for extra in [(486, 1), (486, 13)]:  # width-2 sliver / width-26 run
+        gaps = [(200, 2), (343, 3), extra]
+        rgb = _synthetic_roll_with_mixed_gap_rows(gaps, height=4 * 145 + 200)
+        with pytest.raises(roll.IndexDecodeError) as excinfo:
+            _detect(rgb)
+        error = excinfo.value
+        assert error.error_id == roll.GAP_COUNT_FLOOR_ERROR_ID
+        assert "wide_gap_recovery" in error.diagnostics
+        assert error.diagnostics["narrow_run_count"] == 2
+
+
+def test_recovery_confidence_cap_is_keyed_to_the_mode() -> None:
+    """F3b (adversarial review 2026-08-07): the medium cap and the warning
+    come from running in recovery mode, not from whether a direct-wide
+    boundary survived to the output."""
+
+    gaps = [(200, 2), (343, 3), (486, 7)]
+    rgb = _synthetic_roll_with_mixed_gap_rows(gaps, height=4 * 145 + 200)
+
+    detection = _detect(rgb)
+
+    assert detection.confidence != "high"
+    assert "wide-gap-recovery" in detection.warnings
+
+
+def test_incomplete_index_never_triggers_recovery() -> None:
+    """IncompleteIndexError is a subclass of IndexDecodeError; it must pass
+    through the two-pass wrapper untouched, with no recovery note."""
+
+    rgb, _boundaries = _synthetic_roll(5)
+    known = np.ones_like(rgb, dtype=bool)
+    known[: rgb.shape[0] // 10] = False
+
+    with pytest.raises(roll.IncompleteIndexError) as excinfo:
+        roll.detect_roll_frames(
+            rgb, known, nominal_frame_rows=145, expected_frame_count=None
+        )
+    assert "wide_gap_recovery" not in str(excinfo.value)
+
+
+def _wide_boundary(index: int, row: int, run: tuple[int, int]) -> roll.GapBoundary:
+    return roll.GapBoundary(
+        index=index,
+        output_row=row,
+        fitted_row=float(row),
+        evidence=0.9,
+        transmission=0.95,
+        nonuniformity=0.08,
+        support="direct-wide",
+        evidence_run=run,
+        manual_review=True,
+        review_reasons=("wide-gap-anchor",),
+    )
+
+
+def _clean_records(count: int) -> list[roll.TransportRecord]:
+    return [
+        roll.TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(count)
+    ]
+
+
+def test_wide_anchor_joins_the_fit_by_trailing_edge_when_narrow_count_is_two() -> None:
+    """With only two narrow direct anchors the stock fit refuses; a healthy
+    direct-wide boundary supplies the third anchor at its trailing edge
+    translated into the narrow anchors' centre space. The wide slot resolves
+    through its own trailing-edge record, never automatic; narrow slots stay
+    automatic; the fit gates are unchanged."""
+
+    records = _clean_records(900)
+    boundaries = [
+        _boundary(0, 20),
+        _boundary(1, 163),
+        _wide_boundary(2, 306, (299, 313)),
+        _boundary(3, 449, support="cadence-broad", evidence_run=(429, 469)),
+    ]
+
+    mapping = roll.derive_transport_mapping(boundaries, 4, records)
+
+    assert mapping.native_units_per_preview_row == pytest.approx(42.0)
+    wide_origin = mapping.origins[2]
+    assert wide_origin.method == "wide-gap-trailing-row"
+    assert wide_origin.native_origin == 42 * 313
+    assert not wide_origin.automatic
+    assert wide_origin.manual_review
+    assert mapping.origins[0].automatic
+    assert mapping.origins[1].automatic
+
+
+def test_wide_anchor_is_refused_when_the_local_ramp_is_spiked() -> None:
+    """F2 (adversarial review 2026-08-07): a single-record spike at the wide
+    anchor's trailing edge -- endpoints clean -- must reject the anchor
+    (per-step ramp check), leaving the fit under three anchors and the
+    mapping refused, instead of fitting to noise."""
+
+    records = _clean_records(900)
+    spiked = records[313]
+    records[313] = roll.TransportRecord(
+        row=spiked.row,
+        code=spiked.code,
+        selector=spiked.selector,
+        native_origin=spiked.native_origin + 150,
+    )
+    boundaries = [
+        _boundary(0, 20),
+        _boundary(1, 163),
+        _wide_boundary(2, 306, (299, 313)),
+        _boundary(3, 449, support="cadence-broad", evidence_run=(429, 469)),
+    ]
+
+    with pytest.raises(roll.IndexDecodeError, match="three direct physical gaps"):
+        roll.derive_transport_mapping(boundaries, 4, records)
+
+
+def test_fit_satisfied_by_narrow_anchors_resolves_wide_slot_at_trailing_edge() -> None:
+    """F4 (adversarial review 2026-08-07): when the fit already has its three
+    narrow anchors, a direct-wide slot outside the fit must still resolve at
+    its trailing edge -- the stock centre-keyed window lands ~half a gap
+    early and cannot contain the true record for wide runs."""
+
+    records = _clean_records(900)
+    boundaries = [
+        _boundary(0, 20),
+        _boundary(1, 163),
+        _boundary(2, 306),
+        _wide_boundary(3, 449, (442, 456)),
+    ]
+
+    mapping = roll.derive_transport_mapping(boundaries, 4, records)
+
+    wide_origin = mapping.origins[3]
+    assert wide_origin.native_origin == 42 * 456
+    assert not wide_origin.automatic
+    assert wide_origin.manual_review
+
+
+def test_all_wide_no_narrow_anchors_refuses_mapping() -> None:
+    """Zero narrow anchors means no measured centre-to-trailing offset; wide
+    anchors alone must not fabricate one -- the mapping refuses."""
+
+    records = _clean_records(900)
+    boundaries = [
+        _wide_boundary(0, 20, (13, 27)),
+        _wide_boundary(1, 163, (156, 170)),
+        _wide_boundary(2, 306, (299, 313)),
+    ]
+
+    with pytest.raises(roll.IndexDecodeError, match="three direct physical gaps"):
+        roll.derive_transport_mapping(boundaries, 3, records)
