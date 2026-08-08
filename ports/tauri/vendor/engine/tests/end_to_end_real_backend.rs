@@ -349,7 +349,16 @@ fn roll_approve_for_previewed_real_frame_forwards_one_non_motion_bridge_call() {
     let log_path_string = log_path.display().to_string();
     let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
         "e2e-roll-approve",
-        &[("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str())],
+        &[
+            ("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str()),
+            // Adversarial review S3 (2026-08-08): roll_approve now requires
+            // the approved frame to be one the completed preview flagged
+            // `needsApproval: true` -- mark frame 2 (the one this test
+            // approves) so this test keeps exercising its own actual
+            // subject (one clean, unpolled bridge call) rather than
+            // tripping the new gate.
+            ("MOCK_BRIDGE_PREVIEW_APPROVAL_SLOTS", "2"),
+        ],
     );
 
     send(
@@ -945,7 +954,14 @@ fn roll_approve_rejects_an_operation_stale_after_a_newer_preview_without_bridge_
     let log_path_string = log_path.display().to_string();
     let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
         "e2e-roll-approve-stale-preview",
-        &[("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str())],
+        &[
+            ("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str()),
+            // Adversarial review S3 (2026-08-08): flag frame 1 in both
+            // previews so this test's real subject (stale vs. current
+            // operationId) is what decides the outcome, not the new
+            // needsApproval gate.
+            ("MOCK_BRIDGE_PREVIEW_APPROVAL_SLOTS", "1"),
+        ],
     );
 
     for (id, operation_id) in [(3, "first-preview"), (4, "second-preview")] {
@@ -1211,6 +1227,11 @@ fn roll_approve_session_loss_is_not_retried_and_requires_reconnect() {
         &[
             ("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str()),
             ("MOCK_BRIDGE_CRASH_ON", "roll.approve"),
+            // Adversarial review S3 (2026-08-08): flag frame 1 so the
+            // approve request reaches the bridge (and hits the crash
+            // injection this test is actually about) instead of being
+            // refused earlier by the new needsApproval gate.
+            ("MOCK_BRIDGE_PREVIEW_APPROVAL_SLOTS", "1"),
         ],
     );
 
@@ -3942,4 +3963,409 @@ fn scan_progress_ordinal_tracks_completions_not_the_upfront_burst() {
     let status = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
     assert!(status.success(), "engine did not exit 0: {status:?}");
     let _ = reader_handle.join();
+}
+
+// -- roll.manualFrames / roll.previewStrip (Rung 4 of the feeding UX ladder) ----
+
+/// End-to-end proof of the whole point of `RealLs5000::roll_manual_frames`'s
+/// approval-binding logic: `roll.manualFrames` never went through
+/// `roll.preview`'s own async worker (so `finalize_active_preview_terminal`
+/// never ran), yet the frame it returns must still be approvable through
+/// the exact same `roll.approve` path a normal preview's flagged frame
+/// uses -- using the `operationId` THIS response minted, not one the app
+/// supplied. Mirrors the Python bridge's own
+/// `test_roll_manual_frames_dispatch_routes_rows_and_rearms_scan_gate`.
+#[test]
+fn roll_manual_frames_arms_a_session_whose_frame_is_approvable() {
+    let (mut child, mut stdin, rx, reader_handle) =
+        spawn_connected_engine_with_bridge_env("e2e-manual-frames-approve", &[]);
+
+    send(
+        &mut stdin,
+        3,
+        "roll.manualFrames",
+        json!({"rows": [100, 300, 500]}),
+    );
+    let manual = recv_response_for(&rx, 3, |_| {});
+    assert!(
+        manual.get("error").is_none(),
+        "a structurally valid manual placement must be accepted: {manual:#?}"
+    );
+    assert_eq!(manual["result"]["count"], json!(2));
+    assert_eq!(manual["result"]["fingerprint"], json!("mock-manual-fp"));
+    let operation_id = manual["result"]["operationId"]
+        .as_str()
+        .expect("roll.manualFrames must mint an operationId")
+        .to_string();
+    assert!(!operation_id.is_empty());
+
+    let thumbnails = manual["result"]["thumbnails"]
+        .as_array()
+        .expect("thumbnails array");
+    assert_eq!(thumbnails.len(), 2);
+    assert_eq!(thumbnails[0]["frameIndex"], json!(1));
+    assert_eq!(thumbnails[0]["thumbnail"]["boundaryRows"], json!([100, 300]));
+    assert_eq!(thumbnails[0]["thumbnail"]["needsApproval"], json!(true));
+    assert_eq!(
+        thumbnails[0]["thumbnail"]["warnings"],
+        json!(["user-picked"])
+    );
+    assert_eq!(manual["result"]["snaps"], json!([]));
+
+    // The real proof: roll.approve works on this frame using the
+    // engine-minted operationId, even though roll.preview was never called
+    // this session.
+    send(
+        &mut stdin,
+        4,
+        "roll.approve",
+        json!({"frameIndex": 1, "operationId": operation_id}),
+    );
+    let approval = recv_response_for(&rx, 4, |_| {});
+    assert!(
+        approval.get("error").is_none(),
+        "the frame roll.manualFrames returned must be approvable with its own operationId: {approval:#?}"
+    );
+
+    send(&mut stdin, 5, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 5, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+}
+
+/// `roll.approve` must still refuse a stale/mismatched operationId after a
+/// manual placement -- the new binding logic must not accidentally become
+/// permissive of any string.
+#[test]
+fn roll_manual_frames_frame_rejects_approval_with_a_foreign_operation_id() {
+    let (mut child, mut stdin, rx, reader_handle) =
+        spawn_connected_engine_with_bridge_env("e2e-manual-frames-wrong-op-id", &[]);
+
+    send(
+        &mut stdin,
+        3,
+        "roll.manualFrames",
+        json!({"rows": [100, 300, 500]}),
+    );
+    let manual = recv_response_for(&rx, 3, |_| {});
+    assert!(manual.get("error").is_none(), "{manual:#?}");
+
+    send(
+        &mut stdin,
+        4,
+        "roll.approve",
+        json!({"frameIndex": 1, "operationId": "not-the-real-operation-id"}),
+    );
+    let approval = recv_response_for(&rx, 4, |_| {});
+    assert!(
+        approval.get("error").is_some(),
+        "a foreign operationId must never be accepted: {approval:#?}"
+    );
+    assert_eq!(approval["error"]["code"], json!("INVALID_PARAMS"));
+
+    send(&mut stdin, 5, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 5, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+}
+
+/// 2026-08-08 adversarial review, S1 (part 4): a completed preview binding
+/// must be retired the moment a `roll.manualFrames` request is issued, and
+/// stay retired if that request fails -- never left honorable against a
+/// replacement session that never actually arrived. Without this, an old
+/// approval (still shown by a UI that has not yet learned the replacement
+/// placement failed) could be submitted while the driver's Roll session
+/// itself has already moved on.
+#[test]
+fn roll_manual_frames_retires_the_prior_completed_binding_before_and_on_failure() {
+    let log_directory = unique_output_destination("roll-manual-frames-retires-binding");
+    let log_path = log_directory.join("bridge-calls.log");
+    std::fs::write(&log_path, "").expect("create mock bridge call log");
+    let log_path_string = log_path.display().to_string();
+    let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
+        "e2e-manual-frames-retires-binding",
+        &[
+            ("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str()),
+            (
+                "MOCK_BRIDGE_MANUAL_FRAMES_ERROR",
+                "manual placement rejected for this test",
+            ),
+        ],
+    );
+
+    // Establish a completed binding ("binding-a") via a normal preview --
+    // the exact "placement/preview A completed" half of the S1 scenario.
+    send(
+        &mut stdin,
+        3,
+        "scanner.acquireThumbnails",
+        json!({"frames": [1, 2, 3], "operationId": "binding-a"}),
+    );
+    assert!(recv_response_for(&rx, 3, |_| {}).get("error").is_none());
+    let _ = drain_until(&rx, Duration::from_secs(5), |event| {
+        event["event"] == "scanner.status" && event["payload"]["operationId"] == "binding-a"
+    });
+    std::fs::write(&log_path, "").expect("reset mock bridge call log");
+
+    // A replacement manual placement is attempted and fails (mock bridge
+    // configured to reject every roll.manualFrames call).
+    send(
+        &mut stdin,
+        4,
+        "roll.manualFrames",
+        json!({"rows": [100, 300, 500]}),
+    );
+    let manual = recv_response_for(&rx, 4, |_| {});
+    assert!(
+        manual.get("error").is_some(),
+        "expected the mock bridge's configured manual-frames rejection: {manual:#?}"
+    );
+    assert_eq!(
+        read_mock_bridge_calls(&log_path),
+        vec!["roll.manualFrames"],
+        "the failed placement must still have reached the bridge exactly once"
+    );
+
+    // Binding A must no longer be approvable: it was retired BEFORE the
+    // (failing) roll.manualFrames request was even issued, and the failure
+    // never restored it. This must be refused client-side, before any
+    // bridge call -- the log below must show nothing new.
+    send(
+        &mut stdin,
+        5,
+        "roll.approve",
+        json!({"frameIndex": 1, "operationId": "binding-a"}),
+    );
+    let approval = recv_response_for(&rx, 5, |_| {});
+    let error = approval
+        .get("error")
+        .expect("binding A must stay retired after a failed replacement placement");
+    assert_eq!(error["code"], json!("INVALID_PARAMS"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("does not match")),
+        "{error:#?}"
+    );
+    assert_eq!(
+        read_mock_bridge_calls(&log_path),
+        vec!["roll.manualFrames"],
+        "a retired binding must be refused before any roll.approve bridge call"
+    );
+
+    send(&mut stdin, 6, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 6, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+    let _ = std::fs::remove_dir_all(log_directory);
+}
+
+/// `roll.previewStrip` returns the wire shape a manual-placement editor
+/// needs to seed itself: a loadable path plus the row<->pixel coordinate
+/// space `roll.manualFrames`'s own `rows` are given in.
+#[test]
+fn roll_preview_strip_returns_the_wire_shape() {
+    let (mut child, mut stdin, rx, reader_handle) =
+        spawn_connected_engine_with_bridge_env("e2e-preview-strip", &[]);
+
+    send(&mut stdin, 3, "roll.previewStrip", json!({}));
+    let strip = recv_response_for(&rx, 3, |_| {});
+    assert!(strip.get("error").is_none(), "{strip:#?}");
+    assert_eq!(strip["result"]["rowCount"], json!(4800));
+    assert_eq!(strip["result"]["pixelsPerRow"], json!(1));
+    let image_path = strip["result"]["imagePath"]
+        .as_str()
+        .expect("imagePath is a string");
+    assert!(!image_path.is_empty());
+
+    send(&mut stdin, 4, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 4, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+}
+
+/// The bridge's own plain-English `INVALID_PARAMS` text (manual_frames.py's
+/// gates) must survive into the public engine error unmodified, the same
+/// "never reshape a validation message" contract `roll.setSpacingOffset`
+/// and every other bridge-rejection path already honors.
+#[test]
+fn roll_manual_frames_propagates_invalid_params_message_unmodified() {
+    let sentence = "the 1st frame you placed is about 8 mm tall (between rows 10 and 40), \
+        outside the 15-75 mm range this driver accepts for manual placement";
+    let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
+        "e2e-manual-frames-invalid-params",
+        &[("MOCK_BRIDGE_MANUAL_FRAMES_ERROR", sentence)],
+    );
+
+    send(&mut stdin, 3, "roll.manualFrames", json!({"rows": [10, 40]}));
+    let manual = recv_response_for(&rx, 3, |_| {});
+    let error = manual.get("error").expect("expected a rejected placement");
+    assert_eq!(error["code"], json!("INVALID_PARAMS"));
+    let message = error["message"].as_str().expect("message is a string");
+    assert!(
+        message.contains(sentence),
+        "expected the exact bridge sentence to survive unmodified, got: {message}"
+    );
+
+    send(&mut stdin, 4, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 4, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+}
+
+// -- Adversarial review round 2 (2026-08-08): S3, approval/scan constrained --
+// -- to frames actually shown by the completed preview ----------------------
+
+/// S3: matching operationId/session identity alone must not be enough to
+/// approve an arbitrary frame index -- the frame must be one the completed
+/// preview actually returned AND actually flagged `needsApproval: true`.
+/// Frame 2 here is previewed (so it exists) but never flagged, proving both
+/// halves of the gate: existence in the binding is not sufficient on its
+/// own either.
+#[test]
+fn roll_approve_rejects_a_frame_the_completed_preview_never_flagged() {
+    let log_directory = unique_output_destination("roll-approve-unflagged-frame");
+    let log_path = log_directory.join("bridge-calls.log");
+    std::fs::write(&log_path, "").expect("create mock bridge call log");
+    let log_path_string = log_path.display().to_string();
+    // Deliberately no MOCK_BRIDGE_PREVIEW_APPROVAL_SLOTS: every previewed
+    // frame comes back needsApproval: false.
+    let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
+        "e2e-roll-approve-unflagged",
+        &[("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str())],
+    );
+
+    send(
+        &mut stdin,
+        3,
+        "scanner.acquireThumbnails",
+        json!({"frames": [1, 2, 3], "operationId": "unflagged-preview"}),
+    );
+    assert!(recv_response_for(&rx, 3, |_| {}).get("error").is_none());
+    let _ = drain_until(&rx, Duration::from_secs(5), |event| {
+        event["event"] == "scanner.status"
+            && event["payload"]["operationId"] == "unflagged-preview"
+    });
+    std::fs::write(&log_path, "").expect("reset mock bridge call log");
+
+    send(
+        &mut stdin,
+        4,
+        "roll.approve",
+        json!({"frameIndex": 2, "operationId": "unflagged-preview"}),
+    );
+    let approval = recv_response_for(&rx, 4, |_| {});
+    let error = approval.get("error").expect("an unflagged frame must never be approvable");
+    assert_eq!(error["code"], json!("INVALID_PARAMS"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("flagged for manual review")),
+        "{error:#?}"
+    );
+    assert!(
+        read_mock_bridge_calls(&log_path).is_empty(),
+        "an unflagged approval must be refused before any bridge call"
+    );
+
+    send(&mut stdin, 5, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 5, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+}
+
+/// S3: `scan.start` must refuse a requested frame the completed preview
+/// never returned at all -- the mock bridge's preview worker always
+/// returns exactly slots {1, 2, 3} (BRIDGE.md: "the bridge always
+/// physically reads the full roll regardless of `slots`" -- a `frames`
+/// filter on `scanner.acquireThumbnails` narrows which events a caller is
+/// told about, not which slots the completed preview binding contains), so
+/// requesting frame 4 alongside frame 1 must name frame 4 and never reach
+/// the bridge, closing the "hidden slot" gap a caller could otherwise
+/// exploit by asking for a frame the operator was never shown at all.
+#[test]
+fn scan_start_rejects_a_frame_the_completed_preview_never_returned() {
+    let log_directory = unique_output_destination("scan-start-hidden-frame-call-log");
+    let log_path = log_directory.join("bridge-calls.log");
+    std::fs::write(&log_path, "").expect("create mock bridge call log");
+    let log_path_string = log_path.display().to_string();
+    let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
+        "e2e-scan-start-hidden-frame",
+        &[("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str())],
+    );
+
+    send(
+        &mut stdin,
+        3,
+        "scanner.acquireThumbnails",
+        json!({"frames": [1], "operationId": "hidden-frame-preview"}),
+    );
+    assert!(recv_response_for(&rx, 3, |_| {}).get("error").is_none());
+    let _ = drain_until(&rx, Duration::from_secs(5), |event| {
+        event["event"] == "scanner.status"
+            && event["payload"]["operationId"] == "hidden-frame-preview"
+    });
+    std::fs::write(&log_path, "").expect("reset mock bridge call log");
+
+    let output_directory = unique_output_destination("scan-start-hidden-frame-output");
+    send(
+        &mut stdin,
+        4,
+        "scan.start",
+        json!({
+            "frames": [1, 4],
+            "recipe": {
+                "resolutionDpi": 4000,
+                "bitDepth": 16,
+                "multisamplePasses": 4,
+                "channels": "rgbi",
+                "autofocusEachFrame": true,
+                "autoExposureEachFrame": true
+            },
+            "output": {
+                "archive": {
+                    "enabled": false,
+                    "fullCapturePackage": false,
+                    "destination": output_directory.join("disabled-archive").display().to_string(),
+                    "filenameTemplate": "frame-####"
+                },
+                "positive": {
+                    "enabled": true,
+                    "destination": output_directory.join("positive").display().to_string(),
+                    "filenameTemplate": "frame-####",
+                    "fileFormat": "tiff",
+                    "colorProfile": "adobeRgb1998"
+                },
+                "preview": {"enabled": false}
+            }
+        }),
+    );
+    let start = recv_response_for(&rx, 4, |_| {});
+    let error = start
+        .get("error")
+        .expect("a frame the completed preview never returned must refuse scan.start");
+    assert_eq!(error["code"], json!("INVALID_PARAMS"));
+    assert!(
+        error["message"].as_str().is_some_and(|m| m.contains("frame 4")),
+        "expected the refusal to name the hidden frame: {error:#?}"
+    );
+    assert!(
+        read_mock_bridge_calls(&log_path)
+            .iter()
+            .all(|method| method != "scan.start"),
+        "a hidden-frame request must be refused before any bridge call"
+    );
+
+    send(&mut stdin, 5, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 5, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+    let _ = std::fs::remove_dir_all(output_directory);
 }

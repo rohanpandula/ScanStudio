@@ -27,6 +27,14 @@ struct ContentView: View {
                             sessionModel.dismissLastError()
                         }
                         .id(presentation.technicalDetails)
+                    } else if let snapNote = sessionModel.manualPlacementSnapNote {
+                        // Only shown once no error is active: a successful
+                        // manual placement already clears `lastErrorMessage`,
+                        // so this and the error banner above are never both
+                        // relevant at once.
+                        ManualPlacementSnapNoteBanner(text: snapNote) {
+                            sessionModel.dismissManualPlacementSnapNote()
+                        }
                     }
 
                     Group {
@@ -125,6 +133,9 @@ struct ContentView: View {
         .sheet(item: manualReviewRequestBinding) { request in
             ManualReviewScanSheet(request: request)
         }
+        .sheet(item: manualPlacementStripBinding) { strip in
+            ManualFramePlacementSheet(strip: strip)
+        }
         .focusedSceneValue(
             \.scanStudioFrameIndex,
             sessionModel.frameTransformTargetIndex
@@ -137,6 +148,27 @@ struct ContentView: View {
             set: { newValue in
                 if newValue == nil {
                     sessionModel.cancelPendingManualReviewScan()
+                }
+            }
+        )
+    }
+
+    /// Rung 4: presents `ManualFramePlacementSheet` exactly while
+    /// `manualPlacementStripState` is `.ready` -- `.idle`/`.loading` both
+    /// map to no sheet, so the loading interval is shown on the "Place
+    /// frames manually" button itself (`WorkspaceErrorBanner`) rather than
+    /// as an empty sheet.
+    private var manualPlacementStripBinding: Binding<ManualPlacementStrip?> {
+        Binding(
+            get: {
+                if case .ready(let strip) = sessionModel.manualPlacementStripState {
+                    return strip
+                }
+                return nil
+            },
+            set: { newValue in
+                if newValue == nil {
+                    sessionModel.cancelManualFramePlacement()
                 }
             }
         )
@@ -367,6 +399,10 @@ private struct WorkspaceErrorBanner: View {
     @State private var didCopyTechnicalDetails = false
     @State private var didSaveDiagnosticBundle = false
 
+    private var isLoadingManualPlacement: Bool {
+        sessionModel.manualPlacementStripState == .loading
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
@@ -401,6 +437,50 @@ private struct WorkspaceErrorBanner: View {
                     .foregroundStyle(Color.scanStudioSecondaryText)
                     .help("Dismiss")
                     .accessibilityLabel("Dismiss error")
+                }
+
+                // Rung 3 + Rung 4 of the feeding UX ladder
+                // (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): when the
+                // engine attached a plain-English diagnosis to this
+                // refusal, show it prominently -- never the raw JSON it
+                // was extracted from (`ProbableCauseExtractor`) -- and
+                // offer the manual-placement recovery path right beside
+                // it.
+                if let probableCause = presentation.probableCause {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(probableCause)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Color.scanStudioPrimaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+
+                        Button {
+                            Task {
+                                await sessionModel.beginManualFramePlacement()
+                            }
+                        } label: {
+                            if isLoadingManualPlacement {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.small)
+                                    Text("Loading Film Strip…")
+                                }
+                            } else {
+                                Label(
+                                    "Place frames manually",
+                                    systemImage: "rectangle.and.hand.point.up.left"
+                                )
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.scanStudioAmber)
+                        .font(.system(size: 11, weight: .medium))
+                        .disabled(isLoadingManualPlacement)
+                        .help("Draw your own frame boundaries on the captured film strip")
+                    }
+                    .padding(10)
+                    .background(Color.scanStudioRaised, in: RoundedRectangle(cornerRadius: 6))
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Probable cause: \(probableCause)")
                 }
 
                 HStack(spacing: 12) {
@@ -542,6 +622,51 @@ private struct WorkspaceErrorBanner: View {
         formatter.formatOptions = [.withFullDate, .withTime, .withTimeZone]
         return formatter.string(from: Date())
             .replacingOccurrences(of: ":", with: "")
+    }
+}
+
+/// Rung 4's "surface snaps subtly" requirement: a single quiet line, never
+/// styled as an error (`scanStudioRaised`, not `scanStudioRed`), shown only
+/// while no error is active (`ContentView`'s own `if/else if` with
+/// `WorkspaceErrorBanner`) -- a successful manual placement already
+/// resolved whatever was showing before it.
+private struct ManualPlacementSnapNoteBanner: View {
+    let text: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.scanStudioAmber)
+                    .accessibilityHidden(true)
+                Text(text)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.scanStudioSecondaryText)
+                Spacer(minLength: 12)
+                Button {
+                    onDismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .frame(width: 26, height: 26)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.scanStudioSecondaryText)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 7)
+            .background(Color.scanStudioRaised)
+
+            Rectangle().fill(Color.scanStudioDivider).frame(height: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 }
 
