@@ -1478,6 +1478,7 @@ def test_batch_job_loader_binds_ordered_frame_paths_and_parent_ack_contract(
                 "expected_usb_address": 2,
                 "expected_usb_bus": 1,
                 "exposure_override_10ns": None,
+                "manual_boundary_rows": None,
                 "frames": [
                     {
                         "ack": "frame-017/parent-ack.json",
@@ -1531,6 +1532,7 @@ def _one_frame_job_payload(
     fingerprint: ReviewedRollFingerprint,
     *,
     exposure_override_10ns: object,
+    manual_boundary_rows: object = None,
 ) -> dict[str, object]:
     return {
         "apply_all_boundary_offsets_before_first_frame": True,
@@ -1539,6 +1541,7 @@ def _one_frame_job_payload(
         "expected_usb_bus": 1,
         "expected_usb_address": 2,
         "exposure_override_10ns": exposure_override_10ns,
+        "manual_boundary_rows": manual_boundary_rows,
         "frames": [
             {
                 "ack": "frame-001/parent-ack.json",
@@ -1578,6 +1581,57 @@ def test_batch_job_loader_parses_a_valid_exposure_override(tmp_path: Path) -> No
     )
 
     assert job.exposure_override_10ns == (97_482, 195_597, 180_705)
+
+
+def test_batch_job_loader_parses_valid_manual_boundary_rows(tmp_path: Path) -> None:
+    """Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): same choke point as
+    exposure_override_10ns above -- the operator-picked rows a manual
+    placement session hands Roll.scan_many() must survive the batch-job.json
+    round trip so _derive_live_batch_selections can replay them fresh."""
+    job_path = tmp_path / "batch-job.json"
+    job_path.write_text(
+        json.dumps(
+            _one_frame_job_payload(
+                _reviewed_fingerprint(),
+                exposure_override_10ns=None,
+                manual_boundary_rows=[128, 271, 414],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    job = load_validated_batch_job(
+        job_path,
+        expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+        expected_plan_sha256="a" * 64,
+        expected_continuation_sha256="b" * 64,
+    )
+
+    assert job.manual_boundary_rows == (128, 271, 414)
+
+
+def test_batch_job_loader_refuses_malformed_manual_boundary_rows(
+    tmp_path: Path,
+) -> None:
+    job_path = tmp_path / "batch-job.json"
+    job_path.write_text(
+        json.dumps(
+            _one_frame_job_payload(
+                _reviewed_fingerprint(),
+                exposure_override_10ns=None,
+                manual_boundary_rows=[128, "271"],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProtocolError, match="manual_boundary_rows"):
+        load_validated_batch_job(
+            job_path,
+            expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+            expected_plan_sha256="a" * 64,
+            expected_continuation_sha256="b" * 64,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2246,6 +2300,7 @@ def test_batch_cli_dry_run_validates_one_session_without_single_frame_flags(
                 "expected_usb_address": 2,
                 "expected_usb_bus": 1,
                 "exposure_override_10ns": None,
+                "manual_boundary_rows": None,
                 "frames": [
                     {
                         "ack": "frame-017/parent-ack.json",
@@ -5141,6 +5196,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         frames: tuple[worker_module.BatchFrameSpec, ...],
         *,
         reviewed_fingerprint: ReviewedRollFingerprint,
+        manual_boundary_rows: tuple[int, ...] | None = None,
     ) -> tuple[SimpleNamespace, ...]:
         nonlocal prevalidated
         assert len(preview) == len(worker_module.PREVIEW_READ_SEQUENCES)
@@ -5807,6 +5863,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
             "expected_usb_bus": 1,
             "expected_usb_address": 2,
             "exposure_override_10ns": None,
+            "manual_boundary_rows": None,
             "frames": [
                 {
                     "ack": f"frame-{frame.slot:03d}/parent-ack.json",
@@ -5856,6 +5913,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
         frames: tuple,
         *,
         reviewed_fingerprint: ReviewedRollFingerprint,
+        manual_boundary_rows: tuple[int, ...] | None = None,
     ) -> tuple:
         assert len(preview) == len(worker_module.PREVIEW_READ_SEQUENCES)
         assert table == header_8e
@@ -6332,6 +6390,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
             "expected_usb_bus": 1,
             "expected_usb_address": 2,
             "exposure_override_10ns": None,
+            "manual_boundary_rows": None,
             "frames": [
                 {
                     "ack": f"frame-{frame.slot:03d}/parent-ack.json",
@@ -6381,6 +6440,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         frames: tuple,
         *,
         reviewed_fingerprint: ReviewedRollFingerprint,
+        manual_boundary_rows: tuple[int, ...] | None = None,
     ) -> tuple:
         assert len(preview) == len(worker_module.PREVIEW_READ_SEQUENCES)
         assert table == header_8e

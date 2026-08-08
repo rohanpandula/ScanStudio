@@ -11,6 +11,7 @@ level -- every other module stays hardware-library-free.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import time
@@ -37,10 +38,49 @@ import tifffile
 from coolscanpy.protocol.ls5000_single_pass.roll_index import (
     IndexDecodeError,
     LeadingFrameClippedError,
+    decode_full_index_bytes,
+    parse_live_transport_records_bytes,
+    validate_live_0x8e_bytes,
+)
+
+# Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): SNAP_REVIEW_REASON is a
+# plain module-level string constant (not underscore-prefixed, not part of
+# manual_frames.__all__ either) -- read, never imported for behavior, the
+# same "reach past the public taxonomy with a documented reason" precedent
+# as IndexDecodeError/LeadingFrameClippedError above.
+from coolscanpy.protocol.ls5000_single_pass.manual_frames import SNAP_REVIEW_REASON
+from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    AttemptPaths,
+    CaptureAttemptResult,
+    CaptureMode,
+    CaptureOutcome,
+    CaptureRequest,
 )
 from coolscanpy.roll.preview_session import (
     RollSessionError,
     RollSessionIntegrityError,
+    ValidatedRollPreview,
+    build_manual_roll_preview_session,
+    # `_validate_preview_result`/`_derive_geometry`/
+    # `_validated_preview_density_evidence` are underscore-private module
+    # functions, not exported from preview_session.__all__. They are
+    # imported here anyway, deliberately, because they are the exact
+    # validate-and-decode PREFIX `build_roll_preview_session` itself runs
+    # before it ever calls `detect_roll_frames` -- and manual_frames()
+    # below needs precisely that prefix, without the automatic detector
+    # that follows it in build_roll_preview_session (which is exactly what
+    # already refused on a "completed-but-refused" attempt, and would
+    # refuse again the same way if re-run). No public coolscanpy function
+    # returns a bare ValidatedRollPreview independent of detection; rather
+    # than duplicate this validation logic (SHA256 cross-checks, USB
+    # topology, startup-table/preview-binding-contract matching, density
+    # evidence replay) a second time in the bridge, this reuses the
+    # driver's own already-tested implementation. It becomes dead,
+    # harmless code the day coolscanpy exposes this prefix as a public
+    # function of its own.
+    _derive_geometry,
+    _validate_preview_result,
+    _validated_preview_density_evidence,
 )
 
 from scanstudio_bridge import domain, safety
@@ -64,6 +104,21 @@ _MATERIAL_TO_COOLSCANPY: dict[domain.Material, coolscanpy.Material] = {
     domain.Material.COLOR_NEGATIVE: coolscanpy.Material.COLOR_NEGATIVE,
     domain.Material.BLACK_AND_WHITE_NEGATIVE: coolscanpy.Material.BLACK_AND_WHITE_NEGATIVE,
 }
+# Rung 4: manual_frames() has no material param of its own (the roll already
+# has one -- see coolscanpy.Roll.material) but must still hand the bridge
+# service a domain.Material so scan.start's NO_PREVIEW gate re-arms
+# correctly. Exact inverse of the mapping above -- never hand-maintained
+# separately.
+_COOLSCANPY_TO_MATERIAL: dict[coolscanpy.Material, domain.Material] = {
+    value: key for key, value in _MATERIAL_TO_COOLSCANPY.items()
+}
+
+# capture_process._prepare_attempt_paths' own mkdtemp prefix for a
+# CaptureMode.PREVIEW request ("preview-" + a random tempfile suffix, no
+# selected_slot so no "-slotNN" infix) -- mirrored here as a glob, never
+# imported, since it is assembled from CaptureMode.PREVIEW.value privately
+# inside that method rather than exposed as a constant of its own.
+_PREVIEW_ATTEMPT_GLOB = "preview-*/journal.json"
 
 
 def _coolscanpy_git_head_sha(package_dir: Path) -> str | None:
@@ -398,6 +453,161 @@ def _scan_receipt_from_coolscanpy(
     )
 
 
+# -- Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): manual frame placement --
+#
+# manual_frames()/preview_strip() below both need a ValidatedRollPreview from
+# the LAST preview attempt on this Roll -- successful or refused -- purely
+# from what is already on disk under attempts_root, with no hardware call and
+# no dependence on whatever self._roll's own in-memory state currently holds
+# (a refused preview leaves self._roll without a usable session at all). The
+# three helpers below do exactly that, in three separate steps mirroring
+# preview_session.py's own internal shape: locate the attempt directory,
+# reconstruct its CaptureAttemptResult from disk, then validate+decode it
+# into a ValidatedRollPreview without ever calling detect_roll_frames.
+
+
+def _last_preview_attempt_journal_path(attempts_root: Path) -> Path:
+    """The most recently written preview attempt's journal.json under
+    `attempts_root`. Mirrors exposure_authority._find_frame_attempt_
+    directory's own mtime-pick-and-refuse-on-tie pattern, applied to
+    CaptureMode.PREVIEW's own attempt-directory shape (one per roll.preview
+    call on this Roll -- see capture_process._prepare_attempt_paths) instead
+    of a batch frame directory."""
+    candidates = sorted(
+        attempts_root.glob(_PREVIEW_ATTEMPT_GLOB),
+        key=lambda path: path.stat().st_mtime,
+    )
+    if not candidates:
+        raise BridgeError(
+            ErrorCode.NO_PREVIEW,
+            "no preview attempt evidence was found under this roll's "
+            "attempts directory; run roll.preview first",
+        )
+    if (
+        len(candidates) > 1
+        and candidates[-1].stat().st_mtime == candidates[-2].stat().st_mtime
+    ):
+        raise BridgeError(
+            ErrorCode.INTERNAL,
+            f"{len(candidates)} preview attempts under {attempts_root} are "
+            "mtime-indistinguishable; refusing to guess which one is current",
+        )
+    try:
+        # Fully resolved (symlinks included, e.g. macOS /var -> /private/var)
+        # -- preview_session._artifact_path requires every path it validates
+        # to already equal its own .resolve() exactly, the same invariant
+        # _restore_roll_preview_session's own reconstruction depends on. A
+        # bare glob() result inherits attempts_root's own possibly-unresolved
+        # form, so it is resolved once, here, before anything downstream
+        # sees it.
+        return candidates[-1].resolve(strict=True)
+    except OSError as exc:
+        raise BridgeError(
+            ErrorCode.INTERNAL,
+            f"preview attempt journal is unavailable: {exc}",
+        ) from exc
+
+
+def _reconstruct_last_preview_attempt(attempts_root: Path) -> CaptureAttemptResult:
+    """Rebuild a CaptureAttemptResult purely from the persisted journal.json
+    of the most recent roll.preview attempt on this Roll -- no film
+    movement, no live coolscanpy.Roll state touched. Mirrors
+    coolscanpy.roll.preview_session._restore_roll_preview_session's own
+    attempt reconstruction (there, replaying an operator-approved AUTOMATIC
+    session restored from RollPreviewSession.to_json()); this is the
+    identical shape, sourced from disk directly instead of a saved session
+    blob, because a refused preview never produced a session to serialize in
+    the first place -- the journal on disk is the only surviving evidence."""
+    journal_path = _last_preview_attempt_journal_path(attempts_root)
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BridgeError(
+            ErrorCode.INTERNAL,
+            f"preview attempt journal could not be read: {exc}",
+        ) from exc
+    if not isinstance(journal, dict):
+        raise BridgeError(
+            ErrorCode.INTERNAL, f"{journal_path}: journal is not a JSON object"
+        )
+    output_value = journal.get("output")
+    if not isinstance(output_value, str):
+        raise BridgeError(
+            ErrorCode.INTERNAL, f"{journal_path}: journal has no output path"
+        )
+    root = journal_path.parent
+    paths = AttemptPaths(
+        directory=root,
+        output=Path(output_value),
+        journal=journal_path,
+        # None of these three are ever read by _validate_preview_result/
+        # _derive_geometry/_validated_preview_density_evidence -- only
+        # .directory/.output/.journal are (see preview_session.py) --
+        # placeholders exactly like _restore_roll_preview_session's own
+        # reconstruction uses.
+        plan=root / "replay-first-rgbi4-plan.jsonl",
+        manifest=root / "replay-first-rgbi4-manifest.json",
+        bootstrap_status=root / "worker-bootstrap.json",
+        stdout=root / "stdout.txt",
+        stderr=root / "stderr.txt",
+    )
+    return CaptureAttemptResult(
+        outcome=CaptureOutcome.COMPLETE,
+        request=CaptureRequest(mode=CaptureMode.PREVIEW),
+        paths=paths,
+        argv=(),
+        returncode=0,
+        stdout="",
+        stderr="",
+        journal=journal,
+    )
+
+
+def _validated_preview_from_attempt(
+    attempt: CaptureAttemptResult,
+) -> ValidatedRollPreview:
+    """Validate and decode one completed preview attempt into its raw
+    whole-roll raster, WITHOUT running frame detection -- the exact prefix
+    build_roll_preview_session itself runs before detect_roll_frames (see
+    this module's import comment above). May raise RollSessionIntegrityError
+    (artifact/journal self-check failure -- a driver-side defect, not an
+    operator condition) or coolscanpy.MeterUnusableError (#17: no usable
+    density meter mean while replaying this preview's evidence) -- both
+    handled the same way preview() itself already handles them."""
+    (
+        journal,
+        preview_artifact,
+        preview_bytes,
+        table_artifact,
+        table_bytes,
+        journal_artifact,
+        _capacity,
+        usb_topology,
+    ) = _validate_preview_result(attempt)
+    geometry = _derive_geometry(journal, len(preview_bytes))
+    _validated_preview_density_evidence(attempt, journal, preview_bytes, geometry)
+    validated_table, usable_rows = validate_live_0x8e_bytes(
+        table_bytes, geometry.height
+    )
+    rgb, _known, decode_report = decode_full_index_bytes(
+        preview_bytes, geometry, usable_rows=usable_rows
+    )
+    records = parse_live_transport_records_bytes(
+        validated_table, maximum_rows=geometry.height
+    )
+    return ValidatedRollPreview(
+        preview_artifact=preview_artifact,
+        table_artifact=table_artifact,
+        journal_artifact=journal_artifact,
+        usb_topology=usb_topology,
+        geometry=geometry,
+        usable_rows=usable_rows,
+        rgb=rgb,
+        transport_records=records,
+        decode_report=decode_report,
+    )
+
+
 class CoolscanPyTransport:
     """Thin real adapter over CoolscanPy's `Device`/`Roll` API. Satisfies
     `transport.Transport` structurally -- no explicit inheritance needed,
@@ -697,6 +907,189 @@ class CoolscanPyTransport:
                 f"and a fresh preview is required ({type(exc).__name__}: {exc})",
             ) from exc
         return _thumbnail_from_coolscanpy(thumbnail, image_path=str(tile_path))
+
+    # -- manual frame placement (Rung 4) -----------------------------------------
+
+    def manual_frames(
+        self, rows: list[int]
+    ) -> tuple[
+        domain.PreviewResult,
+        tuple[domain.Thumbnail, ...],
+        tuple[domain.BoundarySnap, ...],
+        domain.Material,
+    ]:
+        """Re-slice the last completed preview attempt's already-decoded
+        raster at operator-picked boundary rows.
+
+        No hardware call, no film movement -- this is a pure re-slice of
+        bytes already on disk from an earlier roll.preview attempt
+        (successful, or completed-but-refused: the exact case this exists
+        for). Leaves self._roll's session armed exactly like a successful
+        preview() left it, so approve()/set_spacing_offset()/start_scan()
+        all keep working on the resulting manual slots unchanged.
+        """
+        if self._device is None:
+            raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+        if self._scanning:
+            raise BridgeError(
+                ErrorCode.HARDWARE_LANE_BUSY, "a scan job holds the hardware lane"
+            )
+        if self._roll is None or self.attempts_root is None:
+            raise BridgeError(
+                ErrorCode.NO_PREVIEW,
+                "manual frame placement requires a completed roll.preview "
+                "attempt first",
+            )
+        attempt = _reconstruct_last_preview_attempt(self.attempts_root)
+        try:
+            preview = _validated_preview_from_attempt(attempt)
+        except coolscanpy.MeterUnusableError as exc:
+            # #17, same handling as preview()'s own: fail-closed, no
+            # fabricated exposure, a friendly METER_UNUSABLE card rather
+            # than INTERNAL.
+            raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
+
+        try:
+            session = build_manual_roll_preview_session(
+                preview, rows, material=self._roll.material
+            )
+        except IndexDecodeError as exc:
+            # manual_frames.py's own plain-English gates (structure, frame
+            # height, transport-table sanity) -- about the operator's picks,
+            # not a hardware fault. IndexDecodeError is the SAME exception
+            # class preview()'s own REFEED_REQUIRED mapping catches above,
+            # for the automatic detector's transport-table faults -- it
+            # means something different from this different call site
+            # (different rows, different meaning), so it gets a different
+            # mapping: INVALID_PARAMS, matching set_spacing_offset's own
+            # ValueError->INVALID_PARAMS precedent for "the operator's
+            # request doesn't check out" rather than "refeed the strip".
+            raise BridgeError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
+        except RollSessionIntegrityError:
+            # Artifact/journal integrity faults are driver-side defects, not
+            # operator conditions -- same precedent as preview()'s own
+            # handling; let it reach the wire as INTERNAL.
+            raise
+        except RollSessionError as exc:
+            # build_manual_roll_preview_session's own "produced no
+            # scanner-addressable slots" refusal -- also about the
+            # operator's picks, so the same INVALID_PARAMS mapping as the
+            # IndexDecodeError branch above.
+            raise BridgeError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
+
+        # Arm self._roll's session state exactly like Roll.preview()'s own
+        # success tail does (_roll.py: "self._session = session;
+        # self._session_usb_topology = topology; self._approvals.clear()").
+        # Reaching into these three private fields directly -- never a
+        # public Roll method -- because Roll.restore_preview_session()
+        # explicitly, deliberately refuses a manual session
+        # (preview_session.py's _restore_roll_preview_session: "roll
+        # session was built from manual frame placement; restoring... is
+        # not yet supported. Refuse loudly instead of guessing.") and no
+        # OTHER public Roll API exists for installing an already-built
+        # RollPreviewSession without a fresh hardware read. This is not a
+        # hardware attempt, so it does not acquire the HardwareLane or
+        # require safety.require_armed() the way roll.preview/scan.start/
+        # device.eject do -- self._scanning (checked above) is still
+        # respected as a plain busy-guard against racing an ACTUAL transport
+        # read, but manual_frames() itself never becomes one; a real
+        # preview()/scan_many() call still goes through their own unmodified
+        # code paths, hardware lane, and locking exactly as before. Locked
+        # the same way Roll.preview()/set_spacing_offset()/approve()
+        # themselves protect this exact state, so a concurrent Roll caller
+        # can never observe a half-armed session.
+        with self._roll._state_condition:  # noqa: SLF001
+            self._roll._session = session
+            self._roll._session_usb_topology = preview.usb_topology
+            self._roll._approvals.clear()
+
+        preview_dir = safety.DEFAULT_BASE_DIR / "previews" / uuid.uuid4().hex
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        thumbnails: list[domain.Thumbnail] = []
+        for slot in session.slots:
+            tile_path = preview_dir / f"slot-{slot.slot_id:04d}.tif"
+            tifffile.imwrite(
+                tile_path, _normalize_preview_tile(slot.thumbnail), photometric="rgb"
+            )
+            thumbnails.append(
+                domain.Thumbnail(
+                    slot=slot.slot_id,
+                    boundary_rows=slot.boundary_rows,
+                    spacing_offset=slot.boundary_offset_rows,
+                    needs_approval=slot.manual_review,
+                    warnings=slot.warnings,
+                    image_path=str(tile_path),
+                    partial=slot.partial,
+                )
+            )
+
+        # Per-boundary snap notes (BRIDGE.md's contract): derived from the
+        # session's own boundaries rather than re-running
+        # build_manual_detection a second time for its ManualFrameDetection.
+        # snaps -- SNAP_REVIEW_REASON is present on boundary `i` if and only
+        # if build_manual_detection's own final_rows[i] != rows[i] (see
+        # manual_frames.py: the reason is appended exactly when a boundary's
+        # snapped index is in `snapped_indices`, the same set that decided
+        # final_rows[i] != row); `rows[i]` (the operator's own request,
+        # already in hand here) and `boundary.output_row` (the resolved,
+        # possibly-snapped row) reconstruct the identical BoundarySnap this
+        # module's own manual_frames.py would have returned.
+        snaps: list[domain.BoundarySnap] = []
+        for index, (requested_row, boundary) in enumerate(
+            zip(rows, session.detection.boundaries)
+        ):
+            if SNAP_REVIEW_REASON in boundary.review_reasons:
+                assert boundary.evidence_run is not None
+                snaps.append(
+                    domain.BoundarySnap(
+                        boundary_index=index,
+                        requested_row=requested_row,
+                        snapped_row=boundary.output_row,
+                        evidence_run=boundary.evidence_run,
+                    )
+                )
+
+        material = _COOLSCANPY_TO_MATERIAL[self._roll.material]
+        self._material = material
+        self._preview_established = True
+        result = domain.PreviewResult(
+            count=len(thumbnails), fingerprint=self._roll.fingerprint.sha256
+        )
+        return result, tuple(thumbnails), tuple(snaps), material
+
+    def preview_strip(self) -> domain.PreviewStrip:
+        """Render the last completed preview attempt's whole captured raster
+        to one image, for a manual-placement editor to draw boundary lines
+        on before any row has been picked.
+
+        Same precondition as manual_frames() (a completed preview attempt,
+        successful or refused, already on disk); no hardware call, and no
+        session/approval state is touched -- purely a read.
+        """
+        if self._device is None:
+            raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+        if self._roll is None or self.attempts_root is None:
+            raise BridgeError(
+                ErrorCode.NO_PREVIEW,
+                "roll.previewStrip requires a completed roll.preview attempt first",
+            )
+        attempt = _reconstruct_last_preview_attempt(self.attempts_root)
+        try:
+            preview = _validated_preview_from_attempt(attempt)
+        except coolscanpy.MeterUnusableError as exc:
+            raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
+
+        strip_dir = safety.DEFAULT_BASE_DIR / "previews" / uuid.uuid4().hex
+        strip_dir.mkdir(parents=True, exist_ok=True)
+        strip_path = strip_dir / "strip.tif"
+        tifffile.imwrite(
+            strip_path, _normalize_preview_tile(preview.rgb), photometric="rgb"
+        )
+        return domain.PreviewStrip(
+            image_path=str(strip_path),
+            row_count=len(preview.rgb),
+            pixels_per_row=1,
+        )
 
     # -- scanning -----------------------------------------------------------------
 

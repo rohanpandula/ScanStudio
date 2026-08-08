@@ -363,6 +363,17 @@ class BridgeService:
                 int(_require_param(params, "offsetRows")),
             )
             return {"thumbnail": _thumbnail_to_wire(thumbnail)}
+        if method == "roll.manualFrames":
+            return self._handle_roll_manual_frames(request)
+        if method == "roll.previewStrip":
+            if not self._device_open:
+                raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+            if self._motion_op_active:
+                raise BridgeError(
+                    ErrorCode.HARDWARE_LANE_BUSY,
+                    "a motion operation is still active; retry after it finishes",
+                )
+            return to_wire(self._transport.preview_strip())
         if method == "scan.start":
             return self._handle_scan_start(request, emit)
         if method == "scan.stop":
@@ -614,6 +625,40 @@ class BridgeService:
 
         threading.Thread(target=worker, daemon=True).start()
         return {"accepted": True}
+
+    # -- roll.manualFrames (Rung 4) --------------------------------------------------
+
+    def _handle_roll_manual_frames(self, request: dict) -> dict:
+        # Same NOT_CONNECTED/HARDWARE_LANE_BUSY shape as roll.setSpacingOffset
+        # (both non-motion-capable, synchronous) -- deliberately NOT gated on
+        # self._preview_material being set: manual placement's whole reason
+        # to exist is re-slicing a preview attempt that may have FAILED
+        # (never set self._preview_material at all). The transport itself
+        # raises NO_PREVIEW when no preview attempt exists on disk at all.
+        if not self._device_open:
+            raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+        if self._motion_op_active:
+            raise BridgeError(
+                ErrorCode.HARDWARE_LANE_BUSY,
+                "a motion operation is still active; retry after it finishes",
+            )
+        params = request.get("params") or {}
+        rows = [int(row) for row in _require_param(params, "rows")]
+        preview_result, thumbnails, snaps, material = self._transport.manual_frames(
+            rows
+        )
+        # manual_frames() arms a usable session exactly like a successful
+        # roll.preview does, but carries no material param of its own (the
+        # session already has one) -- scan.start's own NO_PREVIEW gate
+        # (self._preview_material) is re-armed here, from the transport's
+        # answer, instead of from this request's params.
+        self._preview_material = material
+        return {
+            "count": preview_result.count,
+            "fingerprint": preview_result.fingerprint,
+            "thumbnails": [_thumbnail_to_wire(t) for t in thumbnails],
+            "snaps": [to_wire(s) for s in snaps],
+        }
 
     # -- scan.start / scan.stop --------------------------------------------------------
 

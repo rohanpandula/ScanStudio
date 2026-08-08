@@ -145,6 +145,7 @@ class _StubTransport:
         *,
         preview_thumbnails: int = 2,
         start_scan_raises: Exception | None = None,
+        manual_frames_raises: Exception | None = None,
     ) -> None:
         self.device_open = False
         self.approved: list[int] = []
@@ -154,6 +155,9 @@ class _StubTransport:
         self.close_called = False
         self._preview_thumbnails = preview_thumbnails
         self._start_scan_raises = start_scan_raises
+        self.manual_frames_calls: list[tuple[int, ...]] = []
+        self.preview_strip_calls = 0
+        self._manual_frames_raises = manual_frames_raises
 
     def list_devices(self) -> list[domain.DeviceInfo]:
         return [_device_info()]
@@ -195,6 +199,49 @@ class _StubTransport:
             needs_approval=True,
             warnings=("manual-review-required",),
             image_path=f"/tmp/stub-preview/adjusted-slot-{slot:04d}-{offset_rows}.tif",
+        )
+
+    def manual_frames(
+        self, rows: list[int]
+    ) -> tuple[
+        domain.PreviewResult,
+        tuple[domain.Thumbnail, ...],
+        tuple[domain.BoundarySnap, ...],
+        domain.Material,
+    ]:
+        self.manual_frames_calls.append(tuple(rows))
+        if self._manual_frames_raises is not None:
+            raise self._manual_frames_raises
+        thumbnails = tuple(
+            domain.Thumbnail(
+                slot=i + 1,
+                boundary_rows=(rows[i], rows[i + 1]),
+                spacing_offset=0,
+                needs_approval=True,
+                warnings=("user-picked",),
+                image_path=f"/tmp/stub-preview/manual-slot-{i + 1:04d}.tif",
+            )
+            for i in range(len(rows) - 1)
+        )
+        snaps = (
+            domain.BoundarySnap(
+                boundary_index=0,
+                requested_row=rows[0],
+                snapped_row=rows[0],
+                evidence_run=(max(0, rows[0] - 2), rows[0] + 2),
+            ),
+        )
+        return (
+            domain.PreviewResult(count=len(thumbnails), fingerprint="stub-manual-fp"),
+            thumbnails,
+            snaps,
+            domain.Material.COLOR_NEGATIVE,
+        )
+
+    def preview_strip(self) -> domain.PreviewStrip:
+        self.preview_strip_calls += 1
+        return domain.PreviewStrip(
+            image_path="/tmp/stub-preview/strip.tif", row_count=4800, pixels_per_row=1
         )
 
     def start_scan(self, slots, recipe, output, on_progress, on_retry, on_frame, on_call=None):
@@ -761,6 +808,169 @@ def test_roll_set_spacing_offset_is_refused_while_scan_job_is_active(
     finally:
         transport.release.set()
         _wait_for(lambda: emit.has("scan.completed"))
+
+
+# -- roll.manualFrames / roll.previewStrip (Rung 4) --------------------------------
+
+
+def test_roll_manual_frames_dispatch_routes_rows_and_rearms_scan_gate(
+    tmp_path: Path,
+) -> None:
+    """Proves the dispatch shape end to end: roll.manualFrames reaches
+    transport.manual_frames() with the exact rows requested, the wire result
+    carries count/fingerprint/thumbnails/snaps, and -- since manual_frames()
+    arms a usable session without ever calling roll.preview -- a following
+    scan.start is no longer refused with NO_PREVIEW (BridgeService's
+    self._preview_material must have been re-armed from the transport's
+    returned material, not from a roll.preview request that never
+    happened)."""
+    transport = _StubTransport()
+    svc = _opened_service(tmp_path, transport)
+
+    result = svc.dispatch(
+        {
+            "id": 2,
+            "method": "roll.manualFrames",
+            "params": {"rows": [100, 300, 500]},
+        },
+        lambda *_a: None,
+    )
+
+    assert transport.manual_frames_calls == [(100, 300, 500)]
+    assert result["count"] == 2
+    assert result["fingerprint"] == "stub-manual-fp"
+    assert [t["slot"] for t in result["thumbnails"]] == [1, 2]
+    assert result["thumbnails"][0]["boundaryRows"] == [100, 300]
+    assert result["thumbnails"][0]["needsApproval"] is True
+    assert result["snaps"] == [
+        {
+            "boundaryIndex": 0,
+            "requestedRow": 100,
+            "snappedRow": 100,
+            "evidenceRun": [98, 102],
+        }
+    ]
+
+    # The real proof this armed a usable session: scan.start no longer
+    # raises NO_PREVIEW, even though roll.preview was never called this
+    # session.
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {
+                "id": 3,
+                "method": "scan.start",
+                "params": {
+                    "slots": [1],
+                    "recipe": _wire_recipe(),
+                    "output": {
+                        "destination": str(tmp_path / "out"),
+                        "filenameTemplate": "frame-####.tif",
+                    },
+                },
+            },
+            lambda *_a: None,
+        )
+    # HW_MOTION_NOT_ARMED (the latch was never armed in this test) proves
+    # scan.start got PAST its NO_PREVIEW gate -- the one thing this test is
+    # pinning -- and was refused for an unrelated, later reason instead.
+    assert excinfo.value.code is ErrorCode.HW_MOTION_NOT_ARMED
+
+
+def test_roll_manual_frames_without_open_device_is_not_connected(
+    tmp_path: Path,
+) -> None:
+    transport = _StubTransport()
+    svc = _make_service(tmp_path, transport)
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {
+                "id": 2,
+                "method": "roll.manualFrames",
+                "params": {"rows": [100, 300]},
+            },
+            lambda *_a: None,
+        )
+
+    assert excinfo.value.code is ErrorCode.NOT_CONNECTED
+    assert transport.manual_frames_calls == []
+
+
+def test_roll_manual_frames_missing_rows_is_invalid_params(tmp_path: Path) -> None:
+    transport = _StubTransport()
+    svc = _opened_service(tmp_path, transport)
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {"id": 2, "method": "roll.manualFrames", "params": {}},
+            lambda *_a: None,
+        )
+
+    assert excinfo.value.code is ErrorCode.INVALID_PARAMS
+    assert "rows" in str(excinfo.value)
+    assert transport.manual_frames_calls == []
+
+
+def test_roll_manual_frames_propagates_transport_validation_error_unmodified(
+    tmp_path: Path,
+) -> None:
+    """service.py must not truncate or reshape a validation-failure
+    BridgeError raised from the transport -- the plain-English sentence
+    manual_frames.py's own gates produce is what the operator needs to see,
+    unmodified, at the dispatch boundary."""
+    sentence = (
+        "the 1st frame you placed is about 8 mm tall (between rows 10 and "
+        "40), outside the 15-75 mm range this driver accepts for manual "
+        "placement"
+    )
+    transport = _StubTransport(
+        manual_frames_raises=BridgeError(ErrorCode.INVALID_PARAMS, sentence)
+    )
+    svc = _opened_service(tmp_path, transport)
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {
+                "id": 2,
+                "method": "roll.manualFrames",
+                "params": {"rows": [10, 40]},
+            },
+            lambda *_a: None,
+        )
+
+    assert excinfo.value.code is ErrorCode.INVALID_PARAMS
+    assert str(excinfo.value) == sentence
+
+
+def test_roll_preview_strip_dispatch_returns_wire_shape(tmp_path: Path) -> None:
+    transport = _StubTransport()
+    svc = _opened_service(tmp_path, transport)
+
+    result = svc.dispatch(
+        {"id": 2, "method": "roll.previewStrip", "params": {}}, lambda *_a: None
+    )
+
+    assert transport.preview_strip_calls == 1
+    assert result == {
+        "imagePath": "/tmp/stub-preview/strip.tif",
+        "rowCount": 4800,
+        "pixelsPerRow": 1,
+    }
+
+
+def test_roll_preview_strip_without_open_device_is_not_connected(
+    tmp_path: Path,
+) -> None:
+    transport = _StubTransport()
+    svc = _make_service(tmp_path, transport)
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {"id": 2, "method": "roll.previewStrip", "params": {}}, lambda *_a: None
+        )
+
+    assert excinfo.value.code is ErrorCode.NOT_CONNECTED
+    assert transport.preview_strip_calls == 0
 
 
 def test_roll_preview_error_telemetry_includes_message(

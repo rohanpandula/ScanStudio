@@ -1095,6 +1095,16 @@ class CaptureBatchRequest:
     expected_usb_bus: int
     expected_usb_address: int
     exposure_override_10ns: tuple[int, int, int] | None = None
+    # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the exact operator-
+    # picked boundary rows from a manual-placement preview session, carried
+    # across the process boundary so the batch child can replay
+    # manual_frames.build_manual_detection fresh against its own live re-read
+    # bytes -- never trusted as a serialized detection result (see worker.py's
+    # _derive_live_frame_selection docstring). None for an ordinary,
+    # automatically-detected session -- see Roll.scan_many, which derives
+    # this from its own reviewed session rather than accepting it from a
+    # caller.
+    manual_boundary_rows: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.frames, tuple):
@@ -3506,6 +3516,14 @@ class CaptureProcessAdapter:
                 else list(request.exposure_override_10ns)
             ),
             "frames": frames,
+            # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): same optional,
+            # always-present, nullable-array shape as exposure_override_10ns
+            # above -- see CaptureBatchRequest.manual_boundary_rows.
+            "manual_boundary_rows": (
+                None
+                if request.manual_boundary_rows is None
+                else list(request.manual_boundary_rows)
+            ),
             "parent_ack_required_after_every_frame": True,
             "release_once_after_last_frame": True,
             "reviewed_roll_fingerprint": request.reviewed_fingerprint.to_payload(),

@@ -519,6 +519,12 @@ class LiveBatchJob:
     continuation_plan_sha256: str
     job_sha256: str
     exposure_override_10ns: tuple[int, int, int] | None = None
+    # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): see
+    # capture_process.CaptureBatchRequest.manual_boundary_rows -- the exact
+    # same value, carried through load_validated_batch_job's own parse of
+    # this untrusted job JSON, for _derive_live_batch_selections to replay
+    # fresh against this call's own live re-read bytes.
+    manual_boundary_rows: tuple[int, ...] | None = None
 
     @property
     def selected_slots(self) -> tuple[int, ...]:
@@ -1863,6 +1869,7 @@ def load_validated_batch_job(
         "expected_usb_bus",
         "exposure_override_10ns",
         "frames",
+        "manual_boundary_rows",
         "reviewed_roll_fingerprint",
         "session_id",
     }
@@ -1902,6 +1909,27 @@ def load_validated_batch_job(
                 )
             parsed_ticks.append(raw)
         exposure_override_10ns = (parsed_ticks[0], parsed_ticks[1], parsed_ticks[2])
+    # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): same
+    # defense-in-depth stance as exposure_override_10ns above -- the worker
+    # subprocess trusts nothing it reads from this job file, even though
+    # Roll/CaptureBatchRequest already only ever emit rows a manual session
+    # itself produced.
+    raw_manual_boundary_rows = payload.get("manual_boundary_rows")
+    manual_boundary_rows: tuple[int, ...] | None = None
+    if raw_manual_boundary_rows is not None:
+        if not isinstance(raw_manual_boundary_rows, list) or not raw_manual_boundary_rows:
+            raise ProtocolError(
+                "batch job manual_boundary_rows must be a nonempty array of "
+                "integer preview rows"
+            )
+        parsed_rows: list[int] = []
+        for row in raw_manual_boundary_rows:
+            if isinstance(row, bool) or not isinstance(row, int):
+                raise ProtocolError(
+                    "batch job manual_boundary_rows entries must be integers"
+                )
+            parsed_rows.append(row)
+        manual_boundary_rows = tuple(parsed_rows)
     session_id = payload.get("session_id")
     if (
         not isinstance(session_id, str)
@@ -2015,6 +2043,7 @@ def load_validated_batch_job(
         continuation_plan_sha256=expected_continuation_sha256,
         job_sha256=actual_job_sha256,
         exposure_override_10ns=exposure_override_10ns,
+        manual_boundary_rows=manual_boundary_rows,
     )
 
 
@@ -6051,6 +6080,7 @@ def run_live_capture(
                                 live_sub_8e_table,
                                 batch_job.frames,
                                 reviewed_fingerprint=(batch_job.reviewed_fingerprint),
+                                manual_boundary_rows=batch_job.manual_boundary_rows,
                             )
                             live_selection = batch_selections[0]
                             journal["batch_prevalidated_frame_selections"] = [
@@ -6803,6 +6833,7 @@ def run_live_capture(
                     live_sub_8e_table,
                     batch_job.frames,
                     reviewed_fingerprint=batch_job.reviewed_fingerprint,
+                    manual_boundary_rows=batch_job.manual_boundary_rows,
                 )
                 session_journal.update(
                     {

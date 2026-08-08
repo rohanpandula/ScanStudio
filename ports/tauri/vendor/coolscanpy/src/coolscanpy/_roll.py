@@ -86,6 +86,9 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
     NikonExactBuilderEvidence,
     build_nikon_exact_builder_evidence,
 )
+from coolscanpy.protocol.ls5000_single_pass.manual_frames import (
+    MANUAL_PLACEMENT_WARNING,
+)
 from coolscanpy.protocol.ls5000_single_pass.meter import (
     EXPOSURE_MAX,
     EXPOSURE_MIN,
@@ -954,6 +957,21 @@ class Roll:
                 expected_usb_bus=topology[0],
                 expected_usb_address=topology[1],
                 exposure_override_10ns=exposure_override_10ns,
+                # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the same
+                # computation RollPreviewSession.to_json() already uses to
+                # decide whether ITS OWN provenance is a manual session's
+                # (preview_session.py) -- MANUAL_PLACEMENT_WARNING is only
+                # ever attached by manual_frames.build_manual_detection,
+                # never by the automatic detector, so this is None for
+                # every ordinary session, unchanged from before this batch
+                # gained the field.
+                manual_boundary_rows=(
+                    tuple(
+                        boundary.output_row for boundary in session.detection.boundaries
+                    )
+                    if MANUAL_PLACEMENT_WARNING in session.detection.warnings
+                    else None
+                ),
             )
             # A held session is single-use *per call*: whether this batch
             # resumes it successfully, fails, is stopped, or is ended by

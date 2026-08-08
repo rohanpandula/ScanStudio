@@ -14,15 +14,27 @@ adapter/workflow injection seams. No hardware is touched by any test here.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import struct
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import coolscanpy
 import numpy as np
 import pytest
 import tifffile
+
+from coolscanpy.protocol.ls5000_single_pass import roll_index as _roll_index_module
+from coolscanpy.protocol.ls5000_single_pass.density import (
+    DensityCalibration,
+    build_nikon_density_evidence,
+)
+from coolscanpy.protocol.ls5000_single_pass.plan import CANONICAL_PLAN_SHA256
+from coolscanpy.roll.preview_session import _preview_binding_contract
 
 from scanstudio_bridge import domain, safety, service
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
@@ -53,6 +65,7 @@ class _FakeRoll:
         thumbnails: list["coolscanpy.Thumbnail"] | None = None,
         fingerprint_sha256: str = "f" * 64,
         scan_results: dict[int, list[object]] | None = None,
+        material: "coolscanpy.Material" = coolscanpy.Material.COLOR_NEGATIVE,
     ) -> None:
         self._thumbnails = thumbnails or []
         self._fingerprint_sha256 = fingerprint_sha256
@@ -63,6 +76,19 @@ class _FakeRoll:
         self.safe_stop_calls = 0
         self.closed = False
         self._safe_stop_requested = False
+        # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md):
+        # CoolscanPyTransport.manual_frames() arms a manually-built
+        # RollPreviewSession by reaching into these exact private
+        # coolscanpy.Roll attributes directly -- no public Roll API installs
+        # an already-built session without a fresh hardware read (see that
+        # method's own comment). This fake carries the same attribute names,
+        # real types, and locking shape so that code path runs unmodified
+        # against this double, exactly as it would against a real Roll.
+        self.material = material
+        self._state_condition = threading.Condition(threading.RLock())
+        self._session: object | None = None
+        self._session_usb_topology: tuple[int, int] | None = None
+        self._approvals: dict[int, object] = {}
 
     def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
         if slots is None:
@@ -310,6 +336,238 @@ def _opened_transport(
 
 def _output(destination: Path, filename_template: str = "frame-####.tif") -> domain.OutputSpec:
     return domain.OutputSpec(destination=str(destination), filename_template=filename_template)
+
+
+# -- Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): synthetic on-disk preview ---
+# attempt. manual_frames()/preview_strip() read straight from disk
+# (attempts_root), bypassing the _FakeRoll double this file otherwise uses
+# everywhere else -- see coolscanpy_transport.py's own
+# _reconstruct_last_preview_attempt/_validated_preview_from_attempt. The
+# helpers below build one REAL, byte-valid preview attempt directory
+# (journal.json + capture-preview.bin + capture-008e.bin +
+# capture-frame-map.json). Ported byte-for-byte from coolscanpy's own test
+# fixture (coolscanpy/tests/roll/test_ls5000_roll_session.py's
+# _preview_fixture/_synthetic_index/_encode_index/_transport_table -- the
+# owner's already-proven encoding, not re-derived here), landed under a real
+# attempts_root with the CaptureMode.PREVIEW "preview-" mkdtemp prefix
+# CoolscanPyTransport's own glob expects instead of a bare test directory
+# name. The transport-table encoding (code=6*(row%18), selector=row//18) is
+# the same 42-native-units-per-row convention coolscanpy's own
+# test_manual_frames.py/test_ls5000_roll_session.py fixtures use, comfortably
+# inside build_manual_detection's 40..45 ramp-guard gate.
+
+_SYNTHETIC_DENSITY_CALIBRATION_PAYLOADS = tuple(
+    bytes.fromhex(value)
+    for value in (
+        "8c20000000040000df1a",
+        "8c20000000040000bba4",
+        "8c200000000400007fab",
+    )
+)
+_SYNTHETIC_DENSITY_CALIBRATION_NUMERATORS = (57_114, 48_036, 32_683)
+
+
+def _synthetic_density_calibration(session_id: str) -> DensityCalibration:
+    return DensityCalibration(
+        session_id=session_id,
+        numerators=_SYNTHETIC_DENSITY_CALIBRATION_NUMERATORS,
+        payload_hex=tuple(
+            payload.hex() for payload in _SYNTHETIC_DENSITY_CALIBRATION_PAYLOADS
+        ),
+        payload_sha256=tuple(
+            hashlib.sha256(payload).hexdigest()
+            for payload in _SYNTHETIC_DENSITY_CALIBRATION_PAYLOADS
+        ),
+    )
+
+
+def _encode_synthetic_index(rgb16: np.ndarray) -> bytes:
+    """Encode the compact RGB96 index rows the scanner itself would have
+    written -- byte-for-byte port of test_ls5000_roll_session.py's own
+    _encode_index."""
+    blocks = np.zeros(
+        (rgb16.shape[0] // 2, _roll_index_module.INDEX_BLOCK_WORDS),
+        dtype=np.uint16,
+    )
+    blocks[:, 0:96] = rgb16[0::2, :, 0]
+    blocks[:, 96:192] = rgb16[0::2, :, 1]
+    blocks[:, 192:288] = rgb16[0::2, :, 2]
+    blocks[:, 512:608] = rgb16[1::2, :, 0]
+    blocks[:, 608:704] = rgb16[1::2, :, 1]
+    blocks[:, 704:800] = rgb16[1::2, :, 2]
+    blocks[:, 800::2] = _roll_index_module.INDEX_TRAILER_MARK
+    blocks[:, 801::2] = np.arange(
+        _roll_index_module.INDEX_TRAILER_COUNTER0,
+        _roll_index_module.INDEX_TRAILER_COUNTER0
+        + _roll_index_module.INDEX_TRAILER_WORDS // 2,
+        dtype=np.uint16,
+    )
+    return blocks.astype(">u2", copy=False).tobytes()
+
+
+def _synthetic_preview_index(
+    *, height: int, frame_count: int = 40, content_frames: int = 40, leader: int = 128
+) -> np.ndarray:
+    """Textured cells separated by physical clear-film gaps, at the pitch=143
+    convention coolscanpy's own manual-session fixtures use -- byte-for-byte
+    port of test_ls5000_roll_session.py's own _synthetic_index."""
+    pitch = 143
+    boundaries = [leader + index * pitch for index in range(frame_count + 1)]
+    y = np.arange(height, dtype=np.int64)[:, None]
+    x = np.arange(90, dtype=np.int64)[None, :]
+    texture = (x * 173 + y * 71 + (x * y) % 997) % 7_000
+    aperture = np.empty((height, 90, 3), dtype=np.int64)
+    for channel, base in enumerate((7_000, 5_500, 4_000)):
+        aperture[:, :, channel] = base + texture * (3 - channel) // 2
+    clear_base = np.asarray((34_200, 25_500, 17_800), dtype=np.int64)
+    clear_noise = ((x * 19 + y * 13) % 301 - 150)[:, :, None]
+    aperture[: boundaries[0]] = clear_base + clear_noise[: boundaries[0]]
+    aperture[boundaries[-1] :] = clear_base + clear_noise[boundaries[-1] :]
+    for boundary in boundaries:
+        start = max(0, boundary - 3)
+        end = min(height, boundary + 3)
+        aperture[start:end] = clear_base + clear_noise[start:end]
+    if content_frames < frame_count:
+        clear_start = boundaries[content_frames]
+        aperture[clear_start:] = clear_base + clear_noise[clear_start:]
+    rgb = np.empty((height, 96, 3), dtype=np.int64)
+    rgb[:, 2:92] = aperture
+    rgb[:, :2] = np.asarray((1_300, 1_000, 700))
+    rgb[:, 92:] = np.asarray((1_100, 850, 600))
+    return rgb.clip(0, 65_535).astype(np.uint16)
+
+
+def _synthetic_transport_table(rows: int) -> bytes:
+    """42-native-units-per-row same-traversal table -- byte-for-byte port of
+    test_ls5000_roll_session.py's own _transport_table."""
+    records = bytearray()
+    for row in range(rows):
+        records.extend(struct.pack(">HH", 6 * (row % 18), row // 18))
+    total = 8 + len(records)
+    return b"\x00\x8e\x00\x00" + total.to_bytes(2, "big") + b"\x00\x00" + bytes(records)
+
+
+def _write_synthetic_preview_attempt(
+    attempts_root: Path, *, slot_capacity_hint: int = 40
+) -> Path:
+    """Write one complete, byte-valid preview attempt directory under
+    ``attempts_root`` with CoolscanPyTransport's own "preview-" mkdtemp
+    prefix -- everything manual_frames()/preview_strip()'s
+    _reconstruct_last_preview_attempt/_validated_preview_from_attempt need to
+    find and validate it, exactly as if a real roll.preview attempt had just
+    completed (this journal shape is "preview-only"/"complete"/released --
+    see preview_session.py's _validate_preview_result: both that shape and
+    the "preview-and-hold" shape a real Roll.preview() always uses today
+    validate identically). Returns the attempt directory."""
+    contract = _preview_binding_contract(slot_capacity_hint)
+    native_height = contract["native_height"]
+    decoded_height = contract["decoded_height"]
+    startup_status = contract["startup_status"]
+    preview_binding = {
+        key: value for key, value in contract.items() if key != "startup_status"
+    }
+
+    attempt = attempts_root / f"preview-{uuid.uuid4().hex}"
+    attempt.mkdir(parents=True)
+    output = attempt / "capture.bin"
+    output.write_bytes(b"")
+    preview_path = attempt / "capture-preview.bin"
+    table_path = attempt / "capture-008e.bin"
+    mapping_path = attempt / "capture-frame-map.json"
+
+    rgb = _synthetic_preview_index(height=decoded_height)
+    usable_rows = len(rgb)
+    preview = _encode_synthetic_index(rgb)
+    table = _synthetic_transport_table(usable_rows)
+    preview_path.write_bytes(preview)
+    table_path.write_bytes(table)
+
+    density_session_id = "single-reservation-roll-preview"
+    density_exposures = (71_373, 137_524, 126_126)
+    preview_sha256 = hashlib.sha256(preview).hexdigest()
+    density_evidence = build_nikon_density_evidence(
+        preview,
+        calibration=_synthetic_density_calibration(density_session_id),
+        density_f03_exposures_raw_10ns=density_exposures,
+        session_id=density_session_id,
+        capture_attempt_id=attempt.name,
+        scan_identity=f"{density_session_id}:density-97dpi:{preview_sha256}",
+        source_native_height=native_height,
+        source_height=decoded_height,
+    )
+    receipt = {
+        "status": "preview-only-complete",
+        "slot_capacity_hint": slot_capacity_hint,
+        "slot_capacity_semantics": (
+            "scanner-addressable preview slots; not an exposure count"
+        ),
+        "preview_bytes": len(preview),
+        "preview_sha256": preview_sha256,
+        "table_bytes": len(table),
+        "table_sha256": hashlib.sha256(table).hexdigest(),
+        "frame_detection": "deferred-offline",
+        "startup_table": {
+            "count": slot_capacity_hint,
+            "sha256": "a" * 64,
+            "status": startup_status,
+        },
+        "preview_binding": preview_binding,
+    }
+    mapping_path.write_text(json.dumps(receipt), encoding="utf-8")
+    journal = {
+        "status": "complete",
+        "capture_mode": "preview-only",
+        "requested_frame": None,
+        "requested_boundary_offset_rows": 0,
+        "expected_frame_count": None,
+        "expected_reads": 0,
+        "completed_reads": 0,
+        "expected_bytes": 0,
+        "completed_bytes": 0,
+        "disk_bytes": 0,
+        "unit_released": True,
+        "output": str(output.resolve()),
+        "output_sha256": hashlib.sha256(b"").hexdigest(),
+        "plan_sha256": CANONICAL_PLAN_SHA256,
+        "capture_engine_sha256": "b" * 64,
+        "scanner_identity": "Nikon LS-5000 ED 1.03",
+        "expected_usb_bus": 1,
+        "expected_usb_address": 2,
+        "actual_usb_bus": 1,
+        "actual_usb_address": 2,
+        "preview_geometry_validated_before_reads": True,
+        "preview_windows": [
+            {
+                "color_id": color,
+                "resolution": [97, 97],
+                "origin": [0, 0],
+                "size": [3_946, native_height],
+                "bit_depth": 16,
+                "density_f03_exposure_raw_10ns": exposure,
+            }
+            for color, exposure in zip((1, 2, 3), density_exposures, strict=True)
+        ],
+        "density_calibration_session_id": density_session_id,
+        "nikon_density_evidence": density_evidence.to_dict(),
+        "live_startup_0x8f": {"count": slot_capacity_hint, "sha256": "a" * 64},
+        "live_startup_0x8f_status": startup_status,
+        "live_preview_binding": preview_binding,
+        "live_index_artifacts": {
+            "mapping": str(mapping_path.resolve()),
+            "preview": str(preview_path.resolve()),
+            "table": str(table_path.resolve()),
+        },
+        "live_index_evidence": {
+            "status": "persisted-before-frame-detection",
+            "preview_bytes": len(preview),
+            "preview_sha256": preview_sha256,
+            "table_bytes": len(table),
+            "table_sha256": hashlib.sha256(table).hexdigest(),
+        },
+        "preview_only_receipt": receipt,
+    }
+    (attempt / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
+    return attempt
 
 
 # -- list_devices / open_device ----------------------------------------------------
@@ -982,6 +1240,191 @@ def test_preview_maps_base_roll_mismatch(monkeypatch: pytest.MonkeyPatch) -> Non
         transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
     assert excinfo.value.code == ErrorCode.ROLL_MISMATCH
     assert "different USB topology" in str(excinfo.value)
+
+
+def test_preview_probable_cause_survives_into_refeed_required_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rung 3 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): detect_roll_frames's
+    failure paths attach a best-effort plain-English
+    diagnostics["probable_cause"] sentence to the IndexDecodeError they raise
+    (roll_index.py). IndexDecodeError.__str__ already embeds its full
+    diagnostics dict (json.dumps) in the message, and preview()'s own
+    existing except IndexDecodeError branch already interpolates str(exc)
+    into its REFEED_REQUIRED message -- so the sentence should ride through
+    automatically, with no bridge change needed. This test pins that so a
+    future refactor of either side can't silently drop it."""
+    from coolscanpy.protocol.ls5000_single_pass.roll_index import IndexDecodeError
+
+    sentence = (
+        "this looks like half-frame film (frames about every 19 mm); this "
+        "driver expects standard 35 mm spacing"
+    )
+
+    class _ProbableCauseRoll(_FakeRoll):
+        def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
+            raise IndexDecodeError(
+                "transport anchor residual is inconsistent with one affine "
+                "preview traversal (MAE 4.447 rows, max 11.241 rows)",
+                error_id="gap-lattice-anchor",
+                diagnostics={"probable_cause": sentence},
+            )
+
+    transport, _device = _opened_transport(monkeypatch, _ProbableCauseRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert excinfo.value.code == ErrorCode.REFEED_REQUIRED
+    message = str(excinfo.value)
+    assert sentence in message
+    assert "MAE 4.447" in message
+
+
+# -- roll.manualFrames / roll.previewStrip (Rung 4) --------------------------------
+
+
+def test_manual_frames_without_any_preview_attempt_is_no_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """manual_frames() is usable only after at least one roll.preview
+    attempt (successful or refused) exists on disk -- before that, self._roll
+    and self.attempts_root are both still None."""
+    transport, _device = _opened_transport(monkeypatch, _FakeRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([128, 271, 414])
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
+
+
+def test_preview_strip_without_any_preview_attempt_is_no_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _device = _opened_transport(monkeypatch, _FakeRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview_strip()
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
+
+
+def _transport_with_synthetic_preview_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[CoolscanPyTransport, _FakeRoll, Path]:
+    """An opened transport whose attempts_root already holds one real,
+    byte-valid preview attempt on disk -- the "completed-but-refused (or
+    completed) preview attempt" manual_frames()/preview_strip() require.
+    Runs one (successful, contents-irrelevant) fake preview() first purely
+    to let CoolscanPyTransport.preview()'s own existing code create
+    self._roll/self.attempts_root exactly as it would in production; the
+    attempt this test actually reads back is a separately-written synthetic
+    one, matching how a real refused preview would leave its own evidence
+    on disk without ever producing a _FakeRoll-shaped in-memory session."""
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert transport.attempts_root is not None
+    attempt_dir = _write_synthetic_preview_attempt(transport.attempts_root)
+    return transport, roll, attempt_dir
+
+
+def test_manual_frames_happy_path_arms_session_for_approve_and_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch
+    )
+
+    result, thumbnails, snaps, material = transport.manual_frames([128, 271, 414])
+
+    assert material is domain.Material.COLOR_NEGATIVE
+    assert result.count == 2
+    assert len(thumbnails) == 2
+    assert [t.slot for t in thumbnails] == [1, 2]
+    assert thumbnails[0].boundary_rows == (128, 271)
+    assert thumbnails[1].boundary_rows == (271, 414)
+    assert thumbnails[0].needs_approval is True
+    assert "user-picked" in thumbnails[0].warnings
+    assert Path(thumbnails[0].image_path).is_file()
+    # Picked rows land exactly on the synthetic raster's own clear-film gap
+    # centers -- snap assist finds a zero-distance match at every boundary,
+    # so nothing moves and no snap note is produced.
+    assert snaps == ()
+
+    # The transport's own bookkeeping is re-armed exactly like a successful
+    # preview() leaves it.
+    assert transport._material is domain.Material.COLOR_NEGATIVE
+    assert transport._preview_established is True
+
+    # The real proof of "armed exactly like a successful preview": the SAME
+    # coolscanpy.Roll instance's session/approvals state now reflects the
+    # manual session, and the EXISTING, unmodified approve()/
+    # set_spacing_offset() methods keep working against it unchanged.
+    assert roll._session is not None
+    assert len(roll._session.slots) == 2
+    assert roll._approvals == {}
+    transport.approve(1)
+    assert roll.approve_calls == [1]
+    # _FakeRoll.set_spacing_offset resolves against its OWN _thumbnails list
+    # (slot 1, from the fixture's setup preview() call above) -- unrelated to
+    # the manual session's own slot numbering, but exactly enough to prove
+    # set_spacing_offset() itself still runs unmodified, end to end, after
+    # manual_frames() armed the roll.
+    adjusted = transport.set_spacing_offset(1, 0)
+    assert adjusted.slot == 1
+    assert roll.spacing_offset_calls == [(1, 0)]
+
+
+def test_manual_frames_validation_failure_maps_to_invalid_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """manual_frames.py's own plain-English physical-frame-height gate (15-75
+    mm) refuses a too-short pick -- surfaced as INVALID_PARAMS (the operator's
+    rows, not a hardware fault), with the exact sentence preserved."""
+    transport, _roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch
+    )
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([128, 140])
+
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    message = str(excinfo.value)
+    assert "outside the 15-75 mm range" in message
+    assert "manual placement" in message
+
+
+def test_manual_frames_structural_failure_maps_to_invalid_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single boundary row (0 frames) fails manual_frames.py's own
+    structural gate before any physical check runs -- also INVALID_PARAMS."""
+    transport, _roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch
+    )
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.manual_frames([128])
+
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert "at least 2 boundary rows" in str(excinfo.value)
+
+
+def test_preview_strip_happy_path_renders_whole_raster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch
+    )
+
+    strip = transport.preview_strip()
+
+    assert strip.row_count == 6_104  # the 40-record contract's decoded_height
+    assert strip.pixels_per_row == 1
+    assert Path(strip.image_path).is_file()
+    with tifffile.TiffFile(strip.image_path) as handle:
+        image = handle.asarray()
+    # _normalize_preview_tile's swapaxes(0,1): the raster's row axis (what
+    # roll.manualFrames's rows address) becomes the image's WIDTH axis.
+    assert image.shape == (96, 6_104, 3)
 
 
 def test_start_scan_maps_base_roll_mismatch(

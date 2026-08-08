@@ -74,6 +74,34 @@ class Transport(Protocol):
         self, slot: int, offset_rows: int
     ) -> domain.Thumbnail: ...
 
+    def manual_frames(
+        self, rows: list[int]
+    ) -> tuple[
+        domain.PreviewResult,
+        tuple[domain.Thumbnail, ...],
+        tuple[domain.BoundarySnap, ...],
+        domain.Material,
+    ]:
+        """Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): re-slice the
+        last completed preview attempt's already-decoded raster at
+        operator-picked boundary rows -- no hardware call, no film
+        movement. Usable only when a preview attempt (successful or
+        refused) already exists this session; raises `NO_PREVIEW`
+        otherwise. Leaves roll/session state armed exactly like a
+        successful `preview()` -- the returned `domain.Material` is what
+        the caller must re-arm `scan.start`'s own NO_PREVIEW gate with,
+        since this call carries no `material` param of its own (the
+        session already has one)."""
+        ...
+
+    def preview_strip(self) -> domain.PreviewStrip:
+        """Rung 4: render the last completed preview attempt's whole
+        captured raster to one image, for a manual-placement editor to
+        draw boundary lines on before any row has been picked. Same
+        precondition and NO_PREVIEW failure as `manual_frames`; no hardware
+        call."""
+        ...
+
     def start_scan(
         self,
         slots: list[int],
