@@ -2202,8 +2202,38 @@ pub fn render_derivative_from_archive_with_processing(
             }
             (positive, None)
         }
-        domain::C41RenderTarget::Nikonlook =>
-            render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?,
+        domain::C41RenderTarget::Nikonlook => {
+            let cool_colors = &recipes.c41_render.cool_colors;
+            let exact_nikon_requested = [
+                &cool_colors.checkout_path,
+                &cool_colors.builder_red_path,
+                &cool_colors.builder_green_path,
+                &cool_colors.builder_blue_path,
+            ]
+            .iter()
+            .any(|path| path.as_ref().is_some_and(|path| !path.is_empty()));
+            if exact_nikon_requested {
+                if processing.film_process != domain::FilmProcess::C41ColorNegative {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::InvalidParams,
+                        "exact Nikon replay only supports C-41 color-negative scans".to_string(),
+                    ));
+                }
+                let (positive, replay_width, replay_height) =
+                    render_nikon_oem_replay(archive_rgb_path, cool_colors)?;
+                if replay_width != width || replay_height != height {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::Internal,
+                        format!(
+                            "exact Nikon replay changed the frame dimensions from {width}x{height} to {replay_width}x{replay_height}"
+                        ),
+                    ));
+                }
+                (positive, None)
+            } else {
+                render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?
+            }
+        }
         target => {
             return Err(domain::EngineError::new(
                 protocol::ErrorCode::InvalidParams,

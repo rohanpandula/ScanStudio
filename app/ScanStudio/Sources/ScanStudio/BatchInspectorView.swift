@@ -330,22 +330,21 @@ struct BatchInspectorView: View {
                     }
                 }
                 if sessionModel.scanFilmProcess == .c41ColorNegative {
-                    InspectorSettingRow(label: "C-41 renderer") {
-                        Picker("C-41 renderer", selection: c41RenderGroupBinding) {
-                            Text("ScanStudio NikonLook").tag(C41RenderTarget.nikonlook)
-                            Text("XXX (Testing)").tag(C41RenderTarget.noritsuLs600)
+                        InspectorSettingRow(label: "C-41 renderer") {
+                            Picker("C-41 renderer", selection: c41RenderGroupBinding) {
+                                Text("ScanStudio NikonLook").tag(C41RenderTarget.nikonlook)
+                                Text("XXX (Testing)").tag(C41RenderTarget.noritsuLs600)
                         }
                     }
                     if sessionModel.c41RenderTarget != .nikonlook {
                         InspectorSettingRow(label: "Testing pipeline") {
                             Picker("Testing pipeline", selection: c41RenderTargetBinding) {
-                                Text("Nikon OEM replay").tag(C41RenderTarget.nikonOemReplay)
                                 Text("Noritsu LS-600 style").tag(C41RenderTarget.noritsuLs600)
                                 Text("FlexColor clean room").tag(C41RenderTarget.flexcolorCleanroom)
                             }
                         }
                     }
-                    if sessionModel.c41RenderTarget == .nikonOemReplay {
+                    if sessionModel.c41RenderTarget == .nikonlook {
                         externalDirectoryField(
                             label: "Cool Colors folder",
                             path: coolColorsCheckoutPathBinding,
@@ -354,7 +353,7 @@ struct BatchInspectorView: View {
                         externalPathField(label: "Builder LUT — red", path: coolColorsBuilderRedPathBinding, prompt: "Choose the matching red builder LUT", types: ["npy"])
                         externalPathField(label: "Builder LUT — green", path: coolColorsBuilderGreenPathBinding, prompt: "Choose the matching green builder LUT", types: ["npy"])
                         externalPathField(label: "Builder LUT — blue", path: coolColorsBuilderBluePathBinding, prompt: "Choose the matching blue builder LUT", types: ["npy"])
-                        Text("Uses the builder LUTs made for this exact scan. Everything stays in your local folders.")
+                        Text("Optional exact Nikon source: when all three matching builder LUTs are supplied, ScanStudio uses the Cool Colors Nikon replay. Otherwise it uses the built-in NikonLook renderer.")
                             .font(.system(size: 10))
                             .foregroundStyle(Color.scanStudioSecondaryText)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1156,16 +1155,21 @@ struct BatchInspectorView: View {
     }
 
     /// The UI intentionally presents all non-Nikon experimental paths under
-    /// one clearly marked target. Selecting it defaults to the Nikon replay;
+    /// one clearly marked target. Selecting it defaults to the Noritsu style;
     /// the secondary picker chooses the concrete testing pipeline.
     private var c41RenderGroupBinding: Binding<C41RenderTarget> {
         Binding(
-            get: { sessionModel.c41RenderTarget == .nikonlook ? .nikonlook : .nikonOemReplay },
+            get: {
+                switch sessionModel.c41RenderTarget {
+                case .nikonlook, .nikonOemReplay: .nikonlook
+                case .noritsuLs600, .flexcolorCleanroom: .noritsuLs600
+                }
+            },
             set: { target in
                 if target == .nikonlook {
                     sessionModel.c41RenderTarget = .nikonlook
                 } else if sessionModel.c41RenderTarget == .nikonlook {
-                    sessionModel.c41RenderTarget = .nikonOemReplay
+                    sessionModel.c41RenderTarget = .noritsuLs600
                 }
             }
         )
