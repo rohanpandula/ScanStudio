@@ -332,15 +332,15 @@ struct BatchInspectorView: View {
                 if sessionModel.scanFilmProcess == .c41ColorNegative {
                         InspectorSettingRow(label: "C-41 renderer") {
                             Picker("C-41 renderer", selection: c41RenderGroupBinding) {
-                                Text("ScanStudio NikonLook").tag(C41RenderTarget.nikonlook)
+                                Text("Nikon Scan").tag(C41RenderTarget.nikonlook)
                                 Text("XXX (Testing)").tag(C41RenderTarget.noritsuLs600)
                         }
                     }
                     if sessionModel.c41RenderTarget != .nikonlook {
                         InspectorSettingRow(label: "Testing pipeline") {
                             Picker("Testing pipeline", selection: c41RenderTargetBinding) {
-                                Text("Noritsu Lab Mode").tag(C41RenderTarget.noritsuLs600)
-                                Text("FlexColor clean room").tag(C41RenderTarget.flexcolorCleanroom)
+                                Text("Noritsu Lab").tag(C41RenderTarget.noritsuLs600)
+                                Text("Flextight Lab").tag(C41RenderTarget.flexcolorCleanroom)
                             }
                         }
                     }
