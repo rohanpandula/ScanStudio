@@ -1844,6 +1844,49 @@ fn render_nikon_oem_replay(
     Ok((pixels, image.width, image.height))
 }
 
+fn exact_nikon_requested(inputs: &domain::CoolColorsInputs) -> bool {
+    [
+        &inputs.checkout_path,
+        &inputs.builder_red_path,
+        &inputs.builder_green_path,
+        &inputs.builder_blue_path,
+    ]
+    .iter()
+    .any(|path| path.as_ref().is_some_and(|path| !path.is_empty()))
+}
+
+/// Noritsu's recovered output curve is deliberately strong on its own. Lab
+/// operators normally temper it with exposure and print adjustments, so this
+/// export mode mixes only a restrained portion over the Nikon-positive base.
+/// That retains the warmer, denser Noritsu character without crushing the
+/// frame into the high-contrast display look.
+const NORITSU_LAB_CURVE: [f64; 20] = [
+    0.0, 76.0 / 65535.0, 203.0 / 65535.0, 445.0 / 65535.0, 880.0 / 65535.0,
+    1583.0 / 65535.0, 2633.0 / 65535.0, 4108.0 / 65535.0, 6187.0 / 65535.0,
+    9214.0 / 65535.0, 13545.0 / 65535.0, 19538.0 / 65535.0, 27390.0 / 65535.0,
+    36346.0 / 65535.0, 45295.0 / 65535.0, 53128.0 / 65535.0, 58736.0 / 65535.0,
+    61539.0 / 65535.0, 63657.0 / 65535.0, 1.0,
+];
+const NORITSU_LAB_STRENGTH: f64 = 0.30;
+
+fn apply_noritsu_lab_mode(pixels: Vec<[f64; 3]>) -> Vec<[f64; 3]> {
+    pixels
+        .into_iter()
+        .map(|pixel| {
+            pixel.map(|value| {
+                let clamped = value.clamp(0.0, 1.0);
+                let position = clamped * (NORITSU_LAB_CURVE.len() - 1) as f64;
+                let left = position.floor() as usize;
+                let right = (left + 1).min(NORITSU_LAB_CURVE.len() - 1);
+                let mapped = NORITSU_LAB_CURVE[left]
+                    + (NORITSU_LAB_CURVE[right] - NORITSU_LAB_CURVE[left])
+                        * (position - left as f64);
+                value * (1.0 - NORITSU_LAB_STRENGTH) + mapped * NORITSU_LAB_STRENGTH
+            })
+        })
+        .collect()
+}
+
 /// Conservative RGB-only, classical-CV cleanup for isolated bright/dark B&W
 /// dust impulses. Runs after B&W inversion on derivatives only; archive pixels
 /// are never passed here. A low-variance 5×5 outer ring supplies the local
@@ -2204,15 +2247,7 @@ pub fn render_derivative_from_archive_with_processing(
         }
         domain::C41RenderTarget::Nikonlook => {
             let cool_colors = &recipes.c41_render.cool_colors;
-            let exact_nikon_requested = [
-                &cool_colors.checkout_path,
-                &cool_colors.builder_red_path,
-                &cool_colors.builder_green_path,
-                &cool_colors.builder_blue_path,
-            ]
-            .iter()
-            .any(|path| path.as_ref().is_some_and(|path| !path.is_empty()));
-            if exact_nikon_requested {
+            if exact_nikon_requested(cool_colors) {
                 if processing.film_process != domain::FilmProcess::C41ColorNegative {
                     return Err(domain::EngineError::new(
                         protocol::ErrorCode::InvalidParams,
@@ -2234,10 +2269,33 @@ pub fn render_derivative_from_archive_with_processing(
                 render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?
             }
         }
+        domain::C41RenderTarget::NoritsuLs600 => {
+            let cool_colors = &recipes.c41_render.cool_colors;
+            let (nikon, provenance) = if exact_nikon_requested(cool_colors) {
+                if processing.film_process != domain::FilmProcess::C41ColorNegative {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::InvalidParams,
+                        "Noritsu Lab Mode only supports C-41 color-negative scans".to_string(),
+                    ));
+                }
+                let (positive, replay_width, replay_height) =
+                    render_nikon_oem_replay(archive_rgb_path, cool_colors)?;
+                if replay_width != width || replay_height != height {
+                    return Err(domain::EngineError::new(
+                        protocol::ErrorCode::Internal,
+                        "exact Nikon replay changed the frame dimensions before Noritsu Lab Mode".to_string(),
+                    ));
+                }
+                (positive, None)
+            } else {
+                render_positive(processing.film_process, &raw_linear, width as usize, exposure_10ns)?
+            };
+            (apply_noritsu_lab_mode(nikon), provenance)
+        }
         target => {
             return Err(domain::EngineError::new(
                 protocol::ErrorCode::InvalidParams,
-                format!("XXX (Testing) {target:?} export is not wired yet; choose Nikon OEM replay or ScanStudio NikonLook"),
+                format!("XXX (Testing) {target:?} export is not wired yet; choose Noritsu Lab Mode or ScanStudio NikonLook"),
             ));
         }
     };

@@ -339,7 +339,7 @@ struct BatchInspectorView: View {
                     if sessionModel.c41RenderTarget != .nikonlook {
                         InspectorSettingRow(label: "Testing pipeline") {
                             Picker("Testing pipeline", selection: c41RenderTargetBinding) {
-                                Text("Noritsu LS-600 style").tag(C41RenderTarget.noritsuLs600)
+                                Text("Noritsu Lab Mode").tag(C41RenderTarget.noritsuLs600)
                                 Text("FlexColor clean room").tag(C41RenderTarget.flexcolorCleanroom)
                             }
                         }
