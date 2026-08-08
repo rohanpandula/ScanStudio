@@ -1792,3 +1792,30 @@ def test_healthy_captures_report_no_housekeeping_suffix() -> None:
     _decoded, _known, report = roll.decode_full_index_bytes(stream, geometry)
 
     assert report["housekeeping_suffix_start"] is None
+
+
+def test_two_sided_parity_swap_is_refused_as_a_framing_slip() -> None:
+    """Post-release adversarial review 2026-08-08, C2: BOTH parities
+    swapping onto each other's record at one point is the signature of a
+    one-row slip in the device's row generator -- every subsequent row
+    lands on the opposite parity, displacing all later frames by one index
+    row. The one-sided power-on collapse stays accepted; the two-sided
+    swap must refuse exactly as it did before the collapse acceptance."""
+
+    rgb = np.arange(20 * 96 * 3, dtype=np.uint16).reshape(20, 96, 3)
+    rows = (
+        np.frombuffer(_encode_index(rgb), dtype=">u2")
+        .copy()
+        .reshape(-1, roll.INDEX_ROW_WORDS)
+    )
+    even_record = rows[0, roll.INDEX_RGB_WORDS_PER_ROW :].copy()
+    odd_record = rows[1, roll.INDEX_RGB_WORDS_PER_ROW :].copy()
+    for row in range(13, len(rows)):
+        rows[row, roll.INDEX_RGB_WORDS_PER_ROW :] = (
+            odd_record if row % 2 == 0 else even_record
+        )
+    stream = rows.astype(">u2", copy=False).tobytes()
+    geometry = roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, len(stream))
+
+    with pytest.raises(roll.IndexDecodeError, match="framing mismatch"):
+        roll.decode_full_index_bytes(stream, geometry)

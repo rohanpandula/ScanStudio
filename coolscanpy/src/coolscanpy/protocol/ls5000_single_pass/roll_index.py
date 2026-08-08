@@ -548,14 +548,18 @@ def _validate_full_index_rows(rows: np.ndarray, usable_rows: int) -> dict:
     }
     housekeeping_suffix_start: int | None = None
     final_housekeeping = dict(parity_housekeeping)
+    parity_is_stable = {}
+    parity_first_bad = {}
     for parity, expected in parity_housekeeping.items():
         actual = prefix[parity::2, INDEX_RGB_WORDS_PER_ROW:]
-        if len(actual) == 0:
+        matches = np.all(actual == expected, axis=1) if len(actual) else np.ones(0, bool)
+        parity_is_stable[parity] = bool(matches.all())
+        if not parity_is_stable[parity]:
+            parity_first_bad[parity] = int(np.flatnonzero(~matches)[0])
+    for parity, expected in parity_housekeeping.items():
+        if parity_is_stable.get(parity, True):
             continue
-        matches = np.all(actual == expected, axis=1)
-        if bool(matches.all()):
-            continue
-        local = int(np.flatnonzero(~matches)[0])
+        local = parity_first_bad[parity]
         row = parity + 2 * local
         # Power-on housekeeping collapse (first live observation 2026-08-08,
         # attempt preview-g7w8t49z, the first preview after a scanner power
@@ -564,14 +568,23 @@ def _validate_full_index_rows(rows: np.ndarray, usable_rows: int) -> dict:
         # film's trailing edge -- the odd parity's housekeeping record
         # collapses into the OTHER parity's own record and stays there.
         # Accepted only in exactly that shape, fail-closed on everything
-        # else: at most one transition per parity, and the entire remainder
-        # must byte-equal the other parity's template from this same
-        # capture -- self-referential, no magic constants, so arbitrary
-        # corruption (which cannot reproduce the other parity's exact
-        # 224-word record) still refuses with today's message.
+        # else: EXACTLY ONE parity may transition, the entire remainder must
+        # byte-equal the other parity's template from this same capture, and
+        # the other parity must itself be stable across every usable row.
+        # The two-sided version of this pattern -- both parities swapping at
+        # one point -- is precisely what a one-row slip in the device's row
+        # generator produces (every later row lands on the opposite parity),
+        # and accepting it would silently misframe every frame after the
+        # slip by one index row (2026-08-08 post-release adversarial review,
+        # C2). One-sided-only keeps the live power-on shape and restores the
+        # pre-change refusal for the slip signature.
         other = parity_housekeeping.get(1 - parity)
-        suffix = actual[local:]
-        if other is not None and bool(np.all(suffix == other)):
+        suffix = prefix[parity::2, INDEX_RGB_WORDS_PER_ROW:][local:]
+        if (
+            other is not None
+            and parity_is_stable.get(1 - parity, False)
+            and bool(np.all(suffix == other))
+        ):
             housekeeping_suffix_start = row
             final_housekeeping[parity] = other.copy()
             continue
