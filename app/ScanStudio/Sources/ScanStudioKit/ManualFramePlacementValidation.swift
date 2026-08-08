@@ -8,23 +8,15 @@ import Foundation
 /// `MINIMUM_MANUAL_FRAME_HEIGHT_ROWS = 56`,
 /// `MANUAL_FRAME_HEIGHT_MM_PER_ROW = 0.267`) plus one deliberate
 /// tightening on the CEILING (adversarial review S7b, 2026-08-08):
-/// `manual_frames.py`'s own placement gate still accepts up to 280 rows
-/// (~75mm), but that is not the scanner's real limit for a frame that must
-/// actually be *fine-scanned* afterward -- the fixed single-pass fine
-/// capture window is `FINE_NATIVE_HEIGHT = 5_959` native pixels
-/// (`worker.py`), which divided by the same 40-45 native-units-per-row
-/// transport pitch this driver uses everywhere else (`MINIMUM_TRANSPORT_
-/// SCALE`/`MAXIMUM_TRANSPORT_SCALE`) lands at roughly 132-149 preview rows
-/// -- ~145 rows at the middle of that range. A placement between 145 and
-/// 280 rows would pass `manual_frames.py`'s own preview-time gate today
-/// but risks failing or clipping later at actual fine-scan capture, since
-/// nothing in that gate cross-checks the fine-scan window at all. This
-/// type's ceiling is therefore the tighter, hardware-grounded one so the
-/// UI never lets an operator build a placement the scanner cannot actually
-/// capture in one pass -- strictly more conservative than the server's own
-/// (not yet tightened) gate, so every placement this validator accepts
-/// also passes the server's wider one; nothing this changes could newly
-/// diverge client and server.
+/// the driver's `manual_frames.py` enforces the same ceiling as
+/// `FINE_CAPTURE_WINDOW_ROWS = 145`: the fixed single-pass fine capture
+/// window is `FINE_NATIVE_HEIGHT = 5_959` native pixels (`worker.py`)
+/// over the validated preview pitch of 41, exactly 145 preview rows.
+/// Client and server are in deliberate lockstep at 145 (the driver's gate
+/// was tightened the same night this validator was written -- both sides
+/// refuse a frame the scanner cannot capture in one pass), so every
+/// placement this validator accepts also passes the server's gate, and a
+/// placement it refuses would have been refused there too.
 ///
 /// This is a UX nicety, never the authority: the server still validates
 /// every submitted `rows` array independently -- including the

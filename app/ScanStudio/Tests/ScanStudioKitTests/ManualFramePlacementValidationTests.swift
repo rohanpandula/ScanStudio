@@ -81,8 +81,8 @@ struct ManualFramePlacementValidationTests {
     @Test("a placement between the new 145-row ceiling and the driver's own wider 280-row gate is refused client-side")
     func placementBetweenNewAndServerCeilingIsRefused() {
         // S7b's whole point: this client must refuse something
-        // manual_frames.py's own (not yet tightened) server gate would
-        // still accept, so the editor never lets an operator build a
+        // both client and driver refuse past 145 rows (in lockstep since
+        // the same-night driver tightening); this pins the client half.
         // placement the scanner cannot actually fine-scan in one pass.
         #expect(ManualFramePlacementValidation.maximumFrameHeightRows < 280)
         let reason = ManualFramePlacementValidation.blockingReason(for: [0, 200])

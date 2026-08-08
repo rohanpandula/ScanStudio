@@ -446,9 +446,16 @@ class MockTransport:
                 ErrorCode.NO_PREVIEW,
                 "roll.previewStrip requires a completed roll.preview attempt first",
             )
-        row_count = self._slot_count * 1200
+        # The wire contract promises the image's width axis carries exactly
+        # row_count columns at pixels_per_row=1 (the real transport writes
+        # the raster unresized). The mock keeps the file small by capping
+        # the synthetic strip, so its REPORTED row_count is the written
+        # width -- an honest miniature, never a contradiction the editor's
+        # row-to-pixel mapping would silently mis-scale on (2026-08-08
+        # second-opinion review, finding 2).
+        row_count = min(self._slot_count * 1200, 4_096)
         tile_path = self._preview_dir / f"strip-{uuid.uuid4().hex}.tif"
-        strip = np.zeros((_SYNTHETIC_PREVIEW_WIDTH, min(row_count, 4096), 3), dtype=np.uint8)
+        strip = np.zeros((_SYNTHETIC_PREVIEW_WIDTH, row_count, 3), dtype=np.uint8)
         tifffile.imwrite(tile_path, strip, photometric="rgb")
         return domain.PreviewStrip(
             image_path=str(tile_path), row_count=row_count, pixels_per_row=1

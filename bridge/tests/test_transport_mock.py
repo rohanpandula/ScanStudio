@@ -788,6 +788,10 @@ def test_preview_strip_happy_path_returns_row_count_and_image() -> None:
 
     strip = transport.preview_strip()
 
-    assert strip.row_count == 4 * 1200
+    assert strip.row_count == min(4 * 1200, 4_096)  # honest cap: width == rows
+    import tifffile as _tifffile
+
+    written = _tifffile.imread(strip.image_path)
+    assert written.shape[1] == strip.row_count  # width axis == reported rows
     assert strip.pixels_per_row == 1
     assert Path(strip.image_path).is_file()

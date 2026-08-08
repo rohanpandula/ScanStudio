@@ -398,7 +398,12 @@ struct ManualFramePlacementView: View {
     private func row(atX x: CGFloat) -> Int {
         guard hasRealRaster else { return 0 }
         let fraction = min(max(x / renderedWidth, 0), 1)
-        return Int((fraction * CGFloat(rasterRows)).rounded())
+        // Clamp to the last valid row: the wire contract (and the driver's
+        // own in-raster gate) is 0..rowCount-1, and a click at the strip's
+        // far-right edge would otherwise round to rowCount itself and be
+        // refused server-side after Confirm (2026-08-08 second-opinion
+        // review, finding 4).
+        return min(Int((fraction * CGFloat(rasterRows)).rounded()), rasterRows - 1)
     }
 
     private func addBoundary(atX x: CGFloat) {
