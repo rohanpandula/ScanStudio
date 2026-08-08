@@ -279,6 +279,50 @@ pub enum OutputColorProfile {
     ProPhotoRgb,
 }
 
+/// The C-41 renderer used for regenerable positive and preview derivatives.
+/// The archive always retains the untouched scanner RGB master.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum C41RenderTarget {
+    #[default]
+    Nikonlook,
+    NoritsuLs600,
+    FlexcolorCleanroom,
+}
+
+/// Optional paths to user-owned FlexColor calibration inputs.  These are
+/// deliberately paths, never embedded profile/LUT/ICC bytes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FlexcolorInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_setting_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lut_table_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_icc_path: Option<String>,
+}
+
+/// Selects the C-41 derivative renderer and, for the clean-room FlexColor
+/// path, identifies the operator-owned inputs it may read.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct C41RenderRecipe {
+    #[serde(default)]
+    pub target: C41RenderTarget,
+    #[serde(default)]
+    pub flexcolor: FlexcolorInputs,
+}
+
+impl Default for C41RenderRecipe {
+    fn default() -> Self {
+        Self {
+            target: C41RenderTarget::Nikonlook,
+            flexcolor: FlexcolorInputs::default(),
+        }
+    }
+}
+
 fn default_archive_filename_template() -> String {
     "ScanStudio#".to_string()
 }
@@ -465,6 +509,10 @@ pub struct OutputRecipe {
     /// keeps older projects and clients uncropped.
     #[serde(default)]
     pub auto_crop: bool,
+    /// C-41 target for regenerable positive/preview exports. Missing keys
+    /// preserve the historic nikonlook output of existing projects.
+    #[serde(default)]
+    pub c41_render: C41RenderRecipe,
 }
 
 impl Default for OutputRecipe {
@@ -474,6 +522,7 @@ impl Default for OutputRecipe {
             positive: PositiveRecipe::default(),
             preview: PreviewRecipe::default(),
             auto_crop: false,
+            c41_render: C41RenderRecipe::default(),
         }
     }
 }
@@ -1224,6 +1273,7 @@ mod tests {
     fn output_recipe_round_trips() {
         round_trip(&OutputRecipe {
             auto_crop: false,
+            c41_render: C41RenderRecipe::default(),
             archive: ArchiveRecipe {
                 enabled: true,
                 filename_template: "Archive_####".into(),

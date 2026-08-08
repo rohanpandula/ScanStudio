@@ -1,6 +1,7 @@
 import AppKit
 import ScanStudioKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct BatchInspectorView: View {
     @Environment(SessionModel.self) private var sessionModel
@@ -326,6 +327,46 @@ struct BatchInspectorView: View {
                 InspectorSettingRow(label: "Color setting") {
                     Picker("Color setting", selection: positiveColorProfileBinding) {
                         Text("Current engine default").tag(OutputColorProfile.adobeRgb1998)
+                    }
+                }
+                if sessionModel.scanFilmProcess == .c41ColorNegative {
+                    InspectorSettingRow(label: "C-41 renderer") {
+                        Picker("C-41 renderer", selection: c41RenderGroupBinding) {
+                            Text("ScanStudio NikonLook").tag(C41RenderTarget.nikonlook)
+                            Text("XXX (Testing)").tag(C41RenderTarget.noritsuLs600)
+                        }
+                    }
+                    if sessionModel.c41RenderTarget != .nikonlook {
+                        InspectorSettingRow(label: "Testing pipeline") {
+                            Picker("Testing pipeline", selection: c41RenderTargetBinding) {
+                                Text("Noritsu LS-600 style").tag(C41RenderTarget.noritsuLs600)
+                                Text("FlexColor clean room").tag(C41RenderTarget.flexcolorCleanroom)
+                            }
+                        }
+                    }
+                    if sessionModel.c41RenderTarget == .flexcolorCleanroom {
+                        externalPathField(
+                            label: "Film recipe",
+                            path: flexColorImageSettingPathBinding,
+                            prompt: "Choose ImageSetting Recipe",
+                            types: ["xml", "plist"]
+                        )
+                        externalPathField(
+                            label: "LUTTable",
+                            path: flexColorLutTablePathBinding,
+                            prompt: "Choose LUTTable Profile",
+                            types: ["xml", "plist"]
+                        )
+                        externalPathField(
+                            label: "Input ICC",
+                            path: flexColorInputIccPathBinding,
+                            prompt: "Choose Flextight Input ICC",
+                            types: ["icc", "icm"]
+                        )
+                        Text("Uses your external FlexColor files; their contents are never copied into the project.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.scanStudioSecondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 Text(positiveOutputExplanation)
@@ -904,6 +945,40 @@ struct BatchInspectorView: View {
     }
 
     @ViewBuilder
+    private func externalPathField(label: String, path: Binding<String>, prompt: String, types: [String]) -> some View {
+        InspectorSettingRow(label: label) {
+            HStack(spacing: 6) {
+                Text(path.wrappedValue.isEmpty ? "Not selected" : URL(fileURLWithPath: path.wrappedValue).lastPathComponent)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(path.wrappedValue.isEmpty ? Color.scanStudioSecondaryText : .primary)
+                Spacer(minLength: 0)
+                Button("Choose…") {
+                    chooseExternalFile(prompt: prompt, types: types, path: path)
+                }
+                .controlSize(.small)
+                if !path.wrappedValue.isEmpty {
+                    Button("Clear") { path.wrappedValue = "" }
+                        .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private func chooseExternalFile(prompt: String, types: [String], path: Binding<String>) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = types.compactMap { UTType(filenameExtension: $0) }
+        panel.prompt = "Use This File"
+        panel.message = prompt
+        if panel.runModal() == .OK, let url = panel.url {
+            path.wrappedValue = url.path
+        }
+    }
+
+    @ViewBuilder
     private func outputDisclosure<Content: View>(
         title: String,
         isEnabled: Binding<Bool>,
@@ -1028,6 +1103,38 @@ struct BatchInspectorView: View {
 
     private var positiveColorProfileBinding: Binding<OutputColorProfile> {
         Binding(get: { sessionModel.positiveColorProfile }, set: { sessionModel.positiveColorProfile = $0 })
+    }
+
+    private var c41RenderTargetBinding: Binding<C41RenderTarget> {
+        Binding(get: { sessionModel.c41RenderTarget }, set: { sessionModel.c41RenderTarget = $0 })
+    }
+
+    /// The UI intentionally presents all non-Nikon experimental paths under
+    /// one clearly marked target. Selecting it defaults to the Noritsu path;
+    /// the secondary picker chooses the concrete testing pipeline.
+    private var c41RenderGroupBinding: Binding<C41RenderTarget> {
+        Binding(
+            get: { sessionModel.c41RenderTarget == .nikonlook ? .nikonlook : .noritsuLs600 },
+            set: { target in
+                if target == .nikonlook {
+                    sessionModel.c41RenderTarget = .nikonlook
+                } else if sessionModel.c41RenderTarget == .nikonlook {
+                    sessionModel.c41RenderTarget = .noritsuLs600
+                }
+            }
+        )
+    }
+
+    private var flexColorImageSettingPathBinding: Binding<String> {
+        Binding(get: { sessionModel.flexColorImageSettingPath }, set: { sessionModel.flexColorImageSettingPath = $0 })
+    }
+
+    private var flexColorLutTablePathBinding: Binding<String> {
+        Binding(get: { sessionModel.flexColorLutTablePath }, set: { sessionModel.flexColorLutTablePath = $0 })
+    }
+
+    private var flexColorInputIccPathBinding: Binding<String> {
+        Binding(get: { sessionModel.flexColorInputIccPath }, set: { sessionModel.flexColorInputIccPath = $0 })
     }
 
     private var positiveFilenameTemplateBinding: Binding<String> {

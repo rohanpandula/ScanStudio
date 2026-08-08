@@ -565,6 +565,47 @@ public enum OutputColorProfile: String, Codable, CaseIterable, Identifiable, Sen
     public var id: String { rawValue }
 }
 
+/// Renderer for C-41 positive/preview derivatives. The archive master is
+/// independent and always remains untouched scanner RGB.
+public enum C41RenderTarget: String, Codable, CaseIterable, Identifiable, Sendable {
+    case nikonlook
+    case noritsuLs600
+    case flexcolorCleanroom
+
+    public var id: String { rawValue }
+}
+
+/// Operator-owned clean-room FlexColor inputs. Only paths are persisted; no
+/// profile, LUT, or ICC bytes are copied into the project manifest.
+public struct FlexColorInputs: Codable, Equatable, Sendable {
+    public let imageSettingPath: String?
+    public let lutTablePath: String?
+    public let inputIccPath: String?
+
+    public init(imageSettingPath: String? = nil, lutTablePath: String? = nil, inputIccPath: String? = nil) {
+        self.imageSettingPath = imageSettingPath
+        self.lutTablePath = lutTablePath
+        self.inputIccPath = inputIccPath
+    }
+}
+
+public struct C41RenderRecipe: Codable, Equatable, Sendable {
+    public let target: C41RenderTarget
+    public let flexcolor: FlexColorInputs
+
+    public init(target: C41RenderTarget = .nikonlook, flexcolor: FlexColorInputs = FlexColorInputs()) {
+        self.target = target
+        self.flexcolor = flexcolor
+    }
+
+    private enum CodingKeys: String, CodingKey { case target, flexcolor }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        target = try values.decodeIfPresent(C41RenderTarget.self, forKey: .target) ?? .nikonlook
+        flexcolor = try values.decodeIfPresent(FlexColorInputs.self, forKey: .flexcolor) ?? FlexColorInputs()
+    }
+}
+
 public struct ProcessingRecipe: Codable, Equatable, Sendable {
     public let filmProcess: FilmProcess
     public let autofocusEachFrame: Bool
@@ -705,26 +746,30 @@ public struct OutputRecipe: Codable, Equatable, Sendable {
     /// on their historic uncropped behavior. Mirrors
     /// `domain.rs::OutputRecipe.auto_crop`.
     public let autoCrop: Bool
+    public let c41Render: C41RenderRecipe
 
     public init(
         archive: ArchiveRecipe,
         positive: PositiveRecipe,
         preview: PreviewRecipe,
-        autoCrop: Bool = false
+        autoCrop: Bool = false,
+        c41Render: C41RenderRecipe = C41RenderRecipe()
     ) {
         self.archive = archive
         self.positive = positive
         self.preview = preview
         self.autoCrop = autoCrop
+        self.c41Render = c41Render
     }
 
-    private enum CodingKeys: String, CodingKey { case archive, positive, preview, autoCrop }
+    private enum CodingKeys: String, CodingKey { case archive, positive, preview, autoCrop, c41Render }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         archive = try values.decode(ArchiveRecipe.self, forKey: .archive)
         positive = try values.decode(PositiveRecipe.self, forKey: .positive)
         preview = try values.decode(PreviewRecipe.self, forKey: .preview)
         autoCrop = try values.decodeIfPresent(Bool.self, forKey: .autoCrop) ?? false
+        c41Render = try values.decodeIfPresent(C41RenderRecipe.self, forKey: .c41Render) ?? C41RenderRecipe()
     }
 }
 

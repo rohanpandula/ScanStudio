@@ -719,6 +719,13 @@ public final class SessionModel {
     public var positiveEnabled = true
     public var positiveFileFormat: OutputFileFormat = .tiff
     public var positiveColorProfile: OutputColorProfile = .adobeRgb1998
+    /// Selected C-41 derivative renderer. The archive master never changes.
+    public var c41RenderTarget: C41RenderTarget = .nikonlook
+    /// External, operator-owned inputs for the FlexColor clean-room target.
+    /// These paths are persisted in the project recipe; their bytes are not.
+    public var flexColorImageSettingPath = ""
+    public var flexColorLutTablePath = ""
+    public var flexColorInputIccPath = ""
     public var positiveFilenameTemplate = FilenameTemplate.defaultTemplate
     public var positiveDestination = SessionModel.defaultOutputDestination(subfolder: "Positive")
     public var previewEnabled = true
@@ -909,7 +916,15 @@ public final class SessionModel {
                 ),
                 destination: jpegDestination
             ),
-            autoCrop: autoCropEnabled
+            autoCrop: autoCropEnabled,
+            c41Render: C41RenderRecipe(
+                target: c41RenderTarget,
+                flexcolor: FlexColorInputs(
+                    imageSettingPath: flexColorImageSettingPath.isEmpty ? nil : flexColorImageSettingPath,
+                    lutTablePath: flexColorLutTablePath.isEmpty ? nil : flexColorLutTablePath,
+                    inputIccPath: flexColorInputIccPath.isEmpty ? nil : flexColorInputIccPath
+                )
+            )
         )
     }
 
@@ -2634,6 +2649,10 @@ public final class SessionModel {
         positiveEnabled = recipes.positive.enabled
         positiveFileFormat = recipes.positive.fileFormat
         positiveColorProfile = recipes.positive.colorProfile
+        c41RenderTarget = recipes.c41Render.target
+        flexColorImageSettingPath = recipes.c41Render.flexcolor.imageSettingPath ?? ""
+        flexColorLutTablePath = recipes.c41Render.flexcolor.lutTablePath ?? ""
+        flexColorInputIccPath = recipes.c41Render.flexcolor.inputIccPath ?? ""
         positiveFilenameTemplate = recipes.positive.filenameTemplate
         positiveDestination = recipes.positive.destination
         previewEnabled = recipes.preview.enabled
