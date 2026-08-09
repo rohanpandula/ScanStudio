@@ -32,16 +32,17 @@
   display: flex;
   align-items: center;
   gap: 0.4rem;
-  color: #374151;
+  color: var(--scan-row-label);
   font-size: 0.8rem;
   font-weight: 600;
 }
 
 .focusControl select {
   padding: 0.32rem 0.45rem;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
-  background: #ffffff;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
 }
 
 .batchTransformControls {
@@ -51,9 +52,10 @@
 
 .batchTransformControls summary {
   padding: 0.35rem 0.6rem;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
-  background: #f9fafb;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
   user-select: none;
 }
@@ -69,17 +71,18 @@
   flex-wrap: wrap;
   gap: 0.4rem;
   padding: 0.5rem;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  background: #ffffff;
-  box-shadow: 0 0.35rem 1rem rgb(17 24 39 / 14%);
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
+  background: var(--scan-raised);
+  box-shadow: 0 0.35rem 1rem rgb(0 0 0 / 34%);
 }
 
 .controlButton {
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
 }
 
@@ -91,7 +94,7 @@
 .mediaGuidance {
   max-width: 60ch;
   margin: 0;
-  color: #4b5563;
+  color: var(--scan-secondary-text);
   font-size: 0.9rem;
   line-height: 1.45;
 }
@@ -99,10 +102,10 @@
 .failureBanner {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  border-radius: 9px;
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
   font-size: 0.9rem;
 }
 
@@ -117,9 +120,9 @@
   display: block;
   aspect-ratio: 3 / 2;
   padding: 0.4rem;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--scan-border-emphasis);
   border-radius: 6px;
-  background: #f9fafb;
+  background: var(--scan-thumbnail-well);
   cursor: pointer;
   overflow: hidden;
 }
@@ -152,10 +155,10 @@
   border-radius: 4px;
   background: repeating-linear-gradient(
     45deg,
-    #f3f4f6,
-    #f3f4f6 0.5rem,
-    #e5e7eb 0.5rem,
-    #e5e7eb 1rem
+    var(--scan-raised),
+    var(--scan-raised) 0.5rem,
+    var(--scan-sidebar) 0.5rem,
+    var(--scan-sidebar) 1rem
   );
 }
 
@@ -166,14 +169,14 @@
   left: 0.45rem;
   padding: 0.1rem 0.3rem;
   border-radius: 3px;
-  background: rgb(255 255 255 / 82%);
+  background: rgb(0 0 0 / 68%);
   font-size: 0.7rem;
-  color: #6b7280;
+  color: var(--scan-primary-text);
 }
 
 .selected {
-  border-color: #2563eb;
-  outline: 2px solid #2563eb;
+  border-color: var(--scan-amber);
+  outline: 2px solid var(--scan-amber);
   outline-offset: -2px;
 }
 
@@ -185,8 +188,8 @@
   content: "Edit";
   padding: 0.1rem 0.35rem;
   border-radius: 999px;
-  background: rgb(17 24 39 / 78%);
-  color: #ffffff;
+  background: rgb(0 0 0 / 78%);
+  color: var(--scan-primary-text);
   font-size: 0.62rem;
   font-weight: 600;
   letter-spacing: 0.02em;

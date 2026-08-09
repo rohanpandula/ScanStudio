@@ -3,25 +3,26 @@
   flex-direction: column;
   gap: 0.75rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
+  background: var(--scan-raised);
 }
 
 .heading {
   margin: 0;
   font-size: 1rem;
   font-weight: 700;
-  color: #111827;
+  color: var(--scan-primary-text);
 }
 
 .writeMode {
   margin: 0;
   font-size: 0.85rem;
-  color: #374151;
+  color: var(--scan-primary-text);
   padding: 0.4rem 0.6rem;
-  border-left: 3px solid #2563eb;
-  background: #eff6ff;
+  border: 1px solid var(--scan-cyan-border);
+  border-radius: 6px;
+  background: var(--scan-cyan-fill);
 }
 
 .probeTable {
@@ -33,16 +34,16 @@
 .probeTable th {
   text-align: left;
   font-weight: 600;
-  color: #6b7280;
-  border-bottom: 1px solid #e5e7eb;
+  color: var(--scan-secondary-text);
+  border-bottom: 1px solid var(--scan-divider);
   padding: 0.35rem 0.5rem;
 }
 
 .probeTable td {
   vertical-align: top;
-  border-bottom: 1px solid #f3f4f6;
+  border-bottom: 1px solid var(--scan-divider);
   padding: 0.35rem 0.5rem;
-  color: #111827;
+  color: var(--scan-primary-text);
 }
 
 .badge {
@@ -54,36 +55,36 @@
 }
 
 .badge[data-status="Ok"] {
-  background: #f0fdf4;
-  color: #166534;
-  border-color: #bbf7d0;
+  background: var(--scan-green-fill);
+  color: var(--scan-green);
+  border-color: var(--scan-green-border);
 }
 
 .badge[data-status="Fail"] {
-  background: #fef2f2;
-  color: #b91c1c;
-  border-color: #fecaca;
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
+  border-color: var(--scan-red-border);
 }
 
 .badge[data-status="Unknown"] {
-  background: #fffbeb;
-  color: #92400e;
-  border-color: #fde68a;
+  background: var(--scan-amber-fill);
+  color: var(--scan-amber);
+  border-color: var(--scan-amber-border);
 }
 
 .maxReadLine {
   margin: 0;
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--scan-secondary-text);
   padding-top: 0.4rem;
-  border-top: 1px dashed #e5e7eb;
+  border-top: 1px dashed var(--scan-divider);
 }
 
 code {
   font-size: 0.75rem;
   word-break: break-all;
-  background: #f9fafb;
-  border: 1px solid #e5e7eb;
+  background: var(--scan-workspace);
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
   padding: 0.1rem 0.35rem;
 }

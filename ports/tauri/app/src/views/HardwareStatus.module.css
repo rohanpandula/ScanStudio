@@ -10,29 +10,29 @@
   font-weight: 600;
   padding: 0.25rem 0.6rem;
   border-radius: 999px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
-  color: #374151;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-row-label);
 }
 
 .chip[data-state="armed"],
 .chip[data-state="present"] {
-  border-color: #bbf7d0;
-  background: #f0fdf4;
-  color: #166534;
+  border-color: var(--scan-green-border);
+  background: var(--scan-green-fill);
+  color: var(--scan-green);
 }
 
 .chip[data-state="not-armed"],
 .chip[data-state="not-present"] {
-  border-color: #fecaca;
-  background: #fef2f2;
-  color: #b91c1c;
+  border-color: var(--scan-red-border);
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
 }
 
 .chip[data-state="unknown"] {
-  border-color: #fde68a;
-  background: #fffbeb;
-  color: #92400e;
+  border-color: var(--scan-amber-border);
+  background: var(--scan-amber-fill);
+  color: var(--scan-amber);
 }
 
 .errorPanel {
@@ -40,16 +40,16 @@
   flex-direction: column;
   gap: 0.35rem;
   padding: 0.75rem;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  background: #fef2f2;
+  border: 1px solid var(--scan-red-border);
+  border-radius: 9px;
+  background: var(--scan-red-fill);
 }
 
 .errorTitle {
   margin: 0;
   font-size: 0.9rem;
   font-weight: 600;
-  color: #b91c1c;
+  color: var(--scan-primary-text);
 }
 
 .errorCode {
@@ -58,20 +58,20 @@
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #b91c1c;
+  color: var(--scan-primary-text);
 }
 
 .errorMessage {
   margin: 0;
   font-size: 0.9rem;
-  color: #111827;
+  color: var(--scan-primary-text);
   white-space: pre-wrap;
 }
 
 .guidance {
   margin: 0;
   font-size: 0.8rem;
-  color: #6b7280;
-  border-top: 1px dashed #fecaca;
+  color: var(--scan-secondary-text);
+  border-top: 1px dashed var(--scan-red-border);
   padding-top: 0.4rem;
 }

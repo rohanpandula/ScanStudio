@@ -47,6 +47,21 @@ Gatekeeper globally. There is no support or release-schedule promise. The
 cross-platform source, setup instructions, and live-validation runbooks are in
 [`ports/tauri`](ports/tauri).
 
+## Browser and headless preview
+
+The first browser/headless slice reuses the React client and the existing Rust
+engine behind a small authenticated Python gateway. It runs locally or in a
+hardened Docker container, supports one controller plus read-only observers,
+and adapts down to a phone-sized browser. The macOS Settings pane includes an
+off-by-default switch for this local browser preview.
+
+This milestone is intentionally **simulator-only**. It launches a separate
+simulator engine, does not share the native app's scanner session, strips the
+bridge and motion environment, and exposes no project, capture, USB, or output
+paths. See the [gateway guide](ports/web/README.md) and
+[hardware-capable roadmap](docs/WEB-HEADLESS.md) for the Docker/Unraid boundary
+and the gates required before real scanning is enabled.
+
 ## Download
 
 All prerelease packages are published together on the

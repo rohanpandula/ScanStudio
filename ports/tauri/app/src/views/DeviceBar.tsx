@@ -33,7 +33,15 @@ function stableGetSnapshot(): Readonly<SessionState> {
   return cachedSnapshot;
 }
 
-export default function DeviceBar() {
+export interface DeviceBarProps {
+  canControl?: boolean;
+  showDiagnosticActions?: boolean;
+}
+
+export default function DeviceBar({
+  canControl = true,
+  showDiagnosticActions = true,
+}: DeviceBarProps) {
   const [devices, setDevices] = useState<DeviceInfo[] | null>(null);
 
   useEffect(() => {
@@ -78,6 +86,7 @@ export default function DeviceBar() {
               <button
                 type="button"
                 className={styles.controlButton}
+                disabled={!canControl}
                 onClick={() => void sessionStore.disconnect()}
               >
                 Disconnect
@@ -86,6 +95,7 @@ export default function DeviceBar() {
               <button
                 type="button"
                 className={styles.controlButton}
+                disabled={!canControl}
                 onClick={() => void sessionStore.connect(device.deviceId)}
               >
                 Connect
@@ -138,15 +148,17 @@ export default function DeviceBar() {
           state.previewOutcome === "failed" ? state.previewError : null
         }
       />
-      <DiagnosticReportActions
-        error={state.filmFeedInterrupted}
-        thumbnailsFailed={
-          state.previewOutcome === "failed" ? state.previewError : null
-        }
-        device={device}
-        status={status}
-        thumbnails={state.thumbnails}
-      />
+      {showDiagnosticActions && (
+        <DiagnosticReportActions
+          error={state.filmFeedInterrupted}
+          thumbnailsFailed={
+            state.previewOutcome === "failed" ? state.previewError : null
+          }
+          device={device}
+          status={status}
+          thumbnails={state.thumbnails}
+        />
+      )}
     </div>
   );
 }

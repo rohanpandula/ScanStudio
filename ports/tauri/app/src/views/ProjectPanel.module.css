@@ -16,9 +16,9 @@
   gap: 1rem;
   align-items: baseline;
   padding: 0.75rem;
-  border: 1px solid #d1fae5;
-  border-radius: 6px;
-  background: #ecfdf5;
+  border: 1px solid var(--scan-green-border);
+  border-radius: 9px;
+  background: var(--scan-green-fill);
 }
 
 .form {
@@ -36,22 +36,23 @@
 
 .directory {
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--scan-secondary-text);
 }
 
 .inlineError {
   margin: 0;
   font-size: 0.85rem;
-  color: #b91c1c;
+  color: var(--scan-primary-text);
+  font-weight: 600;
 }
 
 .error {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  border-radius: 9px;
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
   font-size: 0.9rem;
 }
 
@@ -59,8 +60,9 @@
   align-self: flex-start;
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
 }
 
@@ -85,9 +87,10 @@
   width: 100%;
   text-align: left;
   padding: 0.6rem 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
 }
 
@@ -97,5 +100,5 @@
 
 .recentMeta {
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--scan-secondary-text);
 }

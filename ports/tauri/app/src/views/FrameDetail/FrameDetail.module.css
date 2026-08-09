@@ -9,7 +9,7 @@
 
 .loadingText {
   margin: 0;
-  color: #6b7280;
+  color: var(--scan-secondary-text);
   font-style: italic;
 }
 
@@ -29,8 +29,9 @@
 .controlButton {
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
 }
 
@@ -45,17 +46,17 @@
   align-items: center;
   gap: 0.5rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .viewport {
   position: relative;
   width: 100%;
   overflow: hidden;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--scan-divider);
   border-radius: 6px;
-  background: #111827;
+  background: var(--scan-thumbnail-well);
   min-height: 16rem;
   outline: none;
   cursor: grab;
@@ -118,7 +119,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #9ca3af;
+  color: var(--scan-secondary-text);
   font-size: 0.9rem;
 }
 
@@ -127,8 +128,8 @@
   flex-direction: column;
   gap: 0.6rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .tileRow {
@@ -141,9 +142,9 @@
   width: 6rem;
   height: 4rem;
   object-fit: contain;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--scan-border-emphasis);
   border-radius: 4px;
-  background: #f9fafb;
+  background: var(--scan-thumbnail-well);
 }
 
 .tilePlaceholder {
@@ -152,22 +153,22 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px dashed #d1d5db;
+  border: 1px dashed var(--scan-divider);
   border-radius: 4px;
   background: repeating-linear-gradient(
     45deg,
-    #f9fafb,
-    #f9fafb 0.5rem,
-    #e5e7eb 0.5rem,
-    #e5e7eb 1rem
+    var(--scan-raised),
+    var(--scan-raised) 0.5rem,
+    var(--scan-sidebar) 0.5rem,
+    var(--scan-sidebar) 1rem
   );
-  color: #6b7280;
+  color: var(--scan-secondary-text);
   font-size: 0.7rem;
 }
 
 .rangeLabel {
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--scan-secondary-text);
 }
 
 .inputRow {
@@ -179,7 +180,9 @@
 .numberInput {
   width: 6rem;
   padding: 0.35rem 0.5rem;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   border-radius: 4px;
 }
 
@@ -195,28 +198,28 @@
   letter-spacing: 0.05em;
   padding: 0.15rem 0.5rem;
   border-radius: 999px;
-  border: 1px solid #fca5a5;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
 }
 
 .invalidatedBanner {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #fcd34d;
-  border-radius: 6px;
-  background: #fffbeb;
-  color: #92400e;
+  border: 1px solid var(--scan-amber-border);
+  border-radius: 9px;
+  background: var(--scan-amber-fill);
+  color: var(--scan-primary-text);
   font-size: 0.9rem;
 }
 
 .error {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  border-radius: 9px;
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
   font-size: 0.9rem;
 }
 
@@ -225,8 +228,8 @@
   flex-direction: column;
   gap: 0.6rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .approvalHeader {
@@ -250,7 +253,7 @@
 }
 
 .warningItem {
-  color: #b45309;
+  color: var(--scan-amber);
   font-size: 0.85rem;
 }
 

@@ -10,18 +10,19 @@
 .doneNote {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #bbf7d0;
-  border-radius: 6px;
-  background: #f0fdf4;
-  color: #166534;
+  border: 1px solid var(--scan-green-border);
+  border-radius: 9px;
+  background: var(--scan-green-fill);
+  color: var(--scan-green);
   font-size: 0.9rem;
 }
 
 .controlButton {
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
   font-size: 0.9rem;
   align-self: flex-start;

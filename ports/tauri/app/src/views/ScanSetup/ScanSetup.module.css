@@ -25,8 +25,8 @@
   flex-direction: column;
   gap: 0.6rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .sectionHeader {
@@ -55,12 +55,12 @@
 
 .fieldLabel {
   font-size: 0.8rem;
-  color: #4b5563;
+  color: var(--scan-secondary-text);
 }
 
 .fieldValue {
   font-size: 0.9rem;
-  color: #111827;
+  color: var(--scan-primary-text);
 }
 
 .textInput,
@@ -69,17 +69,18 @@
   width: 100%;
   box-sizing: border-box;
   padding: 0.35rem 0.5rem;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
   font-size: 0.9rem;
-  background: #ffffff;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
 }
 
 .textInput:disabled,
 .numberInput:disabled,
 .selectInput:disabled {
-  background: #f3f4f6;
-  color: #6b7280;
+  background: var(--scan-workspace);
+  color: var(--scan-secondary-text);
   cursor: not-allowed;
 }
 
@@ -112,16 +113,16 @@
 .disabledNote {
   margin: 0;
   padding: 0.4rem 0.6rem;
-  border: 1px solid #fcd34d;
-  border-radius: 6px;
-  background: #fffbeb;
-  color: #92400e;
+  border: 1px solid var(--scan-amber-border);
+  border-radius: 9px;
+  background: var(--scan-amber-fill);
+  color: var(--scan-primary-text);
   font-size: 0.85rem;
 }
 
 .templatePreview {
   font-size: 0.85rem;
-  color: #374151;
+  color: var(--scan-row-label);
 }
 
 .templatePreview strong {
@@ -137,16 +138,17 @@
   letter-spacing: 0.05em;
   padding: 0.15rem 0.5rem;
   border-radius: 999px;
-  border: 1px solid #bfdbfe;
-  background: #eff6ff;
-  color: #1d4ed8;
+  border: 1px solid var(--scan-cyan-border);
+  background: var(--scan-cyan-fill);
+  color: var(--scan-cyan);
 }
 
 .controlButton {
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
   font-size: 0.9rem;
 }
@@ -159,9 +161,9 @@
 .primaryButton {
   padding: 0.45rem 1rem;
   border-radius: 4px;
-  border: 1px solid #2563eb;
-  background: #2563eb;
-  color: #ffffff;
+  border: 1px solid var(--scan-amber);
+  background: var(--scan-amber);
+  color: rgb(0 0 0 / 86%);
   cursor: pointer;
   font-size: 0.95rem;
   font-weight: 600;
@@ -175,9 +177,9 @@
 .dangerButton {
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #fecaca;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
   cursor: pointer;
   font-size: 0.9rem;
 }
@@ -193,8 +195,8 @@
   flex-direction: column;
   gap: 0.75rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .overrideActions {
@@ -205,10 +207,10 @@
 .banner {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #fcd34d;
-  border-radius: 6px;
-  background: #fffbeb;
-  color: #92400e;
+  border: 1px solid var(--scan-amber-border);
+  border-radius: 9px;
+  background: var(--scan-amber-fill);
+  color: var(--scan-primary-text);
   font-size: 0.9rem;
   white-space: pre-wrap;
 }
@@ -216,10 +218,10 @@
 .error {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  border-radius: 9px;
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
   font-size: 0.9rem;
   white-space: pre-wrap;
 }
@@ -227,10 +229,10 @@
 .inlineError {
   margin: 0;
   padding: 0.35rem 0.6rem;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  border-radius: 9px;
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
   font-size: 0.85rem;
 }
 

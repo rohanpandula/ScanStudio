@@ -1,9 +1,11 @@
 .shell {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr);
-  height: 100vh;
+  height: 100%;
   width: 100%;
   overflow: hidden;
+  background: var(--scan-workspace);
+  color: var(--scan-primary-text);
 }
 
 .shell[data-has-inspector="true"] {
@@ -12,14 +14,81 @@
 
 .sidebar {
   overflow-y: auto;
-  border-right: 1px solid #e5e7eb;
+  border-right: 1px solid var(--scan-divider);
+  background: var(--scan-sidebar);
 }
 
 .workspace {
   overflow-y: auto;
+  background: var(--scan-workspace);
 }
 
 .inspector {
   overflow-y: auto;
-  border-left: 1px solid #e5e7eb;
+  border-left: 1px solid var(--scan-divider);
+  background: var(--scan-inspector);
+}
+
+@media (max-width: 64rem) {
+  .shell {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .shell[data-has-inspector="true"] {
+    grid-template-columns: 220px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .shell[data-has-inspector="true"] .sidebar {
+    grid-column: 1;
+    grid-row: 1 / -1;
+  }
+
+  .shell[data-has-inspector="true"] .workspace {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .shell[data-has-inspector="true"] .inspector {
+    grid-column: 2;
+    grid-row: 2;
+    max-height: 14rem;
+    border-top: 1px solid var(--scan-divider);
+    border-left: 0;
+  }
+}
+
+@media (max-width: 44rem) {
+  .shell,
+  .shell[data-has-inspector="true"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(11rem, 36dvh) minmax(0, 1fr);
+  }
+
+  .shell[data-has-inspector="true"] {
+    grid-template-rows: minmax(11rem, 32dvh) minmax(0, 1fr) auto;
+  }
+
+  .sidebar,
+  .shell[data-has-inspector="true"] .sidebar {
+    grid-column: 1;
+    grid-row: 1;
+    border-right: 0;
+    border-bottom: 1px solid var(--scan-divider);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .workspace,
+  .shell[data-has-inspector="true"] .workspace {
+    grid-column: 1;
+    grid-row: 2;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .shell[data-has-inspector="true"] .inspector {
+    grid-column: 1;
+    grid-row: 3;
+    max-height: 11rem;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
 }

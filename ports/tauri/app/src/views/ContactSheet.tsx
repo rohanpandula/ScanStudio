@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../session";
+import { isWebSimulatorPreview } from "../runtime";
 import type { DerivativeTransform, Thumbnail } from "../session/wire/types";
 import styles from "./ContactSheet.module.css";
 
@@ -68,12 +69,18 @@ function shortcutTargetIsEditable(target: EventTarget | null): boolean {
 }
 
 export interface ContactSheetProps {
+  canControl?: boolean;
   onInspectFrame?: (frameIndex: number) => void;
   onCapture?: () => void;
 }
 
-export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheetProps = {}) {
+export default function ContactSheet({
+  canControl = true,
+  onInspectFrame,
+  onCapture,
+}: ContactSheetProps = {}) {
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
+  const simulatorPreview = isWebSimulatorPreview();
   const status = state.connection.status;
   const project = state.project;
   const mediaLoaded = status?.mediaLoaded === true;
@@ -81,7 +88,8 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
   const deviceKind = state.connection.device?.kind ?? null;
   const canLoadSimulatedMedia = !mediaLoaded && connected && deviceKind === "simulated";
   const canPreview =
-    project !== null && (mediaLoaded || (connected && deviceKind === "real"));
+    (project !== null || simulatorPreview) &&
+    (mediaLoaded || (connected && deviceKind === "real"));
   const frameCount = mediaLoaded ? (status?.frameCount ?? 0) : 0;
   const selectionEmpty = state.selectedFrameIndices.length === 0;
   const transformsEditable =
@@ -119,8 +127,11 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
   }, [focusedFrameIndex, transformsEditable]);
 
   const preview = (): void => {
-    if (project === null) return;
-    void sessionStore.acquireThumbnails(undefined, project.filmProcess);
+    if (project === null && !simulatorPreview) return;
+    void sessionStore.acquireThumbnails(
+      undefined,
+      project?.filmProcess ?? "c41ColorNegative",
+    );
   };
 
   const frames: number[] = [];
@@ -138,6 +149,7 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
                 key={carrier}
                 type="button"
                 className={styles.controlButton}
+                disabled={!canControl}
                 onClick={() => void sessionStore.loadMedia(carrier)}
               >
                 {carrier}
@@ -157,7 +169,7 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
             type="button"
             className={styles.controlButton}
             data-testid="preview-button"
-            disabled={state.previewOutcome === "active"}
+            disabled={!canControl || state.previewOutcome === "active"}
             onClick={preview}
           >
             Preview

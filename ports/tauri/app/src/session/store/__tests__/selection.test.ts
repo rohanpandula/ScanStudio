@@ -14,7 +14,7 @@
 import { describe, expect, it } from "vitest";
 import { SessionStore } from "../session";
 import { createScriptedTransport, type ScriptedTransportHandle } from "../../testing/harness";
-import type { EngineError, ScanProject, ScannerStatus } from "../../wire/types";
+import type { DeviceInfo, EngineError, ScanProject, ScannerStatus } from "../../wire/types";
 
 interface Call {
   method: string;
@@ -63,6 +63,14 @@ const UNLOADED: ScannerStatus = {
   lamp: "off",
   transport: "idle",
   activeJobId: null,
+};
+
+const SIMULATOR: DeviceInfo = {
+  deviceId: "sim-ls5000-0",
+  model: "SUPER COOLSCAN 5000 ED",
+  kind: "simulated",
+  firmware: "1.03-sim",
+  connection: "USB (simulated)",
 };
 
 const PROJECT: ScanProject = {
@@ -165,6 +173,97 @@ describe("SessionStore selection (additive UI state)", () => {
 });
 
 describe("SessionStore preview outcome exposure", () => {
+  it("hydrates the connected simulator after a browser refresh", () => {
+    const { store, handle } = scriptedFixture();
+    handle.emitEvent({
+      event: "scanstudio.webEventStream",
+      payload: {
+        state: "ready",
+        engineConnected: true,
+        device: SIMULATOR,
+        status: LOADED_ROLL36,
+      },
+    });
+
+    expect(store.getState().connection).toEqual({
+      connected: true,
+      device: SIMULATOR,
+      status: LOADED_ROLL36,
+    });
+  });
+
+  it.each([
+    ["carrier change", { ...LOADED_ROLL36, carrier: "strip6" }],
+    ["frame-count change", { ...LOADED_ROLL36, frameCount: 35 }],
+    ["eject", UNLOADED],
+  ] satisfies Array<[string, ScannerStatus]>)(
+    "invalidates preview data and approval on same-device hydration after a %s",
+    async (_transition, hydratedStatus) => {
+      const { store, handle, calls } = scriptedFixture();
+      handle.emitEvent({
+        event: "scanstudio.webEventStream",
+        payload: {
+          state: "ready",
+          engineConnected: true,
+          device: SIMULATOR,
+          status: LOADED_ROLL36,
+        },
+      });
+
+      await store.acquireThumbnails();
+      const operationId = calls[0].params.operationId as string;
+      handle.emitEvent({
+        event: "scanner.thumbnail",
+        payload: {
+          frameIndex: 1,
+          thumbnail: { brightness: 0.5, tint: 0.1, needsApproval: true },
+          operationId,
+        },
+      });
+      handle.emitEvent({
+        event: "scanner.thumbnailsComplete",
+        payload: { count: 1, operationId },
+      });
+      await store.approveFrame(1);
+      store.toggleFrameSelection(1, false);
+
+      expect(store.getState()).toMatchObject({
+        thumbnails: { 1: expect.any(Object) },
+        thumbnailOperationIds: { 1: operationId },
+        latestCompletedPreviewOperationId: operationId,
+        approvedFrames: { [operationId]: [1] },
+        selectedFrameIndices: [1],
+        focusedFrameIndex: 1,
+      });
+
+      handle.emitEvent({
+        event: "scanstudio.webEventStream",
+        payload: {
+          state: "ready",
+          engineConnected: true,
+          device: SIMULATOR,
+          status: hydratedStatus,
+        },
+      });
+
+      const state = store.getState();
+      expect(state.connection).toEqual({
+        connected: true,
+        device: SIMULATOR,
+        status: hydratedStatus,
+      });
+      expect(state.thumbnails).toEqual({});
+      expect(state.thumbnailOperationIds).toEqual({});
+      expect(state.activeOperationId).toBeNull();
+      expect(state.latestCompletedPreviewOperationId).toBeNull();
+      expect(state.approvedFrames).toEqual({});
+      expect(state.previewOutcome).toBeNull();
+      expect(state.previewError).toBeNull();
+      expect(state.selectedFrameIndices).toEqual([]);
+      expect(state.focusedFrameIndex).toBeNull();
+    },
+  );
+
   it("is null initially", () => {
     const { store } = scriptedFixture();
     expect(store.getState().previewOutcome).toBeNull();
@@ -212,6 +311,25 @@ describe("SessionStore preview outcome exposure", () => {
     expect(store.getState().previewOutcome).toBe("succeeded");
     expect(store.getState().previewError).toBeNull();
     expect(store.getState().latestCompletedPreviewOperationId).toBe(active);
+  });
+
+  it("fails an active preview closed when the browser event stream drops", async () => {
+    const { store, handle } = scriptedFixture();
+    await store.acquireThumbnails();
+
+    handle.emitEvent({
+      event: "scanstudio.webEventStream",
+      payload: { state: "disconnected" },
+    });
+
+    expect(store.getState().previewOutcome).toBe("failed");
+    expect(store.getState().activeOperationId).toBeNull();
+    expect(store.getState().latestCompletedPreviewOperationId).toBeNull();
+    expect(store.getState().previewError).toEqual({
+      code: "EVENT_STREAM_INTERRUPTED",
+      message:
+        "The browser connection was interrupted during preview. Request a fresh preview before scanning.",
+    });
   });
 
   it("resets to null when the wire rejects the preview request", async () => {

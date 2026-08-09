@@ -3,9 +3,11 @@ import react from "@vitejs/plugin-react";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+// @ts-expect-error process is a nodejs global
+const webGateway = process.env.SCANSTUDIO_WEB_GATEWAY || "http://127.0.0.1:8787";
 
 // https://vite.dev/config/
-export default defineConfig(async () => ({
+export default defineConfig(async ({ mode }) => ({
   plugins: [react()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
@@ -28,5 +30,12 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+    proxy:
+      mode === "web"
+        ? {
+            "/api": { target: webGateway, ws: true },
+            "/healthz": { target: webGateway },
+          }
+        : undefined,
   },
 }));

@@ -1,0 +1,10 @@
+.git
+**/.DS_Store
+**/.pytest_cache
+**/.ruff_cache
+**/.venv
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/dist
+**/target

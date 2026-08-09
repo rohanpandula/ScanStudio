@@ -8,24 +8,24 @@
 
 .windowsSetupHeading {
   margin: 0;
-  color: #111827;
+  color: var(--scan-primary-text);
   font-size: 1rem;
   font-weight: 650;
 }
 
 .windowsSetupCopy {
   margin: 0;
-  color: #4b5563;
+  color: var(--scan-secondary-text);
   font-size: 0.875rem;
   line-height: 1.5;
 }
 
 .windowsSetupButton {
   padding: 0.45rem 0.75rem;
-  border: 1px solid #9ca3af;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
-  background: #ffffff;
-  color: #111827;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   font: inherit;
   font-size: 0.875rem;
   font-weight: 600;
@@ -33,10 +33,10 @@
 }
 
 .windowsSetupButton:hover {
-  background: #f9fafb;
+  background: linear-gradient(var(--scan-control-hover), var(--scan-control-hover)), var(--scan-raised);
 }
 
 .windowsSetupButton:focus-visible {
-  outline: 2px solid #2563eb;
+  outline: 2px solid var(--scan-cyan);
   outline-offset: 2px;
 }

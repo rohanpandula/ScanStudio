@@ -53,6 +53,7 @@ import {
   type Thumbnail,
   isEngineError,
   isDutyCycleReport,
+  isDeviceInfo,
   isFrameState,
   isJobState,
   isScanProject,
@@ -273,6 +274,18 @@ function normalizedScannerStatus(status: ScannerStatus): ScannerStatus {
   if (status.filmPresent !== false) return status;
   // The live sensor verdict is stronger than preview-derived registration.
   return { ...status, mediaLoaded: false, frameCount: null };
+}
+
+function scannerMediaRegistrationChanged(
+  previous: ScannerStatus | null,
+  status: ScannerStatus,
+): boolean {
+  if (previous === null) return false;
+  const ejected = previous.mediaLoaded === true && status.mediaLoaded === false;
+  const mediaChanged =
+    previous.carrier !== status.carrier ||
+    previous.frameCount !== status.frameCount;
+  return ejected || mediaChanged;
 }
 
 function isFilmFeedInterrupted(error: EngineError): boolean {
@@ -604,10 +617,7 @@ export class SessionStore {
     const registrationChanged =
       status.connected === false ||
       status.filmPresent === false ||
-      (previous !== null &&
-        ((previous.mediaLoaded === true && status.mediaLoaded === false) ||
-          previous.carrier !== status.carrier ||
-          previous.frameCount !== status.frameCount));
+      scannerMediaRegistrationChanged(previous, status);
     if (status.filmPresent === false) {
       this.#invalidatePreviewRegistration();
     } else if (registrationChanged) {
@@ -1666,7 +1676,13 @@ export class SessionStore {
         if (!isRecord(payload) || !isScannerStatus(payload.status)) return;
         const previous = this.#state.connection.status;
         const status = normalizedScannerStatus(payload.status);
-        this.#state.connection = { ...this.#state.connection, status };
+        this.#state.connection = status.connected === false
+          ? { connected: false, device: null, status: null }
+          : {
+              ...this.#state.connection,
+              connected: this.#state.connection.device !== null,
+              status,
+            };
         // Approval-binding invalidation observed through status transitions
         // (roll.approve triggers 4-5): eject (mediaLoaded true -> false),
         // media change (carrier/frameCount change), and disconnect
@@ -1679,15 +1695,9 @@ export class SessionStore {
         if (status.connected === false) {
           this.#state.latestCompletedPreviewOperationId = null;
           registrationChanged = true;
-        } else if (previous !== null) {
-          const ejected = previous.mediaLoaded === true && status.mediaLoaded === false;
-          const mediaChanged =
-            previous.carrier !== status.carrier ||
-            previous.frameCount !== status.frameCount;
-          if (ejected || mediaChanged) {
-            this.#state.latestCompletedPreviewOperationId = null;
-            registrationChanged = true;
-          }
+        } else if (scannerMediaRegistrationChanged(previous, status)) {
+          this.#state.latestCompletedPreviewOperationId = null;
+          registrationChanged = true;
         }
         if (status.filmPresent === false) {
           this.#invalidatePreviewRegistration();
@@ -1777,6 +1787,62 @@ export class SessionStore {
         }
         this.#state.activeOperationId = null;
         this.#notify();
+        return;
+      }
+      case "scanstudio.webEventStream": {
+        const payload = event.payload as {
+          state?: unknown;
+          engineConnected?: unknown;
+          device?: unknown;
+          status?: unknown;
+        };
+        if (!isRecord(payload)) return;
+        if (payload.state === "disconnected" && this.#previewOutcome === "active") {
+          // The web gateway intentionally has no event replay in this first
+          // slice. If its socket drops during a preview, the browser cannot
+          // prove whether the unseen terminal event was success or failure.
+          // Release the local busy lane, invalidate approval, and require a
+          // fresh preview instead of leaving the UI active forever.
+          this.#previewOutcome = "failed";
+          this.#state.previewOutcome = "failed";
+          this.#state.previewError = {
+            code: "EVENT_STREAM_INTERRUPTED",
+            message:
+              "The browser connection was interrupted during preview. Request a fresh preview before scanning.",
+          };
+          this.#state.activeOperationId = null;
+          this.#state.latestCompletedPreviewOperationId = null;
+          this.#invalidateScanAuthorization();
+          this.#notify();
+          return;
+        }
+        if (payload.state === "ready" && payload.engineConnected === false) {
+          this.#state.connection = { connected: false, device: null, status: null };
+          this.#invalidatePreviewRegistration();
+          this.#notify();
+        } else if (
+          payload.state === "ready" &&
+          payload.engineConnected === true &&
+          isDeviceInfo(payload.device) &&
+          isScannerStatus(payload.status)
+        ) {
+          const previousStatus = this.#state.connection.status;
+          const deviceChanged =
+            this.#state.connection.device?.deviceId !== payload.device.deviceId;
+          const status = normalizedScannerStatus(payload.status);
+          const registrationChanged =
+            deviceChanged ||
+            status.connected === false ||
+            status.filmPresent === false ||
+            scannerMediaRegistrationChanged(previousStatus, status);
+          this.#state.connection = {
+            connected: true,
+            device: payload.device,
+            status,
+          };
+          if (registrationChanged) this.#invalidatePreviewRegistration();
+          this.#notify();
+        }
         return;
       }
       case "scan.progress": {

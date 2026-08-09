@@ -1,0 +1,205 @@
+.loginSurface {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: max(2rem, env(safe-area-inset-top)) max(1.25rem, env(safe-area-inset-right))
+    max(2rem, env(safe-area-inset-bottom)) max(1.25rem, env(safe-area-inset-left));
+  background: var(--scan-workspace);
+  color: var(--scan-primary-text);
+}
+
+.loginContent {
+  width: min(100%, 26rem);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.brandMark {
+  width: 2.25rem;
+  height: 0.35rem;
+  margin-bottom: 1.5rem;
+  border-radius: 999px;
+  background: var(--scan-amber);
+}
+
+.title {
+  margin: 0 0 0.65rem;
+  font-size: clamp(2.25rem, 8vw, 4.25rem);
+  line-height: 0.98;
+  letter-spacing: -0.035em;
+}
+
+.statusCopy {
+  max-width: 36ch;
+  margin: 0 0 2rem;
+  color: var(--scan-secondary-text);
+  font-size: 1rem;
+  line-height: 1.55;
+}
+
+.label {
+  margin-bottom: 0.5rem;
+  color: var(--scan-row-label);
+  font-size: 0.875rem;
+  font-weight: 650;
+}
+
+.tokenInput {
+  min-height: 3rem;
+  padding: 0 0.85rem;
+  border: 1px solid var(--scan-divider);
+  border-radius: 0.55rem;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
+  font: inherit;
+}
+
+.tokenInput:focus-visible {
+  border-color: var(--scan-cyan);
+  outline: 3px solid rgb(79 201 217 / 18%);
+  outline-offset: 1px;
+}
+
+.error {
+  margin: 0.75rem 0 0;
+  color: var(--scan-primary-text);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.primaryButton {
+  min-height: 3rem;
+  margin-top: 1rem;
+  padding: 0 1rem;
+  border: 1px solid var(--scan-amber);
+  border-radius: 0.55rem;
+  background: var(--scan-amber);
+  color: rgb(0 0 0 / 86%);
+  font: inherit;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.primaryButton:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--scan-amber) 88%, white);
+}
+
+.primaryButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.primaryButton:focus-visible,
+.claimButton:focus-visible {
+  outline: 3px solid rgb(79 201 217 / 38%);
+  outline-offset: 2px;
+}
+
+.authenticatedShell {
+  height: 100dvh;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--scan-workspace);
+}
+
+.runtimeBar {
+  min-height: 2.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: max(0.55rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
+    0.55rem max(1rem, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--scan-divider);
+  background: var(--scan-sidebar);
+  color: var(--scan-primary-text);
+  font-size: 0.82rem;
+}
+
+.runtimeIdentity,
+.observerControls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.runtimeIdentity {
+  font-weight: 700;
+}
+
+.liveDot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--scan-green);
+}
+
+.runtimeBar[data-control="observer"] .liveDot {
+  background: var(--scan-amber);
+}
+
+.runtimeBar[data-control="offline"] .liveDot {
+  background: var(--scan-secondary-text);
+  box-shadow: none;
+}
+
+.controlCopy {
+  color: var(--scan-secondary-text);
+}
+
+.claimButton {
+  min-height: 2rem;
+  padding: 0 0.65rem;
+  border: 1px solid var(--scan-divider);
+  border-radius: 0.4rem;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.appFrame {
+  grid-row: 3;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.runtimeError {
+  grid-row: 2;
+  margin: 0;
+  padding: 0.55rem max(1rem, env(safe-area-inset-right)) 0.55rem
+    max(1rem, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--scan-red-border);
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+@media (max-width: 42rem) {
+  .runtimeBar {
+    align-items: center;
+  }
+
+  .runtimeBar[data-control="observer"] .controlCopy {
+    display: none;
+  }
+
+  .runtimeBar[data-control="owned"] .controlCopy,
+  .runtimeBar[data-control="offline"] .controlCopy {
+    display: block;
+    max-width: 12rem;
+    text-align: right;
+    line-height: 1.25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .primaryButton,
+  .claimButton {
+    transition: none;
+  }
+}

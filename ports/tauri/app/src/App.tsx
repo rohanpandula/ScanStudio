@@ -8,6 +8,8 @@ import FrameDetailView from "./views/FrameDetail/FrameDetailView";
 import ProjectPanel from "./views/ProjectPanel";
 import SetupChecker from "./views/SetupChecker";
 import { sessionStore, type SessionState } from "./session";
+import { isTauriRuntime, isWebSimulatorPreview } from "./runtime";
+import { useScannerControl } from "./scannerControl";
 import styles from "./App.module.css";
 
 let cachedStore: unknown = null;
@@ -46,14 +48,19 @@ function App() {
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const [workspace, setWorkspace] = useState<Workspace>({ kind: "contact" });
   const selectedFrames = state.selectedFrameIndices;
-  const windows = isWindows();
+  const windows = isTauriRuntime() && isWindows();
+  const simulatorPreview = isWebSimulatorPreview();
+  const canControlScanner = useScannerControl();
 
   return (
     <AppShell
       sidebar={
         <>
-          <DeviceBar />
-          <ProjectPanel />
+          <DeviceBar
+            canControl={canControlScanner}
+            showDiagnosticActions={!simulatorPreview}
+          />
+          {!simulatorPreview && <ProjectPanel />}
         </>
       }
       workspace={
@@ -74,8 +81,15 @@ function App() {
           {workspace.kind === "windows-setup" && <SetupChecker />}
           {workspace.kind === "contact" && (
             <ContactSheet
-              onInspectFrame={(frameIndex) => setWorkspace({ kind: "frame-detail", frameIndex })}
-              onCapture={() => setWorkspace({ kind: "capture" })}
+              canControl={canControlScanner}
+              onInspectFrame={
+                simulatorPreview
+                  ? undefined
+                  : (frameIndex) => setWorkspace({ kind: "frame-detail", frameIndex })
+              }
+              onCapture={
+                simulatorPreview ? undefined : () => setWorkspace({ kind: "capture" })
+              }
             />
           )}
         </div>

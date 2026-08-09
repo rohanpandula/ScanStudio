@@ -25,8 +25,8 @@
   flex-direction: column;
   gap: 0.6rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .sectionHeader {
@@ -55,12 +55,12 @@
 
 .fieldLabel {
   font-size: 0.8rem;
-  color: #4b5563;
+  color: var(--scan-secondary-text);
 }
 
 .fieldValue {
   font-size: 0.9rem;
-  color: #111827;
+  color: var(--scan-primary-text);
 }
 
 .textInput,
@@ -70,17 +70,18 @@
   width: 100%;
   box-sizing: border-box;
   padding: 0.35rem 0.5rem;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
   font-size: 0.9rem;
-  background: #ffffff;
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
 }
 
 .textInput:disabled,
 .numberInput:disabled,
 .selectInput:disabled {
-  background: #f3f4f6;
-  color: #6b7280;
+  background: var(--scan-workspace);
+  color: var(--scan-secondary-text);
 }
 
 .fixedWidth {
@@ -105,9 +106,9 @@
   border-radius: 4px;
   font-size: 0.85rem;
   cursor: pointer;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
-  color: #111827;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
 }
 
 .controlButton:disabled,
@@ -118,15 +119,15 @@
 }
 
 .primaryButton {
-  background: #2563eb;
-  border-color: #2563eb;
-  color: #ffffff;
+  background: var(--scan-amber);
+  border-color: var(--scan-amber);
+  color: rgb(0 0 0 / 86%);
 }
 
 .dangerButton {
-  border-color: #b91c1c;
-  color: #b91c1c;
-  background: #ffffff;
+  border-color: var(--scan-red-border);
+  color: var(--scan-primary-text);
+  background: var(--scan-red-fill);
 }
 
 .radioGroup {
@@ -152,16 +153,16 @@
 
 .disabledNote {
   font-size: 0.78rem;
-  color: #6b7280;
+  color: var(--scan-secondary-text);
   margin: 0;
 }
 
 .banner {
   padding: 0.5rem 0.75rem;
   border-radius: 4px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  color: #b91c1c;
+  background: var(--scan-red-fill);
+  border: 1px solid var(--scan-red-border);
+  color: var(--scan-primary-text);
   font-size: 0.85rem;
 }
 
@@ -170,8 +171,8 @@
   flex-direction: column;
   gap: 0.75rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .readonlyList {
@@ -186,8 +187,8 @@
 .argBlock {
   margin: 0;
   padding: 0.5rem 0.6rem;
-  background: #0f172a;
-  color: #e2e8f0;
+  background: var(--scan-thumbnail-well);
+  color: var(--scan-primary-text);
   border-radius: 4px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.75rem;
@@ -205,19 +206,19 @@
   flex-direction: column;
   gap: 0.3rem;
   padding: 0.5rem 0.6rem;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
-  background: #f9fafb;
+  background: var(--scan-raised);
 }
 
 .resultPre {
   margin: 0;
   padding: 0.4rem;
-  background: #ffffff;
-  border: 1px solid #e5e7eb;
+  background: var(--scan-workspace);
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.75rem;
   white-space: pre-wrap;
-  color: #111827;
+  color: var(--scan-primary-text);
 }

@@ -1,0 +1,81 @@
+:root {
+  /* Exact web mappings of ScanStudioTheme.swift's incumbent visual tokens. */
+  --scan-workspace: rgb(7.8% 8.6% 9.4%); /* #141618 at 8-bit display depth */
+  --scan-sidebar: rgb(11% 12.2% 13.3%); /* #1c1f22 */
+  --scan-inspector: rgb(11% 12.2% 13.3%); /* #1c1f22 */
+  --scan-raised: rgb(14.1% 15.3% 16.9%); /* #24272b */
+  --scan-divider: rgb(255 255 255 / 10%);
+  --scan-primary-text: rgb(93.3% 94.5% 94.9%); /* #eef1f2 */
+  --scan-secondary-text: rgb(60.4% 63.9% 65.9%); /* #9aa3a8 */
+  --scan-amber: rgb(91% 63.9% 23.9%); /* #e8a33d */
+  --scan-cyan: rgb(31% 78.8% 85.1%); /* #4fc9d9 */
+  --scan-red: rgb(83.9% 27.1% 27.1%); /* #d64545 */
+  --scan-green: rgb(24.7% 74.9% 43.5%); /* #3fbf6f */
+  --scan-row-label: rgb(255 255 255 / 70%);
+  --scan-section-label: rgb(255 255 255 / 55%);
+
+  /* Native component treatments: tinted tags, hairlines, and dark media wells. */
+  --scan-border-emphasis: rgb(255 255 255 / 14%);
+  --scan-control-hover: rgb(255 255 255 / 7%);
+  --scan-thumbnail-well: rgb(0 0 0 / 34%);
+  --scan-overlay: rgb(0 0 0 / 68%);
+  --scan-amber-fill: rgb(91% 63.9% 23.9% / 18%);
+  --scan-amber-border: rgb(91% 63.9% 23.9% / 50%);
+  --scan-cyan-fill: rgb(31% 78.8% 85.1% / 18%);
+  --scan-cyan-border: rgb(31% 78.8% 85.1% / 50%);
+  --scan-red-fill: rgb(83.9% 27.1% 27.1% / 18%);
+  --scan-red-border: rgb(83.9% 27.1% 27.1% / 50%);
+  --scan-green-fill: rgb(24.7% 74.9% 43.5% / 18%);
+  --scan-green-border: rgb(24.7% 74.9% 43.5% / 50%);
+  --scan-card-radius: 9px;
+  --scan-thumbnail-radius: 6px;
+  --scan-control-radius: 4px;
+
+  color-scheme: dark;
+  color: var(--scan-primary-text);
+  background: var(--scan-workspace);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 20rem;
+  height: 100%;
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+a,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: rgb(79 201 217 / 18%);
+}
+
+:where(button, a, input, select, textarea):focus-visible {
+  outline-color: var(--scan-cyan);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  button,
+  select,
+  input:not([type="checkbox"]):not([type="radio"]) {
+    min-height: 2.75rem;
+  }
+}

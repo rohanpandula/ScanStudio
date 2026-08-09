@@ -23,7 +23,7 @@
 .scannedCount {
   margin-left: auto;
   font-size: 0.85rem;
-  color: #374151;
+  color: var(--scan-row-label);
   font-variant-numeric: tabular-nums;
 }
 
@@ -34,9 +34,9 @@
   letter-spacing: 0.05em;
   padding: 0.15rem 0.5rem;
   border-radius: 999px;
-  border: 1px solid #bfdbfe;
-  background: #eff6ff;
-  color: #1d4ed8;
+  border: 1px solid var(--scan-amber-border);
+  background: var(--scan-amber-fill);
+  color: var(--scan-amber);
 }
 
 .progressRow {
@@ -57,15 +57,15 @@
 .hint {
   margin: 0;
   font-size: 0.8rem;
-  color: #6b7280;
+  color: var(--scan-secondary-text);
 }
 
 .primaryButton {
   padding: 0.45rem 1rem;
   border-radius: 4px;
-  border: 1px solid #2563eb;
-  background: #2563eb;
-  color: #ffffff;
+  border: 1px solid var(--scan-amber);
+  background: var(--scan-amber);
+  color: rgb(0 0 0 / 86%);
   cursor: pointer;
   font-size: 0.95rem;
   font-weight: 600;
@@ -79,9 +79,9 @@
 .dangerButton {
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #fecaca;
-  background: #fef2f2;
-  color: #b91c1c;
+  border: 1px solid var(--scan-red-border);
+  background: var(--scan-red-fill);
+  color: var(--scan-primary-text);
   cursor: pointer;
   font-size: 0.9rem;
 }
@@ -94,8 +94,9 @@
 .controlButton {
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
   font-size: 0.9rem;
 }
@@ -116,30 +117,30 @@
   align-items: center;
   gap: 0.75rem;
   padding: 0.4rem 0.6rem;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
   font-size: 0.9rem;
 }
 
 .frameRow[data-state="completed"] {
-  border-color: #bbf7d0;
-  background: #f0fdf4;
+  border-color: var(--scan-green-border);
+  background: var(--scan-green-fill);
 }
 
 .frameRow[data-state="failed"] {
-  border-color: #fecaca;
-  background: #fef2f2;
+  border-color: var(--scan-red-border);
+  background: var(--scan-red-fill);
 }
 
 .frameRow[data-state="skipped"] {
-  border-color: #e5e7eb;
-  background: #f9fafb;
-  color: #6b7280;
+  border-color: var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-secondary-text);
 }
 
 .frameRow[data-state="active"] {
-  border-color: #bfdbfe;
-  background: #eff6ff;
+  border-color: var(--scan-amber-border);
+  background: var(--scan-amber-fill);
 }
 
 .frameIndex {
@@ -154,19 +155,19 @@
   letter-spacing: 0.05em;
   padding: 0.15rem 0.5rem;
   border-radius: 999px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
 }
 
 .frameError {
   font-size: 0.8rem;
-  color: #b91c1c;
+  color: var(--scan-primary-text);
   overflow-wrap: anywhere;
 }
 
 .receiptSummary {
   margin-left: auto;
-  color: #4b5563;
+  color: var(--scan-secondary-text);
   font-size: 0.75rem;
   overflow-wrap: anywhere;
 }
@@ -193,11 +194,11 @@
 }
 
 .tickerLine {
-  color: #374151;
+  color: var(--scan-row-label);
 }
 
 .tickerError {
-  color: #b91c1c;
+  color: var(--scan-primary-text);
   font-weight: 600;
 }
 
@@ -206,8 +207,8 @@
   flex-direction: column;
   gap: 0.5rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .pendingRow {
@@ -219,15 +220,15 @@
 
 .pendingStats {
   font-size: 0.85rem;
-  color: #374151;
+  color: var(--scan-row-label);
 }
 
 .resumeButton {
   padding: 0.35rem 0.9rem;
   border-radius: 4px;
-  border: 1px solid #2563eb;
-  background: #eff6ff;
-  color: #1d4ed8;
+  border: 1px solid var(--scan-amber-border);
+  background: var(--scan-amber-fill);
+  color: var(--scan-amber);
   cursor: pointer;
   font-size: 0.9rem;
   font-weight: 600;

@@ -73,6 +73,39 @@ jobs:
       - name: Check ports/tauri/vendor mirrors for drift beyond the known baseline
         run: scripts/check_ports_vendor_sync.sh
 
+  web-preview:
+    name: Browser gateway and container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ports/tauri/app/package-lock.json
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+      - name: Test and build the shared browser client
+        working-directory: ports/tauri/app
+        run: |
+          npm ci
+          npm test
+          npm run build:web
+      - name: Test the locked simulator-only gateway
+        working-directory: ports/web
+        run: |
+          uv sync --locked --extra test
+          uv run ruff check .
+          uv run pytest
+      - name: Validate the hardened Compose contract
+        env:
+          SCANSTUDIO_WEB_TOKEN: ci-only-token
+          SCANSTUDIO_WEB_ALLOWED_ORIGINS: http://127.0.0.1:8787
+        run: docker compose -f ports/web/compose.yaml config --quiet
+      - name: Build the simulator appliance image
+        run: docker build -f ports/web/Dockerfile -t scanstudio-web:ci .
+
   package:
     name: Self-contained package build (${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}

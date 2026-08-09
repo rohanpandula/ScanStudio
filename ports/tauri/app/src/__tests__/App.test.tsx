@@ -17,6 +17,10 @@ afterEach(() => {
 const mocks = vi.hoisted(() => ({ sessionStore: null as unknown, invoke: vi.fn() }));
 vi.mock("../session", () => mocks);
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("../runtime", () => ({
+  isTauriRuntime: () => true,
+  isWebSimulatorPreview: () => false,
+}));
 
 const PROJECT: ScanProject = {
   schemaVersion: 4,

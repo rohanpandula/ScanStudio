@@ -18,9 +18,9 @@
   letter-spacing: 0.05em;
   padding: 0.15rem 0.5rem;
   border-radius: 999px;
-  border: 1px solid #fcd34d;
-  background: #fffbeb;
-  color: #92400e;
+  border: 1px solid var(--scan-amber-border);
+  background: var(--scan-amber-fill);
+  color: var(--scan-amber);
 }
 
 .realBadge {
@@ -30,17 +30,17 @@
   letter-spacing: 0.05em;
   padding: 0.15rem 0.5rem;
   border-radius: 999px;
-  border: 1px solid #bbf7d0;
-  background: #f0fdf4;
-  color: #166534;
+  border: 1px solid var(--scan-green-border);
+  background: var(--scan-green-fill);
+  color: var(--scan-green);
 }
 
 .canvas {
   width: 100%;
   aspect-ratio: 1;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--scan-divider);
   border-radius: 4px;
-  background: #111827;
+  background: var(--scan-thumbnail-well);
 }
 
 .marker {
@@ -50,19 +50,19 @@
 .cleanNotice {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #bbf7d0;
-  border-radius: 6px;
-  background: #f0fdf4;
-  color: #166534;
+  border: 1px solid var(--scan-green-border);
+  border-radius: 9px;
+  background: var(--scan-green-fill);
+  color: var(--scan-green);
   font-size: 0.9rem;
 }
 
 .iceOffNotice {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid #fcd34d;
-  border-radius: 6px;
-  background: #fffbeb;
-  color: #92400e;
+  border: 1px solid var(--scan-amber-border);
+  border-radius: 9px;
+  background: var(--scan-amber-fill);
+  color: var(--scan-amber);
   font-size: 0.9rem;
 }

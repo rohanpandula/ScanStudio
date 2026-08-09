@@ -25,8 +25,8 @@
   flex-direction: column;
   gap: 0.5rem;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .deviceModel {
@@ -40,17 +40,24 @@
   letter-spacing: 0.05em;
   padding: 0.1rem 0.4rem;
   border-radius: 999px;
-  background: #f3f4f6;
-  border: 1px solid #e5e7eb;
+  background: var(--scan-cyan-fill);
+  border: 1px solid var(--scan-cyan-border);
+  color: var(--scan-cyan);
 }
 
 .controlButton {
   align-self: flex-start;
   padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
+  border: 1px solid var(--scan-divider);
+  background: var(--scan-raised);
+  color: var(--scan-primary-text);
   cursor: pointer;
+}
+
+.controlButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .statusBlock {
@@ -59,8 +66,8 @@
   gap: 0.35rem;
   margin: 0;
   padding: 0.75rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
+  border: 1px solid var(--scan-divider);
+  border-radius: 9px;
 }
 
 .statusRow {
@@ -71,6 +78,7 @@
 .statusRow dt {
   font-weight: 600;
   min-width: 6rem;
+  color: var(--scan-row-label);
 }
 
 .statusRow dd {

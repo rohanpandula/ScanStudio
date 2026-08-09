@@ -1,8 +1,6 @@
-// Settings scene for the in-app update flow (01-05). Thin SwiftUI: renders
-// `UpdateFlowModel` state and forwards button taps to its async actions. All
-// policy lives in the model (install gated on `jobActive`, up-to-date vs error
-// are distinct states, no auto-relaunch). The scene lives in the executable
-// target so network/app concerns stay out of the ScanStudioKit library.
+// Settings scene for the in-app update flow (01-05) and the optional local
+// browser preview. Thin SwiftUI renders the two host-owned models and forwards
+// actions; update policy and web-process lifecycle stay out of this view.
 
 import AppKit
 import ScanStudioKit
@@ -10,11 +8,71 @@ import SwiftUI
 
 struct UpdateSettingsView: View {
     @Bindable var model: UpdateFlowModel
+    @Bindable var webServerModel: WebServerModel
+    @State private var tokenWasCopied = false
 
     var body: some View {
         Form {
             Section {
                 header
+            }
+
+            Section("Browser preview") {
+                Toggle(
+                    "Run browser preview (simulator only)",
+                    isOn: Binding(
+                        get: { webServerModel.isEnabled },
+                        set: { enabled in
+                            Task { await webServerModel.setEnabled(enabled) }
+                        }
+                    )
+                )
+                .disabled(webServerModel.state == .stopping)
+
+                Text("Starts a local browser UI with its own simulator-only engine. It does not share or control the scanner connected to the native app.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                browserStatus
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Local address")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        Text(webServerModel.browserURL.absoluteString)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                        Spacer(minLength: 8)
+                        Button("Open in Browser") {
+                            NSWorkspace.shared.open(webServerModel.browserURL)
+                        }
+                        .disabled(webServerModel.state != .running)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Access token")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(webServerModel.accessToken)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel("Browser preview access token")
+                        Spacer(minLength: 8)
+                        Button(tokenWasCopied ? "Copied" : "Copy Token") {
+                            copyAccessToken()
+                        }
+                    }
+                }
+
+                Text("Enter the token in the browser. Only browsers on this Mac can connect, and a new token is created each time Scan Studio launches.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Section("Release channel") {
@@ -67,7 +125,7 @@ struct UpdateSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440)
+        .frame(width: 560)
     }
 
     private var header: some View {
@@ -95,6 +153,41 @@ struct UpdateSettingsView: View {
             return "Installed version \(stamp)"
         }
         return "Development build"
+    }
+
+    @ViewBuilder
+    private var browserStatus: some View {
+        switch webServerModel.state {
+        case .off:
+            Label("Off", systemImage: "stop.circle")
+                .foregroundStyle(.secondary)
+        case .starting:
+            ProgressView("Starting browser preview…")
+        case .running:
+            Label("Running locally — simulator only", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(Color.scanStudioGreen)
+        case .stopping:
+            ProgressView("Stopping browser preview…")
+        case .failed(let message):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Browser preview unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(Color.scanStudioRed)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func copyAccessToken() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(webServerModel.accessToken, forType: .string)
+        tokenWasCopied = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            tokenWasCopied = false
+        }
     }
 
     @ViewBuilder

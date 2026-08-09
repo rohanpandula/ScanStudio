@@ -100,6 +100,28 @@ SCANSTUDIO_ENGINE_PATH="$(pwd)/engine/target/release/scanstudio-engine" swift ru
 Set `SCANSTUDIO_TIMESCALE` (default `1.0`) to multiply simulated delays. For
 example, `SCANSTUDIO_TIMESCALE=0.05 make run` provides a fast walkthrough.
 
+### Browser preview toggle (development)
+
+Scan Studio's Settings window can start a loopback-only, simulator-only
+browser preview for the current app session. Prepare the existing web runtime
+and frontend first:
+
+```sh
+cd ../../ports/web && uv sync --locked --extra test
+cd ../tauri/app && npm ci && npm run build:web
+```
+
+When the engine comes from this checkout, the app discovers
+`ports/web/.venv/bin/scanstudio-web` and `ports/tauri/app/dist`. A custom
+development layout can set the exact paths with
+`SCANSTUDIO_WEB_COMMAND_PATH` and `SCANSTUDIO_WEB_STATIC_DIR`.
+
+The release packaging scripts do not bundle these Python/frontend artifacts
+yet. The app-side packaged-resource contract reserves
+`Contents/Resources/WebRuntime/bin/scanstudio-web` and
+`Contents/Resources/WebFrontend` for that later step; until then a packaged
+build reports the missing runtime honestly and leaves the toggle off.
+
 ## Real hardware: LS-5000 through the CoolscanPy bridge
 
 The real-device backend speaks the NDJSON contract in

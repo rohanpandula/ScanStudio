@@ -50,7 +50,10 @@ struct ScanStudioApp: App {
         }
 
         Settings {
-            UpdateSettingsView(model: appDelegate.updateFlowModel)
+            UpdateSettingsView(
+                model: appDelegate.updateFlowModel,
+                webServerModel: appDelegate.webServerModel
+            )
         }
     }
 }
@@ -167,12 +170,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shared in-app update flow (01-05): one instance per app run, handed to
     /// the Settings scene and the launch + 24 h background check.
     let updateFlowModel: UpdateFlowModel
+    /// Optional, session-only browser preview. It always starts off and owns a
+    /// separate simulator engine; it never shares the native scanner session.
+    let webServerModel: WebServerModel
     /// Cancellable handle for the rolling 24 h background check task.
     private var backgroundUpdateTask: Task<Void, Never>?
 
     override init() {
+        var browserEngineURL: URL?
         do {
             let engineURL = try EngineLocator.locate()
+            browserEngineURL = engineURL
             let client = try EngineClient(engineURL: engineURL)
             let diagnosticsDirectory = FileManager.default
                 .homeDirectoryForCurrentUser
@@ -187,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updateFlowModel = Self.makeUpdateFlowModel()
+        webServerModel = WebServerModel(engineURL: browserEngineURL)
         super.init()
 
         // AUT-05-GUARD: mirror the real job-active signal into the update flow
@@ -221,13 +230,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         backgroundUpdateTask?.cancel()
-        guard case .ready(let client, _) = launchState else { return }
+        let client: EngineClient?
+        if case .ready(let readyClient, _) = launchState {
+            client = readyClient
+        } else {
+            client = nil
+        }
         let finished = DispatchSemaphore(value: 0)
+        let webServerModel = webServerModel
         Task.detached {
-            await client.terminate()
+            // AppKit is synchronously waiting on the main thread here, so use
+            // the model's nonisolated process hook. The bounded process
+            // controller escalates after its graceful-shutdown window, which
+            // prevents a gateway from outliving Scan Studio.
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    await webServerModel.stopProcessForApplicationTermination()
+                }
+                if let client {
+                    group.addTask {
+                        await client.terminate()
+                    }
+                }
+            }
             finished.signal()
         }
-        _ = finished.wait(timeout: .now() + 2)
+        _ = finished.wait(timeout: .now() + 6)
     }
 
     private static func describe(_ error: Error) -> String {
