@@ -330,6 +330,21 @@ pub fn validate_staged_receipt_paths(
             ));
         }
     }
+    // Raw export is refused at plan time on the staged lane, so a receipt
+    // reporting raw artifacts is a protocol violation. Refusing it here --
+    // before finalize_receipt moves any staged master into the user's
+    // archive -- beats the post-finalize raw checks, which also fire but
+    // only after files have already been persisted.
+    if let Some(actual) = receipt.raw_export_path.as_deref() {
+        return Err(format!(
+            "bridge receipt reported a raw export {actual:?} for frame {slot}, but raw export is refused on the staged capture path"
+        ));
+    }
+    if let Some(actual) = receipt.raw_export_ir_path.as_deref() {
+        return Err(format!(
+            "bridge receipt reported a raw export IR sidecar {actual:?} for frame {slot}, but raw export is refused on the staged capture path"
+        ));
+    }
     Ok(())
 }
 
@@ -918,6 +933,28 @@ mod tests {
             started_at: None,
             capture_duration_ms: None,
         }
+    }
+
+    #[test]
+    fn staged_receipt_reporting_raw_export_is_refused_before_finalize() {
+        let root = unique_dir("staged-raw-refusal");
+        std::fs::create_dir_all(&root).unwrap();
+        let expected_rgb = "/tmp/scanstudio-wsl-staging/owner/capture-owner-0001.tif";
+
+        let clean = staged_receipt(&root);
+        validate_staged_receipt_paths(expected_rgb, 1, Channels::Rgbi, &clean).unwrap();
+
+        let mut with_raw = staged_receipt(&root);
+        with_raw.raw_export_path = Some("/tmp/evil-raw.dng".into());
+        let error =
+            validate_staged_receipt_paths(expected_rgb, 1, Channels::Rgbi, &with_raw).unwrap_err();
+        assert!(error.contains("staged capture path"), "{error}");
+
+        let mut with_raw_ir = staged_receipt(&root);
+        with_raw_ir.raw_export_ir_path = Some("/tmp/evil-raw_IR.tif".into());
+        let error = validate_staged_receipt_paths(expected_rgb, 1, Channels::Rgbi, &with_raw_ir)
+            .unwrap_err();
+        assert!(error.contains("staged capture path"), "{error}");
     }
 
     #[test]
