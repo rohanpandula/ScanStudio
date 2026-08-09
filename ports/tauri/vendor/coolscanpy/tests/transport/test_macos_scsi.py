@@ -34,8 +34,14 @@ class FakeScsiTarget:
     complete GOOD with no data.
     """
 
-    def __init__(self, responses: dict[int, dict] | None = None) -> None:
+    def __init__(
+        self,
+        responses: dict[int, dict] | None = None,
+        *,
+        fail_step: str | None = None,
+    ) -> None:
         self.responses = responses or {}
+        self.fail_step = fail_step
         self.log: list[tuple] = []
         self._keepalive: list[object] = []
         self.released_tasks = 0
@@ -128,6 +134,8 @@ class FakeScsiTarget:
             fields[name] = fn
 
         def set_cdb(_task, cdb_ptr, size):
+            if self.fail_step == "SetCommandDescriptorBlock":
+                return -1
             self._cdb = bytes(
                 ctypes.cast(
                     cdb_ptr, ctypes.POINTER(ctypes.c_uint8 * size)
@@ -137,12 +145,22 @@ class FakeScsiTarget:
             return 0
 
         def set_sg(_task, sg_ptr, entries, total, direction):
+            if self.fail_step == "SetScatterGatherEntries":
+                return -1
             element = sg_ptr[0]
             self._sg = (element.address, element.length, direction)
             self.log.append(("SetScatterGatherEntries", entries, total, direction))
             return 0
 
+        def set_timeout(_task, _timeout_ms):
+            if self.fail_step == "SetTimeoutDuration":
+                return -1
+            self.log.append(("SetTimeoutDuration", _timeout_ms))
+            return 0
+
         def execute(_task, sense_ptr, status_ptr, transferred_ptr):
+            if self.fail_step == "ExecuteTaskSync":
+                return -1
             script = self.responses.get(self._cdb[0] if self._cdb else -1, {})
             payload = script.get("payload", b"")
             transferred = 0
@@ -170,6 +188,8 @@ class FakeScsiTarget:
             return 0
 
         def service_response(_task, out_ptr):
+            if self.fail_step == "GetSCSIServiceResponse":
+                return -1
             ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_uint32))[0] = (
                 self._service_response
             )
@@ -182,6 +202,7 @@ class FakeScsiTarget:
 
         fields["SetCommandDescriptorBlock"] = types["SetCommandDescriptorBlock"](set_cdb)
         fields["SetScatterGatherEntries"] = types["SetScatterGatherEntries"](set_sg)
+        fields["SetTimeoutDuration"] = types["SetTimeoutDuration"](set_timeout)
         fields["ExecuteTaskSync"] = types["ExecuteTaskSync"](execute)
         fields["GetSCSIServiceResponse"] = types["GetSCSIServiceResponse"](
             service_response
@@ -190,6 +211,7 @@ class FakeScsiTarget:
         self._keepalive += [
             fields["SetCommandDescriptorBlock"],
             fields["SetScatterGatherEntries"],
+            fields["SetTimeoutDuration"],
             fields["ExecuteTaskSync"],
             fields["GetSCSIServiceResponse"],
             fields["Release"],
@@ -259,16 +281,158 @@ def test_exclusive_access_failure_is_fatal_and_named() -> None:
         device.obtain_exclusive_access()
 
 
-def test_task_released_even_when_execution_path_raises() -> None:
+@pytest.mark.parametrize(
+    "step",
+    [
+        "SetCommandDescriptorBlock",
+        "SetScatterGatherEntries",
+        "SetTimeoutDuration",
+        "ExecuteTaskSync",
+        "GetSCSIServiceResponse",
+    ],
+)
+def test_task_released_when_each_post_creation_step_fails(step: str) -> None:
+    target = FakeScsiTarget(fail_step=step)
+    device = device_over(target)
+    device.obtain_exclusive_access()
+    with pytest.raises(MacScsiTransportError, match=step):
+        device.perform_transaction(
+            bytes([0x12, 0, 0, 0, 96, 0]),
+            direction=DATA_TRANSFER_FROM_TARGET,
+            data_in_length=96,
+        )
+    assert target.released_tasks == 1, f"task leaked after {step} failure"
+
+
+def test_invalid_cdb_is_refused_before_any_task_exists() -> None:
     target = FakeScsiTarget()
     device = device_over(target)
     device.obtain_exclusive_access()
     with pytest.raises(MacScsiTransportError, match="CDB length"):
         device.perform_transaction(b"\x00" * 7)
-    # invalid CDB is refused before a task exists; now break a later step
-    original = macos_scsi._TaskVtbl
+    assert ("CreateSCSITask",) not in target.log
     assert target.released_tasks == 0
-    assert original is macos_scsi._TaskVtbl
+
+
+# ---------------------------------------------------------------------------
+# Independent ABI oracle: hard-coded from the SDK headers, NOT derived from
+# the production declarations, so a slot swap or width change in the
+# production vtables fails here even though the fake target would follow it.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_UUIDS = {
+    # SCSITaskLib.h
+    "_UUID_SCSITASK_DEVICE_USER_CLIENT": "7D66678E-08A2-11D5-A1B8-0030657D052A",
+    "_UUID_SCSITASK_DEVICE_INTERFACE": "1BBC4132-08A5-11D5-90ED-0030657D052A",
+    # IOCFPlugIn.h
+    "_UUID_IOCFPLUGIN_INTERFACE": "C244E858-109C-11D4-91D4-0050E4C6426F",
+}
+
+_IUNKNOWN_SLOTS = ["_reserved", "QueryInterface", "AddRef", "Release"]
+
+# SCSITaskLib.h SCSITaskDeviceInterface, header order.
+_EXPECTED_DEVICE_SLOTS = _IUNKNOWN_SLOTS + [
+    "version",
+    "revision",
+    "IsExclusiveAccessAvailable",
+    "AddCallbackDispatcherToRunLoop",
+    "RemoveCallbackDispatcherFromRunLoop",
+    "ObtainExclusiveAccess",
+    "ReleaseExclusiveAccess",
+    "CreateSCSITask",
+]
+
+# SCSITaskLib.h SCSITaskInterface, header order.
+_EXPECTED_TASK_SLOTS = _IUNKNOWN_SLOTS + [
+    "version",
+    "revision",
+    "IsTaskActive",
+    "SetTaskAttribute",
+    "GetTaskAttribute",
+    "SetCommandDescriptorBlock",
+    "GetCommandDescriptorBlockSize",
+    "GetCommandDescriptorBlock",
+    "SetScatterGatherEntries",
+    "SetTimeoutDuration",
+    "GetTimeoutDuration",
+    "SetTaskCompletionCallback",
+    "ExecuteTaskAsync",
+    "ExecuteTaskSync",
+    "AbortTask",
+    "GetSCSIServiceResponse",
+    "GetTaskState",
+    "GetTaskStatus",
+    "GetRealizedDataTransferCount",
+    "GetAutoSenseData",
+    "SetAutoSenseDataBuffer",
+    "ResetForNewTask",
+]
+
+# IOCFPlugIn.h: IUNKNOWN_C_GUTS + IOCFPLUGINBASE.
+_EXPECTED_PLUGIN_SLOTS = _IUNKNOWN_SLOTS + [
+    "version", "revision", "Probe", "Start", "Stop",
+]
+
+
+def test_uuid_constants_match_the_sdk_headers() -> None:
+    for name, canonical in _EXPECTED_UUIDS.items():
+        values = getattr(macos_scsi, name)
+        rendered = "".join(f"{b:02X}" for b in values)
+        expected = canonical.replace("-", "")
+        assert rendered == expected, f"{name} drifted from the SDK header"
+
+
+def test_vtable_slot_order_matches_the_sdk_headers() -> None:
+    assert [n for n, _ in macos_scsi._DeviceVtbl._fields_] == _EXPECTED_DEVICE_SLOTS
+    assert [n for n, _ in macos_scsi._TaskVtbl._fields_] == _EXPECTED_TASK_SLOTS
+    assert [n for n, _ in macos_scsi._IOCFPlugInVtbl._fields_] == _EXPECTED_PLUGIN_SLOTS
+
+
+def test_vtable_struct_sizes_match_compiled_lp64_layout() -> None:
+    # Sizes measured by a C program compiled against the SDK headers on
+    # arm64 (LP64): IOCFPlugInInterface 64, SCSITaskDeviceInterface 88,
+    # SCSITaskInterface 200; CFUUIDBytes 16, SCSITaskSGElement 16 with
+    # fields at offsets 0 and 8.
+    assert ctypes.sizeof(macos_scsi._IOCFPlugInVtbl) == 64
+    assert ctypes.sizeof(macos_scsi._DeviceVtbl) == 88
+    assert ctypes.sizeof(macos_scsi._TaskVtbl) == 200
+    assert ctypes.sizeof(macos_scsi._CFUUIDBytes) == 16
+    assert ctypes.sizeof(macos_scsi._SGElement) == 16
+    assert macos_scsi._SGElement.address.offset == 0
+    assert macos_scsi._SGElement.length.offset == 8
+
+
+def test_close_reports_release_failures_after_finishing_cleanup() -> None:
+    target = FakeScsiTarget()
+    device = device_over(target)
+    device.obtain_exclusive_access()
+
+    release_result = {"value": -1}
+    types = dict(macos_scsi._DeviceVtbl._fields_)
+
+    def failing_release(_self):
+        target.log.append(("ReleaseExclusiveAccess",))
+        return release_result["value"]
+
+    vtbl = macos_scsi._vtbl(target.device_handle, macos_scsi._DeviceVtbl)
+    replacement = types["ReleaseExclusiveAccess"](failing_release)
+    target._keepalive.append(replacement)
+    vtbl.ReleaseExclusiveAccess = replacement
+
+    with pytest.raises(MacScsiTransportError, match="ReleaseExclusiveAccess"):
+        device.close()
+    # cleanup still completed: device handle dropped, second close is a no-op
+    assert not device._device
+    device.close()
+
+
+def test_cli_rejects_malformed_probe_ids() -> None:
+    lines: list[str] = []
+    assert macos_scsi.main(["--probe", "not-a-registry-id"], out=lines.append) == 2
+    assert any("registry id" in line for line in lines)
+    assert macos_scsi.main(["--probe", "-4"], out=lines.append) == 2
+    assert macos_scsi.main(["--probe"], out=lines.append) == 2
+    assert macos_scsi.main(["bogus"], out=lines.append) == 2
 
 
 def test_oversize_transfer_refused_with_chunking_pointer() -> None:

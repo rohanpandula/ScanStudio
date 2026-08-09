@@ -101,10 +101,10 @@ _UUID_SCSITASK_DEVICE_INTERFACE = (
     0x1B, 0xBC, 0x41, 0x32, 0x08, 0xA5, 0x11, 0xD5,
     0x90, 0xED, 0x00, 0x30, 0x65, 0x7D, 0x05, 0x2A,
 )
-# IOCFPlugIn.h: kIOCFPlugInInterfaceID F95BABE5-6624-11D2-8132-000E20CF14BE
+# IOCFPlugIn.h: kIOCFPlugInInterfaceID C244E858-109C-11D4-91D4-0050E4C6426F
 _UUID_IOCFPLUGIN_INTERFACE = (
-    0xF9, 0x5B, 0xAB, 0xE5, 0x66, 0x24, 0x11, 0xD2,
-    0x81, 0x32, 0x00, 0x0E, 0x20, 0xCF, 0x14, 0xBE,
+    0xC2, 0x44, 0xE8, 0x58, 0x10, 0x9C, 0x11, 0xD4,
+    0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F,
 )
 
 
@@ -421,9 +421,12 @@ class _Frameworks:
         self._utf8 = 0x08000100  # kCFStringEncodingUTF8
 
     def cfstr(self, value: str) -> ctypes.c_void_p:
-        return ctypes.c_void_p(
-            self.cf.CFStringCreateWithCString(None, value.encode(), self._utf8)
-        )
+        ref = self.cf.CFStringCreateWithCString(None, value.encode(), self._utf8)
+        if not ref:
+            # CF Create functions may return NULL; passing that onward and
+            # CFRelease-ing it later traps.
+            raise MacScsiTransportError(f"CFStringCreateWithCString({value!r}) failed")
+        return ctypes.c_void_p(ref)
 
     def cf_to_str(self, ref: int | None) -> str | None:
         if not ref:
@@ -492,7 +495,10 @@ def _iter_scsi_task_services(fw: _Frameworks) -> Iterator[int]:
                 pass
             fw.iokit.IOObjectRelease(service)
     finally:
-        fw.iokit.IOObjectRelease(iterator.value)
+        # IOServiceGetMatchingServices may succeed with a NULL iterator
+        # when nothing matched; releasing MACH_PORT_NULL is invalid.
+        if iterator.value:
+            fw.iokit.IOObjectRelease(iterator.value)
 
 
 def list_scsi_task_devices() -> list[ScsiTaskDeviceInfo]:
@@ -596,9 +602,10 @@ class MacScsiTaskDevice:
             ctypes.byref(out),
         )
         if hresult != 0 or not out:
-            self._destroy_plugin()
+            extra = self._destroy_plugin()
             raise MacScsiTransportError(
                 f"QueryInterface(SCSITaskDeviceInterface) failed: {hresult}"
+                + ("; " + "; ".join(extra) if extra else "")
             )
         self._device = out
         return self
@@ -614,26 +621,53 @@ class MacScsiTaskDevice:
             )
         self._exclusive = True
 
-    def close(self) -> None:
+    def close(self, *, raise_on_error: bool = True) -> None:
+        """Release exclusive access, the device interface, and the plug-in.
+
+        All teardown steps always run (a failed exclusive release must not
+        leak the plug-in), their failures are collected, and by default a
+        failure raises AFTER cleanup completes -- silently losing a failed
+        ReleaseExclusiveAccess would leave the in-kernel logical-unit
+        drivers quiesced with nothing telling the user why. A second
+        close() is a no-op.
+        """
+
+        failures: list[str] = []
         if self._device:
             device_vtbl = _vtbl(self._device, _DeviceVtbl)
             if self._exclusive:
-                device_vtbl.ReleaseExclusiveAccess(self._device)
+                status = device_vtbl.ReleaseExclusiveAccess(self._device)
+                if status != 0:
+                    failures.append(
+                        "ReleaseExclusiveAccess failed: "
+                        f"0x{status & 0xFFFFFFFF:08x} (the device may stay "
+                        "quiesced until this process exits or the bus resets)"
+                    )
                 self._exclusive = False
             device_vtbl.Release(self._device)
             self._device = ctypes.c_void_p(None)
-        self._destroy_plugin()
+        failures.extend(self._destroy_plugin())
+        if failures and raise_on_error:
+            raise MacScsiTransportError("; ".join(failures))
 
     def __enter__(self) -> "MacScsiTaskDevice":
         return self
 
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, *exc_info: object) -> None:
+        # During exception unwind, a teardown failure must not mask the
+        # original error; on the clean path it must be heard.
+        self.close(raise_on_error=exc_type is None)
 
-    def _destroy_plugin(self) -> None:
+    def _destroy_plugin(self) -> list[str]:
+        failures: list[str] = []
         if self._plugin and self._fw is not None:
-            self._fw.iokit.IODestroyPlugInInterface(self._plugin)
+            status = self._fw.iokit.IODestroyPlugInInterface(self._plugin)
+            if status != 0:
+                failures.append(
+                    f"IODestroyPlugInInterface failed: 0x{status & 0xFFFFFFFF:08x}"
+                )
             self._plugin = ctypes.c_void_p(None)
+        return failures
 
     def _require_device(self) -> ctypes.c_void_p:
         if not self._device:
@@ -812,15 +846,25 @@ def _format_inquiry(payload: bytes) -> str:
 def main(argv: list[str] | None = None, *, out: Callable[[str], None] = print) -> int:
     """List SCSITask devices; with ``--probe <id>``, run the motion-free probe."""
 
+    usage = "usage: python -m coolscanpy.transport.macos_scsi [--probe <registry-id>]"
     args = list(sys.argv[1:] if argv is None else argv)
     probe_id: int | None = None
     if args and args[0] == "--probe":
         if len(args) != 2:
-            out("usage: python -m coolscanpy.transport.macos_scsi [--probe <registry-id>]")
+            out(usage)
             return 2
-        probe_id = int(args[1], 0)
+        try:
+            probe_id = int(args[1], 0)
+        except ValueError:
+            out(f"--probe expects a registry id (decimal or 0x-hex), got {args[1]!r}")
+            out(usage)
+            return 2
+        if not 0 < probe_id < 1 << 64:
+            out(f"--probe registry id out of range: {args[1]!r}")
+            out(usage)
+            return 2
     elif args:
-        out("usage: python -m coolscanpy.transport.macos_scsi [--probe <registry-id>]")
+        out(usage)
         return 2
 
     devices = list_scsi_task_devices()
