@@ -28,11 +28,14 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-08-07 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md, Rung 4
+    # scan-side wiring): both files gained CaptureBatchRequest/LiveBatchJob's
+    # additive manual_boundary_rows field plus its batch-job.json plumbing.
     "capture_process.py": "6208a95b23bba84ee0903a07a0d583a9840c5332cbdc60f38a4b574a050d24e2",
     "worker.py": "f625057c5619c9ddf94d7e233c6ac9d2a86e300c1a8b1bd8d7f5f03d0eac8c24",
     "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
-    "usb_backend.py": "77499a606dc48049521d2fd0359a0405cb55525242843d61165b642c78841208",
-    "density.py": "be7e1e11635edcc70e150fd7454625a478effbb2446017b2cb56676dcb5ebed9",
+    "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
+    "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
     "packed.py": "856315714e4f7e81f42e1ca93917e4cc0feb03b24915c2ad604302bfdca46f87",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",

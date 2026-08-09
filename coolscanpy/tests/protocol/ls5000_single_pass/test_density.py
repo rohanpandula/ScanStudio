@@ -435,6 +435,53 @@ def test_density_evaluator_uses_first_maximum_and_skips_saturated_rows() -> None
     )
 
 
+def test_correctly_rounded_log10_reproduces_reference_triplet_on_any_libm() -> None:
+    # The density backend must be platform-independent: glibc x86_64 rounds the
+    # red reference input one ULP low via math.log10 (3fd8b159777b9d5e), where
+    # the correctly-rounded value is 3fd8b159777b9d5f. correctly_rounded_log10
+    # must reproduce all three captured reference doubles regardless of the
+    # host libm, so a single pinned reference stays valid on every platform.
+    from coolscanpy.protocol.ls5000_single_pass.density import (
+        correctly_rounded_log10,
+        _ARITHMETIC_REFERENCE_BINARY64_BE_HEX,
+        _ARITHMETIC_REFERENCE_DENOMINATORS,
+        _ARITHMETIC_REFERENCE_NUMERATORS,
+        _ARITHMETIC_REFERENCE_ROW_MEANS,
+        FULL_SCALE,
+    )
+
+    actual = []
+    for numerator, denominator, row_mean in zip(
+        _ARITHMETIC_REFERENCE_NUMERATORS,
+        _ARITHMETIC_REFERENCE_DENOMINATORS,
+        _ARITHMETIC_REFERENCE_ROW_MEANS,
+        strict=True,
+    ):
+        ratio = FULL_SCALE / ((float(numerator) * row_mean) / float(denominator))
+        actual.append(struct.pack(">d", correctly_rounded_log10(ratio)).hex())
+    assert tuple(actual) == _ARITHMETIC_REFERENCE_BINARY64_BE_HEX
+
+    # The exact red-channel ratio whose glibc math.log10 is 1 ULP low: pin the
+    # correctly-rounded result directly so the backend can't silently regress
+    # to a libm passthrough.
+    red_ratio = FULL_SCALE / (
+        (float(_ARITHMETIC_REFERENCE_NUMERATORS[0]) * _ARITHMETIC_REFERENCE_ROW_MEANS[0])
+        / float(_ARITHMETIC_REFERENCE_DENOMINATORS[0])
+    )
+    assert struct.pack(">d", correctly_rounded_log10(red_ratio)).hex() == (
+        "3fd8b159777b9d5f"
+    )
+    # Sanity: correctly-rounded never disagrees with libm by more than 1 ULP.
+    for value in (2.4312216427815936, 10.0, 1.0000000001, 999.999):
+        cr = correctly_rounded_log10(value)
+        assert abs(cr - math.log10(value)) <= abs(cr) * 2**-52 + 5e-324
+
+
+def test_verify_nikon_density_arithmetic_backend_passes_after_fix() -> None:
+    # Must not raise on any host now that the backend is correctly-rounded.
+    verify_nikon_density_arithmetic_backend()
+
+
 def test_archived_density_means_reproduce_all_three_binary64_outputs_exactly() -> None:
     image = _archived_means_source_image()
     wire = _wire_from_image(image)
@@ -699,13 +746,15 @@ def test_runtime_arithmetic_gate_refuses_one_ulp_log10_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     verify_nikon_density_arithmetic_backend()
-    real_log10 = density_module.math.log10
+    real_backend = density_module.correctly_rounded_log10
 
     def drifted_log10(value: float) -> float:
-        return math.nextafter(real_log10(value), math.inf)
+        return math.nextafter(real_backend(value), math.inf)
 
-    monkeypatch.setattr(density_module.math, "log10", drifted_log10)
-    with pytest.raises(RuntimeError, match="not bit-exact"):
+    # The guard now validates the correctly-rounded backend itself (not the
+    # host libm): a 1-ULP drift in that backend must still fail closed.
+    monkeypatch.setattr(density_module, "correctly_rounded_log10", drifted_log10)
+    with pytest.raises(RuntimeError, match="does not reproduce"):
         verify_nikon_density_arithmetic_backend()
 
 
