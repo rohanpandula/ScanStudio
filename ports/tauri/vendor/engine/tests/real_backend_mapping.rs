@@ -98,6 +98,32 @@ fn drain_events(
     events
 }
 
+/// Retries `op` while it returns `ScannerBusy`, up to `deadline`, then
+/// panics with the last error. For asserting that a background drain
+/// EVENTUALLY unblocks an operation: a fixed sleep before the attempt
+/// races the drain worker on loaded CI runners (two main-branch flakes,
+/// 2026-08-09), while polling keeps the same contract without the race.
+/// Any error other than `ScannerBusy` fails immediately.
+fn retry_while_busy<T>(
+    what: &str,
+    deadline: Duration,
+    mut op: impl FnMut() -> Result<T, domain::EngineError>,
+) -> T {
+    let started = Instant::now();
+    loop {
+        match op() {
+            Ok(value) => return value,
+            Err(error) if error.code == ErrorCode::ScannerBusy => {
+                if started.elapsed() > deadline {
+                    panic!("{what} still busy after {deadline:?}: {error:?}");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("{what} failed with a non-busy error: {error:?}"),
+        }
+    }
+}
+
 /// Collects every event that arrives within `duration`, without waiting
 /// for any specific target event — used by the crash test below, where
 /// the exact event sequence isn't pinned down (per Plan 09-03's own
@@ -435,11 +461,13 @@ fn healthy_preview_timeout_quarantines_successors_until_disconnect_and_reconnect
     // The quarantined worker keeps consuming only its own late terminal.
     // Once that terminal has been safely discarded, an explicit disconnect
     // plus reconnect establishes a clean session and a genuinely new preview
-    // may be accepted.
-    std::thread::sleep(Duration::from_millis(600));
-    backend
-        .disconnect()
-        .expect("disconnect should succeed after the predecessor terminal is drained");
+    // may be accepted. The drain runs on a background worker, so poll until
+    // it unblocks disconnect instead of racing it with a fixed sleep.
+    retry_while_busy(
+        "disconnect after the predecessor terminal is drained",
+        GENEROUS_TIMEOUT,
+        || backend.disconnect(),
+    );
     backend
         .connect(DEVICE_ID, &ConnectOptions::default())
         .expect("explicit reconnect should establish a clean preview session");
@@ -816,13 +844,15 @@ fn quarantined_terminal_generation_loss_does_not_strand_poison_gate() {
             && event["payload"]["code"] == "BRIDGE_STREAM_STALLED"
     }));
 
-    // The mock's late terminal arrives at 100ms. Allow its exact discard-only
-    // reader to consume it and exercise the generation-loss hook immediately
-    // before poison finalization.
-    std::thread::sleep(Duration::from_millis(200));
-    backend
-        .connect(DEVICE_ID, &ConnectOptions::default())
-        .expect("the terminal-consuming worker must retire its poisoned reader gate");
+    // The mock's late terminal arrives at 100ms. Its exact discard-only
+    // reader consumes it and exercises the generation-loss hook immediately
+    // before poison finalization on a background worker, so poll until the
+    // gate retires instead of racing it with a fixed sleep.
+    retry_while_busy(
+        "connect after the terminal-consuming worker retires its poisoned reader gate",
+        GENEROUS_TIMEOUT,
+        || backend.connect(DEVICE_ID, &ConnectOptions::default()),
+    );
 }
 
 /// Proves `map_status` forwards `BridgeDeviceStatus.filmPresent` verbatim
