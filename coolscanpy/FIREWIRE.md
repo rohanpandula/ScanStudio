@@ -11,15 +11,23 @@ to scan an LS-9000 through it today.
 
 coolscanpy's client for that surface is
 `coolscanpy.transport.macos_scsi`: a pure-Python (ctypes) SCSITaskLib
-transport. No compiled extension, no extra install.
+transport. No compiled extension, no extra install. On Linux the same
+role is played by `coolscanpy.transport.linux_sg`, a pure-Python client
+for the kernel's v3 `SG_IO` interface over the nodes `firewire-sbp2`
+publishes.
 
 ## What works today
 
-Device discovery, identity, and a motion-free probe:
+Device discovery, identity, and a motion-free probe, on either OS:
 
 ```
 python -m coolscanpy.transport.macos_scsi
 python -m coolscanpy.transport.macos_scsi --probe <registry-id>
+```
+
+```
+python -m coolscanpy.transport.linux_sg
+python -m coolscanpy.transport.linux_sg --probe /dev/sgN
 ```
 
 The probe takes exclusive access, runs TEST UNIT READY, INQUIRY, and
@@ -105,7 +113,9 @@ re-verified at v0.3.0: the table moved from `src/devices.rs` to
 - If another client (VueScan, a stale probe) holds the device,
   exclusive access fails with a named error -- close the other client
   first.
-- On Linux, none of this is needed: the kernel's own `firewire-sbp2`
-  exposes the same scanners as SCSI devices, nkscan drives a real
-  LS-9000 that way today, and the long-term plan for FireWire units
-  remains Linux-first (issue #16 discussion).
+- On Linux, none of the ASFireWire requirements apply: the kernel's own
+  `firewire-sbp2` exposes the same scanners as SCSI devices, nkscan
+  drives a real LS-9000 that way today, and the long-term plan for
+  FireWire units remains Linux-first (issue #16 discussion).
+  coolscanpy's probe runs there through `linux_sg` with no extra
+  install; the same paste-the-output ask in issue #28 applies.
