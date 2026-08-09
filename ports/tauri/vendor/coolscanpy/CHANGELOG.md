@@ -2,23 +2,34 @@
 
 ## Unreleased
 
-C-41 derivatives now identify their color and physical scale correctly.
-Positive TIFFs and preview JPEGs embed a deterministic, ScanStudio-authored
-ICC profile compatible with the Adobe RGB (1998) color space. Full-resolution
-Positive TIFFs also carry the capture recipe's real pixels-per-inch value,
-while downsampled previews do not falsely claim the capture resolution.
-Positive-film, Kodachrome, and black-and-white derivatives remain unlabelled
-unless their render path actually has that color contract. Archival masters
-are never rewritten by this metadata correction.
+- macOS SCSI transport for FireWire Coolscans (`coolscanpy.transport.macos_scsi`):
+  pure-ctypes SCSITaskLib client targeting the ASFireWire DriverKit stack, with
+  device discovery, identity, a motion-free probe CLI, and the 1 MB per-task
+  chunking policy. Scanning on the FireWire models stays deliberately refused
+  until real-hardware captures confirm the command set (FIREWIRE.md, issue #28).
 
-Real capture receipts now record an authoritative per-frame UTC start and
-duration instead of substituting receipt-arrival time and zero milliseconds.
-The measured interval begins after frame selection and binding, includes
-metering, exposure and focus, acquisition, durable raw validation, decode, and
-capture quality checks, and excludes session setup, inter-frame waits, release,
-bridge delivery, and derivative rendering. The timing survives CoolscanPy,
-bridge, engine, manifest, and app boundaries. Legacy receipts remain valid and
-show their absent timing as not recorded rather than inventing a value.
+## 0.3.0 - 2026-08-08
+
+Raw negative export writers: a 16-bit LinearRaw DNG (DNG 1.4, uncompressed,
+untouched negative) with the infrared plane embedded as a marked grayscale
+SubIFD, plus linear TIFF variants -- IR as a fourth channel, IR as a
+separate sidecar file, or RGB-only. Atomic, fail-closed writes; containers
+are parsed back tag-by-tag in tests and verified sample-for-sample. Written
+for ScanStudio's raw export feature; the encoder API is scanning-agnostic
+(ScanResult in, file out).
+
+## 0.2.1 - 2026-08-08
+
+The power-on housekeeping-collapse acceptance is one-sided only: exactly
+one parity may transition onto the other parity's record, and the other
+parity must be stable across the whole capture. The two-sided swap -- the
+signature of a one-row slip in the scanner's row generator, which would
+silently displace every later frame by one index row -- refuses exactly as
+it did before 0.2.0. Found by post-release adversarial review; the live
+power-on shape is unaffected. The preview-failure teardown also uses the
+already-resolved adapter rather than re-resolving inside the handler.
+
+## 0.2.0 - 2026-08-08
 
 A failed roll preview can no longer strand its capture worker holding the
 scanner's USB claim. `Roll.preview()` spawns the `--preview-and-hold` child,
@@ -44,22 +55,9 @@ Whole-roll preview now keeps a content-supported leading frame when an
 otherwise valid feed places its fitted start exactly one 97-dpi preview row
 before the captured raster. The thumbnail is clamped to row zero, its
 same-capture transport origin is inferred from the validated interior mapping,
-and the frame remains blocked on explicit manual review. When enough of a
-leading frame remains to prove it exists but two or more rows fall outside the
-captured raster, preview now refuses with a typed deeper-refeed instruction
-instead of silently presenting a six-exposure strip as five. It also refuses
-to clamp that missing origin into the transport table, which would scan a
-cropped first frame and overlap the second. Clips with less than half a frame
-visible remain excluded as non-addressable edge material, while cells that
-meet the strict clear-film contract remain ordinary leader rather than being
-misreported as a clipped exposure.
-
-Transparent macOS app bundles can now pin PyUSB to an app-owned libusb
-without pretending the interpreter is PyInstaller-frozen. The resolver accepts
-only the fixed `*.app/Contents/Resources/BridgeRuntime/python/bin` interpreter
-layout when this CoolscanPy source is inside the same signed app, loads only a
-regular library under that app's `Contents/Frameworks`, and fails closed if it
-is missing. Ordinary source installs retain normal host-library lookup.
+and the frame remains blocked on explicit manual review; clips of two or more
+rows are still excluded fail-closed. This prevents a six-exposure strip from
+being silently presented as five after a one-row feed variation.
 
 C-41 fine scans now expose RGB the way Nikon Scan would. The meter loop's
 own converged solve consistently landed 6–9 % brighter than Nikon's
