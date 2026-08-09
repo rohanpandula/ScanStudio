@@ -42,8 +42,10 @@ For the archived source, rows 75 through 224 yield selected means
 ``(33182.166666666664, 29120.114583333332, 22777.90625)``.  Together with the
 three calibration numerators and the source-pass ``f03`` triplet
 ``(70307, 136614, 125470)``, they reproduce Nikon's captured density doubles.
-Preserving Nikon's multiply/divide/divide operation order before macOS
-``log10`` matches all three binary64 results exactly.
+Preserving Nikon's multiply/divide/divide operation order and taking a
+correctly-rounded ``log10`` (:func:`correctly_rounded_log10`, not the host
+libm, which is 1 ULP off on some platforms) matches all three binary64
+results exactly on any host.
 
 The separate 285-dpi RGBI pass is the analyzer/builder raster, not the density
 source.  Its ``f02``/final-fine exposure triplet must remain a distinct field
@@ -57,6 +59,7 @@ import json
 import math
 import struct
 from dataclasses import dataclass
+from decimal import Decimal, localcontext
 
 import numpy as np
 
@@ -188,14 +191,39 @@ def _require_u32(value: object, label: str) -> int:
     return value
 
 
-def verify_nikon_density_arithmetic_backend() -> None:
-    """Fail closed when this host's binary64/libm result is not Nikon-exact.
+def correctly_rounded_log10(value: float) -> float:
+    """Round-half-even float64 ``log10(value)``, independent of the host libm.
 
-    The recovered multiply/divide/divide order alone is insufficient on a
-    platform whose ``log10`` rounds the green reference input one ULP away
-    from the captured Nikon result.  Replaying all three pinned reference
-    inputs at runtime makes that platform dependency explicit before any
-    density result can be promoted.
+    ``math.log10`` is not correctly rounded on every platform: glibc x86_64
+    rounds the red Nikon density reference input one ULP low
+    (``3fd8b159777b9d5e`` vs the correctly-rounded ``3fd8b159777b9d5f``),
+    which broke byte-exact density off the reference platform. Computing in
+    wide-precision ``Decimal`` and letting ``float()`` round to the nearest
+    double yields the correctly-rounded result on any host -- bit-identical
+    to the doubles captured on the reference platform, where ``math.log10``
+    already happened to be correctly rounded. This runs three times per scan
+    (once per channel) on a scalar, so the ``Decimal`` cost is irrelevant.
+
+    ``value`` is a finite float64, so ``Decimal(value)`` is its exact value;
+    60 digits keeps the ln/ln10 quotient far enough from any rounding
+    boundary that the final ``float()`` is correctly rounded.
+    """
+
+    with localcontext() as ctx:
+        ctx.prec = 60
+        return float(Decimal(value).ln() / Decimal(10).ln())
+
+
+def verify_nikon_density_arithmetic_backend() -> None:
+    """Fail closed unless the correctly-rounded log10 reproduces the refs.
+
+    The recovered multiply/divide/divide order plus a correctly-rounded
+    ``log10`` (:func:`correctly_rounded_log10`) must reproduce all three
+    pinned Nikon reference doubles exactly. Replaying them at runtime keeps
+    the invariant explicit before any density result can be promoted, and
+    catches a regression in the rounding backend on any platform. The single
+    reference is valid on every host because the backend is now
+    platform-independent, not the host libm.
     """
 
     actual: list[str] = []
@@ -208,11 +236,11 @@ def verify_nikon_density_arithmetic_backend() -> None:
         product = float(numerator) * row_mean
         quotient = product / float(denominator)
         ratio = FULL_SCALE / quotient
-        actual.append(struct.pack(">d", math.log10(ratio)).hex())
+        actual.append(struct.pack(">d", correctly_rounded_log10(ratio)).hex())
     if tuple(actual) != _ARITHMETIC_REFERENCE_BINARY64_BE_HEX:
         raise RuntimeError(
-            "host math.log10 is not bit-exact for the Nikon density reference "
-            f"triplet: got {tuple(actual)!r}"
+            "correctly-rounded log10 does not reproduce the Nikon density "
+            f"reference triplet: got {tuple(actual)!r}"
         )
 
 
@@ -1647,7 +1675,7 @@ def evaluate_nikon_density(
             raise ValueError(
                 f"{CHANNELS[index]} density ratio is not positive and finite"
             )
-        raw = math.log10(ratio)
+        raw = correctly_rounded_log10(ratio)
         if not math.isfinite(raw):
             raise ValueError(f"{CHANNELS[index]} density is not finite")
         lower, upper = _DENSITY_RANGES[index]
