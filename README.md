@@ -65,12 +65,13 @@ app, so installing ScanStudio does not require Homebrew, SANE, or a Nikon
 driver. The optional software-eject and legacy plain-scan paths still need a
 system SANE backend.
 
-The driver inside the app is also a standalone Python package:
-[`pip install coolscanpy`](https://pypi.org/project/coolscanpy/). Every
+You do not need Python or pip to use ScanStudio -- the driver is built into
+the app. For people who want the driver without the app (scripting, or
+running the FireWire probe standalone), it is also published as
+[`pip install coolscanpy`](https://pypi.org/project/coolscanpy/), and every
 ScanStudio release ships in lockstep with the matching coolscanpy release --
 the release pipeline refuses to build until the exact bundled driver is
-published -- so a pip user and an app user always run the same driver
-generation.
+published -- so both kinds of user always run the same driver generation.
 
 ## What it does
 
