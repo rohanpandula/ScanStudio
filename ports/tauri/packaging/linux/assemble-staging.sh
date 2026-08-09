@@ -149,6 +149,23 @@ else
     printf '%s\n' 'skipping python-sane build on non-Linux staging host; strict Linux verification requires it'
 fi
 
+# (4b) Make the curated site-packages and the GPL coolscanpy source resolvable
+# by the bundled interpreter's OWN default sys.path. The bridge process injects
+# these two directories at runtime, but the capture worker is spawned as an
+# isolated `python -I -B` child (protocol/ls5000_single_pass/capture_process.py)
+# that inherits none of that injection -- so without this it dies with
+# `ModuleNotFoundError: No module named 'coolscanpy'` (and would then miss numpy
+# et al. too) and no real preview/scan can run. `-I` implies `-E -s -P` but not
+# `-S`, so site.py still processes this .pth. Paths are derived from sys.prefix
+# at startup because the AppImage mountpoint (/tmp/.mount_*) is only known then.
+# coolscanpy is NOT copied here: it stays solely under CorrespondingSource so
+# the GPL corresponding-source boundary is unchanged.
+INTERP_SITE_PACKAGES="$STAGING_ROOT/BridgeRuntime/python/lib/python3.13/site-packages"
+require_directory "bundled interpreter site-packages" "$INTERP_SITE_PACKAGES"
+cat > "$INTERP_SITE_PACKAGES/scanstudio-bridge-runtime.pth" <<'PTH'
+import os,sys; _br=os.path.dirname(sys.prefix); _p=[os.path.join(_br,'site-packages'),os.path.join(os.path.dirname(_br),'CorrespondingSource','coolscanpy','src')]; sys.path[:0]=[q for q in _p if os.path.isdir(q) and q not in sys.path]
+PTH
+
 # (5) per-wheel license collection.
 collect_python_wheel_licenses "$SITE_PACKAGES_DIR" "$STAGING_ROOT/Licenses/python-wheels"
 
