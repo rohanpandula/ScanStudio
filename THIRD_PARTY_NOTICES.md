@@ -42,11 +42,14 @@ operation failure, never a simulated successful connection.
 
 CoolscanPy's USB discovery recognizes Nikon Coolscan units by vendor/product id.
 The PID-to-model mapping (LS-40 `04b0:4000`, LS-50 `04b0:4001`, LS-5000
-`04b0:4002`) is referenced from the `nkscan` project by activexray, licensed
-Apache-2.0, at commit `87a1724886f8262e7791731ca055aa00ad6632fb`
-(`src/scanners/ls40.rs`, `src/scanners/ls50/mod.rs`, `src/scanners/ls5000/mod.rs`;
-`src/devices.rs` round-trip tests). This is a reference to the USB identity
-facts only; no `nkscan` source code is vendored.
+`04b0:4002`) is referenced from the `nkscan` project by activexray,
+dual-licensed MIT OR Apache-2.0, at commit
+`87a1724886f8262e7791731ca055aa00ad6632fb` (`src/scanners/ls40.rs`,
+`src/scanners/ls50/mod.rs`, `src/scanners/ls5000/mod.rs`;
+`src/devices.rs` round-trip tests), and re-verified at tag `v0.3.0`,
+where the table lives in `src/protocol/model.rs` with the same ids.
+This is a reference to the USB identity facts only; no `nkscan` source
+code is vendored.
 
 ## ASFireWire behavioral reference (FireWire Coolscans)
 

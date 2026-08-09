@@ -78,6 +78,8 @@ _USB_FALLBACK_ID_PREFIX = "usb"
 # from memory: LS-40 = 0x4000 (Coolscan IV), LS-50 = 0x4001 (Coolscan V),
 # LS-5000 = 0x4002 (Coolscan 5000 ED). FireWire models (LS-8000/9000/4000)
 # expose no USB ids and are found by SCSI only, so they are out of scope here.
+# Re-verified at tag v0.3.0 (2026-08-09): the table moved to
+# src/protocol/model.rs; the ids are unchanged.
 # Of which only the LS-5000 (0x4002) is driven; the other models are listed
 # by discovery as recognized-but-unsupported (labeled, never connectable).
 _NIKON_COOLSCAN_USB_MODELS: dict[int, dict[int, str]] = {
