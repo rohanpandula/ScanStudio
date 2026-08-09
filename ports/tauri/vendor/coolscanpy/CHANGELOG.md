@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-09
+
+- Linux SG_IO transport for FireWire Coolscans
+  (`coolscanpy.transport.linux_sg`): the Linux twin of `macos_scsi`, a
+  pure-ctypes client for the kernel's v3 `SG_IO` interface over the
+  `/dev/sg*` nodes `firewire-sbp2` publishes. Same surface as the macOS
+  lane -- sysfs discovery with the Nikon identity filter, an exclusive
+  `O_EXCL` claim, a fail-closed synchronous transaction primitive, a
+  motion-free probe CLI, and the shared 1 MB chunking policy. Struct
+  layout and constants are transcribed from the kernel v6.6 headers, with
+  an independent LP64 ABI oracle in the tests. Scanning on the FireWire
+  models stays deliberately refused pending real-hardware captures
+  (FIREWIRE.md, issue #28).
+- Density arithmetic is now bit-exact on any libm. `math.log10` is not
+  correctly rounded on every platform (glibc x86_64 rounds the red Nikon
+  density reference input one ULP low), which broke byte-exact density off
+  the reference platform. The density path now uses a correctly-rounded
+  `log10` (60-digit `Decimal`, round-to-nearest-double); it is
+  byte-identical on macOS-arm64 (already correctly rounded) and corrects
+  glibc, so a single pinned reference is valid on every host.
+
 ## 0.4.0 - 2026-08-09
 
 - macOS SCSI transport for FireWire Coolscans (`coolscanpy.transport.macos_scsi`):
