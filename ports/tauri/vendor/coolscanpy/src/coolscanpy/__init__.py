@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - only when the package isn't installed
     # Linux preview packages run directly from CorrespondingSource, where
     # distribution metadata is intentionally absent. Keep this fallback
     # aligned with pyproject.toml for accurate startup provenance.
-    __version__ = "0.3.0"
+    __version__ = "0.4.0"
 
 from coolscanpy._device import Device, get_devices, open
 from coolscanpy._roll import Roll

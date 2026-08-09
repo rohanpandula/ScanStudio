@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-09
+
 - macOS SCSI transport for FireWire Coolscans (`coolscanpy.transport.macos_scsi`):
   pure-ctypes SCSITaskLib client targeting the ASFireWire DriverKit stack, with
   device discovery, identity, a motion-free probe CLI, and the 1 MB per-task
