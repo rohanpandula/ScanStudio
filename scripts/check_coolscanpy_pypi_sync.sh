@@ -15,30 +15,35 @@
 #
 # The vendored tree deliberately diverges from the published package in a
 # small, documented set of files (ScanStudio-specific behavior that must
-# not ship to standalone users). Those files are exempt from the byte
-# comparison here; their drift is governed by the crossing checklist
-# (see ScanStudioCloseout/MULTIBATCH-CROSSING-20260807.md) instead.
+# not ship to standalone users). Each exemption is pinned to the sha256 of
+# BOTH sides, so an exempt file cannot quietly drift on either side: any
+# change to it fails this gate until the divergence is re-reviewed and the
+# pin updated (crossing checklist:
+# ScanStudioCloseout/MULTIBATCH-CROSSING-20260807.md).
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-VENDORED_DIRS="coolscanpy/src/coolscanpy"
-# Each entry names WHY it diverges; anything not listed must match the
-# published package byte-for-byte, which is how this gate catches sync lag.
+VENDORED_DIR="coolscanpy/src/coolscanpy"
+# relpath|vendored-sha256|published-sha256 -- one entry per deliberate
+# divergence, with WHY it diverges. Paths are exact, relative to the
+# src/coolscanpy root; anything not listed must match byte-for-byte.
+# Re-pin: shasum -a 256 <both files>, update the entry in the same change
+# that alters the file.
 KNOWN_VENDORED_DIVERGENCE=(
   # required scanner_identity + capture-timing feature
-  "protocol/ls5000_single_pass/worker.py"
+  "protocol/ls5000_single_pass/worker.py|f625057c5619c9ddf94d7e233c6ac9d2a86e300c1a8b1bd8d7f5f03d0eac8c24|f5f12eebea1cb20c599e9adbd919599eb7143c649dc972cbf6e2bf7d243556d3"
   # LeadingFrameClippedError + confident-clear-film gate
-  "protocol/ls5000_single_pass/roll_index.py"
+  "protocol/ls5000_single_pass/roll_index.py|ae64e28a5d7e442cc368995b47c60ea1097f95f272fff558e93c7fc50800a5ef|ab84fc59ad08ab411f266d56960eabb066b62a3a1082dee3491e58ea77d5a4c5"
   # its export surface for the class above
-  "protocol/ls5000_single_pass/__init__.py"
+  "protocol/ls5000_single_pass/__init__.py|ce8aa97b707f5ef83f96128b378722191f7280bd41c1f3acbb04c75e3ea7523e|1f0f324034a95e2c8ca772ce52a78a800b0bf215d3ae4ec77422b08b1376856c"
   # pins differ because the two files above differ
-  "protocol/ls5000_single_pass/bundle.py"
+  "protocol/ls5000_single_pass/bundle.py|7c6d2afdf7835027cb6e96f0b91d74fcc2d2909fc0d26f4e0e9ebc62987c5a86|b96e91ebc65db338a8125625b30878780e2200e62048a8ba89d84f05dce5012d"
   # packaged-app libusb resolution (app bundles its own signed binary)
-  "protocol/ls5000_single_pass/usb_backend.py"
+  "protocol/ls5000_single_pass/usb_backend.py|afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62|666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1"
   # capture-timing receipt fields (started_at/duration)
-  "src/coolscanpy/_roll.py"
-  "capture/single_pass_workflow.py"
-  "src/coolscanpy/types.py"
+  "_roll.py|06e6706bd067602e9577340f330b80064185fffc072c5f7da3256e56d866b501|c3c5f9f4f5c18e0dde17d426091b481defb8aff239fc7540a22e62123c822437"
+  "capture/single_pass_workflow.py|a5a01b15ff50df9a6f78d1c2c4f39d10548e7651cf3365e8698d479b633b5914|c8d93dce3c7de3b585c2d051b7d09054802a130797c590c97b36b78889def15c"
+  "types.py|1343c93c03ade64f0927602fe8e8e25353bada6b1b8a919ce9084c5cbcb321de|f853b8dde9c4a6c3b7ce96195d320c7ba9c88839019bed9ce55fe444ea08e54a"
 )
 
 workdir="$(mktemp -d)"
@@ -69,22 +74,79 @@ if [ -z "$published_src" ]; then
   exit 1
 fi
 
-fail=0
-raw="$(diff -rq --exclude='__pycache__' --exclude='*.pyc' \
-  "$published_src" "$VENDORED_DIRS" 2>&1 || true)"
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  exempt=0
-  for known in "${KNOWN_VENDORED_DIVERGENCE[@]}"; do
-    case "$line" in *"$known"*) exempt=1 ;; esac
-  done
-  if [ "$exempt" = 0 ]; then
-    echo "::error::driver differs from the published PyPI package: $line"
-    fail=1
-  fi
-done <<EOF
-$raw
-EOF
+printf '%s\n' "${KNOWN_VENDORED_DIVERGENCE[@]}" > "$workdir/exemptions"
+if PUBLISHED_SRC="$published_src" VENDORED_DIR="$VENDORED_DIR" \
+  python3 - "$workdir/exemptions" <<'PY'
+import hashlib, os, sys
+
+published = os.environ["PUBLISHED_SRC"]
+vendored = os.environ["VENDORED_DIR"]
+exemptions = {}
+with open(sys.argv[1]) as handle:
+    for line in handle:
+        line = line.strip()
+        if not line:
+            continue
+        rel, v_sha, p_sha = line.split("|")
+        exemptions[rel] = (v_sha, p_sha)
+
+def tree(root):
+    found = set()
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in files:
+            if name.endswith(".pyc"):
+                continue
+            found.add(os.path.relpath(os.path.join(base, name), root))
+    return found
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+fail = False
+def error(message):
+    global fail
+    print(f"::error::{message}")
+    fail = True
+
+for rel in sorted(tree(published) | tree(vendored) | set(exemptions)):
+    v_path = os.path.join(vendored, rel)
+    p_path = os.path.join(published, rel)
+    v_exists = os.path.isfile(v_path)
+    p_exists = os.path.isfile(p_path)
+    if rel in exemptions:
+        v_pin, p_pin = exemptions[rel]
+        if not v_exists or not p_exists:
+            error(f"exempt driver file {rel} is missing on one side "
+                  f"(vendored: {v_exists}, published: {p_exists})")
+            continue
+        v_now, p_now = sha256(v_path), sha256(p_path)
+        if v_now != v_pin or p_now != p_pin:
+            error(f"exempt driver file {rel} changed since its divergence "
+                  f"was last reviewed (vendored {v_now[:12]} vs pinned "
+                  f"{v_pin[:12]}, published {p_now[:12]} vs pinned "
+                  f"{p_pin[:12]}); re-review the divergence and re-pin it "
+                  f"in scripts/check_coolscanpy_pypi_sync.sh")
+    elif not v_exists:
+        error(f"driver file {rel} is on PyPI but missing from the vendored tree")
+    elif not p_exists:
+        error(f"driver file {rel} is vendored but missing from the published PyPI package")
+    else:
+        with open(v_path, "rb") as v_handle, open(p_path, "rb") as p_handle:
+            if v_handle.read() != p_handle.read():
+                error(f"driver file {rel} differs from the published PyPI package")
+
+sys.exit(1 if fail else 0)
+PY
+then
+  fail=0
+else
+  fail=1
+fi
 
 vendored_version="$(python3 -c "
 import tomllib
@@ -101,8 +163,8 @@ if [ "$fail" = 1 ]; then
   echo "coolscanpy release from the canonical repo (rohanpandula/coolscanpy,"
   echo "port/cross-platform) FIRST -- same round, same generation, no delta"
   echo "-- then re-run this release. Deliberately ScanStudio-only files are"
-  echo "exempt and listed in this script."
+  echo "exempt, sha256-pinned, and listed in this script."
   exit 1
 fi
 
-echo "OK: vendored driver matches PyPI coolscanpy $pypi_version (exempt files aside)"
+echo "OK: vendored driver matches PyPI coolscanpy $pypi_version (exempt files pinned)"
