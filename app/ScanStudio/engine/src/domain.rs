@@ -800,17 +800,29 @@ pub enum PartialDate {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataSet {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lens: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub film_stock: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<FilmProcess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iso: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date: Option<PartialDate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub photographer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copyright: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_number: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     #[serde(default)]
     pub keywords: Vec<String>,
@@ -1396,6 +1408,32 @@ mod tests {
             },
         });
         round_trip(&OutputRecipe::default());
+    }
+
+    #[test]
+    fn empty_metadata_set_omits_unset_optionals_so_the_frontend_validator_accepts_it() {
+        // The webview's isMetadataSet treats a present-but-null optional as
+        // invalid (it expects the key absent when unset). Emitting `null` for
+        // every field made isScanProject reject a freshly created project, so
+        // the Preview button never appeared. A default MetadataSet must
+        // serialize with only `keywords`; every other field is omitted.
+        let value = serde_json::to_value(MetadataSet::default()).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["keywords"],
+        );
+        assert_eq!(object["keywords"], json!([]));
+        // A populated field is still emitted, and both shapes round-trip.
+        let populated = MetadataSet {
+            camera: Some("Nikon".into()),
+            ..MetadataSet::default()
+        };
+        let populated_value = serde_json::to_value(&populated).unwrap();
+        assert_eq!(populated_value["camera"], json!("Nikon"));
+        assert!(!populated_value.as_object().unwrap().contains_key("lens"));
+        round_trip(&MetadataSet::default());
+        round_trip(&populated);
     }
 
     #[test]
