@@ -129,6 +129,20 @@ if [[ "$host_is_linux" -eq 1 ]]; then
         printf 'FAIL  isolated bridge + python-sane import\n' >&2
         failures=$((failures + 1))
     fi
+    # The capture worker is spawned as `python -I -B` with NO path injection
+    # (protocol/ls5000_single_pass/capture_process.py), so it must resolve
+    # coolscanpy + its whole runtime chain from the interpreter's own default
+    # sys.path -- the scanstudio-bridge-runtime.pth is what makes that true.
+    # This is the check whose absence let the packaging gap ship: the injected
+    # import above passes even when the worker cannot start. Import the worker
+    # module itself, exactly as the child does, with no argv paths.
+    worker_bootstrap='import coolscanpy, numpy, cv2, tifffile, sane, usb; import coolscanpy.protocol.ls5000_single_pass.worker'
+    if "$root/BridgeRuntime/python/bin/python3.13" -I -B -c "$worker_bootstrap" 2>/dev/null; then
+        printf 'PASS  isolated capture-worker import (no path injection)\n'
+    else
+        printf 'FAIL  isolated capture-worker import (no path injection) -- coolscanpy/deps not on the bundled interpreter default path\n' >&2
+        failures=$((failures + 1))
+    fi
     if [[ -x "$root/scanstudio-bridge" ]] \
         && timeout 15s "$root/scanstudio-bridge" --version </dev/null >/dev/null 2>&1; then
         printf 'PASS  bundled bridge launch/import smoke\n'
