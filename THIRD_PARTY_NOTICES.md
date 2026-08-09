@@ -48,6 +48,20 @@ Apache-2.0, at commit `87a1724886f8262e7791731ca055aa00ad6632fb`
 `src/devices.rs` round-trip tests). This is a reference to the USB identity
 facts only; no `nkscan` source code is vendored.
 
+## ASFireWire behavioral reference (FireWire Coolscans)
+
+CoolscanPy's macOS SCSI transport (`coolscanpy.transport.macos_scsi`)
+targets the ASFireWire DriverKit FireWire stack by mrmidi
+(https://github.com/mrmidi/ASFireWire, licensed Apache-2.0), which
+publishes FireWire SBP-2 scanners as standard macOS SCSI devices. Two
+behavioral facts of that stack are encoded here: that its scanners are
+reached through Apple's SCSITaskLib surface, and its 1 MB per-SCSI-task
+transfer ceiling (its `kMaxTransferPerTask`), which the transport's
+chunking policy mirrors. This is a reference to interface and limit
+facts only; no ASFireWire source code is vendored. The Apple interface
+declarations themselves (UUIDs, vtable layouts, structs) are transcribed
+from the macOS SDK headers.
+
 ## Rust engine dependencies
 
 The macOS app package includes the Rust engine, and its compiled binary includes Rust dependency code. The current locked dependency set uses the licenses shown below. `Cargo.lock` is the source of the version set; these SPDX expressions come from the resolved package metadata.
