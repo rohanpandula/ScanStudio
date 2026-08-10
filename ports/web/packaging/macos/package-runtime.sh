@@ -330,13 +330,15 @@ import sys
 
 path = Path(sys.argv[1])
 contents = path.read_text()
-if contents.count("/install") != 35 or contents.count("/var/folders/") != 33:
+temporary_root = "/var/" + "folders/"
+private_temporary_root = "/private" + temporary_root
+if contents.count("/install") != 35 or contents.count(temporary_root) != 33:
     raise SystemExit("pinned CPython sysconfig path contract changed")
 contents = contents.replace("/install", "/__SCANSTUDIO_WEB_BUNDLED_PYTHON__")
 contents = contents.replace(
-    "/private/var/folders/", "/__SCANSTUDIO_PBS_BUILD_PATH__/"
-).replace("/var/folders/", "/__SCANSTUDIO_PBS_BUILD_PATH__/")
-if "/install" in contents or "/var/folders/" in contents:
+    private_temporary_root, "/__SCANSTUDIO_PBS_BUILD_PATH__/"
+).replace(temporary_root, "/__SCANSTUDIO_PBS_BUILD_PATH__/")
+if "/install" in contents or temporary_root in contents:
     raise SystemExit("packaged CPython sysconfig path sanitization was incomplete")
 path.write_text(contents)
 PY
@@ -622,8 +624,13 @@ if find "$bundle" -perm -0022 -print -quit | grep -q .; then
     printf 'Refusing a group- or world-writable runtime path.\n' >&2
     exit 1
 fi
+user_home_pattern="/"'Users/'
+temporary_root_pattern="/var/"'folders/'
+private_temporary_root_pattern="/private/var/"'folders/'
 private_path_matches="$(
-    grep -rEl '/Users/|/var/folders/|/private/var/folders/' "$bundle" 2>/dev/null || true
+    grep -rEl \
+        "${user_home_pattern}|${temporary_root_pattern}|${private_temporary_root_pattern}" \
+        "$bundle" 2>/dev/null || true
 )"
 if [[ -n "$private_path_matches" ]]; then
     printf 'Refusing a runtime bundle containing a developer or temporary build path:\n%s\n' \

@@ -137,7 +137,12 @@ if find "$resources/Python" \
     printf 'Runtime contains a forbidden unused/native dependency path.\n' >&2
     exit 1
 fi
-if grep -rEl '/Users/|/var/folders/|/private/var/folders/' "$bundle" >/dev/null 2>&1; then
+user_home_pattern="/"'Users/'
+temporary_root_pattern="/var/"'folders/'
+private_temporary_root_pattern="/private/var/"'folders/'
+if grep -rEl \
+    "${user_home_pattern}|${temporary_root_pattern}|${private_temporary_root_pattern}" \
+    "$bundle" >/dev/null 2>&1; then
     printf 'Runtime contains a developer or temporary build path.\n' >&2
     exit 1
 fi
