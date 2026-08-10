@@ -67,7 +67,25 @@ FORBIDDEN_ARTIFACT_PATTERNS = (
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "AWS access key"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "GitHub token"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "Slack token"),
-    (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), "API key"),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+        "API key",
+    ),
+    (
+        re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b"),
+        "Stripe secret key",
+    ),
+    (
+        re.compile(r"(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),
+        "Google API key",
+    ),
+    (
+        re.compile(
+            r"(?<![0-9A-Za-z._-])ya29\.[0-9A-Za-z._-]{20,}"
+            r"(?![0-9A-Za-z._-])"
+        ),
+        "Google OAuth token",
+    ),
     (re.compile(r"/(?:Users|home)/[^\s`\"']+"), "personal absolute path"),
     (re.compile(r"^GIT binary patch$", re.MULTILINE), "Git binary patch"),
     (re.compile(r"^Binary files .* differ$", re.MULTILINE), "binary diff summary"),

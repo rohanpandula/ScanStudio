@@ -476,6 +476,27 @@ class EvidenceHardeningTests(unittest.TestCase):
                         f"{prefix}ABCDEFGHIJKLMNOP".encode(), "artifact"
                     )
 
+    def test_high_confidence_service_tokens_are_rejected(self) -> None:
+        service_tokens = (
+            ("API key", "sk-" + "proj-" + "A" * 24),
+            ("API key", "sk-" + "123e4567-e89b-12d3-a456-426614174000"),
+            ("API key", "sk-" + "A" * 19 + "-"),
+            ("Stripe secret key", "sk_" + "live_" + "A" * 24),
+            ("Stripe secret key", "sk_" + "test_" + "A" * 24),
+            ("Google API key", "AI" + "za" + "A" * 35),
+            ("Google API key", "AI" + "za" + "A" * 34 + "-"),
+            ("Google OAuth token", "ya" + "29." + "A" * 24),
+            ("Google OAuth token", "ya" + "29.d." + "A" * 24),
+            ("Google OAuth token", "ya" + "29." + "A_9-" * 5),
+        )
+        for label, token in service_tokens:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(EvidenceError, label):
+                    checker_module.require_safe_artifact(token.encode(), "artifact")
+        checker_module.require_safe_artifact(
+            ("AI" + "za" + "A" * 34 + "-B").encode(), "artifact"
+        )
+
     def test_degenerate_pass_report_is_rejected(self) -> None:
         with self.assertRaisesRegex(EvidenceError, "substantive review"):
             validate_report(b"VERDICT: PASS\n", "report")
