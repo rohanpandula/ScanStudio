@@ -297,6 +297,11 @@ class ReviewInputTests(GitRepositoryTestCase):
         )
         self.assertIn(patches[0].body, rendered)
         self.assertIn(patches[1].body, rendered)
+        header = json.loads(rendered.splitlines()[1])
+        self.assertEqual(header["inputSchemaVersion"], 2)
+        self.assertEqual(header["sourcePaths"], ["a.txt", "b.txt"])
+        self.assertEqual(metadata["inputSchemaVersion"], 2)
+        self.assertEqual(metadata["sourcePaths"], ["a.txt", "b.txt"])
         request = build_review_request(b"prompt\n", rendered)
         self.assertEqual(request, build_review_request(b"prompt\n", rendered))
         self.assertEqual(

@@ -68,9 +68,13 @@ python3 scripts/adversarial_review_input.py emit \
 ```
 
 The input contains a canonical metadata header, the complete canonical diffs
-for primary paths, and the complete canonical diffs for context paths. The
-checker rebuilds those bytes from the declared base/head and lists. It does not
-trust a stored input, path, summary, or symlink. Canonical Git operations force
+for primary paths, and the complete canonical diffs for context paths. Schema
+version 2 also includes `sourcePaths`, the canonical inventory of every path in
+the frozen source diff. A dependency omitted from one shard's body is not
+missing from the change when it appears in `sourcePaths`; its bytes are owned
+by another mandatory shard. The checker rebuilds all of these bytes from the
+declared base/head and lists. It does not trust a stored input, path, summary,
+or symlink. Canonical Git operations force
 `--ignore-submodules=none`; a `.gitmodules` `ignore=all` setting cannot hide a
 gitlink change from path coverage or evidence history checks.
 Candidate manifests and evidence artifacts are enumerated and read as regular

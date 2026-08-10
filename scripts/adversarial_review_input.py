@@ -26,7 +26,7 @@ from typing import Any, Sequence
 FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 MAX_SHARD_BYTES = 100 * 1024
 MAX_SHARD_CHANGED_LINES = 2_000
-INPUT_SCHEMA_VERSION = 1
+INPUT_SCHEMA_VERSION = 2
 MAX_SEMANTIC_PLAN_BYTES = 1 * 1024 * 1024
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 30
@@ -540,6 +540,7 @@ def build_review_input(
     base: str,
     reviewed: str,
     full_diff: bytes,
+    source_paths: Sequence[str],
     primary_patches: Sequence[FilePatch],
     context_patches: Sequence[FilePatch] = (),
 ) -> tuple[bytes, dict[str, Any]]:
@@ -560,6 +561,7 @@ def build_review_input(
         "primaryPaths": primary_paths,
         "reviewedCommit": reviewed,
         "sourceDiffSha256": sha256_bytes(full_diff),
+        "sourcePaths": list(source_paths),
     }
     chunks = [
         b"SCANSTUDIO-ADVERSARIAL-REVIEW-INPUT\n",
@@ -618,7 +620,12 @@ def automatic_shard_input(
         select_primary_paths(patches, context_paths) if context_paths else []
     )
     rendered, metadata = build_review_input(
-        base, reviewed, full, selected, selected_context
+        base,
+        reviewed,
+        full,
+        [item.path for item in patches],
+        selected,
+        selected_context,
     )
     metadata.update({"shardCount": len(shards), "shardIndex": shard_index})
     enforce_shard_limits(metadata, f"automatic shard {shard_index}")
@@ -637,7 +644,12 @@ def explicit_shard_input(
         select_primary_paths(patches, context_paths) if context_paths else []
     )
     rendered, metadata = build_review_input(
-        base, reviewed, full, selected_primary, selected_context
+        base,
+        reviewed,
+        full,
+        [item.path for item in patches],
+        selected_primary,
+        selected_context,
     )
     enforce_shard_limits(metadata, "explicit shard")
     return rendered, metadata
@@ -731,7 +743,13 @@ def full_diff_input(base: str, reviewed: str) -> tuple[bytes, dict[str, Any]]:
     full, patches = file_patches(base, reviewed)
     if not patches:
         raise ReviewInputError("canonical review diff is empty")
-    rendered, metadata = build_review_input(base, reviewed, full, patches)
+    rendered, metadata = build_review_input(
+        base,
+        reviewed,
+        full,
+        [item.path for item in patches],
+        patches,
+    )
     if len(rendered) > MAX_REQUEST_BYTES:
         raise ReviewInputError(
             f"full-diff synthesis input exceeds {MAX_REQUEST_BYTES} bytes"

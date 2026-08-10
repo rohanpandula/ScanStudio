@@ -10,6 +10,20 @@ CI behavior. Trace startup, shutdown, malformed responses, timeouts, and
 failure recovery across component boundaries. The documented simulator-only
 scope and source-only macOS packaging boundary are intentional.
 
+The input header's sourcePaths inventory names every file changed anywhere in
+the frozen source diff. A dependency listed there but omitted from this shard's
+primary/context body is reviewed in another mandatory shard; absence from this
+packet is not evidence that the file is uncommitted. Report a dangling
+dependency only when it is absent from sourcePaths or the shown contract is
+actually inconsistent. The outbound request rejects binary data plus a fixed,
+high-confidence set of credential-like and POSIX personal-path patterns before
+any model call; that text filter is deliberately conservative, not
+comprehensive. Still report sensitive material that the fixed filter allows.
+
+Exactly one standalone verdict sentinel is allowed, at EOF. A standalone
+VERDICT line in the body is intentionally ambiguous and invalid; ordinary prose
+such as "VERDICT: BLOCK would be wrong" is not a sentinel.
+
 Report only concrete regressions introduced by the diff, ordered by severity.
 Every finding must include severity, exact repository-relative file and hunk,
 a reproducible sequence, evidence, and a minimal fix direction. Exclude style
