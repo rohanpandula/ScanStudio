@@ -826,6 +826,7 @@ fn current_status(state: &MockState, fresh_status_read: bool) -> BridgeDeviceSta
             state.motion_armed
         },
         film_present: state.film_present,
+        adapter: None,
     }
 }
 

@@ -51,6 +51,7 @@ from coolscanpy.capture.single_pass_workflow import (
     SinglePassWorkflowError,
 )
 from coolscanpy.exceptions import (
+    AdapterUnsupported,
     BatchIntegrityError,
     CaptureWorkerBootstrapFailed,
     DeviceBusy,
@@ -535,6 +536,62 @@ class Roll:
 
     # -- preview ---------------------------------------------------------
 
+    def _require_strip_feeder_adapter(self) -> None:
+        """Refuse the strip workflow when a non-strip adapter is inserted.
+
+        The preview/scan plan replays a trace captured behind a strip
+        feeder, and the hardware gates parts of that trace on the adapter
+        (a mount adapter drops VPD page E2h and lacks the perforation
+        reads the roll traversal depends on — issue #70). Probing costs
+        three motion-free INQUIRYs on the already-held I/O lane.
+
+        Fail-open only on probe *uncertainty*: an unreadable identity
+        proceeds (matching ``Device.film_present``'s "None is never a
+        verdict" rule) and lets the synchronized worker fail closed at
+        the wire if the adapter truly cannot run the plan. Positive
+        evidence of a non-strip adapter refuses immediately with remedy
+        text instead of surfacing a protocol internal.
+        """
+
+        from coolscanpy.transport.adapter_identity import (
+            STRIP_FEEDER_ADAPTERS,
+            AdapterIdentityError,
+            probe_adapter_identity,
+        )
+
+        try:
+            identity = probe_adapter_identity(device_id=self._device._info.id)
+        except AdapterIdentityError:
+            logger.warning(
+                "adapter identity probe failed; proceeding without an "
+                "adapter verdict",
+                exc_info=True,
+            )
+            return
+        except Exception:
+            logger.warning(
+                "adapter identity probe failed unexpectedly; proceeding "
+                "without an adapter verdict",
+                exc_info=True,
+            )
+            return
+        if identity.is_strip_feeder:
+            return
+        remedy = (
+            "mounted slides need a dedicated single-frame workflow that "
+            "does not exist yet; remove the slide mount and insert a strip "
+            "feeder to scan strips"
+            if identity.adapter_ascii == "Mount"
+            else "insert a strip feeder to run the strip workflow"
+        )
+        raise AdapterUnsupported(
+            f"the inserted {identity.adapter_model} cannot run the strip "
+            f"preview/scan workflow (supported adapters: "
+            f"{', '.join(STRIP_FEEDER_ADAPTERS)}); {remedy}",
+            adapter=identity.adapter_ascii,
+            supported=STRIP_FEEDER_ADAPTERS,
+        )
+
     def preview(
         self,
         slots: Iterable[int] | None = None,
@@ -590,6 +647,7 @@ class Roll:
         try:
             self._device._acquire_io_lock("roll preview")
             io_acquired = True
+            self._require_strip_feeder_adapter()
             adapter = self._ensure_adapter()
             # A fresh preview always supersedes whatever the previous one was
             # holding -- mirrors this method's own preexisting "re-reads the

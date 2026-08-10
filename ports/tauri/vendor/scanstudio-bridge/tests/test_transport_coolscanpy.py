@@ -3299,3 +3299,60 @@ def test_coolscanpy_git_head_sha_present_when_component_git_succeeds(
         coolscanpy_transport_module._coolscanpy_git_head_sha(package_dir)
         == "0123456789abcdef0123456789abcdef01234567"
     )
+
+
+# ---------------------------------------------------------------------------
+# Adapter identity (#70): status surfaces the page-01h string; a positively
+# identified non-strip adapter refuses preview as ADAPTER_UNSUPPORTED.
+# ---------------------------------------------------------------------------
+
+
+def test_preview_raises_adapter_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _MountAdapterRoll(_FakeRoll):
+        def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
+            raise coolscanpy.AdapterUnsupported(
+                "the inserted MA-21 mount adapter cannot run the strip "
+                "preview/scan workflow",
+                adapter="Mount",
+                supported=("6Strip", "36Strip"),
+            )
+
+    transport, _device = _opened_transport(monkeypatch, _MountAdapterRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert excinfo.value.code == ErrorCode.ADAPTER_UNSUPPORTED
+    assert "MA-21" in excinfo.value.message
+
+
+def test_status_reports_adapter_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Identity:
+        adapter_ascii = "Mount"
+
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    device.adapter_identity = lambda: _Identity()
+    assert transport.status().adapter == "Mount"
+
+
+def test_status_adapter_is_none_when_probe_is_absent_or_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _FakeDevice has no adapter_identity attribute at all: older coolscanpy.
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    assert transport.status().adapter is None
+
+    # A probe that raises must degrade to None, never propagate from status().
+    def _boom() -> object:
+        raise RuntimeError("interface is owned by an active capture")
+
+    device.adapter_identity = _boom
+    assert transport.status().adapter is None
+
+    # A probe returning None (unreadable identity) also reports None.
+    device.adapter_identity = lambda: None
+    assert transport.status().adapter is None
+
+    # A non-callable attribute (a broken/mocked dependency) is not a probe;
+    # the defensive callable() check keeps the identity honestly unknown.
+    device.adapter_identity = "Mount"
+    assert transport.status().adapter is None

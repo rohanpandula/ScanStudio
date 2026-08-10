@@ -90,6 +90,10 @@ class DeviceStatus:
     lane_held: bool
     motion_armed: bool
     film_present: bool | None
+    # The scanner's own page-01h adapter identity ("Mount", "6Strip",
+    # "36Strip", "240", "Feeder"), or None when it could not be read.
+    # Adapter-dependent workflows key on this; diagnostics render it.
+    adapter: str | None = None
 
 
 @dataclass(frozen=True)

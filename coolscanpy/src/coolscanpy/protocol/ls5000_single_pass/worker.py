@@ -116,6 +116,11 @@ PREVIEW_SET_WINDOW_SEQUENCES = (88, 89, 90)
 PREVIEW_GET_WINDOW_SEQUENCES = (115, 116, 117)
 PREVIEW_READ_SEQUENCES = tuple(range(118, 166))
 DENSITY_CALIBRATION_SEQUENCES = (81, 82, 83)
+# The full-length page-00h EVPD INQUIRY (sequence 5 reads its four-byte
+# header). Its live response is the unit's own advertised VPD page list,
+# which is adapter-dependent -- the source of truth for which later EVPD
+# entries the inserted adapter can actually answer (issue #70).
+VPD_PAGE_LIST_BODY_SEQUENCE = 6
 # Nikon Scan does not treat these final all-ready TUR runs as ordinary
 # wait-until-ready loops.  It sends every confirmation before programming the
 # 97 dpi whole-roll windows: two confirmations, the three density reads above,
@@ -3383,6 +3388,96 @@ def _bind_live_sub_8e_read(entry: dict, header: bytes) -> dict:
     return bound
 
 
+def _evpd_inquiry_page(entry: dict) -> int | None:
+    """Return the VPD page code of an EVPD INQUIRY entry, else ``None``.
+
+    Only a six-byte INQUIRY CDB with the EVPD bit set qualifies; the
+    standard INQUIRY (sequence 1) and every non-INQUIRY command return
+    ``None`` so they can never participate in adapter-conditional
+    handling.
+    """
+
+    try:
+        cdb = bytes.fromhex(entry.get("cdb", ""))
+    except (TypeError, ValueError):
+        return None
+    if len(cdb) != 6 or cdb[0] != 0x12 or not cdb[1] & 0x01:
+        return None
+    return cdb[2]
+
+
+def _decode_live_vpd_page_list(payload: bytes) -> tuple[int, ...] | None:
+    """Decode the live page-00h supported-page list, else ``None``.
+
+    The response is allocation-padded by the transport, so only the
+    header-declared count is trusted. A malformed header returns ``None``
+    -- with no trustworthy live list every EVPD entry stays on the strict
+    replay path, which is the fail-closed direction.
+    """
+
+    payload = bytes(payload)
+    if len(payload) < 4 or payload[0] != 0x06 or payload[1] != 0x00 or payload[2] != 0x00:
+        return None
+    declared = payload[3]
+    pages = payload[4 : 4 + declared]
+    if len(pages) != declared:
+        return None
+    return tuple(pages)
+
+
+def _perform_adapter_conditional_evpd(
+    ep_out: Any,
+    ep_in: Any,
+    entry: dict,
+    *,
+    data_timeout_ms: int,
+) -> tuple[bool, TransactionResult]:
+    """Perform one EVPD INQUIRY whose page the live unit does not advertise.
+
+    The canonical trace was captured behind a strip feeder, and the
+    LS-5000's advertised VPD page list is adapter-dependent: live probing
+    shows the MA-21 mount adapter drops pages 47h and E2h, and the unit
+    then refuses an INQUIRY for the missing page with a status-only
+    reply (phase 0x01) instead of the traced data-in (issue #70). That
+    refusal is the documented live variance, so it is accepted -- with
+    the full Nikon status envelope still required -- and reported back
+    as ``(False, result)``. A unit that answers with data despite not
+    advertising the page is validated against the traced contract
+    exactly as before and reported as ``(True, result)``. Anything else
+    fails closed.
+    """
+
+    result = perform_transaction(
+        ep_out, ep_in, entry, data_timeout_ms=data_timeout_ms
+    )
+    if result.phase == 0x03:
+        _require_trace_result(entry, result)
+        return True, result
+    status = result.status
+    status_sense = status[1:4].hex() if len(status) == 8 else None
+    # Only the live-proven refusal shape is benign: CHECK CONDITION
+    # (status byte 0x02) with ILLEGAL REQUEST / INVALID FIELD IN CDB
+    # (sense 052400), status-only, no payload. Anything else -- a UNIT
+    # ATTENTION from a mid-session adapter swap (06xxxx), NOT READY
+    # (02xxxx), or an unknown refusal sense -- stays fail-closed exactly
+    # like the strict path would.
+    if (
+        result.phase == 0x01
+        and not result.payload
+        and len(status) == 8
+        and status[0] == 0x02
+        and result.sense == status_sense
+        and result.sense == "052400"
+        and status[5:] == bytes(3)
+    ):
+        return False, result
+    raise SynchronizedProtocolError(
+        f"command {entry['seq']}: unadvertised-page INQUIRY returned "
+        f"phase 0x{result.phase:02x} with {len(result.payload)} payload "
+        f"bytes and status {status.hex()}; refusing to continue"
+    )
+
+
 def _validate_variable_frame_table_payload(payload: bytes) -> StartupFrameTable:
     """Validate the bounded, self-describing startup READ(0x8f) response."""
 
@@ -5471,6 +5566,8 @@ def run_live_capture(
             preview_data = bytearray()
             live_sub_8e_header: bytes | None = None
             live_sub_8e_table: bytes | None = None
+            live_vpd_pages: tuple[int, ...] | None = None
+            adapter_absent_evpd: list[dict] = []
             live_selection: LiveFrameSelection | None = None
             batch_selections: tuple[LiveFrameSelection, ...] | None = None
             startup_table: StartupFrameTable | None = None
@@ -5489,6 +5586,9 @@ def run_live_capture(
             while entry_index < len(preamble):
                 entry = preamble[entry_index]
                 if entry.get("preview_skipped") is True:
+                    entry_index += 1
+                    continue
+                if entry.get("adapter_absent_skipped") is True:
                     entry_index += 1
                     continue
                 if entry["seq"] == DYNAMIC_WINDOW_GROUPS[-1][0]:
@@ -5573,8 +5673,19 @@ def run_live_capture(
                     "request_len": request,
                     "request_parts": entry.get("request_parts"),
                 }
+                evpd_page = _evpd_inquiry_page(entry)
+                adapter_conditional = (
+                    evpd_page is not None
+                    and live_vpd_pages is not None
+                    and evpd_page not in live_vpd_pages
+                    and entry.get("role") == "preamble"
+                )
                 at_transaction_boundary = False
-                if entry["seq"] == VARIABLE_FRAME_TABLE_SEQUENCE:
+                if adapter_conditional:
+                    page_advertised, result = _perform_adapter_conditional_evpd(
+                        ep_out, ep_in, entry, data_timeout_ms=timeout
+                    )
+                elif entry["seq"] == VARIABLE_FRAME_TABLE_SEQUENCE:
                     result = _perform_variable_frame_table_transaction(
                         ep_out, ep_in, entry, data_timeout_ms=timeout
                     )
@@ -5584,6 +5695,30 @@ def run_live_capture(
                     )
                 at_transaction_boundary = True
                 journal["stall_recoveries"] += result.stall_recoveries
+                if adapter_conditional and not page_advertised:
+                    # The unit refused the whole command for the missing
+                    # page, so its traced two-step partner (the full-length
+                    # body read of the same page) has no live length to
+                    # bind and must not be sent either.
+                    receipt = {
+                        "seq": entry["seq"],
+                        "page": f"{evpd_page:02x}",
+                        "sense": result.sense,
+                        "status": result.status.hex(),
+                    }
+                    next_index = entry_index + 1
+                    if (
+                        next_index < len(preamble)
+                        and _evpd_inquiry_page(preamble[next_index]) == evpd_page
+                        and preamble[next_index].get("role") == "preamble"
+                    ):
+                        preamble[next_index]["adapter_absent_skipped"] = True
+                        receipt["skipped_body_seq"] = preamble[next_index]["seq"]
+                    adapter_absent_evpd.append(receipt)
+                    journal["adapter_absent_evpd"] = adapter_absent_evpd
+                    _write_journal(journal_path, journal)
+                    entry_index += 1
+                    continue
                 scan_active, ready_required = _scan_lifecycle_after_transaction(
                     entry,
                     result,
@@ -5599,6 +5734,18 @@ def run_live_capture(
                     ):
                         session_journal["scanner_identity"] = scanner_identity
                         _write_journal(session_journal_path, session_journal)
+                if entry["seq"] == VPD_PAGE_LIST_BODY_SEQUENCE:
+                    live_vpd_pages = _decode_live_vpd_page_list(result.payload)
+                    if live_vpd_pages is None:
+                        # No trustworthy live list: every EVPD entry stays
+                        # on the strict replay path (the fail-closed
+                        # direction). Record why in the journal.
+                        journal["adapter_vpd_pages_malformed"] = True
+                    else:
+                        journal["adapter_vpd_pages"] = [
+                            f"{page:02x}" for page in live_vpd_pages
+                        ]
+                    _write_journal(journal_path, journal)
                 if entry["seq"] in DENSITY_CALIBRATION_SEQUENCES:
                     density_calibration_reads.append(
                         decode_density_calibration_read(

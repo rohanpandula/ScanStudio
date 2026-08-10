@@ -37,6 +37,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from coolscanpy._logging import get_logger
 from coolscanpy.exceptions import DeviceBusy, DeviceNotFound, EjectFailed
 from coolscanpy.session.backend import ScannerCapabilities, ScannerDevice
 from coolscanpy.session.params import ScanParams
@@ -52,6 +53,8 @@ from coolscanpy.types import (
 if TYPE_CHECKING:
     from coolscanpy._roll import Roll
     from coolscanpy.session.service import ScannerService
+
+logger = get_logger(__name__)
 
 _COOLSCAN3_PREFIX = "coolscan3:"
 
@@ -672,6 +675,38 @@ class Device:
             from coolscanpy.transport.adapter_status import probe_adapter_status
 
             return probe_adapter_status(device_id=self._info.id).film_present
+        finally:
+            self._release_io_lock()
+
+    def adapter_identity(self):
+        """Return the inserted adapter's identity, or ``None`` if unreadable.
+
+        This is a motion-free raw-USB INQUIRY query (standard INQUIRY plus
+        VPD pages 00h/01h). ``None`` means the identity could not be read
+        (for example, an active capture owns the interface); it must never
+        be interpreted as any particular adapter. The result is a
+        :class:`coolscanpy.transport.adapter_identity.AdapterIdentity`
+        snapshot of the adapter state at call time — swapping the physical
+        adapter invalidates it, so callers wanting freshness re-query.
+        """
+
+        self._acquire_io_lock("adapter identity")
+        try:
+            from coolscanpy.transport.adapter_identity import (
+                AdapterIdentityError,
+                probe_adapter_identity,
+            )
+
+            try:
+                return probe_adapter_identity(device_id=self._info.id)
+            except AdapterIdentityError:
+                logger.warning("adapter identity probe failed", exc_info=True)
+                return None
+            except Exception:
+                logger.warning(
+                    "adapter identity probe failed unexpectedly", exc_info=True
+                )
+                return None
         finally:
             self._release_io_lock()
 

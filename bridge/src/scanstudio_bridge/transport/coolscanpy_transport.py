@@ -714,6 +714,21 @@ class CoolscanPyTransport:
         # same session storage, but block every capture until that happens.
         if film_present is False:
             self._preview_established = False
+        # Same defensive shape for the adapter identity: adapters are
+        # hot-swappable between calls (SA-30 out, MA-21 in), so this is
+        # re-read per status snapshot rather than cached at open. None means
+        # unreadable, never a particular adapter.
+        adapter: str | None = None
+        adapter_identity_attr = getattr(self._device, "adapter_identity", None)
+        if callable(adapter_identity_attr):
+            try:
+                identity = adapter_identity_attr()
+            except Exception:
+                identity = None
+            if identity is not None:
+                adapter_ascii = getattr(identity, "adapter_ascii", None)
+                if isinstance(adapter_ascii, str) and adapter_ascii:
+                    adapter = adapter_ascii
         return domain.DeviceStatus(
             connected=True,
             device_id=self._device_id,
@@ -726,6 +741,7 @@ class CoolscanPyTransport:
             # access to it.
             motion_armed=False,
             film_present=film_present,
+            adapter=adapter,
         )
 
     def close_device(self) -> None:
@@ -820,6 +836,11 @@ class CoolscanPyTransport:
                 thumbnails = self._roll.preview(slots=slots)
             except coolscanpy.CaptureWorkerBootstrapFailed as exc:
                 raise BridgeError(ErrorCode.INTERNAL, str(exc)) from exc
+            except coolscanpy.AdapterUnsupported as exc:
+                # #70: a non-strip adapter (MA-21 mount, IA-20, SF-210) is
+                # positively identified before any worker dispatch. Surface
+                # the remedy text as its own card, never INTERNAL.
+                raise BridgeError(ErrorCode.ADAPTER_UNSUPPORTED, str(exc)) from exc
             except coolscanpy.FeederParked as exc:
                 raise BridgeError(ErrorCode.FEEDER_PARKED, str(exc)) from exc
             except coolscanpy.RefeedRequired as exc:
