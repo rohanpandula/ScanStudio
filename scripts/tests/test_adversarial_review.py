@@ -449,6 +449,14 @@ class ReviewInputTests(GitRepositoryTestCase):
 
 
 class EvidenceHardeningTests(unittest.TestCase):
+    def test_aws_long_lived_and_temporary_access_keys_are_rejected(self) -> None:
+        for prefix in ("AKIA", "ASIA"):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(EvidenceError, "AWS access key"):
+                    checker_module.require_safe_artifact(
+                        f"{prefix}ABCDEFGHIJKLMNOP".encode(), "artifact"
+                    )
+
     def test_degenerate_pass_report_is_rejected(self) -> None:
         with self.assertRaisesRegex(EvidenceError, "substantive review"):
             validate_report(b"VERDICT: PASS\n", "report")

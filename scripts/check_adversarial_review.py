@@ -61,7 +61,7 @@ FORBIDDEN_ARTIFACT_PATTERNS = (
         re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
         "private key",
     ),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "AWS access key"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "GitHub token"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "Slack token"),
     (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), "API key"),
