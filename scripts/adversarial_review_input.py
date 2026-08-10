@@ -12,9 +12,11 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,6 +29,8 @@ INPUT_SCHEMA_VERSION = 1
 MAX_SEMANTIC_PLAN_BYTES = 1 * 1024 * 1024
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 30
+MAX_GIT_STDOUT_BYTES = 16 * 1024 * 1024
+MAX_GIT_STDERR_BYTES = 1 * 1024 * 1024
 REQUEST_BEGIN = b"\n--- BEGIN FROZEN REVIEW INPUT ---\n"
 REQUEST_END = b"\n--- END FROZEN REVIEW INPUT ---\n"
 BINARY_DIFF_MARKERS = (b"\nGIT binary patch\n", b"\nBinary files ")
@@ -53,31 +57,94 @@ class ShardPlan:
 
 
 def git_bytes(*args: str) -> bytes:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    command = ["git", *args]
     try:
-        result = subprocess.run(
-            ["git", *args],
-            check=True,
+        process = subprocess.Popen(
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=GIT_TIMEOUT_SECONDS,
-            env={
-                **os.environ,
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_TERMINAL_PROMPT": "0",
-            },
+            env=environment,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise ReviewInputError(
-            f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
-        ) from exc
-    return result.stdout
+    except OSError as exc:
+        raise ReviewInputError(f"cannot start Git command: {exc}") from exc
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    streams = {
+        process.stdout: (bytearray(), MAX_GIT_STDOUT_BYTES, "stdout"),
+        process.stderr: (bytearray(), MAX_GIT_STDERR_BYTES, "stderr"),
+    }
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+
+    def stop_process() -> None:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_process()
+                raise ReviewInputError(
+                    f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
+                )
+            ready = selector.select(remaining)
+            if not ready:
+                if process.poll() is None:
+                    stop_process()
+                    raise ReviewInputError(
+                        f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
+                    )
+                continue
+            for key, _events in ready:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer, limit, name = streams[stream]
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    stop_process()
+                    raise ReviewInputError(f"Git command {name} exceeds {limit} bytes")
+        return_code = process.wait()
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+    stdout = bytes(streams[process.stdout][0])
+    stderr = bytes(streams[process.stderr][0])
+    if return_code:
+        raise subprocess.CalledProcessError(
+            return_code, command, output=stdout, stderr=stderr
+        )
+    return stdout
 
 
 def read_regular_file(path: Path, label: str, max_bytes: int) -> bytes:
     """Read one bounded regular file without following a final symlink."""
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -494,7 +561,14 @@ def json_line(value: Any) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("plan", "describe", "emit", "describe-full", "emit-full"):
+    for command in (
+        "preflight",
+        "plan",
+        "describe",
+        "emit",
+        "describe-full",
+        "emit-full",
+    ):
         child = subparsers.add_parser(command)
         child.add_argument("base")
         child.add_argument("reviewed")
@@ -538,6 +612,25 @@ def main() -> int:
         git_bytes("cat-file", "-e", f"{reviewed}^{{commit}}")
         if base == reviewed:
             raise ReviewInputError("base and reviewed commits must differ")
+        if args.command == "preflight":
+            head = git_bytes("rev-parse", "HEAD").decode().strip()
+            if head != reviewed:
+                raise ReviewInputError(
+                    "reviewed commit must equal the clean worktree HEAD"
+                )
+            git_bytes("merge-base", "--is-ancestor", base, reviewed)
+            dirty = git_bytes(
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            )
+            if dirty:
+                raise ReviewInputError(
+                    "review requires a clean worktree, including submodules"
+                )
+            print("review preflight passed")
+            return 0
         if args.command == "plan":
             full, shards = plan_shards(base, reviewed)
             value = {

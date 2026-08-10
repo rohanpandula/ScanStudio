@@ -44,6 +44,35 @@ def require_object(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def parse_json_object(raw: bytes, label: str) -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (
+        ValueError,
+        UnicodeDecodeError,
+        RecursionError,
+        MemoryError,
+        OverflowError,
+    ) as exc:
+        raise ParseError(f"{label} is not safe valid JSON") from exc
+    return require_object(value, label)
+
+
 def event_lines(raw: bytes) -> Iterator[tuple[int, bytes]]:
     if not raw or len(raw) > MAX_EVENT_BYTES:
         raise ParseError("OpenCode event stream is empty or exceeds the size limit")
@@ -83,10 +112,7 @@ def validate_substantive_report(report: str) -> None:
 def extract_session_id(raw: bytes) -> str:
     sessions: set[str] = set()
     for line_number, line in event_lines(raw):
-        try:
-            event = require_object(json.loads(line), f"event line {line_number}")
-        except json.JSONDecodeError as exc:
-            raise ParseError(f"event line {line_number} is not valid JSON") from exc
+        event = parse_json_object(line, f"event line {line_number}")
         session = event.get("sessionID")
         if not isinstance(session, str) or CONTEXT_ID.fullmatch(session) is None:
             raise ParseError(f"event line {line_number} has invalid sessionID")
@@ -105,10 +131,7 @@ def parse_event_stream(raw: bytes) -> tuple[str, str, str]:
     for line_number, line in event_lines(raw):
         if state == "finished":
             raise ParseError("OpenCode emitted output after step-finish")
-        try:
-            event = require_object(json.loads(line), f"event line {line_number}")
-        except json.JSONDecodeError as exc:
-            raise ParseError(f"event line {line_number} is not valid JSON") from exc
+        event = parse_json_object(line, f"event line {line_number}")
         session = event.get("sessionID")
         if not isinstance(session, str) or CONTEXT_ID.fullmatch(session) is None:
             raise ParseError(f"event line {line_number} has invalid sessionID")
@@ -239,11 +262,9 @@ def parse_export(
         raise ParseError("OpenCode session export is empty or exceeds the size limit")
     if TOOL_VERSION.fullmatch(tool_version) is None:
         raise ParseError("OpenCode tool version is not semver-like")
+    exported = parse_json_object(raw, "session export")
     try:
-        exported = require_object(json.loads(raw), "session export")
         request_text = request.decode("utf-8")
-    except json.JSONDecodeError as exc:
-        raise ParseError("OpenCode session export is not valid JSON") from exc
     except UnicodeDecodeError as exc:
         raise ParseError("review request is not UTF-8") from exc
     export_info = require_object(exported.get("info"), "session export info")
@@ -342,11 +363,9 @@ def parse_failure_receipt(
         raise ParseError("OpenCode tool version is not semver-like")
     if not raw or len(raw) > MAX_EXPORT_BYTES:
         raise ParseError("OpenCode session export is empty or exceeds the size limit")
+    exported = parse_json_object(raw, "session export")
     try:
-        exported = require_object(json.loads(raw), "session export")
         request_text = request.decode("utf-8")
-    except json.JSONDecodeError as exc:
-        raise ParseError("OpenCode session export is not valid JSON") from exc
     except UnicodeDecodeError as exc:
         raise ParseError("review request is not UTF-8") from exc
     export_info = require_object(exported.get("info"), "session export info")
@@ -397,23 +416,25 @@ def parse_failure_receipt(
     if exported_text_parts(parent.get("parts"), "parent user message") != request_text:
         raise ParseError("failure export parent does not match request bytes")
     assistant_parts = require_parts(assistant.get("parts"), "failed assistant")
-    part_types = [
-        part.get("type") if isinstance(part, dict) else type(part).__name__
-        for part in assistant_parts
-    ]
-    assistant_text = "".join(
-        part.get("text", "")
-        for part in assistant_parts
-        if isinstance(part, dict) and part.get("type") == "text"
-    ).strip()
-    forbidden = [
-        part.get("type") if isinstance(part, dict) else type(part).__name__
-        for part in assistant_parts
-        if not isinstance(part, dict)
-        or part.get("type") not in {"step-start", "reasoning", "text", "step-finish"}
-    ]
-    if forbidden:
-        raise ParseError("failed assistant contains forbidden/unknown parts")
+    allowed_parts = {"step-start", "reasoning", "text", "step-finish"}
+    part_types: list[str] = []
+    assistant_text_parts: list[str] = []
+    for index, raw_part in enumerate(assistant_parts):
+        part = require_object(raw_part, f"failed assistant.parts[{index}]")
+        part_type = part.get("type")
+        if part_type not in allowed_parts:
+            raise ParseError("failed assistant contains forbidden/unknown parts")
+        assert isinstance(part_type, str)
+        part_types.append(part_type)
+        if part_type in {"reasoning", "text"}:
+            value = part.get("text")
+            if not isinstance(value, str):
+                raise ParseError(
+                    f"failed assistant {part_type} part must contain string text"
+                )
+            if part_type == "text":
+                assistant_text_parts.append(value)
+    assistant_text = "".join(assistant_text_parts).strip()
     finish = assistant_info.get("finish")
     if (
         not part_types

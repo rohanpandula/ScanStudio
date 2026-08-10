@@ -73,6 +73,9 @@ checker rebuilds those bytes from the declared base/head and lists. It does not
 trust a stored input, path, summary, or symlink. Canonical Git operations force
 `--ignore-submodules=none`; a `.gitmodules` `ignore=all` setting cannot hide a
 gitlink change from path coverage or evidence history checks.
+Candidate evidence is opened component-by-component relative to the already
+opened repository directory, using no-follow descriptors; path checks and file
+reads do not have a symlink-swap window.
 
 This is deliberately a text-source gate. Binary patches are rejected before a
 model call because an encoded Git binary delta is neither meaningfully
@@ -117,6 +120,10 @@ The boundary labels are descriptive rather than a delimiter parser: consumers
 bind and compare the complete request bytes, and Git prefixes every diff content
 line. Request components are opened without following final symlinks and the
 complete request is size-bounded before invocation.
+The two scan-only CLI modes intentionally accept wrapper-owned temporary files
+outside the repository. They disclose no contents and confer no read access the
+trusted local operator does not already have; restricting them to repository
+paths would prevent scanning the exact temporary request sent to OpenCode.
 
 ```sh
 scripts/run_adversarial_review.sh \
@@ -144,8 +151,11 @@ and the recorded context ID remains auditable. Raw events, the exported
 transcript, prompt/input request, and reasoning are temporary wrapper files and
 must never be copied into repository evidence. Later local session retention
 follows operator and tool policy; the wrapper does not delete final sessions.
-Git subprocesses are time-bounded. A hung repository or local storage service
-fails the review attempt instead of pinning the gate indefinitely.
+All Git operations, including wrapper preflight, use one supervisor that strips
+inherited `GIT_*` overrides, bounds stdout and stderr, and enforces a timeout. A
+hung or output-flooding repository fails the review attempt instead of pinning
+or exhausting the gate. Request reads are nonblocking until `fstat` confirms a
+regular file, so a FIFO cannot stall validation.
 
 ## Mandatory full-diff synthesis
 

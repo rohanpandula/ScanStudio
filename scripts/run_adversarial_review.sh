@@ -172,7 +172,19 @@ if [[ -n "$failure_receipt" || -n "$failure_outcome" ]]; then
   fi
 fi
 
-repository_root="$(git rev-parse --show-toplevel)"
+repository_root="$(python3 - <<'PY'
+from pathlib import Path
+
+start = Path.cwd().resolve()
+for candidate in (start, *start.parents):
+    marker = candidate / ".git"
+    if marker.is_dir() or marker.is_file():
+        print(candidate)
+        break
+else:
+    raise SystemExit("review wrapper must run inside a Git worktree")
+PY
+)"
 if [[ -L "$repository_root/docs/adversarial-review-prompts/security-reliability.txt" \
   || -L "$repository_root/docs/adversarial-review-prompts/cross-layer-correctness.txt" ]]; then
   echo "canonical review prompts must not be symlinks" >&2
@@ -200,18 +212,11 @@ else
   exit 2
 fi
 
-if [[ -n "$(git -C "$repository_root" status --porcelain=v1 \
-  --untracked-files=all --ignore-submodules=none)" ]]; then
-  echo "review requires a clean worktree, including submodules" >&2
-  exit 2
-fi
-if [[ "$review_base" == "$reviewed_commit" ]]; then
-  echo "base and reviewed commits must differ" >&2
-  exit 2
-fi
-git cat-file -e "${review_base}^{commit}"
-git cat-file -e "${reviewed_commit}^{commit}"
-git merge-base --is-ancestor "$review_base" "$reviewed_commit"
+(
+  cd "$repository_root"
+  python3 scripts/adversarial_review_input.py preflight \
+    "$review_base" "$reviewed_commit" >/dev/null
+)
 
 opencode_bin="$(command -v opencode)"
 opencode_version="$("$opencode_bin" --version)"

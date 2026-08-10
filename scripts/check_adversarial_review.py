@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 from adversarial_review_input import (
-    GIT_TIMEOUT_SECONDS,
     MAX_SHARD_BYTES,
     MAX_SHARD_CHANGED_LINES,
     ReviewInputError,
@@ -24,6 +23,7 @@ from adversarial_review_input import (
     explicit_shard_input,
     file_patches,
     full_diff_input,
+    git_bytes,
     read_regular_file,
 )
 
@@ -70,28 +70,6 @@ FORBIDDEN_ARTIFACT_PATTERNS = (
 
 class EvidenceError(ValueError):
     pass
-
-
-def git_bytes(*args: str) -> bytes:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=GIT_TIMEOUT_SECONDS,
-            env={
-                **os.environ,
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_TERMINAL_PROMPT": "0",
-            },
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EvidenceError(
-            f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
-        ) from exc
-    return result.stdout
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -180,43 +158,124 @@ def evidence_file(bundle: Path, value: Any, label: str) -> Path:
     name = require_string(value, label)
     if Path(name).name != name:
         raise EvidenceError(f"{label} must name a direct child of its evidence bundle")
-    unresolved = bundle / name
-    if unresolved.is_symlink():
-        raise EvidenceError(f"{label} must not be a symlink")
-    candidate = unresolved.resolve()
+    return bundle / name
+
+
+def normalized_repository_path(
+    path: Path, repository_root: Path, label: str
+) -> tuple[Path, Path]:
+    root = Path(os.path.abspath(repository_root))
+    candidate = Path(os.path.abspath(path if path.is_absolute() else root / path))
     try:
-        candidate.relative_to(bundle.resolve())
+        relative = candidate.relative_to(root)
     except ValueError as exc:
-        raise EvidenceError(f"{label} escapes its evidence bundle") from exc
+        raise EvidenceError(f"{label} is outside the candidate repository") from exc
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise EvidenceError(f"{label} is not a normalized repository file")
+    return candidate, relative
+
+
+def open_directory_beneath(repository_root: Path, relative: Path, label: str) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        mode = candidate.stat().st_mode
+        descriptor = os.open(repository_root, flags)
     except OSError as exc:
-        raise EvidenceError(f"{label} does not exist: {name}") from exc
+        raise EvidenceError(f"cannot open repository root for {label}: {exc}") from exc
+    try:
+        for part in relative.parts:
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise EvidenceError(
+            f"{label} must stay beneath non-symlink repository directories: {exc}"
+        ) from exc
+
+
+def open_regular_file_beneath(
+    path: Path, repository_root: Path, label: str
+) -> tuple[int, Path]:
+    candidate, relative = normalized_repository_path(path, repository_root, label)
+    directory = open_directory_beneath(repository_root, relative.parent, label)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(relative.name, flags, dir_fd=directory)
+    except OSError as exc:
+        raise EvidenceError(f"cannot open {label}: {exc}") from exc
+    finally:
+        os.close(directory)
+    mode = os.fstat(descriptor).st_mode
     if not stat.S_ISREG(mode):
-        raise EvidenceError(f"{label} must be a regular file: {name}")
-    return candidate
+        os.close(descriptor)
+        raise EvidenceError(f"{label} must be a regular non-symlink file")
+    return descriptor, candidate
+
+
+def read_regular_file_beneath(
+    path: Path, repository_root: Path, label: str, max_bytes: int
+) -> tuple[Path, bytes]:
+    descriptor, candidate = open_regular_file_beneath(path, repository_root, label)
+    try:
+        size = os.fstat(descriptor).st_size
+        if size > max_bytes:
+            raise EvidenceError(f"{label} exceeds {max_bytes} bytes")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise EvidenceError(f"{label} exceeds {max_bytes} bytes")
+        return candidate, b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def regular_direct_children_beneath(
+    bundle: Path, repository_root: Path, label: str
+) -> set[Path]:
+    candidate, relative = normalized_repository_path(bundle, repository_root, label)
+    descriptor = open_directory_beneath(repository_root, relative, label)
+    try:
+        children: set[Path] = set()
+        for name in os.listdir(descriptor):
+            try:
+                mode = os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise EvidenceError(f"cannot inspect {label}/{name}: {exc}") from exc
+            if not stat.S_ISREG(mode):
+                raise EvidenceError(
+                    f"{label} entries must be regular non-symlink files: {name}"
+                )
+            children.add(candidate / name)
+        return children
+    finally:
+        os.close(descriptor)
 
 
 def require_path_without_symlink_ancestors(
     path: Path, repository_root: Path, label: str
 ) -> Path:
-    """Resolve a repository path only after rejecting every symlink component."""
+    """Open a repository file through descriptor-relative, no-follow traversal."""
 
-    candidate = path if path.is_absolute() else repository_root / path
-    try:
-        relative = candidate.relative_to(repository_root)
-    except ValueError as exc:
-        raise EvidenceError(f"{label} is outside the candidate repository") from exc
-    current = repository_root
-    for part in relative.parts:
-        current = current / part
-        try:
-            mode = os.lstat(current).st_mode
-        except OSError as exc:
-            raise EvidenceError(f"cannot inspect {label}: {exc}") from exc
-        if stat.S_ISLNK(mode):
-            raise EvidenceError(f"{label} must not contain symlink ancestors")
-    return candidate.resolve()
+    descriptor, candidate = open_regular_file_beneath(path, repository_root, label)
+    os.close(descriptor)
+    return candidate
 
 
 def require_safe_artifact(value: bytes, label: str) -> bytes:
@@ -245,9 +304,19 @@ def require_safe_title(value: bytes, label: str) -> bytes:
 
 
 def safe_artifact_bytes(path: Path, label: str) -> bytes:
+    repository_root = Path.cwd().resolve()
     try:
-        value = read_regular_file(path, label, MAX_ARTIFACT_BYTES)
-    except (OSError, ReviewInputError) as exc:
+        _candidate, relative = normalized_repository_path(path, repository_root, label)
+    except EvidenceError:
+        relative = None
+    try:
+        if relative is None:
+            value = read_regular_file(path, label, MAX_ARTIFACT_BYTES)
+        else:
+            _candidate, value = read_regular_file_beneath(
+                path, repository_root, label, MAX_ARTIFACT_BYTES
+            )
+    except (OSError, ReviewInputError, EvidenceError) as exc:
         raise EvidenceError(f"cannot read {label}: {exc}") from exc
     return require_safe_artifact(value, label)
 
@@ -650,7 +719,7 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
     if not isinstance(shards, list) or not shards:
         raise EvidenceError(f"{path}: shards must be a non-empty array")
 
-    artifacts: set[Path] = {path.resolve()}
+    artifacts: set[Path] = {path}
     contexts: set[str] = set()
     tool_versions: set[str] = set()
     prompt_artifact_by_role: dict[str, Path] = {}
@@ -861,17 +930,9 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
             raise EvidenceError(f"{path}: dispositions hash mismatch")
         artifacts.add(dispositions)
 
-    actual_files: set[Path] = set()
-    for child in bundle.iterdir():
-        if child.is_symlink():
-            raise EvidenceError(
-                f"{path}: evidence entries must not be symlinks: {child}"
-            )
-        if not stat.S_ISREG(child.stat().st_mode):
-            raise EvidenceError(
-                f"{path}: evidence entries must be regular files: {child}"
-            )
-        actual_files.add(child.resolve())
+    actual_files = regular_direct_children_beneath(
+        bundle, repository_root, f"{path}:evidence bundle"
+    )
     if actual_files != artifacts:
         extras = sorted(item.name for item in actual_files - artifacts)
         missing = sorted(item.name for item in artifacts - actual_files)
@@ -975,7 +1036,12 @@ def main() -> int:
         )
         git_bytes("cat-file", "-e", f"{expected_base}^{{commit}}")
         git_bytes("cat-file", "-e", f"{expected_tip}^{{commit}}")
-    except (EvidenceError, OSError, subprocess.CalledProcessError) as exc:
+    except (
+        EvidenceError,
+        OSError,
+        ReviewInputError,
+        subprocess.CalledProcessError,
+    ) as exc:
         print(f"error: invalid repository/base/tip: {exc}", file=sys.stderr)
         return 2
 
@@ -986,7 +1052,7 @@ def main() -> int:
             "--untracked-files=all",
             "--ignore-submodules=none",
         )
-    except subprocess.CalledProcessError as exc:
+    except (ReviewInputError, subprocess.CalledProcessError) as exc:
         print(f"error: cannot inspect candidate worktree: {exc}", file=sys.stderr)
         return 1
     if dirty:

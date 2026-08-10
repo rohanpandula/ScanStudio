@@ -14,6 +14,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
+import adversarial_review_input as review_input_module  # noqa: E402
 from adversarial_review_input import (  # noqa: E402
     MAX_REQUEST_BYTES,
     ReviewInputError,
@@ -360,6 +361,42 @@ class ReviewInputTests(GitRepositoryTestCase):
         with self.assertRaisesRegex(ReviewInputError, "binary changes"):
             file_patches(self.head, binary_head)
 
+    def test_binary_marker_text_is_still_reviewable(self) -> None:
+        (self.repository / "a.txt").write_text(
+            "GIT binary patch\nBinary files a and b differ\n", encoding="utf-8"
+        )
+        run("git", "add", "a.txt")
+        run("git", "commit", "-qm", "marker text")
+        marker_head = rev_parse(self.repository)
+        _full, patches = file_patches(self.head, marker_head)
+        self.assertEqual([item.path for item in patches], ["a.txt"])
+
+    def test_git_output_is_bounded_and_injected_git_dir_is_ignored(self) -> None:
+        with mock.patch.object(review_input_module, "MAX_GIT_STDOUT_BYTES", 1):
+            with self.assertRaisesRegex(ReviewInputError, "stdout exceeds 1 bytes"):
+                canonical_diff(self.base, self.head)
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/definitely/not/a/repository"}):
+            self.assertTrue(canonical_diff(self.base, self.head))
+
+    def test_preflight_requires_clean_reviewed_head(self) -> None:
+        command = [
+            sys.executable,
+            str(SCRIPTS / "adversarial_review_input.py"),
+            "preflight",
+            self.base,
+            self.head,
+        ]
+        clean = subprocess.run(
+            command, cwd=self.repository, check=False, capture_output=True, text=True
+        )
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        (self.repository / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        dirty = subprocess.run(
+            command, cwd=self.repository, check=False, capture_output=True, text=True
+        )
+        self.assertEqual(dirty.returncode, 1)
+        self.assertIn("clean worktree", dirty.stderr)
+
 
 class EvidenceHardeningTests(unittest.TestCase):
     def test_degenerate_pass_report_is_rejected(self) -> None:
@@ -380,6 +417,13 @@ class EvidenceHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(ReviewInputError, "exceeds"):
                 read_regular_file(oversized, "oversized", 4)
 
+    def test_bounded_reader_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / "fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(ReviewInputError, "regular file"):
+                read_regular_file(fifo, "fifo", MAX_REQUEST_BYTES)
+
     def test_symlinked_evidence_ancestor_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -387,7 +431,7 @@ class EvidenceHardeningTests(unittest.TestCase):
             outside.mkdir()
             docs = root / "docs"
             docs.symlink_to(outside, target_is_directory=True)
-            with self.assertRaisesRegex(EvidenceError, "symlink ancestors"):
+            with self.assertRaisesRegex(EvidenceError, "non-symlink repository"):
                 require_path_without_symlink_ancestors(
                     docs / "adversarial-reviews" / "test" / "manifest.json",
                     root,
@@ -395,11 +439,8 @@ class EvidenceHardeningTests(unittest.TestCase):
                 )
 
     def test_git_timeout_is_reported_as_review_input_error(self) -> None:
-        with mock.patch(
-            "adversarial_review_input.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(["git", "status"], 30),
-        ):
-            with self.assertRaisesRegex(ReviewInputError, "exceeded 30 seconds"):
+        with mock.patch("adversarial_review_input.GIT_TIMEOUT_SECONDS", 0):
+            with self.assertRaisesRegex(ReviewInputError, "exceeded 0 seconds"):
                 canonical_diff("a" * 40, "b" * 40)
 
 

@@ -236,6 +236,28 @@ class ParserCountLimitTests(unittest.TestCase):
                 )
 
 
+class MalformedExportTests(unittest.TestCase):
+    def test_failure_export_rejects_non_string_text(self) -> None:
+        exported = json.loads(export_bytes("request", "partial", finish="length"))
+        exported["messages"][1]["parts"][2]["text"] = 123
+        with self.assertRaisesRegex(parser.ParseError, "string text"):
+            failure_receipt(
+                json.dumps(exported).encode(),
+                outcome="OUTPUT_LIMIT",
+            )
+
+    def test_json_recursion_error_becomes_parse_error(self) -> None:
+        with mock.patch.object(parser.json, "loads", side_effect=RecursionError):
+            with self.assertRaisesRegex(parser.ParseError, "safe valid JSON"):
+                parser.parse_json_object(b"{}", "session export")
+
+    def test_duplicate_keys_and_nonstandard_constants_are_rejected(self) -> None:
+        for raw in (b'{"info":{},"info":{}}', b'{"value":NaN}'):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(parser.ParseError, "safe valid JSON"):
+                    parser.parse_json_object(raw, "session export")
+
+
 class ProviderErrorFallbackTests(unittest.TestCase):
     def test_parser_rejects_provider_error_outcome(self) -> None:
         raw = export_bytes(
