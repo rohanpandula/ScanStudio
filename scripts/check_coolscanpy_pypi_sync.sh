@@ -37,7 +37,7 @@ KNOWN_VENDORED_DIVERGENCE=(
   # its export surface for the class above
   "protocol/ls5000_single_pass/__init__.py|ce8aa97b707f5ef83f96128b378722191f7280bd41c1f3acbb04c75e3ea7523e|1f0f324034a95e2c8ca772ce52a78a800b0bf215d3ae4ec77422b08b1376856c"
   # pins differ because the two files above differ
-  "protocol/ls5000_single_pass/bundle.py|7c6d2afdf7835027cb6e96f0b91d74fcc2d2909fc0d26f4e0e9ebc62987c5a86|b96e91ebc65db338a8125625b30878780e2200e62048a8ba89d84f05dce5012d"
+  "protocol/ls5000_single_pass/bundle.py|10f2aedb2f7a371879098c7e0cfb31c58854fbccd0c46cb57f059fceb93f0559|ea18f5225b77ee7e54bd7c5bdf876b8a842fd895310ea8202a22482047c2c4bb"
   # packaged-app libusb resolution (app bundles its own signed binary)
   "protocol/ls5000_single_pass/usb_backend.py|afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62|666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1"
   # capture-timing receipt fields (started_at/duration)
