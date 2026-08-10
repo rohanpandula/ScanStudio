@@ -58,7 +58,10 @@ FAILED_HIGH_FINISH = {
 }
 FORBIDDEN_ARTIFACT_PATTERNS = (
     (
-        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+        re.compile(
+            r"-----BEGIN (?:(?:RSA |OPENSSH |EC |DSA |ENCRYPTED )?PRIVATE KEY|"
+            r"PGP PRIVATE KEY BLOCK)-----"
+        ),
         "private key",
     ),
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "AWS access key"),

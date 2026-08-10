@@ -449,6 +449,25 @@ class ReviewInputTests(GitRepositoryTestCase):
 
 
 class EvidenceHardeningTests(unittest.TestCase):
+    def test_common_private_key_headers_are_rejected(self) -> None:
+        marker_start = "-----" + "BEGIN "
+        marker_end = "-----"
+        key_kinds = (
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+            "PGP PRIVATE KEY BLOCK",
+        )
+        for key_kind in key_kinds:
+            with self.subTest(key_kind=key_kind):
+                with self.assertRaisesRegex(EvidenceError, "private key"):
+                    checker_module.require_safe_artifact(
+                        f"{marker_start}{key_kind}{marker_end}".encode(), "artifact"
+                    )
+
     def test_aws_long_lived_and_temporary_access_keys_are_rejected(self) -> None:
         for prefix in ("AKIA", "ASIA"):
             with self.subTest(prefix=prefix):
