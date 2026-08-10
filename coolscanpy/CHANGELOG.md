@@ -1,3 +1,10 @@
+## 0.6.0 - 2026-08-10
+
+- VPD dump: two-step dialect plus conformance validation.
+- unload-timer: GET B4h with the live 3600s/enabled reading.
+- perforation: 8Eh probe.
+- wedge-recovery: dry-run planner with 81h live acceptance.
+
 # Changelog
 
 ## Unreleased
