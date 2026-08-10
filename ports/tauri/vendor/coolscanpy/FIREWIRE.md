@@ -119,3 +119,26 @@ re-verified at v0.3.0: the table moved from `src/devices.rs` to
   FireWire units remains Linux-first (issue #16 discussion).
   coolscanpy's probe runs there through `linux_sg` with no extra
   install; the same paste-the-output ask in issue #28 applies.
+
+## Capability pages are walked, never indexed
+
+Capability pages are variable layouts. A parser follows each page's length
+prefixes and extend bits in order; it does not assign a permanent meaning to a
+fixed byte offset across scanner models. The byte positions in an interface
+specification are authoritative for the exact model documented by that
+specification, not a promise that another unit inserts every preceding field in
+the same place.
+
+The 2026-08-10 live LS-5000 dump gives a concrete length example. Its C1h page
+advertises `window_descriptor_len: 61`, while the SET WINDOW data header in the
+LS-5000 specification recommends a 50-byte window descriptor. The C1h set-value
+table itself specifies 61, so this is not a scanner/spec conflict; it is a
+warning against using the command header's recommended 50 as a capability-page
+layout constant.
+
+The reported nkscan v0.3.3 changelog example for the LS-8000 could not be
+verified from the local source bundle: no nkscan changelog was banked. The
+reported autofocus failure and the exact upstream wording therefore are not
+quoted here. Once that changelog is stored locally, its exact sentence should
+be added as the second model-specific regression example rather than
+reconstructed from memory.
