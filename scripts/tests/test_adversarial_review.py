@@ -582,6 +582,21 @@ class EvidenceHardeningTests(unittest.TestCase):
         ):
             self.assertEqual(review_input_module.git_bytes("version"), b"")
 
+    def test_git_accepts_final_output_from_process_done_at_deadline(self) -> None:
+        completed = subprocess.Popen(
+            [sys.executable, "-c", "print('final', end='')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        completed.wait(timeout=5)
+        with (
+            mock.patch.object(
+                review_input_module.subprocess, "Popen", return_value=completed
+            ),
+            mock.patch.object(review_input_module, "GIT_TIMEOUT_SECONDS", 0),
+        ):
+            self.assertEqual(review_input_module.git_bytes("version"), b"final")
+
     def test_git_reaps_child_that_closes_pipes_then_exceeds_deadline(self) -> None:
         real_popen = subprocess.Popen
         spawned: list[subprocess.Popen[bytes]] = []
@@ -607,6 +622,46 @@ class EvidenceHardeningTests(unittest.TestCase):
                     review_input_module.subprocess,
                     "Popen",
                     side_effect=close_pipes_then_sleep,
+                ),
+                mock.patch.object(review_input_module, "GIT_TIMEOUT_SECONDS", 0.05),
+                mock.patch.object(review_input_module, "GIT_KILL_REAP_SECONDS", 0.5),
+                mock.patch.object(
+                    review_input_module.os, "killpg", wraps=os.killpg
+                ) as kill_process_group,
+            ):
+                with self.assertRaisesRegex(ReviewInputError, "exceeded"):
+                    review_input_module.git_bytes("version")
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertEqual(len(spawned), 1)
+            self.assertIsNotNone(spawned[0].poll())
+            self.assertEqual(kill_process_group.call_count, 1)
+        finally:
+            for process in spawned:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_git_timeout_applies_to_continuously_ready_output(self) -> None:
+        real_popen = subprocess.Popen
+        spawned: list[subprocess.Popen[bytes]] = []
+
+        def continuously_write(
+            _command: list[str], **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            process = real_popen(
+                [sys.executable, "-c", "import os\nwhile True:\n os.write(1,b'x')\n"],
+                **kwargs,
+            )
+            spawned.append(process)
+            return process
+
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.object(
+                    review_input_module.subprocess,
+                    "Popen",
+                    side_effect=continuously_write,
                 ),
                 mock.patch.object(review_input_module, "GIT_TIMEOUT_SECONDS", 0.05),
                 mock.patch.object(review_input_module, "GIT_KILL_REAP_SECONDS", 0.5),

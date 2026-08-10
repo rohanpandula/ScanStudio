@@ -161,7 +161,13 @@ def git_bytes(*args: str) -> bytes:
                     return return_code
                 raise
 
+    cleanup_started = False
+
     def stop_process() -> None:
+        nonlocal cleanup_started
+        if cleanup_started:
+            return
+        cleanup_started = True
         killed = False
         kill_deadline = time.monotonic() + GIT_KILL_REAP_SECONDS
         reap_deadline = kill_deadline
@@ -215,12 +221,21 @@ def git_bytes(*args: str) -> bytes:
                     timeout = max(0.0, select_deadline - time.monotonic())
 
     completed = False
+    final_nonblocking_drain_passes = 0
     try:
         selector = selectors.DefaultSelector()
         for stream in streams:
             selector.register(stream, selectors.EVENT_READ)
         while selector.get_map():
-            remaining = max(0.0, deadline - time.monotonic())
+            expired = time.monotonic() >= deadline
+            if expired:
+                if final_nonblocking_drain_passes >= 2:
+                    raise timeout_error()
+                # Permit two bounded nonblocking passes at the deadline: one
+                # for a final small output chunk and one to observe its EOF. A
+                # live writer still cannot use readiness to reset the budget.
+                final_nonblocking_drain_passes += 1
+            remaining = 0.0 if expired else max(0.0, deadline - time.monotonic())
             ready = select_ready(remaining, deadline)
             if not ready:
                 # A descriptor can become ready at the same instant the timed
