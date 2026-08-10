@@ -87,7 +87,7 @@ python3 "$repository_root/scripts/check_adversarial_review.py" \
     --pure \
     --agent build \
     --model "$review_model" \
-    --variant max \
+    --variant high \
     --dir "$review_sandbox" \
     --title "$review_title" | tee "$report_file"
 

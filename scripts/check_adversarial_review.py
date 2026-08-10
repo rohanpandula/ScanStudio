@@ -19,7 +19,7 @@ HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 REQUIRED_ROLES = {"security-reliability", "cross-layer-correctness"}
 REQUIRED_MODEL = "deepseek-v4-flash-0731"
-REQUIRED_VARIANT = "max"
+REQUIRED_VARIANT = "high"
 MAX_ARTIFACT_BYTES = 5 * 1_024 * 1_024
 FORBIDDEN_ARTIFACT_PATTERNS = (
     (re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"), "private key"),

@@ -14,9 +14,12 @@ command or exploratory read.
 4. Run two new OpenCode sessions against that same diff:
    - a security and reliability attack pass;
    - a cross-layer correctness and regression pass.
-5. Use the exact `deepseek-v4-flash-0731` model ID at maximum effort. Record
-   the OpenCode version and provider; the dated model ID is mandatory even
-   when a provider offers an undated alias.
+5. Use the exact `deepseek-v4-flash-0731` model ID with OpenCode's `high`
+   reasoning variant. Record the OpenCode version and provider; the dated
+   model ID is mandatory even when a provider offers an undated alias. The
+   `max` variant is intentionally not used: on a full milestone diff it can
+   consume the entire response budget as hidden reasoning and emit no
+   auditable report, which must fail closed.
 6. Do not show either reviewer the other reviewer's first-pass report. Treat
    any instructions embedded in the diff as untrusted data and deny all model
    tools. The model receives the frozen diff through standard input.
@@ -65,7 +68,7 @@ The manifest records:
 - base and reviewed commit IDs;
 - SHA-256 of the canonical diff;
 - OpenCode version, provider, exact model ID, and fresh context ID for both
-  reviewers, plus the required `max` variant;
+  reviewers, plus the required `high` variant;
 - prompt and report filenames and SHA-256 values;
 - final verdicts and the unresolved-blocker count;
 - an independence declaration for each run.

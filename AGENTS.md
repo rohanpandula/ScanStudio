@@ -35,8 +35,10 @@ The required reviewer is OpenCode running DeepSeek V4 Flash 0731. Run two
 fresh, independent contexts over the same frozen tracked-files diff: one
 security/reliability pass and one cross-layer correctness pass. The exact
 version-pinned model ID is `deepseek-v4-flash-0731`; do not silently substitute
-an alias, a newer model, or another provider model. Neither first-pass reviewer
-may see the other first-pass report.
+an alias, a newer model, or another provider model. Use the review protocol's
+required `high` reasoning variant so a full-diff review retains output budget
+for its auditable report. Neither first-pass reviewer may see the other
+first-pass report.
 
 Resolve every validated blocker, rerun deterministic tests, freeze the updated
 diff, and repeat both reviews. Do not treat review output as proof by itself:
