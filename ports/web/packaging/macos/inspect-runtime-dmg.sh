@@ -5,19 +5,34 @@ set -euo pipefail
 
 usage() {
     printf 'Usage: inspect-runtime-dmg.sh <runtime.dmg> <version> <arm64|x86_64> <team-id> <summary.json>\n' >&2
+    printf '   or: inspect-runtime-dmg.sh --prepare-assembly <unsigned.dmg> <assembly.json> <version> <arm64|x86_64> <prepared-root>\n' >&2
 }
 
-if [[ $# -ne 5 ]]; then
+mode="release"
+if [[ $# -eq 6 && "$1" == "--prepare-assembly" ]]; then
+    mode="assembly"
+    dmg="$2"
+    assembly_receipt="$3"
+    version="$4"
+    arch="$5"
+    prepared_root="$6"
+    expected_team=""
+    summary=""
+elif [[ $# -eq 5 ]]; then
+    dmg="$1"
+    version="$2"
+    arch="$3"
+    expected_team="$4"
+    summary="$5"
+    assembly_receipt=""
+    prepared_root=""
+else
     usage
     exit 64
 fi
-
-dmg="$1"
-version="$2"
-arch="$3"
-expected_team="$4"
-summary="$5"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+private_path_checker="$script_dir/assert-no-private-paths.sh"
+receipt_tool="$script_dir/runtime-assembly-receipt.py"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     printf 'Runtime DMG inspection requires macOS.\n' >&2
@@ -36,16 +51,37 @@ if [[ "$arch" != "arm64" && "$arch" != "x86_64" ]]; then
     printf 'Bad architecture: %s\n' "$arch" >&2
     exit 64
 fi
-if [[ ! "$expected_team" =~ ^[0-9A-Z]{10}$ ]]; then
+if [[ "$mode" == "release" && ! "$expected_team" =~ ^[0-9A-Z]{10}$ ]]; then
     printf 'Bad Developer ID team identifier.\n' >&2
     exit 64
 fi
-if [[ -e "$summary" || -L "$summary" ]]; then
+if [[ "$mode" == "release" && ( -e "$summary" || -L "$summary" ) ]]; then
     printf 'Refusing to overwrite an existing payload summary: %s\n' "$summary" >&2
     exit 73
 fi
+if [[ "$mode" == "assembly" \
+      && ( -e "$prepared_root" || -L "$prepared_root" ) ]]; then
+    printf 'Refusing to overwrite prepared runtime root: %s\n' "$prepared_root" >&2
+    exit 73
+fi
 
-for command in codesign file hdiutil lipo spctl strings xcrun; do
+for required_helper in \
+    "$private_path_checker" \
+    "$receipt_tool" \
+    "$script_dir/payload-tree-hash.sh" \
+    "$script_dir/python-build-standalone-evidence.py"; do
+    if [[ ! -f "$required_helper" || -L "$required_helper" ]]; then
+        printf 'Required static verification helper is missing or linked: %s\n' \
+            "$required_helper" >&2
+        exit 66
+    fi
+done
+
+required_commands=(cmp file hdiutil lipo python3 rsync strings)
+if [[ "$mode" == "release" ]]; then
+    required_commands+=(codesign spctl xcrun)
+fi
+for command in "${required_commands[@]}"; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf 'Required verification tool is unavailable: %s\n' "$command" >&2
         exit 127
@@ -53,21 +89,35 @@ for command in codesign file hdiutil lipo spctl strings xcrun; do
 done
 
 stem="ScanStudio-WebRuntime-$version-macOS-$arch"
-if [[ "$(basename "$dmg")" != "$stem.dmg" ]]; then
+expected_dmg_name="$stem.dmg"
+if [[ "$mode" == "assembly" ]]; then
+    expected_dmg_name="$stem.unsigned.dmg"
+fi
+if [[ "$(basename "$dmg")" != "$expected_dmg_name" ]]; then
     printf 'Runtime DMG name does not match its version/architecture contract.\n' >&2
     exit 64
 fi
 
-codesign --verify --strict "$dmg"
 hdiutil verify "$dmg" >/dev/null
-xcrun stapler validate "$dmg"
-spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+if [[ "$mode" == "release" ]]; then
+    codesign --verify --strict "$dmg"
+    xcrun stapler validate "$dmg"
+    spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+fi
 
-summary_parent="$(dirname "$summary")"
-mkdir -p "$summary_parent"
-summary_parent="$(cd "$summary_parent" && pwd)"
-summary="$summary_parent/$(basename "$summary")"
-workdir="$(mktemp -d "$summary_parent/.runtime-inspect.XXXXXX")"
+if [[ "$mode" == "release" ]]; then
+    work_parent="$(dirname "$summary")"
+else
+    work_parent="$(dirname "$prepared_root")"
+fi
+mkdir -p "$work_parent"
+work_parent="$(cd "$work_parent" && pwd)"
+if [[ "$mode" == "release" ]]; then
+    summary="$work_parent/$(basename "$summary")"
+else
+    prepared_root="$work_parent/$(basename "$prepared_root")"
+fi
+workdir="$(mktemp -d "$work_parent/.runtime-inspect.XXXXXX")"
 mount_point="$workdir/mounted"
 mkdir "$mount_point"
 mounted=0
@@ -81,9 +131,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mount_point" "$dmg"
+hdiutil attach -quiet -readonly -noautoopen -nobrowse \
+    -mountpoint "$mount_point" "$dmg"
 mounted=1
-python3 - "$mount_point" <<'PY'
+python3 -I -S - "$mount_point" <<'PY'
 from pathlib import Path
 import sys
 
@@ -137,15 +188,7 @@ if find "$resources/Python" \
     printf 'Runtime contains a forbidden unused/native dependency path.\n' >&2
     exit 1
 fi
-user_home_pattern="/"'Users/'
-temporary_root_pattern="/var/"'folders/'
-private_temporary_root_pattern="/private/var/"'folders/'
-if grep -rEl \
-    "${user_home_pattern}|${temporary_root_pattern}|${private_temporary_root_pattern}" \
-    "$bundle" >/dev/null 2>&1; then
-    printf 'Runtime contains a developer or temporary build path.\n' >&2
-    exit 1
-fi
+"$private_path_checker" "$bundle"
 if find "$bundle" \
     \( -iname '*coolscanpy*' -o -iname '*scanstudio-bridge*' \
        -o -iname '*libusb*' -o -name 'sane.py' -o -name 'scanstudio-engine' \
@@ -160,7 +203,7 @@ if ! strings "$launcher" | grep -Fxq 'SCANSTUDIO_BRIDGE_CMD' \
     exit 1
 fi
 
-python3 - "$resources/runtime.json" "$version" "$arch" <<'PY'
+python3 -I -S - "$resources/runtime.json" "$version" "$arch" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -183,12 +226,12 @@ if value != expected:
     raise SystemExit(f"internal runtime contract mismatch: {value!r}")
 PY
 
-python3 "$script_dir/python-build-standalone-evidence.py" verify-bundle \
+python3 -I -S "$script_dir/python-build-standalone-evidence.py" verify-bundle \
     --pin "$script_dir/python-build-standalone-lock.json" \
     --architecture "$arch" \
     --runtime-root "$resources/Python" \
     --evidence-root "$resources/Licenses/python-build-standalone"
-python3 - \
+python3 -I -S - \
     "$resources/Licenses/python-build-standalone/inventory.json" \
     "$resources/SBOM/ScanStudio-WebRuntime.cdx.json" <<'PY'
 import json
@@ -239,6 +282,45 @@ if ("zlib", "required") not in actual or any(name == "zlib-ng" for name, _ in ac
     raise SystemExit("CycloneDX does not reflect the proven system-zlib dependency")
 PY
 
+if [[ "$(lipo -archs "$launcher")" != "$arch" ]]; then
+    printf 'Runtime launcher architecture mismatch.\n' >&2
+    exit 1
+fi
+while IFS= read -r -d '' candidate; do
+    if file -b "$candidate" | grep -q 'Mach-O' \
+        && [[ "$(lipo -archs "$candidate")" != "$arch" ]]; then
+        printf 'Nested runtime architecture mismatch: %s\n' "$candidate" >&2
+        exit 1
+    fi
+done < <(find "$bundle" -type f -print0)
+
+tree_summary="$workdir/tree-summary.json"
+"$script_dir/payload-tree-hash.sh" "$bundle" > "$tree_summary"
+
+if [[ "$mode" == "assembly" ]]; then
+    python3 -I -S "$receipt_tool" verify \
+        "$dmg" "$version" "$arch" "$tree_summary" "$assembly_receipt"
+
+    mkdir "$prepared_root"
+    rsync -a "$bundle" "$prepared_root/"
+    prepared_bundle="$prepared_root/ScanStudioWebRuntime.bundle"
+
+    hdiutil detach -quiet "$mount_point"
+    mounted=0
+
+    copied_tree="$workdir/copied-tree.json"
+    "$script_dir/payload-tree-hash.sh" "$prepared_bundle" > "$copied_tree"
+    if ! cmp -s "$tree_summary" "$copied_tree"; then
+        printf 'Prepared runtime copy changed payload bytes or modes.\n' >&2
+        exit 1
+    fi
+    python3 -I -S "$receipt_tool" verify \
+        "$dmg" "$version" "$arch" "$copied_tree" "$assembly_receipt"
+    printf 'Statically validated and prepared unsigned runtime at %s\n' \
+        "$prepared_bundle"
+    exit 0
+fi
+
 codesign --verify --deep --strict "$bundle"
 codesign --verify --strict "$launcher"
 spctl --assess --type execute --verbose=2 "$bundle"
@@ -257,24 +339,13 @@ if ! printf '%s\n' "$identity" | grep -Fq 'Authority=Developer ID Application:';
     printf 'Runtime launcher is not Developer ID Application signed.\n' >&2
     exit 1
 fi
-if [[ "$(lipo -archs "$launcher")" != "$arch" ]]; then
-    printf 'Runtime launcher architecture mismatch.\n' >&2
-    exit 1
-fi
 while IFS= read -r -d '' candidate; do
     if file -b "$candidate" | grep -q 'Mach-O'; then
         codesign --verify --strict "$candidate"
-        if [[ "$(lipo -archs "$candidate")" != "$arch" ]]; then
-            printf 'Nested runtime architecture mismatch: %s\n' "$candidate" >&2
-            exit 1
-        fi
     fi
 done < <(find "$bundle" -type f -print0)
 
-tree_summary="$workdir/tree-summary.json"
-"$script_dir/payload-tree-hash.sh" \
-    "$bundle" > "$tree_summary"
-python3 - \
+python3 -I -S - \
     "$tree_summary" "$summary" "$bundle_identifier" "$team_identifier" <<'PY'
 import json
 from pathlib import Path

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Build a separately delivered, Developer-ID-signed macOS web runtime DMG.
+# Assemble a separately delivered unsigned macOS web runtime DMG. Signing and
+# notarization happen only on a fresh runner after this payload is transferred,
+# mounted read-only, statically validated, copied, detached, and re-hashed.
 # This payload deliberately contains no ScanStudio engine, bridge, CoolScanPy,
 # libusb, SANE binding, hardware authorization, or native ScanStudio.app.
 set -euo pipefail
 
 usage() {
-    printf 'Usage: package-runtime.sh <version> <arm64|x86_64> <output-dir> <Developer ID Application identity>\n' >&2
+    printf 'Usage: package-runtime.sh <version> <arm64|x86_64> <output-dir>\n' >&2
 }
 
-if [[ $# -ne 4 ]]; then
+if [[ $# -ne 3 ]]; then
     usage
     exit 64
 fi
@@ -16,7 +18,6 @@ fi
 version="$1"
 arch="$2"
 output_dir="$3"
-codesign_identity="$4"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     printf 'The macOS web runtime must be built on macOS.\n' >&2
@@ -35,12 +36,7 @@ if [[ "$(uname -m)" != "$arch" ]]; then
     printf 'Refusing a non-native runtime build: requested %s on %s.\n' "$arch" "$(uname -m)" >&2
     exit 64
 fi
-if [[ "$codesign_identity" != 'Developer ID Application: '* ]]; then
-    printf 'A Developer ID Application identity is mandatory; ad-hoc signing is not a web-runtime release.\n' >&2
-    exit 78
-fi
-
-for command in codesign file hdiutil install_name_tool lipo otool rsync shasum stat strip xcrun; do
+for command in cmp file hdiutil install_name_tool lipo otool rsync shasum stat strip xcrun; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf 'Required packaging tool is unavailable: %s\n' "$command" >&2
         exit 127
@@ -57,6 +53,9 @@ frontend_marker="$frontend/scanstudio-web-runtime.json"
 launcher_source="$script_dir/launcher.c"
 pbs_pin="$script_dir/python-build-standalone-lock.json"
 pbs_evidence_tool="$script_dir/python-build-standalone-evidence.py"
+assembly_receipt_tool="$script_dir/runtime-assembly-receipt.py"
+private_path_checker="$script_dir/assert-no-private-paths.sh"
+payload_tree_hasher="$script_dir/payload-tree-hash.sh"
 pbs_distribution_root="${SCANSTUDIO_PBS_DISTRIBUTION_ROOT:-}"
 
 for required_file in \
@@ -69,6 +68,9 @@ for required_file in \
     "$launcher_source" \
     "$pbs_pin" \
     "$pbs_evidence_tool" \
+    "$assembly_receipt_tool" \
+    "$private_path_checker" \
+    "$payload_tree_hasher" \
     "$repo_root/LICENSE" \
     "$repo_root/THIRD_PARTY_NOTICES.md"; do
     if [[ ! -f "$required_file" ]]; then
@@ -158,9 +160,11 @@ done
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
 stem="ScanStudio-WebRuntime-$version-macOS-$arch"
-output="$output_dir/$stem.dmg"
-if [[ -e "$output" || -L "$output" ]]; then
-    printf 'Refusing to overwrite an existing release artifact: %s\n' "$output" >&2
+output="$output_dir/$stem.unsigned.dmg"
+assembly_receipt="$output_dir/$stem.assembly.json"
+if [[ -e "$output" || -L "$output" \
+      || -e "$assembly_receipt" || -L "$assembly_receipt" ]]; then
+    printf 'Refusing to overwrite an existing runtime assembly artifact.\n' >&2
     exit 73
 fi
 
@@ -170,7 +174,7 @@ bundle="$payload_root/ScanStudioWebRuntime.bundle"
 contents="$bundle/Contents"
 resources="$contents/Resources"
 bundled_python="$resources/Python"
-temporary_dmg="$staging_root/$stem.dmg"
+temporary_dmg="$staging_root/$stem.unsigned.dmg"
 mount_point="$staging_root/mounted"
 mounted=0
 cleanup() {
@@ -624,46 +628,18 @@ if find "$bundle" -perm -0022 -print -quit | grep -q .; then
     printf 'Refusing a group- or world-writable runtime path.\n' >&2
     exit 1
 fi
-user_home_pattern="/"'Users/'
-temporary_root_pattern="/var/"'folders/'
-private_temporary_root_pattern="/private/var/"'folders/'
-private_path_matches="$(
-    grep -rEl \
-        "${user_home_pattern}|${temporary_root_pattern}|${private_temporary_root_pattern}" \
-        "$bundle" 2>/dev/null || true
-)"
-if [[ -n "$private_path_matches" ]]; then
-    printf 'Refusing a runtime bundle containing a developer or temporary build path:\n%s\n' \
-        "$private_path_matches" >&2
-    exit 1
-fi
+"$private_path_checker" "$bundle"
 
 PYTHONDONTWRITEBYTECODE=1 "$bundled_python/bin/python3.13" -I -c \
     'import fastapi, scanstudio_web.cli, uvicorn, wsproto; assert fastapi and uvicorn and wsproto'
 find "$bundle" -type f -name '*.pyc' -delete
 find "$bundle" -type d -name '__pycache__' -empty -delete
 
-# Sign every nested Mach-O before the launcher and outer bundle. Timestamped
-# Developer ID signatures are mandatory here; there is no ad-hoc code path.
-while IFS= read -r -d '' candidate; do
-    [[ "$candidate" == "$contents/MacOS/scanstudio-web-runtime" ]] && continue
-    if file -b "$candidate" | grep -q 'Mach-O'; then
-        codesign --force --options runtime --timestamp \
-            --sign "$codesign_identity" "$candidate"
-        codesign --verify --strict "$candidate"
-        if [[ "$(lipo -archs "$candidate")" != "$arch" ]]; then
-            printf 'Nested runtime architecture mismatch: %s\n' "$candidate" >&2
-            exit 1
-        fi
-    fi
-done < <(find "$bundle" -type f -print0)
-codesign --force --options runtime --timestamp \
-    --identifier 'dev.scanstudio.live.web-runtime' \
-    --sign "$codesign_identity" \
-    "$contents/MacOS/scanstudio-web-runtime"
-codesign --force --options runtime --timestamp \
-    --sign "$codesign_identity" "$bundle"
-codesign --verify --deep --strict "$bundle"
+# Bind the exact unsigned bytes and modes before placing them in the handoff
+# image. The build runner is the only phase allowed to execute payload code.
+assembled_tree="$staging_root/assembled-tree.json"
+mounted_tree="$staging_root/mounted-tree.json"
+"$payload_tree_hasher" "$bundle" > "$assembled_tree"
 
 hdiutil create -quiet \
     -fs HFS+ \
@@ -673,22 +649,27 @@ hdiutil create -quiet \
     -srcfolder "$payload_root" \
     "$temporary_dmg"
 hdiutil verify "$temporary_dmg" >/dev/null
-hdiutil attach -quiet -readonly -nobrowse \
+hdiutil attach -quiet -readonly -noautoopen -nobrowse \
     -mountpoint "$mount_point" "$temporary_dmg"
 mounted=1
 if [[ ! -d "$mount_point/ScanStudioWebRuntime.bundle" ]]; then
-    printf 'Mounted runtime image does not contain the expected bundle.\n' >&2
+    printf 'Mounted unsigned runtime image does not contain the expected bundle.\n' >&2
     exit 1
 fi
-codesign --verify --deep --strict "$mount_point/ScanStudioWebRuntime.bundle"
+"$payload_tree_hasher" \
+    "$mount_point/ScanStudioWebRuntime.bundle" > "$mounted_tree"
+if ! cmp -s "$assembled_tree" "$mounted_tree"; then
+    printf 'Unsigned DMG did not preserve the exact payload bytes and modes.\n' >&2
+    exit 1
+fi
 hdiutil detach -quiet "$mount_point"
 mounted=0
 
-codesign --force --timestamp --sign "$codesign_identity" "$temporary_dmg"
-codesign --verify --strict "$temporary_dmg"
-hdiutil verify "$temporary_dmg" >/dev/null
 mv "$temporary_dmg" "$output"
+python3 -I -S "$assembly_receipt_tool" emit \
+    "$output" "$version" "$arch" "$mounted_tree" "$assembly_receipt"
 
-printf 'Packaged %s\n' "$output"
+printf 'Assembled unsigned runtime %s\n' "$output"
+printf 'Assembly receipt %s\n' "$assembly_receipt"
 printf 'SHA-256 %s\n' "$(shasum -a 256 "$output" | awk '{print $1}')"
-printf 'Notarization and stapling are still required before manifest emission.\n'
+printf 'A fresh runner must validate, copy, sign, notarize, and manifest this payload.\n'

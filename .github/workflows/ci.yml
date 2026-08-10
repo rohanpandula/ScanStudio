@@ -30,11 +30,14 @@ jobs:
           python3 -m py_compile \
             scripts/adversarial_review_input.py \
             scripts/check_adversarial_review.py \
-            scripts/parse_opencode_review.py
+            scripts/parse_opencode_review.py \
+            ports/web/packaging/macos/runtime-assembly-receipt.py
           bash -n scripts/run_adversarial_review.sh
           bash -n \
             ports/web/packaging/macos/package-runtime.sh \
+            ports/web/packaging/macos/assert-no-private-paths.sh \
             ports/web/packaging/macos/inspect-runtime-dmg.sh \
+            ports/web/packaging/macos/sign-runtime.sh \
             ports/web/packaging/macos/payload-tree-hash.sh \
             ports/web/packaging/macos/prepare-pinned-python.sh \
             ports/web/packaging/macos/require-openssl3.sh \
@@ -42,6 +45,7 @@ jobs:
             ports/web/packaging/macos/verify-integrity.sh \
             ports/web/packaging/macos/verify-runtime-release.sh
           ports/web/packaging/macos/tests/test-integrity.sh
+          ports/web/packaging/macos/tests/test-release-boundary.sh
           ports/web/packaging/macos/tests/test-payload-tree-hash.sh
           ports/web/packaging/macos/tests/test-python-build-standalone-evidence.sh
 
