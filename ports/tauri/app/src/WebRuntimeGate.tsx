@@ -98,6 +98,10 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
   }, [releaseLocalControl]);
 
   const refresh = useCallback(async (): Promise<void> => {
+    // A claim is the authoritative ownership transition. Starting a session
+    // read while it is pending would supersede its generation and could leave
+    // a successful server lease without the page retaining its token.
+    if (claimInFlight.current !== null) return;
     const generation = ++refreshGeneration.current;
     setError(null);
     try {

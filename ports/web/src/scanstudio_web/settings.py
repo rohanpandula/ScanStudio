@@ -99,10 +99,13 @@ class Settings:
     lease_ttl_seconds: float = 30.0
     engine_startup_timeout_seconds: float = 10.0
     engine_request_timeout_seconds: float = 30.0
+    engine_write_timeout_seconds: float = 5.0
     engine_shutdown_timeout_seconds: float = 3.0
     max_request_body_bytes: int = 1_048_576
     max_engine_line_bytes: int = 4_194_304
     event_queue_size: int = 256
+    max_auth_sessions: int = 256
+    max_event_subscribers: int = 64
 
     def __post_init__(self) -> None:
         if not self.engine_command or any(not item for item in self.engine_command):
@@ -127,6 +130,18 @@ class Settings:
             raise ConfigurationError("session_ttl_seconds must be positive")
         if self.event_queue_size < 1:
             raise ConfigurationError("event_queue_size must be positive")
+        if not 0 < self.engine_write_timeout_seconds <= 30:
+            raise ConfigurationError(
+                "engine_write_timeout_seconds must be positive and at most 30"
+            )
+        if not 1 <= self.max_auth_sessions <= 4_096:
+            raise ConfigurationError(
+                "max_auth_sessions must be between 1 and 4096"
+            )
+        if not 1 <= self.max_event_subscribers <= 1_024:
+            raise ConfigurationError(
+                "max_event_subscribers must be between 1 and 1024"
+            )
         for origin in self.expected_origins:
             normalize_origin(origin)
 
@@ -199,6 +214,12 @@ class Settings:
                 minimum=0.1,
                 maximum=600.0,
             ),
+            engine_write_timeout_seconds=_env_float(
+                "SCANSTUDIO_WEB_ENGINE_WRITE_TIMEOUT_SECONDS",
+                5.0,
+                minimum=0.1,
+                maximum=30.0,
+            ),
             engine_shutdown_timeout_seconds=_env_float(
                 "SCANSTUDIO_WEB_ENGINE_SHUTDOWN_TIMEOUT_SECONDS",
                 3.0,
@@ -222,5 +243,17 @@ class Settings:
                 256,
                 minimum=8,
                 maximum=4_096,
+            ),
+            max_auth_sessions=_env_int(
+                "SCANSTUDIO_WEB_MAX_AUTH_SESSIONS",
+                256,
+                minimum=1,
+                maximum=4_096,
+            ),
+            max_event_subscribers=_env_int(
+                "SCANSTUDIO_WEB_MAX_EVENT_SUBSCRIBERS",
+                64,
+                minimum=1,
+                maximum=1_024,
             ),
         )

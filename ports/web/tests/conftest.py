@@ -23,6 +23,8 @@ def app_factory(tmp_path: Path) -> Callable[..., tuple[object, Path, Path]]:
         mode: str = "normal",
         token: str | None = ACCESS_TOKEN,
         static_dir: Path | None = None,
+        max_auth_sessions: int = 256,
+        max_event_subscribers: int = 64,
     ):
         nonlocal counter
         counter += 1
@@ -47,6 +49,8 @@ def app_factory(tmp_path: Path) -> Callable[..., tuple[object, Path, Path]]:
             engine_request_timeout_seconds=1.0,
             engine_shutdown_timeout_seconds=0.15,
             event_queue_size=8,
+            max_auth_sessions=max_auth_sessions,
+            max_event_subscribers=max_event_subscribers,
         )
         return create_app(settings), request_log, env_log
 

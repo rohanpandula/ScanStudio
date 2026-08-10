@@ -18,11 +18,18 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from .controller_lease import ControllerLease, LeaseRejected
 from .engine_process import EngineRequestTimeout, EngineSupervisor, EngineUnavailable
-from .relay import EventBroker, SubscriberClosed
-from .security import AuthManager, AuthenticationError, OriginError
+from .relay import EventBroker, SubscriberClosed, SubscriberLimitReached
+from .security import (
+    AuthManager,
+    AuthenticationError,
+    OriginError,
+    SessionLimitReached,
+)
 from .settings import ConfigurationError, Settings
 
 CONTROL_LEASE_HEADER = "X-ScanStudio-Control-Lease"
+WEB_RUNTIME_MARKER_FILENAME = "scanstudio-web-runtime.json"
+WEB_RUNTIME_MARKER = {"schemaVersion": 1, "runtime": "simulator-only-web"}
 
 READ_ONLY_METHODS = frozenset({"scanner.list", "scanner.status"})
 MUTATING_METHODS = frozenset(
@@ -139,7 +146,10 @@ def create_app(
 ) -> FastAPI:
     resolved = settings or Settings.from_env()
     static_dir = _usable_static_dir(resolved.static_dir)
-    events = EventBroker(resolved.event_queue_size)
+    events = EventBroker(
+        resolved.event_queue_size,
+        max_subscribers=resolved.max_event_subscribers,
+    )
     engine = EngineSupervisor(resolved, events, on_fatal=on_engine_fatal)
     auth = AuthManager(resolved)
     lease = ControllerLease(resolved.lease_ttl_seconds)
@@ -154,7 +164,7 @@ def create_app(
         if not static_assets_ready():
             raise ConfigurationError(
                 "SCANSTUDIO_WEB_STATIC_DIR must name a directory containing "
-                "index.html"
+                "index.html and a compatible scanstudio-web-runtime.json marker"
             )
         await engine.start()
         try:
@@ -250,9 +260,12 @@ def create_app(
     async def healthz() -> JSONResponse:
         snapshot = engine.health()
         healthy = snapshot["ready"] is True and static_assets_ready()
+        # Orchestrators need only the status code and stable readiness word.
+        # Keep the child PID and internal fatal diagnostics out of this public
+        # endpoint so probing an unauthenticated deployment reveals no internals.
         return JSONResponse(
             status_code=200 if healthy else 503,
-            content={"status": "ok" if healthy else "unhealthy", "engine": snapshot},
+            content={"status": "ok" if healthy else "unhealthy"},
         )
 
     @app.get("/startupz")
@@ -261,7 +274,7 @@ def create_app(
         ready = snapshot["ready"] is True and static_assets_ready()
         return JSONResponse(
             status_code=200 if ready else 503,
-            content={"started": ready, "engine": snapshot},
+            content={"started": ready},
         )
 
     @app.get("/api/v1/session")
@@ -285,6 +298,8 @@ def create_app(
             )
         except AuthenticationError as exc:
             raise GatewayError(401, "INVALID_TOKEN", "invalid access token") from exc
+        except SessionLimitReached as exc:
+            raise GatewayError(429, "SESSION_LIMIT_REACHED", str(exc)) from exc
         response = JSONResponse(
             content={"authenticated": True, "control": await lease.state()}
         )
@@ -394,7 +409,11 @@ def create_app(
             await websocket.close(code=4401, reason="authentication required")
             return
 
-        subscriber = await events.subscribe()
+        try:
+            subscriber = await events.subscribe()
+        except SubscriberLimitReached:
+            await websocket.close(code=4429, reason="event subscriber limit reached")
+            return
         receive_task: asyncio.Task[Message] | None = None
         try:
             await websocket.accept()
@@ -460,5 +479,12 @@ def _usable_static_dir(path: Path | None) -> Path | None:
         return None
     resolved = path.resolve()
     if not resolved.is_dir() or not (resolved / "index.html").is_file():
+        return None
+    marker = resolved / WEB_RUNTIME_MARKER_FILENAME
+    try:
+        marker_value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if marker_value != WEB_RUNTIME_MARKER:
         return None
     return resolved

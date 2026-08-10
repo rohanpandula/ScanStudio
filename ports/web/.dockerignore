@@ -8,3 +8,9 @@
 **/node_modules
 **/dist
 **/target
+**/.env
+**/.env.*
+**/.scanstudio
+**/live-attempts
+**/evidence-packages
+**/diagnostic-bundles

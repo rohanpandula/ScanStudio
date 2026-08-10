@@ -314,9 +314,24 @@ class EngineSupervisor:
             self._pending[request_id] = future
             try:
                 process.stdin.write(wire)
-                await process.stdin.drain()
+                await asyncio.wait_for(
+                    process.stdin.drain(),
+                    timeout=self._settings.engine_write_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                self._cancel_pending(request_id)
+                message = (
+                    "engine stdin remained blocked beyond the configured write timeout"
+                )
+                await self._mark_fatal(message)
+                raise EngineUnavailable(message) from exc
+            except asyncio.CancelledError:
+                # The bytes may already be in the pipe. Retain issued-id history
+                # so a later response is ignored instead of poisoning the engine.
+                self._abandon(request_id)
+                raise
             except (BrokenPipeError, ConnectionResetError) as exc:
-                self._pending.pop(request_id, None)
+                self._cancel_pending(request_id)
                 await self._mark_fatal("engine stdin closed while writing a request")
                 raise EngineUnavailable(self._fatal_error or str(exc)) from exc
             return request_id, future
@@ -398,8 +413,13 @@ class EngineSupervisor:
                 )
             future = self._pending.pop(request_id, None)
             if future is None:
-                if request_id in self._abandoned_set:
-                    self._abandoned_set.discard(request_id)
+                self._abandoned_set.discard(request_id)
+                # IDs are allocated monotonically without gaps. A positive ID
+                # below _next_id was issued by this supervisor, even if its
+                # bounded abandonment tombstone has since been evicted or an
+                # engine emitted a duplicate response. Late issued responses
+                # are harmless; a never-issued ID still fails the protocol.
+                if 1 <= request_id < self._next_id:
                     return
                 raise EngineProtocolError(
                     f"engine returned unknown response id {request_id}"
@@ -422,14 +442,17 @@ class EngineSupervisor:
         raise EngineProtocolError("engine emitted an unknown NDJSON envelope")
 
     def _abandon(self, request_id: int) -> None:
-        future = self._pending.pop(request_id, None)
-        if future is not None and not future.done():
-            future.cancel()
+        self._cancel_pending(request_id)
         if len(self._abandoned_ids) == self._abandoned_ids.maxlen:
             oldest = self._abandoned_ids[0]
             self._abandoned_set.discard(oldest)
         self._abandoned_ids.append(request_id)
         self._abandoned_set.add(request_id)
+
+    def _cancel_pending(self, request_id: int) -> None:
+        future = self._pending.pop(request_id, None)
+        if future is not None and not future.done():
+            future.cancel()
 
     async def _mark_fatal(
         self,

@@ -16,6 +16,10 @@ class OriginError(Exception):
     pass
 
 
+class SessionLimitReached(Exception):
+    pass
+
+
 class AuthManager:
     """In-memory opaque browser sessions backed by one deployment token."""
 
@@ -65,6 +69,10 @@ class AuthManager:
             if existing_session in self._sessions:
                 session_id = existing_session
             else:
+                if len(self._sessions) >= self._settings.max_auth_sessions:
+                    raise SessionLimitReached(
+                        "the active browser session limit has been reached"
+                    )
                 session_id = secrets.token_urlsafe(32)
             self._sessions[session_id] = now + self._settings.session_ttl_seconds
             return session_id

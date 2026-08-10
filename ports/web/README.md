@@ -6,7 +6,7 @@ This slice is deliberately simulator-only. The gateway removes `SCANSTUDIO_BRIDG
 
 ## Runtime contract
 
-The gateway sends `engine.hello` as the child's first NDJSON request, owns all correlation IDs, drains stderr, and starts serving only after the handshake and simulator-device check succeed. Engine events are broadcast unchanged to bounded per-observer queues. A slow observer is disconnected rather than blocking the engine reader.
+The gateway sends `engine.hello` as the child's first NDJSON request, owns all correlation IDs, drains stderr, and starts serving only after the handshake and simulator-device check succeed. Engine events are broadcast unchanged to bounded per-observer queues and a bounded observer set. A slow or excess observer is disconnected rather than blocking the engine reader or growing memory without limit.
 
 The public engine allowlist is exactly:
 
@@ -25,6 +25,9 @@ Routes:
 - `POST /api/v1/engine/request` with `{"method":"...","params":{...}}`
 - `WS /api/v1/engine/events`
 - `GET /healthz` and `GET /startupz`
+
+The two unauthenticated probes expose only stable readiness booleans/status.
+Child PIDs and internal startup/fatal diagnostics are never returned publicly.
 
 Login exchanges the deployment token for an opaque `HttpOnly; SameSite=Strict` cookie. State-changing requests and WebSocket upgrades require an exact configured `Origin`; there is no permissive CORS policy. Under HTTPS, set `SCANSTUDIO_WEB_COOKIE_SECURE=true`.
 
@@ -90,7 +93,7 @@ The tests do not import scanner transports, configure a bridge, or perform live 
 
 ## Docker / Unraid simulator preview
 
-The multi-stage image builds the existing Vite application, compiles the existing Rust engine, installs the Python gateway, and copies only runtime artifacts into a non-root Python 3.13 image. Build context must be the repository root; Compose handles that automatically.
+The multi-stage image builds the existing Vite application, compiles the existing Rust engine, installs the Python gateway, and copies only runtime artifacts into a non-root Python 3.13 image. Build stages are digest-pinned, and the repository license and third-party notices are retained at `/opt/scanstudio/licenses`. Build context must be the repository root; Compose handles that automatically.
 
 ```sh
 export SCANSTUDIO_WEB_TOKEN="$(openssl rand -hex 32)"
@@ -101,6 +104,11 @@ docker compose -f ports/web/compose.yaml up --build
 For access beyond a trusted local network, use HTTPS through a trusted reverse proxy or a private VPN, set the exact `https://host[:port]` origin, and set `SCANSTUDIO_WEB_COOKIE_SECURE=true`. The access token protects the application, but plain HTTP does not protect that token from network observers.
 
 The container intentionally has no `devices`, `privileged`, bridge command, motion authorization, or scan-output volume. Those boundaries must be designed and reviewed as a later hardware-capable phase.
+
+This source milestone is not yet a published container release. Before an
+image is distributed, generate and verify a dependency-complete notice/SBOM
+for the locked Python, JavaScript, Rust, and base-image closure; the copied
+repository notices are a floor, not that release evidence.
 
 Do not run Uvicorn with multiple workers or reload mode. Sessions, the controller lease, and the exactly-one engine supervisor are process-local correctness boundaries; the `scanstudio-web` entry point always runs one worker.
 
@@ -114,10 +122,17 @@ Do not run Uvicorn with multiple workers or reload mode. Sessions, the controlle
 | `SCANSTUDIO_WEB_TOKEN` | unset | Required for every non-loopback bind |
 | `SCANSTUDIO_WEB_ALLOWED_ORIGINS` | loopback origins | Comma-separated exact HTTP(S) origins; required for non-loopback binds |
 | `SCANSTUDIO_WEB_COOKIE_SECURE` | inferred from HTTPS-only origins | Mark the session cookie Secure |
-| `SCANSTUDIO_WEB_STATIC_DIR` | unset | Existing Vite `dist` directory to serve |
+| `SCANSTUDIO_WEB_STATIC_DIR` | unset | Existing simulator-web Vite `dist` directory to serve |
 | `SCANSTUDIO_WEB_LEASE_TTL_SECONDS` | `30` | Controller lease lifetime, 5–300 seconds |
 | `SCANSTUDIO_WEB_SESSION_TTL_SECONDS` | `43200` | In-memory browser session lifetime |
+| `SCANSTUDIO_WEB_MAX_AUTH_SESSIONS` | `256` | Hard cap on active authenticated browser sessions |
+| `SCANSTUDIO_WEB_MAX_EVENT_SUBSCRIBERS` | `64` | Hard cap on active event WebSockets |
+| `SCANSTUDIO_WEB_ENGINE_WRITE_TIMEOUT_SECONDS` | `5` | Fail-closed timeout for a blocked engine stdin pipe |
 
-When `SCANSTUDIO_WEB_STATIC_DIR` is explicitly set, startup fails unless that directory contains `index.html`; readiness never reports success for a configured but unusable web bundle.
+When `SCANSTUDIO_WEB_STATIC_DIR` is explicitly set, startup fails unless that
+directory contains both `index.html` and the compatible
+`scanstudio-web-runtime.json` emitted only by `npm run build:web`. An ordinary
+desktop build therefore cannot be served accidentally, and readiness never
+reports success for a configured but incompatible bundle.
 
 All browser sessions and leases are intentionally ephemeral and are invalidated when the gateway restarts.

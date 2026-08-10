@@ -91,6 +91,7 @@ public protocol WebServerReadinessChecking: Sendable {
 public enum WebServerRuntimeLocateError: Error, LocalizedError, Equatable {
     case missingCommandOverride(String)
     case missingStaticDirectoryOverride(String)
+    case incompatibleStaticDirectoryOverride(String)
     case runtimeUnavailable(commandPaths: [String], staticPaths: [String])
     case engineUnavailable
 
@@ -100,8 +101,10 @@ public enum WebServerRuntimeLocateError: Error, LocalizedError, Equatable {
             return "SCANSTUDIO_WEB_COMMAND_PATH points to a missing executable: \(path)"
         case .missingStaticDirectoryOverride(let path):
             return "SCANSTUDIO_WEB_STATIC_DIR points to a missing directory: \(path)"
+        case .incompatibleStaticDirectoryOverride(let path):
+            return "SCANSTUDIO_WEB_STATIC_DIR is not a simulator-only web build: \(path). Run npm run build:web so it contains scanstudio-web-runtime.json."
         case .runtimeUnavailable(let commandPaths, let staticPaths):
-            return "The browser preview runtime is not installed. Looked for the gateway at \(commandPaths.joined(separator: ", ")) and the web app at \(staticPaths.joined(separator: ", ")). For development, set SCANSTUDIO_WEB_COMMAND_PATH and SCANSTUDIO_WEB_STATIC_DIR."
+            return "The browser preview runtime is not installed. Looked for the gateway at \(commandPaths.joined(separator: ", ")) and a simulator-only web build at \(staticPaths.joined(separator: ", ")). For development, run npm run build:web, or set SCANSTUDIO_WEB_COMMAND_PATH and SCANSTUDIO_WEB_STATIC_DIR."
         case .engineUnavailable:
             return "The browser preview cannot start because the Scan Studio engine is unavailable."
         }
@@ -116,6 +119,14 @@ public enum WebServerRuntimeLocateError: Error, LocalizedError, Equatable {
 public struct WebServerRuntimeLocator: Sendable {
     public static let commandOverrideKey = "SCANSTUDIO_WEB_COMMAND_PATH"
     public static let staticDirectoryOverrideKey = "SCANSTUDIO_WEB_STATIC_DIR"
+    static let staticDirectoryMarkerFilename = "scanstudio-web-runtime.json"
+    static let staticDirectoryMarkerSchemaVersion = 1
+    static let staticDirectoryMarkerRuntime = "simulator-only-web"
+
+    private struct StaticDirectoryMarker: Decodable {
+        let schemaVersion: Int
+        let runtime: String
+    }
 
     private let environment: [String: String]
     private let bundleResourceURL: URL?
@@ -137,7 +148,8 @@ public struct WebServerRuntimeLocator: Sendable {
             bundleResourceURL: bundleResourceURL,
             developmentRepositoryURL: developmentRepositoryURL,
             fileExists: FileManager.default.fileExists(atPath:),
-            isDirectory: Self.isDirectory(atPath:)
+            isDirectory: Self.isDirectory(atPath:),
+            readFile: FileManager.default.contents(atPath:)
         )
     }
 
@@ -146,7 +158,8 @@ public struct WebServerRuntimeLocator: Sendable {
         bundleResourceURL: URL?,
         developmentRepositoryURL: URL?,
         fileExists: (String) -> Bool,
-        isDirectory: (String) -> Bool
+        isDirectory: (String) -> Bool,
+        readFile: (String) -> Data?
     ) throws -> WebServerRuntime {
         let packagedCommand = bundleResourceURL?
             .appendingPathComponent("WebRuntime", isDirectory: true)
@@ -187,7 +200,14 @@ public struct WebServerRuntimeLocator: Sendable {
             guard isDirectory(staticURL.path) else {
                 throw WebServerRuntimeLocateError.missingStaticDirectoryOverride(staticURL.path)
             }
-        } else if let candidate = staticCandidates.first(where: { isDirectory($0.path) }) {
+            guard hasCompatibleMarker(in: staticURL, readFile: readFile) else {
+                throw WebServerRuntimeLocateError.incompatibleStaticDirectoryOverride(
+                    staticURL.path
+                )
+            }
+        } else if let candidate = staticCandidates.first(where: {
+            isDirectory($0.path) && hasCompatibleMarker(in: $0, readFile: readFile)
+        }) {
             staticURL = candidate
         } else {
             throw WebServerRuntimeLocateError.runtimeUnavailable(
@@ -220,6 +240,22 @@ public struct WebServerRuntimeLocator: Sendable {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func hasCompatibleMarker(
+        in staticDirectoryURL: URL,
+        readFile: (String) -> Data?
+    ) -> Bool {
+        let markerURL = staticDirectoryURL.appendingPathComponent(
+            staticDirectoryMarkerFilename,
+            isDirectory: false
+        )
+        guard let data = readFile(markerURL.path),
+              let marker = try? JSONDecoder().decode(StaticDirectoryMarker.self, from: data) else {
+            return false
+        }
+        return marker.schemaVersion == staticDirectoryMarkerSchemaVersion
+            && marker.runtime == staticDirectoryMarkerRuntime
     }
 
     private static func isDirectory(atPath path: String) -> Bool {

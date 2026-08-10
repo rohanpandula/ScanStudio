@@ -33,17 +33,8 @@ def test_startup_health_first_hello_simulator_environment_and_shutdown(
     with TestClient(app) as client:
         health = client.get("/healthz")
         assert health.status_code == 200
-        assert (
-            health.json()["engine"]
-            | {
-                "running": True,
-                "ready": True,
-                "simulatorOnly": True,
-                "protocolVersion": 1,
-            }
-            == health.json()["engine"]
-        )
-        assert client.get("/startupz").json()["started"] is True
+        assert health.json() == {"status": "ok"}
+        assert client.get("/startupz").json() == {"started": True}
 
     requests = read_requests(request_log)
     assert [request["method"] for request in requests[:2]] == [
@@ -72,6 +63,30 @@ def test_explicit_static_dir_without_index_fails_startup(
 
     # Configuration fails before the supervised engine can report ready.
     assert not request_log.exists()
+
+
+def test_explicit_static_dir_requires_web_marker_and_serves_marked_bundle(
+    app_factory, tmp_path: Path
+) -> None:
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<h1>ScanStudio</h1>", encoding="utf-8")
+
+    unmarked_app, unmarked_log, _ = app_factory(static_dir=static_dir)
+    with pytest.raises(ConfigurationError, match="scanstudio-web-runtime.json"):
+        with TestClient(unmarked_app):
+            pass
+    assert not unmarked_log.exists()
+
+    (static_dir / "scanstudio-web-runtime.json").write_text(
+        '{"schemaVersion":1,"runtime":"simulator-only-web"}\n',
+        encoding="utf-8",
+    )
+    marked_app, _, _ = app_factory(static_dir=static_dir)
+    with TestClient(marked_app) as client:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert "ScanStudio" in response.text
 
 
 def test_cookie_login_and_post_origin_checks(app_factory) -> None:
@@ -106,6 +121,32 @@ def test_cookie_login_and_post_origin_checks(app_factory) -> None:
             "/api/v1/control/claim", headers={"Origin": "http://testserver:8080"}
         )
         assert wrong_port.status_code == 403
+
+
+def test_browser_session_limit_rejects_new_sessions_without_evicting_existing(
+    app_factory,
+) -> None:
+    app, _, _ = app_factory(max_auth_sessions=2)
+    with TestClient(app) as client:
+        assert login(client).status_code == 200
+        first_session = client.cookies.get("scanstudio_session")
+        assert first_session is not None
+
+        client.cookies.clear()
+        assert login(client).status_code == 200
+        second_session = client.cookies.get("scanstudio_session")
+        assert second_session is not None and second_session != first_session
+
+        client.cookies.clear()
+        refused = login(client)
+        assert refused.status_code == 429
+        assert refused.json()["error"]["code"] == "SESSION_LIMIT_REACHED"
+
+        existing = client.get(
+            "/api/v1/session",
+            headers={"Cookie": f"scanstudio_session={first_session}"},
+        )
+        assert existing.json()["authenticated"] is True
 
 
 def test_lease_exact_allowlist_and_simulator_connect_gate(app_factory) -> None:
@@ -223,6 +264,44 @@ def test_authenticated_observer_websocket_receives_events(app_factory) -> None:
             )
             assert response.status_code == 200
             assert websocket.receive_json()["event"] == "scanner.status"
+
+
+def test_event_subscriber_limit_rejects_excess_and_recovers_capacity(
+    app_factory,
+) -> None:
+    app, _, _ = app_factory(max_event_subscribers=1)
+    with TestClient(app) as client:
+        assert login(client).status_code == 200
+        with client.websocket_connect(
+            "/api/v1/engine/events", headers={"Origin": ORIGIN}
+        ):
+            with pytest.raises(WebSocketDisconnect) as caught:
+                with client.websocket_connect(
+                    "/api/v1/engine/events", headers={"Origin": ORIGIN}
+                ) as excess:
+                    excess.receive_json()
+            assert caught.value.code == 4429
+
+        # Unsubscribing the first observer deterministically returns capacity.
+        with client.websocket_connect(
+            "/api/v1/engine/events", headers={"Origin": ORIGIN}
+        ):
+            pass
+
+
+def test_public_health_endpoints_hide_engine_failure_details(app_factory) -> None:
+    app, _, _ = app_factory(mode="exit-on-status")
+    with TestClient(app) as client:
+        assert login(client).status_code == 200
+        failed = post_engine(client, "scanner.status")
+        assert failed.status_code == 503
+
+        health = client.get("/healthz")
+        startup = client.get("/startupz")
+        assert health.status_code == 503
+        assert startup.status_code == 503
+        assert health.json() == {"status": "unhealthy"}
+        assert startup.json() == {"started": False}
 
 
 @pytest.mark.asyncio

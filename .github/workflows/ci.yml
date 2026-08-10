@@ -17,6 +17,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  adversarial-review:
+    name: Adversarial review evidence
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify the reviewed diff and evidence reports
+        run: >-
+          python3 scripts/check_adversarial_review.py
+          --expected-base "${{ github.event.pull_request.base.sha }}"
+
   app-and-engine:
     name: App and engine tests
     runs-on: macos-15
@@ -105,6 +118,82 @@ jobs:
         run: docker compose -f ports/web/compose.yaml config --quiet
       - name: Build the simulator appliance image
         run: docker build -f ports/web/Dockerfile -t scanstudio-web:ci .
+      - name: Smoke-test the built image with the real Rust simulator
+        env:
+          SCANSTUDIO_WEB_TOKEN: ci-only-token
+          SCANSTUDIO_WEB_ALLOWED_ORIGINS: http://127.0.0.1:18787
+        run: |
+          cookie_jar="$(mktemp)"
+          cleanup() {
+            docker logs scanstudio-web-ci-smoke 2>/dev/null || true
+            docker rm --force scanstudio-web-ci-smoke >/dev/null 2>&1 || true
+            rm -f "$cookie_jar"
+          }
+          trap cleanup EXIT
+
+          docker run --detach --name scanstudio-web-ci-smoke \
+            --init \
+            --read-only \
+            --tmpfs /tmp:size=64m,mode=1777 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --publish 127.0.0.1:18787:8787 \
+            --env SCANSTUDIO_WEB_BIND=0.0.0.0 \
+            --env SCANSTUDIO_WEB_PORT=8787 \
+            --env SCANSTUDIO_WEB_TOKEN \
+            --env SCANSTUDIO_WEB_ALLOWED_ORIGINS \
+            scanstudio-web:ci
+
+          for ((attempt = 1; attempt <= 30; attempt += 1)); do
+            if curl --fail --silent http://127.0.0.1:18787/startupz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18787/startupz >/dev/null
+          curl --fail --silent http://127.0.0.1:18787/ | grep --quiet '#141618'
+
+          curl --fail --silent \
+            --cookie-jar "$cookie_jar" \
+            --header 'Origin: http://127.0.0.1:18787' \
+            --header 'Content-Type: application/json' \
+            --data '{"token":"ci-only-token"}' \
+            http://127.0.0.1:18787/api/v1/session/login >/dev/null
+          lease="$(curl --fail --silent \
+            --cookie "$cookie_jar" \
+            --header 'Origin: http://127.0.0.1:18787' \
+            --request POST \
+            http://127.0.0.1:18787/api/v1/control/claim \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["leaseToken"])')"
+
+          request_engine() {
+            curl --fail --silent \
+              --cookie "$cookie_jar" \
+              --header 'Origin: http://127.0.0.1:18787' \
+              --header "X-ScanStudio-Control-Lease: $lease" \
+              --header 'Content-Type: application/json' \
+              --data "$1" \
+              http://127.0.0.1:18787/api/v1/engine/request
+          }
+          request_engine '{"method":"scanner.connect","params":{"deviceId":"sim-ls5000-0","options":{"timeScale":0.01}}}' \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"]["status"]["connected"] is True'
+          request_engine '{"method":"sim.loadMedia","params":{"carrier":"strip6"}}' >/dev/null
+          request_engine '{"method":"scanner.acquireThumbnails","params":{"frames":[1],"operationId":"ci-preview"}}' \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"]["accepted"] is True'
+          preview_complete=false
+          for ((attempt = 1; attempt <= 30; attempt += 1)); do
+            if request_engine '{"method":"scanner.status","params":{}}' \
+                | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"]["transport"] == "idle"'; then
+              preview_complete=true
+              break
+            fi
+            sleep 0.1
+          done
+          [[ "$preview_complete" == true ]]
+          request_engine '{"method":"scanner.disconnect","params":{}}' \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"] == {}'
+          request_engine '{"method":"scanner.status","params":{}}' \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["error"]["code"] == "NOT_CONNECTED"'
 
   package:
     name: Self-contained package build (${{ matrix.arch }})

@@ -1,0 +1,41 @@
+name: Protected adversarial review evidence
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adversarial-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  evidence:
+    name: Base-owned adversarial review evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the protected base validator
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          path: validator
+      - name: Check out the read-only PR merge tree
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          path: candidate
+      - name: Validate with code from the protected base
+        env:
+          REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ ! -f validator/scripts/check_adversarial_review.py ]]; then
+            echo "Base branch has not bootstrapped the adversarial-review validator yet."
+            exit 0
+          fi
+          python3 validator/scripts/check_adversarial_review.py \
+            --repository candidate \
+            --expected-base "$REVIEW_BASE_SHA"

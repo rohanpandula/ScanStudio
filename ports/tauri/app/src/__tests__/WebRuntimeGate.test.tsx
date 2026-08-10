@@ -204,6 +204,58 @@ describe("WebRuntimeGate", () => {
     expect(window.sessionStorage.getItem("scanstudio.control-lease")).toBeNull();
   });
 
+  it("retains a successful claim when the periodic refresh fires while it is in flight", async () => {
+    const locks = installFakeLocks();
+    let sessionReads = 0;
+    let resolveClaim: ((response: Response) => void) | null = null;
+    let runPeriodicRefresh: (() => void) | null = null;
+    vi.spyOn(window, "setInterval").mockImplementation((handler, timeout) => {
+      if (timeout === 60_000 && typeof handler === "function") {
+        runPeriodicRefresh = handler as () => void;
+      }
+      return setTimeout(() => undefined, 0);
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/v1/session") {
+          sessionReads += 1;
+          return jsonResponse({ authenticated: true, control: "observer" });
+        }
+        if (path === "/api/v1/control/claim") {
+          return new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+
+    render(
+      <WebRuntimeGate>
+        <ControlProbe />
+      </WebRuntimeGate>,
+    );
+    markEventStreamReady();
+    fireEvent.click(await screen.findByRole("button", { name: "Try to take control" }));
+    await waitFor(() => expect(locks.request).toHaveBeenCalled());
+    await waitFor(() => expect(resolveClaim).not.toBeNull());
+    expect(runPeriodicRefresh).not.toBeNull();
+
+    act(() => runPeriodicRefresh?.());
+    await act(async () => {
+      resolveClaim?.(jsonResponse({ leaseToken: "delayed-tab-lease", expiresInSeconds: 30 }));
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText("Control: owned")).toBeVisible();
+    expect(getControlLeaseToken()).toBe("delayed-tab-lease");
+    expect(locks.isHeld()).toBe(true);
+    expect(sessionReads).toBe(1);
+    expect(window.sessionStorage.getItem("scanstudio.control-lease")).toBeNull();
+  });
+
   it("omits a duplicated tab's copied lease and lets the server reject its claim", async () => {
     window.sessionStorage.setItem("scanstudio.control-lease", "copied-tab-lease");
     const locks = installFakeLocks(true);

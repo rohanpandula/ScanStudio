@@ -9,6 +9,10 @@ class SubscriberClosed(Exception):
     pass
 
 
+class SubscriberLimitReached(Exception):
+    pass
+
+
 _CLOSED = object()
 
 
@@ -32,8 +36,13 @@ class EventBroker:
     simulator slice; reconnecting clients must re-read scanner state.
     """
 
-    def __init__(self, queue_size: int) -> None:
+    def __init__(self, queue_size: int, max_subscribers: int = 64) -> None:
+        if queue_size < 1:
+            raise ValueError("queue_size must be positive")
+        if max_subscribers < 1:
+            raise ValueError("max_subscribers must be positive")
         self._queue_size = queue_size
+        self._max_subscribers = max_subscribers
         self._subscribers: set[EventSubscriber] = set()
         self._closed = False
         self._lock = asyncio.Lock()
@@ -43,6 +52,10 @@ class EventBroker:
         async with self._lock:
             if self._closed:
                 subscriber.queue.put_nowait(_CLOSED)
+            elif len(self._subscribers) >= self._max_subscribers:
+                raise SubscriberLimitReached(
+                    "the active event subscriber limit has been reached"
+                )
             else:
                 self._subscribers.add(subscriber)
         return subscriber

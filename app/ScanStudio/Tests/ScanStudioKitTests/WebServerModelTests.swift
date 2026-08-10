@@ -18,7 +18,8 @@ struct WebServerRuntimeLocatorTests {
             bundleResourceURL: URL(fileURLWithPath: "/Applications/ScanStudio.app/Contents/Resources"),
             developmentRepositoryURL: URL(fileURLWithPath: "/somewhere-else"),
             fileExists: { $0 == command },
-            isDirectory: { $0 == staticDirectory }
+            isDirectory: { $0 == staticDirectory },
+            readFile: markerReader(staticDirectory)
         )
 
         #expect(runtime.executableURL.path == command)
@@ -43,7 +44,8 @@ struct WebServerRuntimeLocatorTests {
             },
             isDirectory: { path in
                 path == packagedStatic || path == "/checkout/ports/tauri/app/dist"
-            }
+            },
+            readFile: markerReader(packagedStatic, "/checkout/ports/tauri/app/dist")
         )
 
         #expect(runtime.executableURL.path == packagedCommand)
@@ -61,7 +63,8 @@ struct WebServerRuntimeLocatorTests {
             bundleResourceURL: nil,
             developmentRepositoryURL: repository,
             fileExists: { $0 == command },
-            isDirectory: { $0 == staticDirectory }
+            isDirectory: { $0 == staticDirectory },
+            readFile: markerReader(staticDirectory)
         )
 
         #expect(runtime.executableURL.path == command)
@@ -76,7 +79,8 @@ struct WebServerRuntimeLocatorTests {
                 bundleResourceURL: nil,
                 developmentRepositoryURL: nil,
                 fileExists: { _ in false },
-                isDirectory: { _ in false }
+                isDirectory: { _ in false },
+                readFile: { _ in nil }
             )
         }
     }
@@ -93,9 +97,119 @@ struct WebServerRuntimeLocatorTests {
                 bundleResourceURL: nil,
                 developmentRepositoryURL: nil,
                 fileExists: { $0 == command },
-                isDirectory: { _ in false }
+                isDirectory: { _ in false },
+                readFile: { _ in nil }
             )
         }
+    }
+
+    @Test("a static-directory override without a web runtime marker fails closed")
+    func unmarkedStaticOverrideFailsClosed() {
+        let command = "/working/gateway"
+        let staticDirectory = "/working/dist"
+        #expect(
+            throws: WebServerRuntimeLocateError.incompatibleStaticDirectoryOverride(
+                staticDirectory
+            )
+        ) {
+            try WebServerRuntimeLocator.locate(
+                environment: [
+                    WebServerRuntimeLocator.commandOverrideKey: command,
+                    WebServerRuntimeLocator.staticDirectoryOverrideKey: staticDirectory,
+                ],
+                bundleResourceURL: nil,
+                developmentRepositoryURL: nil,
+                fileExists: { $0 == command },
+                isDirectory: { $0 == staticDirectory },
+                readFile: { _ in nil }
+            )
+        }
+    }
+
+    @Test("an incompatible packaged frontend falls back to a marked development build")
+    func incompatiblePackagedStaticFallsBackToDevelopment() throws {
+        let resources = URL(fileURLWithPath: "/Applications/ScanStudio.app/Contents/Resources")
+        let repository = URL(fileURLWithPath: "/checkout")
+        let packagedCommand = "/Applications/ScanStudio.app/Contents/Resources/WebRuntime/bin/scanstudio-web"
+        let packagedStatic = "/Applications/ScanStudio.app/Contents/Resources/WebFrontend"
+        let developmentStatic = "/checkout/ports/tauri/app/dist"
+
+        let runtime = try WebServerRuntimeLocator.locate(
+            environment: [:],
+            bundleResourceURL: resources,
+            developmentRepositoryURL: repository,
+            fileExists: { $0 == packagedCommand },
+            isDirectory: { $0 == packagedStatic || $0 == developmentStatic },
+            readFile: markerReader(developmentStatic)
+        )
+
+        #expect(runtime.executableURL.path == packagedCommand)
+        #expect(runtime.staticDirectoryURL.path == developmentStatic)
+    }
+
+    @Test("automatic static candidates without a compatible marker fail closed")
+    func unmarkedAutomaticStaticFailsClosed() {
+        let repository = URL(fileURLWithPath: "/checkout")
+        let command = "/checkout/ports/web/.venv/bin/scanstudio-web"
+        let staticDirectory = "/checkout/ports/tauri/app/dist"
+
+        #expect(
+            throws: WebServerRuntimeLocateError.runtimeUnavailable(
+                commandPaths: [command],
+                staticPaths: [staticDirectory]
+            )
+        ) {
+            try WebServerRuntimeLocator.locate(
+                environment: [:],
+                bundleResourceURL: nil,
+                developmentRepositoryURL: repository,
+                fileExists: { $0 == command },
+                isDirectory: { $0 == staticDirectory },
+                readFile: { _ in nil }
+            )
+        }
+    }
+
+    @Test("a mismatched marker cannot satisfy an explicit static override")
+    func mismatchedStaticMarkerFailsClosed() {
+        let command = "/working/gateway"
+        let staticDirectory = "/working/dist"
+        let markerPath = URL(fileURLWithPath: staticDirectory, isDirectory: true)
+            .appendingPathComponent(WebServerRuntimeLocator.staticDirectoryMarkerFilename)
+            .path
+        let mismatchedMarker = Data(
+            #"{"schemaVersion":1,"runtime":"desktop"}"#.utf8
+        )
+
+        #expect(
+            throws: WebServerRuntimeLocateError.incompatibleStaticDirectoryOverride(
+                staticDirectory
+            )
+        ) {
+            try WebServerRuntimeLocator.locate(
+                environment: [
+                    WebServerRuntimeLocator.commandOverrideKey: command,
+                    WebServerRuntimeLocator.staticDirectoryOverrideKey: staticDirectory,
+                ],
+                bundleResourceURL: nil,
+                developmentRepositoryURL: nil,
+                fileExists: { $0 == command },
+                isDirectory: { $0 == staticDirectory },
+                readFile: { $0 == markerPath ? mismatchedMarker : nil }
+            )
+        }
+    }
+
+    private func markerReader(_ directories: String...) -> (String) -> Data? {
+        let markerPaths = Set(directories.map { directory in
+            URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent(WebServerRuntimeLocator.staticDirectoryMarkerFilename)
+                .path
+        })
+        let marker = Data(
+            #"{"schemaVersion":1,"runtime":"simulator-only-web"}"#.utf8
+        )
+        return { markerPaths.contains($0) ? marker : nil }
     }
 }
 
