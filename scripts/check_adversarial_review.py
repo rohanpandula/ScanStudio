@@ -131,7 +131,7 @@ def canonical_diff(base: str, reviewed: str) -> bytes:
         "--output-indicator-new=+",
         "--output-indicator-old=-",
         "--output-indicator-context= ",
-        "--unified=80",
+        "--unified=3",
         base,
         reviewed,
     )

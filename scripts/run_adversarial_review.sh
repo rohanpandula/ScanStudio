@@ -61,7 +61,7 @@ GIT_OPTIONAL_LOCKS=0 git -c core.quotePath=true --no-pager diff \
   --output-indicator-new=+ \
   --output-indicator-old=- \
   --output-indicator-context=' ' \
-  --unified=80 \
+  --unified=3 \
   "$review_base" "$reviewed_commit" >"$diff_file"
 if [[ ! -s "$diff_file" ]]; then
   echo "canonical review diff is empty" >&2
