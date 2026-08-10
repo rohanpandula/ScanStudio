@@ -235,6 +235,12 @@ rejects all prompt/artifact collisions.
 Reports must be non-empty and end with exactly one machine-readable line,
 `VERDICT: PASS`. Bare and token-only reports are rejected by fixed minimum
 body-byte and body-line floors at both capture and evidence-validation time.
+This bundle is terminal completion evidence, not a ledger of unresolved review
+attempts: authenticated `REQUEST_CHANGES` and `BLOCK` outputs are triaged first,
+validated findings require a new frozen diff and complete rerun, and rejected
+findings are summarized in the optional hashed dispositions artifact. Therefore
+the terminal manifest deliberately requires only `PASS` reports and
+`unresolvedBlockers: 0`.
 Context IDs and report artifacts are globally distinct. The
 checker recomputes canonical request bytes, enforces exact-once primary
 coverage and limits, rejects binary/credential/personal-path patterns, refuses

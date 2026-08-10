@@ -29,6 +29,15 @@ Exactly one standalone verdict sentinel is allowed, at EOF. A standalone
 VERDICT line in the body is intentionally ambiguous and invalid; ordinary prose
 such as "VERDICT: BLOCK would be wrong" is not a sentinel.
 
+The evidence checker intentionally certifies only the terminal, remediated
+bundle: every included review must PASS and unresolvedBlockers must be zero.
+The capture/parser still preserve authenticated REQUEST_CHANGES and BLOCK
+attempts; validated findings require a new frozen diff and fresh reviews, while
+rejected findings are recorded in dispositions. Do not report the inability to
+put an unresolved verdict in a passing manifest as a defect. Do report any way
+the pipeline can relabel non-PASS bytes as PASS, omit a verified blocker without
+a disposition, or reuse a report/session while claiming independence.
+
 Report only actionable defects introduced by the diff, ordered by severity.
 Every finding must include severity, exact repository-relative file and hunk,
 a reproducible failure or attack sequence, evidence, and the smallest
