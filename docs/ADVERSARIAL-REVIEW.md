@@ -74,6 +74,14 @@ trust a stored input, path, summary, or symlink. Canonical Git operations force
 `--ignore-submodules=none`; a `.gitmodules` `ignore=all` setting cannot hide a
 gitlink change from path coverage or evidence history checks.
 
+This is deliberately a text-source gate. Binary patches are rejected before a
+model call because an encoded Git binary delta is neither meaningfully
+reviewable nor safe to treat as text evidence. Keep binary asset changes in a
+separate step with an asset-specific visual/hash review; they cannot be claimed
+as passing this text gate. High-confidence credential and personal-path
+patterns in source also fail before transmission and must be removed or
+reworked, not allowlisted after the fact.
+
 For a multi-shard run, put all semantic lists in one temporary JSON plan. The
 file has exactly one top-level `shards` array; each item has exactly
 `primaryPaths` and `contextPaths` arrays. Validate exact ownership and print
@@ -105,6 +113,10 @@ checks the exact provider/model, preflights shard limits, and bounds/scans the
 title. It constructs one request from the trusted prompt, fixed boundary bytes,
 and deterministic input; scans and hashes that request; then passes that exact
 file to OpenCode from a neutral temporary directory with all tools denied.
+The boundary labels are descriptive rather than a delimiter parser: consumers
+bind and compare the complete request bytes, and Git prefixes every diff content
+line. Request components are opened without following final symlinks and the
+complete request is size-bounded before invocation.
 
 ```sh
 scripts/run_adversarial_review.sh \
@@ -132,6 +144,8 @@ and the recorded context ID remains auditable. Raw events, the exported
 transcript, prompt/input request, and reasoning are temporary wrapper files and
 must never be copied into repository evidence. Later local session retention
 follows operator and tool policy; the wrapper does not delete final sessions.
+Git subprocesses are time-bounded. A hung repository or local storage service
+fails the review attempt instead of pinning the gate indefinitely.
 
 ## Mandatory full-diff synthesis
 
@@ -171,10 +185,12 @@ The evidence bundle copies that receipt as a hashed direct-child artifact. A
 receipt contains only schema/base/head, role/context, OpenCode version, exact
 provider/model/variant, finish, input/request hashes, and outcome. Finish is
 strictly mapped: `OUTPUT_LIMIT` uses `length`; `EMPTY_REPORT` and
-`NO_FINAL_VERDICT` use `stop`; `PROVIDER_ERROR` uses null and requires an
-exported provider error during receipt generation. Receipts never contain raw
-assistant text/reasoning or reference arbitrary log paths. They are sanitized
-procedural attestations, not provider signatures.
+`NO_FINAL_VERDICT` use `stop`. Every receipt requires an identifiable session
+and an independently exported transcript bound to the exact request. A
+session-less provider, authentication, or network failure is not eligible for
+fallback and must be retried at `high`; stderr alone is not review provenance.
+Receipts never contain raw assistant text/reasoning or reference arbitrary log
+paths. They are sanitized procedural attestations, not provider signatures.
 
 ## Evidence bundle (schema version 2)
 
@@ -200,7 +216,9 @@ script checkout, binds each role to exactly one reusable prompt artifact, and
 rejects all prompt/artifact collisions.
 
 Reports must be non-empty and end with exactly one machine-readable line,
-`VERDICT: PASS`. Context IDs and report artifacts are globally distinct. The
+`VERDICT: PASS`. Bare and token-only reports are rejected by fixed minimum
+body-byte and body-line floors at both capture and evidence-validation time.
+Context IDs and report artifacts are globally distinct. The
 checker recomputes canonical request bytes, enforces exact-once primary
 coverage and limits, rejects binary/credential/personal-path patterns, refuses
 symlinks and undeclared extras, and requires a clean worktree including
@@ -215,7 +233,10 @@ protected prompt bytes against the candidate merge tree, explicitly passing
 both PR base and PR head, with read-only permissions and no secrets or
 candidate-code execution. Configure that base-owned check as required.
 
-Repository evidence cannot cryptographically prove model provenance. Recorded
-session/provider/model fields are procedural attestations checked for internal
-consistency, not provider signatures. Human review and protected-branch policy
-remain part of the gate; CI never calls a model or reads provider credentials.
+Repository evidence cannot cryptographically prove model provenance. The local
+operator who captures events and exports is inside the trust boundary; a party
+that can forge both inputs can also forge an internally consistent transcript.
+Recorded session/provider/model fields are procedural attestations checked for
+internal consistency, not provider signatures. Human review, retained local
+session IDs, and protected-branch policy remain part of the gate; CI never calls
+a model or reads provider credentials.

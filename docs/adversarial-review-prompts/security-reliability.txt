@@ -15,6 +15,9 @@ a reproducible failure or attack sequence, evidence, and the smallest
 defensible fix. Omit style comments and issues disproved by tests in the diff.
 If no defect remains, say so explicitly and list only material residual risks.
 
+The report body before the verdict must contain at least three non-empty lines
+and at least 160 UTF-8 bytes. A bare verdict is invalid evidence.
+
 End with exactly one of these lines:
 VERDICT: PASS
 VERDICT: REQUEST_CHANGES

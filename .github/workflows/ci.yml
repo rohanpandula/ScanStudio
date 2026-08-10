@@ -174,12 +174,31 @@ jobs:
             --header 'Content-Type: application/json' \
             --data '{"token":"ci-only-token"}' \
             http://127.0.0.1:18787/api/v1/session/login >/dev/null
+          wrong_origin_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --cookie "$cookie_jar" \
+            --header 'Origin: http://attacker.invalid' \
+            --request POST \
+            http://127.0.0.1:18787/api/v1/control/claim)"
+          [[ "$wrong_origin_status" == 403 ]]
           lease="$(curl --fail --silent \
             --cookie "$cookie_jar" \
             --header 'Origin: http://127.0.0.1:18787' \
             --request POST \
             http://127.0.0.1:18787/api/v1/control/claim \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["leaseToken"])')"
+          second_claim_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --cookie "$cookie_jar" \
+            --header 'Origin: http://127.0.0.1:18787' \
+            --request POST \
+            http://127.0.0.1:18787/api/v1/control/claim)"
+          [[ "$second_claim_status" == 409 ]]
+          missing_lease_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --cookie "$cookie_jar" \
+            --header 'Origin: http://127.0.0.1:18787' \
+            --header 'Content-Type: application/json' \
+            --data '{"method":"scanner.connect","params":{"deviceId":"sim-ls5000-0"}}' \
+            http://127.0.0.1:18787/api/v1/engine/request)"
+          [[ "$missing_lease_status" == 423 ]]
 
           request_engine() {
             curl --fail --silent \
@@ -196,13 +215,14 @@ jobs:
           request_engine '{"method":"scanner.acquireThumbnails","params":{"frames":[1],"operationId":"ci-preview"}}' \
             | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"]["accepted"] is True'
           preview_complete=false
-          for ((attempt = 1; attempt <= 30; attempt += 1)); do
+          preview_deadline=$((SECONDS + 60))
+          while ((SECONDS < preview_deadline)); do
             if request_engine '{"method":"scanner.status","params":{}}' \
                 | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"]["transport"] == "idle"'; then
               preview_complete=true
               break
             fi
-            sleep 0.1
+            sleep 0.25
           done
           [[ "$preview_complete" == true ]]
           request_engine '{"method":"scanner.disconnect","params":{}}' \

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from adversarial_review_input import (
+    GIT_TIMEOUT_SECONDS,
     MAX_SHARD_BYTES,
     MAX_SHARD_CHANGED_LINES,
     ReviewInputError,
@@ -23,6 +24,7 @@ from adversarial_review_input import (
     explicit_shard_input,
     file_patches,
     full_diff_input,
+    read_regular_file,
 )
 
 
@@ -44,14 +46,18 @@ REQUIRED_MODEL = "deepseek-v4-flash-0731"
 REQUIRED_VARIANT = "high"
 MAX_ARTIFACT_BYTES = 5 * 1_024 * 1_024
 MAX_TITLE_BYTES = 200
+MIN_REPORT_BODY_BYTES = 160
+MIN_REPORT_BODY_LINES = 3
 FAILED_HIGH_FINISH = {
     "EMPTY_REPORT": "stop",
     "NO_FINAL_VERDICT": "stop",
     "OUTPUT_LIMIT": "length",
-    "PROVIDER_ERROR": None,
 }
 FORBIDDEN_ARTIFACT_PATTERNS = (
-    (re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"), "private key"),
+    (
+        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+        "private key",
+    ),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "GitHub token"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "Slack token"),
@@ -67,12 +73,24 @@ class EvidenceError(ValueError):
 
 
 def git_bytes(*args: str) -> bytes:
-    result = subprocess.run(
-        ["git", *args],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=GIT_TIMEOUT_SECONDS,
+            env={
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EvidenceError(
+            f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
+        ) from exc
     return result.stdout
 
 
@@ -92,7 +110,9 @@ def require_exact_keys(
     missing = sorted(required - set(value))
     unknown = sorted(set(value) - required - optional)
     if missing or unknown:
-        raise EvidenceError(f"{label} keys mismatch; missing={missing}, unknown={unknown}")
+        raise EvidenceError(
+            f"{label} keys mismatch; missing={missing}, unknown={unknown}"
+        )
 
 
 def require_string(value: Any, label: str) -> str:
@@ -147,7 +167,9 @@ def require_path_list(value: Any, label: str) -> list[str]:
             or candidate.as_posix() != path
             or any(part in ("", ".", "..") for part in candidate.parts)
         ):
-            raise EvidenceError(f"{label}[{index}] must be a normalized repository path")
+            raise EvidenceError(
+                f"{label}[{index}] must be a normalized repository path"
+            )
         paths.append(path)
     if len(paths) != len(set(paths)):
         raise EvidenceError(f"{label} must not contain duplicates")
@@ -173,6 +195,28 @@ def evidence_file(bundle: Path, value: Any, label: str) -> Path:
     if not stat.S_ISREG(mode):
         raise EvidenceError(f"{label} must be a regular file: {name}")
     return candidate
+
+
+def require_path_without_symlink_ancestors(
+    path: Path, repository_root: Path, label: str
+) -> Path:
+    """Resolve a repository path only after rejecting every symlink component."""
+
+    candidate = path if path.is_absolute() else repository_root / path
+    try:
+        relative = candidate.relative_to(repository_root)
+    except ValueError as exc:
+        raise EvidenceError(f"{label} is outside the candidate repository") from exc
+    current = repository_root
+    for part in relative.parts:
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except OSError as exc:
+            raise EvidenceError(f"cannot inspect {label}: {exc}") from exc
+        if stat.S_ISLNK(mode):
+            raise EvidenceError(f"{label} must not contain symlink ancestors")
+    return candidate.resolve()
 
 
 def require_safe_artifact(value: bytes, label: str) -> bytes:
@@ -202,8 +246,8 @@ def require_safe_title(value: bytes, label: str) -> bytes:
 
 def safe_artifact_bytes(path: Path, label: str) -> bytes:
     try:
-        value = path.read_bytes()
-    except OSError as exc:
+        value = read_regular_file(path, label, MAX_ARTIFACT_BYTES)
+    except (OSError, ReviewInputError) as exc:
         raise EvidenceError(f"cannot read {label}: {exc}") from exc
     return require_safe_artifact(value, label)
 
@@ -214,12 +258,13 @@ def trusted_prompt_bytes() -> dict[str, bytes]:
         if path.is_symlink():
             raise EvidenceError(f"trusted prompt for {role} must not be a symlink")
         try:
-            mode = path.stat().st_mode
-            contents = path.read_bytes()
-        except OSError as exc:
-            raise EvidenceError(f"cannot read trusted prompt for {role}: {exc}") from exc
-        if not stat.S_ISREG(mode):
-            raise EvidenceError(f"trusted prompt for {role} must be a regular file")
+            contents = read_regular_file(
+                path, f"trusted prompt for {role}", MAX_ARTIFACT_BYTES
+            )
+        except (OSError, ReviewInputError) as exc:
+            raise EvidenceError(
+                f"cannot read trusted prompt for {role}: {exc}"
+            ) from exc
         require_safe_artifact(contents, f"trusted prompt for {role}")
         if not contents.strip():
             raise EvidenceError(f"trusted prompt for {role} must not be empty")
@@ -261,6 +306,15 @@ def validate_report(contents: bytes, label: str) -> None:
         raise EvidenceError(f"{label} must end with VERDICT: PASS")
     if verdicts != ["PASS"]:
         raise EvidenceError(f"{label} must contain exactly one verdict")
+    body = "\n".join(rendered.splitlines()[:-1]).strip()
+    body_lines = [line for line in body.splitlines() if line.strip()]
+    if (
+        len(body.encode("utf-8")) < MIN_REPORT_BODY_BYTES
+        or len(body_lines) < MIN_REPORT_BODY_LINES
+    ):
+        raise EvidenceError(
+            f"{label} must contain a substantive review before its verdict"
+        )
 
 
 def validate_review(
@@ -311,7 +365,9 @@ def validate_review(
     contexts.add(context)
     if item.get("tool") != "opencode":
         raise EvidenceError(f"{label}.tool must be opencode")
-    tool_versions.add(require_tool_version(item.get("toolVersion"), f"{label}.toolVersion"))
+    tool_versions.add(
+        require_tool_version(item.get("toolVersion"), f"{label}.toolVersion")
+    )
     if item.get("provider") != REQUIRED_PROVIDER or item.get("model") != REQUIRED_MODEL:
         raise EvidenceError(f"{label} must use the pinned provider/model")
     if item.get("variant") != required_variant:
@@ -326,9 +382,9 @@ def validate_review(
     if require_sha256(item.get("inputSha256"), f"{label}.inputSha256") != input_hash:
         raise EvidenceError(f"{label}.inputSha256 does not match its review input")
     expected_request = build_review_request(trusted_prompts[role], expected_input)
-    if require_sha256(item.get("requestSha256"), f"{label}.requestSha256") != sha256_bytes(
-        expected_request
-    ):
+    if require_sha256(
+        item.get("requestSha256"), f"{label}.requestSha256"
+    ) != sha256_bytes(expected_request):
         raise EvidenceError(f"{label}.requestSha256 does not match prompt plus input")
 
     prompt_path = evidence_file(bundle, item.get("prompt"), f"{label}.prompt")
@@ -406,13 +462,17 @@ def validate_failure_receipt(
         optional=set(),
         label=f"{label}.receipt",
     )
-    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    canonical = (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
     if raw != canonical:
         raise EvidenceError(f"{label}.receipt must use canonical JSON encoding")
     if receipt.get("schemaVersion") != 1:
         raise EvidenceError(f"{label}.receipt schemaVersion must be 1")
     if receipt.get("baseCommit") != base or receipt.get("reviewedCommit") != reviewed:
-        raise EvidenceError(f"{label}.receipt must bind the same base and reviewed head")
+        raise EvidenceError(
+            f"{label}.receipt must bind the same base and reviewed head"
+        )
     role = require_string(receipt.get("role"), f"{label}.receipt.role")
     if role not in REQUIRED_ROLES:
         raise EvidenceError(f"{label}.receipt.role is invalid")
@@ -425,17 +485,26 @@ def validate_failure_receipt(
     tool_versions.add(
         require_tool_version(receipt.get("toolVersion"), f"{label}.receipt.toolVersion")
     )
-    if receipt.get("provider") != REQUIRED_PROVIDER or receipt.get("model") != REQUIRED_MODEL:
+    if (
+        receipt.get("provider") != REQUIRED_PROVIDER
+        or receipt.get("model") != REQUIRED_MODEL
+    ):
         raise EvidenceError(f"{label}.receipt must use the pinned provider/model")
     if receipt.get("variant") != REQUIRED_VARIANT:
         raise EvidenceError(f"{label}.receipt.variant must be high")
     input_hash = sha256_bytes(expected_input)
-    if require_sha256(receipt.get("inputSha256"), f"{label}.receipt.inputSha256") != input_hash:
+    if (
+        require_sha256(receipt.get("inputSha256"), f"{label}.receipt.inputSha256")
+        != input_hash
+    ):
         raise EvidenceError(f"{label}.receipt input hash mismatch")
-    request_hash = sha256_bytes(build_review_request(trusted_prompts[role], expected_input))
-    if require_sha256(
-        receipt.get("requestSha256"), f"{label}.receipt.requestSha256"
-    ) != request_hash:
+    request_hash = sha256_bytes(
+        build_review_request(trusted_prompts[role], expected_input)
+    )
+    if (
+        require_sha256(receipt.get("requestSha256"), f"{label}.receipt.requestSha256")
+        != request_hash
+    ):
         raise EvidenceError(f"{label}.receipt request hash mismatch")
     outcome = receipt.get("outcome")
     if outcome not in FAILED_HIGH_FINISH:
@@ -489,13 +558,15 @@ def validate_failed_high_attempts(
             )
         )
     if not final_roles.issubset(attempt_roles):
-        raise EvidenceError(f"{label} needs a same-role failed high attempt per low review")
+        raise EvidenceError(
+            f"{label} needs a same-role failed high attempt per low review"
+        )
 
 
 def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool:
+    repository_root = Path.cwd().resolve()
+    path = require_path_without_symlink_ancestors(path, repository_root, str(path))
     bundle = path.parent
-    if path.is_symlink() or bundle.is_symlink():
-        raise EvidenceError(f"{path}: manifest and bundle must not be symlinks")
     try:
         manifest_bytes = safe_artifact_bytes(path, str(path))
         manifest = require_object(json.loads(manifest_bytes.decode("utf-8")), str(path))
@@ -522,18 +593,22 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
     base = require_commit(manifest.get("baseCommit"), "baseCommit")
     reviewed = require_commit(manifest.get("reviewedCommit"), "reviewedCommit")
     if base != expected_base:
-        raise EvidenceError(f"{path}: baseCommit must equal trusted base {expected_base}")
+        raise EvidenceError(
+            f"{path}: baseCommit must equal trusted base {expected_base}"
+        )
     if base == reviewed:
         raise EvidenceError(f"{path}: reviewedCommit must differ from baseCommit")
     git_bytes("cat-file", "-e", f"{base}^{{commit}}")
     git_bytes("cat-file", "-e", f"{reviewed}^{{commit}}")
     git_bytes("cat-file", "-e", f"{expected_tip}^{{commit}}")
-    if subprocess.run(
-        ["git", "merge-base", "--is-ancestor", base, reviewed], check=False
-    ).returncode:
+    try:
+        git_bytes("merge-base", "--is-ancestor", base, reviewed)
+    except subprocess.CalledProcessError:
         raise EvidenceError(f"{path}: baseCommit is not an ancestor of reviewedCommit")
 
-    parents = git_bytes("rev-list", "--parents", "-n", "1", expected_tip).decode().split()
+    parents = (
+        git_bytes("rev-list", "--parents", "-n", "1", expected_tip).decode().split()
+    )
     if parents != [expected_tip, reviewed]:
         raise EvidenceError(
             f"{path}: expected tip must be a single-parent direct child of reviewedCommit"
@@ -541,7 +616,9 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
     head_tree = git_bytes("rev-parse", "HEAD^{tree}").strip()
     expected_tree = git_bytes("rev-parse", f"{expected_tip}^{{tree}}").strip()
     if head_tree != expected_tree:
-        raise EvidenceError(f"{path}: candidate checkout tree differs from expected tip")
+        raise EvidenceError(
+            f"{path}: candidate checkout tree differs from expected tip"
+        )
 
     reviewed_diff = require_safe_artifact(
         canonical_diff(base, reviewed), f"{path}:canonical source diff"
@@ -609,8 +686,12 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
         index = require_int(shard.get("index"), f"{label}.index")
         if index != offset + 1:
             raise EvidenceError(f"{label}.index must be contiguous and one-based")
-        primary_paths = require_path_list(shard.get("primaryPaths"), f"{label}.primaryPaths")
-        context_paths = require_path_list(shard.get("contextPaths"), f"{label}.contextPaths")
+        primary_paths = require_path_list(
+            shard.get("primaryPaths"), f"{label}.primaryPaths"
+        )
+        context_paths = require_path_list(
+            shard.get("contextPaths"), f"{label}.contextPaths"
+        )
         if set(primary_paths).intersection(context_paths):
             raise EvidenceError(f"{label} primary and context paths must not overlap")
         try:
@@ -699,9 +780,10 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
     synthesis_input, synthesis_metadata = full_diff_input(base, reviewed)
     if synthesis_item.get("byteLength") != synthesis_metadata["byteLength"]:
         raise EvidenceError("synthesis.byteLength does not match full-diff input")
-    if require_sha256(
-        synthesis_item.get("inputSha256"), "synthesis.inputSha256"
-    ) != synthesis_metadata["inputSha256"]:
+    if (
+        require_sha256(synthesis_item.get("inputSha256"), "synthesis.inputSha256")
+        != synthesis_metadata["inputSha256"]
+    ):
         raise EvidenceError("synthesis.inputSha256 does not match full-diff input")
     _input_path, synthesis_contents = validate_hashed_artifact(
         bundle, synthesis_item, "input", "synthesis", artifacts
@@ -710,7 +792,9 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
         raise EvidenceError("synthesis.input bytes are not reproducible")
     synthesis_reviews = synthesis_item.get("reviews")
     if not isinstance(synthesis_reviews, list) or not 1 <= len(synthesis_reviews) <= 2:
-        raise EvidenceError("synthesis.reviews must contain one or two independent reviews")
+        raise EvidenceError(
+            "synthesis.reviews must contain one or two independent reviews"
+        )
     variants = {
         require_object(review, f"synthesis.reviews[{index}]").get("variant")
         for index, review in enumerate(synthesis_reviews)
@@ -737,9 +821,7 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
             raise EvidenceError("synthesis.reviews must not repeat roles")
         synthesis_roles.add(role)
     if "cross-layer-correctness" not in synthesis_roles:
-        raise EvidenceError(
-            "synthesis.reviews must include cross-layer-correctness"
-        )
+        raise EvidenceError("synthesis.reviews must include cross-layer-correctness")
     if synthesis_variant == "low":
         validate_failed_high_attempts(
             synthesis_item.get("fallback"),
@@ -782,9 +864,13 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
     actual_files: set[Path] = set()
     for child in bundle.iterdir():
         if child.is_symlink():
-            raise EvidenceError(f"{path}: evidence entries must not be symlinks: {child}")
+            raise EvidenceError(
+                f"{path}: evidence entries must not be symlinks: {child}"
+            )
         if not stat.S_ISREG(child.stat().st_mode):
-            raise EvidenceError(f"{path}: evidence entries must be regular files: {child}")
+            raise EvidenceError(
+                f"{path}: evidence entries must be regular files: {child}"
+            )
         actual_files.add(child.resolve())
     if actual_files != artifacts:
         extras = sorted(item.name for item in actual_files - artifacts)
@@ -807,10 +893,14 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
         ).split(b"\0")
         if item
     ]
-    repository_root = Path.cwd().resolve()
-    declared_names = {
-        item.relative_to(repository_root).as_posix() for item in artifacts
-    }
+    try:
+        declared_names = {
+            item.relative_to(repository_root).as_posix() for item in artifacts
+        }
+    except ValueError as exc:
+        raise EvidenceError(
+            f"{path}: evidence artifacts escape the repository"
+        ) from exc
     if set(committed_paths) != declared_names or len(committed_paths) != len(
         declared_names
     ):
@@ -820,7 +910,11 @@ def validate_manifest(path: Path, expected_base: str, expected_tip: str) -> bool
             f"{path}: evidence tip must change exactly this bundle; "
             f"extras={extras}, missing={missing}"
         )
-    if path.as_posix() not in committed_paths:
+    try:
+        manifest_name = path.relative_to(repository_root).as_posix()
+    except ValueError as exc:
+        raise EvidenceError(f"{path}: manifest escapes the repository") from exc
+    if manifest_name not in committed_paths:
         raise EvidenceError(f"{path}: manifest is absent from evidence tip")
     return True
 
@@ -840,7 +934,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="scan one request/report for high-confidence unsafe content",
     )
-    parser.add_argument("--scan-title", type=Path, help="scan and bound one session title")
+    parser.add_argument(
+        "--scan-title", type=Path, help="scan and bound one session title"
+    )
     return parser.parse_args()
 
 
@@ -853,10 +949,12 @@ def main() -> int:
         target = args.scan_artifact or args.scan_title
         assert target is not None
         try:
-            if target.is_symlink():
-                raise EvidenceError("scan target must not be a symlink")
             if args.scan_title is not None:
-                require_safe_title(target.read_bytes(), str(target))
+                try:
+                    title = read_regular_file(target, str(target), MAX_TITLE_BYTES)
+                except ReviewInputError as exc:
+                    raise EvidenceError(str(exc)) from exc
+                require_safe_title(title, str(target))
             else:
                 safe_artifact_bytes(target, str(target))
         except (EvidenceError, OSError) as exc:
@@ -897,7 +995,10 @@ def main() -> int:
 
     manifests = sorted(EVIDENCE_ROOT.glob("*/manifest.json"))
     if not manifests:
-        print(f"error: no adversarial-review manifest below {EVIDENCE_ROOT}", file=sys.stderr)
+        print(
+            f"error: no adversarial-review manifest below {EVIDENCE_ROOT}",
+            file=sys.stderr,
+        )
         return 1
     errors: list[str] = []
     covering: list[Path] = []

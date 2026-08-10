@@ -8,12 +8,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 from adversarial_review_input import (  # noqa: E402
+    MAX_REQUEST_BYTES,
     ReviewInputError,
     automatic_shard_input,
     build_review_request,
@@ -24,11 +26,14 @@ from adversarial_review_input import (  # noqa: E402
     file_patches,
     full_diff_input,
     plan_shards,
+    read_regular_file,
 )
 from check_adversarial_review import (  # noqa: E402
     EvidenceError,
+    require_path_without_symlink_ancestors,
     trusted_prompt_bytes,
     validate_manifest,
+    validate_report,
 )
 from parse_opencode_review import (  # noqa: E402
     ParseError,
@@ -290,7 +295,9 @@ class ReviewInputTests(GitRepositoryTestCase):
         self.assertIn(patches[1].body, rendered)
         request = build_review_request(b"prompt\n", rendered)
         self.assertEqual(request, build_review_request(b"prompt\n", rendered))
-        self.assertEqual(metadata["diffByteLength"], sum(len(item.body) for item in patches))
+        self.assertEqual(
+            metadata["diffByteLength"], sum(len(item.body) for item in patches)
+        )
 
     def test_explicit_lists_must_follow_canonical_order(self) -> None:
         with self.assertRaises(ReviewInputError):
@@ -344,6 +351,56 @@ class ReviewInputTests(GitRepositoryTestCase):
         large_head = rev_parse(self.repository)
         with self.assertRaises(ReviewInputError):
             automatic_shard_input(self.head, large_head, 1, ["b.txt"])
+
+    def test_binary_change_is_rejected_before_review(self) -> None:
+        (self.repository / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00payload")
+        run("git", "add", "image.png")
+        run("git", "commit", "-qm", "binary", cwd=self.repository)
+        binary_head = rev_parse(self.repository)
+        with self.assertRaisesRegex(ReviewInputError, "binary changes"):
+            file_patches(self.head, binary_head)
+
+
+class EvidenceHardeningTests(unittest.TestCase):
+    def test_degenerate_pass_report_is_rejected(self) -> None:
+        with self.assertRaisesRegex(EvidenceError, "substantive review"):
+            validate_report(b"VERDICT: PASS\n", "report")
+
+    def test_bounded_reader_rejects_symlinks_and_oversized_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.write_bytes(b"safe")
+            link = root / "link"
+            link.symlink_to(target)
+            with self.assertRaises(ReviewInputError):
+                read_regular_file(link, "link", MAX_REQUEST_BYTES)
+            oversized = root / "oversized"
+            oversized.write_bytes(b"x" * 5)
+            with self.assertRaisesRegex(ReviewInputError, "exceeds"):
+                read_regular_file(oversized, "oversized", 4)
+
+    def test_symlinked_evidence_ancestor_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            outside = root / "outside"
+            outside.mkdir()
+            docs = root / "docs"
+            docs.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(EvidenceError, "symlink ancestors"):
+                require_path_without_symlink_ancestors(
+                    docs / "adversarial-reviews" / "test" / "manifest.json",
+                    root,
+                    "manifest",
+                )
+
+    def test_git_timeout_is_reported_as_review_input_error(self) -> None:
+        with mock.patch(
+            "adversarial_review_input.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["git", "status"], 30),
+        ):
+            with self.assertRaisesRegex(ReviewInputError, "exceeded 30 seconds"):
+                canonical_diff("a" * 40, "b" * 40)
 
 
 class SubmoduleDiffTests(GitRepositoryTestCase):
@@ -421,14 +478,24 @@ class ManifestFixture(GitRepositoryTestCase):
         prompts = trusted_prompt_bytes()
         bundle = self.repository / "docs/adversarial-reviews/test"
         bundle.mkdir(parents=True)
+
+        def passing_report(scope: str) -> bytes:
+            return (
+                f"Review scope: {scope}\n"
+                "The frozen change was traced through its declared contract and failure paths.\n"
+                "No actionable regression remains in this bounded fixture; hashes and ordering agree.\n"
+                "Material residual risk is limited to the procedural provenance documented by the gate.\n"
+                "VERDICT: PASS\n"
+            ).encode()
+
         files = {
             "shard-001.input.txt": shard_input,
             "synthesis.input.txt": synthesis_input,
             "security.prompt.txt": prompts["security-reliability"],
             "correctness.prompt.txt": prompts["cross-layer-correctness"],
-            "shard-security.report.md": b"shard security\nVERDICT: PASS\n",
-            "shard-correctness.report.md": b"shard correctness\nVERDICT: PASS\n",
-            "synthesis.report.md": b"integration correctness\nVERDICT: PASS\n",
+            "shard-security.report.md": passing_report("shard security"),
+            "shard-correctness.report.md": passing_report("shard correctness"),
+            "synthesis.report.md": passing_report("integration correctness"),
         }
         if synthesis_low:
             receipt = {
@@ -440,9 +507,7 @@ class ManifestFixture(GitRepositoryTestCase):
                 "outcome": "OUTPUT_LIMIT",
                 "provider": "openrouter",
                 "requestSha256": hashlib.sha256(
-                    build_review_request(
-                        prompts[synthesis_role], synthesis_input
-                    )
+                    build_review_request(prompts[synthesis_role], synthesis_input)
                 ).hexdigest(),
                 "reviewedCommit": reviewed,
                 "role": synthesis_role,

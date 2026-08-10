@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -23,8 +25,11 @@ MAX_SHARD_BYTES = 100 * 1024
 MAX_SHARD_CHANGED_LINES = 2_000
 INPUT_SCHEMA_VERSION = 1
 MAX_SEMANTIC_PLAN_BYTES = 1 * 1024 * 1024
+MAX_REQUEST_BYTES = 5 * 1024 * 1024
+GIT_TIMEOUT_SECONDS = 30
 REQUEST_BEGIN = b"\n--- BEGIN FROZEN REVIEW INPUT ---\n"
 REQUEST_END = b"\n--- END FROZEN REVIEW INPUT ---\n"
+BINARY_DIFF_MARKERS = (b"\nGIT binary patch\n", b"\nBinary files ")
 
 
 class ReviewInputError(ValueError):
@@ -48,13 +53,54 @@ class ShardPlan:
 
 
 def git_bytes(*args: str) -> bytes:
-    result = subprocess.run(
-        ["git", *args],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=GIT_TIMEOUT_SECONDS,
+            env={
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewInputError(
+            f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
+        ) from exc
     return result.stdout
+
+
+def read_regular_file(path: Path, label: str, max_bytes: int) -> bytes:
+    """Read one bounded regular file without following a final symlink."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ReviewInputError(f"cannot open {label}: {exc}") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ReviewInputError(f"{label} must be a regular file")
+        if details.st_size > max_bytes:
+            raise ReviewInputError(f"{label} exceeds {max_bytes} bytes")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ReviewInputError(f"{label} exceeds {max_bytes} bytes")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -137,16 +183,22 @@ def file_patches(base: str, reviewed: str) -> tuple[bytes, list[FilePatch]]:
     paths = changed_paths(base, reviewed)
     if not full:
         if paths:
-            raise ReviewInputError("changed paths exist but the canonical diff is empty")
+            raise ReviewInputError(
+                "changed paths exist but the canonical diff is empty"
+            )
         return full, []
-    starts = [
-        match.start()
-        for match in re.finditer(br"(?m)^diff --git ", full)
-    ]
+    if any(marker in full for marker in BINARY_DIFF_MARKERS):
+        raise ReviewInputError(
+            "binary changes are not reviewable by the text evidence gate; "
+            "separate them into an explicitly reviewed asset step"
+        )
+    starts = [match.start() for match in re.finditer(rb"(?m)^diff --git ", full)]
     if not starts or starts[0] != 0:
         raise ReviewInputError("canonical diff has an unrecognized file boundary")
     starts.append(len(full))
-    bodies = [full[starts[index] : starts[index + 1]] for index in range(len(starts) - 1)]
+    bodies = [
+        full[starts[index] : starts[index + 1]] for index in range(len(starts) - 1)
+    ]
     if len(paths) != len(bodies):
         raise ReviewInputError(
             "canonical diff file count does not match the changed-path list"
@@ -291,7 +343,8 @@ def build_review_input(
         "diffSha256": sha256_bytes(combined_diff),
         "inputSha256": sha256_bytes(rendered),
         "oversizedSingleFile": (
-            len(primary_patches) == 1 and not context_patches
+            len(primary_patches) == 1
+            and not context_patches
             and (
                 len(primary_diff) > MAX_SHARD_BYTES
                 or primary_lines > MAX_SHARD_CHANGED_LINES
@@ -318,7 +371,9 @@ def automatic_shard_input(
     _, patches = file_patches(base, reviewed)
     chosen = shards[shard_index - 1]
     selected = select_primary_paths(patches, chosen.primary_paths)
-    selected_context = select_primary_paths(patches, context_paths) if context_paths else []
+    selected_context = (
+        select_primary_paths(patches, context_paths) if context_paths else []
+    )
     rendered, metadata = build_review_input(
         base, reviewed, full, selected, selected_context
     )
@@ -335,7 +390,9 @@ def explicit_shard_input(
 ) -> tuple[bytes, dict[str, Any]]:
     full, patches = file_patches(base, reviewed)
     selected_primary = select_primary_paths(patches, primary_paths)
-    selected_context = select_primary_paths(patches, context_paths) if context_paths else []
+    selected_context = (
+        select_primary_paths(patches, context_paths) if context_paths else []
+    )
     rendered, metadata = build_review_input(
         base, reviewed, full, selected_primary, selected_context
     )
@@ -357,9 +414,7 @@ def enforce_shard_limits(metadata: dict[str, Any], label: str) -> None:
 
 
 def load_semantic_plan(path: Path) -> list[dict[str, Any]]:
-    if path.is_symlink() or not path.is_file():
-        raise ReviewInputError("semantic plan must be a regular non-symlink file")
-    raw = path.read_bytes()
+    raw = read_regular_file(path, "semantic plan", MAX_SEMANTIC_PLAN_BYTES)
     if not raw or len(raw) > MAX_SEMANTIC_PLAN_BYTES or b"\x00" in raw:
         raise ReviewInputError("semantic plan is empty, binary, or too large")
     try:
@@ -379,10 +434,18 @@ def load_semantic_plan(path: Path) -> list[dict[str, Any]]:
             )
         primary = item.get("primaryPaths")
         context = item.get("contextPaths")
-        if not isinstance(primary, list) or not all(isinstance(path, str) for path in primary):
-            raise ReviewInputError(f"semantic plan shard {index} primaryPaths is invalid")
-        if not isinstance(context, list) or not all(isinstance(path, str) for path in context):
-            raise ReviewInputError(f"semantic plan shard {index} contextPaths is invalid")
+        if not isinstance(primary, list) or not all(
+            isinstance(path, str) for path in primary
+        ):
+            raise ReviewInputError(
+                f"semantic plan shard {index} primaryPaths is invalid"
+            )
+        if not isinstance(context, list) or not all(
+            isinstance(path, str) for path in context
+        ):
+            raise ReviewInputError(
+                f"semantic plan shard {index} contextPaths is invalid"
+            )
         parsed.append({"primaryPaths": primary, "contextPaths": context})
     return parsed
 
@@ -402,7 +465,9 @@ def describe_semantic_plan(
         metadata.update({"shardCount": len(specs), "shardIndex": index})
         described.append((rendered, metadata))
         owned_paths.extend(spec["primaryPaths"])
-    duplicates = sorted(path for path in set(owned_paths) if owned_paths.count(path) > 1)
+    duplicates = sorted(
+        path for path in set(owned_paths) if owned_paths.count(path) > 1
+    )
     missing = sorted(expected_paths - set(owned_paths))
     extras = sorted(set(owned_paths) - expected_paths)
     if duplicates or missing or extras:
@@ -452,13 +517,20 @@ def main() -> int:
     args = parse_args()
     try:
         if args.command == "request":
-            if args.prompt.is_symlink() or args.input.is_symlink():
-                raise ReviewInputError("request inputs must not be symlinks")
-            prompt = args.prompt.read_bytes()
-            review_input = args.input.read_bytes()
+            prompt = read_regular_file(args.prompt, "request prompt", MAX_REQUEST_BYTES)
+            review_input = read_regular_file(
+                args.input, "review input", MAX_REQUEST_BYTES
+            )
             if not prompt or not review_input:
-                raise ReviewInputError("request prompt and review input must be non-empty")
-            sys.stdout.buffer.write(build_review_request(prompt, review_input))
+                raise ReviewInputError(
+                    "request prompt and review input must be non-empty"
+                )
+            request = build_review_request(prompt, review_input)
+            if len(request) > MAX_REQUEST_BYTES:
+                raise ReviewInputError(
+                    f"complete review request exceeds {MAX_REQUEST_BYTES} bytes"
+                )
+            sys.stdout.buffer.write(request)
             return 0
         base = require_commit(args.base, "base")
         reviewed = require_commit(args.reviewed, "reviewed")

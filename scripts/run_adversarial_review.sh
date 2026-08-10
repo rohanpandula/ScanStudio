@@ -160,7 +160,7 @@ if [[ -n "$failure_receipt" || -n "$failure_outcome" ]]; then
     exit 2
   fi
   case "$failure_outcome" in
-    EMPTY_REPORT|NO_FINAL_VERDICT|OUTPUT_LIMIT|PROVIDER_ERROR) ;;
+    EMPTY_REPORT|NO_FINAL_VERDICT|OUTPUT_LIMIT) ;;
     *)
       echo "unsupported failure outcome: $failure_outcome" >&2
       exit 2

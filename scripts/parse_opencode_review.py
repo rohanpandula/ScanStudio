@@ -5,15 +5,20 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 MAX_EVENT_BYTES = 16 * 1024 * 1024
 MAX_EXPORT_BYTES = 64 * 1024 * 1024
+MAX_EVENT_PARTS = 10_000
+MAX_EXPORTED_PARTS = 10_000
+MIN_REPORT_BODY_BYTES = 160
+MIN_REPORT_BODY_LINES = 3
 VERDICT = re.compile(r"^VERDICT: (PASS|REQUEST_CHANGES|BLOCK)$", re.MULTILINE)
 CONTEXT_ID = re.compile(r"^ses_[A-Za-z0-9]+$")
 TOOL_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
@@ -26,6 +31,7 @@ EVENT_TYPES = {
     "text": "text",
     "step-finish": "step_finish",
 }
+FAILURE_OUTCOMES = {"EMPTY_REPORT", "NO_FINAL_VERDICT", "OUTPUT_LIMIT"}
 
 
 class ParseError(ValueError):
@@ -38,13 +44,45 @@ def require_object(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
-def extract_session_id(raw: bytes) -> str:
+def event_lines(raw: bytes) -> Iterator[tuple[int, bytes]]:
     if not raw or len(raw) > MAX_EVENT_BYTES:
         raise ParseError("OpenCode event stream is empty or exceeds the size limit")
-    sessions: set[str] = set()
-    for line_number, line in enumerate(raw.splitlines(), start=1):
+    part_count = 0
+    for line_number, line in enumerate(io.BytesIO(raw), start=1):
         if not line.strip():
             continue
+        part_count += 1
+        if part_count > MAX_EVENT_PARTS:
+            raise ParseError("OpenCode event stream exceeds the part count limit")
+        yield line_number, line
+
+
+def require_parts(value: Any, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ParseError(f"{label} lacks parts")
+    if len(value) > MAX_EXPORTED_PARTS:
+        raise ParseError(f"{label} exceeds the exported part count limit")
+    return value
+
+
+def validate_substantive_report(report: str) -> None:
+    """Reject a PASS attestation that contains no meaningful review body."""
+
+    lines = report.splitlines()
+    if not lines or lines[-1].strip() != "VERDICT: PASS":
+        return
+    body = "\n".join(lines[:-1]).strip()
+    body_lines = [line for line in lines[:-1] if line.strip()]
+    if (
+        len(body.encode("utf-8")) < MIN_REPORT_BODY_BYTES
+        or len(body_lines) < MIN_REPORT_BODY_LINES
+    ):
+        raise ParseError("PASS report must contain a substantive review body")
+
+
+def extract_session_id(raw: bytes) -> str:
+    sessions: set[str] = set()
+    for line_number, line in event_lines(raw):
         try:
             event = require_object(json.loads(line), f"event line {line_number}")
         except json.JSONDecodeError as exc:
@@ -59,16 +97,12 @@ def extract_session_id(raw: bytes) -> str:
 
 
 def parse_event_stream(raw: bytes) -> tuple[str, str, str]:
-    if not raw or len(raw) > MAX_EVENT_BYTES:
-        raise ParseError("OpenCode event stream is empty or exceeds the size limit")
     session_id: str | None = None
     message_id: str | None = None
     text_parts: list[str] = []
     seen_part_ids: set[str] = set()
     state = "before-start"
-    for line_number, line in enumerate(raw.splitlines(), start=1):
-        if not line.strip():
-            continue
+    for line_number, line in event_lines(raw):
         if state == "finished":
             raise ParseError("OpenCode emitted output after step-finish")
         try:
@@ -106,7 +140,9 @@ def parse_event_stream(raw: bytes) -> tuple[str, str, str]:
                 f"event line {line_number} contains forbidden/unknown part {part_type!r}"
             )
         if event.get("type") != expected_event_type:
-            raise ParseError(f"event line {line_number} has mismatched event/part types")
+            raise ParseError(
+                f"event line {line_number} has mismatched event/part types"
+            )
         if state == "before-start":
             if part_type != "step-start":
                 raise ParseError("first OpenCode event must be step-start")
@@ -126,19 +162,23 @@ def parse_event_stream(raw: bytes) -> tuple[str, str, str]:
             text_parts.append(value)
 
     if state != "finished" or session_id is None or message_id is None:
-        raise ParseError("OpenCode events must contain one ordered start/finish sequence")
+        raise ParseError(
+            "OpenCode events must contain one ordered start/finish sequence"
+        )
     report = "".join(text_parts).strip()
     if not report:
         raise ParseError("assistant report is empty")
     verdicts = VERDICT.findall(report)
-    if len(verdicts) != 1 or report.splitlines()[-1].strip() != f"VERDICT: {verdicts[0]}":
+    if (
+        len(verdicts) != 1
+        or report.splitlines()[-1].strip() != f"VERDICT: {verdicts[0]}"
+    ):
         raise ParseError("assistant report must contain exactly one verdict at EOF")
     return session_id, message_id, report
 
 
 def exported_text_parts(parts: Any, label: str) -> str:
-    if not isinstance(parts, list):
-        raise ParseError(f"{label} lacks parts")
+    parts = require_parts(parts, label)
     values: list[str] = []
     for index, part in enumerate(parts):
         item = require_object(part, f"{label}.parts[{index}]")
@@ -151,7 +191,8 @@ def exported_text_parts(parts: Any, label: str) -> str:
 
 
 def exported_assistant_text(parts: Any) -> str:
-    if not isinstance(parts, list) or len(parts) < 3:
+    parts = require_parts(parts, "exported assistant")
+    if len(parts) < 3:
         raise ParseError("exported assistant lacks its ordered parts")
     allowed = {"step-start", "reasoning", "text", "step-finish"}
     part_types: list[str] = []
@@ -160,7 +201,9 @@ def exported_assistant_text(parts: Any) -> str:
         item = require_object(part, f"assistant.parts[{index}]")
         part_type = item.get("type")
         if part_type not in allowed:
-            raise ParseError(f"exported assistant contains forbidden part {part_type!r}")
+            raise ParseError(
+                f"exported assistant contains forbidden part {part_type!r}"
+            )
         part_types.append(part_type)
         if part_type == "text":
             value = item.get("text")
@@ -285,6 +328,8 @@ def parse_failure_receipt(
     expected_provider: str,
     expected_model: str,
 ) -> dict[str, Any]:
+    if outcome not in FAILURE_OUTCOMES:
+        raise ParseError("failure receipt outcome is invalid")
     if (
         FULL_COMMIT.fullmatch(base_commit) is None
         or FULL_COMMIT.fullmatch(reviewed_commit) is None
@@ -309,7 +354,9 @@ def parse_failure_receipt(
         raise ParseError("session export top-level ID does not match events")
     messages = exported.get("messages")
     if not isinstance(messages, list) or len(messages) != 2:
-        raise ParseError("failed fresh review session must contain exactly two messages")
+        raise ParseError(
+            "failed fresh review session must contain exactly two messages"
+        )
     user_entries: dict[str, dict[str, Any]] = {}
     assistants: list[dict[str, Any]] = []
     for index, entry in enumerate(messages):
@@ -345,11 +392,11 @@ def parse_failure_receipt(
         or assistant_info.get("variant") != "high"
     ):
         raise ParseError("failure export does not use the pinned high model")
+    if assistant_info.get("error") is not None:
+        raise ParseError("failed assistant records a provider error")
     if exported_text_parts(parent.get("parts"), "parent user message") != request_text:
         raise ParseError("failure export parent does not match request bytes")
-    assistant_parts = assistant.get("parts")
-    if not isinstance(assistant_parts, list):
-        raise ParseError("failed assistant lacks parts")
+    assistant_parts = require_parts(assistant.get("parts"), "failed assistant")
     part_types = [
         part.get("type") if isinstance(part, dict) else type(part).__name__
         for part in assistant_parts
@@ -368,18 +415,18 @@ def parse_failure_receipt(
     if forbidden:
         raise ParseError("failed assistant contains forbidden/unknown parts")
     finish = assistant_info.get("finish")
-    error = assistant_info.get("error")
-    if not part_types or part_types[0] != "step-start" or part_types.count("step-start") != 1:
+    if (
+        not part_types
+        or part_types[0] != "step-start"
+        or part_types.count("step-start") != 1
+    ):
         raise ParseError("failed assistant must begin with exactly one step-start")
     finish_parts = [
         part
         for part in assistant_parts
         if isinstance(part, dict) and part.get("type") == "step-finish"
     ]
-    if finish is None:
-        if finish_parts:
-            raise ParseError("unfinished provider error must not contain step-finish")
-    elif (
+    if (
         len(finish_parts) != 1
         or assistant_parts[-1] is not finish_parts[0]
         or finish_parts[0].get("reason") != finish
@@ -396,11 +443,6 @@ def parse_failure_receipt(
             raise ParseError(
                 "NO_FINAL_VERDICT requires non-empty finish=stop text without verdict"
             )
-    elif outcome == "PROVIDER_ERROR":
-        if finish is not None or error is None:
-            raise ParseError("PROVIDER_ERROR requires finish=null and an exported error")
-    else:
-        raise ParseError("failure receipt outcome is invalid")
     return {
         "baseCommit": base_commit,
         "contextId": session_id,
@@ -472,6 +514,7 @@ def main() -> int:
             print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
             return 0
         session_id, message_id, report = parse_event_stream(event_bytes)
+        validate_substantive_report(report)
         metadata = parse_export(
             args.export.read_bytes(),
             session_id=session_id,
@@ -484,7 +527,9 @@ def main() -> int:
             expected_variant=args.variant,
         )
         sys.stdout.write(report + "\n")
-        print("REVIEW_METADATA " + json.dumps(metadata, sort_keys=True), file=sys.stderr)
+        print(
+            "REVIEW_METADATA " + json.dumps(metadata, sort_keys=True), file=sys.stderr
+        )
         return 0
     except (OSError, ParseError) as exc:
         print(f"error: {exc}", file=sys.stderr)
