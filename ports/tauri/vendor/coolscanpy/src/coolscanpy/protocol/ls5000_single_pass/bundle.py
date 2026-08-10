@@ -32,7 +32,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # scan-side wiring): both files gained CaptureBatchRequest/LiveBatchJob's
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
     "capture_process.py": "6208a95b23bba84ee0903a07a0d583a9840c5332cbdc60f38a4b574a050d24e2",
-    "worker.py": "f625057c5619c9ddf94d7e233c6ac9d2a86e300c1a8b1bd8d7f5f03d0eac8c24",
+    "worker.py": "d826249919c94b67f76b6a36400374a090ef2c9b2c05138f51913e9576e67650",
     "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",

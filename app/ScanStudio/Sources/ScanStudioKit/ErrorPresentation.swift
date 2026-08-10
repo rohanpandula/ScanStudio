@@ -137,6 +137,13 @@ public enum ErrorPresentationPolicy {
             guidance: "Power-cycle the scanner before trying another film movement."
         ),
         Copy(
+            code: "ADAPTER_UNSUPPORTED",
+            title: "This film adapter isn’t supported yet",
+            guidance: "Previews and scans need the SA-21 or SA-30 strip feeder. "
+                + "The scanner was not moved. Mounted-slide support (MA-21) is "
+                + "not available yet."
+        ),
+        Copy(
             code: "HARDWARE_LANE_BUSY",
             title: "Scanner is finishing another task",
             guidance: "Wait for the current scanner operation to finish, then try again."

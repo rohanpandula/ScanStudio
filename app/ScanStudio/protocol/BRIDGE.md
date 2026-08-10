@@ -16,7 +16,7 @@ Contract between the external `scanstudio-bridge` sidecar (GPL-3.0, wraps Coolsc
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `DEVICE_NOT_FOUND`, `DEVICE_BUSY`, `NO_PREVIEW`, `UNKNOWN_JOB`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED`, `FINGERPRINT_REFUSED`, `MANUAL_REVIEW_REQUIRED`, `REFEED_REQUIRED`, `FILM_FEED_INTERRUPTED`, `ROLL_MISMATCH`, `TRANSPORT_SMEAR_DETECTED`, `GEOMETRY_VALIDATION_ERROR`, `SPLIT_ALIGNMENT_ERROR`, `BATCH_INTEGRITY_ERROR`, `NOT_IMPLEMENTED`, `INTERNAL` — 23 total.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `DEVICE_NOT_FOUND`, `DEVICE_BUSY`, `NO_PREVIEW`, `UNKNOWN_JOB`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED`, `ADAPTER_UNSUPPORTED`, `FINGERPRINT_REFUSED`, `MANUAL_REVIEW_REQUIRED`, `REFEED_REQUIRED`, `FILM_FEED_INTERRUPTED`, `ROLL_MISMATCH`, `TRANSPORT_SMEAR_DETECTED`, `GEOMETRY_VALIDATION_ERROR`, `SPLIT_ALIGNMENT_ERROR`, `BATCH_INTEGRITY_ERROR`, `NOT_IMPLEMENTED`, `INTERNAL` — 24 total.
 
 `recoverable` is `true` only for `HARDWARE_LANE_BUSY`: retrying the identical request once the lane frees can succeed with no other action. Every other code needs a *different* action first — re-arm the latch, call `roll.approve`, physically refeed the strip, power-cycle the transport — so every other code is `recoverable: false`.
 
@@ -28,6 +28,7 @@ Contract between the external `scanstudio-bridge` sidecar (GPL-3.0, wraps Coolsc
 | `DeviceBusy` | `DEVICE_BUSY` |
 | `EjectFailed` | `EJECT_FAILED` |
 | `FeederParked` | `FEEDER_PARKED` |
+| `AdapterUnsupported` | `ADAPTER_UNSUPPORTED` |
 | `FingerprintRefused` | `FINGERPRINT_REFUSED` |
 | `ManualReviewRequired` | `MANUAL_REVIEW_REQUIRED` |
 | `RefeedRequired` | `REFEED_REQUIRED` |
@@ -51,7 +52,7 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | `device.open` | `{deviceId: string}` | `{device: DeviceInfo, status: DeviceStatus}` | `DEVICE_NOT_FOUND`, `ALREADY_CONNECTED`, `DEVICE_BUSY` |
 | `device.status` | `{}` | `DeviceStatus` | `NOT_CONNECTED` |
 | `device.close` | `{}` | `{}` | `NOT_CONNECTED`, `HARDWARE_LANE_BUSY` |
-| `roll.preview` | `{material: "colorNegative"\|"blackAndWhiteNegative", slots?: [number]}` | `{accepted: true}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`; via `roll.previewError`: `FEEDER_PARKED`, `REFEED_REQUIRED`, `DEVICE_BUSY`, `ROLL_MISMATCH` |
+| `roll.preview` | `{material: "colorNegative"\|"blackAndWhiteNegative", slots?: [number]}` | `{accepted: true}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`; via `roll.previewError`: `FEEDER_PARKED`, `ADAPTER_UNSUPPORTED`, `REFEED_REQUIRED`, `DEVICE_BUSY`, `ROLL_MISMATCH` |
 | `roll.approve` | `{slot: number}` | `{}` | `NOT_CONNECTED`, `NO_PREVIEW` |
 | `roll.setSpacingOffset` | `{slot: number, offsetRows: number}` | `{thumbnail: Thumbnail}` | `NOT_CONNECTED`, `NO_PREVIEW`, `INVALID_PARAMS` |
 | `roll.manualFrames` | `{rows: [number]}` | `{count: number, fingerprint: string, thumbnails: [Thumbnail], snaps: [BoundarySnap]}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `METER_UNUSABLE` |
@@ -182,6 +183,7 @@ DeviceStatus
   laneHeld: bool
   motionArmed: bool                       // live re-check result, never a cached value (see SAFE-02 guardrails)
   filmPresent: bool|null                  // live, no-motion film-presence read; null when no trustworthy verdict is available (see prose below)
+  adapter: string|null                    // the scanner's page-01h adapter identity ("Mount"|"6Strip"|"36Strip"|"240"|"Feeder"); null when unreadable, never a guess (see prose below)
 
 CaptureRecipe
   resolutionDpi: number
@@ -330,6 +332,8 @@ ScanReceipt
 
 `PreviewStrip.imagePath` (additive, 2026-08-07) is rendered through the identical transform `Thumbnail.imagePath` already uses (`swapaxes(0,1)`, 0.5th/99.5th percentile stretch, 8-bit TIFF) applied once to the whole captured raster instead of one frame's crop — so the raster's row axis (the coordinate space `roll.manualFrames`'s `rows` are given in, `0..rowCount-1`) is the image's WIDTH axis, not its height, exactly like every existing `Thumbnail` crop already is. `pixelsPerRow` is always `1` today (native resolution, never resized); carried explicitly so a future downsampled strip cannot silently break row-to-pixel math on either side of the wire.
 
+`DeviceStatus.adapter` is the scanner's own INQUIRY EVPD page-01h ASCII adapter identity, re-read on every status snapshot because adapters are hot-swappable without a reconnect. The value set is the interface specification's Table 2-2-2-2-1: `Mount` (MA-21 mount adapter), `6Strip` (SA-21), `36Strip` (SA-30), `240` (IA-20), `Feeder` (SF-210). `null` means the identity could not be read (for example, an active capture owns the interface) and must never be interpreted as any particular adapter. Clients wanting the marketing model name map the string themselves; the wire carries the scanner's own vocabulary.
+
 `DeviceStatus.filmPresent` is a live, no-motion film-presence read, distinct from `previewEstablished` (which only means "a preview has run this session," never "film is physically loaded right now"). The bundled CoolScanPy asks the exact opened LS-5000 with TEST UNIT READY: `true` means the scanner reports medium gripped, `false` means its verified MEDIUM NOT PRESENT sense was observed, and `null` means no trustworthy verdict was available (for example, an active capture owns the interface, an older dependency lacks the method, or the scanner returned an unrecognised/malformed reply). A verified `false` retires the stale preview registration in the same status snapshot (`previewEstablished: false`, `slotCount: null`) and gates the next scan on a fresh preview. `null` is never interpreted as absence. Presence is not motion readiness: a short strip parked at the transport end-stop can still report `true`.
 
 CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanReceipt` as `meterRgbiPath` starting this phase (Phase 10): the bridge writes `frame.meter_rgbi` (an HxWx4 uint16 array) to `{stem}_METER.tif` alongside the RGB/IR files, unconditionally whenever CoolscanPy supplies it — never fabricated; `null` only if absent.
@@ -429,6 +433,8 @@ No image bytes — base64 or otherwise — ever appear on the wire. `scan.start`
 Emitted by the preview worker instead of `roll.previewComplete` when the preview fails after acceptance (transport exception or CoolscanPy detection error such as RollSessionError). Payload: `{code: ErrorCode, message: string}`. Discovered live: detection RAISES rather than returning an empty session; without this event a worker death was silent.
 
 **Terminal events fire after the lane is released (ordering, 2026-07-25).** `roll.previewComplete`, `roll.previewError`, `scan.error`, `scan.completed`, and the closing `scan.start` telemetry entry are all emitted only AFTER the worker has released the hardware lane. A client that reacts to a terminal event by polling `device.status` therefore always observes the lane free — previously the one-shot status poll could race the worker's cleanup, capture `laneHeld: true`, and (with no later re-poll) leave a UI stuck on "busy" forever, observed live 2026-07-25. Per-frame events (`scan.progress`, `scan.frameRetrying`, `scan.frameCompleted`, `scan.frameFailed`) and `hardware.anomaly` still fire while the lane is held, since they report on the in-flight hardware call. **Motion-operation gate (2026-07-25, same day):** a new motion request or `device.close` issued in the narrow window after the lane release but before the terminal event has been handed to the wire is refused with the recoverable `HARDWARE_LANE_BUSY` — never accepted — so one operation's terminal events can never interleave into a successor's. The gate drops the instant the terminal event is emitted; a client that reacts to the terminal event itself therefore never observes it.
+
+**Adapter-gated preview (additive, 2026-08-10, #70).** `roll.preview` is a strip-feeder workflow: the traced command plan was captured behind an SA-30, and the hardware gates parts of it on the adapter (the MA-21 drops VPD page `E2h`; perforation reads are SA-21/SA-30-only). When CoolscanPy positively identifies a non-strip adapter before worker dispatch it raises `AdapterUnsupported`, which the bridge forwards as `ADAPTER_UNSUPPORTED` via `roll.previewError` with the remedy in `message` (swap to a strip feeder; mounted slides need a future dedicated workflow). An unreadable identity does not refuse: the preview proceeds and any true incompatibility still fails closed at the wire.
 
 **Typed preview failures (additive, 2026-07-25).** The bridge maps post-acceptance preview failures to typed codes instead of flattening them to `INTERNAL`: CoolscanPy's `FeederParked` → `FEEDER_PARKED`, `RefeedRequired` → `REFEED_REQUIRED`, `DeviceBusy` → `DEVICE_BUSY`. Two CoolscanPy-internal exception types known to leak past its public taxonomy are mapped explicitly: `IndexDecodeError` (the whole-roll transport table is inconsistent with one uniform traversal — observed live 2026-07-25 as `transport anchor residual is inconsistent with one affine preview traversal`) and `RollSessionError` (preview completed but no usable roll session, e.g. low alignment confidence or no scanner-addressable slots) both surface as `REFEED_REQUIRED`, with the underlying CoolscanPy detail preserved in `message` — the operator action for both is eject/refeed and preview again. `RollSessionIntegrityError` (artifact/journal self-check failures) stays `INTERNAL`: it indicates a driver-side defect, not an operator condition. Error telemetry lines for `roll.preview` and `scan.start` now also carry the `message` alongside `code` — the 2026-07-25 live failure was undiagnosable from telemetry precisely because only the bare code was recorded.
 

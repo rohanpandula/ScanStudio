@@ -2846,14 +2846,47 @@ fn preview_frame_count_for_holder(
 /// overlaying the previously authoritative `DeviceInfo.capabilities`
 /// classification. A disconnected status never advertises a cached holder,
 /// and `media_loaded` remains the bridge's `preview_established` signal.
+fn holder_from_adapter_ascii(ascii: &str) -> Option<DetectedHolder> {
+    // The scanner's own page-01h identity (spec Table 2-2-2-2-1) is
+    // authoritative when the bridge supplies it — unlike the capacity
+    // heuristic it needs no frame-control corroboration. The IA-20
+    // ("240") and SF-210 ("Feeder") have no carrier in this family's
+    // vocabulary and stay unclassified.
+    match ascii {
+        "Mount" => Some(DetectedHolder {
+            adapter: "MA-21",
+            carrier: MediaCarrier::Mounted,
+        }),
+        "6Strip" => Some(DetectedHolder {
+            adapter: "SA-21",
+            carrier: MediaCarrier::Strip6,
+        }),
+        "36Strip" => Some(DetectedHolder {
+            adapter: "SA-30",
+            carrier: MediaCarrier::Roll36,
+        }),
+        _ => None,
+    }
+}
+
 fn map_status(
     bridge: &BridgeDeviceStatus,
     detected_holder: Option<DetectedHolder>,
 ) -> ScannerStatus {
-    let detected_holder = bridge.connected.then_some(detected_holder).flatten();
+    let live_holder = bridge.adapter.as_deref().and_then(holder_from_adapter_ascii);
+    let detected_holder = bridge
+        .connected
+        .then_some(live_holder.or(detected_holder))
+        .flatten();
     ScannerStatus {
         connected: bridge.connected,
-        adapter: detected_holder.map(|holder| holder.adapter.to_string()),
+        // Prefer the classified model name; an identified-but-unclassified
+        // adapter (IA-20/SF-210 or a future string) still surfaces its raw
+        // page-01h identity so diagnostics never regress to "unknown" when
+        // the scanner itself named the adapter.
+        adapter: detected_holder
+            .map(|holder| holder.adapter.to_string())
+            .or_else(|| bridge.connected.then(|| bridge.adapter.clone()).flatten()),
         media_loaded: bridge.preview_established,
         carrier: detected_holder.map(|holder| holder.carrier),
         // `slotCount` becomes an actual film-frame count only after the
@@ -5937,6 +5970,67 @@ mod tests {
     }
 
     #[test]
+    fn live_adapter_string_overrides_the_capability_heuristic() {
+        // #70: the bridge's page-01h identity is the scanner's own word and
+        // wins over the capacity-derived guess. "Mount" classifies MA-21
+        // even when capabilities would have suggested a roll feeder.
+        let bridge_status = BridgeDeviceStatus {
+            connected: true,
+            device_id: Some("coolscan3:usb:libusb:000:013".to_string()),
+            preview_established: false,
+            slot_count: None,
+            active_job_id: None,
+            lane_held: false,
+            motion_armed: false,
+            film_present: Some(true),
+            adapter: Some("Mount".to_string()),
+        };
+        let heuristic_holder = derive_detected_holder(&capabilities(Some(40), true));
+        let status = map_status(&bridge_status, heuristic_holder);
+        assert_eq!(status.adapter.as_deref(), Some("MA-21"));
+        assert_eq!(status.carrier, Some(MediaCarrier::Mounted));
+    }
+
+    #[test]
+    fn unclassified_adapter_string_still_surfaces_raw_identity() {
+        // An IA-20/SF-210 (or a future string) has no carrier in this
+        // family's vocabulary, but the scanner named it — diagnostics must
+        // show that name, not "unknown".
+        let bridge_status = BridgeDeviceStatus {
+            connected: true,
+            device_id: Some("coolscan3:usb:libusb:000:013".to_string()),
+            preview_established: false,
+            slot_count: None,
+            active_job_id: None,
+            lane_held: false,
+            motion_armed: false,
+            film_present: None,
+            adapter: Some("Feeder".to_string()),
+        };
+        let status = map_status(&bridge_status, None);
+        assert_eq!(status.adapter.as_deref(), Some("Feeder"));
+        assert_eq!(status.carrier, None);
+    }
+
+    #[test]
+    fn bridge_status_without_adapter_field_still_deserializes() {
+        // Older bridges never send `adapter`; the serde default keeps the
+        // envelope readable and the identity honestly unknown.
+        let decoded: BridgeDeviceStatus = serde_json::from_value(serde_json::json!({
+            "connected": true,
+            "deviceId": "coolscan3:usb:libusb:000:013",
+            "previewEstablished": false,
+            "slotCount": null,
+            "activeJobId": null,
+            "laneHeld": false,
+            "motionArmed": false,
+            "filmPresent": null,
+        }))
+        .expect("adapter-less DeviceStatus must deserialize");
+        assert_eq!(decoded.adapter, None);
+    }
+
+    #[test]
     fn status_overlays_a_known_holder_without_changing_media_loaded_semantics() {
         let bridge_status = BridgeDeviceStatus {
             connected: true,
@@ -5947,6 +6041,7 @@ mod tests {
             lane_held: false,
             motion_armed: false,
             film_present: Some(true),
+            adapter: None,
         };
         let holder = derive_detected_holder(&capabilities(Some(40), true));
         let status = map_status(&bridge_status, holder);
@@ -5997,6 +6092,7 @@ mod tests {
             lane_held: false,
             motion_armed: true,
             film_present: None,
+            adapter: None,
         };
 
         let status = map_status(&bridge_status, None);
@@ -6068,6 +6164,7 @@ mod tests {
                     lane_held: false,
                     motion_armed: false,
                     film_present: Some(true),
+                    adapter: None,
                 },
                 derive_detected_holder(&capabilities(capacity, frame_control)),
             );

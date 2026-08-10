@@ -86,7 +86,10 @@ impl<T> BridgeEvent<T> {
 }
 
 // ---------------------------------------------------------------------
-// Error codes (BRIDGE.md "Error codes" — 21 total). `recoverable` is
+// Error codes — the 22 codes this engine names in its closed enum.
+// BRIDGE.md documents additional wire codes (24 in total) that travel
+// through the String-typed runtime paths below without an enum
+// variant (see `BridgeErrorEventPayload.code`). `recoverable` is
 // `true` only for `HARDWARE_LANE_BUSY`: retrying the identical request
 // once the lane frees can succeed with no other action. Every other code
 // needs a different action first, so it is always `recoverable: false`.
@@ -107,6 +110,7 @@ pub enum BridgeErrorCode {
     HardwareLaneBusy,
     EjectFailed,
     FeederParked,
+    AdapterUnsupported,
     FingerprintRefused,
     ManualReviewRequired,
     RefeedRequired,
@@ -179,6 +183,13 @@ pub struct BridgeDeviceStatus {
     /// means the transport could not establish a trustworthy verdict,
     /// never that film is absent (BRIDGE.md `DeviceStatus`).
     pub film_present: Option<bool>,
+    /// The scanner's own page-01h adapter identity string ("Mount",
+    /// "6Strip", "36Strip", "240", "Feeder"), re-read per status
+    /// snapshot because adapters are hot-swappable. `None` (or the
+    /// field missing entirely, for older bridges) means unreadable,
+    /// never a particular adapter (BRIDGE.md `DeviceStatus.adapter`).
+    #[serde(default)]
+    pub adapter: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -759,6 +770,7 @@ mod tests {
             (BridgeErrorCode::HardwareLaneBusy, "HARDWARE_LANE_BUSY"),
             (BridgeErrorCode::EjectFailed, "EJECT_FAILED"),
             (BridgeErrorCode::FeederParked, "FEEDER_PARKED"),
+            (BridgeErrorCode::AdapterUnsupported, "ADAPTER_UNSUPPORTED"),
             (BridgeErrorCode::FingerprintRefused, "FINGERPRINT_REFUSED"),
             (
                 BridgeErrorCode::ManualReviewRequired,
@@ -1027,7 +1039,7 @@ mod tests {
         assert_eq!(value["code"], json!("REFEED_REQUIRED"));
         round_trip(&payload);
 
-        // A code string outside the 21-member BridgeErrorCode enum must
+        // A code string outside the 22-member BridgeErrorCode enum must
         // still deserialize cleanly -- this is the entire point of typing
         // `code` as `String` rather than `BridgeErrorCode`.
         let future_code: BridgeScanErrorPayload = serde_json::from_value(json!({

@@ -234,6 +234,9 @@ class MockTransport:
             # access to it.
             motion_armed=False,
             film_present=self._film_present,
+            # The mock simulates the SA-30 strip feeder the real traces
+            # were captured behind.
+            adapter="36Strip",
         )
 
     def close_device(self) -> None:

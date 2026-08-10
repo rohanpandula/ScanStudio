@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - only when the package isn't installed
 from coolscanpy._device import Device, get_devices, open
 from coolscanpy._roll import Roll
 from coolscanpy.exceptions import (
+    AdapterUnsupported,
     BatchIntegrityError,
     CaptureWorkerBootstrapFailed,
     DeviceBusy,
@@ -103,6 +104,7 @@ __all__ = [
     "EjectNotAvailable",
     "SafeStopRequested",
     "FeederParked",
+    "AdapterUnsupported",
     "CaptureWorkerBootstrapFailed",
     "RollMismatch",
     "FingerprintRefused",

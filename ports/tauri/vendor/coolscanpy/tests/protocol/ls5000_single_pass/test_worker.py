@@ -7260,3 +7260,187 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
 
     assert validated["status"] == "ejected"
     assert validated["completed_slots"] == [7]
+
+
+# ---------------------------------------------------------------------------
+# Adapter-conditional EVPD replay (#70): the live page-00h list gates which
+# traced EVPD INQUIRY entries the inserted adapter can answer.
+# ---------------------------------------------------------------------------
+
+
+def test_evpd_inquiry_page_classification() -> None:
+    # Plan sequence 25: EVPD INQUIRY for page E2h.
+    assert worker_module._evpd_inquiry_page({"cdb": "1201e2000480"}) == 0xE2
+    # Standard INQUIRY (sequence 1) has EVPD clear and never participates.
+    assert worker_module._evpd_inquiry_page({"cdb": "120000002480"}) is None
+    # Non-INQUIRY commands never participate.
+    assert worker_module._evpd_inquiry_page({"cdb": "28008c00010300000a80"}) is None
+    assert worker_module._evpd_inquiry_page({"cdb": ""}) is None
+    assert worker_module._evpd_inquiry_page({"cdb": "zz"}) is None
+
+
+def test_decode_live_vpd_page_list_bounds_and_padding() -> None:
+    # The live MA-21 list (2026-08-10): 17 declared pages, no 47h/E2h.
+    mount = bytes.fromhex("06000011000140415051606162c1d1e1e3f0f8fbfc")
+    pages = worker_module._decode_live_vpd_page_list(mount)
+    assert pages is not None
+    assert 0xE2 not in pages and 0x47 not in pages and len(pages) == 17
+
+    # The canonical strip response is allocation-padded on the wire; only
+    # the declared count is trusted, stale tail bytes are never pages.
+    strip = bytes.fromhex("0600001300014041475051606162c1d1e1e3f0f8e2fbfc")
+    padded = strip + b"\xde\xad\xbe\xef"
+    pages = worker_module._decode_live_vpd_page_list(padded)
+    assert pages is not None
+    assert len(pages) == 0x13 and 0xE2 in pages and 0xDE not in pages
+
+    # Malformed headers yield None: every EVPD entry stays strict.
+    assert worker_module._decode_live_vpd_page_list(b"") is None
+    assert worker_module._decode_live_vpd_page_list(b"\x07\x00\x00\x01\x01") is None
+    assert worker_module._decode_live_vpd_page_list(b"\x06\x00\x00\x05\x01") is None
+
+
+def _refusal_result() -> worker_module.TransactionResult:
+    # Live MA-21 refusal shape: status-only phase, empty payload, full
+    # Nikon status envelope carrying the sense.
+    return worker_module.TransactionResult(
+        phase=0x01,
+        payload=b"",
+        status=bytes.fromhex("0205240000000000"),
+        sense="052400",
+        stall_recoveries=0,
+    )
+
+
+def test_adapter_conditional_evpd_accepts_clean_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = {
+        "seq": 25,
+        "name": "INQUIRY",
+        "cdb": "1201e2000480",
+        "expected_phase": 0x03,
+        "expected_sense": "000000",
+        "request_len": 4,
+        "request_parts": [4],
+    }
+    monkeypatch.setattr(
+        worker_module,
+        "perform_transaction",
+        lambda *a, **k: _refusal_result(),
+    )
+    advertised, result = worker_module._perform_adapter_conditional_evpd(
+        None, None, entry, data_timeout_ms=1000
+    )
+    assert advertised is False
+    assert result.sense == "052400"
+
+
+def test_adapter_conditional_evpd_validates_data_reply_strictly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = {
+        "seq": 25,
+        "name": "INQUIRY",
+        "cdb": "1201e2000480",
+        "expected_phase": 0x03,
+        "expected_sense": "000000",
+        "expected_status": "0000000000000000",
+        "request_len": 4,
+        "request_parts": [4],
+    }
+    good = worker_module.TransactionResult(
+        phase=0x03,
+        payload=bytes.fromhex("06e2001a"),
+        status=bytes(8),
+        sense="000000",
+        stall_recoveries=0,
+    )
+    monkeypatch.setattr(worker_module, "perform_transaction", lambda *a, **k: good)
+    advertised, result = worker_module._perform_adapter_conditional_evpd(
+        None, None, entry, data_timeout_ms=1000
+    )
+    assert advertised is True and result is good
+
+    # A data reply that violates the traced contract still fails closed.
+    short = replace(good, payload=b"\x06")
+    monkeypatch.setattr(worker_module, "perform_transaction", lambda *a, **k: short)
+    with pytest.raises(worker_module.SynchronizedProtocolError):
+        worker_module._perform_adapter_conditional_evpd(
+            None, None, entry, data_timeout_ms=1000
+        )
+
+
+def test_adapter_conditional_evpd_refuses_malformed_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = {"seq": 25, "name": "INQUIRY", "cdb": "1201e2000480", "request_len": 4}
+    # Refusal with payload bytes: not the observed live shape.
+    with_payload = replace(_refusal_result(), payload=b"\x00")
+    # Busy phase: not a refusal at all.
+    busy = replace(_refusal_result(), phase=0x04)
+    # Truncated status envelope.
+    bad_status = replace(_refusal_result(), status=b"\x02")
+    # Sense disagreeing with its own status envelope.
+    bad_sense = replace(_refusal_result(), sense="023a00")
+    # UNIT ATTENTION (mid-session adapter swap) and NOT READY are real
+    # transient scanner states, not benign page-absent refusals: only the
+    # live-proven 052400 ILLEGAL REQUEST is accepted (adversarial-review
+    # finding 1, 2026-08-10).
+    unit_attention = replace(
+        _refusal_result(),
+        sense="062800",
+        status=bytes.fromhex("0206280000000000"),
+    )
+    not_ready = replace(
+        _refusal_result(),
+        sense="020401",
+        status=bytes.fromhex("0202040100000000"),
+    )
+    # A refusal whose status byte is not CHECK CONDITION is not the
+    # proven shape either, even with the right sense bytes.
+    wrong_status_byte = replace(
+        _refusal_result(), status=bytes.fromhex("0005240000000000")
+    )
+    for result in (
+        with_payload,
+        busy,
+        bad_status,
+        bad_sense,
+        unit_attention,
+        not_ready,
+        wrong_status_byte,
+    ):
+        monkeypatch.setattr(
+            worker_module, "perform_transaction", lambda *a, _r=result, **k: _r
+        )
+        with pytest.raises(worker_module.SynchronizedProtocolError):
+            worker_module._perform_adapter_conditional_evpd(
+                None, None, entry, data_timeout_ms=1000
+            )
+
+
+def test_every_canonical_evpd_page_is_advertised_by_a_strip_feeder() -> None:
+    """Strip-feeder behavior stays byte-identical (adversarial finding 5).
+
+    With the full strip-feeder page list live, every EVPD INQUIRY entry in
+    the canonical plan is advertised, so the adapter-conditional branch is
+    structurally unreachable and the strict replay path is unchanged.
+    """
+
+    strip_pages = worker_module._decode_live_vpd_page_list(
+        bytes.fromhex("0600001300014041475051606162c1d1e1e3f0f8e2fbfc")
+    )
+    assert strip_pages is not None
+    plan = worker_module.load_canonical_plan()
+    evpd_entries = [
+        entry
+        for entry in plan
+        if worker_module._evpd_inquiry_page(entry) is not None
+    ]
+    assert evpd_entries, "the canonical plan must contain EVPD entries"
+    for entry in evpd_entries:
+        assert worker_module._evpd_inquiry_page(entry) in strip_pages, (
+            f"seq {entry.get('seq')} page would take the adapter-conditional "
+            "path on a strip feeder"
+        )

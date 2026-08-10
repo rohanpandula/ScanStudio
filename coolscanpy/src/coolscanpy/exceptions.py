@@ -22,6 +22,7 @@ __all__ = [
     "EjectNotAvailable",
     "SafeStopRequested",
     "FeederParked",
+    "AdapterUnsupported",
     "CaptureWorkerBootstrapFailed",
     "RollMismatch",
     "FingerprintRefused",
@@ -82,6 +83,34 @@ class SafeStopRequested(PyCoolscanError):
 class FeederParked(PyCoolscanError):
     """The capture outcome requires a power cycle before the transport can be
     used again."""
+
+
+class AdapterUnsupported(PyCoolscanError):
+    """The inserted film adapter cannot run the requested workflow.
+
+    The strip workflows (:meth:`Roll.preview` and the batch scans that
+    follow it) replay a command trace captured behind a strip feeder, and
+    the hardware itself gates parts of that trace on the adapter — a
+    mount adapter drops VPD page ``E2h`` and does not support the
+    perforation reads the roll traversal is built on. Swapping to a
+    strip feeder (SA-21/SA-30) is the remedy; slide media needs a
+    dedicated single-frame workflow that does not exist yet.
+
+    ``adapter`` is the scanner's page-01h ASCII identity (for example
+    ``"Mount"``); ``supported`` names the adapter identities the
+    workflow accepts.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        adapter: str,
+        supported: tuple[str, ...],
+    ) -> None:
+        super().__init__(message)
+        self.adapter = adapter
+        self.supported = supported
 
 
 class CaptureWorkerBootstrapFailed(PyCoolscanError):
