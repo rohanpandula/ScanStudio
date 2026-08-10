@@ -376,9 +376,14 @@ def create_app(
             # become non-standard JSON on the NDJSON wire.
             json.dumps(body.params, allow_nan=False)
             if body.method in MUTATING_METHODS:
-                pending = await lease.submit_if_owned(
-                    control_token(request),
-                    lambda: engine.submit(body.method, body.params),
+                reservation = await lease.reserve_submission(control_token(request))
+                pending = await engine.submit(
+                    body.method,
+                    body.params,
+                    write_guard=lambda enqueue: lease.commit_submission(
+                        reservation,
+                        enqueue,
+                    ),
                 )
                 envelope = await pending.result()
             else:

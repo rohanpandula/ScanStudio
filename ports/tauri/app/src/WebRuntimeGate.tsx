@@ -16,6 +16,7 @@ import {
 import { isTauriRuntime } from "./runtime";
 import {
   notifyWebSessionReady,
+  WEB_CONTROL_LOST_EVENT,
   WEB_EVENT_STREAM_STATE_EVENT,
   type WebEventStreamState,
 } from "./engine/client";
@@ -79,6 +80,7 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
   const claimInFlight = useRef<Promise<void> | null>(null);
   const refreshGeneration = useRef(0);
   const controlTabLock = useRef<HeldControlTabLock | null>(null);
+  const heartbeatIntervalMs = useRef(2_000);
 
   const releaseLocalControl = useCallback((): void => {
     clearControlLeaseToken();
@@ -159,9 +161,12 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
         releaseLocalControl();
         throw new Error(`Control request failed (${response.status}).`);
       }
-      let payload: { leaseToken?: unknown };
+      let payload: { leaseToken?: unknown; expiresInSeconds?: unknown };
       try {
-        payload = (await response.json()) as { leaseToken?: unknown };
+        payload = (await response.json()) as {
+          leaseToken?: unknown;
+          expiresInSeconds?: unknown;
+        };
       } catch {
         releaseLocalControl();
         throw new Error("The scanner server returned an unreadable control lease.");
@@ -170,6 +175,12 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
         releaseLocalControl();
         throw new Error("The scanner server did not return a control lease.");
       }
+      heartbeatIntervalMs.current =
+        typeof payload.expiresInSeconds === "number" &&
+        Number.isFinite(payload.expiresInSeconds) &&
+        payload.expiresInSeconds > 0
+          ? Math.max(250, Math.min(10_000, (payload.expiresInSeconds * 1_000) / 3))
+          : 2_000;
       setControlLeaseToken(payload.leaseToken);
       setError(null);
       setSession((current) =>
@@ -196,6 +207,20 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
       releaseLocalControl();
     };
   }, [refresh, releaseLocalControl, tauri]);
+
+  useEffect(() => {
+    if (tauri) return;
+    const loseControl = (): void => {
+      refreshGeneration.current += 1;
+      releaseLocalControl();
+      setSession((current) =>
+        current === null ? current : { ...current, control: "observer" },
+      );
+      setError("Scanner control expired. Reclaim control to continue.");
+    };
+    window.addEventListener(WEB_CONTROL_LOST_EVENT, loseControl);
+    return () => window.removeEventListener(WEB_CONTROL_LOST_EVENT, loseControl);
+  }, [releaseLocalControl, tauri]);
 
   useEffect(() => {
     if (tauri) return;
@@ -235,7 +260,7 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
 
   useEffect(() => {
     if (tauri || session?.control !== "owned") return;
-    const heartbeat = window.setInterval(() => {
+    const sendHeartbeat = (): void => {
       const generation = ++refreshGeneration.current;
       void post("/api/v1/control/heartbeat", undefined, true)
         .then((response) => {
@@ -266,7 +291,13 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
           );
           setError("The scanner server could not be reached; control was released locally.");
         });
-    }, 10_000);
+    };
+    const heartbeat = window.setInterval(sendHeartbeat, heartbeatIntervalMs.current);
+    const resumeHeartbeat = (): void => {
+      if (document.visibilityState === "visible") sendHeartbeat();
+    };
+    window.addEventListener("focus", sendHeartbeat);
+    document.addEventListener("visibilitychange", resumeHeartbeat);
     const release = (): void => {
       const headers = controlLeaseHeaders();
       void fetch("/api/v1/control/release", {
@@ -280,6 +311,8 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
     window.addEventListener("pagehide", release);
     return () => {
       window.clearInterval(heartbeat);
+      window.removeEventListener("focus", sendHeartbeat);
+      document.removeEventListener("visibilitychange", resumeHeartbeat);
       window.removeEventListener("pagehide", release);
       releaseLocalControl();
     };

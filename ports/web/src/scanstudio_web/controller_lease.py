@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -18,6 +18,13 @@ class LeaseRejected(Exception):
 class LeaseGrant:
     token: str
     expires_in_seconds: float
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseReservation:
+    """Server-internal authorization ticket for one engine enqueue."""
+
     generation: int
 
 
@@ -95,16 +102,36 @@ class ControllerLease:
         async with self._lock:
             self._require_locked(token)
 
-    async def submit_if_owned(
-        self,
-        token: str | None,
-        submitter: Callable[[], Awaitable[T]],
-    ) -> T:
-        """Validate ownership and enqueue one mutation as one atomic boundary."""
+    async def reserve_submission(self, token: str | None) -> LeaseReservation:
+        """Authorize activity now; actual enqueue must still commit this ticket."""
 
         async with self._lock:
-            self._require_locked(token)
-            return await submitter()
+            active = self._require_locked(token)
+            active.deadline = self._clock() + self._ttl
+            return LeaseReservation(generation=active.generation)
+
+    async def commit_submission(
+        self,
+        reservation: LeaseReservation,
+        enqueue: Callable[[], T],
+    ) -> T:
+        """Revalidate a reservation and synchronously enqueue under the lock.
+
+        The engine may wait for its writer lane before calling this method.
+        Release, expiry, or takeover invalidates the old generation, so a
+        predecessor cannot enter the pipe after a successor owns the lease.
+        Only the non-blocking `enqueue` call runs under the lease mutex; pipe
+        drain and response waiting remain independent.
+        """
+
+        async with self._lock:
+            active = self._current_locked()
+            if active is None or active.generation != reservation.generation:
+                raise LeaseRejected(
+                    "the controller lease changed before the command was enqueued"
+                )
+            active.deadline = self._clock() + self._ttl
+            return enqueue()
 
     def _current_locked(self) -> _ActiveLease | None:
         if self._active is not None and self._active.deadline <= self._clock():

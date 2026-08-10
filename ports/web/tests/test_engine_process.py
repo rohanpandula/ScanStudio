@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from scanstudio_web.controller_lease import ControllerLease
+from scanstudio_web.controller_lease import ControllerLease, LeaseRejected
 from scanstudio_web.engine_process import (
     EngineProtocolError,
     EngineRequestTimeout,
@@ -140,9 +141,11 @@ async def test_stalled_stdin_marks_engine_fatal_and_releases_controller_lock(
     class HangingStdin:
         def __init__(self) -> None:
             self.writes: list[bytes] = []
+            self.write_started = asyncio.Event()
 
         def write(self, data: bytes) -> None:
             self.writes.append(data)
+            self.write_started.set()
 
         async def drain(self) -> None:
             await asyncio.Event().wait()
@@ -157,7 +160,7 @@ async def test_stalled_stdin_marks_engine_fatal_and_releases_controller_lock(
             self.terminated = True
 
     settings = replace(
-        settings_for(tmp_path, "normal"), engine_write_timeout_seconds=0.01
+        settings_for(tmp_path, "normal"), engine_write_timeout_seconds=0.5
     )
     fatal_notifications: list[str] = []
     supervisor = EngineSupervisor(
@@ -171,14 +174,27 @@ async def test_stalled_stdin_marks_engine_fatal_and_releases_controller_lock(
 
     lease = ControllerLease(30)
     grant = await lease.claim()
-    with pytest.raises(EngineUnavailable, match="write timeout"):
-        await asyncio.wait_for(
-            lease.submit_if_owned(
-                grant.token,
-                lambda: supervisor.submit("scanner.status", {}),
+    reservation = await lease.reserve_submission(grant.token)
+    submission = asyncio.create_task(
+        supervisor.submit(
+            "scanner.status",
+            {},
+            write_guard=lambda enqueue: lease.commit_submission(
+                reservation,
+                enqueue,
             ),
-            timeout=0.25,
         )
+    )
+    await asyncio.wait_for(process.stdin.write_started.wait(), timeout=0.1)
+
+    # Engine flow control owns its own lane. Controller-plane operations stay
+    # live while drain is blocked, rather than waiting for its fatal timeout.
+    assert (
+        await asyncio.wait_for(lease.heartbeat(grant.token), timeout=0.1)
+    ).token == grant.token
+
+    with pytest.raises(EngineUnavailable, match="write timeout"):
+        await asyncio.wait_for(submission, timeout=1)
 
     assert process.stdin.writes
     assert process.terminated is True
@@ -186,9 +202,86 @@ async def test_stalled_stdin_marks_engine_fatal_and_releases_controller_lock(
     assert fatal_notifications == [
         "engine stdin remained blocked beyond the configured write timeout"
     ]
-    # The fatal write path returned through submit_if_owned, so a heartbeat is
-    # not stranded behind ControllerLease's atomic submission lock.
     assert (await lease.heartbeat(grant.token)).token == grant.token
+
+
+@pytest.mark.asyncio
+async def test_takeover_rejects_predecessor_waiting_for_engine_writer(
+    tmp_path: Path,
+) -> None:
+    class GatedStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.write_started = asyncio.Event()
+            self.drain_gate = asyncio.Event()
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(data)
+            self.write_started.set()
+
+        async def drain(self) -> None:
+            await self.drain_gate.wait()
+
+    class GatedProcess:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.stdin = GatedStdin()
+
+    supervisor = EngineSupervisor(
+        settings_for(tmp_path, "normal"),
+        EventBroker(8),
+    )
+    process = GatedProcess()
+    supervisor._process = process
+    supervisor._ready = True
+
+    # Occupy the writer lane so the old and replacement controller requests
+    # both queue behind a real drain boundary.
+    lane_owner = asyncio.create_task(supervisor.submit("scanner.status", {}))
+    await asyncio.wait_for(process.stdin.write_started.wait(), timeout=0.1)
+
+    tokens = iter(("old-capability", "replacement-capability"))
+    lease = ControllerLease(30, token_factory=lambda: next(tokens))
+    old_grant = await lease.claim()
+    old_reservation = await lease.reserve_submission(old_grant.token)
+    old_submission = asyncio.create_task(
+        supervisor.submit(
+            "scanner.connect",
+            {"deviceId": "sim-ls5000-0"},
+            write_guard=lambda enqueue: lease.commit_submission(
+                old_reservation,
+                enqueue,
+            ),
+        )
+    )
+    await asyncio.sleep(0)
+
+    await lease.release(old_grant.token)
+    replacement = await lease.claim()
+    replacement_reservation = await lease.reserve_submission(replacement.token)
+    replacement_submission = asyncio.create_task(
+        supervisor.submit(
+            "sim.loadMedia",
+            {"carrier": "strip6"},
+            write_guard=lambda enqueue: lease.commit_submission(
+                replacement_reservation,
+                enqueue,
+            ),
+        )
+    )
+
+    process.stdin.drain_gate.set()
+    lane_pending = await lane_owner
+    with pytest.raises(LeaseRejected, match="changed before the command was enqueued"):
+        await old_submission
+    replacement_pending = await replacement_submission
+
+    methods = [json.loads(wire)["method"] for wire in process.stdin.writes]
+    assert methods == ["scanner.status", "sim.loadMedia"]
+    assert replacement_pending.request_id == lane_pending.request_id + 1
+
+    supervisor._cancel_pending(lane_pending.request_id)
+    supervisor._cancel_pending(replacement_pending.request_id)
 
 
 @pytest.mark.asyncio

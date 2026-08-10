@@ -5,7 +5,10 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebRuntimeGate from "../WebRuntimeGate";
 import { clearControlLeaseToken, getControlLeaseToken } from "../controlLease";
-import { WEB_EVENT_STREAM_STATE_EVENT } from "../engine/client";
+import {
+  WEB_CONTROL_LOST_EVENT,
+  WEB_EVENT_STREAM_STATE_EVENT,
+} from "../engine/client";
 import { useScannerControl } from "../scannerControl";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -113,6 +116,43 @@ describe("WebRuntimeGate", () => {
     unmount();
     await waitFor(() => expect(locks.isHeld()).toBe(false));
     expect(getControlLeaseToken()).toBeNull();
+  });
+
+  it("demotes an expired controller as soon as an engine request reports lease loss", async () => {
+    const locks = installFakeLocks();
+    const intervals = vi.spyOn(window, "setInterval");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/v1/session") {
+          return jsonResponse({ authenticated: true, control: "available" });
+        }
+        if (path === "/api/v1/control/claim") {
+          return jsonResponse({ leaseToken: "short-lived-lease", expiresInSeconds: 5 });
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+
+    render(
+      <WebRuntimeGate>
+        <ControlProbe />
+      </WebRuntimeGate>,
+    );
+    markEventStreamReady();
+    expect(await screen.findByText("Control: owned")).toBeVisible();
+    expect(locks.isHeld()).toBe(true);
+    expect(
+      intervals.mock.calls.some(([, timeout]) => timeout === 5_000 / 3),
+    ).toBe(true);
+
+    act(() => window.dispatchEvent(new Event(WEB_CONTROL_LOST_EVENT)));
+
+    expect(screen.getByText("Control: observer")).toBeVisible();
+    expect(screen.getByText("Scanner control expired. Reclaim control to continue.")).toBeVisible();
+    expect(getControlLeaseToken()).toBeNull();
+    await waitFor(() => expect(locks.isHeld()).toBe(false));
   });
 
   it("keeps a second no-Locks page observing when the server lease is already owned", async () => {

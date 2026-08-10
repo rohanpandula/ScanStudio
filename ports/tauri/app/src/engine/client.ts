@@ -1,5 +1,10 @@
 import { isTauriRuntime } from "../runtime";
-import { controlLeaseHeaders } from "../controlLease";
+import {
+  clearControlLeaseToken,
+  CONTROL_LEASE_HEADER,
+  controlLeaseHeaders,
+  getControlLeaseToken,
+} from "../controlLease";
 
 export interface EngineError {
   code: string;
@@ -13,6 +18,7 @@ const WEB_REQUEST_ENDPOINT = "/api/v1/engine/request";
 const WEB_EVENT_ENDPOINT = "/api/v1/engine/events";
 const WEB_SESSION_READY_EVENT = "scanstudio:web-session-ready";
 export const WEB_EVENT_STREAM_STATE_EVENT = "scanstudio:web-event-stream-state";
+export const WEB_CONTROL_LOST_EVENT = "scanstudio:web-control-lost";
 
 export interface WebEventStreamState {
   ready: boolean;
@@ -45,12 +51,14 @@ function asEngineError(value: unknown, fallback: string): EngineError {
 }
 
 async function webRequest<T>(method: string, params: unknown): Promise<T> {
+  const leaseHeaders = controlLeaseHeaders();
+  const submittedLeaseToken = leaseHeaders[CONTROL_LEASE_HEADER] ?? null;
   let response: Response;
   try {
     response = await fetch(WEB_REQUEST_ENDPOINT, {
       method: "POST",
       credentials: "same-origin",
-      headers: { "Content-Type": "application/json", ...controlLeaseHeaders() },
+      headers: { "Content-Type": "application/json", ...leaseHeaders },
       body: JSON.stringify({ method, params }),
     });
   } catch (error) {
@@ -58,6 +66,17 @@ async function webRequest<T>(method: string, params: unknown): Promise<T> {
       error,
       "The ScanStudio server could not be reached. Check the server and try again.",
     );
+  }
+
+  if (
+    response.status === 423 &&
+    submittedLeaseToken !== null &&
+    getControlLeaseToken() === submittedLeaseToken
+  ) {
+    // The server is the lease authority. Fail closed immediately instead of
+    // leaving the UI enabled until a background-throttled heartbeat runs.
+    clearControlLeaseToken();
+    window.dispatchEvent(new Event(WEB_CONTROL_LOST_EVENT));
   }
 
   let payload: unknown;
@@ -75,10 +94,11 @@ async function webRequest<T>(method: string, params: unknown): Promise<T> {
     payload !== null &&
     "error" in payload
   ) {
-    throw asEngineError(
+    const engineError = asEngineError(
       payload.error,
       `The engine request failed (${response.status}).`,
     );
+    throw engineError;
   }
   if (!response.ok) {
     throw asEngineError(

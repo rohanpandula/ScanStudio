@@ -1,7 +1,16 @@
 /** @vitest-environment jsdom */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { engineRequest, notifyWebSessionReady, onEngineEvent } from "../client";
-import { clearControlLeaseToken, setControlLeaseToken } from "../../controlLease";
+import {
+  engineRequest,
+  notifyWebSessionReady,
+  onEngineEvent,
+  WEB_CONTROL_LOST_EVENT,
+} from "../client";
+import {
+  clearControlLeaseToken,
+  getControlLeaseToken,
+  setControlLeaseToken,
+} from "../../controlLease";
 import { SessionStore } from "../../session/store/session";
 import type { EngineTransport } from "../../session/wire/codec";
 
@@ -79,6 +88,64 @@ describe("browser engine client", () => {
         },
       }),
     );
+  });
+
+  it("drops local control immediately when the gateway rejects an expired lease", async () => {
+    setControlLeaseToken("expired-controller-lease");
+    const controlLost = vi.fn();
+    window.addEventListener(WEB_CONTROL_LOST_EVENT, controlLost);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "CONTROL_LEASE_REQUIRED",
+              message: "a current controller lease is required",
+            },
+          }),
+          { status: 423, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    await expect(engineRequest("scanner.connect", { deviceId: "sim-ls5000-0" }))
+      .rejects.toMatchObject({ code: "CONTROL_LEASE_REQUIRED" });
+    expect(getControlLeaseToken()).toBeNull();
+    expect(controlLost).toHaveBeenCalledOnce();
+    window.removeEventListener(WEB_CONTROL_LOST_EVENT, controlLost);
+  });
+
+  it("does not let a delayed stale-token 423 clear a replacement lease", async () => {
+    setControlLeaseToken("stale-controller-lease");
+    let resolveRequest!: (response: Response) => void;
+    const pendingResponse = new Promise<Response>((resolve) => {
+      resolveRequest = resolve;
+    });
+    const fetchMock = vi.fn().mockReturnValue(pendingResponse);
+    const controlLost = vi.fn();
+    window.addEventListener(WEB_CONTROL_LOST_EVENT, controlLost);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = engineRequest("scanner.connect", { deviceId: "sim-ls5000-0" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    setControlLeaseToken("replacement-controller-lease");
+    resolveRequest(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "CONTROL_LEASE_REQUIRED",
+            message: "the old controller lease expired",
+          },
+        }),
+        { status: 423, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    await expect(request).rejects.toMatchObject({ code: "CONTROL_LEASE_REQUIRED" });
+    expect(getControlLeaseToken()).toBe("replacement-controller-lease");
+    expect(controlLost).not.toHaveBeenCalled();
+    window.removeEventListener(WEB_CONTROL_LOST_EVENT, controlLost);
   });
 
   it("never presents a controller lease copied through sessionStorage", async () => {

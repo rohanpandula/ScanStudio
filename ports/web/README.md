@@ -48,7 +48,13 @@ used. The gateway's atomic claim remains the authority: concurrent pages can
 both try, but only one receives a lease. Refreshing a fallback page drops its
 in-memory bearer, so control may need to be reclaimed after the old lease
 expires. The default lease is 30 seconds; the web UI heartbeats every 10
-seconds. A missing, stale, expired, or other page's token fails closed.
+seconds, or every third of the configured lifetime when that is shorter.
+Foregrounding the page checks immediately, accepted mutations renew the
+server lease, and a `423` engine response demotes the page synchronously. A
+missing, stale, expired, or other page's token fails closed.
+Mutation reservations are revalidated under the lease mutex at the exact
+engine-pipe enqueue boundary; slow pipe drain never holds that mutex, and a
+released predecessor cannot enqueue after a replacement takes control.
 WebSockets need only the auth cookie and exact Origin, so observer pages can
 subscribe without taking control.
 

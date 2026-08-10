@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,6 +14,8 @@ from .relay import EventBroker
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
+
+EngineWriteGuard = Callable[[Callable[[], None]], Awaitable[None]]
 
 
 class EngineUnavailable(RuntimeError):
@@ -175,6 +177,8 @@ class EngineSupervisor:
         self,
         method: str,
         params: dict[str, Any],
+        *,
+        write_guard: EngineWriteGuard | None = None,
     ) -> PendingEngineRequest:
         if self._closing:
             raise EngineUnavailable("scanstudio-engine is shutting down")
@@ -182,7 +186,11 @@ class EngineSupervisor:
             raise EngineUnavailable(
                 self._fatal_error or "scanstudio-engine is not ready"
             )
-        request_id, future = await self._write_request(method, params)
+        request_id, future = await self._write_request(
+            method,
+            params,
+            write_guard=write_guard,
+        )
         return PendingEngineRequest(
             _supervisor=self,
             request_id=request_id,
@@ -290,7 +298,11 @@ class EngineSupervisor:
             raise
 
     async def _write_request(
-        self, method: str, params: dict[str, Any]
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        write_guard: EngineWriteGuard | None = None,
     ) -> tuple[int, asyncio.Future[dict[str, Any]]]:
         process = self._process
         if process is None or process.returncode is not None or process.stdin is None:
@@ -298,7 +310,6 @@ class EngineSupervisor:
 
         async with self._write_lock:
             request_id = self._next_id
-            self._next_id += 1
             wire = (
                 json.dumps(
                     {"id": request_id, "method": method, "params": params},
@@ -311,15 +322,29 @@ class EngineSupervisor:
             future: asyncio.Future[dict[str, Any]] = (
                 asyncio.get_running_loop().create_future()
             )
-            self._pending[request_id] = future
-            try:
+            issued = False
+
+            def enqueue() -> None:
+                nonlocal issued
+                self._next_id += 1
+                self._pending[request_id] = future
+                issued = True
                 process.stdin.write(wire)
+
+            try:
+                if write_guard is None:
+                    enqueue()
+                else:
+                    await write_guard(enqueue)
                 await asyncio.wait_for(
                     process.stdin.drain(),
                     timeout=self._settings.engine_write_timeout_seconds,
                 )
             except asyncio.TimeoutError as exc:
-                self._cancel_pending(request_id)
+                if issued:
+                    self._cancel_pending(request_id)
+                else:
+                    future.cancel()
                 message = (
                     "engine stdin remained blocked beyond the configured write timeout"
                 )
@@ -328,12 +353,24 @@ class EngineSupervisor:
             except asyncio.CancelledError:
                 # The bytes may already be in the pipe. Retain issued-id history
                 # so a later response is ignored instead of poisoning the engine.
-                self._abandon(request_id)
+                if issued:
+                    self._abandon(request_id)
+                else:
+                    future.cancel()
                 raise
             except (BrokenPipeError, ConnectionResetError) as exc:
-                self._cancel_pending(request_id)
+                if issued:
+                    self._cancel_pending(request_id)
+                else:
+                    future.cancel()
                 await self._mark_fatal("engine stdin closed while writing a request")
                 raise EngineUnavailable(self._fatal_error or str(exc)) from exc
+            except BaseException:
+                if issued:
+                    self._cancel_pending(request_id)
+                else:
+                    future.cancel()
+                raise
             return request_id, future
 
     async def _read_stdout(self) -> None:
