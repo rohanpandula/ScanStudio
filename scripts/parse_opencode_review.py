@@ -7,10 +7,15 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import re
+import stat
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Iterator
+
+from adversarial_review_input import MAX_REQUEST_BYTES
 
 
 MAX_EVENT_BYTES = 16 * 1024 * 1024
@@ -36,6 +41,87 @@ FAILURE_OUTCOMES = {"EMPTY_REPORT", "NO_FINAL_VERDICT", "OUTPUT_LIMIT"}
 
 class ParseError(ValueError):
     pass
+
+
+def read_regular_file(path: Path, label: str, max_bytes: int) -> bytes:
+    """Read one bounded regular file through no-follow ancestor traversal."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_only = getattr(os, "O_DIRECTORY", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if (
+        nofollow is None
+        or directory_only is None
+        or nonblock is None
+        or os.open not in os.supports_dir_fd
+    ):
+        raise ParseError(f"cannot safely open {label}: required flags are unavailable")
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | directory_only | nofollow
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
+    candidate = Path(os.path.abspath(path))
+    try:
+        directory = os.open(os.sep, directory_flags)
+    except OSError as exc:
+        raise ParseError(f"cannot open filesystem root for {label}: {exc}") from exc
+    try:
+        try:
+            for part in candidate.parts[1:-1]:
+                next_directory = os.open(part, directory_flags, dir_fd=directory)
+                os.close(directory)
+                directory = next_directory
+            descriptor = os.open(candidate.name, file_flags, dir_fd=directory)
+        except OSError as exc:
+            raise ParseError(
+                f"{label} must stay beneath non-symlink directories: {exc}"
+            ) from exc
+    finally:
+        os.close(directory)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ParseError(f"{label} must be a regular non-symlink file")
+        if details.st_size > max_bytes:
+            raise ParseError(f"{label} exceeds {max_bytes} bytes")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ParseError(f"{label} exceeds {max_bytes} bytes")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def normalize_report_newlines(report: str) -> str:
+    """Canonicalize CRLF and reject ambiguous controls or line separators."""
+
+    normalized = report.replace("\r\n", "\n")
+    if "\r" in normalized:
+        raise ParseError("assistant report contains a bare carriage return")
+    for character in normalized:
+        if character not in {"\n", "\t"} and unicodedata.category(character) in {
+            "Cc",
+            "Cf",
+            "Cs",
+            "Zl",
+            "Zp",
+        }:
+            raise ParseError(
+                "assistant report contains an ambiguous control or line separator"
+            )
+    return normalized
+
+
+def validate_request_size(request: bytes) -> None:
+    if len(request) > MAX_REQUEST_BYTES:
+        raise ParseError(f"review request exceeds {MAX_REQUEST_BYTES} bytes")
 
 
 def require_object(value: Any, label: str) -> dict[str, Any]:
@@ -95,10 +181,10 @@ def require_parts(value: Any, label: str) -> list[Any]:
 
 
 def validate_substantive_report(report: str) -> None:
-    """Reject a PASS attestation that contains no meaningful review body."""
+    """Reject any verdict attestation that has no meaningful review body."""
 
     lines = report.splitlines()
-    if not lines or lines[-1].strip() != "VERDICT: PASS":
+    if not lines or VERDICT.fullmatch(lines[-1].strip()) is None:
         return
     body = "\n".join(lines[:-1]).strip()
     body_lines = [line for line in lines[:-1] if line.strip()]
@@ -106,7 +192,7 @@ def validate_substantive_report(report: str) -> None:
         len(body.encode("utf-8")) < MIN_REPORT_BODY_BYTES
         or len(body_lines) < MIN_REPORT_BODY_LINES
     ):
-        raise ParseError("PASS report must contain a substantive review body")
+        raise ParseError("review report must contain a substantive review body")
 
 
 def extract_session_id(raw: bytes) -> str:
@@ -157,6 +243,8 @@ def parse_event_stream(raw: bytes) -> tuple[str, str, str]:
         seen_part_ids.add(part_id)
 
         part_type = part.get("type")
+        if not isinstance(part_type, str):
+            raise ParseError(f"event line {line_number} has non-string part type")
         expected_event_type = EVENT_TYPES.get(part_type)
         if expected_event_type is None:
             raise ParseError(
@@ -188,13 +276,14 @@ def parse_event_stream(raw: bytes) -> tuple[str, str, str]:
         raise ParseError(
             "OpenCode events must contain one ordered start/finish sequence"
         )
-    report = "".join(text_parts).strip()
-    if not report:
+    report = "".join(text_parts)
+    normalized_report = normalize_report_newlines(report).strip()
+    if not normalized_report:
         raise ParseError("assistant report is empty")
-    verdicts = VERDICT.findall(report)
+    verdicts = VERDICT.findall(normalized_report)
     if (
         len(verdicts) != 1
-        or report.splitlines()[-1].strip() != f"VERDICT: {verdicts[0]}"
+        or normalized_report.splitlines()[-1].strip() != f"VERDICT: {verdicts[0]}"
     ):
         raise ParseError("assistant report must contain exactly one verdict at EOF")
     return session_id, message_id, report
@@ -223,7 +312,7 @@ def exported_assistant_text(parts: Any) -> str:
     for index, part in enumerate(parts):
         item = require_object(part, f"assistant.parts[{index}]")
         part_type = item.get("type")
-        if part_type not in allowed:
+        if not isinstance(part_type, str) or part_type not in allowed:
             raise ParseError(
                 f"exported assistant contains forbidden part {part_type!r}"
             )
@@ -243,7 +332,7 @@ def exported_assistant_text(parts: Any) -> str:
         raise ParseError("exported assistant contains a late step-start")
     if not text:
         raise ParseError("exported assistant has no text")
-    return "".join(text).strip()
+    return "".join(text)
 
 
 def parse_export(
@@ -262,6 +351,7 @@ def parse_export(
         raise ParseError("OpenCode session export is empty or exceeds the size limit")
     if TOOL_VERSION.fullmatch(tool_version) is None:
         raise ParseError("OpenCode tool version is not semver-like")
+    validate_request_size(request)
     exported = parse_json_object(raw, "session export")
     try:
         request_text = request.decode("utf-8")
@@ -349,7 +439,7 @@ def parse_failure_receipt(
     expected_provider: str,
     expected_model: str,
 ) -> dict[str, Any]:
-    if outcome not in FAILURE_OUTCOMES:
+    if not isinstance(outcome, str) or outcome not in FAILURE_OUTCOMES:
         raise ParseError("failure receipt outcome is invalid")
     if (
         FULL_COMMIT.fullmatch(base_commit) is None
@@ -357,12 +447,18 @@ def parse_failure_receipt(
         or base_commit == reviewed_commit
     ):
         raise ParseError("failure receipt commits are invalid")
-    if role not in ROLES or HEX_SHA256.fullmatch(input_sha256) is None:
+    if (
+        not isinstance(role, str)
+        or role not in ROLES
+        or not isinstance(input_sha256, str)
+        or HEX_SHA256.fullmatch(input_sha256) is None
+    ):
         raise ParseError("failure receipt role or input hash is invalid")
     if TOOL_VERSION.fullmatch(tool_version) is None:
         raise ParseError("OpenCode tool version is not semver-like")
     if not raw or len(raw) > MAX_EXPORT_BYTES:
         raise ParseError("OpenCode session export is empty or exceeds the size limit")
+    validate_request_size(request)
     exported = parse_json_object(raw, "session export")
     try:
         request_text = request.decode("utf-8")
@@ -397,7 +493,7 @@ def parse_failure_receipt(
     assistant = assistants[0]
     assistant_info = require_object(assistant.get("info"), "assistant message info")
     parent_id = assistant_info.get("parentID")
-    if parent_id not in user_entries:
+    if not isinstance(parent_id, str) or parent_id not in user_entries:
         raise ParseError("failed assistant is not bound to exported user request")
     parent = user_entries[parent_id]
     parent_info = require_object(parent.get("info"), "parent user message info")
@@ -422,9 +518,8 @@ def parse_failure_receipt(
     for index, raw_part in enumerate(assistant_parts):
         part = require_object(raw_part, f"failed assistant.parts[{index}]")
         part_type = part.get("type")
-        if part_type not in allowed_parts:
+        if not isinstance(part_type, str) or part_type not in allowed_parts:
             raise ParseError("failed assistant contains forbidden/unknown parts")
-        assert isinstance(part_type, str)
         part_types.append(part_type)
         if part_type in {"reasoning", "text"}:
             value = part.get("text")
@@ -434,7 +529,7 @@ def parse_failure_receipt(
                 )
             if part_type == "text":
                 assistant_text_parts.append(value)
-    assistant_text = "".join(assistant_text_parts).strip()
+    assistant_text = normalize_report_newlines("".join(assistant_text_parts)).strip()
     finish = assistant_info.get("finish")
     if (
         not part_types
@@ -513,16 +608,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        event_bytes = args.events.read_bytes()
+        event_bytes = read_regular_file(args.events, "OpenCode events", MAX_EVENT_BYTES)
         if args.command == "session-id":
             session_id = extract_session_id(event_bytes)
             print(session_id)
             return 0
         if args.command == "failure-receipt":
+            export_bytes = read_regular_file(
+                args.export, "OpenCode session export", MAX_EXPORT_BYTES
+            )
+            request_bytes = read_regular_file(
+                args.request, "review request", MAX_REQUEST_BYTES
+            )
             receipt = parse_failure_receipt(
-                args.export.read_bytes(),
+                export_bytes,
                 session_id=extract_session_id(event_bytes),
-                request=args.request.read_bytes(),
+                request=request_bytes,
                 tool_version=args.tool_version,
                 base_commit=args.base,
                 reviewed_commit=args.reviewed,
@@ -535,19 +636,26 @@ def main() -> int:
             print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
             return 0
         session_id, message_id, report = parse_event_stream(event_bytes)
-        validate_substantive_report(report)
+        normalized_report = normalize_report_newlines(report).strip()
+        validate_substantive_report(normalized_report)
+        export_bytes = read_regular_file(
+            args.export, "OpenCode session export", MAX_EXPORT_BYTES
+        )
+        request_bytes = read_regular_file(
+            args.request, "review request", MAX_REQUEST_BYTES
+        )
         metadata = parse_export(
-            args.export.read_bytes(),
+            export_bytes,
             session_id=session_id,
             message_id=message_id,
             report=report,
-            request=args.request.read_bytes(),
+            request=request_bytes,
             tool_version=args.tool_version,
             expected_provider=args.provider,
             expected_model=args.model,
             expected_variant=args.variant,
         )
-        sys.stdout.write(report + "\n")
+        sys.stdout.write(normalized_report + "\n")
         print(
             "REVIEW_METADATA " + json.dumps(metadata, sort_keys=True), file=sys.stderr
         )

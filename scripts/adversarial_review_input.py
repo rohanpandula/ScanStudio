@@ -13,6 +13,7 @@ import json
 import os
 import re
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -29,15 +30,38 @@ INPUT_SCHEMA_VERSION = 1
 MAX_SEMANTIC_PLAN_BYTES = 1 * 1024 * 1024
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 30
+GIT_KILL_REAP_SECONDS = 1
 MAX_GIT_STDOUT_BYTES = 16 * 1024 * 1024
 MAX_GIT_STDERR_BYTES = 1 * 1024 * 1024
-REQUEST_BEGIN = b"\n--- BEGIN FROZEN REVIEW INPUT ---\n"
-REQUEST_END = b"\n--- END FROZEN REVIEW INPUT ---\n"
+REQUEST_BOUNDARY_PREFIX = b"SCANSTUDIO-FROZEN-REVIEW-INPUT-"
+REQUEST_BEGIN = b"\n--- BEGIN "
+REQUEST_END = b"\n--- END "
 BINARY_DIFF_MARKERS = (b"\nGIT binary patch\n", b"\nBinary files ")
 
 
 class ReviewInputError(ValueError):
     """The requested review input cannot be reproduced safely."""
+
+
+def strict_json_loads(raw: bytes) -> Any:
+    """Decode standards-compliant JSON while rejecting duplicate object keys."""
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    return json.loads(
+        raw,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
 
 
 @dataclass(frozen=True)
@@ -54,6 +78,18 @@ class ShardPlan:
     diff: bytes
     changed_lines: int
     oversized_single_file: bool
+
+
+def read_fd_with_eintr_retry(
+    descriptor: int, size: int, *, deadline: float | None = None
+) -> bytes:
+    while True:
+        try:
+            return os.read(descriptor, size)
+        except InterruptedError:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError from None
+            continue
 
 
 def git_bytes(*args: str) -> bytes:
@@ -74,6 +110,7 @@ def git_bytes(*args: str) -> bytes:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
+            start_new_session=True,
         )
     except OSError as exc:
         raise ReviewInputError(f"cannot start Git command: {exc}") from exc
@@ -84,35 +121,123 @@ def git_bytes(*args: str) -> bytes:
         process.stdout: (bytearray(), MAX_GIT_STDOUT_BYTES, "stdout"),
         process.stderr: (bytearray(), MAX_GIT_STDERR_BYTES, "stderr"),
     }
-    selector = selectors.DefaultSelector()
-    for stream in streams:
-        selector.register(stream, selectors.EVENT_READ)
     deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+    selector: selectors.BaseSelector | None = None
+
+    def poll_process(poll_deadline: float = deadline) -> int | None:
+        retried_after_deadline = False
+        while True:
+            try:
+                return process.poll()
+            except InterruptedError:
+                if time.monotonic() >= poll_deadline:
+                    if retried_after_deadline:
+                        return None
+                    retried_after_deadline = True
+                continue
+
+    def wait_process(wait_deadline: float = deadline) -> int:
+        while True:
+            return_code = poll_process(wait_deadline)
+            if return_code is not None:
+                return return_code
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                # Resolve the exact-deadline race before declaring a timeout.
+                return_code = poll_process(wait_deadline)
+                if return_code is not None:
+                    return return_code
+                raise subprocess.TimeoutExpired(command, GIT_TIMEOUT_SECONDS)
+            try:
+                return process.wait(timeout=remaining)
+            except InterruptedError:
+                continue
+            except subprocess.TimeoutExpired:
+                return_code = poll_process(wait_deadline)
+                if return_code is not None:
+                    return return_code
+                raise
 
     def stop_process() -> None:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-
-    try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                stop_process()
-                raise ReviewInputError(
-                    f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
-                )
-            ready = selector.select(remaining)
-            if not ready:
-                if process.poll() is None:
-                    stop_process()
-                    raise ReviewInputError(
-                        f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds"
-                    )
+        killed = False
+        kill_deadline = time.monotonic() + GIT_KILL_REAP_SECONDS
+        reap_deadline = kill_deadline
+        # Git and any helpers inherit this dedicated process group. Kill the
+        # group even when the direct child has already exited: a helper can
+        # otherwise retain the captured pipe descriptors forever.
+        while True:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                killed = True
+                break
+            except InterruptedError:
+                if time.monotonic() >= kill_deadline:
+                    break
                 continue
+            except (ProcessLookupError, PermissionError):
+                break
+        if poll_process(kill_deadline) is None:
+            try:
+                process.kill()
+                killed = True
+            except (ProcessLookupError, PermissionError):
+                pass
+        if killed:
+            # A killed child still needs a bounded reap even when its command
+            # budget has just expired; otherwise it can leak a live Popen/zombie.
+            reap_deadline = time.monotonic() + GIT_KILL_REAP_SECONDS
+        try:
+            wait_process(reap_deadline)
+        except subprocess.TimeoutExpired:
+            # Cleanup remains bounded even if the platform fails to reap SIGKILL.
+            pass
+
+    def timeout_error() -> ReviewInputError:
+        stop_process()
+        return ReviewInputError(f"Git command exceeded {GIT_TIMEOUT_SECONDS} seconds")
+
+    def select_ready(timeout: float, select_deadline: float) -> list[Any]:
+        assert selector is not None
+        retried_after_deadline = False
+        while True:
+            try:
+                return selector.select(timeout)
+            except InterruptedError:
+                if time.monotonic() >= select_deadline:
+                    if retried_after_deadline:
+                        return []
+                    retried_after_deadline = True
+                    timeout = 0
+                elif timeout > 0:
+                    timeout = max(0.0, select_deadline - time.monotonic())
+
+    completed = False
+    try:
+        selector = selectors.DefaultSelector()
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = max(0.0, deadline - time.monotonic())
+            ready = select_ready(remaining, deadline)
+            if not ready:
+                # A descriptor can become ready at the same instant the timed
+                # select expires. One nonblocking pass prevents rejecting EOF
+                # or the last bounded output chunk at that boundary.
+                ready = select_ready(0, time.monotonic())
+                if not ready:
+                    if time.monotonic() >= deadline:
+                        raise timeout_error()
+                    if poll_process(deadline) is not None:
+                        continue
+                    continue
             for key, _events in ready:
                 stream = key.fileobj
-                chunk = os.read(stream.fileno(), 64 * 1024)
+                try:
+                    chunk = read_fd_with_eintr_retry(
+                        stream.fileno(), 64 * 1024, deadline=deadline
+                    )
+                except TimeoutError:
+                    raise timeout_error() from None
                 if not chunk:
                     selector.unregister(stream)
                     continue
@@ -121,9 +246,16 @@ def git_bytes(*args: str) -> bytes:
                 if len(buffer) > limit:
                     stop_process()
                     raise ReviewInputError(f"Git command {name} exceeds {limit} bytes")
-        return_code = process.wait()
+        try:
+            return_code = wait_process()
+        except subprocess.TimeoutExpired as exc:
+            raise timeout_error() from exc
+        completed = True
     finally:
-        selector.close()
+        if not completed:
+            stop_process()
+        if selector is not None:
+            selector.close()
         process.stdout.close()
         process.stderr.close()
 
@@ -145,10 +277,14 @@ def read_regular_file(path: Path, label: str, max_bytes: int) -> bytes:
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0)
     )
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ReviewInputError(f"cannot open {label}: {exc}") from exc
+    while True:
+        try:
+            descriptor = os.open(path, flags)
+            break
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise ReviewInputError(f"cannot open {label}: {exc}") from exc
     try:
         details = os.fstat(descriptor)
         if not stat.S_ISREG(details.st_mode):
@@ -158,7 +294,9 @@ def read_regular_file(path: Path, label: str, max_bytes: int) -> bytes:
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+            chunk = read_fd_with_eintr_retry(
+                descriptor, min(64 * 1024, max_bytes + 1 - total)
+            )
             if not chunk:
                 break
             chunks.append(chunk)
@@ -240,9 +378,47 @@ def changed_line_count(patch: bytes) -> int:
 
 
 def build_review_request(prompt: bytes, review_input: bytes) -> bytes:
-    """Return the exact single user-message payload sent to OpenCode."""
+    """Return the exact, raw-text user-message payload sent to OpenCode.
 
-    return prompt + REQUEST_BEGIN + review_input + REQUEST_END
+    The content-derived boundary is guaranteed not to occur in either payload,
+    so a diff cannot forge the apparent end of its frozen-input frame. Both
+    payloads remain verbatim so the outbound secret scanner sees their bytes.
+    """
+
+    if not prompt or not review_input:
+        raise ReviewInputError("request prompt and review input must be non-empty")
+    seed = hashlib.sha256(
+        b"ScanStudio adversarial review request\0" + prompt + b"\0" + review_input
+    ).digest()
+    counter = 0
+    while True:
+        digest = hashlib.sha256(seed + counter.to_bytes(8, "big")).hexdigest()
+        boundary = REQUEST_BOUNDARY_PREFIX + digest.encode("ascii")
+        if boundary not in prompt and boundary not in review_input:
+            break
+        counter += 1
+    metadata = (
+        b"; bytes="
+        + str(len(review_input)).encode("ascii")
+        + b"; sha256="
+        + sha256_bytes(review_input).encode("ascii")
+    )
+    request = (
+        prompt
+        + REQUEST_BEGIN
+        + boundary
+        + metadata
+        + b" ---\n"
+        + review_input
+        + REQUEST_END
+        + boundary
+        + b" ---\n"
+    )
+    if len(request) > MAX_REQUEST_BYTES:
+        raise ReviewInputError(
+            f"complete review request exceeds {MAX_REQUEST_BYTES} bytes"
+        )
+    return request
 
 
 def file_patches(base: str, reviewed: str) -> tuple[bytes, list[FilePatch]]:
@@ -485,8 +661,14 @@ def load_semantic_plan(path: Path) -> list[dict[str, Any]]:
     if not raw or len(raw) > MAX_SEMANTIC_PLAN_BYTES or b"\x00" in raw:
         raise ReviewInputError("semantic plan is empty, binary, or too large")
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = strict_json_loads(raw)
+    except (
+        UnicodeDecodeError,
+        ValueError,
+        RecursionError,
+        MemoryError,
+        OverflowError,
+    ) as exc:
         raise ReviewInputError("semantic plan must be valid UTF-8 JSON") from exc
     if not isinstance(value, dict) or set(value) != {"shards"}:
         raise ReviewInputError("semantic plan must contain only a shards array")
@@ -550,6 +732,10 @@ def full_diff_input(base: str, reviewed: str) -> tuple[bytes, dict[str, Any]]:
     if not patches:
         raise ReviewInputError("canonical review diff is empty")
     rendered, metadata = build_review_input(base, reviewed, full, patches)
+    if len(rendered) > MAX_REQUEST_BYTES:
+        raise ReviewInputError(
+            f"full-diff synthesis input exceeds {MAX_REQUEST_BYTES} bytes"
+        )
     metadata.update({"shardCount": 1, "shardIndex": 1, "synthesis": True})
     return rendered, metadata
 
@@ -600,10 +786,6 @@ def main() -> int:
                     "request prompt and review input must be non-empty"
                 )
             request = build_review_request(prompt, review_input)
-            if len(request) > MAX_REQUEST_BYTES:
-                raise ReviewInputError(
-                    f"complete review request exceeds {MAX_REQUEST_BYTES} bytes"
-                )
             sys.stdout.buffer.write(request)
             return 0
         base = require_commit(args.base, "base")

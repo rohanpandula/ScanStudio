@@ -225,16 +225,19 @@ if [[ ! "$opencode_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]];
   exit 2
 fi
 
-review_sandbox="$(mktemp -d)"
-review_input_file="$(mktemp)"
-input_metadata_file="$(mktemp)"
-request_file="$(mktemp)"
-title_file="$(mktemp)"
-event_file="$(mktemp)"
-export_file="$(mktemp)"
-opencode_error_file="$(mktemp)"
-export_error_file="$(mktemp)"
-receipt_temp_file="$(mktemp)"
+review_work_dir="$(mktemp -d)"
+review_work_dir="$(cd "$review_work_dir" && pwd -P)"
+review_sandbox="$review_work_dir/sandbox"
+mkdir -m 700 "$review_sandbox"
+review_input_file="$review_work_dir/review-input.txt"
+input_metadata_file="$review_work_dir/input-metadata.json"
+request_file="$review_work_dir/request.txt"
+title_file="$review_work_dir/title.txt"
+event_file="$review_work_dir/events.jsonl"
+export_file="$review_work_dir/export.json"
+opencode_error_file="$review_work_dir/opencode-error.txt"
+export_error_file="$review_work_dir/export-error.txt"
+receipt_temp_file="$review_work_dir/failure-receipt.json"
 # shellcheck disable=SC2329  # Invoked indirectly by EXIT trap.
 cleanup() {
   rm -f \
@@ -242,6 +245,7 @@ cleanup() {
     "$event_file" "$export_file" "$opencode_error_file" "$export_error_file" \
     "$receipt_temp_file"
   rmdir "$review_sandbox" 2>/dev/null || true
+  rmdir "$review_work_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 

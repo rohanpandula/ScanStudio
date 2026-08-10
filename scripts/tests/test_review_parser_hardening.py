@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -142,11 +143,17 @@ class ReportSubstanceTests(unittest.TestCase):
         self.assertGreaterEqual(len(body.encode("utf-8")), parser.MIN_REPORT_BODY_BYTES)
         parser.validate_substantive_report(report)
 
+    def test_substantive_floor_applies_to_every_final_verdict(self) -> None:
+        for verdict in ("REQUEST_CHANGES", "BLOCK"):
+            with self.subTest(verdict=verdict):
+                with self.assertRaisesRegex(parser.ParseError, "substantive"):
+                    parser.validate_substantive_report(f"VERDICT: {verdict}")
+
     def test_cli_rejects_degenerate_pass_before_export_acceptance(self) -> None:
         report = "VERDICT: PASS"
         request = "request"
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(os.path.realpath(temporary))
             events = root / "events.jsonl"
             exported = root / "export.json"
             request_file = root / "request.txt"
@@ -236,7 +243,187 @@ class ParserCountLimitTests(unittest.TestCase):
                 )
 
 
+class ParserFileBoundaryTests(unittest.TestCase):
+    def test_bounded_reader_accepts_a_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(os.path.realpath(temporary)) / "input"
+            path.write_bytes(b"safe")
+            self.assertEqual(parser.read_regular_file(path, "input", 4), b"safe")
+
+    def test_bounded_reader_rejects_symlink_fifo_directory_and_oversize(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(os.path.realpath(temporary))
+            target = root / "target"
+            target.write_bytes(b"safe")
+            link = root / "link"
+            link.symlink_to(target)
+            fifo = root / "fifo"
+            os.mkfifo(fifo)
+            oversized = root / "oversized"
+            oversized.write_bytes(b"12345")
+            cases = (
+                (link, "non-symlink directories"),
+                (fifo, "regular non-symlink file"),
+                (root, "regular non-symlink file"),
+                (oversized, "exceeds"),
+            )
+            for path, error in cases:
+                with self.subTest(path=path.name):
+                    with self.assertRaisesRegex(parser.ParseError, error):
+                        parser.read_regular_file(path, path.name, 4)
+            with self.assertRaisesRegex(parser.ParseError, "regular non-symlink file"):
+                parser.read_regular_file(Path("/dev/null"), "device", 4)
+
+    def test_bounded_reader_rejects_a_symlinked_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(os.path.realpath(temporary))
+            actual = root / "actual"
+            actual.mkdir()
+            (actual / "input").write_bytes(b"safe")
+            alias = root / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            with self.assertRaisesRegex(parser.ParseError, "non-symlink directories"):
+                parser.read_regular_file(alias / "input", "input", 4)
+
+    def test_request_limit_applies_to_success_and_failure_parsers(self) -> None:
+        report = substantive_report()
+        with mock.patch.object(parser, "MAX_REQUEST_BYTES", 6):
+            with self.assertRaisesRegex(parser.ParseError, "request exceeds"):
+                parser.parse_export(
+                    export_bytes("request", report),
+                    session_id=SESSION_ID,
+                    message_id=MESSAGE_ID,
+                    report=report,
+                    request=b"request",
+                    tool_version="1.18.15",
+                    expected_provider="openrouter",
+                    expected_model=MODEL,
+                    expected_variant="high",
+                )
+            with self.assertRaisesRegex(parser.ParseError, "request exceeds"):
+                failure_receipt(
+                    export_bytes("request", "partial", finish="length"),
+                    outcome="OUTPUT_LIMIT",
+                )
+
+
+class NewlineNormalizationTests(unittest.TestCase):
+    def test_crlf_report_is_canonicalized_and_still_export_bound(self) -> None:
+        raw_report = substantive_report().replace("\n", "\r\n")
+        session, message, report = parser.parse_event_stream(event_bytes(raw_report))
+        self.assertEqual(report, raw_report)
+        parser.validate_substantive_report(report)
+        parser.parse_export(
+            export_bytes("request", raw_report),
+            session_id=session,
+            message_id=message,
+            report=report,
+            request=b"request",
+            tool_version="1.18.15",
+            expected_provider="openrouter",
+            expected_model=MODEL,
+            expected_variant="high",
+        )
+        self.assertNotIn("\r", parser.normalize_report_newlines(report))
+
+    def test_event_and_export_reports_remain_exactly_bound(self) -> None:
+        raw_report = substantive_report().replace("\n", "\r\n")
+        session, message, report = parser.parse_event_stream(event_bytes(raw_report))
+        with self.assertRaisesRegex(parser.ParseError, "does not match"):
+            parser.parse_export(
+                export_bytes("request", substantive_report()),
+                session_id=session,
+                message_id=message,
+                report=report,
+                request=b"request",
+                tool_version="1.18.15",
+                expected_provider="openrouter",
+                expected_model=MODEL,
+                expected_variant="high",
+            )
+
+    def test_outer_whitespace_cannot_be_stripped_into_an_export_match(self) -> None:
+        raw_report = "  " + substantive_report() + "\n"
+        session, message, report = parser.parse_event_stream(event_bytes(raw_report))
+        with self.assertRaisesRegex(parser.ParseError, "does not match"):
+            parser.parse_export(
+                export_bytes("request", substantive_report()),
+                session_id=session,
+                message_id=message,
+                report=report,
+                request=b"request",
+                tool_version="1.18.15",
+                expected_provider="openrouter",
+                expected_model=MODEL,
+                expected_variant="high",
+            )
+
+    def test_bare_carriage_return_is_rejected(self) -> None:
+        report = substantive_report().replace("\n", "\r")
+        with self.assertRaisesRegex(parser.ParseError, "bare carriage return"):
+            parser.parse_event_stream(event_bytes(report))
+        with self.assertRaisesRegex(parser.ParseError, "bare carriage return"):
+            parser.parse_event_stream(event_bytes("\r" + substantive_report()))
+
+    def test_unicode_line_separator_cannot_hide_a_conflicting_verdict(self) -> None:
+        report = (
+            "Scope: reviewed the complete packet.\n"
+            "Evidence: a conflicting verdict follows a Unicode separator.\n"
+            "Result: this must fail closed.\u2028VERDICT: BLOCK\n"
+            "VERDICT: PASS"
+        )
+        with self.assertRaisesRegex(parser.ParseError, "control or line separator"):
+            parser.parse_event_stream(event_bytes(report))
+
+
 class MalformedExportTests(unittest.TestCase):
+    def test_unhashable_part_types_fail_cleanly(self) -> None:
+        report = substantive_report()
+        events = [json.loads(line) for line in event_bytes(report).splitlines()]
+        events[1]["part"]["type"] = []
+        with self.assertRaisesRegex(parser.ParseError, "non-string part type"):
+            parser.parse_event_stream(
+                b"\n".join(json.dumps(item).encode() for item in events)
+            )
+
+        successful = json.loads(export_bytes("request", report))
+        successful["messages"][1]["parts"][1]["type"] = []
+        with self.assertRaisesRegex(parser.ParseError, "forbidden part"):
+            parser.parse_export(
+                json.dumps(successful).encode(),
+                session_id=SESSION_ID,
+                message_id=MESSAGE_ID,
+                report=report,
+                request=b"request",
+                tool_version="1.18.15",
+                expected_provider="openrouter",
+                expected_model=MODEL,
+                expected_variant="high",
+            )
+
+        failed = json.loads(export_bytes("request", "partial", finish="length"))
+        failed["messages"][1]["parts"][1]["type"] = []
+        with self.assertRaisesRegex(parser.ParseError, "forbidden/unknown parts"):
+            failure_receipt(
+                json.dumps(failed).encode(),
+                outcome="OUTPUT_LIMIT",
+            )
+
+    def test_unhashable_failure_outcome_fails_cleanly(self) -> None:
+        with self.assertRaisesRegex(parser.ParseError, "outcome is invalid"):
+            failure_receipt(
+                export_bytes("request", "partial", finish="length"),
+                outcome=[],  # type: ignore[arg-type]
+            )
+
+    def test_no_final_verdict_receipt_rejects_crlf_verdict(self) -> None:
+        report = "analysis\r\nVERDICT: PASS\r\ntrailing"
+        with self.assertRaisesRegex(parser.ParseError, "without verdict"):
+            failure_receipt(
+                export_bytes("request", report, finish="stop"),
+                outcome="NO_FINAL_VERDICT",
+            )
+
     def test_failure_export_rejects_non_string_text(self) -> None:
         exported = json.loads(export_bytes("request", "partial", finish="length"))
         exported["messages"][1]["parts"][2]["text"] = 123

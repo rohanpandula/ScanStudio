@@ -73,9 +73,10 @@ checker rebuilds those bytes from the declared base/head and lists. It does not
 trust a stored input, path, summary, or symlink. Canonical Git operations force
 `--ignore-submodules=none`; a `.gitmodules` `ignore=all` setting cannot hide a
 gitlink change from path coverage or evidence history checks.
-Candidate evidence is opened component-by-component relative to the already
-opened repository directory, using no-follow descriptors; path checks and file
-reads do not have a symlink-swap window.
+Candidate manifests and evidence artifacts are enumerated and read as regular
+blobs from the immutable expected-tip Git tree. The mutable checkout is never
+the source of evidence bytes, so a concurrent file or symlink swap cannot
+change what the checker validates.
 
 This is deliberately a text-source gate. Binary patches are rejected before a
 model call because an encoded Git binary delta is neither meaningfully
@@ -113,13 +114,13 @@ repository so the clean-worktree review precondition remains true.
 Use the checked-in wrapper once per role and shard. It accepts only the two
 canonical repository prompts, requires a clean tree including submodules,
 checks the exact provider/model, preflights shard limits, and bounds/scans the
-title. It constructs one request from the trusted prompt, fixed boundary bytes,
-and deterministic input; scans and hashes that request; then passes that exact
-file to OpenCode from a neutral temporary directory with all tools denied.
-The boundary labels are descriptive rather than a delimiter parser: consumers
-bind and compare the complete request bytes, and Git prefixes every diff content
-line. Request components are opened without following final symlinks and the
-complete request is size-bounded before invocation.
+title. It constructs one request from the trusted prompt, a deterministic
+content-derived boundary, and deterministic input; scans and hashes that
+request; then passes that exact file to OpenCode from a neutral temporary
+directory with all tools denied. The boundary cannot occur in the prompt or
+input and carries the input byte length and SHA-256. Consumers still bind and
+compare the complete request bytes. Request components are opened without
+following symlinks and the complete request is size-bounded before invocation.
 The two scan-only CLI modes intentionally accept wrapper-owned temporary files
 outside the repository. They disclose no contents and confer no read access the
 trusted local operator does not already have; restricting them to repository
@@ -154,8 +155,10 @@ follows operator and tool policy; the wrapper does not delete final sessions.
 All Git operations, including wrapper preflight, use one supervisor that strips
 inherited `GIT_*` overrides, bounds stdout and stderr, and enforces a timeout. A
 hung or output-flooding repository fails the review attempt instead of pinning
-or exhausting the gate. Request reads are nonblocking until `fstat` confirms a
-regular file, so a FIFO cannot stall validation.
+or exhausting the gate; its dedicated process group is killed and reaped on
+timeout or setup/read failure, including helpers that retain capture pipes.
+Request reads are nonblocking until `fstat` confirms a regular file, so a FIFO
+cannot stall validation.
 
 ## Mandatory full-diff synthesis
 
@@ -232,10 +235,12 @@ Context IDs and report artifacts are globally distinct. The
 checker recomputes canonical request bytes, enforces exact-once primary
 coverage and limits, rejects binary/credential/personal-path patterns, refuses
 symlinks and undeclared extras, and requires a clean worktree including
-submodules. The expected evidence tip must be a single-parent direct child of
-the reviewed commit, and that commit's diff-tree must contain exactly the
-declared bundle. The candidate checkout tree must equal the explicitly trusted
-PR head tree; a GitHub merge checkout is accepted only when tree-identical.
+submodules. Manifests and evidence artifacts are enumerated and read from the
+immutable expected-tip Git tree, never from mutable checkout bytes. The
+expected evidence tip must be a single-parent direct child of the reviewed
+commit, and that commit's diff-tree must contain exactly the declared bundle.
+The candidate checkout tree must equal the explicitly trusted PR head tree; a
+GitHub merge checkout is accepted only when tree-identical.
 
 The normal PR check validates candidate evidence. Once the workflow is on the
 default branch, `pull_request_target` runs the protected-base checker and

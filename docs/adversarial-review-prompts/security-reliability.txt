@@ -9,6 +9,12 @@ boundaries, and fail-closed behavior. Trace concrete races and malformed or
 late messages across Python, TypeScript, Swift, and Rust. The documented
 simulator-only scope and source-only macOS packaging boundary are intentional.
 
+Repository evidence is a procedural attestation captured by a trusted local
+operator, not a cryptographic provider signature. That documented trust
+boundary is intentional; do not report the absence of provider-signed receipts
+as a defect. Do report any concrete way the gate can accept mismatched request,
+session, model, report, commit, or artifact bytes within that boundary.
+
 Report only actionable defects introduced by the diff, ordered by severity.
 Every finding must include severity, exact repository-relative file and hunk,
 a reproducible failure or attack sequence, evidence, and the smallest
