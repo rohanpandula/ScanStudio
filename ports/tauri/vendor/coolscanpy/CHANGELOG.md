@@ -1,3 +1,22 @@
+## 0.7.0 - 2026-08-10
+
+- Adapter identity: motion-free VPD 00h/01h probe
+  (`transport.adapter_identity`, `Device.adapter_identity()`) with the
+  interface specification's Table 2-2-2-2-1 vocabulary
+  (Mount / 6Strip / 36Strip / 240 / Feeder).
+- `Roll.preview()` now refuses positively-identified non-strip adapters
+  with the new typed `AdapterUnsupported` instead of dying in the
+  synchronized protocol as INTERNAL. Live-validated on a real LS-5000
+  with an MA-21 and a mounted slide: the advertised VPD page list is
+  adapter-dependent (the MA-21 drops pages 47h and E2h), so the
+  strip-captured preview trace cannot replay against a mount adapter.
+- The capture worker binds EVPD INQUIRY replay entries to the live
+  page-00h list: an unadvertised page's status-only 052400 refusal (the
+  live-proven shape, exact-pinned) is accepted and journaled, its paired
+  body read skipped. Strip feeders advertise every traced page, so their
+  replay is structurally unchanged (regression-tested against the
+  canonical plan).
+
 ## 0.6.0 - 2026-08-10
 
 - VPD dump: two-step dialect plus conformance validation.
