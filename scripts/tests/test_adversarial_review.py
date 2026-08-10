@@ -544,6 +544,29 @@ class EvidenceHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(ReviewInputError, "exceeded 0 seconds"):
                 canonical_diff("a" * 40, "b" * 40)
 
+    def test_git_ignores_repository_local_fsmonitor_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            run("git", "init", "-q", cwd=repository)
+            hook = repository / "fsmonitor.sh"
+            marker = repository / "fsmonitor-ran"
+            hook.write_text(
+                f"#!/bin/sh\ntouch {str(marker)!r}\nprintf '\\n'\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+            run("git", "config", "core.fsmonitor", str(hook), cwd=repository)
+
+            review_input_module.git_bytes(
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+            )
+
+            self.assertFalse(marker.exists())
+
     def test_git_accepts_eof_from_process_already_done_at_deadline(self) -> None:
         completed = subprocess.Popen(
             [sys.executable, "-c", "pass"],

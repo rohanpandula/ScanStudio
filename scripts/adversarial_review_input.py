@@ -103,7 +103,10 @@ def git_bytes(*args: str) -> bytes:
             "GIT_TERMINAL_PROMPT": "0",
         }
     )
-    command = ["git", *args]
+    # Local repository configuration is outside the reviewed commit. Disable
+    # the only executable read-path setting used by these commands so a
+    # hostile core.fsmonitor hook cannot run during preflight/status reads.
+    command = ["git", "-c", "core.fsmonitor=false", *args]
     try:
         process = subprocess.Popen(
             command,
