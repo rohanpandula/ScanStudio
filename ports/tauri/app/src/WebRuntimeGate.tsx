@@ -9,7 +9,9 @@ import {
 import {
   acquireControlTabLock,
   clearControlLeaseToken,
+  CONTROL_LEASE_HEADER,
   controlLeaseHeaders,
+  getControlLeaseToken,
   setControlLeaseToken,
   type HeldControlTabLock,
 } from "./controlLease";
@@ -30,19 +32,102 @@ interface WebSession {
   control: ControlState;
 }
 
+interface WebSessionRead {
+  session: WebSession;
+  submittedLeaseToken: string | null;
+}
+
+interface ControlLeaseTiming {
+  ttlMs: number;
+  heartbeatIntervalMs: number;
+  heartbeatTimeoutMs: number;
+}
+
+interface ActiveHeartbeat {
+  leaseToken: string;
+  controller: AbortController;
+  timeoutId: number;
+}
+
+interface ActiveClaim {
+  promise: Promise<void>;
+  controller: AbortController;
+  timeoutId: number | null;
+}
+
+interface ActiveControlVerification {
+  leaseToken: string;
+  monotonicDeadlineMs: number;
+  wallDeadlineMs: number;
+  timeoutId: number | null;
+}
+
 interface WebRuntimeGateProps {
   children: ReactNode;
 }
 
 const CONTROL_TAB_UNVERIFIED_MESSAGE =
   "Scanner control could not be verified for this tab. Reclaim control in this tab.";
+const CONTROL_RENEWAL_OVERDUE_MESSAGE =
+  "Scanner control renewal is overdue; verifying before continuing.";
+const CLAIM_REQUEST_TIMEOUT_MS = 10_000;
+const MIN_HEARTBEAT_TIMER_MS = 250;
+const MAX_HEARTBEAT_TIMER_MS = 10_000;
+const HEARTBEAT_SAFETY_MARGIN_MS = 250;
 
-async function readSession(): Promise<WebSession> {
+function controlLeaseSafeRemainingMs(
+  monotonicDeadlineMs: number,
+  wallDeadlineMs: number,
+): number {
+  return (
+    Math.min(
+      monotonicDeadlineMs - performance.now(),
+      wallDeadlineMs - Date.now(),
+    ) - HEARTBEAT_SAFETY_MARGIN_MS
+  );
+}
+
+function controlLeaseTiming(expiresInSeconds: unknown): ControlLeaseTiming | null {
+  if (
+    typeof expiresInSeconds !== "number" ||
+    !Number.isFinite(expiresInSeconds) ||
+    expiresInSeconds <= 0
+  ) {
+    return null;
+  }
+  const ttlMs = expiresInSeconds * 1_000;
+  if (!Number.isFinite(ttlMs)) return null;
+  const heartbeatIntervalMs = Math.max(
+    MIN_HEARTBEAT_TIMER_MS,
+    Math.min(MAX_HEARTBEAT_TIMER_MS, ttlMs / 3),
+  );
+  const requestBudgetMs = ttlMs - heartbeatIntervalMs - HEARTBEAT_SAFETY_MARGIN_MS;
+  if (requestBudgetMs < MIN_HEARTBEAT_TIMER_MS) return null;
+  return {
+    ttlMs,
+    heartbeatIntervalMs,
+    // Settle a stalled request before the next normal heartbeat tick whenever
+    // the lease lifetime permits it, leaving that tick available for recovery.
+    heartbeatTimeoutMs: Math.min(
+      Math.max(MIN_HEARTBEAT_TIMER_MS, heartbeatIntervalMs / 2),
+      requestBudgetMs,
+    ),
+  };
+}
+
+async function readSession(): Promise<WebSessionRead> {
+  const headers = controlLeaseHeaders();
+  const submittedLeaseToken = headers[CONTROL_LEASE_HEADER] ?? null;
   const response = await fetch("/api/v1/session", {
     credentials: "same-origin",
-    headers: controlLeaseHeaders(),
+    headers,
   });
-  if (response.status === 401) return { authenticated: false, control: "available" };
+  if (response.status === 401) {
+    return {
+      session: { authenticated: false, control: "available" },
+      submittedLeaseToken,
+    };
+  }
   if (!response.ok) throw new Error(`Session check failed (${response.status}).`);
   const payload = (await response.json()) as Partial<WebSession>;
   const control =
@@ -50,12 +135,20 @@ async function readSession(): Promise<WebSession> {
       ? payload.control
       : "available";
   return {
-    authenticated: payload.authenticated === true,
-    control,
+    session: {
+      authenticated: payload.authenticated === true,
+      control,
+    },
+    submittedLeaseToken,
   };
 }
 
-async function post(path: string, body?: unknown, includeLease = false): Promise<Response> {
+async function post(
+  path: string,
+  body?: unknown,
+  includeLease = false,
+  signal?: AbortSignal,
+): Promise<Response> {
   return fetch(path, {
     method: "POST",
     credentials: "same-origin",
@@ -64,6 +157,7 @@ async function post(path: string, body?: unknown, includeLease = false): Promise
       ...(includeLease ? controlLeaseHeaders() : {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
 }
 
@@ -73,31 +167,159 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [controlVerified, setControlVerified] = useState(tauri);
   const [eventStream, setEventStream] = useState<WebEventStreamState>({
     ready: tauri,
     message: tauri ? null : "Connecting to the scanner event stream…",
   });
-  const claimInFlight = useRef<Promise<void> | null>(null);
+  const claimInFlight = useRef<ActiveClaim | null>(null);
   const refreshGeneration = useRef(0);
   const controlTabLock = useRef<HeldControlTabLock | null>(null);
   const heartbeatIntervalMs = useRef(2_000);
+  const heartbeatTimeoutMs = useRef(2_000);
+  const controlLeaseTtlMs = useRef(6_000);
+  const controlLeaseMonotonicDeadlineMs = useRef(0);
+  const controlLeaseWallDeadlineMs = useRef(0);
+  const heartbeatInFlight = useRef<ActiveHeartbeat | null>(null);
+  const controlVerificationDeadline = useRef<ActiveControlVerification | null>(null);
 
-  const releaseLocalControl = useCallback((): void => {
+  const clearControlVerificationDeadline = useCallback((): void => {
+    const activeVerification = controlVerificationDeadline.current;
+    controlVerificationDeadline.current = null;
+    if (activeVerification !== null && activeVerification.timeoutId !== null) {
+      window.clearTimeout(activeVerification.timeoutId);
+      activeVerification.timeoutId = null;
+    }
+  }, []);
+
+  const verifyLocalControlUntil = useCallback(
+    (
+      leaseToken: string,
+      monotonicDeadlineMs: number,
+      wallDeadlineMs: number,
+    ): void => {
+      clearControlVerificationDeadline();
+      if (getControlLeaseToken() !== leaseToken) return;
+      const activeVerification: ActiveControlVerification = {
+        leaseToken,
+        monotonicDeadlineMs,
+        wallDeadlineMs,
+        timeoutId: null,
+      };
+      const checkDeadline = (): void => {
+        if (controlVerificationDeadline.current !== activeVerification) return;
+        if (getControlLeaseToken() !== activeVerification.leaseToken) {
+          controlVerificationDeadline.current = null;
+          activeVerification.timeoutId = null;
+          return;
+        }
+        const remainingMs = controlLeaseSafeRemainingMs(
+          activeVerification.monotonicDeadlineMs,
+          activeVerification.wallDeadlineMs,
+        );
+        if (remainingMs > 0) {
+          activeVerification.timeoutId = window.setTimeout(
+            checkDeadline,
+            Math.min(MAX_HEARTBEAT_TIMER_MS, Math.max(1, remainingMs)),
+          );
+          return;
+        }
+        controlVerificationDeadline.current = null;
+        activeVerification.timeoutId = null;
+        refreshGeneration.current += 1;
+        setControlVerified(false);
+        setError(CONTROL_RENEWAL_OVERDUE_MESSAGE);
+      };
+      controlVerificationDeadline.current = activeVerification;
+      activeVerification.timeoutId = window.setTimeout(
+        checkDeadline,
+        Math.min(
+          MAX_HEARTBEAT_TIMER_MS,
+          Math.max(
+            0,
+            controlLeaseSafeRemainingMs(monotonicDeadlineMs, wallDeadlineMs),
+          ),
+        ),
+      );
+      setControlVerified(true);
+    },
+    [clearControlVerificationDeadline],
+  );
+
+  const releaseLocalControl = useCallback((expectedLeaseToken?: string): void => {
+    if (
+      expectedLeaseToken !== undefined &&
+      getControlLeaseToken() !== expectedLeaseToken
+    ) {
+      return;
+    }
+    const activeClaim = claimInFlight.current;
+    if (activeClaim !== null) {
+      if (activeClaim.timeoutId !== null) {
+        window.clearTimeout(activeClaim.timeoutId);
+        activeClaim.timeoutId = null;
+      }
+      if (!activeClaim.controller.signal.aborted) activeClaim.controller.abort();
+    }
+    const activeHeartbeat = heartbeatInFlight.current;
+    if (
+      activeHeartbeat !== null &&
+      (expectedLeaseToken === undefined || activeHeartbeat.leaseToken === expectedLeaseToken)
+    ) {
+      window.clearTimeout(activeHeartbeat.timeoutId);
+      activeHeartbeat.controller.abort();
+      if (heartbeatInFlight.current === activeHeartbeat) heartbeatInFlight.current = null;
+    }
+    controlLeaseMonotonicDeadlineMs.current = 0;
+    controlLeaseWallDeadlineMs.current = 0;
+    clearControlVerificationDeadline();
+    setControlVerified(false);
     clearControlLeaseToken();
     controlTabLock.current?.release();
     controlTabLock.current = null;
-  }, []);
+  }, [clearControlVerificationDeadline]);
 
-  const commitSession = useCallback((next: WebSession): void => {
-    if (next.authenticated && next.control === "owned" && controlTabLock.current === null) {
-      releaseLocalControl();
-      setSession({ ...next, control: "observer" });
-      setError(CONTROL_TAB_UNVERIFIED_MESSAGE);
-      return;
-    }
-    if (!next.authenticated || next.control !== "owned") releaseLocalControl();
-    setSession(next);
-  }, [releaseLocalControl]);
+  const commitSession = useCallback(
+    (next: WebSession, submittedLeaseToken: string | null): void => {
+      const activeLeaseToken = getControlLeaseToken();
+      // A read started before a replacement claim must never clear or verify the
+      // replacement capability after it completes.
+      if (activeLeaseToken !== null && submittedLeaseToken !== activeLeaseToken) return;
+      if (next.authenticated && next.control === "owned" && controlTabLock.current === null) {
+        releaseLocalControl();
+        setSession({ ...next, control: "observer" });
+        setError(CONTROL_TAB_UNVERIFIED_MESSAGE);
+        return;
+      }
+      if (next.authenticated && next.control === "owned") {
+        if (submittedLeaseToken === null || activeLeaseToken !== submittedLeaseToken) {
+          releaseLocalControl();
+          setSession({ ...next, control: "observer" });
+          setError(CONTROL_TAB_UNVERIFIED_MESSAGE);
+          return;
+        }
+        if (
+          controlLeaseSafeRemainingMs(
+            controlLeaseMonotonicDeadlineMs.current,
+            controlLeaseWallDeadlineMs.current,
+          ) < MIN_HEARTBEAT_TIMER_MS
+        ) {
+          setControlVerified(false);
+          setError(CONTROL_RENEWAL_OVERDUE_MESSAGE);
+        } else {
+          verifyLocalControlUntil(
+            activeLeaseToken,
+            controlLeaseMonotonicDeadlineMs.current,
+            controlLeaseWallDeadlineMs.current,
+          );
+          setError(null);
+        }
+      }
+      if (!next.authenticated || next.control !== "owned") releaseLocalControl();
+      setSession(next);
+    },
+    [releaseLocalControl, verifyLocalControlUntil],
+  );
 
   const refresh = useCallback(async (): Promise<void> => {
     // A claim is the authoritative ownership transition. Starting a session
@@ -109,7 +331,7 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
     try {
       const next = await readSession();
       if (refreshGeneration.current === generation) {
-        commitSession(next);
+        commitSession(next.session, next.submittedLeaseToken);
       }
     } catch (caught) {
       if (refreshGeneration.current === generation) {
@@ -119,7 +341,13 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
   }, [commitSession]);
 
   const claimControl = useCallback((): Promise<void> => {
-    if (claimInFlight.current !== null) return claimInFlight.current;
+    if (claimInFlight.current !== null) return claimInFlight.current.promise;
+    const controller = new AbortController();
+    const activeClaim: ActiveClaim = {
+      promise: Promise.resolve(),
+      controller,
+      timeoutId: null,
+    };
     const claim = (async (): Promise<void> => {
       const generation = ++refreshGeneration.current;
       setError(null);
@@ -132,8 +360,14 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
         controlTabLock.current = localGuard;
       }
       let response: Response;
+      const claimStartedAt = performance.now();
+      const claimStartedWallTime = Date.now();
+      activeClaim.timeoutId = window.setTimeout(
+        () => controller.abort(),
+        CLAIM_REQUEST_TIMEOUT_MS,
+      );
       try {
-        response = await post("/api/v1/control/claim");
+        response = await post("/api/v1/control/claim", undefined, false, controller.signal);
       } catch {
         releaseLocalControl();
         if (refreshGeneration.current === generation) {
@@ -175,25 +409,57 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
         releaseLocalControl();
         throw new Error("The scanner server did not return a control lease.");
       }
-      heartbeatIntervalMs.current =
-        typeof payload.expiresInSeconds === "number" &&
-        Number.isFinite(payload.expiresInSeconds) &&
-        payload.expiresInSeconds > 0
-          ? Math.max(250, Math.min(10_000, (payload.expiresInSeconds * 1_000) / 3))
-          : 2_000;
+      const timing = controlLeaseTiming(payload.expiresInSeconds);
+      if (timing === null) {
+        setControlLeaseToken(payload.leaseToken);
+        void post("/api/v1/control/release", undefined, true).catch(() => undefined);
+        releaseLocalControl(payload.leaseToken);
+        throw new Error("The scanner server did not return a usable control lease lifetime.");
+      }
+      heartbeatIntervalMs.current = timing.heartbeatIntervalMs;
+      heartbeatTimeoutMs.current = timing.heartbeatTimeoutMs;
+      controlLeaseTtlMs.current = timing.ttlMs;
+      const claimedMonotonicDeadlineMs = claimStartedAt + timing.ttlMs;
+      const claimedWallDeadlineMs = claimStartedWallTime + timing.ttlMs;
+      if (
+        controlLeaseSafeRemainingMs(
+          claimedMonotonicDeadlineMs,
+          claimedWallDeadlineMs,
+        ) < MIN_HEARTBEAT_TIMER_MS
+      ) {
+        setControlLeaseToken(payload.leaseToken);
+        void post("/api/v1/control/release", undefined, true).catch(() => undefined);
+        releaseLocalControl(payload.leaseToken);
+        setSession((current) =>
+          current === null ? current : { ...current, control: "observer" },
+        );
+        throw new Error(CONTROL_RENEWAL_OVERDUE_MESSAGE);
+      }
+      controlLeaseMonotonicDeadlineMs.current = claimedMonotonicDeadlineMs;
+      controlLeaseWallDeadlineMs.current = claimedWallDeadlineMs;
       setControlLeaseToken(payload.leaseToken);
+      verifyLocalControlUntil(
+        payload.leaseToken,
+        claimedMonotonicDeadlineMs,
+        claimedWallDeadlineMs,
+      );
       setError(null);
       setSession((current) =>
         current === null ? current : { ...current, control: "owned" },
       );
     })();
-    claimInFlight.current = claim;
+    activeClaim.promise = claim;
+    claimInFlight.current = activeClaim;
     const clearClaim = (): void => {
-      if (claimInFlight.current === claim) claimInFlight.current = null;
+      if (activeClaim.timeoutId !== null) {
+        window.clearTimeout(activeClaim.timeoutId);
+        activeClaim.timeoutId = null;
+      }
+      if (claimInFlight.current === activeClaim) claimInFlight.current = null;
     };
     void claim.then(clearClaim, clearClaim);
     return claim;
-  }, [releaseLocalControl]);
+  }, [releaseLocalControl, verifyLocalControlUntil]);
 
   useEffect(() => {
     if (tauri) return;
@@ -205,6 +471,46 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
     return () => {
       refreshGeneration.current += 1;
       releaseLocalControl();
+    };
+  }, [refresh, releaseLocalControl, tauri]);
+
+  useEffect(() => {
+    if (tauri) return;
+    const releaseForPageHide = (): void => {
+      refreshGeneration.current += 1;
+      const headers = controlLeaseHeaders();
+      if (headers[CONTROL_LEASE_HEADER] !== undefined) {
+        void fetch("/api/v1/control/release", {
+          method: "POST",
+          credentials: "same-origin",
+          headers,
+          keepalive: true,
+        }).catch(() => undefined);
+      }
+      releaseLocalControl();
+      setSession((current) =>
+        current === null || !current.authenticated
+          ? current
+          : { ...current, control: "observer" },
+      );
+    };
+    const restorePersistedPage = (event: PageTransitionEvent): void => {
+      if (!event.persisted) return;
+      const activeClaim = claimInFlight.current;
+      if (activeClaim === null) {
+        void refresh();
+        return;
+      }
+      const refreshAfterClaim = (): void => {
+        void refresh();
+      };
+      void activeClaim.promise.then(refreshAfterClaim, refreshAfterClaim);
+    };
+    window.addEventListener("pagehide", releaseForPageHide);
+    window.addEventListener("pageshow", restorePersistedPage);
+    return () => {
+      window.removeEventListener("pagehide", releaseForPageHide);
+      window.removeEventListener("pageshow", restorePersistedPage);
     };
   }, [refresh, releaseLocalControl, tauri]);
 
@@ -261,62 +567,120 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
   useEffect(() => {
     if (tauri || session?.control !== "owned") return;
     const sendHeartbeat = (): void => {
-      const generation = ++refreshGeneration.current;
-      void post("/api/v1/control/heartbeat", undefined, true)
+      if (heartbeatInFlight.current !== null) return;
+      const submittedLeaseToken = getControlLeaseToken();
+      if (submittedLeaseToken === null) return;
+      const requestStartedAt = performance.now();
+      const requestStartedWallTime = Date.now();
+      // WebKit's monotonic clock may pause during system sleep while the
+      // gateway's wall-clock lease continues to expire. Either clock reaching
+      // its deadline is enough to fail closed.
+      const remainingVerifiedMs =
+        controlLeaseSafeRemainingMs(
+          controlLeaseMonotonicDeadlineMs.current,
+          controlLeaseWallDeadlineMs.current,
+        );
+      const requestTimeoutMs =
+        remainingVerifiedMs >= MIN_HEARTBEAT_TIMER_MS
+          ? Math.min(heartbeatTimeoutMs.current, remainingVerifiedMs)
+          : heartbeatTimeoutMs.current;
+      if (remainingVerifiedMs < MIN_HEARTBEAT_TIMER_MS) {
+        setControlVerified(false);
+        setError("Scanner control renewal is overdue; verifying before continuing.");
+      }
+      const controller = new AbortController();
+      const activeHeartbeat: ActiveHeartbeat = {
+        leaseToken: submittedLeaseToken,
+        controller,
+        timeoutId: window.setTimeout(() => controller.abort(), requestTimeoutMs),
+      };
+      heartbeatInFlight.current = activeHeartbeat;
+      void post("/api/v1/control/heartbeat", undefined, true, controller.signal)
         .then((response) => {
-          if (refreshGeneration.current !== generation) return;
+          if (
+            heartbeatInFlight.current !== activeHeartbeat ||
+            getControlLeaseToken() !== submittedLeaseToken
+          ) {
+            return;
+          }
           if (response.status === 401) {
-            releaseLocalControl();
+            releaseLocalControl(submittedLeaseToken);
+            setError(null);
             setSession({ authenticated: false, control: "available" });
           } else if (response.status === 409 || response.status === 423) {
-            releaseLocalControl();
+            releaseLocalControl(submittedLeaseToken);
             setSession((current) =>
               current === null ? current : { ...current, control: "observer" },
             );
-          } else if (!response.ok) {
-            releaseLocalControl();
-            setSession((current) =>
-              current === null ? current : { ...current, control: "observer" },
+            setError("Scanner control expired. Reclaim control to continue.");
+          } else if (response.status !== 200) {
+            setControlVerified(false);
+            setError(
+              `Scanner control heartbeat could not be verified (${response.status}); retrying.`,
             );
-            setError(`Scanner control heartbeat failed (${response.status}).`);
           } else {
+            const renewedMonotonicDeadlineMs =
+              requestStartedAt + controlLeaseTtlMs.current;
+            const renewedWallDeadlineMs =
+              requestStartedWallTime + controlLeaseTtlMs.current;
+            if (
+              controlLeaseSafeRemainingMs(
+                renewedMonotonicDeadlineMs,
+                renewedWallDeadlineMs,
+              ) < MIN_HEARTBEAT_TIMER_MS
+            ) {
+              setControlVerified(false);
+              setError(CONTROL_RENEWAL_OVERDUE_MESSAGE);
+              return;
+            }
+            controlLeaseMonotonicDeadlineMs.current = renewedMonotonicDeadlineMs;
+            controlLeaseWallDeadlineMs.current = renewedWallDeadlineMs;
+            verifyLocalControlUntil(
+              submittedLeaseToken,
+              renewedMonotonicDeadlineMs,
+              renewedWallDeadlineMs,
+            );
             setError(null);
           }
         })
         .catch(() => {
-          if (refreshGeneration.current !== generation) return;
-          releaseLocalControl();
-          setSession((current) =>
-            current === null ? current : { ...current, control: "observer" },
+          if (
+            heartbeatInFlight.current !== activeHeartbeat ||
+            getControlLeaseToken() !== submittedLeaseToken
+          ) {
+            return;
+          }
+          setControlVerified(false);
+          setError(
+            "The scanner server could not be reached; verifying control before continuing.",
           );
-          setError("The scanner server could not be reached; control was released locally.");
+        })
+        .finally(() => {
+          window.clearTimeout(activeHeartbeat.timeoutId);
+          if (heartbeatInFlight.current === activeHeartbeat) {
+            heartbeatInFlight.current = null;
+          }
         });
     };
     const heartbeat = window.setInterval(sendHeartbeat, heartbeatIntervalMs.current);
+    const verifyAndSendHeartbeat = (): void => {
+      refreshGeneration.current += 1;
+      setControlVerified(false);
+      setError(null);
+      sendHeartbeat();
+    };
     const resumeHeartbeat = (): void => {
-      if (document.visibilityState === "visible") sendHeartbeat();
+      if (document.visibilityState === "visible") verifyAndSendHeartbeat();
     };
-    window.addEventListener("focus", sendHeartbeat);
+    window.addEventListener("focus", verifyAndSendHeartbeat);
     document.addEventListener("visibilitychange", resumeHeartbeat);
-    const release = (): void => {
-      const headers = controlLeaseHeaders();
-      void fetch("/api/v1/control/release", {
-        method: "POST",
-        credentials: "same-origin",
-        headers,
-        keepalive: true,
-      });
-      releaseLocalControl();
-    };
-    window.addEventListener("pagehide", release);
     return () => {
       window.clearInterval(heartbeat);
-      window.removeEventListener("focus", sendHeartbeat);
+      window.removeEventListener("focus", verifyAndSendHeartbeat);
       document.removeEventListener("visibilitychange", resumeHeartbeat);
-      window.removeEventListener("pagehide", release);
       releaseLocalControl();
     };
-  }, [releaseLocalControl, session?.control, tauri]);
+  }, [releaseLocalControl, session?.control, tauri, verifyLocalControlUntil]);
 
   if (tauri) return children;
 
@@ -336,7 +700,7 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
       setToken("");
       const next = await readSession();
       if (refreshGeneration.current === generation) {
-        commitSession(next);
+        commitSession(next.session, next.submittedLeaseToken);
       }
     } catch {
       setError("The ScanStudio server could not be reached.");
@@ -393,11 +757,17 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
   }
 
   return (
-    <ScannerControlProvider canControl={session.control === "owned" && eventStream.ready}>
+    <ScannerControlProvider
+      canControl={session.control === "owned" && controlVerified && eventStream.ready}
+    >
       <div className={styles.authenticatedShell}>
         <header
           className={styles.runtimeBar}
-          data-control={eventStream.ready ? session.control : "offline"}
+          data-control={
+            !eventStream.ready || (session.control === "owned" && !controlVerified)
+              ? "offline"
+              : session.control
+          }
         >
           <div className={styles.runtimeIdentity}>
             <span className={styles.liveDot} aria-hidden="true" />
@@ -406,6 +776,10 @@ export default function WebRuntimeGate({ children }: WebRuntimeGateProps) {
           {!eventStream.ready ? (
             <span className={styles.controlCopy} role="status">
               {eventStream.message ?? "Reconnecting to scanner events…"}
+            </span>
+          ) : session.control === "owned" && !controlVerified ? (
+            <span className={styles.controlCopy} role="status">
+              Verifying scanner control…
             </span>
           ) : session.control === "owned" ? (
             <span className={styles.controlCopy}>This browser has scanner control</span>
