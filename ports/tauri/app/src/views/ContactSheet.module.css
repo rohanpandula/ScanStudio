@@ -37,6 +37,32 @@
   font-weight: 600;
 }
 
+.previewProcessControl {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: #374151;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.previewProcessControl select {
+  padding: 0.32rem 0.45rem;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.previewReadiness {
+  display: flex;
+  max-width: 62ch;
+  align-items: center;
+  gap: 0.5rem;
+  color: #92400e;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
 .focusControl select {
   padding: 0.32rem 0.45rem;
   border: 1px solid #d1d5db;

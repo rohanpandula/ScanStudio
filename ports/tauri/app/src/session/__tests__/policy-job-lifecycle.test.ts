@@ -230,6 +230,14 @@ describe("SessionStore job lifecycle (scripted transport)", () => {
     } satisfies WireEvent);
     expect(store.getState().frameReceipts[13]).toEqual([first]);
 
+    handle.emitEvent({
+      event: "scan.completed",
+      payload: {
+        jobId: "job-1",
+        summary: { completed: [13], failed: [], skipped: [1], stopped: false },
+      },
+    } satisfies WireEvent);
+
     // A later job re-scanning the same frame appends, preserving history.
     await store.startScan([13], CAPTURE_RECIPE);
     const second = { ...receiptFor(13, 2100), jobId: "job-1" };

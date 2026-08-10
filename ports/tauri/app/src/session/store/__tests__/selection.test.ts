@@ -169,6 +169,49 @@ describe("SessionStore preview outcome exposure", () => {
     const { store } = scriptedFixture();
     expect(store.getState().previewOutcome).toBeNull();
     expect(store.getState().previewError).toBeNull();
+    expect(store.getState().previewRequestFailure).toBeNull();
+    expect(store.getState().previewFilmProcessSelection).toBe("c41ColorNegative");
+    expect(store.getState().previewFilmProcess).toBeNull();
+  });
+
+  it("commits the selected film process only on a correlated successful completion", async () => {
+    const { store, handle, calls } = scriptedFixture();
+    store.setPreviewFilmProcess("bwNegative");
+    await store.acquireThumbnails();
+    const active = calls[0].params.operationId as string;
+
+    expect(calls[0].params.filmProcess).toBe("bwNegative");
+    expect(store.getState().previewFilmProcess).toBeNull();
+
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 3, operationId: "another-operation" },
+    });
+    expect(store.getState().previewFilmProcess).toBeNull();
+
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 3, operationId: active },
+    });
+    expect(store.getState().previewFilmProcess).toBe("bwNegative");
+  });
+
+  it("invalidates a completed registration when the pre-project process changes", async () => {
+    const { store, handle, calls } = scriptedFixture();
+    await store.acquireThumbnails(undefined, "bwNegative");
+    const active = calls[0].params.operationId as string;
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 3, operationId: active },
+    });
+    expect(store.getState().previewFilmProcess).toBe("bwNegative");
+
+    store.setPreviewFilmProcess("positive");
+
+    expect(store.getState().previewFilmProcessSelection).toBe("positive");
+    expect(store.getState().previewFilmProcess).toBeNull();
+    expect(store.getState().previewOutcome).toBeNull();
+    expect(store.getState().latestCompletedPreviewOperationId).toBeNull();
   });
 
   it("tracks active -> failed and stays failed across the correlated failure pair", async () => {
@@ -231,6 +274,11 @@ describe("SessionStore preview outcome exposure", () => {
     expect(store.getState().previewOutcome).toBeNull();
     expect(store.getState().previewError).toBeNull();
     expect(store.getState().activeOperationId).toBeNull();
+    expect(store.getState().previewRequestFailure?.error).toEqual({
+      code: "SCANNER_BUSY",
+      message: "scanner is busy",
+      recoverable: false,
+    });
   });
 
   it("resets to null on loadMedia", async () => {
@@ -245,10 +293,16 @@ describe("SessionStore preview outcome exposure", () => {
       payload: { code: "BRIDGE_STREAM_STALLED", message: "preview stream stalled", operationId: active },
     });
     expect(store.getState().previewOutcome).toBe("failed");
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 0, operationId: active },
+    });
 
     await store.loadMedia("roll36");
     expect(store.getState().previewOutcome).toBeNull();
     expect(store.getState().previewError).toBeNull();
+    expect(store.getState().previewRequestFailure).toBeNull();
+    expect(store.getState().previewFilmProcess).toBeNull();
   });
 
   it("resets to null on a project change (#resetSessionBinding)", async () => {
@@ -263,9 +317,15 @@ describe("SessionStore preview outcome exposure", () => {
       payload: { code: "BRIDGE_STREAM_STALLED", message: "preview stream stalled", operationId: active },
     });
     expect(store.getState().previewOutcome).toBe("failed");
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 0, operationId: active },
+    });
 
     await store.createProject("Reset Project", "roll36", 36, "c41ColorNegative", "/tmp/reset");
     expect(store.getState().previewOutcome).toBeNull();
     expect(store.getState().previewError).toBeNull();
+    expect(store.getState().previewRequestFailure).toBeNull();
+    expect(store.getState().previewFilmProcess).toBeNull();
   });
 });

@@ -1,6 +1,7 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../session";
-import type { DeviceInfo } from "../session/wire/types";
+import { sessionOperationBusy } from "../session/store/session";
+import type { DeviceInfo, EngineError } from "../session/wire/types";
 import DiagnosticReportActions from "./DiagnosticReportActions";
 import HardwareErrorPanel from "./HardwareErrorPanel";
 import HardwareStatusChips from "./HardwareStatusChips";
@@ -33,8 +34,37 @@ function stableGetSnapshot(): Readonly<SessionState> {
   return cachedSnapshot;
 }
 
+function connectionErrorOf(error: unknown): EngineError {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    "message" in error &&
+    typeof (error as { code: unknown }).code === "string" &&
+    typeof (error as { message: unknown }).message === "string"
+  ) {
+    return {
+      code: (error as { code: string }).code,
+      message: (error as { message: string }).message,
+      recoverable:
+        "recoverable" in error &&
+        typeof (error as { recoverable: unknown }).recoverable === "boolean"
+          ? (error as { recoverable: boolean }).recoverable
+          : false,
+    };
+  }
+  return {
+    code: "INTERNAL",
+    message: error instanceof Error ? error.message : "scanner connection request failed",
+    recoverable: false,
+  };
+}
+
 export default function DeviceBar() {
   const [devices, setDevices] = useState<DeviceInfo[] | null>(null);
+  const [connectionPending, setConnectionPending] = useState<string | null>(null);
+  const connectionPendingRef = useRef(false);
+  const [connectionError, setConnectionError] = useState<EngineError | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -55,6 +85,41 @@ export default function DeviceBar() {
   const connected = state.connection.connected;
   const status = state.connection.status;
   const device = state.connection.device;
+  const operationBusy = sessionOperationBusy(state);
+  const visibleError =
+    state.previewRequestFailure?.error ??
+    state.filmFeedInterrupted ??
+    connectionError;
+
+  const connect = async (deviceId: string): Promise<void> => {
+    if (connectionPendingRef.current || operationBusy) return;
+    connectionPendingRef.current = true;
+    setConnectionPending(deviceId);
+    setConnectionError(null);
+    try {
+      await sessionStore.connect(deviceId);
+    } catch (error) {
+      setConnectionError(connectionErrorOf(error));
+    } finally {
+      connectionPendingRef.current = false;
+      setConnectionPending(null);
+    }
+  };
+
+  const disconnect = async (): Promise<void> => {
+    if (connectionPendingRef.current || operationBusy) return;
+    connectionPendingRef.current = true;
+    setConnectionPending("disconnect");
+    setConnectionError(null);
+    try {
+      await sessionStore.disconnect();
+    } catch (error) {
+      setConnectionError(connectionErrorOf(error));
+    } finally {
+      connectionPendingRef.current = false;
+      setConnectionPending(null);
+    }
+  };
   // Hardware tri-state chips only ever mount for a real backend session --
   // the simulator omits motionArmed/filmPresent entirely (PROTOCOL.md:
   // "null is never absence"; the simulator omits the field rather than
@@ -66,33 +131,53 @@ export default function DeviceBar() {
     <div className={styles.deviceBar}>
       <h2 className={styles.heading}>Devices</h2>
       <ul className={styles.deviceList}>
-        {(devices ?? []).map((device) => (
-          <li
-            key={device.deviceId}
-            className={styles.deviceCard}
-            data-testid={`device-card-${device.deviceId}`}
-          >
-            <div className={styles.deviceModel}>{device.model}</div>
-            <span className={styles.kindBadge}>{device.kind}</span>
-            {connected ? (
-              <button
-                type="button"
-                className={styles.controlButton}
-                onClick={() => void sessionStore.disconnect()}
-              >
-                Disconnect
-              </button>
-            ) : (
-              <button
-                type="button"
-                className={styles.controlButton}
-                onClick={() => void sessionStore.connect(device.deviceId)}
-              >
-                Connect
-              </button>
-            )}
-          </li>
-        ))}
+        {(devices ?? []).map((listedDevice) => {
+          const isActive =
+            connected && device?.deviceId === listedDevice.deviceId;
+          const connectionBlocked = connected && !isActive;
+
+          return (
+            <li
+              key={listedDevice.deviceId}
+              className={styles.deviceCard}
+              data-testid={`device-card-${listedDevice.deviceId}`}
+            >
+              <div className={styles.deviceModel}>{listedDevice.model}</div>
+              <span className={styles.kindBadge}>{listedDevice.kind}</span>
+              {isActive ? (
+                <>
+                  <span className={styles.connectionState}>Active</span>
+                  <button
+                    type="button"
+                    className={styles.controlButton}
+                    disabled={operationBusy || connectionPending !== null}
+                    onClick={() => void disconnect()}
+                  >
+                    Disconnect
+                  </button>
+                </>
+              ) : (
+                <>
+                  {connectionBlocked && (
+                    <span className={styles.connectionHint}>
+                      Disconnect active device first
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    className={styles.controlButton}
+                    disabled={
+                      connectionBlocked || operationBusy || connectionPending !== null
+                    }
+                    onClick={() => void connect(listedDevice.deviceId)}
+                  >
+                    Connect
+                  </button>
+                </>
+              )}
+            </li>
+          );
+        })}
       </ul>
       {status !== null && (
         <dl className={styles.statusBlock} data-testid="scanner-status">
@@ -133,13 +218,13 @@ export default function DeviceBar() {
         />
       )}
       <HardwareErrorPanel
-        error={state.filmFeedInterrupted}
+        error={visibleError}
         thumbnailsFailed={
           state.previewOutcome === "failed" ? state.previewError : null
         }
       />
       <DiagnosticReportActions
-        error={state.filmFeedInterrupted}
+        error={visibleError}
         thumbnailsFailed={
           state.previewOutcome === "failed" ? state.previewError : null
         }

@@ -167,6 +167,10 @@ describe("App shell reachability (06-03 Task 2)", () => {
         event: "scanner.thumbnail",
         payload: { frameIndex: 5, thumbnail: { brightness: 0.5 }, operationId },
       });
+      handle.emitEvent({
+        event: "scanner.thumbnailsComplete",
+        payload: { count: 36, operationId },
+      });
     });
 
     // Frame-detail reachability: select exactly one frame, then inspect.

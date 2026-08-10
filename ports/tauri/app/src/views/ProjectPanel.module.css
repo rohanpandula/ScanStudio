@@ -45,6 +45,13 @@
   color: #b91c1c;
 }
 
+.registrationSummary {
+  margin: 0;
+  color: #4b5563;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
 .error {
   margin: 0;
   padding: 0.5rem 0.75rem;

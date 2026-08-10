@@ -56,6 +56,13 @@ describe("scan.progress observation (06-03)", () => {
       payload: { jobId: "job-9", frameIndex: 2, jobPercent: 50, etaSeconds: 5 },
     });
     expect(store.getState().scanProgress).not.toBeNull();
+    emitEvent({
+      event: "scan.completed",
+      payload: {
+        jobId: "job-9",
+        summary: { completed: [1, 2, 3], failed: [], skipped: [], stopped: false },
+      },
+    });
     await store.startScan([1, 2, 3], CAPTURE);
     expect(store.getState().scanProgress).toBeNull();
   });

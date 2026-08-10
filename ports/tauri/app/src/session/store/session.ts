@@ -126,6 +126,30 @@ export interface SessionState {
   // for the contact sheet's failure banner (never invented copy).
   previewOutcome: "active" | "succeeded" | "failed" | null;
   previewError: { code: string; message: string } | null;
+  // A request can be rejected before the asynchronous preview operation is
+  // accepted (for example HW_MOTION_NOT_ARMED). Keep that transport phase
+  // separate from scanner.thumbnailsFailed so typed hardware guidance and
+  // diagnostics remain reachable without inventing an async failure event.
+  previewRequestFailure: { operationId: string; error: EngineError } | null;
+  // Material selected for the next preview before a project exists, and the
+  // material actually committed by the most recent correlated completion.
+  // Project creation uses only the committed value; an ACK is not enough.
+  previewFilmProcessSelection: FilmProcess;
+  previewFilmProcess: FilmProcess | null;
+  // Real hardware publishes its authoritative detected carrier/count in a
+  // correlated status after thumbnailsComplete. Project attachment must wait
+  // for that status rather than reusing the previous preview's dimensions.
+  previewStatusOperationId: string | null;
+  // True while project.create/open owns the project boundary, including
+  // persistence of pre-project alignment drafts after an attachment.
+  projectChangePending: boolean;
+  // True while scanner.connect/disconnect or simulated media loading owns
+  // the device-session boundary.
+  connectionChangePending: boolean;
+  // Serializes user-visible spacing/alignment writes against preview,
+  // project, and scan boundaries so a late response cannot mutate drafts
+  // after a project attachment has already persisted its snapshot.
+  frameAlignmentMutationPending: boolean;
   // Subscriber-only UI selection state (05-03 Task 1): frame indices
   // 1..status.frameCount selected by the user. No wire call is attached; it
   // survives unrelated store notifications and is reset only by the
@@ -178,6 +202,18 @@ export interface SessionState {
   } | null;
 }
 
+/** One physical/project boundary owns the session at a time. */
+export function sessionOperationBusy(state: Readonly<SessionState>): boolean {
+  return (
+    state.activeOperationId !== null ||
+    state.projectChangePending ||
+    state.connectionChangePending ||
+    state.frameAlignmentMutationPending ||
+    state.scanStartPending ||
+    (state.jobState !== null && !isTerminalJobState(state.jobState))
+  );
+}
+
 interface JobStateEventPayload {
   jobId: string;
   state: unknown;
@@ -217,6 +253,13 @@ function createInitialState(): SessionState {
     approvedFrames: {},
     previewOutcome: null,
     previewError: null,
+    previewRequestFailure: null,
+    previewFilmProcessSelection: "c41ColorNegative",
+    previewFilmProcess: null,
+    previewStatusOperationId: null,
+    projectChangePending: false,
+    connectionChangePending: false,
+    frameAlignmentMutationPending: false,
     selectedFrameIndices: [],
     focusedFrameIndex: null,
     frameAlignmentDrafts: {},
@@ -232,6 +275,78 @@ function createInitialState(): SessionState {
     filmFeedInterrupted: null,
     scanProgress: null,
     lastCompletedSummary: null,
+  };
+}
+
+export interface PreProjectPreviewRegistration {
+  operationId: string;
+  carrier: "roll36" | "strip6" | "mounted" | null;
+  frameCount: number;
+  filmProcess: FilmProcess;
+}
+
+function projectHasExactFrameSet(project: ScanProject): boolean {
+  if (project.frames.length !== project.frameCount) return false;
+  const indices = new Set(project.frames.map((frame) => frame.index));
+  if (indices.size !== project.frameCount) return false;
+  for (let frameIndex = 1; frameIndex <= project.frameCount; frameIndex += 1) {
+    if (!indices.has(frameIndex)) return false;
+  }
+  return true;
+}
+
+/**
+ * Returns the evidence that may be attached to a newly-created project.
+ * Every frame must be present and correlated to the one completed operation;
+ * partial, stale, failed, or still-replaying previews fail closed.
+ */
+export function preProjectPreviewRegistration(
+  state: Readonly<SessionState>,
+): PreProjectPreviewRegistration | null {
+  if (
+    state.project !== null ||
+    state.previewOutcome !== "succeeded" ||
+    state.previewFilmProcess === null ||
+    state.latestCompletedPreviewOperationId === null ||
+    state.activeOperationId !== null ||
+    state.frameAlignmentMutationPending ||
+    state.failedFrameAlignmentReplayIndices.size > 0 ||
+    state.pendingFrameAlignmentReplayIndices.size > 0
+  ) {
+    return null;
+  }
+  const status = state.connection.status;
+  if (
+    status?.mediaLoaded !== true ||
+    status.connected !== true ||
+    !Number.isInteger(status.frameCount) ||
+    (status.frameCount ?? 0) <= 0
+  ) {
+    return null;
+  }
+  const frameCount = status.frameCount as number;
+  const operationId = state.latestCompletedPreviewOperationId;
+  if (
+    state.connection.device?.kind === "real" &&
+    state.previewStatusOperationId !== operationId
+  ) {
+    return null;
+  }
+  const thumbnailIndices = Object.keys(state.thumbnails).map(Number);
+  if (thumbnailIndices.length !== frameCount) return null;
+  for (let frameIndex = 1; frameIndex <= frameCount; frameIndex += 1) {
+    if (
+      state.thumbnails[frameIndex] === undefined ||
+      state.thumbnailOperationIds[frameIndex] !== operationId
+    ) {
+      return null;
+    }
+  }
+  return {
+    operationId,
+    carrier: status.carrier,
+    frameCount,
+    filmProcess: state.previewFilmProcess,
   };
 }
 
@@ -267,6 +382,22 @@ function normalizedDerivativeTransform(
   return transform === undefined
     ? { ...IDENTITY_DERIVATIVE_TRANSFORM }
     : { ...transform };
+}
+
+function frameAlignmentEquals(
+  left: FrameAlignment | undefined,
+  right: FrameAlignment | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  const leftTransform = normalizedDerivativeTransform(left.derivativeTransform);
+  const rightTransform = normalizedDerivativeTransform(right.derivativeTransform);
+  return (
+    left.offsetRows === right.offsetRows &&
+    left.approved === right.approved &&
+    leftTransform.rotationDegrees === rightTransform.rotationDegrees &&
+    leftTransform.horizontalMirror === rightTransform.horizontalMirror &&
+    leftTransform.verticalMirror === rightTransform.verticalMirror
+  );
 }
 
 function normalizedScannerStatus(status: ScannerStatus): ScannerStatus {
@@ -473,6 +604,8 @@ export class SessionStore {
   // field (state.previewOutcome) is kept in lockstep at every assignment so
   // views can observe the outcome.
   #previewOutcome: "active" | "failed" | "succeeded" | null = null;
+  #pendingPreviewFilmProcess: { operationId: string; filmProcess: FilmProcess } | null = null;
+  #activePreviewAuthorizationEpoch: number | null = null;
 
   // Selection range-extend anchor (05-03 Task 1): the frame index of the
   // last non-extend toggle, which shift-extend ranges start from (mirrors
@@ -558,34 +691,58 @@ export class SessionStore {
     deviceId: string,
     options?: ConnectOptions,
   ): Promise<{ device: DeviceInfo; status: ScannerStatus }> {
+    if (sessionOperationBusy(this.#state)) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active scanner operation to finish before connecting a device",
+        recoverable: false,
+      } satisfies EngineError;
+    }
     const params: Record<string, unknown> = { deviceId };
     if (options !== undefined) params.options = options;
-    const result = (await this.transport.sendRequest("scanner.connect", params)) as {
-      device: DeviceInfo;
-      status: ScannerStatus;
-    };
-    const status = normalizedScannerStatus(result.status);
-    this.#state.connection = { connected: true, device: result.device, status };
-    // Approval-binding trigger 6 (reconnect): a new successful connect
-    // invalidates any prior completed-preview token.
-    this.#state.latestCompletedPreviewOperationId = null;
-    this.#state.filmFeedInterrupted = null;
-    this.#invalidateScanAuthorization();
+    this.#state.connectionChangePending = true;
     this.#notify();
-    return { ...result, status };
+    try {
+      const result = (await this.transport.sendRequest("scanner.connect", params)) as {
+        device: DeviceInfo;
+        status: ScannerStatus;
+      };
+      const status = normalizedScannerStatus(result.status);
+      this.#state.connection = { connected: true, device: result.device, status };
+      // Approval-binding trigger 6 (reconnect): a new successful connect
+      // invalidates any prior completed-preview token.
+      this.#invalidatePreviewRegistration();
+      this.#state.filmFeedInterrupted = null;
+      return { ...result, status };
+    } finally {
+      this.#state.connectionChangePending = false;
+      this.#notify();
+    }
   }
 
   /** Thin forward to scanner.disconnect; clears the connected device. */
   async disconnect(): Promise<unknown> {
-    const result = await this.transport.sendRequest("scanner.disconnect", {});
-    this.#state.connection = { connected: false, device: null, status: null };
-    // Approval-binding trigger 5 (disconnect): the current device-session
-    // binding cannot survive a lost session.
-    this.#state.latestCompletedPreviewOperationId = null;
-    this.#state.filmFeedInterrupted = null;
-    this.#invalidateScanAuthorization();
+    if (sessionOperationBusy(this.#state)) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active scanner operation to finish before disconnecting the device",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    this.#state.connectionChangePending = true;
     this.#notify();
-    return result;
+    try {
+      const result = await this.transport.sendRequest("scanner.disconnect", {});
+      this.#state.connection = { connected: false, device: null, status: null };
+      // Approval-binding trigger 5 (disconnect): the current device-session
+      // binding cannot survive a lost session.
+      this.#invalidatePreviewRegistration();
+      this.#state.filmFeedInterrupted = null;
+      return result;
+    } finally {
+      this.#state.connectionChangePending = false;
+      this.#notify();
+    }
   }
 
   /** Thin forward to scanner.list; no state field represents the listing. */
@@ -597,22 +754,57 @@ export class SessionStore {
 
   /** Thin forward to scanner.status; refreshes connection.status. */
   async refreshStatus(): Promise<ScannerStatus> {
+    const recoveryCandidate =
+      this.#state.connection.device?.kind === "real" &&
+      this.#state.previewOutcome === "succeeded" &&
+      this.#state.latestCompletedPreviewOperationId !== null &&
+      this.#state.previewStatusOperationId === null &&
+      this.#state.activeOperationId === null
+        ? {
+            operationId: this.#state.latestCompletedPreviewOperationId,
+            authorizationEpoch: this.#scanAuthorizationEpoch,
+          }
+        : null;
     const received = (await this.transport.sendRequest("scanner.status", {})) as ScannerStatus;
     const status = normalizedScannerStatus(received);
     const previous = this.#state.connection.status;
-    this.#state.connection = { ...this.#state.connection, status };
+    this.#state.connection = !status.connected
+      ? { connected: false, device: null, status }
+      : this.#state.connection.device !== null
+        ? { ...this.#state.connection, status }
+        : { ...this.#state.connection, connected: false, status };
+    const refreshEstablishesCompletedPreview =
+      recoveryCandidate !== null &&
+      this.#scanAuthorizationEpoch === recoveryCandidate.authorizationEpoch &&
+      this.#state.latestCompletedPreviewOperationId === recoveryCandidate.operationId &&
+      this.#state.previewOutcome === "succeeded" &&
+      status.connected === true &&
+      status.mediaLoaded === true &&
+      status.filmPresent !== false &&
+      Number.isInteger(status.frameCount) &&
+      (status.frameCount ?? 0) > 0;
+    if (refreshEstablishesCompletedPreview) {
+      this.#state.previewStatusOperationId = recoveryCandidate.operationId;
+    }
     const registrationChanged =
       status.connected === false ||
       status.filmPresent === false ||
-      (previous !== null &&
+      (!refreshEstablishesCompletedPreview && previous !== null &&
         ((previous.mediaLoaded === true && status.mediaLoaded === false) ||
           previous.carrier !== status.carrier ||
           previous.frameCount !== status.frameCount));
-    if (status.filmPresent === false) {
-      this.#invalidatePreviewRegistration();
-    } else if (registrationChanged) {
-      this.#state.latestCompletedPreviewOperationId = null;
-      this.#invalidateScanAuthorization();
+    if (status.filmPresent === false || registrationChanged) {
+      if (this.#state.activeOperationId !== null) {
+        this.#invalidateRegistrationPreservingActivePreviewLane();
+      } else {
+        this.#invalidatePreviewRegistration();
+      }
+    }
+    if (
+      status.motionArmed === true &&
+      this.#state.previewRequestFailure?.error.code === "HW_MOTION_NOT_ARMED"
+    ) {
+      this.#state.previewRequestFailure = null;
     }
     this.#notify();
     return status;
@@ -620,21 +812,30 @@ export class SessionStore {
 
   /** Thin forward to sim.loadMedia; refreshes connection.status. */
   async loadMedia(carrier: "roll36" | "strip6" | "mounted"): Promise<ScannerStatus> {
-    const received = (await this.transport.sendRequest("sim.loadMedia", { carrier })) as ScannerStatus;
-    const status = normalizedScannerStatus(received);
-    this.#state.connection = { ...this.#state.connection, status };
-    // Approval-binding trigger 3 (media reset): a succeeding loadMedia
-    // invalidates any prior completed-preview token. A media reset also
-    // starts the next preview fresh: the previous preview outcome (and its
-    // error, if any) no longer describes the loaded media.
-    this.#state.latestCompletedPreviewOperationId = null;
-    this.#previewOutcome = null;
-    this.#state.previewOutcome = null;
-    this.#state.previewError = null;
-    this.#state.filmFeedInterrupted = null;
-    this.#invalidateScanAuthorization();
+    if (sessionOperationBusy(this.#state)) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active scanner operation to finish before loading simulated media",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    this.#state.connectionChangePending = true;
     this.#notify();
-    return status;
+    try {
+      const received = (await this.transport.sendRequest("sim.loadMedia", { carrier })) as ScannerStatus;
+      const status = normalizedScannerStatus(received);
+      this.#state.connection = { ...this.#state.connection, status };
+      // Approval-binding trigger 3 (media reset): a succeeding loadMedia
+      // invalidates any prior completed-preview token. A media reset also
+      // starts the next preview fresh: the previous preview outcome (and its
+      // error, if any) no longer describes the loaded media.
+      this.#invalidatePreviewRegistration();
+      this.#state.filmFeedInterrupted = null;
+      return status;
+    } finally {
+      this.#state.connectionChangePending = false;
+      this.#notify();
+    }
   }
 
   /**
@@ -711,6 +912,20 @@ export class SessionStore {
     this.#notify();
   }
 
+  /** Selects the material for the next preview when no project is active. */
+  setPreviewFilmProcess(filmProcess: FilmProcess): void {
+    if (this.#state.project !== null || sessionOperationBusy(this.#state)) return;
+    if (this.#state.previewFilmProcessSelection === filmProcess) return;
+    this.#state.previewFilmProcessSelection = filmProcess;
+    if (this.#state.previewFilmProcess !== null) {
+      // The visible thumbnails were rendered for a different material. Do
+      // not let the project form silently save that completed registration
+      // after the operator has selected a new process for the roll.
+      this.#invalidatePreviewRegistration();
+    }
+    this.#notify();
+  }
+
   /**
    * Forward to scanner.acquireThumbnails with a fresh correlation token.
    * Preview correlation policy (04-03 Task 1): a fresh crypto.randomUUID()
@@ -725,7 +940,38 @@ export class SessionStore {
     frames?: number[],
     filmProcess?: FilmProcess,
   ): Promise<{ accepted: boolean; frames: number[] }> {
-    if (this.#previewOutcome === "active") {
+    if (this.#state.connectionChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the device connection change to finish before requesting a preview",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.projectChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active project change to finish before requesting a preview",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.frameAlignmentMutationPending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active frame-alignment change to finish before requesting a preview",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (
+      this.#state.scanStartPending ||
+      (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState))
+    ) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active scan to finish before requesting a preview",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.activeOperationId !== null) {
       throw {
         code: "INVALID_PARAMS",
         message:
@@ -733,16 +979,51 @@ export class SessionStore {
         recoverable: false,
       } satisfies EngineError;
     }
+    if (
+      this.#state.project !== null &&
+      filmProcess !== undefined &&
+      filmProcess !== this.#state.project.filmProcess
+    ) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "filmProcess conflicts with the active project's filmProcess",
+        recoverable: false,
+      } satisfies EngineError;
+    }
     const operationId = crypto.randomUUID();
+    const effectiveFilmProcess =
+      this.#state.project?.filmProcess ??
+      filmProcess ??
+      this.#state.previewFilmProcessSelection;
     this.#previewOutcome = "active";
     this.#state.previewOutcome = "active";
     this.#state.previewError = null;
+    this.#state.previewRequestFailure = null;
+    this.#state.previewFilmProcess = null;
+    this.#state.previewStatusOperationId = null;
+    if (this.#state.project === null && frames === undefined) {
+      // A pre-project full preview replaces the prior registration. Clear
+      // its tiles so a shorter real re-preview cannot retain out-of-range
+      // thumbnails that permanently prevent attachment.
+      this.#state.thumbnails = {};
+      this.#state.thumbnailOperationIds = {};
+      this.#state.selectedFrameIndices = [];
+      this.#state.focusedFrameIndex = null;
+      this.#selectionAnchor = null;
+    }
     this.#state.activeOperationId = operationId;
     this.#state.latestCompletedPreviewOperationId = null;
+    this.#pendingPreviewFilmProcess = { operationId, filmProcess: effectiveFilmProcess };
     this.#invalidateScanAuthorization();
-    const params: Record<string, unknown> = { operationId };
+    this.#activePreviewAuthorizationEpoch = this.#scanAuthorizationEpoch;
+    const params: Record<string, unknown> = {
+      operationId,
+      filmProcess: effectiveFilmProcess,
+    };
     if (frames !== undefined) params.frames = frames;
-    if (filmProcess !== undefined) params.filmProcess = filmProcess;
+    // Subscribers must see the lane become active before a slow transport ACK
+    // so a second click cannot queue another motion-capable request.
+    this.#notify();
     try {
       const result = (await this.transport.sendRequest("scanner.acquireThumbnails", params)) as {
         accepted: boolean;
@@ -751,11 +1032,40 @@ export class SessionStore {
       this.#notify();
       return result;
     } catch (error) {
-      this.#previewOutcome = null;
-      this.#state.previewOutcome = null;
-      this.#state.previewError = null;
-      this.#state.activeOperationId = null;
-      this.#notify();
+      // Events can arrive before the request response. A late rejection must
+      // not erase a correlated completion/failure (or a replacement lane).
+      if (
+        this.#state.activeOperationId === operationId &&
+        this.#previewOutcome === "active"
+      ) {
+        this.#previewOutcome = null;
+        this.#state.previewOutcome = null;
+        this.#state.previewError = null;
+        this.#state.activeOperationId = null;
+        this.#pendingPreviewFilmProcess = null;
+        this.#activePreviewAuthorizationEpoch = null;
+        const requestError: EngineError = isEngineError(error)
+          ? error
+          : {
+              code: "INTERNAL",
+              message: error instanceof Error ? error.message : "preview request failed",
+              recoverable: false,
+            };
+        this.#state.previewRequestFailure = { operationId, error: requestError };
+        if (isEngineError(error)) {
+          if (
+            error.code === "HW_MOTION_NOT_ARMED" &&
+            this.#state.connection.device?.kind === "real" &&
+            this.#state.connection.status !== null
+          ) {
+            this.#state.connection = {
+              ...this.#state.connection,
+              status: { ...this.#state.connection.status, motionArmed: false },
+            };
+          }
+        }
+        this.#notify();
+      }
       throw error;
     }
   }
@@ -795,6 +1105,31 @@ export class SessionStore {
    * invalidates that frame's prior recorded approval.
    */
   async setSpacingOffset(frameIndex: number, offsetRows: number): Promise<void> {
+    if (this.#state.connectionChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the device connection change to finish before adjusting spacing",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.projectChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active project change to finish before adjusting spacing",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (
+      this.#state.frameAlignmentMutationPending ||
+      this.#state.scanStartPending ||
+      (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState))
+    ) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active frame-alignment or scan boundary to finish before adjusting spacing",
+        recoverable: false,
+      } satisfies EngineError;
+    }
     const bounds = frameIndex === 1 ? { min: 0, max: 144 } : { min: -144, max: 144 };
     if (offsetRows < bounds.min || offsetRows > bounds.max) {
       throw {
@@ -811,51 +1146,57 @@ export class SessionStore {
         recoverable: false,
       } satisfies EngineError;
     }
-    const result = (await this.transport.sendRequest("roll.setSpacingOffset", {
-      frameIndex,
-      offsetRows,
-      operationId,
-    })) as { thumbnail?: unknown } | undefined;
-    if (this.#state.latestCompletedPreviewOperationId !== operationId) {
-      throw {
-        code: "INVALID_PARAMS",
-        message: "the spacing-offset response belongs to a superseded preview",
-        recoverable: false,
-      } satisfies EngineError;
-    }
-    // Fail closed: a malformed response is never applied; the prior tile and
-    // its approvals stay authoritative.
-    if (result === undefined || !isThumbnail(result.thumbnail)) return;
-    this.#state.thumbnails = { ...this.#state.thumbnails, [frameIndex]: result.thumbnail };
-    this.#state.thumbnailOperationIds = {
-      ...this.#state.thumbnailOperationIds,
-      [frameIndex]: operationId,
-    };
-    // Changing the offset invalidates prior manual approval for that frame.
-    const approved = this.#state.approvedFrames[operationId];
-    if (approved !== undefined) {
-      const remaining = approved.filter((frame) => frame !== frameIndex);
-      if (remaining.length === 0) {
-        const next = { ...this.#state.approvedFrames };
-        delete next[operationId];
-        this.#state.approvedFrames = next;
-      } else {
-        this.#state.approvedFrames = { ...this.#state.approvedFrames, [operationId]: remaining };
-      }
-    }
-    // Keep the confirmed transport offset and the independent presentation
-    // transform together in the one FrameAlignment object the engine owns.
-    // Persistence is intentionally deferred to the scan-start boundary.
-    const prior = this.#frameAlignmentFor(frameIndex);
-    this.#state.frameAlignmentDrafts = {
-      ...this.#state.frameAlignmentDrafts,
-      [frameIndex]: {
-        offsetRows: result.thumbnail.spacingOffset ?? offsetRows,
-        approved: false,
-        derivativeTransform: normalizedDerivativeTransform(prior?.derivativeTransform),
-      },
-    };
+    this.#state.frameAlignmentMutationPending = true;
     this.#notify();
+    try {
+      const result = (await this.transport.sendRequest("roll.setSpacingOffset", {
+        frameIndex,
+        offsetRows,
+        operationId,
+      })) as { thumbnail?: unknown } | undefined;
+      if (this.#state.latestCompletedPreviewOperationId !== operationId) {
+        throw {
+          code: "INVALID_PARAMS",
+          message: "the spacing-offset response belongs to a superseded preview",
+          recoverable: false,
+        } satisfies EngineError;
+      }
+      // Fail closed: a malformed response is never applied; the prior tile and
+      // its approvals stay authoritative.
+      if (result === undefined || !isThumbnail(result.thumbnail)) return;
+      this.#state.thumbnails = { ...this.#state.thumbnails, [frameIndex]: result.thumbnail };
+      this.#state.thumbnailOperationIds = {
+        ...this.#state.thumbnailOperationIds,
+        [frameIndex]: operationId,
+      };
+      // Changing the offset invalidates prior manual approval for that frame.
+      const approved = this.#state.approvedFrames[operationId];
+      if (approved !== undefined) {
+        const remaining = approved.filter((frame) => frame !== frameIndex);
+        if (remaining.length === 0) {
+          const next = { ...this.#state.approvedFrames };
+          delete next[operationId];
+          this.#state.approvedFrames = next;
+        } else {
+          this.#state.approvedFrames = { ...this.#state.approvedFrames, [operationId]: remaining };
+        }
+      }
+      // Keep the confirmed transport offset and the independent presentation
+      // transform together in the one FrameAlignment object the engine owns.
+      // Persistence is intentionally deferred to the scan-start boundary.
+      const prior = this.#frameAlignmentFor(frameIndex);
+      this.#state.frameAlignmentDrafts = {
+        ...this.#state.frameAlignmentDrafts,
+        [frameIndex]: {
+          offsetRows: result.thumbnail.spacingOffset ?? offsetRows,
+          approved: false,
+          derivativeTransform: normalizedDerivativeTransform(prior?.derivativeTransform),
+        },
+      };
+    } finally {
+      this.#state.frameAlignmentMutationPending = false;
+      this.#notify();
+    }
   }
 
   /**
@@ -870,29 +1211,60 @@ export class SessionStore {
     frameIndex: number,
     alignment: FrameAlignment | null,
   ): Promise<void> {
-    const result = (await this.transport.sendRequest("project.setFrameAlignment", {
-      frameIndex,
-      alignment,
-    })) as { project?: unknown } | undefined;
-    if (alignment === null) {
-      const next = { ...this.#state.frameAlignmentDrafts };
-      delete next[frameIndex];
-      this.#state.frameAlignmentDrafts = next;
-      // Removing the draft also removes any prior replay failure for the
-      // frame (review HIGH): a cleared alignment must not stay blocked by a
-      // failure that referred to the deleted offset.
-      this.#state.failedFrameAlignmentReplayIndices.delete(frameIndex);
-      this.#state.pendingFrameAlignmentReplayIndices.delete(frameIndex);
-    } else {
-      this.#state.frameAlignmentDrafts = {
-        ...this.#state.frameAlignmentDrafts,
-        [frameIndex]: alignment,
-      };
+    if (this.#state.connectionChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the device connection change to finish before saving frame transforms",
+        recoverable: false,
+      } satisfies EngineError;
     }
-    if (result !== undefined && isScanProject(result.project)) {
-      this.#state.project = result.project;
+    if (this.#state.projectChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active project change to finish before saving frame transforms",
+        recoverable: false,
+      } satisfies EngineError;
     }
+    if (
+      this.#state.frameAlignmentMutationPending ||
+      this.#state.scanStartPending ||
+      (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState))
+    ) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active frame-alignment or scan boundary to finish before saving frame transforms",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    this.#state.frameAlignmentMutationPending = true;
     this.#notify();
+    try {
+      const result = (await this.transport.sendRequest("project.setFrameAlignment", {
+        frameIndex,
+        alignment,
+      })) as { project?: unknown } | undefined;
+      if (alignment === null) {
+        const next = { ...this.#state.frameAlignmentDrafts };
+        delete next[frameIndex];
+        this.#state.frameAlignmentDrafts = next;
+        // Removing the draft also removes any prior replay failure for the
+        // frame (review HIGH): a cleared alignment must not stay blocked by a
+        // failure that referred to the deleted offset.
+        this.#state.failedFrameAlignmentReplayIndices.delete(frameIndex);
+        this.#state.pendingFrameAlignmentReplayIndices.delete(frameIndex);
+      } else {
+        this.#state.frameAlignmentDrafts = {
+          ...this.#state.frameAlignmentDrafts,
+          [frameIndex]: alignment,
+        };
+      }
+      if (result !== undefined && isScanProject(result.project)) {
+        this.#state.project = result.project;
+      }
+    } finally {
+      this.#state.frameAlignmentMutationPending = false;
+      this.#notify();
+    }
   }
 
   #frameAlignmentFor(frameIndex: number): FrameAlignment | undefined {
@@ -911,7 +1283,10 @@ export class SessionStore {
 
   /** Transform edits are drafts until the next scan-start persistence gate. */
   frameTransformsAreEditable(): boolean {
-    return this.#state.scanStartPending ||
+    return this.#state.activeOperationId !== null ||
+      this.#state.projectChangePending ||
+      this.#state.frameAlignmentMutationPending ||
+      this.#state.scanStartPending ||
       (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState))
       ? false
       : true;
@@ -1224,26 +1599,129 @@ export class SessionStore {
     filmProcess: "positive" | "c41ColorNegative" | "bwNegative" | "kodachrome",
     directory?: string,
   ): Promise<{ project: ScanProject; directory: string }> {
-    const params: Record<string, unknown> = { name, carrier, frameCount, filmProcess };
-    if (directory !== undefined) params.directory = directory;
-    const result = (await this.transport.sendRequest("project.create", params)) as {
-      project: ScanProject;
-      directory: string;
-    };
-    // Fail-closed commit: a malformed response never corrupts store state.
-    // A successful project change resets the session binding (review HIGH):
-    // preview tokens, approvals, and thumbnail provenance belong to the
-    // project context they were created under and must not leak across
-    // projects. Alignment drafts are rebuilt from the loaded project's own
-    // frames; any stale replay failure is cleared (replay re-runs after the
-    // next preview). The jobId is dropped so a previous job's late events
-    // can never match the new project's context.
-    if (isScanProject(result.project)) {
+    if (this.#state.connectionChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the device connection change to finish before creating a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.activeOperationId !== null) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active preview to finish before creating a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.frameAlignmentMutationPending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active frame-alignment change to finish before creating a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (
+      this.#state.scanStartPending ||
+      (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState))
+    ) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active scan to finish before creating a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.projectChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active project change to finish before creating a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    this.#state.projectChangePending = true;
+    this.#notify();
+    try {
+      const registration = preProjectPreviewRegistration(this.#state);
+      const attachCandidate =
+        registration !== null &&
+        registration.frameCount === frameCount &&
+        registration.filmProcess === filmProcess &&
+        (registration.carrier === null || registration.carrier === carrier)
+          ? { ...registration, authorizationEpoch: this.#scanAuthorizationEpoch }
+          : null;
+      const params: Record<string, unknown> = { name, carrier, frameCount, filmProcess };
+      if (directory !== undefined) params.directory = directory;
+      const rawResult = await this.transport.sendRequest("project.create", params);
+      if (
+        !isRecord(rawResult) ||
+        !isScanProject(rawResult.project) ||
+        typeof rawResult.directory !== "string"
+      ) {
+        throw {
+          code: "INTERNAL",
+          message: "project.create returned an invalid project",
+          recoverable: false,
+        } satisfies EngineError;
+      }
+      const result = {
+        project: rawResult.project,
+        directory: rawResult.directory,
+      };
+      const responseMatchesRequest =
+        result.project.carrier === carrier &&
+        result.project.frameCount === frameCount &&
+        result.project.filmProcess === filmProcess;
+      const attachmentProjectUsable =
+        responseMatchesRequest && projectHasExactFrameSet(result.project);
+      const currentRegistration = preProjectPreviewRegistration(this.#state);
+      const attachmentStillCurrent =
+        attachCandidate !== null &&
+        this.#scanAuthorizationEpoch === attachCandidate.authorizationEpoch &&
+        currentRegistration?.operationId === attachCandidate.operationId &&
+        currentRegistration.frameCount === attachCandidate.frameCount &&
+        currentRegistration.filmProcess === attachCandidate.filmProcess &&
+        currentRegistration.carrier === attachCandidate.carrier;
+
+      // project.create makes the returned project active in the engine. Adopt
+      // any structurally valid response even if its identity fields disagree,
+      // but detach the preview and surface the protocol violation fail-closed.
       this.#state.project = result.project;
-      this.#resetSessionBinding(result.project);
+      if (attachmentProjectUsable && attachmentStillCurrent) {
+        this.#attachProjectToPreview(result.project);
+        // Pre-project rotation/mirroring/spacing drafts become durable at
+        // the same attachment boundary. Without this write, closing and
+        // reopening the newly-created project silently loses those edits.
+        const persistenceEpoch = this.#scanAuthorizationEpoch;
+        const draftFrames = Object.keys(this.#state.frameAlignmentDrafts).map(Number);
+        await this.#persistFrameGeometryBeforeScan(
+          draftFrames,
+          persistenceEpoch,
+          result.project.id,
+        );
+      } else {
+        this.#resetSessionBinding(result.project);
+      }
+      if (!responseMatchesRequest) {
+        throw {
+          code: "INTERNAL",
+          message: "project.create returned a project that does not match the requested carrier, frame count, and film process",
+          recoverable: false,
+        } satisfies EngineError;
+      }
+      if (attachmentStillCurrent && !attachmentProjectUsable) {
+        throw {
+          code: "INTERNAL",
+          message: "project.create returned a malformed frame set for the completed preview",
+          recoverable: false,
+        } satisfies EngineError;
+      }
+      return {
+        project: this.#state.project ?? result.project,
+        directory: result.directory,
+      };
+    } finally {
+      this.#state.projectChangePending = false;
       this.#notify();
     }
-    return result;
   }
 
   /**
@@ -1258,13 +1736,16 @@ export class SessionStore {
     this.#previewOutcome = null;
     this.#state.previewOutcome = null;
     this.#state.previewError = null;
+    this.#state.previewRequestFailure = null;
+    this.#state.previewFilmProcess = null;
+    this.#state.previewStatusOperationId = null;
+    this.#pendingPreviewFilmProcess = null;
+    this.#activePreviewAuthorizationEpoch = null;
     this.#state.approvedFrames = {};
     this.#state.thumbnailOperationIds = {};
-    this.#state.jobId = null;
-    this.#state.scanStartPending = false;
-    this.#state.filmFeedInterrupted = null;
-    this.#jobBoundaryPending = false;
-    this.#pendingScanEvents = [];
+    this.#state.selectedFrameIndices = [];
+    this.#state.focusedFrameIndex = null;
+    this.#selectionAnchor = null;
     const drafts: Record<number, FrameAlignment> = {};
     for (const frame of project.frames) {
       if (frame.alignment !== undefined) drafts[frame.index] = frame.alignment;
@@ -1272,6 +1753,28 @@ export class SessionStore {
     this.#state.frameAlignmentDrafts = drafts;
     this.#state.failedFrameAlignmentReplayIndices = new Set();
     this.#state.pendingFrameAlignmentReplayIndices = new Set();
+    this.#resetProjectRuntime(project);
+  }
+
+  /**
+   * First save after an exact pre-project preview is an attachment boundary,
+   * not a media/project switch. Preserve registration and user review state
+   * while adopting the durable project's receipts and job boundary.
+   */
+  #attachProjectToPreview(project: ScanProject): void {
+    this.#state.activeOperationId = null;
+    this.#state.previewRequestFailure = null;
+    this.#pendingPreviewFilmProcess = null;
+    this.#activePreviewAuthorizationEpoch = null;
+    this.#resetProjectRuntime(project);
+  }
+
+  #resetProjectRuntime(project: ScanProject): void {
+    this.#state.jobId = null;
+    this.#state.scanStartPending = false;
+    this.#state.filmFeedInterrupted = null;
+    this.#jobBoundaryPending = false;
+    this.#pendingScanEvents = [];
     this.#invalidateScanAuthorization();
     const receipts: Record<number, ScanReceipt[]> = {};
     for (const frame of project.frames) {
@@ -1282,15 +1785,67 @@ export class SessionStore {
 
   /** Thin forward to project.open; records the active project. */
   async openProject(directory: string): Promise<{ project: ScanProject; directory: string }> {
-    const result = (await this.transport.sendRequest("project.open", {
-      directory,
-    })) as { project: ScanProject; directory: string };
-    if (isScanProject(result.project)) {
+    if (this.#state.connectionChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the device connection change to finish before opening a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.activeOperationId !== null) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active preview to finish before opening a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.frameAlignmentMutationPending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active frame-alignment change to finish before opening a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (
+      this.#state.scanStartPending ||
+      (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState))
+    ) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active scan to finish before opening a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.projectChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active project change to finish before opening a project",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    this.#state.projectChangePending = true;
+    this.#notify();
+    try {
+      const rawResult = await this.transport.sendRequest("project.open", { directory });
+      if (
+        !isRecord(rawResult) ||
+        !isScanProject(rawResult.project) ||
+        typeof rawResult.directory !== "string"
+      ) {
+        throw {
+          code: "INTERNAL",
+          message: "project.open returned an invalid project",
+          recoverable: false,
+        } satisfies EngineError;
+      }
+      const result = { project: rawResult.project, directory: rawResult.directory };
       this.#state.project = result.project;
       this.#resetSessionBinding(result.project);
+      return result;
+    } finally {
+      this.#state.projectChangePending = false;
       this.#notify();
     }
-    return result;
   }
 
   /** Thin forward to project.list; no state field represents the listing. */
@@ -1327,7 +1882,7 @@ export class SessionStore {
       const persisted = currentProject.frames.find((frame) => frame.index === frameIndex);
       if (persisted === undefined) continue;
       const desired = this.#state.frameAlignmentDrafts[frameIndex];
-      if (JSON.stringify(persisted.alignment) === JSON.stringify(desired)) continue;
+      if (frameAlignmentEquals(persisted.alignment, desired)) continue;
       const response = (await this.transport.sendRequest("project.setFrameAlignment", {
         frameIndex,
         alignment: desired ?? null,
@@ -1340,10 +1895,24 @@ export class SessionStore {
           recoverable: false,
         } satisfies EngineError;
       }
-      if (response.project.id !== startingProject.id) {
+      if (
+        response.project.id !== startingProject.id ||
+        response.project.carrier !== startingProject.carrier ||
+        response.project.frameCount !== startingProject.frameCount ||
+        response.project.filmProcess !== startingProject.filmProcess ||
+        !projectHasExactFrameSet(response.project)
+      ) {
         throw {
           code: "INVALID_PARAMS",
-          message: "the frame transform response belongs to a different project",
+          message: "the frame transform response belongs to a different or malformed project",
+          recoverable: false,
+        } satisfies EngineError;
+      }
+      const saved = response.project.frames.find((frame) => frame.index === frameIndex);
+      if (saved === undefined || !frameAlignmentEquals(saved.alignment, desired)) {
+        throw {
+          code: "INTERNAL",
+          message: `project.setFrameAlignment did not persist frame ${frameIndex}`,
           recoverable: false,
         } satisfies EngineError;
       }
@@ -1370,6 +1939,52 @@ export class SessionStore {
     output?: OutputRecipe,
     frameAlignments?: Record<number, FrameAlignment>,
   ): Promise<ScanStartResult> {
+    if (this.#state.connectionChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the device connection change to finish before starting a scan",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.filmFeedInterrupted !== null) {
+      throw {
+        code: "FILM_FEED_INTERRUPTED",
+        message:
+          "the previous film registration is no longer valid; reinsert the film, acquire a fresh preview, then resume the remaining frames",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.activeOperationId !== null) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active preview to finish before starting a scan",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.projectChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active project change to finish before starting a scan",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (this.#state.frameAlignmentMutationPending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active frame-alignment change to finish before starting a scan",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    if (
+      this.#state.scanStartPending ||
+      (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState))
+    ) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active scan to finish before starting another scan",
+        recoverable: false,
+      } satisfies EngineError;
+    }
     // Recipe mirroring (04-03 Task 2): client-side pre-validation running
     // BEFORE the needsApproval gate and the wire call. Defaults are applied
     // deterministically, B&W forcing mirrors domain.rs
@@ -1500,15 +2115,6 @@ export class SessionStore {
       } satisfies EngineError;
     }
 
-    if (this.#state.filmFeedInterrupted !== null) {
-      throw {
-        code: "FILM_FEED_INTERRUPTED",
-        message:
-          "the previous film registration is no longer valid; reinsert the film, acquire a fresh preview, then resume the remaining frames",
-        recoverable: false,
-      } satisfies EngineError;
-    }
-
     const params: Record<string, unknown> = { frames, recipe: effectiveCapture };
     if (effectiveProcessing !== undefined) params.processing = effectiveProcessing;
     if (resolved.output !== undefined) params.output = resolved.output;
@@ -1606,6 +2212,13 @@ export class SessionStore {
 
   /** Thin forward to project.pendingFrames. */
   async pendingFrames(): Promise<PendingFramesResult> {
+    if (this.#state.projectChangePending) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "wait for the active project change to finish before reading pending frames",
+        recoverable: false,
+      } satisfies EngineError;
+    }
     return (await this.transport.sendRequest("project.pendingFrames", {})) as PendingFramesResult;
   }
 
@@ -1634,9 +2247,42 @@ export class SessionStore {
     this.#previewOutcome = null;
     this.#state.previewOutcome = null;
     this.#state.previewError = null;
+    this.#state.previewRequestFailure = null;
+    this.#state.previewFilmProcess = null;
+    this.#state.previewStatusOperationId = null;
+    this.#pendingPreviewFilmProcess = null;
+    this.#activePreviewAuthorizationEpoch = null;
     this.#state.selectedFrameIndices = [];
     this.#state.focusedFrameIndex = null;
     this.#selectionAnchor = null;
+    this.#clearUnsavedPreProjectAlignment();
+    this.#invalidateScanAuthorization();
+  }
+
+  #clearUnsavedPreProjectAlignment(): void {
+    if (this.#state.project !== null) return;
+    this.#state.frameAlignmentDrafts = {};
+    this.#state.failedFrameAlignmentReplayIndices = new Set();
+    this.#state.pendingFrameAlignmentReplayIndices = new Set();
+  }
+
+  /**
+   * A generic status update cannot prove an asynchronous preview worker has
+   * released its physical lane. Retire its registration evidence and epoch,
+   * but keep the active operation/button lock until its correlated terminal.
+   */
+  #invalidateRegistrationPreservingActivePreviewLane(): void {
+    this.#state.thumbnails = {};
+    this.#state.thumbnailOperationIds = {};
+    this.#state.latestCompletedPreviewOperationId = null;
+    this.#state.approvedFrames = {};
+    this.#state.previewFilmProcess = null;
+    this.#state.previewStatusOperationId = null;
+    this.#pendingPreviewFilmProcess = null;
+    this.#state.selectedFrameIndices = [];
+    this.#state.focusedFrameIndex = null;
+    this.#selectionAnchor = null;
+    this.#clearUnsavedPreProjectAlignment();
     this.#invalidateScanAuthorization();
   }
 
@@ -1666,7 +2312,11 @@ export class SessionStore {
         if (!isRecord(payload) || !isScannerStatus(payload.status)) return;
         const previous = this.#state.connection.status;
         const status = normalizedScannerStatus(payload.status);
-        this.#state.connection = { ...this.#state.connection, status };
+        this.#state.connection = !status.connected
+          ? { connected: false, device: null, status }
+          : this.#state.connection.device !== null
+            ? { ...this.#state.connection, status }
+            : { ...this.#state.connection, connected: false, status };
         // Approval-binding invalidation observed through status transitions
         // (roll.approve triggers 4-5): eject (mediaLoaded true -> false),
         // media change (carrier/frameCount change), and disconnect
@@ -1675,6 +2325,15 @@ export class SessionStore {
         // correlated thumbnailsComplete / thumbnailsFailed+thumbnailsComplete
         // sequence does that, so an untagged generic status cannot terminate
         // an active preview.
+        const operationId =
+          typeof payload.operationId === "string" ? payload.operationId : null;
+        const statusBelongsToPreview =
+          operationId !== null &&
+          (operationId === this.#state.activeOperationId ||
+            operationId === this.#state.latestCompletedPreviewOperationId);
+        if (statusBelongsToPreview) {
+          this.#state.previewStatusOperationId = operationId;
+        }
         let registrationChanged = false;
         if (status.connected === false) {
           this.#state.latestCompletedPreviewOperationId = null;
@@ -1684,15 +2343,28 @@ export class SessionStore {
           const mediaChanged =
             previous.carrier !== status.carrier ||
             previous.frameCount !== status.frameCount;
-          if (ejected || mediaChanged) {
+          // The real backend emits thumbnailsComplete first and then a status
+          // event carrying the same operationId with the newly detected
+          // carrier/count. That transition establishes this preview; treating
+          // it as foreign media would immediately erase the token we just
+          // completed.
+          if (ejected || (mediaChanged && !statusBelongsToPreview)) {
             this.#state.latestCompletedPreviewOperationId = null;
             registrationChanged = true;
           }
         }
-        if (status.filmPresent === false) {
-          this.#invalidatePreviewRegistration();
-        } else if (registrationChanged) {
-          this.#invalidateScanAuthorization();
+        if (status.filmPresent === false || registrationChanged) {
+          if (this.#state.activeOperationId !== null) {
+            this.#invalidateRegistrationPreservingActivePreviewLane();
+          } else {
+            this.#invalidatePreviewRegistration();
+          }
+        }
+        if (
+          status.motionArmed === true &&
+          this.#state.previewRequestFailure?.error.code === "HW_MOTION_NOT_ARMED"
+        ) {
+          this.#state.previewRequestFailure = null;
         }
         this.#notify();
         return;
@@ -1712,7 +2384,8 @@ export class SessionStore {
         // accepted preview). Missing or mismatched tokens are no-ops.
         if (
           this.#state.activeOperationId === null ||
-          payload.operationId !== this.#state.activeOperationId
+          payload.operationId !== this.#state.activeOperationId ||
+          this.#activePreviewAuthorizationEpoch !== this.#scanAuthorizationEpoch
         ) {
           return;
         }
@@ -1731,7 +2404,8 @@ export class SessionStore {
         }
         if (
           this.#state.activeOperationId === null ||
-          payload.operationId !== this.#state.activeOperationId
+          payload.operationId !== this.#state.activeOperationId ||
+          this.#activePreviewAuthorizationEpoch !== this.#scanAuthorizationEpoch
         ) {
           return;
         }
@@ -1745,6 +2419,8 @@ export class SessionStore {
         this.#previewOutcome = "failed";
         this.#state.previewOutcome = "failed";
         this.#state.previewError = { code: payload.code, message: payload.message };
+        this.#pendingPreviewFilmProcess = null;
+        this.#state.previewFilmProcess = null;
         this.#notify();
         return;
       }
@@ -1763,10 +2439,17 @@ export class SessionStore {
         // thumbnailsFailed already marked it failed -- a zero-count
         // completion preceded by a failure is a FAILURE, not an empty
         // success.
-        if (this.#previewOutcome !== "failed") {
+        const previewStillAuthorized =
+          this.#activePreviewAuthorizationEpoch === this.#scanAuthorizationEpoch;
+        if (this.#previewOutcome !== "failed" && previewStillAuthorized) {
           this.#previewOutcome = "succeeded";
           this.#state.previewOutcome = "succeeded";
           this.#state.latestCompletedPreviewOperationId = payload.operationId;
+          if (this.#pendingPreviewFilmProcess?.operationId === payload.operationId) {
+            this.#state.previewFilmProcess =
+              this.#pendingPreviewFilmProcess.filmProcess;
+          }
+          this.#pendingPreviewFilmProcess = null;
           this.#state.filmFeedInterrupted = null;
           // A successful preview is the trigger for replaying every saved
           // frame-alignment draft through roll.setSpacingOffset (Task 2);
@@ -1774,8 +2457,19 @@ export class SessionStore {
           // those frames excluded from startScan.
           const replayEpoch = this.#alignmentReplayEpoch;
           void this.#replayFrameAlignmentDrafts(payload.operationId, replayEpoch);
+        } else if (this.#previewOutcome !== "failed") {
+          // A foreign/untagged status changed media identity while this
+          // worker was active. Its terminal releases the lane but cannot
+          // resurrect registration evidence for the superseded media.
+          this.#previewOutcome = null;
+          this.#state.previewOutcome = null;
+          this.#state.previewError = null;
+          this.#state.latestCompletedPreviewOperationId = null;
+          this.#state.previewFilmProcess = null;
         }
         this.#state.activeOperationId = null;
+        this.#activePreviewAuthorizationEpoch = null;
+        this.#pendingPreviewFilmProcess = null;
         this.#notify();
         return;
       }

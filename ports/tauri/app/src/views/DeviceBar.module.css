@@ -44,6 +44,21 @@
   border: 1px solid #e5e7eb;
 }
 
+.connectionState,
+.connectionHint {
+  align-self: flex-start;
+  font-size: 0.75rem;
+}
+
+.connectionState {
+  color: #047857;
+  font-weight: 600;
+}
+
+.connectionHint {
+  color: #6b7280;
+}
+
 .controlButton {
   align-self: flex-start;
   padding: 0.35rem 0.75rem;
@@ -51,6 +66,12 @@
   border: 1px solid #d1d5db;
   background: #ffffff;
   cursor: pointer;
+}
+
+.controlButton:disabled {
+  color: #9ca3af;
+  background: #f9fafb;
+  cursor: not-allowed;
 }
 
 .statusBlock {

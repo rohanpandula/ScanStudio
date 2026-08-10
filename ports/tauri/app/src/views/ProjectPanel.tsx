@@ -2,6 +2,10 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { homeDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import { sessionStore, type SessionState } from "../session";
+import {
+  preProjectPreviewRegistration,
+  sessionOperationBusy,
+} from "../session/store/session";
 import type { ProjectSummary } from "../session/wire/types";
 import { frameCountRangeFor, validateFrameCount, type Carrier } from "./projectRules";
 import styles from "./ProjectPanel.module.css";
@@ -58,6 +62,7 @@ export default function ProjectPanel() {
   const [carrier, setCarrier] = useState<Carrier>("roll36");
   const [frameCount, setFrameCount] = useState("36");
   const [filmProcess, setFilmProcess] = useState<FilmProcess>("positive");
+  const [carrierConfirmed, setCarrierConfirmed] = useState(false);
   const [directory, setDirectory] = useState<string | undefined>(undefined);
   const [recent, setRecent] = useState<ProjectSummary[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -65,6 +70,25 @@ export default function ProjectPanel() {
 
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const project = state.project;
+  const previewRegistration = preProjectPreviewRegistration(state);
+  const operationBusy = sessionOperationBusy(state);
+
+  useEffect(() => {
+    if (previewRegistration === null) return;
+    if (previewRegistration.carrier !== null) {
+      setCarrier(previewRegistration.carrier);
+      setCarrierConfirmed(true);
+    } else {
+      setCarrierConfirmed(false);
+    }
+    setFrameCount(String(previewRegistration.frameCount));
+    setFilmProcess(previewRegistration.filmProcess);
+  }, [
+    previewRegistration?.operationId,
+    previewRegistration?.carrier,
+    previewRegistration?.frameCount,
+    previewRegistration?.filmProcess,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,10 +109,34 @@ export default function ProjectPanel() {
     };
   }, []);
 
-  const count = Number(frameCount);
-  const range = frameCountRangeFor(carrier);
-  const validation = validateFrameCount(carrier, count);
-  const createDisabled = name.trim() === "" || !validation.valid || submitting;
+  const resolvedCarrier = previewRegistration?.carrier ?? carrier;
+  const count = previewRegistration?.frameCount ?? Number(frameCount);
+  const resolvedFilmProcess = previewRegistration?.filmProcess ?? filmProcess;
+  const range = frameCountRangeFor(resolvedCarrier);
+  const validation = validateFrameCount(resolvedCarrier, count);
+  const holderNeedsConfirmation =
+    previewRegistration !== null &&
+    previewRegistration.carrier === null &&
+    !carrierConfirmed;
+  const completedPreviewNeedsRecovery =
+    project === null &&
+    state.previewOutcome === "succeeded" &&
+    state.previewFilmProcess !== null &&
+    previewRegistration === null;
+  const waitingForDetectedStatus =
+    completedPreviewNeedsRecovery &&
+    state.connection.device?.kind === "real" &&
+    state.latestCompletedPreviewOperationId !== null &&
+    state.previewStatusOperationId !== state.latestCompletedPreviewOperationId;
+  const previewRegistrationIncomplete =
+    completedPreviewNeedsRecovery && !waitingForDetectedStatus;
+  const createDisabled =
+    name.trim() === "" ||
+    !validation.valid ||
+    holderNeedsConfirmation ||
+    completedPreviewNeedsRecovery ||
+    submitting ||
+    operationBusy;
 
   const pickDirectory = async (): Promise<void> => {
     try {
@@ -111,9 +159,9 @@ export default function ProjectPanel() {
     try {
       await sessionStore.createProject(
         name.trim(),
-        carrier,
+        resolvedCarrier,
         count,
-        filmProcess,
+        resolvedFilmProcess,
         directory,
       );
     } catch (err) {
@@ -127,6 +175,15 @@ export default function ProjectPanel() {
     setError(null);
     try {
       await sessionStore.openProject(summary.directory);
+    } catch (err) {
+      setError(messageOf(err));
+    }
+  };
+
+  const refreshPreviewStatus = async (): Promise<void> => {
+    setError(null);
+    try {
+      await sessionStore.refreshStatus();
     } catch (err) {
       setError(messageOf(err));
     }
@@ -155,8 +212,12 @@ export default function ProjectPanel() {
         <label htmlFor="project-carrier">Carrier</label>
         <select
           id="project-carrier"
-          value={carrier}
-          onChange={(event) => setCarrier(event.target.value as Carrier)}
+          value={resolvedCarrier}
+          disabled={previewRegistration?.carrier !== null && previewRegistration !== null}
+          onChange={(event) => {
+            setCarrier(event.target.value as Carrier);
+            setCarrierConfirmed(true);
+          }}
         >
           {CARRIERS.map((option) => (
             <option key={option} value={option}>
@@ -170,13 +231,15 @@ export default function ProjectPanel() {
           type="number"
           min={range.min}
           max={range.max}
-          value={frameCount}
+          value={previewRegistration === null ? frameCount : String(previewRegistration.frameCount)}
+          readOnly={previewRegistration !== null}
           onChange={(event) => setFrameCount(event.target.value)}
         />
         <label htmlFor="project-film-process">Film process</label>
         <select
           id="project-film-process"
-          value={filmProcess}
+          value={resolvedFilmProcess}
+          disabled={previewRegistration !== null}
           onChange={(event) => setFilmProcess(event.target.value as FilmProcess)}
         >
           {FILM_PROCESSES.map((option) => (
@@ -185,6 +248,48 @@ export default function ProjectPanel() {
             </option>
           ))}
         </select>
+        {previewRegistration !== null && (
+          <p className={styles.registrationSummary} data-testid="preview-registration-summary">
+            {previewRegistration.frameCount} frames detected with {previewRegistration.filmProcess}.
+            {previewRegistration.carrier === null
+              ? " Confirm the loaded film holder before creating the project."
+              : " These values are locked to the completed preview."}
+          </p>
+        )}
+        {waitingForDetectedStatus && (
+          <>
+            <p className={styles.registrationSummary} data-testid="preview-status-pending">
+              Waiting for the scanner to report the detected holder and frame count.
+            </p>
+            <button
+              type="button"
+              className={styles.controlButton}
+              data-testid="refresh-preview-status"
+              disabled={operationBusy}
+              onClick={() => void refreshPreviewStatus()}
+            >
+              Check scanner
+            </button>
+          </>
+        )}
+        {previewRegistrationIncomplete && (
+          <p className={styles.registrationSummary} data-testid="preview-registration-incomplete">
+            Preview registration is incomplete or a saved spacing adjustment could not be
+            restored. Choose Preview again before creating the project.
+          </p>
+        )}
+        {previewRegistration !== null &&
+          previewRegistration.carrier === null &&
+          !carrierConfirmed && (
+            <button
+              type="button"
+              className={styles.controlButton}
+              data-testid="confirm-preview-carrier"
+              onClick={() => setCarrierConfirmed(true)}
+            >
+              Confirm {carrier} holder
+            </button>
+          )}
         <div className={styles.directoryRow}>
           <button type="button" className={styles.controlButton} onClick={() => void pickDirectory()}>
             Choose output folder
@@ -213,6 +318,9 @@ export default function ProjectPanel() {
               type="button"
               className={styles.recentRow}
               data-testid={`recent-project-${summary.id}`}
+              disabled={
+                operationBusy || submitting
+              }
               onClick={() => void openRecent(summary)}
             >
               <span className={styles.recentName}>{summary.name}</span>
