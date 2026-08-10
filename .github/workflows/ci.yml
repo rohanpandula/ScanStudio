@@ -17,6 +17,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  adversarial-review-tooling:
+    name: Adversarial review tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test deterministic shard and OpenCode parsers
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m py_compile \
+            scripts/adversarial_review_input.py \
+            scripts/check_adversarial_review.py \
+            scripts/parse_opencode_review.py
+          bash -n scripts/run_adversarial_review.sh
+
   adversarial-review:
     name: Adversarial review evidence
     if: github.event_name == 'pull_request'
@@ -29,6 +43,7 @@ jobs:
         run: >-
           python3 scripts/check_adversarial_review.py
           --expected-base "${{ github.event.pull_request.base.sha }}"
+          --expected-tip "${{ github.event.pull_request.head.sha }}"
 
   app-and-engine:
     name: App and engine tests

@@ -31,25 +31,36 @@ Every bounded implementation step must follow
 [`docs/ADVERSARIAL-REVIEW.md`](docs/ADVERSARIAL-REVIEW.md) before work proceeds
 to the next step or is reported complete.
 
-The required reviewer is OpenCode running DeepSeek V4 Flash 0731. Run two
-fresh, independent contexts over the same frozen tracked-files diff: one
-security/reliability pass and one cross-layer correctness pass. The exact
-version-pinned model ID is `deepseek-v4-flash-0731`; do not silently substitute
-an alias, a newer model, or another provider model. Use the review protocol's
-required `high` reasoning variant so a full-diff review retains output budget
-for its auditable report. Neither first-pass reviewer may see the other
-first-pass report.
+The required reviewer is OpenCode using the exact provider/model pin
+`openrouter/deepseek/deepseek-v4-flash-0731`. Generate the deterministic
+file-boundary shard plan for one frozen base/head diff, then run two fresh,
+independent `high`-variant contexts over every shard: one security/reliability
+pass and one cross-layer correctness pass. Neither first-pass reviewer may see
+the other first-pass report. Do not silently substitute an alias, newer model,
+different provider, or lower variant for any required shard review.
+
+A full-diff integration synthesis is mandatory and never substitutes for
+shard coverage. It uses `high` by default. `low` is allowed only when the
+manifest contains a canonical, hashed failure receipt for a same-role `high`
+attempt over the identical base, reviewed head, input, and request. Follow the
+fallback schema and limits in the review protocol; do not use prose summaries
+as a substitute for canonical source bytes.
 
 Resolve every validated blocker, rerun deterministic tests, freeze the updated
 diff, and repeat both reviews. Do not treat review output as proof by itself:
 reproduce findings against the code and tests before changing behavior.
 
 Keep model/API calls local, tool-denied, and isolated from the repository
-directory. Never send credentials, environment files, untracked files,
-scanner logs, capture evidence, personal absolute paths, or live-media
-artifacts to a reviewer. CI verifies evidence consistency, hashes, and the
-trusted PR base; CI must not call model APIs. Those checks do not authenticate
-model provenance, so protected-branch review remains mandatory.
+directory. Use OpenCode JSON output and retain only the parsed assistant
+report plus sanitized session metadata. Never send credentials, environment
+files, untracked files, scanner logs, capture evidence, personal absolute
+paths, or live-media artifacts. Never copy raw reasoning into repository
+evidence. OpenCode necessarily retains the local session for export and
+auditable context IDs; subsequent local retention follows operator/tool
+policy. CI verifies evidence consistency, deterministic shard coverage,
+request hashes, and the trusted PR base/head; CI must not call model APIs.
+Those checks do not authenticate model provenance, so protected-branch review
+remains mandatory.
 
 If OpenCode or the exact model is unavailable, stop at the review gate and
 report that limitation. Do not waive the gate or claim the step complete.

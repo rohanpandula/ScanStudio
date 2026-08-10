@@ -31,6 +31,7 @@ jobs:
       - name: Validate with code from the protected base
         env:
           REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [[ ! -f validator/scripts/check_adversarial_review.py ]]; then
             echo "Base branch has not bootstrapped the adversarial-review validator yet."
@@ -38,4 +39,5 @@ jobs:
           fi
           python3 validator/scripts/check_adversarial_review.py \
             --repository candidate \
-            --expected-base "$REVIEW_BASE_SHA"
+            --expected-base "$REVIEW_BASE_SHA" \
+            --expected-tip "$REVIEW_HEAD_SHA"

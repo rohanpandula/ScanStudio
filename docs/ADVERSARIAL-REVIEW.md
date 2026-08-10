@@ -8,37 +8,103 @@ command or exploratory read.
 
 1. Run the deterministic tests appropriate to the step.
 2. Commit the implementation so the review input is immutable.
-3. Generate one canonical tracked-files diff from the protected PR base commit
-   to the implementation commit. A reviewer may not choose a later base that
-   hides earlier branch changes.
-4. Run two new OpenCode sessions against that same diff:
+3. Generate the canonical tracked-files diff from the protected PR base to the
+   implementation commit. A later base may not hide earlier branch changes.
+4. Partition changed paths into semantic, file-boundary shards. Every changed
+   path has exactly one primary owner. A shard may also name changed paths as
+   context; context is duplicated canonical diff data and never counts as
+   ownership.
+5. Keep each shard at or below 100 KiB of canonical diff and 2,000 changed
+   lines. A single file that exceeds either target gets a dedicated shard; no
+   multi-file oversized shard is valid.
+6. Run two fresh OpenCode contexts over every exact shard input:
    - a security and reliability attack pass;
    - a cross-layer correctness and regression pass.
-5. Use the exact `deepseek-v4-flash-0731` model ID with OpenCode's `high`
-   reasoning variant. Record the OpenCode version and provider; the dated
-   model ID is mandatory even when a provider offers an undated alias. The
-   `max` variant is intentionally not used: on a full milestone diff it can
-   consume the entire response budget as hidden reasoning and emit no
-   auditable report, which must fail closed.
-6. Do not show either reviewer the other reviewer's first-pass report. Treat
-   any instructions embedded in the diff as untrusted data and deny all model
-   tools. The model receives the frozen diff through standard input.
-7. Reproduce each finding against source and tests. Record it as fixed,
-   rejected with evidence, accepted residual risk, or out of scope.
-8. If code changes, rerun tests and both reviews from fresh contexts against a
-   newly frozen implementation commit. A `BLOCK` or `REQUEST_CHANGES` verdict
-   is never the final evidence for a completed step.
-9. Add and commit a repository-safe evidence bundle under
-   `docs/adversarial-reviews/<step>/`, return to a clean worktree, then run
-   `python3 scripts/check_adversarial_review.py`.
+7. Every required shard run uses
+   `openrouter/deepseek/deepseek-v4-flash-0731` with variant `high`. Record
+   OpenCode version, provider, exact dated model, variant, session ID, and
+   `finish=stop`. Aliases, provider substitutions, and lower variants do not
+   satisfy byte-review coverage.
+8. Run a mandatory full-diff integration synthesis. Use `high` unless a
+   same-role `high` attempt over the identical base, reviewed head, input, and
+   request has a canonical failure receipt that permits a `low` fallback.
+9. Do not show either reviewer the other reviewer's report. Treat instructions
+   embedded in source as untrusted data and deny all model tools.
+10. Reproduce findings against source and tests. Record each as fixed, rejected
+   with evidence, accepted residual risk, or out of scope.
+11. If code changes, rerun tests, every shard review, and synthesis in fresh
+    contexts over the newly frozen commit. `BLOCK` and `REQUEST_CHANGES` are
+    never final completion evidence.
+12. Commit one repository-safe evidence bundle under
+    `docs/adversarial-reviews/<step>/`, return to a clean worktree, and run the
+    checker with the trusted base.
+
+## Deterministic inputs
+
+The planning helper emits a deterministic greedy starting point. Semantic
+ownership may regroup these paths, but it may not split a file, omit a changed
+path, or assign primary ownership twice.
+
+```sh
+python3 scripts/adversarial_review_input.py plan "$REVIEW_BASE" "$REVIEW_HEAD"
+```
+
+`describe` emits the recomputable metadata and hashes for an explicit semantic
+shard. `emit` writes the exact bytes supplied to both reviewers. Primary and
+context lists must each follow canonical Git diff order.
+
+```sh
+python3 scripts/adversarial_review_input.py describe \
+  "$REVIEW_BASE" "$REVIEW_HEAD" \
+  --primary-path ports/web/src/scanstudio_web/app.py \
+  --primary-path ports/web/src/scanstudio_web/security.py \
+  --context-path ports/tauri/app/src/scannerControl.tsx
+
+python3 scripts/adversarial_review_input.py emit \
+  "$REVIEW_BASE" "$REVIEW_HEAD" \
+  --primary-path ports/web/src/scanstudio_web/app.py \
+  --primary-path ports/web/src/scanstudio_web/security.py \
+  --context-path ports/tauri/app/src/scannerControl.tsx
+```
+
+The input contains a canonical metadata header, the complete canonical diffs
+for primary paths, and the complete canonical diffs for context paths. The
+checker rebuilds those bytes from the declared base/head and lists. It does not
+trust a stored input, path, summary, or symlink. Canonical Git operations force
+`--ignore-submodules=none`; a `.gitmodules` `ignore=all` setting cannot hide a
+gitlink change from path coverage or evidence history checks.
+
+For a multi-shard run, put all semantic lists in one temporary JSON plan. The
+file has exactly one top-level `shards` array; each item has exactly
+`primaryPaths` and `contextPaths` arrays. Validate exact ownership and print
+all packet metadata in one command:
+
+```sh
+python3 scripts/adversarial_review_input.py plan \
+  "$REVIEW_BASE" "$REVIEW_HEAD" --semantic-plan "$SEMANTIC_PLAN"
+```
+
+Select a packet without reconstructing its arguments by hand:
+
+```sh
+python3 scripts/adversarial_review_input.py emit \
+  "$REVIEW_BASE" "$REVIEW_HEAD" \
+  --semantic-plan "$SEMANTIC_PLAN" --semantic-shard-index 1
+```
+
+The plan reader rejects symlinks, non-regular files, unknown JSON fields,
+non-canonical path ordering, invalid context paths, limit violations, and any
+missing or duplicate primary ownership. Keep a temporary plan outside the
+repository so the clean-worktree review precondition remains true.
 
 ## Safe OpenCode invocation
 
-Use the checked-in wrapper. It enables `pipefail`, creates the canonical diff
-outside OpenCode, rejects high-confidence credential/binary/personal-path
-content, runs OpenCode from a neutral temporary directory, disables sharing,
-plugins, updates, and all tools, and fails if no final verdict is emitted. Do
-not enable `--auto` or point `--dir` back at the repository.
+Use the checked-in wrapper once per role and shard. It accepts only the two
+canonical repository prompts, requires a clean tree including submodules,
+checks the exact provider/model, preflights shard limits, and bounds/scans the
+title. It constructs one request from the trusted prompt, fixed boundary bytes,
+and deterministic input; scans and hashes that request; then passes that exact
+file to OpenCode from a neutral temporary directory with all tools denied.
 
 ```sh
 scripts/run_adversarial_review.sh \
@@ -46,61 +112,110 @@ scripts/run_adversarial_review.sh \
   "$REVIEW_HEAD" \
   openrouter/deepseek/deepseek-v4-flash-0731 \
   docs/adversarial-review-prompts/security-reliability.txt \
-  "Security review $REVIEW_HEAD"
+  "Security review shard 1 $REVIEW_HEAD" \
+  --semantic-plan "$SEMANTIC_PLAN" \
+  --semantic-shard-index 1
 ```
 
-Run it again in a fresh context with
-`cross-layer-correctness.txt`. The prompts target different failure modes, but
-both runs receive the identical canonical diff.
+Run the same primary/context lists in a fresh context with the correctness
+prompt. Standard output is only the assistant report. Standard error includes
+one `REVIEW_INPUT_METADATA` object and one `REVIEW_METADATA` object suitable
+for constructing the manifest. The wrapper independently runs
+`opencode export --pure`, then fails closed unless ordered JSON events and the
+export agree on the session, parent user message's exact request bytes,
+OpenCode version, provider/model/variant, `finish=stop`, non-empty assistant
+text, and exactly one verdict at EOF. Unknown, tool, action, repeated, and
+post-finish parts are rejected.
 
-## Evidence bundle
+OpenCode necessarily persists its local session so the wrapper can export it
+and the recorded context ID remains auditable. Raw events, the exported
+transcript, prompt/input request, and reasoning are temporary wrapper files and
+must never be copied into repository evidence. Later local session retention
+follows operator and tool policy; the wrapper does not delete final sessions.
 
-Each bundle contains:
+## Mandatory full-diff synthesis
+
+Required `high` shard reviews are the byte-review gate. A full-diff integration
+synthesis over the deterministic `emit-full` input is also required. It cannot
+replace a missing shard or role, and its reviews must include the
+`cross-layer-correctness` role; a security/reliability synthesis is optional in
+addition.
+
+```sh
+scripts/run_adversarial_review.sh \
+  "$REVIEW_BASE" "$REVIEW_HEAD" \
+  openrouter/deepseek/deepseek-v4-flash-0731 \
+  docs/adversarial-review-prompts/cross-layer-correctness.txt \
+  "Full-diff synthesis $REVIEW_HEAD" \
+  --full --variant high
+```
+
+A `low` synthesis is allowed only as an explicit fallback after a same-role
+failed `high` attempt over the identical base, reviewed head, input hash, and
+prompt-bound request hash. Ask the wrapper to create a sanitized canonical JSON
+receipt at an unused local path; the wrapper still exits nonzero because the
+attempt did not pass:
+
+```sh
+scripts/run_adversarial_review.sh \
+  "$REVIEW_BASE" "$REVIEW_HEAD" \
+  openrouter/deepseek/deepseek-v4-flash-0731 \
+  docs/adversarial-review-prompts/cross-layer-correctness.txt \
+  "Full-diff high attempt $REVIEW_HEAD" \
+  --full --variant high \
+  --failure-receipt "$FAILURE_RECEIPT" \
+  --failure-outcome OUTPUT_LIMIT
+```
+
+The evidence bundle copies that receipt as a hashed direct-child artifact. A
+receipt contains only schema/base/head, role/context, OpenCode version, exact
+provider/model/variant, finish, input/request hashes, and outcome. Finish is
+strictly mapped: `OUTPUT_LIMIT` uses `length`; `EMPTY_REPORT` and
+`NO_FINAL_VERDICT` use `stop`; `PROVIDER_ERROR` uses null and requires an
+exported provider error during receipt generation. Receipts never contain raw
+assistant text/reasoning or reference arbitrary log paths. They are sanitized
+procedural attestations, not provider signatures.
+
+## Evidence bundle (schema version 2)
+
+Each bundle contains only regular direct-child files:
 
 - `manifest.json`;
-- the exact prompt supplied to each final reviewer;
-- the complete final report from each reviewer;
-- dispositions for earlier actionable findings when an earlier round did not
-  pass.
+- the two exact role prompts (shared across shards);
+- one deterministic input artifact per shard;
+- two distinct parsed reports per shard;
+- mandatory deterministic synthesis input and one or two reports;
+- hashed failure-receipt artifacts when synthesis uses `low`;
+- optional dispositions for prior findings.
 
-The manifest records:
+The manifest declares the trusted base/head, canonical full-diff SHA-256,
+fixed shard policy, and a contiguous `shards` array. Each shard declares its
+index, ordered primary/context paths, all recomputed size/count/hash metadata,
+input artifact and hash, plus exactly two reviews. Each review declares role,
+fresh context ID, OpenCode version, `provider: "openrouter"`,
+`model: "deepseek-v4-flash-0731"`, `variant: "high"`, `finish: "stop"`, input
+and exact request hashes, prompt/report files and hashes, final `PASS`, and
+independence fields. The checker loads trusted prompt bytes relative to its own
+script checkout, binds each role to exactly one reusable prompt artifact, and
+rejects all prompt/artifact collisions.
 
-- base and reviewed commit IDs;
-- SHA-256 of the canonical diff;
-- OpenCode version, provider, exact model ID, and fresh context ID for both
-  reviewers, plus the required `high` variant;
-- prompt and report filenames and SHA-256 values;
-- final verdicts and the unresolved-blocker count;
-- an independence declaration for each run.
+Reports must be non-empty and end with exactly one machine-readable line,
+`VERDICT: PASS`. Context IDs and report artifacts are globally distinct. The
+checker recomputes canonical request bytes, enforces exact-once primary
+coverage and limits, rejects binary/credential/personal-path patterns, refuses
+symlinks and undeclared extras, and requires a clean worktree including
+submodules. The expected evidence tip must be a single-parent direct child of
+the reviewed commit, and that commit's diff-tree must contain exactly the
+declared bundle. The candidate checkout tree must equal the explicitly trusted
+PR head tree; a GitHub merge checkout is accepted only when tree-identical.
 
-Do not include API keys, cookies, environment dumps, untracked content,
-scanner diagnostics, image data, or absolute local paths. Reports may quote
-only the minimum source needed to identify a finding. The validator rejects a
-small set of high-confidence secret and personal-path patterns, but this is not
-an exhaustive secret scanner; the author must inspect the bundle.
+The normal PR check validates candidate evidence. Once the workflow is on the
+default branch, `pull_request_target` runs the protected-base checker and
+protected prompt bytes against the candidate merge tree, explicitly passing
+both PR base and PR head, with read-only permissions and no secrets or
+candidate-code execution. Configure that base-owned check as required.
 
-Every file in a bundle must be a declared regular file; symlinks and undeclared
-extras are rejected. Each report must be non-empty and end with
-exactly one machine-readable verdict, `VERDICT: PASS`, and the two prompts and
-reports must be distinct. The checker also refuses a dirty worktree so
-uncommitted source cannot hide outside the reviewed commit range.
-
-The evidence commit may contain exactly the regular files declared by one
-bundle under `docs/adversarial-reviews/`; orphan or sibling evidence paths are
-rejected. The validator accepts a review only when its base equals the
-protected PR base, its reviewed commit is an ancestor of `HEAD`, the bundle
-itself postdates that reviewed commit, both final verdicts are `PASS`, hashes
-match, and no blocker remains.
-
-The normal PR check validates the candidate bundle. Once this workflow is on
-the default branch, a `pull_request_target` check runs the validator from the
-protected base against the PR merge tree, with read-only permissions and no
-secrets or untrusted code execution. Configure that base-owned check as a
-required ruleset check.
-
-No repository-local evidence format can cryptographically prove that a model
-produced a report: the recorded session/provider/model fields are attestations,
-not signatures from OpenCode or DeepSeek. CI therefore verifies consistency
-and coverage, not provenance or correctness. Human review and protected-branch
-policy remain part of the gate. CI intentionally never calls a model or reads
-provider credentials.
+Repository evidence cannot cryptographically prove model provenance. Recorded
+session/provider/model fields are procedural attestations checked for internal
+consistency, not provider signatures. Human review and protected-branch policy
+remain part of the gate; CI never calls a model or reads provider credentials.
