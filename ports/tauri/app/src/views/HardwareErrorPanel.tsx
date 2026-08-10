@@ -91,8 +91,9 @@ export default function HardwareErrorPanel({
           {error.message}
         </p>
         <p className={styles.guidance} data-testid="motion-independent-guidance">
-          The motion latch is operator-owned: arm it at the machine before scanning.
-          The app never arms motion on your behalf.
+          Motion authorization is operator-owned. Reopen ScanStudio using the
+          documented owner-authorized hardware launch procedure. The app never
+          enables motion on your behalf.
         </p>
       </div>
     );

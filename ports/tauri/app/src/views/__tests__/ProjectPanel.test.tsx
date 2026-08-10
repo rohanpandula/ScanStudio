@@ -5,7 +5,13 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionStore } from "../../session/store/session";
 import { createScriptedTransport } from "../../session/testing/harness";
-import type { EngineError, ProjectSummary, ScanProject } from "../../session/wire/types";
+import type {
+  DeviceInfo,
+  EngineError,
+  ProjectSummary,
+  ScanProject,
+  ScannerStatus,
+} from "../../session/wire/types";
 import ProjectPanel from "../ProjectPanel";
 
 afterEach(cleanup);
@@ -152,6 +158,170 @@ describe("ProjectPanel", () => {
     expect(banner).toHaveTextContent("36 frames");
   });
 
+  it("uses preview identity and explicitly confirms an unknown holder", async () => {
+    const device: DeviceInfo = {
+      deviceId: "sim-strip",
+      model: "LS-5000 (simulated)",
+      kind: "simulated",
+      firmware: "sim-1",
+      connection: "virtual",
+    };
+    const status: ScannerStatus = {
+      connected: true,
+      adapter: "SA-21",
+      mediaLoaded: true,
+      carrier: null,
+      frameCount: 2,
+      lamp: "stable",
+      transport: "idle",
+      activeJobId: null,
+    };
+    const registeredProject: ScanProject = {
+      ...PROJECT,
+      id: "proj-registered",
+      name: "Registered strip",
+      carrier: "roll36",
+      frameCount: 2,
+      filmProcess: "bwNegative",
+      frames: [1, 2].map((index) => ({ index, excluded: false, receipts: [] })),
+    };
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const handle = createScriptedTransport({
+      onRequest: (method, params) => {
+        calls.push({ method, params: params as Record<string, unknown> });
+        if (method === "scanner.connect") return { result: { device, status } };
+        if (method === "scanner.acquireThumbnails") {
+          return { result: { accepted: true, frames: [1, 2] } };
+        }
+        if (method === "project.list") return { result: { projects: [] } };
+        if (method === "project.create") {
+          return {
+            result: { project: registeredProject, directory: "/tmp/registered" },
+          };
+        }
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+    await store.connect(device.deviceId);
+    store.setPreviewFilmProcess("bwNegative");
+    await store.acquireThumbnails();
+    const operationId = calls.find(
+      (call) => call.method === "scanner.acquireThumbnails",
+    )?.params.operationId as string;
+    for (const frameIndex of [1, 2]) {
+      handle.emitEvent({
+        event: "scanner.thumbnail",
+        payload: { frameIndex, thumbnail: { brightness: 0.5 }, operationId },
+      });
+    }
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 2, operationId },
+    });
+    mocks.sessionStore = store;
+    const createSpy = vi.spyOn(store, "createProject");
+    const user = userEvent.setup();
+
+    render(<ProjectPanel />);
+
+    expect(await screen.findByTestId("preview-registration-summary")).toHaveTextContent(
+      "2 frames detected with bwNegative",
+    );
+    expect(screen.getByLabelText("Carrier")).toHaveValue("roll36");
+    expect(screen.getByLabelText("Carrier")).toBeEnabled();
+    expect(screen.getByLabelText("Frame count")).toHaveValue(2);
+    expect(screen.getByLabelText("Frame count")).toHaveAttribute("readonly");
+    expect(screen.getByLabelText("Film process")).toHaveValue("bwNegative");
+    expect(screen.getByLabelText("Film process")).toBeDisabled();
+
+    await user.type(screen.getByLabelText("Project name"), "Registered strip");
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+    await user.click(screen.getByTestId("confirm-preview-carrier"));
+    expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
+    await act(async () => {
+      await user.click(screen.getByRole("button", { name: "Create" }));
+    });
+    expect(createSpy).toHaveBeenCalledWith(
+      "Registered strip",
+      "roll36",
+      2,
+      "bwNegative",
+      undefined,
+    );
+    expect(screen.queryByTestId("project-error")).toBeNull();
+  });
+
+  it("keeps Create disabled until a real preview reports its correlated detected holder", async () => {
+    const device: DeviceInfo = {
+      deviceId: "real-ls5000",
+      model: "LS-5000",
+      kind: "real",
+      firmware: "1.0",
+      connection: "usb",
+    };
+    const priorStatus: ScannerStatus = {
+      connected: true,
+      adapter: "MA-21",
+      mediaLoaded: true,
+      carrier: "mounted",
+      frameCount: 1,
+      lamp: "stable",
+      transport: "idle",
+      activeJobId: null,
+      motionArmed: true,
+      filmPresent: true,
+    };
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const handle = createScriptedTransport({
+      onRequest: (method, params) => {
+        calls.push({ method, params: params as Record<string, unknown> });
+        if (method === "scanner.connect") return { result: { device, status: priorStatus } };
+        if (method === "scanner.acquireThumbnails") {
+          return { result: { accepted: true, frames: [1] } };
+        }
+        if (method === "scanner.status") {
+          return {
+            result: { ...priorStatus, adapter: "SA-21", carrier: "strip6" },
+          };
+        }
+        if (method === "project.list") return { result: { projects: [] } };
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+    await store.connect(device.deviceId);
+    store.setPreviewFilmProcess("bwNegative");
+    await store.acquireThumbnails();
+    const operationId = calls.find(
+      (call) => call.method === "scanner.acquireThumbnails",
+    )?.params.operationId as string;
+    handle.emitEvent({
+      event: "scanner.thumbnail",
+      payload: { frameIndex: 1, thumbnail: { brightness: 0.5 }, operationId },
+    });
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 1, operationId },
+    });
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<ProjectPanel />);
+
+    await user.type(await screen.findByLabelText("Project name"), "Detected strip");
+    expect(screen.getByTestId("preview-status-pending")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+
+    await act(async () => {
+      await user.click(screen.getByTestId("refresh-preview-status"));
+    });
+    expect(await screen.findByTestId("preview-registration-summary")).toHaveTextContent(
+      "1 frames detected with bwNegative",
+    );
+    expect(screen.getByLabelText("Carrier")).toHaveValue("strip6");
+    expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
+  });
+
   it("passes the native picker's returned directory to createProject when one is chosen", async () => {
     dialogMocks.open.mockResolvedValue("/Users/test/My Scans");
     const store = projectFixture((method) => {
@@ -219,6 +389,19 @@ describe("ProjectPanel", () => {
       await user.click(row);
     });
     expect(openSpy).toHaveBeenCalledWith("/scans/old-roll");
+  });
+
+  it("disables create and open actions while a preview owns the lane", async () => {
+    const store = projectFixture();
+    await store.acquireThumbnails();
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<ProjectPanel />);
+
+    await user.type(await screen.findByLabelText("Project name"), "Blocked");
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+    expect(await screen.findByTestId("recent-project-proj-2")).toBeDisabled();
+    expect(screen.getByTestId("recent-project-proj-3")).toBeDisabled();
   });
 
   it("displays a rejected create's error message verbatim", async () => {

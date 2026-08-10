@@ -14,7 +14,15 @@ afterEach(cleanup);
 // app/src/session/index.ts, which wraps the Tauri invoke bridge and cannot
 // run under jsdom. Replace the module with a hoisted holder that each test
 // points at a fresh SessionStore built on a scripted transport.
-const mocks = vi.hoisted(() => ({ sessionStore: null as unknown }));
+const mocks = vi.hoisted(() => ({
+  sessionStore: null as unknown,
+  diagnosticTimeline: {
+    record: vi.fn(),
+    sessionId: "test-session",
+    summaryLines: [] as string[],
+    toJsonl: () => "",
+  },
+}));
 vi.mock("../../session", () => mocks);
 
 const SIM_DEVICE: DeviceInfo = {
@@ -23,6 +31,14 @@ const SIM_DEVICE: DeviceInfo = {
   kind: "simulated",
   firmware: "1.0.0",
   connection: "USB",
+};
+
+const REAL_DEVICE: DeviceInfo = {
+  deviceId: "real-ls5000-0",
+  model: "Nikon LS-5000",
+  kind: "real",
+  firmware: "1.02",
+  connection: "usb",
 };
 
 const CONNECTED_STATUS: ScannerStatus = {
@@ -89,30 +105,121 @@ describe("DeviceBar", () => {
     expect(disconnectSpy).toHaveBeenCalled();
   });
 
-  it("never renders the simulated label on a real device's card", async () => {
-    const realDevice: DeviceInfo = {
-      deviceId: "real-ls5000-0",
-      model: "Nikon LS-5000",
-      kind: "real" as DeviceInfo["kind"],
-      firmware: "2.4.1",
-      connection: "SCSI",
-    };
-    mocks.sessionStore = scriptedFixture([realDevice]);
+  it("only lets the active device disconnect when multiple devices are listed", async () => {
+    const store = scriptedFixture([SIM_DEVICE, REAL_DEVICE], CONNECTED_STATUS);
+    await store.connect(SIM_DEVICE.deviceId);
+    mocks.sessionStore = store;
+    const connectSpy = vi.spyOn(store, "connect");
+    const user = userEvent.setup();
+
     render(<DeviceBar />);
-    const card = await screen.findByTestId(`device-card-${realDevice.deviceId}`);
-    expect(card).toHaveTextContent(realDevice.model);
+
+    const activeCard = await screen.findByTestId(`device-card-${SIM_DEVICE.deviceId}`);
+    const inactiveCard = screen.getByTestId(`device-card-${REAL_DEVICE.deviceId}`);
+    expect(within(activeCard).getByRole("button", { name: "Disconnect" })).toBeEnabled();
+    expect(within(activeCard).getByText("Active")).toBeInTheDocument();
+    expect(within(inactiveCard).queryByRole("button", { name: "Disconnect" })).toBeNull();
+    const inactiveConnect = within(inactiveCard).getByRole("button", { name: "Connect" });
+    expect(inactiveConnect).toBeDisabled();
+    expect(inactiveCard).toHaveTextContent("Disconnect active device first");
+    expect(screen.getAllByRole("button", { name: "Disconnect" })).toHaveLength(1);
+
+    await user.click(inactiveConnect);
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("releases the active card when the engine reports an asynchronous disconnect", async () => {
+    const handle = createScriptedTransport({
+      onRequest: (method) => {
+        if (method === "scanner.list") return { result: { devices: [SIM_DEVICE] } };
+        if (method === "scanner.connect") {
+          return { result: { device: SIM_DEVICE, status: CONNECTED_STATUS } };
+        }
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+    await store.connect(SIM_DEVICE.deviceId);
+    mocks.sessionStore = store;
+    render(<DeviceBar />);
+    expect(await screen.findByText("Active")).toBeInTheDocument();
+
+    act(() => {
+      handle.emitEvent({
+        event: "scanner.status",
+        payload: {
+          status: {
+            ...CONNECTED_STATUS,
+            connected: false,
+            mediaLoaded: false,
+            carrier: null,
+            frameCount: null,
+            transport: "idle",
+          },
+        },
+      });
+    });
+
+    expect(screen.queryByText("Active")).toBeNull();
+    expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+    expect(store.getState().connection).toMatchObject({
+      connected: false,
+      device: null,
+    });
+  });
+
+  it("consumes and surfaces a typed connection rejection", async () => {
+    const handle = createScriptedTransport({
+      onRequest: (method) => {
+        if (method === "scanner.list") return { result: { devices: [SIM_DEVICE] } };
+        if (method === "scanner.connect") {
+          return {
+            error: {
+              code: "ALREADY_CONNECTED",
+              message: "another scanner session already owns the bridge",
+              recoverable: true,
+            },
+          };
+        }
+        return { result: undefined };
+      },
+    });
+    mocks.sessionStore = new SessionStore(handle.transport);
+    const user = userEvent.setup();
+    render(<DeviceBar />);
+
+    await user.click(await screen.findByRole("button", { name: "Connect" }));
+    const panel = await screen.findByTestId("hardware-error-panel");
+    expect(panel).toHaveTextContent("ALREADY_CONNECTED");
+    expect(panel).toHaveTextContent("another scanner session already owns the bridge");
+  });
+
+  it("normalizes a malformed connection rejection without trusting missing fields", async () => {
+    const store = scriptedFixture([SIM_DEVICE]);
+    vi.spyOn(store, "connect").mockRejectedValue({
+      code: "BROKEN_ADAPTER",
+      message: "adapter returned an incomplete error",
+    });
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<DeviceBar />);
+
+    await user.click(await screen.findByRole("button", { name: "Connect" }));
+    const panel = await screen.findByTestId("hardware-error-panel");
+    expect(panel).toHaveTextContent("BROKEN_ADAPTER");
+    expect(panel).toHaveTextContent("adapter returned an incomplete error");
+  });
+
+  it("never renders the simulated label on a real device's card", async () => {
+    mocks.sessionStore = scriptedFixture([REAL_DEVICE]);
+    render(<DeviceBar />);
+    const card = await screen.findByTestId(`device-card-${REAL_DEVICE.deviceId}`);
+    expect(card).toHaveTextContent(REAL_DEVICE.model);
     expect(within(card).getByText("real")).toBeInTheDocument();
     expect(within(card).queryByText(/simulated/i)).toBeNull();
   });
 
   it("describes real mediaLoaded as preview registration, not film presence", async () => {
-    const realDevice: DeviceInfo = {
-      deviceId: "real-ls5000-0",
-      model: "Nikon LS-5000",
-      kind: "real",
-      firmware: "1.02",
-      connection: "usb",
-    };
     const realStatus: ScannerStatus = {
       ...CONNECTED_STATUS,
       mediaLoaded: false,
@@ -122,8 +229,8 @@ describe("DeviceBar", () => {
       filmPresent: true,
       motionArmed: false,
     };
-    const store = scriptedFixture([realDevice], realStatus);
-    await store.connect(realDevice.deviceId);
+    const store = scriptedFixture([REAL_DEVICE], realStatus);
+    await store.connect(REAL_DEVICE.deviceId);
     mocks.sessionStore = store;
 
     render(<DeviceBar />);
@@ -131,5 +238,45 @@ describe("DeviceBar", () => {
     expect(await screen.findByText("Preview registration")).toBeInTheDocument();
     expect(screen.getByText("Not established")).toBeInTheDocument();
     expect(screen.queryByText("No media")).toBeNull();
+  });
+
+  it("routes an immediate motion refusal into the typed hardware panel and diagnostics", async () => {
+    const readyStatus: ScannerStatus = {
+      ...CONNECTED_STATUS,
+      transport: "idle",
+      motionArmed: true,
+      filmPresent: true,
+    };
+    const handle = createScriptedTransport({
+      onRequest: (method) => {
+        if (method === "scanner.list") return { result: { devices: [REAL_DEVICE] } };
+        if (method === "scanner.connect") {
+          return { result: { device: REAL_DEVICE, status: readyStatus } };
+        }
+        if (method === "scanner.acquireThumbnails") {
+          return {
+            error: {
+              code: "HW_MOTION_NOT_ARMED",
+              message: "motion authorization expired",
+              recoverable: false,
+            },
+          };
+        }
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+    await store.connect(REAL_DEVICE.deviceId);
+    await expect(store.acquireThumbnails()).rejects.toMatchObject({
+      code: "HW_MOTION_NOT_ARMED",
+    });
+    mocks.sessionStore = store;
+
+    render(<DeviceBar />);
+
+    const panel = await screen.findByTestId("hardware-error-panel");
+    expect(panel).toHaveAttribute("data-code", "HW_MOTION_NOT_ARMED");
+    expect(panel).toHaveTextContent("motion authorization expired");
+    expect(screen.getByTestId("diagnostic-report-actions")).toBeInTheDocument();
   });
 });

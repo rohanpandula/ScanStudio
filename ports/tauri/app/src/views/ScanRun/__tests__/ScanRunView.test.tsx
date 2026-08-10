@@ -115,6 +115,13 @@ async function runFixture(): Promise<Fixture> {
   await store.loadMedia("roll36");
   await store.createProject("Run Roll", "roll36", 36, "c41ColorNegative");
   await store.acquireThumbnails();
+  const previewOperationId = calls.find(
+    (call) => call.method === "scanner.acquireThumbnails",
+  )?.params.operationId as string;
+  handle.emitEvent({
+    event: "scanner.thumbnailsComplete",
+    payload: { count: 36, operationId: previewOperationId },
+  });
   await store.startScan([1, 2, 3, 4, 13], {
     resolutionDpi: 4000,
     bitDepth: 16,

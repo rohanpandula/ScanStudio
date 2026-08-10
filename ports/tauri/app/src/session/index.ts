@@ -14,5 +14,13 @@ export const sessionStore = new SessionStore(createClientTransport());
 // internals.
 export const diagnosticTimeline = new DiagnosticTimeline();
 
-export { SessionStore };
-export type { SessionState } from "./store/session";
+export {
+  SessionStore,
+  preProjectPreviewRegistration,
+  sessionOperationBusy,
+} from "./store/session";
+export type {
+  FilmProcess,
+  PreProjectPreviewRegistration,
+  SessionState,
+} from "./store/session";

@@ -63,9 +63,12 @@ const PROJECT_WITH_ALIGNED_FRAME: ScanProject = {
   },
   rollMetadata: { keywords: [] },
   createdAt: "2026-07-22T09:00:00Z",
-  frames: [
-    { index: 2, excluded: false, alignment: { offsetRows: 9, approved: true }, receipts: [] },
-  ],
+  frames: Array.from({ length: 36 }, (_, offset) => {
+    const index = offset + 1;
+    return index === 2
+      ? { index, excluded: false, alignment: { offsetRows: 9, approved: true }, receipts: [] }
+      : { index, excluded: false, receipts: [] };
+  }),
 };
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -82,6 +85,7 @@ function approvalStore(overrides?: {
   setSpacingOffset?: (params: Record<string, unknown>) => { error: EngineError };
 }) {
   const calls: { method: string; params: Record<string, unknown> }[] = [];
+  let currentProject = structuredClone(PROJECT_WITH_ALIGNED_FRAME);
   const handle = createScriptedTransport({
     onRequest: (method, params) => {
       calls.push({ method, params: params as Record<string, unknown> });
@@ -97,10 +101,26 @@ function approvalStore(overrides?: {
               thumbnail: { imagePath: "/preview/frame-new.png", spacingOffset: 9 },
             },
           };
-        case "project.setFrameAlignment":
-          return { result: { project: PROJECT_WITH_ALIGNED_FRAME } };
+        case "project.setFrameAlignment": {
+          const request = params as {
+            frameIndex: number;
+            alignment: ScanProject["frames"][number]["alignment"] | null;
+          };
+          currentProject = {
+            ...currentProject,
+            frames: currentProject.frames.map((frame) => {
+              if (frame.index !== request.frameIndex) return frame;
+              if (request.alignment === null) {
+                const { alignment: _removed, ...withoutAlignment } = frame;
+                return withoutAlignment;
+              }
+              return { ...frame, alignment: request.alignment };
+            }),
+          };
+          return { result: { project: currentProject } };
+        }
         case "project.open":
-          return { result: { project: PROJECT_WITH_ALIGNED_FRAME, directory: "/proj-b" } };
+          return { result: { project: currentProject, directory: "/proj-b" } };
         case "scan.start":
           return { result: { jobId: "job-1" } };
         default:

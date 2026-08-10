@@ -40,6 +40,12 @@ const EMPTY_STATUS: ScannerStatus = {
   frameCount: null,
 };
 
+const REAL_EMPTY_ARMED: ScannerStatus = {
+  ...EMPTY_STATUS,
+  motionArmed: true,
+  filmPresent: true,
+};
+
 const SIMULATED_DEVICE: DeviceInfo = {
   deviceId: "sim-ls5000-0",
   model: "LS-5000 (simulated)",
@@ -171,12 +177,41 @@ describe("ContactSheet", () => {
 
     const loadCall = fixture.calls.find((c) => c.method === "sim.loadMedia");
     expect(loadCall?.params.carrier).toBe("strip6");
-    // The loaded status from the scripted response swaps the controls for the
-    // grid. With no active project there is nothing to preview from, so no
-    // Preview button renders (filmProcess comes from the project).
+    // The loaded status swaps the controls for the grid and exposes the
+    // pre-project preview flow. Film process is selected before the project
+    // exists so the detected frame registration can be saved afterward.
     expect(await screen.findByTestId("contact-grid")).toBeInTheDocument();
     expect(screen.queryByTestId("load-media-controls")).toBeNull();
-    expect(screen.queryByTestId("preview-button")).toBeNull();
+    expect(screen.getByTestId("preview-button")).toBeEnabled();
+    expect(screen.getByLabelText("Film process for preview")).toHaveValue(
+      "c41ColorNegative",
+    );
+  });
+
+  it("consumes and surfaces a simulated-media load rejection", async () => {
+    const fixture = contactFixture({
+      device: SIMULATED_DEVICE,
+      status: EMPTY_STATUS,
+      onRequest: (method) =>
+        method === "sim.loadMedia"
+          ? {
+              error: {
+                code: "NOT_CONNECTED",
+                message: "the simulator disconnected before media could load",
+                recoverable: true,
+              },
+            }
+          : undefined,
+    });
+    await fixture.store.connect(SIMULATED_DEVICE.deviceId);
+    mocks.sessionStore = fixture.store;
+    const user = userEvent.setup();
+    render(<ContactSheet />);
+
+    await user.click(screen.getByRole("button", { name: "roll36" }));
+    expect(await screen.findByTestId("media-load-error")).toHaveTextContent(
+      "NOT_CONNECTED: the simulator disconnected before media could load",
+    );
   });
 
   it("asks a disconnected user to connect without offering simulator carrier controls", () => {
@@ -192,14 +227,12 @@ describe("ContactSheet", () => {
     expect(fixture.calls.some((call) => call.method === "sim.loadMedia")).toBe(false);
   });
 
-  it("offers the first real preview before registration without sending simulator commands", async () => {
+  it("offers the first real preview before a project exists and sends the selected process", async () => {
     const fixture = contactFixture({
       device: REAL_DEVICE,
-      status: EMPTY_STATUS,
-      project: PROJECT,
+      status: REAL_EMPTY_ARMED,
     });
     await fixture.store.connect(REAL_DEVICE.deviceId);
-    await fixture.store.createProject("Contact Sheet Roll", "roll36", 36, "c41ColorNegative");
     mocks.sessionStore = fixture.store;
     const user = userEvent.setup();
 
@@ -209,12 +242,107 @@ describe("ContactSheet", () => {
       "Load film in the scanner, then choose Preview to establish the current frame registration.",
     );
     expect(screen.queryByTestId("load-media-controls")).toBeNull();
+    expect(screen.queryByTestId("active-project")).toBeNull();
+    await user.selectOptions(
+      screen.getByLabelText("Film process for preview"),
+      "bwNegative",
+    );
     const preview = screen.getByTestId("preview-button");
     await act(async () => {
       await user.click(preview);
     });
-    expect(fixture.calls.some((call) => call.method === "scanner.acquireThumbnails")).toBe(true);
+    const acquire = fixture.calls.find(
+      (call) => call.method === "scanner.acquireThumbnails",
+    );
+    expect(acquire?.params.filmProcess).toBe("bwNegative");
+    expect(fixture.calls.some((call) => call.method === "project.create")).toBe(false);
     expect(fixture.calls.some((call) => call.method === "sim.loadMedia")).toBe(false);
+  });
+
+  it.each([false, undefined])(
+    "keeps real Preview visible but fail-closed when motionArmed is %s",
+    async (motionArmed) => {
+      const fixture = contactFixture({
+        device: REAL_DEVICE,
+        status: { ...EMPTY_STATUS, motionArmed, filmPresent: true },
+      });
+      await fixture.store.connect(REAL_DEVICE.deviceId);
+      mocks.sessionStore = fixture.store;
+      const user = userEvent.setup();
+
+      render(<ContactSheet />);
+
+      expect(screen.getByTestId("preview-button")).toBeVisible();
+      expect(screen.getByTestId("preview-button")).toBeDisabled();
+      expect(screen.getByTestId("preview-readiness-guidance")).toHaveTextContent(
+        motionArmed === false
+          ? /motion authorization.*owner-authorized/i
+          : /motion readiness is unavailable.*check scanner status/i,
+      );
+      await user.click(screen.getByTestId("preview-button"));
+      expect(
+        fixture.calls.some((call) => call.method === "scanner.acquireThumbnails"),
+      ).toBe(false);
+    },
+  );
+
+  it("surfaces a typed scanner-status refresh failure from unknown motion readiness", async () => {
+    const fixture = contactFixture({
+      device: REAL_DEVICE,
+      status: { ...EMPTY_STATUS, motionArmed: undefined, filmPresent: true },
+      onRequest: (method) =>
+        method === "scanner.status"
+          ? {
+              error: {
+                code: "BRIDGE_UNAVAILABLE",
+                message: "scanner bridge did not answer",
+                recoverable: true,
+              },
+            }
+          : undefined,
+    });
+    await fixture.store.connect(REAL_DEVICE.deviceId);
+    mocks.sessionStore = fixture.store;
+    const user = userEvent.setup();
+    render(<ContactSheet />);
+
+    await user.click(screen.getByRole("button", { name: "Check scanner" }));
+    expect(await screen.findByTestId("status-refresh-error")).toHaveTextContent(
+      "BRIDGE_UNAVAILABLE: scanner bridge did not answer",
+    );
+  });
+
+  it("terminates a synchronous preview rejection and renders the exact bridge message", async () => {
+    const fixture = contactFixture({
+      device: REAL_DEVICE,
+      status: REAL_EMPTY_ARMED,
+      onRequest: (method) =>
+        method === "scanner.acquireThumbnails"
+          ? {
+              error: {
+                code: "HW_MOTION_NOT_ARMED",
+                message: "motion authorization is not armed for this process",
+                recoverable: false,
+              },
+            }
+          : undefined,
+    });
+    await fixture.store.connect(REAL_DEVICE.deviceId);
+    mocks.sessionStore = fixture.store;
+    const user = userEvent.setup();
+    const unhandled = vi.fn();
+    window.addEventListener("unhandledrejection", unhandled);
+
+    render(<ContactSheet />);
+    await act(async () => {
+      await user.click(screen.getByTestId("preview-button"));
+    });
+
+    expect(await screen.findByTestId("preview-request-failure")).toHaveTextContent(
+      "motion authorization is not armed for this process",
+    );
+    expect(unhandled).not.toHaveBeenCalled();
+    window.removeEventListener("unhandledrejection", unhandled);
   });
 
   it("calls acquireThumbnails with the project's filmProcess and disables the button while a preview is active", async () => {
@@ -352,6 +480,10 @@ describe("ContactSheet", () => {
           thumbnail: { imagePath: "/scans/frames/frame-0002.png" },
           operationId,
         },
+      });
+      fixture.emitEvent({
+        event: "scanner.thumbnailsComplete",
+        payload: { count: 1, operationId },
       });
     });
     await user.click(screen.getByTestId("contact-tile-2"));

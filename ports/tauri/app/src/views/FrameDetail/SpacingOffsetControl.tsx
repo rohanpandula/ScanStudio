@@ -1,5 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../../session";
+import { sessionOperationBusy } from "../../session/store/session";
 import styles from "./FrameDetail.module.css";
 
 // useSyncExternalStore requires a referentially stable snapshot between
@@ -79,6 +80,7 @@ export default function SpacingOffsetControl({ frameIndex }: { frameIndex: numbe
 
   const parsed = Number.parseInt(value, 10);
   const clampedDisplay = Number.isNaN(parsed) ? range.min : clamp(parsed, range.min, range.max);
+  const adjustmentDisabled = sessionOperationBusy(state);
 
   const commit = async (raw: string): Promise<void> => {
     const parsedInput = Number.parseInt(raw, 10);
@@ -135,6 +137,7 @@ export default function SpacingOffsetControl({ frameIndex }: { frameIndex: numbe
           value={value}
           min={range.min}
           max={range.max}
+          disabled={adjustmentDisabled}
           aria-label={`Spacing offset for frame ${frameIndex}`}
           onChange={(event) => setValue(event.target.value)}
           onBlur={() => void commit(value)}
@@ -148,6 +151,7 @@ export default function SpacingOffsetControl({ frameIndex }: { frameIndex: numbe
           data-testid="spacing-offset-drag"
           min={range.min}
           max={range.max}
+          disabled={adjustmentDisabled}
           step={1}
           value={clampedDisplay}
           aria-label={`Spacing offset drag handle for frame ${frameIndex}`}

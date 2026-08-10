@@ -1,6 +1,11 @@
-import { useEffect, useSyncExternalStore } from "react";
-import { sessionStore, type SessionState } from "../session";
-import type { DerivativeTransform, Thumbnail } from "../session/wire/types";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import {
+  sessionStore,
+  type FilmProcess,
+  type SessionState,
+} from "../session";
+import { sessionOperationBusy } from "../session/store/session";
+import type { DerivativeTransform, EngineError, Thumbnail } from "../session/wire/types";
 import styles from "./ContactSheet.module.css";
 
 // useSyncExternalStore requires a referentially stable snapshot between
@@ -31,6 +36,12 @@ function stableGetSnapshot(): Readonly<SessionState> {
 }
 
 const CARRIERS = ["roll36", "strip6", "mounted"] as const;
+const FILM_PROCESSES: Array<{ value: FilmProcess; label: string }> = [
+  { value: "positive", label: "Positive" },
+  { value: "c41ColorNegative", label: "Color negative (C-41)" },
+  { value: "bwNegative", label: "B&W negative" },
+  { value: "kodachrome", label: "Kodachrome" },
+];
 
 // Behaviorally equivalent to ThumbnailGridView's shaded-tile rendering (gray
 // tile shaded by brightness with a tint cast), not pixel-identical.
@@ -67,12 +78,37 @@ function shortcutTargetIsEditable(target: EventTarget | null): boolean {
   );
 }
 
+function requestErrorOf(error: unknown): Pick<EngineError, "code" | "message"> {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    "message" in error &&
+    typeof (error as { code: unknown }).code === "string" &&
+    typeof (error as { message: unknown }).message === "string"
+  ) {
+    return error as Pick<EngineError, "code" | "message">;
+  }
+  return {
+    code: "INTERNAL",
+    message: error instanceof Error ? error.message : "scanner status request failed",
+  };
+}
+
 export interface ContactSheetProps {
   onInspectFrame?: (frameIndex: number) => void;
   onCapture?: () => void;
 }
 
 export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheetProps = {}) {
+  const [statusRefreshError, setStatusRefreshError] = useState<Pick<
+    EngineError,
+    "code" | "message"
+  > | null>(null);
+  const [mediaLoadError, setMediaLoadError] = useState<Pick<
+    EngineError,
+    "code" | "message"
+  > | null>(null);
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const status = state.connection.status;
   const project = state.project;
@@ -80,14 +116,48 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
   const connected = state.connection.connected;
   const deviceKind = state.connection.device?.kind ?? null;
   const canLoadSimulatedMedia = !mediaLoaded && connected && deviceKind === "simulated";
-  const canPreview =
-    project !== null && (mediaLoaded || (connected && deviceKind === "real"));
+  const canPreview = mediaLoaded || (connected && deviceKind === "real");
+  const motionReadiness =
+    deviceKind !== "real"
+      ? "notApplicable"
+      : status?.motionArmed === true
+        ? "ready"
+        : status?.motionArmed === false
+          ? "notEnabled"
+          : "unknown";
+  const motionReady = motionReadiness === "ready" || motionReadiness === "notApplicable";
+  const transportReady = status?.transport === "idle";
+  const operationBusy = sessionOperationBusy(state);
+  const previewDisabled = operationBusy || !motionReady || !transportReady;
   const frameCount = mediaLoaded ? (status?.frameCount ?? 0) : 0;
   const selectionEmpty = state.selectedFrameIndices.length === 0;
   const transformsEditable =
-    !state.scanStartPending &&
-    (state.jobState === null || ["completed", "failed", "stopped"].includes(state.jobState));
+    !operationBusy;
   const focusedFrameIndex = state.focusedFrameIndex;
+
+  useEffect(() => {
+    if (motionReadiness === "ready") setStatusRefreshError(null);
+  }, [motionReadiness]);
+
+  const checkScanner = async (): Promise<void> => {
+    setStatusRefreshError(null);
+    try {
+      await sessionStore.refreshStatus();
+    } catch (error) {
+      setStatusRefreshError(requestErrorOf(error));
+    }
+  };
+
+  const loadSimulatedMedia = async (
+    carrier: (typeof CARRIERS)[number],
+  ): Promise<void> => {
+    setMediaLoadError(null);
+    try {
+      await sessionStore.loadMedia(carrier);
+    } catch (error) {
+      setMediaLoadError(requestErrorOf(error));
+    }
+  };
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
@@ -119,8 +189,10 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
   }, [focusedFrameIndex, transformsEditable]);
 
   const preview = (): void => {
-    if (project === null) return;
-    void sessionStore.acquireThumbnails(undefined, project.filmProcess);
+    const filmProcess = project?.filmProcess ?? state.previewFilmProcessSelection;
+    // SessionStore owns the typed request-failure state. Deliberately consume
+    // the rejection here so a UI click never becomes an unhandled promise.
+    void sessionStore.acquireThumbnails(undefined, filmProcess).catch(() => {});
   };
 
   const frames: number[] = [];
@@ -138,12 +210,18 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
                 key={carrier}
                 type="button"
                 className={styles.controlButton}
-                onClick={() => void sessionStore.loadMedia(carrier)}
+                disabled={operationBusy}
+                onClick={() => void loadSimulatedMedia(carrier)}
               >
                 {carrier}
               </button>
             ))}
           </div>
+        )}
+        {mediaLoadError !== null && (
+          <p className={styles.failureBanner} role="alert" data-testid="media-load-error">
+            {mediaLoadError.code}: {mediaLoadError.message}
+          </p>
         )}
         {!mediaLoaded && !canLoadSimulatedMedia && (
           <p className={styles.mediaGuidance} data-testid="no-media-guidance">
@@ -152,16 +230,62 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
               : "Connect a scanner to preview film."}
           </p>
         )}
+        {project === null && canPreview && (
+          <label className={styles.previewProcessControl}>
+            Film process for preview
+            <select
+              value={state.previewFilmProcessSelection}
+              disabled={
+                operationBusy
+              }
+              onChange={(event) =>
+                sessionStore.setPreviewFilmProcess(event.target.value as FilmProcess)
+              }
+            >
+              {FILM_PROCESSES.map(({ value, label }) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {canPreview && (
           <button
             type="button"
             className={styles.controlButton}
             data-testid="preview-button"
-            disabled={state.previewOutcome === "active"}
+            disabled={previewDisabled}
             onClick={preview}
           >
             Preview
           </button>
+        )}
+        {canPreview && !motionReady && (
+          <div className={styles.previewReadiness} data-testid="preview-readiness-guidance">
+            <span>
+              {motionReadiness === "notEnabled"
+                ? "Motion authorization is not enabled for this app session. Reopen ScanStudio using the documented owner-authorized hardware launch procedure; the app never enables motion on your behalf."
+                : "Motion readiness is unavailable. Check scanner status; preview remains disabled until readiness can be confirmed."}
+            </span>
+            <button
+              type="button"
+              className={styles.controlButton}
+              onClick={() => void checkScanner()}
+            >
+              Check scanner
+            </button>
+            {statusRefreshError !== null && (
+              <p className={styles.failureBanner} role="alert" data-testid="status-refresh-error">
+                {statusRefreshError.code}: {statusRefreshError.message}
+              </p>
+            )}
+          </div>
+        )}
+        {canPreview && motionReady && !transportReady && (
+          <p className={styles.mediaGuidance} data-testid="preview-readiness-guidance">
+            Wait for the scanner transport to become idle before previewing.
+          </p>
         )}
         {mediaLoaded && (
           <div className={styles.selectionControls}>
@@ -184,7 +308,10 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
                 type="button"
                 className={styles.controlButton}
                 data-testid="capture-action"
-                disabled={selectionEmpty}
+                disabled={
+                  selectionEmpty ||
+                  operationBusy
+                }
                 onClick={onCapture}
               >
                 Capture selected
@@ -340,6 +467,11 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
       {state.previewOutcome === "failed" && (
         <p className={styles.failureBanner} role="alert" data-testid="preview-failure">
           {state.previewError?.message ?? "Preview failed"}
+        </p>
+      )}
+      {state.previewRequestFailure !== null && (
+        <p className={styles.failureBanner} role="alert" data-testid="preview-request-failure">
+          {state.previewRequestFailure.error.message}
         </p>
       )}
       {mediaLoaded && frameCount > 0 && (
