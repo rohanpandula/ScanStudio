@@ -10,6 +10,11 @@ import Observation
 
 public enum WebServerState: Equatable, Sendable {
     case off
+    case checkingRuntime
+    case downloadingRuntime
+    case preparingRuntime
+    case installingRuntime
+    case verifyingRuntime
     case starting
     case running
     case stopping
@@ -88,6 +93,81 @@ public protocol WebServerReadinessChecking: Sendable {
     func waitUntilReady(at startupURL: URL, timeout: Duration) async throws
 }
 
+/// Thread-safe ownership for the executable-code provisioning task. AppKit
+/// invokes termination on the main thread, so the app delegate cannot hop back
+/// to `WebServerModel`'s MainActor just to cancel an in-flight DMG operation.
+/// This coordinator gives both paths one task handle and a bounded completion
+/// signal without weakening the model's UI isolation.
+private final class WebRuntimeProvisioningCoordinator: @unchecked Sendable {
+    private struct ActiveOperation {
+        let identifier: UUID
+        let task: Task<WebServerRuntime, Error>
+        let completion: DispatchSemaphore
+    }
+
+    private let lock = NSLock()
+    private var activeOperation: ActiveOperation?
+
+    var hasActiveOperation: Bool {
+        lock.withLock { activeOperation != nil }
+    }
+
+    func start(
+        operation: @escaping @Sendable () async throws -> WebServerRuntime
+    ) -> Task<WebServerRuntime, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeOperation == nil else { return nil }
+
+        let identifier = UUID()
+        let completion = DispatchSemaphore(value: 0)
+        let task = Task { [self] in
+            defer { finish(identifier: identifier, completion: completion) }
+            return try await operation()
+        }
+        activeOperation = ActiveOperation(
+            identifier: identifier,
+            task: task,
+            completion: completion
+        )
+        return task
+    }
+
+    func cancelCurrent() {
+        let task = lock.withLock { activeOperation?.task }
+        task?.cancel()
+    }
+
+    /// Cancels the current provisioning operation and waits only for the
+    /// caller's cleanup budget. The provisioning task still owns its scratch
+    /// cleanup if a platform command exceeds that budget; application shutdown
+    /// must never wait indefinitely.
+    func cancelCurrentAndWait(timeout: TimeInterval) async {
+        guard timeout.isFinite, timeout > 0 else {
+            cancelCurrent()
+            return
+        }
+        guard let operation = lock.withLock({ activeOperation }) else { return }
+        operation.task.cancel()
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                _ = operation.completion.wait(timeout: .now() + timeout)
+                continuation.resume()
+            }
+        }
+    }
+
+    private func finish(identifier: UUID, completion: DispatchSemaphore) {
+        lock.withLock {
+            if activeOperation?.identifier == identifier {
+                activeOperation = nil
+            }
+        }
+        completion.signal()
+    }
+}
+
 public enum WebServerRuntimeLocateError: Error, LocalizedError, Equatable {
     case missingCommandOverride(String)
     case missingStaticDirectoryOverride(String)
@@ -111,11 +191,9 @@ public enum WebServerRuntimeLocateError: Error, LocalizedError, Equatable {
     }
 }
 
-/// Resolves an eventual packaged runtime first, then the current source-tree
-/// development layout. Packaging is intentionally not changed in this slice:
-/// a future release may place an executable gateway at
-/// `Contents/Resources/WebRuntime/bin/scanstudio-web` and Vite output at
-/// `Contents/Resources/WebFrontend` without changing the app-side contract.
+/// Resolves only explicit/source-development layouts. Release builds never
+/// execute web code from the app bundle; their optional runtime is supplied by
+/// the separately signed, per-user cache and is reverified before each launch.
 public struct WebServerRuntimeLocator: Sendable {
     public static let commandOverrideKey = "SCANSTUDIO_WEB_COMMAND_PATH"
     public static let staticDirectoryOverrideKey = "SCANSTUDIO_WEB_STATIC_DIR"
@@ -123,13 +201,18 @@ public struct WebServerRuntimeLocator: Sendable {
     static let staticDirectoryMarkerSchemaVersion = 1
     static let staticDirectoryMarkerRuntime = "simulator-only-web"
 
+    #if DEBUG
+    private static let developmentRuntimeAllowed = true
+    #else
+    private static let developmentRuntimeAllowed = false
+    #endif
+
     private struct StaticDirectoryMarker: Decodable {
         let schemaVersion: Int
         let runtime: String
     }
 
     private let environment: [String: String]
-    private let bundleResourceURL: URL?
     private let developmentRepositoryURL: URL?
 
     public init(
@@ -138,18 +221,18 @@ public struct WebServerRuntimeLocator: Sendable {
         engineURL: URL?
     ) {
         self.environment = environment
-        self.bundleResourceURL = bundleResourceURL
         self.developmentRepositoryURL = Self.inferRepositoryRoot(from: engineURL)
     }
 
     public func locate() throws -> WebServerRuntime {
         try Self.locate(
             environment: environment,
-            bundleResourceURL: bundleResourceURL,
+            bundleResourceURL: nil,
             developmentRepositoryURL: developmentRepositoryURL,
             fileExists: FileManager.default.fileExists(atPath:),
             isDirectory: Self.isDirectory(atPath:),
-            readFile: FileManager.default.contents(atPath:)
+            readFile: FileManager.default.contents(atPath:),
+            developmentRuntimeAllowed: Self.developmentRuntimeAllowed
         )
     }
 
@@ -159,18 +242,17 @@ public struct WebServerRuntimeLocator: Sendable {
         developmentRepositoryURL: URL?,
         fileExists: (String) -> Bool,
         isDirectory: (String) -> Bool,
-        readFile: (String) -> Data?
+        readFile: (String) -> Data?,
+        developmentRuntimeAllowed: Bool = true
     ) throws -> WebServerRuntime {
-        let packagedCommand = bundleResourceURL?
-            .appendingPathComponent("WebRuntime", isDirectory: true)
-            .appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent("scanstudio-web", isDirectory: false)
-        let developmentCommand = developmentRepositoryURL?
+        let developmentCommand = developmentRuntimeAllowed ? developmentRepositoryURL?
             .appendingPathComponent("ports/web/.venv/bin/scanstudio-web", isDirectory: false)
-        let commandCandidates = [packagedCommand, developmentCommand].compactMap { $0 }
+            : nil
+        let commandCandidates = [developmentCommand].compactMap { $0 }
 
         let commandURL: URL
-        if let override = nonempty(environment[commandOverrideKey]) {
+        if developmentRuntimeAllowed,
+           let override = nonempty(environment[commandOverrideKey]) {
             commandURL = URL(fileURLWithPath: override)
             guard fileExists(commandURL.path) else {
                 throw WebServerRuntimeLocateError.missingCommandOverride(commandURL.path)
@@ -179,8 +261,9 @@ public struct WebServerRuntimeLocator: Sendable {
             commandURL = candidate
         } else {
             let staticCandidates = staticCandidates(
-                bundleResourceURL: bundleResourceURL,
-                developmentRepositoryURL: developmentRepositoryURL
+                bundleResourceURL: nil,
+                developmentRepositoryURL: developmentRuntimeAllowed
+                    ? developmentRepositoryURL : nil
             )
             throw WebServerRuntimeLocateError.runtimeUnavailable(
                 commandPaths: commandCandidates.map(\.path),
@@ -188,14 +271,14 @@ public struct WebServerRuntimeLocator: Sendable {
             )
         }
 
-        let packagedStatic = bundleResourceURL?
-            .appendingPathComponent("WebFrontend", isDirectory: true)
-        let developmentStatic = developmentRepositoryURL?
+        let developmentStatic = developmentRuntimeAllowed ? developmentRepositoryURL?
             .appendingPathComponent("ports/tauri/app/dist", isDirectory: true)
-        let staticCandidates = [packagedStatic, developmentStatic].compactMap { $0 }
+            : nil
+        let staticCandidates = [developmentStatic].compactMap { $0 }
 
         let staticURL: URL
-        if let override = nonempty(environment[staticDirectoryOverrideKey]) {
+        if developmentRuntimeAllowed,
+           let override = nonempty(environment[staticDirectoryOverrideKey]) {
             staticURL = URL(fileURLWithPath: override, isDirectory: true)
             guard isDirectory(staticURL.path) else {
                 throw WebServerRuntimeLocateError.missingStaticDirectoryOverride(staticURL.path)
@@ -228,7 +311,6 @@ public struct WebServerRuntimeLocator: Sendable {
         developmentRepositoryURL: URL?
     ) -> [URL] {
         [
-            bundleResourceURL?.appendingPathComponent("WebFrontend", isDirectory: true),
             developmentRepositoryURL?.appendingPathComponent(
                 "ports/tauri/app/dist",
                 isDirectory: true
@@ -294,7 +376,11 @@ public actor FoundationWebServerProcess: WebServerProcessControlling {
     public nonisolated let terminationEvents: AsyncStream<WebServerProcessExit>
 
     private let terminationContinuation: AsyncStream<WebServerProcessExit>.Continuation
-    private var process: (identifier: UUID, value: Process)?
+    private var process: (
+        identifier: UUID,
+        value: Process,
+        processGroup: WebServerOwnedProcessGroup
+    )?
 
     public init() {
         var continuation: AsyncStream<WebServerProcessExit>.Continuation!
@@ -317,7 +403,16 @@ public actor FoundationWebServerProcess: WebServerProcessControlling {
 
         let continuation = terminationContinuation
         let identifier = configuration.identifier
+        let processGroup = WebServerOwnedProcessGroup(
+            isIsolated: configuration.environment["SCANSTUDIO_WEB_ISOLATE_PROCESS_GROUP"] == "1"
+        )
         process.terminationHandler = { terminated in
+            // The gateway may exit before an explicit stop (for example after
+            // a fatal Python error). Sweep its owned group before publishing
+            // that exit so an engine child cannot escape when a retry replaces
+            // the stored Process. The one-shot token also prevents a later stop
+            // from signaling a PID/PGID that the OS may have reused.
+            processGroup.sweep()
             continuation.yield(
                 WebServerProcessExit(
                     identifier: identifier,
@@ -328,7 +423,8 @@ public actor FoundationWebServerProcess: WebServerProcessControlling {
         }
 
         try process.run()
-        self.process = (configuration.identifier, process)
+        processGroup.activate(processIdentifier: process.processIdentifier)
+        self.process = (configuration.identifier, process, processGroup)
     }
 
     public func stop(identifier: UUID?) {
@@ -338,7 +434,14 @@ public actor FoundationWebServerProcess: WebServerProcessControlling {
         }
         defer { self.process = nil }
         let process = current.value
-        guard process.isRunning else { return }
+        let processGroup = current.processGroup
+        guard process.isRunning else {
+            // The termination handler normally won this race. Calling the
+            // one-shot token here covers the narrow interval where Process has
+            // stopped reporting `isRunning` but its handler has not run yet.
+            processGroup.sweep()
+            return
+        }
 
         let processIdentifier = process.processIdentifier
         process.terminate()
@@ -349,17 +452,66 @@ public actor FoundationWebServerProcess: WebServerProcessControlling {
             Thread.sleep(forTimeInterval: 0.025)
         }
         if process.isRunning {
-            // `scanstudio-web` calls setsid() before it spawns the engine, so
-            // the negative PID targets the isolated gateway process group.
+            // `scanstudio-web` confirms or creates a dedicated process group
+            // before it spawns the engine, so the negative PID targets only
+            // that isolated gateway group.
             // The direct signal is a safe fallback for a rapid stop that lands
             // before Python has completed that setup.
-            Darwin.kill(-processIdentifier, SIGKILL)
+            processGroup.sweep()
             Darwin.kill(processIdentifier, SIGKILL)
         }
         process.waitUntilExit()
         // A process group can outlive its leader. Sweep it once more after the
         // gateway has exited so a stuck engine child cannot become an orphan.
-        Darwin.kill(-processIdentifier, SIGKILL)
+        processGroup.sweep()
+    }
+}
+
+/// One lifecycle-scoped right to signal a gateway's isolated process group.
+/// The termination callback consumes it synchronously before publishing the
+/// exit; explicit stop shares the same token for race coverage. Once consumed,
+/// no later retry or shutdown path can send a signal to a reused PID/PGID.
+private final class WebServerOwnedProcessGroup: @unchecked Sendable {
+    private let isIsolated: Bool
+    private let lock = NSLock()
+    private var processIdentifier: pid_t?
+    private var sweepPending = false
+    private var wasSwept = false
+
+    init(isIsolated: Bool) {
+        self.isIsolated = isIsolated
+    }
+
+    /// `Process` exposes its PID only after `run()`. If a very short-lived
+    /// command terminates between `run()` and this activation, its handler has
+    /// already recorded a pending sweep and activation performs it immediately.
+    func activate(processIdentifier: pid_t) {
+        guard isIsolated else { return }
+        let shouldSweep = lock.withLock { () -> Bool in
+            guard !wasSwept else { return false }
+            self.processIdentifier = processIdentifier
+            guard sweepPending else { return false }
+            wasSwept = true
+            return true
+        }
+        if shouldSweep {
+            _ = Darwin.kill(-processIdentifier, SIGKILL)
+        }
+    }
+
+    func sweep() {
+        guard isIsolated else { return }
+        let target = lock.withLock { () -> pid_t? in
+            guard !wasSwept else { return nil }
+            guard let processIdentifier else {
+                sweepPending = true
+                return nil
+            }
+            wasSwept = true
+            return processIdentifier
+        }
+        guard let target else { return }
+        _ = Darwin.kill(-target, SIGKILL)
     }
 }
 
@@ -420,19 +572,57 @@ public final class WebServerModel {
     public private(set) var isEnabled = false
     public private(set) var state: WebServerState = .off
 
-    public let browserURL: URL
-    public let accessToken: String
+    public private(set) var preferences: WebServerPreferences
+    public private(set) var availableLANAddresses: [String]
+    public private(set) var pendingRuntimeDownloadOffer: WebRuntimeDownloadOffer?
+
+    public private(set) var accessToken: String
+
+    public var browserURL: URL {
+        activeNetworkConfiguration?.browserURL
+            ?? (try? resolvedNetworkConfiguration().browserURL)
+            ?? Self.loopbackURL
+    }
+
+    public var advertisedURLs: [URL] {
+        activeNetworkConfiguration?.advertisedURLs
+            ?? (try? resolvedNetworkConfiguration().advertisedURLs)
+            ?? [Self.loopbackURL]
+    }
+
+    public var configurationErrorMessage: String {
+        do {
+            _ = try resolvedNetworkConfiguration()
+            return ""
+        } catch {
+            return Self.describe(error)
+        }
+    }
 
     private let engineURL: URL?
     private let process: any WebServerProcessControlling
     private let readinessChecker: any WebServerReadinessChecking
     private let inheritedEnvironment: [String: String]
     private let runtimeResolver: () throws -> WebServerRuntime
+    private let runtimeManager: (any WebRuntimeManaging)?
+    private let runtimeRequest: WebRuntimeReleaseRequest?
+    private let lanAddressProvider: () -> [String]
+    private let preferencesDefaults: UserDefaults?
     private var generation: UInt64 = 0
     private var activeProcessIdentifier: UUID?
+    private var activeNetworkConfiguration: WebServerNetworkConfiguration?
+    private let runtimeProvisioning = WebRuntimeProvisioningCoordinator()
     private var terminationObserver: Task<Void, Never>?
 
     public convenience init(engineURL: URL?) {
+        self.init(engineURL: engineURL, runtimeManager: nil, runtimeRequest: nil)
+    }
+
+    public convenience init(
+        engineURL: URL?,
+        runtimeManager: (any WebRuntimeManaging)?,
+        runtimeRequest: WebRuntimeReleaseRequest?
+    ) {
         let process = FoundationWebServerProcess()
         let locator = WebServerRuntimeLocator(engineURL: engineURL)
         self.init(
@@ -440,6 +630,10 @@ public final class WebServerModel {
             process: process,
             readinessChecker: URLSessionWebServerReadinessChecker(),
             inheritedEnvironment: ProcessInfo.processInfo.environment,
+            preferences: Self.loadPreferences(from: .standard),
+            preferencesDefaults: .standard,
+            runtimeManager: runtimeManager,
+            runtimeRequest: runtimeRequest,
             runtimeResolver: { try locator.locate() },
             tokenGenerator: Self.makeAccessToken
         )
@@ -450,7 +644,11 @@ public final class WebServerModel {
         process: any WebServerProcessControlling,
         readinessChecker: any WebServerReadinessChecking,
         inheritedEnvironment: [String: String],
-        browserURL: URL = WebServerModel.loopbackURL,
+        preferences: WebServerPreferences = WebServerPreferences(),
+        privateLANAddresses: @escaping () -> [String] = SystemLANAddressProvider.privateAddresses,
+        preferencesDefaults: UserDefaults? = nil,
+        runtimeManager: (any WebRuntimeManaging)? = nil,
+        runtimeRequest: WebRuntimeReleaseRequest? = nil,
         runtimeResolver: @escaping () throws -> WebServerRuntime,
         tokenGenerator: () -> String
     ) {
@@ -458,7 +656,12 @@ public final class WebServerModel {
         self.process = process
         self.readinessChecker = readinessChecker
         self.inheritedEnvironment = inheritedEnvironment
-        self.browserURL = browserURL
+        self.preferences = preferences
+        self.lanAddressProvider = privateLANAddresses
+        self.availableLANAddresses = privateLANAddresses()
+        self.preferencesDefaults = preferencesDefaults
+        self.runtimeManager = runtimeManager
+        self.runtimeRequest = runtimeRequest
         self.runtimeResolver = runtimeResolver
         self.accessToken = tokenGenerator()
 
@@ -468,6 +671,39 @@ public final class WebServerModel {
                 guard let self else { return }
                 self.handleProcessExit(exit)
             }
+        }
+    }
+
+    public func updatePreferences(_ preferences: WebServerPreferences) {
+        guard !isEnabled, state != .starting, state != .stopping else { return }
+        self.preferences = preferences
+        refreshLANAddresses()
+        savePreferences()
+    }
+
+    public func refreshLANAddresses() {
+        availableLANAddresses = lanAddressProvider()
+    }
+
+    public func regenerateAccessToken() {
+        guard !isEnabled, state != .starting, state != .stopping else { return }
+        accessToken = Self.makeAccessToken()
+    }
+
+    public func cancelRuntimeDownloadOffer() {
+        guard !isEnabled else { return }
+        pendingRuntimeDownloadOffer = nil
+        if state == .checkingRuntime { state = .off }
+    }
+
+    /// Synchronously consumes the consent offer before SwiftUI dismisses its
+    /// confirmation dialog, then starts the accepted operation. This prevents
+    /// the dialog's dismissal binding from clearing the offer before an
+    /// asynchronously scheduled button task can observe it.
+    public func acceptPendingRuntimeDownloadAndEnable() {
+        guard let accepted = consumePendingRuntimeDownloadOffer() else { return }
+        Task { @MainActor [weak self] in
+            await self?.performAcceptedRuntimeDownload(accepted)
         }
     }
 
@@ -484,11 +720,14 @@ public final class WebServerModel {
         isEnabled = enabled
 
         if !enabled {
+            runtimeProvisioning.cancelCurrent()
+            pendingRuntimeDownloadOffer = nil
             state = .stopping
             let processIdentifier = activeProcessIdentifier
             activeProcessIdentifier = nil
             await process.stop(identifier: processIdentifier)
             guard generation == operationGeneration else { return }
+            activeNetworkConfiguration = nil
             state = .off
             return
         }
@@ -498,46 +737,112 @@ public final class WebServerModel {
         await process.stop(identifier: nil)
         guard generation == operationGeneration, isEnabled else { return }
 
-        var launchedIdentifier: UUID?
         do {
             guard let engineURL else {
                 throw WebServerRuntimeLocateError.engineUnavailable
             }
-            let runtime = try runtimeResolver()
-            let processIdentifier = UUID()
-            launchedIdentifier = processIdentifier
-            activeProcessIdentifier = processIdentifier
-            try await process.start(
-                configuration: launchConfiguration(
-                    identifier: processIdentifier,
-                    runtime: runtime,
-                    engineURL: engineURL
-                )
-            )
-            try await readinessChecker.waitUntilReady(
-                at: browserURL.appendingPathComponent("startupz"),
-                timeout: .seconds(10)
-            )
-            guard generation == operationGeneration, isEnabled else {
-                await process.stop(identifier: processIdentifier)
+            refreshLANAddresses()
+            let networkConfiguration = try resolvedNetworkConfiguration()
+            let resolution = try await resolveRuntimeForEnable()
+            guard generation == operationGeneration, isEnabled else { return }
+            switch resolution {
+            case .download(let offer):
+                pendingRuntimeDownloadOffer = offer
+                isEnabled = false
+                state = .off
                 return
+            case .runtime(let runtime):
+                try await launch(
+                    runtime: runtime,
+                    engineURL: engineURL,
+                    networkConfiguration: networkConfiguration,
+                    operationGeneration: operationGeneration
+                )
             }
-            state = .running
         } catch is CancellationError {
-            if activeProcessIdentifier == launchedIdentifier {
-                activeProcessIdentifier = nil
-            }
-            await process.stop(identifier: launchedIdentifier)
             guard generation == operationGeneration else { return }
             isEnabled = false
+            activeNetworkConfiguration = nil
             state = .off
         } catch {
-            if activeProcessIdentifier == launchedIdentifier {
-                activeProcessIdentifier = nil
-            }
-            await process.stop(identifier: launchedIdentifier)
             guard generation == operationGeneration else { return }
             isEnabled = false
+            activeNetworkConfiguration = nil
+            state = .failed(Self.describe(error))
+        }
+    }
+
+    /// Starts the exact signed offer that the user accepted. The offer is
+    /// removed before the executable download begins so a second click cannot
+    /// start a concurrent install. Turning the toggle off cancels this task.
+    public func downloadPendingRuntimeAndEnable() async {
+        guard let accepted = consumePendingRuntimeDownloadOffer() else { return }
+        await performAcceptedRuntimeDownload(accepted)
+    }
+
+    private struct AcceptedRuntimeDownload {
+        let offer: WebRuntimeDownloadOffer
+        let operationGeneration: UInt64
+    }
+
+    private func consumePendingRuntimeDownloadOffer() -> AcceptedRuntimeDownload? {
+        guard let offer = pendingRuntimeDownloadOffer,
+              runtimeManager != nil,
+              !runtimeProvisioning.hasActiveOperation else { return nil }
+        generation &+= 1
+        let accepted = AcceptedRuntimeDownload(
+            offer: offer,
+            operationGeneration: generation
+        )
+        pendingRuntimeDownloadOffer = nil
+        isEnabled = true
+        state = .downloadingRuntime
+        return accepted
+    }
+
+    private func performAcceptedRuntimeDownload(
+        _ accepted: AcceptedRuntimeDownload
+    ) async {
+        guard let runtimeManager else { return }
+        let operationGeneration = accepted.operationGeneration
+        await process.stop(identifier: nil)
+        guard generation == operationGeneration, isEnabled else { return }
+
+        do {
+            guard let engineURL else {
+                throw WebServerRuntimeLocateError.engineUnavailable
+            }
+            refreshLANAddresses()
+            let networkConfiguration = try resolvedNetworkConfiguration()
+            guard let task = runtimeProvisioning.start(operation: {
+                try await runtimeManager.install(accepted.offer) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.generation == operationGeneration,
+                              self.isEnabled else { return }
+                        self.state = Self.webServerState(for: progress)
+                    }
+                }
+            }) else {
+                throw WebRuntimeDistributionError.operationInProgress
+            }
+            let runtime = try await task.value
+            guard generation == operationGeneration, isEnabled else { return }
+            try await launch(
+                runtime: runtime,
+                engineURL: engineURL,
+                networkConfiguration: networkConfiguration,
+                operationGeneration: operationGeneration
+            )
+        } catch is CancellationError {
+            guard generation == operationGeneration else { return }
+            isEnabled = false
+            activeNetworkConfiguration = nil
+            state = .off
+        } catch {
+            guard generation == operationGeneration else { return }
+            isEnabled = false
+            activeNetworkConfiguration = nil
             state = .failed(Self.describe(error))
         }
     }
@@ -550,16 +855,22 @@ public final class WebServerModel {
         isEnabled = false
         state = .stopping
         activeProcessIdentifier = nil
+        await runtimeProvisioning.cancelCurrentAndWait(timeout: 4)
+        pendingRuntimeDownloadOffer = nil
         await process.stop(identifier: nil)
+        activeNetworkConfiguration = nil
         state = .off
     }
 
     /// AppKit calls `applicationWillTerminate` on the main thread and then
-    /// waits briefly for cleanup. This nonisolated hook lets its detached
-    /// cleanup task stop the shared process without waiting for MainActor,
-    /// which is already occupied by the termination callback.
+    /// waits briefly for cleanup. This nonisolated hook cancels executable-code
+    /// provisioning, gives its DMG/scratch cleanup a bounded window, and stops
+    /// the shared process without waiting for MainActor, which is already
+    /// occupied by the termination callback.
     public nonisolated func stopProcessForApplicationTermination() async {
-        await process.stop(identifier: nil)
+        async let provisioning: Void = runtimeProvisioning.cancelCurrentAndWait(timeout: 4)
+        async let processStop: Void = process.stop(identifier: nil)
+        _ = await (provisioning, processStop)
     }
 
     public var visibleErrorMessage: String {
@@ -570,20 +881,32 @@ public final class WebServerModel {
     private func launchConfiguration(
         identifier: UUID,
         runtime: WebServerRuntime,
-        engineURL: URL
+        engineURL: URL,
+        networkConfiguration: WebServerNetworkConfiguration
     ) -> WebServerLaunchConfiguration {
-        var environment = inheritedEnvironment
-        // Defense in depth in addition to the gateway's own child-environment
-        // scrub: the desktop bridge and motion latch never enter this process.
-        environment.removeValue(forKey: "SCANSTUDIO_BRIDGE_CMD")
-        environment.removeValue(forKey: "SCANSTUDIO_HW_MOTION")
+        // Start from a narrow allowlist. In particular, never inherit bridge,
+        // motion, loader, or Python module-search variables into downloaded
+        // executable code. Source builds retain only the simulator time scale.
+        var environment: [String: String] = [
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        ]
+        for key in ["HOME", "TMPDIR", "LANG", "LC_ALL", "SCANSTUDIO_TIMESCALE"] {
+            if let value = inheritedEnvironment[key], !value.isEmpty {
+                environment[key] = value
+            }
+        }
         environment["SCANSTUDIO_ENGINE_PATH"] = engineURL.path
         environment["SCANSTUDIO_WEB_STATIC_DIR"] = runtime.staticDirectoryURL.path
-        environment["SCANSTUDIO_WEB_BIND"] = "127.0.0.1"
-        environment["SCANSTUDIO_WEB_PORT"] = "8787"
-        environment["SCANSTUDIO_WEB_TOKEN"] = accessToken
-        environment["SCANSTUDIO_WEB_ALLOWED_ORIGINS"] = "http://127.0.0.1:8787"
-        environment["SCANSTUDIO_WEB_COOKIE_SECURE"] = "false"
+        environment["SCANSTUDIO_WEB_BIND"] = networkConfiguration.bindAddress
+        environment["SCANSTUDIO_WEB_PORT"] = String(networkConfiguration.port)
+        environment["SCANSTUDIO_WEB_AUTH_MODE"] = networkConfiguration.authenticationMode.rawValue
+        if networkConfiguration.authenticationMode == .accessToken {
+            environment["SCANSTUDIO_WEB_TOKEN"] = accessToken
+        }
+        environment["SCANSTUDIO_WEB_ALLOWED_ORIGINS"] = networkConfiguration.allowedOrigins.joined(separator: ",")
+        environment["SCANSTUDIO_WEB_COOKIE_SECURE"] = networkConfiguration.cookieSecure
+            ? "true"
+            : "false"
         environment["SCANSTUDIO_WEB_ISOLATE_PROCESS_GROUP"] = "1"
         environment["SCANSTUDIO_WEB_ENGINE_SHUTDOWN_TIMEOUT_SECONDS"] = "0.75"
         environment["PYTHONUNBUFFERED"] = "1"
@@ -596,9 +919,89 @@ public final class WebServerModel {
         )
     }
 
+    private enum RuntimeResolution {
+        case runtime(WebServerRuntime)
+        case download(WebRuntimeDownloadOffer)
+    }
+
+    private func resolveRuntimeForEnable() async throws -> RuntimeResolution {
+        do {
+            return .runtime(try runtimeResolver())
+        } catch WebServerRuntimeLocateError.runtimeUnavailable {
+            // Release builds intentionally have no app-bundled fallback.
+        }
+
+        guard let runtimeManager, let runtimeRequest else {
+            throw WebServerRuntimeLocateError.runtimeUnavailable(
+                commandPaths: [],
+                staticPaths: []
+            )
+        }
+        state = .checkingRuntime
+        switch await runtimeManager.inspectVerifiedCurrent(for: runtimeRequest) {
+        case .ready(let installed):
+            return .runtime(installed.webServerRuntime)
+        case .notInstalled, .invalid:
+            let offer = try await runtimeManager.resolveMetadataForConsent(
+                for: runtimeRequest
+            )
+            return .download(offer)
+        }
+    }
+
+    private func launch(
+        runtime: WebServerRuntime,
+        engineURL: URL,
+        networkConfiguration: WebServerNetworkConfiguration,
+        operationGeneration: UInt64
+    ) async throws {
+        state = .starting
+        let processIdentifier = UUID()
+        activeProcessIdentifier = processIdentifier
+        activeNetworkConfiguration = networkConfiguration
+        do {
+            try await process.start(
+                configuration: launchConfiguration(
+                    identifier: processIdentifier,
+                    runtime: runtime,
+                    engineURL: engineURL,
+                    networkConfiguration: networkConfiguration
+                )
+            )
+            try await readinessChecker.waitUntilReady(
+                at: networkConfiguration.readinessURL.appendingPathComponent("startupz"),
+                timeout: .seconds(10)
+            )
+            guard generation == operationGeneration, isEnabled else {
+                throw CancellationError()
+            }
+            state = .running
+        } catch {
+            if activeProcessIdentifier == processIdentifier {
+                activeProcessIdentifier = nil
+            }
+            activeNetworkConfiguration = nil
+            await process.stop(identifier: processIdentifier)
+            throw error
+        }
+    }
+
+    private static func webServerState(
+        for progress: WebRuntimeInstallProgress
+    ) -> WebServerState {
+        switch progress {
+        case .resolvingMetadata: .checkingRuntime
+        case .downloading: .downloadingRuntime
+        case .preparing: .preparingRuntime
+        case .installing: .installingRuntime
+        case .verifyingForLaunch, .complete: .verifyingRuntime
+        }
+    }
+
     private func handleProcessExit(_ exit: WebServerProcessExit) {
         guard exit.identifier == activeProcessIdentifier else { return }
         activeProcessIdentifier = nil
+        activeNetworkConfiguration = nil
         guard isEnabled else {
             if state == .stopping { state = .off }
             return
@@ -616,6 +1019,47 @@ public final class WebServerModel {
         return (0..<32).map { _ in
             String(format: "%02x", UInt8.random(in: .min ... .max, using: &generator))
         }.joined()
+    }
+
+    private func resolvedNetworkConfiguration() throws -> WebServerNetworkConfiguration {
+        try WebServerNetworkResolver.resolve(
+            preferences,
+            privateLANAddresses: availableLANAddresses
+        )
+    }
+
+    private enum PreferenceKey {
+        static let bindScope = "ScanStudio.web.bindScope"
+        static let customBindAddress = "ScanStudio.web.customBindAddress"
+        static let port = "ScanStudio.web.port"
+        static let authenticationMode = "ScanStudio.web.authenticationMode"
+        static let additionalOrigins = "ScanStudio.web.additionalOrigins"
+    }
+
+    private static func loadPreferences(from defaults: UserDefaults) -> WebServerPreferences {
+        let bindScope = defaults.string(forKey: PreferenceKey.bindScope)
+            .flatMap(WebServerBindScope.init(rawValue:)) ?? .thisMac
+        let authenticationMode = defaults.string(forKey: PreferenceKey.authenticationMode)
+            .flatMap(WebServerAuthenticationMode.init(rawValue:)) ?? .accessToken
+        let persistedPort = defaults.object(forKey: PreferenceKey.port) == nil
+            ? 8787
+            : defaults.integer(forKey: PreferenceKey.port)
+        return WebServerPreferences(
+            bindScope: bindScope,
+            customBindAddress: defaults.string(forKey: PreferenceKey.customBindAddress) ?? "",
+            port: persistedPort,
+            authenticationMode: authenticationMode,
+            additionalOrigins: defaults.string(forKey: PreferenceKey.additionalOrigins) ?? ""
+        )
+    }
+
+    private func savePreferences() {
+        guard let defaults = preferencesDefaults else { return }
+        defaults.set(preferences.bindScope.rawValue, forKey: PreferenceKey.bindScope)
+        defaults.set(preferences.customBindAddress, forKey: PreferenceKey.customBindAddress)
+        defaults.set(preferences.port, forKey: PreferenceKey.port)
+        defaults.set(preferences.authenticationMode.rawValue, forKey: PreferenceKey.authenticationMode)
+        defaults.set(preferences.additionalOrigins, forKey: PreferenceKey.additionalOrigins)
     }
 
     private static func describe(_ error: Error) -> String {

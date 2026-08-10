@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from .settings import Settings, normalize_origin
 
@@ -18,6 +20,40 @@ class OriginError(Exception):
 
 class SessionLimitReached(Exception):
     pass
+
+
+class PeerAccessError(Exception):
+    pass
+
+
+_TRUSTED_IPV4_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+_TRUSTED_IPV6_NETWORKS = tuple(
+    ipaddress.ip_network(value) for value in ("::1/128", "fc00::/7")
+)
+_FORWARDED_CLIENT_HEADERS = frozenset({"forwarded", "x-forwarded-for", "x-real-ip"})
+
+
+def socket_peer_is_trusted_lan(host: Any) -> bool:
+    """Classify only a literal socket peer, never a proxy-supplied address."""
+
+    if not isinstance(host, str) or not host or "%" in host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    networks = (
+        _TRUSTED_IPV4_NETWORKS
+        if isinstance(address, ipaddress.IPv4Address)
+        else _TRUSTED_IPV6_NETWORKS
+    )
+    return any(address in network for network in networks)
 
 
 class AuthManager:
@@ -51,6 +87,30 @@ class AuthManager:
         if not self.origin_is_allowed(value):
             raise OriginError(
                 "request Origin is missing or is not an allowed ScanStudio origin"
+            )
+
+    def require_trusted_peer(
+        self,
+        client: Any,
+        headers: Mapping[str, str],
+    ) -> None:
+        if not self._settings.trusted_lan_no_login:
+            return
+        header_names = {name.lower() for name in headers}
+        if header_names.intersection(_FORWARDED_CLIENT_HEADERS):
+            raise PeerAccessError(
+                "proxy client-address headers are forbidden in trusted LAN mode"
+            )
+        if (
+            not isinstance(client, (tuple, list))
+            or len(client) != 2
+            or not isinstance(client[1], int)
+            or isinstance(client[1], bool)
+            or not 1 <= client[1] <= 65_535
+            or not socket_peer_is_trusted_lan(client[0])
+        ):
+            raise PeerAccessError(
+                "request did not arrive from an allowed trusted LAN socket peer"
             )
 
     async def login(

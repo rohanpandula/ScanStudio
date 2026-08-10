@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import logging
 import os
 
@@ -23,7 +24,19 @@ def _isolate_process_group_if_requested() -> None:
         return
     try:
         os.setsid()
-    except (AttributeError, OSError) as exc:
+    except OSError as exc:
+        # Foundation.Process launches macOS children as leaders of fresh
+        # process groups. A group leader cannot call setsid(2), but it already
+        # has the exact isolation the native host needs for kill(-pid, ...).
+        # Accept only that specific, directly observed state; every other
+        # setsid failure remains fail-closed.
+        if exc.errno == errno.EPERM and os.getpid() > 1 and os.getpgrp() == os.getpid():
+            return
+        raise RuntimeError(
+            "SCANSTUDIO_WEB_ISOLATE_PROCESS_GROUP requested, but a dedicated "
+            "process group could not be created"
+        ) from exc
+    except AttributeError as exc:
         raise RuntimeError(
             "SCANSTUDIO_WEB_ISOLATE_PROCESS_GROUP requested, but a dedicated "
             "process group could not be created"

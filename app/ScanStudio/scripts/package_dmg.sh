@@ -17,6 +17,8 @@ if [[ ! -f "$info_plist" ]]; then
     exit 66
 fi
 
+"$script_dir/assert_no_web_runtime.sh" "$source_app"
+
 bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist")"
 release_version="${SCANSTUDIO_RELEASE_VERSION:-$bundle_version-beta.1}"
 release_arch="${SCANSTUDIO_RELEASE_ARCH:-$(uname -m)}"
@@ -70,6 +72,7 @@ hdiutil attach -quiet -readonly -nobrowse \
     -mountpoint "$mount_point" "$temporary_dmg"
 mounted=1
 codesign --verify --deep --strict "$mount_point/ScanStudio.app"
+"$script_dir/assert_no_web_runtime.sh" "$mount_point/ScanStudio.app"
 if find "$mount_point/ScanStudio.app" -type f \
     \( -name 'fixed_output_lut.bin' -o -name 'resource_tables.json' \) \
     -print -quit | grep -q .; then

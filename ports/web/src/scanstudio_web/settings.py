@@ -3,12 +3,31 @@ from __future__ import annotations
 import ipaddress
 import os
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
 class ConfigurationError(ValueError):
     """Raised when a deployment would weaken the gateway's security boundary."""
+
+
+class AuthMode(StrEnum):
+    """Explicit browser authentication boundary for one gateway deployment."""
+
+    TOKEN = "token"
+    TRUSTED_LAN_NO_LOGIN = "trusted-lan-no-login"
+
+
+def _env_auth_mode() -> AuthMode:
+    raw = os.getenv("SCANSTUDIO_WEB_AUTH_MODE", AuthMode.TOKEN.value).strip()
+    try:
+        return AuthMode(raw)
+    except ValueError as exc:
+        choices = ", ".join(mode.value for mode in AuthMode)
+        raise ConfigurationError(
+            f"SCANSTUDIO_WEB_AUTH_MODE must be one of: {choices}"
+        ) from exc
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -55,14 +74,45 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def is_trusted_lan_bind_host(host: str) -> bool:
+    """Allow only explicit private-interface binds for no-login LAN mode."""
+
+    normalized = host.strip().lower()
+    if normalized == "0.0.0.0":
+        return True
+    if not normalized or "%" in normalized:
+        return False
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv4Address):
+        return any(
+            address in network
+            for network in (
+                ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_network("172.16.0.0/12"),
+                ipaddress.ip_network("192.168.0.0/16"),
+            )
+        )
+    return address in ipaddress.ip_network("fc00::/7")
+
+
 def normalize_origin(origin: str) -> str:
     """Return a canonical HTTP(S) origin or reject a URL with extra components."""
 
-    parsed = urlsplit(origin.strip())
+    raw = origin.strip()
+    if "%" in raw or "," in raw:
+        raise ConfigurationError("origin contains an invalid host")
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname
+    except ValueError as exc:
+        raise ConfigurationError("origin contains an invalid host") from exc
     if parsed.scheme.lower() not in {"http", "https"}:
         raise ConfigurationError("origins must use http or https")
     if (
-        not parsed.hostname
+        not host
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
@@ -74,11 +124,36 @@ def normalize_origin(origin: str) -> str:
         )
 
     scheme = parsed.scheme.lower()
-    host = parsed.hostname.lower()
+    authority = parsed.netloc
+    bracketed = authority.startswith("[")
+    if bracketed:
+        closing_bracket = authority.find("]")
+        bracket_host = authority[1:closing_bracket]
+        remainder = authority[closing_bracket + 1 :]
+        if (
+            closing_bracket < 0
+            or not bracket_host
+            or "[" in bracket_host
+            or "]" in remainder
+            or (remainder and not remainder.startswith(":"))
+        ):
+            raise ConfigurationError("origin contains an invalid host")
+        try:
+            ipaddress.IPv6Address(bracket_host)
+        except ValueError as exc:
+            raise ConfigurationError(
+                "bracketed origin hosts must be numeric IPv6 addresses"
+            ) from exc
+    elif "[" in authority or "]" in authority or ":" in host:
+        raise ConfigurationError("origin contains an invalid host")
+
+    host = host.lower()
     try:
         port = parsed.port
     except ValueError as exc:
         raise ConfigurationError("origin contains an invalid port") from exc
+    if authority.endswith(":") or (port is not None and not 1 <= port <= 65_535):
+        raise ConfigurationError("origin contains an invalid port")
     default_port = 80 if scheme == "http" else 443
     port_suffix = "" if port is None or port == default_port else f":{port}"
     rendered_host = f"[{host}]" if ":" in host else host
@@ -90,6 +165,7 @@ class Settings:
     engine_command: tuple[str, ...] = ("scanstudio-engine",)
     bind_host: str = "127.0.0.1"
     port: int = 8787
+    auth_mode: AuthMode = AuthMode.TOKEN
     shared_token: str | None = None
     allowed_origins: tuple[str, ...] = ()
     static_dir: Path | None = None
@@ -108,6 +184,12 @@ class Settings:
     max_event_subscribers: int = 64
 
     def __post_init__(self) -> None:
+        try:
+            auth_mode = AuthMode(self.auth_mode)
+        except ValueError as exc:
+            choices = ", ".join(mode.value for mode in AuthMode)
+            raise ConfigurationError(f"auth_mode must be one of: {choices}") from exc
+        object.__setattr__(self, "auth_mode", auth_mode)
         if not self.engine_command or any(not item for item in self.engine_command):
             raise ConfigurationError(
                 "engine_command must contain a non-empty executable"
@@ -116,13 +198,31 @@ class Settings:
             raise ConfigurationError("port must be between 1 and 65535")
         if self.shared_token is not None and not self.shared_token.strip():
             raise ConfigurationError("the configured access token must not be blank")
-        if not is_loopback_host(self.bind_host) and self.shared_token is None:
+        if self.auth_mode is AuthMode.TOKEN and self.shared_token is None:
+            raise ConfigurationError("SCANSTUDIO_WEB_TOKEN is required in token mode")
+        if (
+            self.auth_mode is AuthMode.TRUSTED_LAN_NO_LOGIN
+            and self.shared_token is not None
+        ):
             raise ConfigurationError(
-                "SCANSTUDIO_WEB_TOKEN is required when binding outside loopback"
+                "SCANSTUDIO_WEB_TOKEN must be unset in trusted-lan-no-login mode"
+            )
+        if (
+            self.auth_mode is AuthMode.TRUSTED_LAN_NO_LOGIN
+            and not is_trusted_lan_bind_host(self.bind_host)
+        ):
+            raise ConfigurationError(
+                "SCANSTUDIO_WEB_BIND must be 0.0.0.0, an RFC1918 address, or "
+                "an IPv6 ULA address in trusted-lan-no-login mode"
             )
         if not is_loopback_host(self.bind_host) and not self.allowed_origins:
             raise ConfigurationError(
                 "SCANSTUDIO_WEB_ALLOWED_ORIGINS is required when binding outside loopback"
+            )
+        if self.auth_mode is AuthMode.TRUSTED_LAN_NO_LOGIN and not self.allowed_origins:
+            raise ConfigurationError(
+                "SCANSTUDIO_WEB_ALLOWED_ORIGINS is required in "
+                "trusted-lan-no-login mode"
             )
         if self.lease_ttl_seconds <= 0:
             raise ConfigurationError("lease_ttl_seconds must be positive")
@@ -135,26 +235,26 @@ class Settings:
                 "engine_write_timeout_seconds must be positive and at most 30"
             )
         if not 1 <= self.max_auth_sessions <= 4_096:
-            raise ConfigurationError(
-                "max_auth_sessions must be between 1 and 4096"
-            )
+            raise ConfigurationError("max_auth_sessions must be between 1 and 4096")
         if not 1 <= self.max_event_subscribers <= 1_024:
-            raise ConfigurationError(
-                "max_event_subscribers must be between 1 and 1024"
-            )
+            raise ConfigurationError("max_event_subscribers must be between 1 and 1024")
         for origin in self.expected_origins:
             normalize_origin(origin)
 
     @property
     def authentication_required(self) -> bool:
-        return self.shared_token is not None
+        return self.auth_mode is AuthMode.TOKEN and self.shared_token is not None
+
+    @property
+    def trusted_lan_no_login(self) -> bool:
+        return self.auth_mode is AuthMode.TRUSTED_LAN_NO_LOGIN
 
     @property
     def expected_origins(self) -> tuple[str, ...]:
         if self.allowed_origins:
             return tuple(normalize_origin(item) for item in self.allowed_origins)
-        # The no-token development mode binds only to loopback. Keep its
-        # origin set explicit to resist DNS rebinding through an attacker Host.
+        # Keep the loopback origin set explicit to resist DNS rebinding through
+        # an attacker-controlled Host even when the gateway binds locally.
         return (
             f"http://127.0.0.1:{self.port}",
             f"http://localhost:{self.port}",
@@ -186,6 +286,7 @@ class Settings:
             engine_command=(os.getenv("SCANSTUDIO_ENGINE_PATH", "scanstudio-engine"),),
             bind_host=bind_host,
             port=port,
+            auth_mode=_env_auth_mode(),
             shared_token=token,
             allowed_origins=origins,
             static_dir=static_dir,

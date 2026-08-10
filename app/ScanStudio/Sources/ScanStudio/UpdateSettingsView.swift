@@ -10,6 +10,7 @@ struct UpdateSettingsView: View {
     @Bindable var model: UpdateFlowModel
     @Bindable var webServerModel: WebServerModel
     @State private var tokenWasCopied = false
+    @State private var confirmingTrustedLAN = false
 
     var body: some View {
         Form {
@@ -27,7 +28,11 @@ struct UpdateSettingsView: View {
                         }
                     )
                 )
-                .disabled(webServerModel.state == .stopping)
+                .disabled(
+                    webServerModel.state == .stopping
+                        || (!webServerModel.isEnabled
+                            && !webServerModel.configurationErrorMessage.isEmpty)
+                )
 
                 Text("Starts a local browser UI with its own simulator-only engine. It does not share or control the scanner connected to the native app.")
                     .font(.caption)
@@ -36,14 +41,20 @@ struct UpdateSettingsView: View {
 
                 browserStatus
 
+                browserNetworkSettings
+
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Local address")
+                    Text(webServerModel.advertisedURLs.count == 1 ? "Browser address" : "Browser addresses")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     HStack(spacing: 10) {
-                        Text(webServerModel.browserURL.absoluteString)
-                            .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(webServerModel.advertisedURLs, id: \.absoluteString) { url in
+                                Text(url.absoluteString)
+                                    .font(.system(.body, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                        }
                         Spacer(minLength: 8)
                         Button("Open in Browser") {
                             NSWorkspace.shared.open(webServerModel.browserURL)
@@ -52,27 +63,55 @@ struct UpdateSettingsView: View {
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Access token")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text(webServerModel.accessToken)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityLabel("Browser preview access token")
-                        Spacer(minLength: 8)
-                        Button(tokenWasCopied ? "Copied" : "Copy Token") {
-                            copyAccessToken()
+                if webServerModel.preferences.authenticationMode == .accessToken {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Access token")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Text(webServerModel.accessToken)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityLabel("Browser preview access token")
+                            Spacer(minLength: 8)
+                            Button(tokenWasCopied ? "Copied" : "Copy Token") {
+                                copyAccessToken()
+                            }
+                            Button("New Token") {
+                                tokenWasCopied = false
+                                webServerModel.regenerateAccessToken()
+                            }
+                            .disabled(!browserSettingsAreEditable)
                         }
                     }
-                }
 
-                Text("Enter the token in the browser. Only browsers on this Mac can connect, and a new token is created each time Scan Studio launches.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    Text("Enter this token in the browser. It is never put in the address, and a new one is created whenever Scan Studio launches or you choose New Token.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if webServerModel.preferences.bindScope != .thisMac
+                        || !webServerModel.preferences.additionalOrigins
+                            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    {
+                        Text("The token controls access but does not encrypt plain HTTP. For any connection beyond your private LAN, use an authenticated HTTPS proxy or private VPN and an exact browser origin.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Label(
+                        "No login on this trusted LAN",
+                        systemImage: "exclamationmark.shield.fill"
+                    )
+                    .foregroundStyle(Color.scanStudioAmber)
+
+                    Text("Every device that can reach this address can control the simulator session. Do not use port forwarding or a reverse proxy: those can make an outside connection look local, which Scan Studio cannot reliably detect.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Section("Release channel") {
@@ -126,6 +165,45 @@ struct UpdateSettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 560)
+        .confirmationDialog(
+            "Allow this trusted LAN without a login?",
+            isPresented: $confirmingTrustedLAN,
+            titleVisibility: .visible
+        ) {
+            Button("Allow LAN Without Login", role: .destructive) {
+                var preferences = webServerModel.preferences
+                preferences.authenticationMode = .trustedLAN
+                if preferences.bindScope == .thisMac {
+                    preferences.bindScope = .localNetwork
+                }
+                preferences.additionalOrigins = ""
+                webServerModel.updatePreferences(preferences)
+            }
+            Button("Keep Access Token", role: .cancel) {}
+        } message: {
+            Text("Use this only on a network you trust. NAT, port forwarding, or a private reverse proxy can make an internet connection appear local, so this mode cannot safely protect a WAN service.")
+        }
+        .confirmationDialog(
+            "Download Browser Preview?",
+            isPresented: Binding(
+                get: { webServerModel.pendingRuntimeDownloadOffer != nil },
+                set: { presented in
+                    if !presented { webServerModel.cancelRuntimeDownloadOffer() }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Download and Enable") {
+                webServerModel.acceptPendingRuntimeDownloadAndEnable()
+            }
+            Button("Cancel", role: .cancel) {
+                webServerModel.cancelRuntimeDownloadOffer()
+            }
+        } message: {
+            if let offer = webServerModel.pendingRuntimeDownloadOffer {
+                Text(runtimeOfferMessage(offer))
+            }
+        }
     }
 
     private var header: some View {
@@ -155,12 +233,121 @@ struct UpdateSettingsView: View {
         return "Development build"
     }
 
+    private var browserSettingsAreEditable: Bool {
+        !webServerModel.isEnabled
+            && webServerModel.state != .starting
+            && webServerModel.state != .stopping
+    }
+
+    @ViewBuilder
+    private var browserNetworkSettings: some View {
+        Picker(
+            "Listen on",
+            selection: Binding(
+                get: { webServerModel.preferences.bindScope },
+                set: { updateWebPreference(\.bindScope, to: $0) }
+            )
+        ) {
+            Text("This Mac only").tag(WebServerBindScope.thisMac)
+            Text("Local network").tag(WebServerBindScope.localNetwork)
+            Text("Specific address").tag(WebServerBindScope.custom)
+        }
+        .disabled(!browserSettingsAreEditable)
+
+        if webServerModel.preferences.bindScope == .custom {
+            TextField(
+                "Interface address",
+                text: Binding(
+                    get: { webServerModel.preferences.customBindAddress },
+                    set: { updateWebPreference(\.customBindAddress, to: $0) }
+                ),
+                prompt: Text("192.168.1.20")
+            )
+            .disabled(!browserSettingsAreEditable)
+        }
+
+        Stepper(
+            value: Binding(
+                get: { webServerModel.preferences.port },
+                set: { updateWebPreference(\.port, to: $0) }
+            ),
+            in: 1024 ... 65535
+        ) {
+            LabeledContent("Port") {
+                Text(String(webServerModel.preferences.port))
+                    .font(.system(.body, design: .monospaced))
+            }
+        }
+        .disabled(!browserSettingsAreEditable)
+
+        Picker(
+            "Browser login",
+            selection: Binding(
+                get: { webServerModel.preferences.authenticationMode },
+                set: { mode in
+                    if mode == .trustedLAN {
+                        confirmingTrustedLAN = true
+                    } else {
+                        updateWebPreference(\.authenticationMode, to: mode)
+                    }
+                }
+            )
+        ) {
+            Text("Access token required").tag(WebServerAuthenticationMode.accessToken)
+            Text("Trusted local network — no login").tag(WebServerAuthenticationMode.trustedLAN)
+        }
+        .disabled(!browserSettingsAreEditable)
+
+        if webServerModel.preferences.authenticationMode == .accessToken {
+            TextField(
+                "Additional browser origins",
+                text: Binding(
+                    get: { webServerModel.preferences.additionalOrigins },
+                    set: { updateWebPreference(\.additionalOrigins, to: $0) }
+                ),
+                prompt: Text("https://scan.example.com")
+            )
+            .disabled(!browserSettingsAreEditable)
+
+            Text("Optional advanced setting for an authenticated reverse proxy. Enter exact browser origins separated by commas; wildcards are not allowed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        if !webServerModel.configurationErrorMessage.isEmpty {
+            Label(webServerModel.configurationErrorMessage, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(Color.scanStudioRed)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func updateWebPreference<Value>(
+        _ keyPath: WritableKeyPath<WebServerPreferences, Value>,
+        to value: Value
+    ) {
+        var preferences = webServerModel.preferences
+        preferences[keyPath: keyPath] = value
+        webServerModel.updatePreferences(preferences)
+    }
+
     @ViewBuilder
     private var browserStatus: some View {
         switch webServerModel.state {
         case .off:
             Label("Off", systemImage: "stop.circle")
                 .foregroundStyle(.secondary)
+        case .checkingRuntime:
+            ProgressView("Checking the signed GitHub component…")
+        case .downloadingRuntime:
+            ProgressView("Downloading the optional browser component…")
+        case .preparingRuntime:
+            ProgressView("Opening the verified component…")
+        case .installingRuntime:
+            ProgressView("Installing the browser component…")
+        case .verifyingRuntime:
+            ProgressView("Verifying the installed component…")
         case .starting:
             ProgressView("Starting browser preview…")
         case .running:
@@ -188,6 +375,14 @@ struct UpdateSettingsView: View {
             try? await Task.sleep(for: .seconds(2))
             tokenWasCopied = false
         }
+    }
+
+    private func runtimeOfferMessage(_ offer: WebRuntimeDownloadOffer) -> String {
+        let size = ByteCountFormatter.string(
+            fromByteCount: offer.downloadSize,
+            countStyle: .file
+        )
+        return "Scan Studio will download the optional \(offer.runtimeVersion) component for \(offer.architecture.rawValue) from the project's GitHub release (\(size), Developer ID signed and notarized). It is stored separately and is not part of the Scan Studio app or normal download."
     }
 
     @ViewBuilder

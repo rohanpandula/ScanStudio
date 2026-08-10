@@ -8,6 +8,18 @@ which continues to use the same Python bridge and CoolScanPy hardware path.
 See [ADR 0001](adr/0001-web-headless-runtime.md) for the decision and safety
 boundaries.
 
+## Optional macOS delivery
+
+The simulator gateway/frontend can be published as a separately downloaded,
+exact-version macOS runtime without increasing the main app/DMG's bundled
+surface. It is never nested in `ScanStudio.app`; the signed runtime reuses the
+matching installed app's engine and remains simulator-only. Publishing is
+opt-in and fails closed unless Developer ID signing, Apple notarization, and a
+detached Ed25519 manifest signature are all available. See
+[Optional macOS web runtime distribution](WEB-RUNTIME-DISTRIBUTION.md) for the
+asset layout, trust bootstrap, key rotation, SBOM/source evidence, and exact
+verification contract.
+
 ## Milestone 1: simulator appliance
 
 Goal: prove the complete browser transport without filesystem writes or scanner

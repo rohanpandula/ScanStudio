@@ -53,7 +53,10 @@ The first browser/headless slice reuses the React client and the existing Rust
 engine behind a small authenticated Python gateway. It runs locally or in a
 hardened Docker container, supports one controller plus read-only observers,
 and adapts down to a phone-sized browser. The macOS Settings pane includes an
-off-by-default switch for this local browser preview.
+off-by-default switch for this local browser preview. The normal app/DMG does
+not contain the web runtime: when a matching optional runtime is published,
+turning the switch on first shows its exact GitHub version, architecture, size,
+and signing status and asks before downloading it.
 
 This milestone is intentionally **simulator-only**. It launches a separate
 simulator engine, does not share the native app's scanner session, strips the
@@ -61,6 +64,10 @@ bridge and motion environment, and exposes no project, capture, USB, or output
 paths. See the [gateway guide](ports/web/README.md) and
 [hardware-capable roadmap](docs/WEB-HEADLESS.md) for the Docker/Unraid boundary
 and the gates required before real scanning is enabled.
+The native settings also select loopback, all private LAN interfaces, or one
+numeric interface address; choose the port; and retain token authentication by
+default. The explicit no-login option is limited to directly connected trusted
+LAN peers and must never be exposed through WAN port forwarding or a proxy.
 
 ## Download
 
@@ -71,6 +78,10 @@ All prerelease packages are published together on the
 - Intel macOS Preview: `ScanStudio-<version>-macOS-x86_64.dmg`
 - Windows x64 Preview: an installer (recommended on clean systems) and a portable zip for systems with WebView2 already installed
 - Linux x64 Preview: an AppImage and a portable tarball
+
+Some releases may additionally publish a separately signed/notarized macOS
+browser runtime. It is an on-demand simulator component, not part of either
+main app DMG; see [its distribution contract](docs/WEB-RUNTIME-DISTRIBUTION.md).
 
 Choose the DMG matching your Mac; the in-app updater does this automatically.
 A release DMG contains the app, the GPL hardware bridge and CoolscanPy source

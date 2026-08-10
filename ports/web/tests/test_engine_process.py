@@ -31,11 +31,45 @@ def settings_for(tmp_path: Path, mode: str) -> Settings:
             "--request-log",
             str(tmp_path / f"{mode}.ndjson"),
         ),
+        shared_token="test-access-token",
         allowed_origins=("http://testserver",),
         engine_startup_timeout_seconds=1,
         engine_request_timeout_seconds=1,
         engine_shutdown_timeout_seconds=0.1,
     )
+
+
+@pytest.mark.asyncio
+async def test_engine_child_contract_is_exact_command_and_stdio_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_for(tmp_path, "normal")
+    captured: dict[str, object] = {}
+
+    async def capture_spawn(*command: str, **kwargs: object):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        raise OSError("stop after contract capture")
+
+    monkeypatch.setenv("SCANSTUDIO_WEB_AUTH_MODE", "trusted-lan-no-login")
+    monkeypatch.setenv("SCANSTUDIO_WEB_BIND", "0.0.0.0")
+    monkeypatch.setenv("SCANSTUDIO_WEB_PORT", "9876")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_spawn)
+    supervisor = EngineSupervisor(settings, EventBroker(8))
+
+    with pytest.raises(EngineUnavailable, match="could not start"):
+        await supervisor.start()
+
+    assert captured["command"] == settings.engine_command
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["stdin"] is asyncio.subprocess.PIPE
+    assert kwargs["stdout"] is asyncio.subprocess.PIPE
+    assert kwargs["stderr"] is asyncio.subprocess.PIPE
+    assert not any(name.startswith("SCANSTUDIO_WEB_") for name in kwargs["env"])
+    assert "host" not in kwargs
+    assert "port" not in kwargs
 
 
 @pytest.mark.asyncio
@@ -89,9 +123,7 @@ async def test_engine_death_closes_existing_event_subscribers(tmp_path: Path) ->
         with pytest.raises(SubscriberClosed):
             await asyncio.wait_for(subscriber.next_event(), timeout=0.5)
         assert supervisor.ready is False
-        assert fatal_notifications == [
-            "scanstudio-engine stdout closed unexpectedly"
-        ]
+        assert fatal_notifications == ["scanstudio-engine stdout closed unexpectedly"]
         await supervisor._mark_fatal("duplicate fatal signal")
         assert len(fatal_notifications) == 1
     finally:

@@ -16,11 +16,14 @@ services:
     ports:
       - "${SCANSTUDIO_WEB_PORT:-8787}:8787"
     environment:
-      SCANSTUDIO_WEB_BIND: 0.0.0.0
-      SCANSTUDIO_WEB_PORT: 8787
-      SCANSTUDIO_WEB_TOKEN: "${SCANSTUDIO_WEB_TOKEN:?set a long random ScanStudio access token}"
-      SCANSTUDIO_WEB_ALLOWED_ORIGINS: "${SCANSTUDIO_WEB_ALLOWED_ORIGINS:?set the exact browser origin, including port}"
-      SCANSTUDIO_WEB_COOKIE_SECURE: "${SCANSTUDIO_WEB_COOKIE_SECURE:-false}"
+      - "SCANSTUDIO_WEB_BIND=0.0.0.0"
+      - "SCANSTUDIO_WEB_PORT=8787"
+      - "SCANSTUDIO_WEB_AUTH_MODE=${SCANSTUDIO_WEB_AUTH_MODE:-token}"
+      - "SCANSTUDIO_WEB_TOKEN=${SCANSTUDIO_WEB_TOKEN:-}"
+      - "SCANSTUDIO_WEB_ALLOWED_ORIGINS=${SCANSTUDIO_WEB_ALLOWED_ORIGINS:?set the exact browser origin, including port}"
+      # A key without `=` is forwarded only when the operator explicitly sets
+      # it. Otherwise Settings infers Secure=true for HTTPS-only origins.
+      - "SCANSTUDIO_WEB_COOKIE_SECURE"
     healthcheck:
       test:
         - CMD

@@ -10,7 +10,13 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "fastapi>=0.115,<1",
-  "uvicorn[standard]>=0.34,<1",
+  # Keep the separately downloaded runtime closure small and auditable. The
+  # standard Uvicorn extra adds native uvloop/httptools/watchfiles binaries
+  # that are unnecessary without reload/workers. wsproto supplies the pure-
+  # Python WebSocket implementation used by the gateway.
+  "pydantic>=1.10.24,<2",
+  "uvicorn>=0.34,<1",
+  "wsproto>=1.2,<2",
 ]
 
 [project.optional-dependencies]

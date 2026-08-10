@@ -6,12 +6,13 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from conftest import ACCESS_TOKEN, ORIGIN, claim, login, post_engine
-from scanstudio_web.app import create_app
+from scanstudio_web.app import EngineRequestBody, create_app
 from scanstudio_web.engine_process import EngineProtocolError
-from scanstudio_web.settings import ConfigurationError, Settings
+from scanstudio_web.settings import AuthMode, ConfigurationError, Settings
 
 
 def read_requests(path: Path) -> list[dict]:
@@ -28,7 +29,11 @@ def test_startup_health_first_hello_simulator_environment_and_shutdown(
     monkeypatch.setenv("SCANSTUDIO_WEB_TOKEN", "must-not-reach-child")
     monkeypatch.setenv("SCANSTUDIO_WEB_ALLOWED_ORIGINS", "http://gateway-only.test")
     monkeypatch.setenv("SCANSTUDIO_ENGINE_TEST_SENTINEL", "preserve-for-engine")
-    app, request_log, env_log = app_factory(token=None)
+    app, request_log, env_log = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
 
     with TestClient(app) as client:
         health = client.get("/healthz")
@@ -121,6 +126,218 @@ def test_cookie_login_and_post_origin_checks(app_factory) -> None:
             "/api/v1/control/claim", headers={"Origin": "http://testserver:8080"}
         )
         assert wrong_port.status_code == 403
+
+
+def test_request_models_reject_unknown_fields_under_pydantic_v1(app_factory) -> None:
+    app, _, _ = app_factory()
+    with TestClient(app) as client:
+        login_extra = client.post(
+            "/api/v1/session/login",
+            headers={"Origin": ORIGIN},
+            json={"token": ACCESS_TOKEN, "evil": True},
+        )
+        assert login_extra.status_code == 422
+        assert login(client).status_code == 200
+
+        claim_extra = client.post(
+            "/api/v1/control/claim",
+            headers={"Origin": ORIGIN},
+            json={"evil": True},
+        )
+        assert claim_extra.status_code == 422
+
+        engine_extra = client.post(
+            "/api/v1/engine/request",
+            headers={"Origin": ORIGIN},
+            json={"method": "scanner.status", "params": {}, "evil": True},
+        )
+        assert engine_extra.status_code == 422
+
+
+def test_request_models_reject_pydantic_v1_coercions(app_factory) -> None:
+    app, _, _ = app_factory()
+    with TestClient(app) as client:
+        integer_token = client.post(
+            "/api/v1/session/login",
+            headers={"Origin": ORIGIN},
+            json={"token": 1234},
+        )
+        assert integer_token.status_code == 422
+        assert login(client).status_code == 200
+
+        claim_array = client.post(
+            "/api/v1/control/claim",
+            headers={"Origin": ORIGIN},
+            json=[],
+        )
+        assert claim_array.status_code == 422
+
+        claim_string = client.post(
+            "/api/v1/control/claim",
+            headers={"Origin": ORIGIN},
+            json="",
+        )
+        assert claim_string.status_code == 422
+
+        integer_method = client.post(
+            "/api/v1/engine/request",
+            headers={"Origin": ORIGIN},
+            json={"method": 123, "params": {}},
+        )
+        assert integer_method.status_code == 422
+
+        params_array = client.post(
+            "/api/v1/engine/request",
+            headers={"Origin": ORIGIN},
+            json={"method": "scanner.status", "params": [["key", "value"]]},
+        )
+        assert params_array.status_code == 422
+
+    with pytest.raises(ValidationError, match="string keys"):
+        EngineRequestBody(method="scanner.status", params={1: "value"})
+
+
+def test_trusted_lan_private_peer_needs_no_login_but_still_needs_exact_origin(
+    app_factory,
+) -> None:
+    app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
+    with TestClient(app, client=("192.168.40.25", 50_000)) as client:
+        session = client.get("/api/v1/session")
+        assert session.status_code == 200
+        assert session.json() == {
+            "authenticated": True,
+            "control": "available",
+        }
+
+        missing_origin = client.post("/api/v1/control/claim")
+        assert missing_origin.status_code == 403
+        assert missing_origin.json()["error"]["code"] == "ORIGIN_FORBIDDEN"
+
+        wrong_origin = client.post(
+            "/api/v1/control/claim",
+            headers={"Origin": "http://evil.test"},
+        )
+        assert wrong_origin.status_code == 403
+        assert wrong_origin.json()["error"]["code"] == "ORIGIN_FORBIDDEN"
+
+        claimed = client.post(
+            "/api/v1/control/claim",
+            headers={"Origin": ORIGIN},
+        )
+        assert claimed.status_code == 200
+        assert claimed.json()["leaseToken"]
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        ("8.8.8.8", 50_000),
+        ("100.64.0.10", 50_000),
+        ("169.254.1.10", 50_000),
+        ("fe80::10", 50_000),
+        ("not-an-address", 50_000),
+        ("192.168.40.25", "not-a-port"),
+        ("192.168.40.25", 0),
+        None,
+    ],
+)
+def test_trusted_lan_rejects_non_lan_http_peers_but_keeps_probes_minimal(
+    app_factory,
+    peer,
+) -> None:
+    app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
+    with TestClient(app, client=peer) as client:
+        rejected = client.get("/api/v1/session")
+        assert rejected.status_code == 403
+        assert rejected.json()["error"]["code"] == "PEER_FORBIDDEN"
+        assert client.get("/not-a-probe").status_code == 403
+
+        health = client.get("/healthz")
+        startup = client.get("/startupz")
+        assert health.status_code == 200
+        assert health.json() == {"status": "ok"}
+        assert startup.status_code == 200
+        assert startup.json() == {"started": True}
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["Forwarded", "X-Forwarded-For", "X-Real-IP"],
+)
+def test_trusted_lan_rejects_proxy_client_headers_even_from_private_peer(
+    app_factory,
+    header,
+) -> None:
+    app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
+    with TestClient(app, client=("192.168.40.25", 50_000)) as client:
+        rejected = client.get(
+            "/api/v1/session",
+            headers={header: "for=192.168.40.25"},
+        )
+        assert rejected.status_code == 403
+        assert rejected.json()["error"]["code"] == "PEER_FORBIDDEN"
+        assert "proxy client-address headers" in rejected.json()["error"]["message"]
+
+
+def test_trusted_lan_forwarded_private_address_cannot_spoof_public_peer(
+    app_factory,
+) -> None:
+    app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
+    with TestClient(app, client=("203.0.113.10", 50_000)) as client:
+        rejected = client.get(
+            "/api/v1/session",
+            headers={"X-Forwarded-For": "192.168.40.25"},
+        )
+        assert rejected.status_code == 403
+        assert rejected.json()["error"]["code"] == "PEER_FORBIDDEN"
+
+
+def test_trusted_lan_peer_gate_covers_static_assets(
+    app_factory, tmp_path: Path
+) -> None:
+    static_dir = tmp_path / "lan-static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<h1>LAN UI</h1>", encoding="utf-8")
+    (static_dir / "scanstudio-web-runtime.json").write_text(
+        '{"schemaVersion":1,"runtime":"simulator-only-web"}\n',
+        encoding="utf-8",
+    )
+
+    public_app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+        static_dir=static_dir,
+    )
+    with TestClient(public_app, client=("203.0.113.10", 50_000)) as client:
+        assert client.get("/").status_code == 403
+
+    private_app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+        static_dir=static_dir,
+    )
+    with TestClient(private_app, client=("fd12:3456::10", 50_000)) as client:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert "LAN UI" in response.text
 
 
 def test_browser_session_limit_rejects_new_sessions_without_evicting_existing(
@@ -266,6 +483,71 @@ def test_authenticated_observer_websocket_receives_events(app_factory) -> None:
             assert websocket.receive_json()["event"] == "scanner.status"
 
 
+def test_trusted_lan_private_peer_opens_websocket_without_login(app_factory) -> None:
+    app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
+    with TestClient(app, client=("10.20.30.40", 50_000)) as client:
+        with client.websocket_connect(
+            "/api/v1/engine/events",
+            headers={"Origin": ORIGIN},
+        ):
+            pass
+
+
+@pytest.mark.parametrize(
+    ("peer", "extra_headers"),
+    [
+        (("8.8.8.8", 50_000), {}),
+        (("100.64.0.10", 50_000), {}),
+        (("169.254.1.10", 50_000), {}),
+        (("fe80::10", 50_000), {}),
+        (("not-an-address", 50_000), {}),
+        (("192.168.40.25", "not-a-port"), {}),
+        (("192.168.40.25", 0), {}),
+        (None, {}),
+        (("192.168.40.25", 50_000), {"X-Forwarded-For": "10.0.0.2"}),
+    ],
+)
+def test_trusted_lan_websocket_rejects_untrusted_peers_and_proxy_headers(
+    app_factory,
+    peer,
+    extra_headers,
+) -> None:
+    app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
+    headers = {"Origin": ORIGIN, **extra_headers}
+    with TestClient(app, client=peer) as client:
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect(
+                "/api/v1/engine/events",
+                headers=headers,
+            ):
+                pass
+        assert caught.value.code == 4403
+
+
+def test_trusted_lan_websocket_preserves_exact_origin_check(app_factory) -> None:
+    app, _, _ = app_factory(
+        auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+        bind_host="0.0.0.0",
+        token=None,
+    )
+    with TestClient(app, client=("192.168.40.25", 50_000)) as client:
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect(
+                "/api/v1/engine/events",
+                headers={"Origin": "http://evil.test"},
+            ):
+                pass
+        assert caught.value.code == 4403
+
+
 def test_event_subscriber_limit_rejects_excess_and_recovers_capacity(
     app_factory,
 ) -> None:
@@ -306,7 +588,13 @@ def test_public_health_endpoints_hide_engine_failure_details(app_factory) -> Non
 
 @pytest.mark.asyncio
 async def test_websocket_accept_failure_unsubscribes_observer() -> None:
-    app = create_app(Settings(allowed_origins=(ORIGIN,)))
+    app = create_app(
+        Settings(
+            auth_mode=AuthMode.TRUSTED_LAN_NO_LOGIN,
+            bind_host="0.0.0.0",
+            allowed_origins=(ORIGIN,),
+        )
+    )
     events = app.state.events
     subscribed: list[Any] = []
     unsubscribed: list[Any] = []
@@ -326,6 +614,7 @@ async def test_websocket_accept_failure_unsubscribes_observer() -> None:
     events.unsubscribe = record_unsubscribe
 
     class AcceptFailure:
+        scope = {"client": ("127.0.0.1", 50_000)}
         headers = {"origin": ORIGIN}
         cookies: dict[str, str] = {}
 

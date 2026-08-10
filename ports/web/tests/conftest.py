@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from scanstudio_web.app import create_app
-from scanstudio_web.settings import Settings
+from scanstudio_web.settings import AuthMode, Settings
 
 FAKE_ENGINE = Path(__file__).with_name("fake_engine.py")
 ORIGIN = "http://testserver"
@@ -22,6 +22,8 @@ def app_factory(tmp_path: Path) -> Callable[..., tuple[object, Path, Path]]:
         *,
         mode: str = "normal",
         token: str | None = ACCESS_TOKEN,
+        auth_mode: AuthMode = AuthMode.TOKEN,
+        bind_host: str = "127.0.0.1",
         static_dir: Path | None = None,
         max_auth_sessions: int = 256,
         max_event_subscribers: int = 64,
@@ -41,6 +43,8 @@ def app_factory(tmp_path: Path) -> Callable[..., tuple[object, Path, Path]]:
                 "--env-log",
                 str(env_log),
             ),
+            bind_host=bind_host,
+            auth_mode=auth_mode,
             shared_token=token,
             allowed_origins=(ORIGIN,),
             static_dir=static_dir,

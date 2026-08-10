@@ -175,6 +175,11 @@ if [[ -n "${SCANSTUDIO_RELEASE_VERSION:-}" ]]; then
         || { print -u2 "Failed to stamp ScanStudioRelease=$SCANSTUDIO_RELEASE_VERSION"; exit 1; }
 fi
 
+# Optional-runtime releases stamp only the raw Ed25519 trust anchor and the
+# Developer ID TeamIdentifier. The runtime and PEM remain separate release
+# material and are explicitly forbidden from this app below.
+"$script_dir/stamp_web_runtime_trust.sh" "$staged_app/Contents/Info.plist"
+
 bundled_libusb="$staged_app/Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib"
 install -m 755 "$bundled_libusb_build/libusb-1.0.dylib" "$bundled_libusb"
 app_minimum="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$staged_app/Contents/Info.plist")"
@@ -433,6 +438,11 @@ LS-5000 color-roll detection, preview, and capture require no host driver.
 The bundled python-sane binding still needs a compatible system SANE backend
 for its optional plain-scan and software-eject paths.
 LICENSES
+
+# Browser delivery is intentionally independent from the production app. A
+# separately downloaded, independently signed runtime must never become an
+# implicit nested payload of ScanStudio.app.
+"$script_dir/assert_no_web_runtime.sh" "$staged_app"
 
 # Swift links object provenance strings into the executable even in a release
 # build. Remove local symbol/debug tables after the source-path remap and

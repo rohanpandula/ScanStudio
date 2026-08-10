@@ -20,6 +20,8 @@ jobs:
   adversarial-review-tooling:
     name: Adversarial review tooling
     runs-on: ubuntu-latest
+    env:
+      OPENSSL_BIN: /usr/bin/openssl
     steps:
       - uses: actions/checkout@v4
       - name: Test deterministic shard and OpenCode parsers
@@ -30,6 +32,18 @@ jobs:
             scripts/check_adversarial_review.py \
             scripts/parse_opencode_review.py
           bash -n scripts/run_adversarial_review.sh
+          bash -n \
+            ports/web/packaging/macos/package-runtime.sh \
+            ports/web/packaging/macos/inspect-runtime-dmg.sh \
+            ports/web/packaging/macos/payload-tree-hash.sh \
+            ports/web/packaging/macos/prepare-pinned-python.sh \
+            ports/web/packaging/macos/require-openssl3.sh \
+            ports/web/packaging/macos/emit-integrity.sh \
+            ports/web/packaging/macos/verify-integrity.sh \
+            ports/web/packaging/macos/verify-runtime-release.sh
+          ports/web/packaging/macos/tests/test-integrity.sh
+          ports/web/packaging/macos/tests/test-payload-tree-hash.sh
+          ports/web/packaging/macos/tests/test-python-build-standalone-evidence.sh
 
   adversarial-review:
     name: Adversarial review evidence
@@ -51,9 +65,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Select and prove OpenSSL 3 for packaging tests
+        run: |
+          brew install openssl@3
+          OPENSSL_BIN="$(brew --prefix openssl@3)/bin/openssl"
+          test "$OPENSSL_BIN" = "$(cd "$(dirname "$OPENSSL_BIN")" && pwd)/$(basename "$OPENSSL_BIN")"
+          ports/web/packaging/macos/require-openssl3.sh "$OPENSSL_BIN"
+          echo "OPENSSL_BIN=$OPENSSL_BIN" >> "$GITHUB_ENV"
       - name: Test Swift app and Rust engine
         working-directory: app/ScanStudio
-        run: make test
+        run: |
+          scripts/tests/test_assert_no_web_runtime.sh
+          scripts/tests/test_stamp_web_runtime_trust.sh
+          xcrun clang -Os -Wall -Wextra -Werror -fsyntax-only \
+            ../../ports/web/packaging/macos/launcher.c
+          make test
 
   bridge:
     name: Bridge tests
@@ -130,7 +156,18 @@ jobs:
         env:
           SCANSTUDIO_WEB_TOKEN: ci-only-token
           SCANSTUDIO_WEB_ALLOWED_ORIGINS: http://127.0.0.1:8787
-        run: docker compose -f ports/web/compose.yaml config --quiet
+        run: |
+          docker compose -f ports/web/compose.yaml config --quiet
+          env -u SCANSTUDIO_WEB_COOKIE_SECURE \
+            SCANSTUDIO_WEB_ALLOWED_ORIGINS=https://scanner.example.test \
+            docker compose -f ports/web/compose.yaml config --format json \
+            | python3 -c \
+              'import json,sys; env=json.load(sys.stdin)["services"]["scanstudio-web"]["environment"]; assert env.get("SCANSTUDIO_WEB_COOKIE_SECURE") is None, env'
+          SCANSTUDIO_WEB_COOKIE_SECURE=true \
+            SCANSTUDIO_WEB_ALLOWED_ORIGINS=https://scanner.example.test \
+            docker compose -f ports/web/compose.yaml config --format json \
+            | python3 -c \
+              'import json,sys; env=json.load(sys.stdin)["services"]["scanstudio-web"]["environment"]; assert env["SCANSTUDIO_WEB_COOKIE_SECURE"] == "true", env'
       - name: Build the simulator appliance image
         run: docker build -f ports/web/Dockerfile -t scanstudio-web:ci .
       - name: Smoke-test the built image with the real Rust simulator
@@ -139,10 +176,16 @@ jobs:
           SCANSTUDIO_WEB_ALLOWED_ORIGINS: http://127.0.0.1:18787
         run: |
           cookie_jar="$(mktemp)"
+          websocket_ready="$(mktemp)"
+          websocket_event="$(mktemp)"
+          websocket_pid=""
           cleanup() {
+            if [[ -n "$websocket_pid" ]]; then
+              kill "$websocket_pid" >/dev/null 2>&1 || true
+            fi
             docker logs scanstudio-web-ci-smoke 2>/dev/null || true
             docker rm --force scanstudio-web-ci-smoke >/dev/null 2>&1 || true
-            rm -f "$cookie_jar"
+            rm -f "$cookie_jar" "$websocket_ready" "$websocket_event"
           }
           trap cleanup EXIT
 
@@ -209,8 +252,98 @@ jobs:
               --data "$1" \
               http://127.0.0.1:18787/api/v1/engine/request
           }
+          session_cookie="$(awk '$6 == "scanstudio_session" { print $6 "=" $7 }' "$cookie_jar")"
+          [[ -n "$session_cookie" ]]
+          python3 - "$session_cookie" "$websocket_ready" "$websocket_event" <<'PY' &
+          import base64
+          import hashlib
+          import json
+          from pathlib import Path
+          import os
+          import socket
+          import struct
+          import sys
+
+          cookie, ready_path, event_path = sys.argv[1:]
+          ready = Path(ready_path)
+          event = Path(event_path)
+          key = base64.b64encode(os.urandom(16)).decode("ascii")
+          expected_accept = base64.b64encode(
+              hashlib.sha1(
+                  (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+              ).digest()
+          ).decode("ascii")
+
+          def receive_exact(connection: socket.socket, size: int) -> bytes:
+              chunks = bytearray()
+              while len(chunks) < size:
+                  chunk = connection.recv(size - len(chunks))
+                  if not chunk:
+                      raise RuntimeError("WebSocket closed before the event arrived")
+                  chunks.extend(chunk)
+              return bytes(chunks)
+
+          with socket.create_connection(("127.0.0.1", 18787), timeout=20) as connection:
+              connection.settimeout(20)
+              request = (
+                  "GET /api/v1/engine/events HTTP/1.1\r\n"
+                  "Host: 127.0.0.1:18787\r\n"
+                  "Upgrade: websocket\r\n"
+                  "Connection: Upgrade\r\n"
+                  f"Sec-WebSocket-Key: {key}\r\n"
+                  "Sec-WebSocket-Version: 13\r\n"
+                  "Origin: http://127.0.0.1:18787\r\n"
+                  f"Cookie: {cookie}\r\n\r\n"
+              )
+              connection.sendall(request.encode("ascii"))
+              response = bytearray()
+              while b"\r\n\r\n" not in response:
+                  response.extend(connection.recv(4096))
+                  if len(response) > 16_384:
+                      raise RuntimeError("oversized WebSocket handshake response")
+              header_block, buffered = bytes(response).split(b"\r\n\r\n", 1)
+              lines = header_block.decode("ascii").split("\r\n")
+              if lines[0] != "HTTP/1.1 101 Switching Protocols":
+                  raise RuntimeError(f"WebSocket upgrade failed: {lines[0]}")
+              headers = {
+                  name.strip().lower(): value.strip()
+                  for name, value in (line.split(":", 1) for line in lines[1:])
+              }
+              if headers.get("sec-websocket-accept") != expected_accept:
+                  raise RuntimeError("WebSocket accept proof does not match")
+              if buffered:
+                  raise RuntimeError("unexpected event before smoke trigger")
+              ready.write_text("ready\n", encoding="utf-8")
+
+              first, second = receive_exact(connection, 2)
+              if first != 0x81 or second & 0x80:
+                  raise RuntimeError("expected one final, unmasked WebSocket text frame")
+              size = second & 0x7F
+              if size == 126:
+                  size = struct.unpack("!H", receive_exact(connection, 2))[0]
+              elif size == 127:
+                  size = struct.unpack("!Q", receive_exact(connection, 8))[0]
+              payload = receive_exact(connection, size)
+              message = json.loads(payload.decode("utf-8"))
+              if message.get("event") != "scanner.status":
+                  raise RuntimeError(f"unexpected WebSocket event: {message!r}")
+              event.write_text(json.dumps(message, sort_keys=True), encoding="utf-8")
+          PY
+          websocket_pid="$!"
+          for ((attempt = 1; attempt <= 100; attempt += 1)); do
+            if [[ -s "$websocket_ready" ]]; then
+              break
+            fi
+            kill -0 "$websocket_pid"
+            sleep 0.1
+          done
+          [[ -s "$websocket_ready" ]]
           request_engine '{"method":"scanner.connect","params":{"deviceId":"sim-ls5000-0","options":{"timeScale":0.01}}}' \
             | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"]["status"]["connected"] is True'
+          wait "$websocket_pid"
+          websocket_pid=""
+          python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["event"] == "scanner.status"' \
+            "$websocket_event"
           request_engine '{"method":"sim.loadMedia","params":{"carrier":"strip6"}}' >/dev/null
           request_engine '{"method":"scanner.acquireThumbnails","params":{"frames":[1],"operationId":"ci-preview"}}' \
             | python3 -c 'import json,sys; assert json.load(sys.stdin)["result"]["accepted"] is True'

@@ -195,7 +195,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updateFlowModel = Self.makeUpdateFlowModel()
-        webServerModel = WebServerModel(engineURL: browserEngineURL)
+        let webRuntimeServices = Self.makeWebRuntimeServices()
+        webServerModel = WebServerModel(
+            engineURL: browserEngineURL,
+            runtimeManager: webRuntimeServices?.manager,
+            runtimeRequest: webRuntimeServices?.request
+        )
         super.init()
 
         // AUT-05-GUARD: mirror the real job-active signal into the update flow
@@ -263,6 +268,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return locateError.message
         }
         return String(describing: error)
+    }
+
+    /// The ordinary app release contains no browser-runtime executable. If a
+    /// release opts into publishing the separate component, packaging stamps
+    /// only its public verification key and Developer ID Team ID. Missing or
+    /// malformed trust metadata keeps on-demand installation unavailable;
+    /// source builds can still use the explicitly development-only locator.
+    private static func makeWebRuntimeServices() -> WebRuntimeHostServices? {
+        guard let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first,
+        let caches = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first else {
+            return nil
+        }
+        return try? WebRuntimeHostBootstrap.makeServices(
+            infoDictionary: Bundle.main.infoDictionary ?? [:],
+            applicationSupportDirectory: applicationSupport,
+            cachesDirectory: caches
+        )
     }
 
     // MARK: - Update wiring (01-05)

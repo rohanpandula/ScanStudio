@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 from typing import Any
 
 import pytest
@@ -44,11 +45,26 @@ def test_requested_process_group_isolation_fails_closed(
         cli._isolate_process_group_if_requested()
 
 
+def test_foundation_process_group_leader_is_already_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCANSTUDIO_WEB_ISOLATE_PROCESS_GROUP", "1")
+    monkeypatch.setattr(cli.os, "getpid", lambda: 4242)
+    monkeypatch.setattr(cli.os, "getpgrp", lambda: 4242)
+
+    def already_group_leader() -> None:
+        raise OSError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(cli.os, "setsid", already_group_leader)
+
+    cli._isolate_process_group_if_requested()
+
+
 def test_main_requests_uvicorn_exit_after_engine_fatal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
-    settings = Settings()
+    settings = Settings(shared_token="test-access-token")
 
     def fake_create_app(
         configured: Settings,

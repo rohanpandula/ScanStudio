@@ -116,11 +116,14 @@ When the engine comes from this checkout, the app discovers
 development layout can set the exact paths with
 `SCANSTUDIO_WEB_COMMAND_PATH` and `SCANSTUDIO_WEB_STATIC_DIR`.
 
-The release packaging scripts do not bundle these Python/frontend artifacts
-yet. The app-side packaged-resource contract reserves
-`Contents/Resources/WebRuntime/bin/scanstudio-web` and
-`Contents/Resources/WebFrontend` for that later step; until then a packaged
-build reports the missing runtime honestly and leaves the toggle off.
+The release packaging scripts deliberately never bundle these Python/frontend
+artifacts in `ScanStudio.app` or its DMG. An optional exact-version runtime may
+instead be delivered as a separate Developer-ID-signed/notarized GitHub asset;
+the app authenticates its detached manifest, caches the verified external
+bundle, and reuses this app's exact engine. Default/dev builds without the
+stamped public key and Team ID continue to report the missing trusted runtime
+honestly and leave the toggle off. See
+[`docs/WEB-RUNTIME-DISTRIBUTION.md`](../../docs/WEB-RUNTIME-DISTRIBUTION.md).
 
 ## Real hardware: LS-5000 through the CoolscanPy bridge
 

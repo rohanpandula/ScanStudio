@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field, StrictStr, root_validator, validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
@@ -23,6 +23,7 @@ from .security import (
     AuthManager,
     AuthenticationError,
     OriginError,
+    PeerAccessError,
     SessionLimitReached,
 )
 from .settings import ConfigurationError, Settings
@@ -30,6 +31,7 @@ from .settings import ConfigurationError, Settings
 CONTROL_LEASE_HEADER = "X-ScanStudio-Control-Lease"
 WEB_RUNTIME_MARKER_FILENAME = "scanstudio-web-runtime.json"
 WEB_RUNTIME_MARKER = {"schemaVersion": 1, "runtime": "simulator-only-web"}
+PUBLIC_PROBE_PATHS = frozenset({"/healthz", "/startupz"})
 
 READ_ONLY_METHODS = frozenset({"scanner.list", "scanner.status"})
 MUTATING_METHODS = frozenset(
@@ -44,17 +46,32 @@ ALLOWED_METHODS = READ_ONLY_METHODS | MUTATING_METHODS
 RESERVED_METHODS = frozenset({"engine.hello", "engine.shutdown"})
 
 
-class LoginBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class StrictRequestBody(BaseModel):
+    @root_validator(pre=True)
+    def require_json_object(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            raise TypeError("request body must be a JSON object")
+        return values
 
-    token: str = Field(min_length=1, max_length=4_096)
+    class Config:
+        extra = "forbid"
 
 
-class EngineRequestBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class LoginBody(StrictRequestBody):
+    token: StrictStr = Field(min_length=1, max_length=4_096)
 
-    method: str = Field(min_length=1, max_length=128)
+
+class EngineRequestBody(StrictRequestBody):
+    method: StrictStr = Field(min_length=1, max_length=128)
     params: dict[str, Any] = Field(default_factory=dict)
+
+    @validator("params", pre=True)
+    def require_params_json_object(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or any(
+            not isinstance(key, str) for key in value
+        ):
+            raise TypeError("params must be a JSON object with string keys")
+        return value
 
 
 class GatewayError(Exception):
@@ -72,6 +89,22 @@ class GatewayError(Exception):
                 "recoverable": False,
             }
         }
+
+
+async def require_empty_json_object_body(request: Request) -> None:
+    raw = await request.body()
+    if not raw:
+        return
+    try:
+        body = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GatewayError(422, "INVALID_REQUEST", "invalid request body") from exc
+    if not isinstance(body, dict) or body:
+        raise GatewayError(
+            422,
+            "INVALID_REQUEST",
+            "control claim body must be an empty JSON object",
+        )
 
 
 class RequestBodyLimitMiddleware:
@@ -216,7 +249,24 @@ def create_app(
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
-        response = await call_next(request)
+        try:
+            if request.url.path not in PUBLIC_PROBE_PATHS:
+                auth.require_trusted_peer(
+                    request.scope.get("client"),
+                    request.headers,
+                )
+            response = await call_next(request)
+        except PeerAccessError as exc:
+            response = JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "code": "PEER_FORBIDDEN",
+                        "message": str(exc),
+                        "recoverable": False,
+                    }
+                },
+            )
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -317,6 +367,7 @@ def create_app(
 
     @app.post("/api/v1/control/claim")
     async def claim_control(request: Request) -> JSONResponse:
+        await require_empty_json_object_body(request)
         await protect_post(request)
         try:
             grant = await lease.claim(control_token(request))
@@ -404,6 +455,14 @@ def create_app(
 
     @app.websocket("/api/v1/engine/events")
     async def engine_events(websocket: WebSocket) -> None:
+        try:
+            auth.require_trusted_peer(
+                websocket.scope.get("client"),
+                websocket.headers,
+            )
+        except PeerAccessError:
+            await websocket.close(code=4403, reason="trusted LAN peer forbidden")
+            return
         try:
             auth.require_origin(websocket.headers.get("origin"))
         except OriginError:
