@@ -40,7 +40,7 @@ steps, and no hardware-motion action appears anywhere here.
    device with VID:PID `04b0:4002`. Bind it once with
    `usbipd bind --busid <busid>` (admin, persists across reboots), then attach
    it to WSL with
-   `usbipd attach --wsl --busid <busid> --distribution Ubuntu-24.04`
+   `usbipd attach --wsl Ubuntu-24.04 --busid=<busid>`
    (no admin needed).
    *Turns green: `usbipd_attach`.*
    **This attach step is routine, not one-time** — repeat it after every
@@ -67,11 +67,15 @@ steps, and no hardware-motion action appears anywhere here.
    *Turns green: `webview2`.* If it reports FAIL, install from
    https://developer.microsoft.com/microsoft-edge/webview2/consumer/.
 
-8. **Launch the ScanStudio app on Windows and open its setup checker screen.**
-   Confirm all five probes — `wsl_status`, `bridge_which`, `bridge_version`,
+8. **Launch the ordinary ScanStudio app on Windows and open its setup checker
+   screen.** This normal Start-menu/Explorer launch is deliberately unarmed;
+   **Check scanner** refreshes status and does not authorize motion. Confirm
+   all five probes — `wsl_status`, `bridge_which`, `bridge_version`,
    `usbipd_attach`, `webview2` — show green. Note the checker's max-single-read
    telemetry line too; it will read "no size data recorded" until a real
-   capture has run.
+   capture has run. Fully quit this setup-checker process before Phase 10. The
+   live runbook uses the separately named **ScanStudio Hardware Session**
+   launcher and an explicit media name.
 
 9. **Recommended (not required): reduce Windows-side disk growth** from
    repeated large staged files by enabling sparse VHD — add `sparseVhd=true`
@@ -84,7 +88,7 @@ steps, and no hardware-motion action appears anywhere here.
 
 usbipd-win has known bugs (issues #504, #180, #581) where a device "works
 once, then fails" until you run `usbipd detach --busid <busid>` followed by
-`usbipd attach --wsl --busid <busid> --distribution Ubuntu-24.04` (a physical
+`usbipd attach --wsl Ubuntu-24.04 --busid=<busid>` (a physical
 replug also works). If the app quit abnormally and a bridge process seems stuck
 holding the scanner (the checker's `bridge_which`/`bridge_version` probes still
 report OK but nothing responds), the last-resort recovery is

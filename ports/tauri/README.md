@@ -28,7 +28,12 @@ download one of the native macOS DMGs from the main
 2. Install WSL2 with Ubuntu 24.04 if it is not already installed.
 3. Follow `packaging/windows/README.md` to install the included offline scanner
    bridge inside WSL2 and attach the scanner's USB device.
-4. Open ScanStudio and use its setup checker before loading film.
+4. Open ordinary ScanStudio and use its setup checker before loading film.
+   This launch is unarmed. For the later owner-attended live runbook, fully
+   quit it and use the separately named **ScanStudio Hardware Session**
+   launcher (or the portable folder's matching `.cmd` launcher), which asks
+   for the explicit junk/test media name and cleans up its owned latch when
+   that app process exits.
 
 The Windows application itself is native. Scanner access currently crosses a
 pinned Ubuntu 24.04 WSL2 lane; both packages carry their own CPython runtime,

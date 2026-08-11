@@ -243,7 +243,7 @@ fn probe_usbipd_attach(executor: &dyn CommandExecutor, is_windows: bool) -> Prob
             status: ProbeStatus::Fail,
             detail: "LS-5000 (04b0:4002) not found in usbipd list output".to_string(),
             fix_command: Some(
-                "usbipd bind --busid <busid> (find <busid> via `usbipd list`), then usbipd attach --wsl --busid <busid> --distribution Ubuntu-24.04"
+                "usbipd bind --busid <busid> (find <busid> via `usbipd list`), then usbipd attach --wsl Ubuntu-24.04 --busid=<busid>"
                     .to_string(),
             ),
         };
@@ -254,7 +254,7 @@ fn probe_usbipd_attach(executor: &dyn CommandExecutor, is_windows: bool) -> Prob
             status: ProbeStatus::Fail,
             detail: "LS-5000 visible to usbipd but not attached to WSL".to_string(),
             fix_command: Some(
-                "usbipd attach --wsl --busid <busid> --distribution Ubuntu-24.04".to_string(),
+                "usbipd attach --wsl Ubuntu-24.04 --busid=<busid>".to_string(),
             ),
         };
     }
@@ -574,6 +574,10 @@ mod tests {
         let na = probe_usbipd_attach(&FakeExecutor::new(not_attached), true);
         assert_eq!(na.status, ProbeStatus::Fail);
         assert_eq!(na.detail, "LS-5000 visible to usbipd but not attached to WSL");
+        assert_eq!(
+            na.fix_command.as_deref(),
+            Some("usbipd attach --wsl Ubuntu-24.04 --busid=<busid>")
+        );
 
         let not_found = HashMap::from([(
             key("usbipd", &["list"]),
@@ -582,6 +586,12 @@ mod tests {
         let nf = probe_usbipd_attach(&FakeExecutor::new(not_found), true);
         assert_eq!(nf.status, ProbeStatus::Fail);
         assert_eq!(nf.detail, "LS-5000 (04b0:4002) not found in usbipd list output");
+        assert_eq!(
+            nf.fix_command.as_deref(),
+            Some(
+                "usbipd bind --busid <busid> (find <busid> via `usbipd list`), then usbipd attach --wsl Ubuntu-24.04 --busid=<busid>"
+            )
+        );
 
         let spawn_fail = HashMap::from([(
             key("usbipd", &["list"]),

@@ -43,6 +43,7 @@ jobs:
         env:
           HOST_PYTHON: python3
         run: |
+          ./packaging/windows/tests/test-hardware-session-launcher.sh
           ./packaging/windows/assemble-staging.sh
           ./packaging/windows/verify-bundle.sh ./packaging/.staging/windows
           tar -C packaging/.staging -czf "$RUNNER_TEMP/windows-staging.tar.gz" windows

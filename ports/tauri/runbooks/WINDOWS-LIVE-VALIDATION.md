@@ -52,7 +52,7 @@ replug, or a usbipd service restart — only the one-time `usbipd bind` is
 durable. The owner runs `usbipd list` to confirm the LS-5000 still shows
 attached to the WSL distro before continuing, re-attaching if needed:
 
-`usbipd attach --wsl --busid <busid> --distribution Ubuntu-24.04`
+`usbipd attach --wsl Ubuntu-24.04 --busid=<busid>`
 
 ## Scheduling and Safety Preconditions
 
@@ -103,41 +103,32 @@ to exercise the usbipd stability gate.
 
 ### Cycle 1
 
-**e1. Arm the motion latch and launch the owner-gated app process.** The owner
-first fully quits every running ScanStudio process. In the Ubuntu-24.04 WSL
-shell, the owner writes non-empty content naming the loaded media (for example
-the string `junk-roll`) to `~/.scanstudio/hw-motion-armed`. This is a separate
-condition; neither the Windows app nor its installer creates the latch.
+**e1. Arm and launch one supervised owner session.** The owner first fully
+quits every running ScanStudio process. From the Windows Start menu, the owner
+opens the separately named **ScanStudio Hardware Session** shortcut. For a
+portable build, the owner double-clicks
+`Start-ScanStudio-Hardware-Session.cmd` beside the extracted
+`scanstudio-app.exe`. The owner keeps the launcher console open and enters the
+explicit name of the junk/test media actually loaded, for example `junk-roll`.
 
-```sh
-install -d -m 700 ~/.scanstudio
-printf '%s\n' 'junk-roll' > ~/.scanstudio/hw-motion-armed
-chmod 600 ~/.scanstudio/hw-motion-armed
-```
+The owner does not run either launcher as administrator and does not create a
+persistent user/system environment variable. The launcher pins
+`Ubuntu-24.04`, refuses if a ScanStudio app/engine, WSL bridge, launcher lock,
+or motion-latch object already exists, atomically creates a token-owned regular
+latch containing the media name, and gives `SCANSTUDIO_HW_MOTION=1` only to the
+new child app process. It strips inherited state/base-directory overrides and
+their `WSLENV` entries, plus any `HOME` entry in `WSLENV`, so both launcher and
+bridge use the same fixed `~/.scanstudio` lane.
+The ordinary **ScanStudio** Start-menu shortcut and a direct Explorer launch
+remain unarmed. The setup checker's **Check scanner** action refreshes status
+only and cannot arm an already-running process.
 
-The owner replaces `junk-roll` with the name of the media actually loaded.
-
-The owner then opens a fresh Windows PowerShell and launches a new ScanStudio
-process with `SCANSTUDIO_HW_MOTION` set to exactly `1` for that process only:
-
-```powershell
-$ScanStudioExe = "$env:LOCALAPPDATA\ScanStudio\scanstudio-app.exe"
-$env:SCANSTUDIO_HW_MOTION = "1"
-try {
-    Start-Process -FilePath $ScanStudioExe
-} finally {
-    Remove-Item Env:\SCANSTUDIO_HW_MOTION -ErrorAction SilentlyContinue
-}
-```
-
-For a portable build, the owner changes `$ScanStudioExe` to the extracted
-`scanstudio-app.exe`. The owner does not use `setx` and does not create a
-persistent user/system variable. A Start-menu or Explorer launch remains
-unarmed. When the new Windows app process contains the exact value `1`, the
-app preserves unrelated `WSLENV` entries and adds
-`SCANSTUDIO_HW_MOTION/u` for its engine child; this is what carries the value
-through `wsl.exe -d Ubuntu-24.04 -e scanstudio-bridge`. Any missing or
-non-exact value is not added by the app. This mirrors the armed-latch contract:
+The app preserves unrelated `WSLENV` entries and adds
+`SCANSTUDIO_HW_MOTION/u` for its engine child; this carries the exact value
+through `wsl.exe -d Ubuntu-24.04 -e scanstudio-bridge`. The launcher waits for
+that exact app child and, when it exits, removes the WSL latch only if the
+unique session token and media content are still an exact match. This mirrors
+the armed-latch contract:
 
 > Armed latch. Re-checked live — never cached — on every motion-capable
 > request: env `SCANSTUDIO_HW_MOTION` == "1" AND file
@@ -244,8 +235,13 @@ collects the bridge stderr and any `CountedBulkReadError` text (those carry
 transferred byte counts) as the failure evidence.
 
 After banking the evidence, the owner fully quits the armed ScanStudio process
-and runs `rm -- ~/.scanstudio/hw-motion-armed` inside Ubuntu. Both actions are
-required to close the live session. A subsequent normal app launch is unarmed.
+and waits for the launcher console to report `Hardware session disarmed.` The
+owner confirms `~/.scanstudio/hw-motion-armed` is absent inside Ubuntu before
+pressing a key to close that paused console. A subsequent normal app launch is
+unarmed. If the latch is still present, the owner stops: the launcher
+deliberately will not overwrite a changed or foreign latch. The owner inspects
+it and removes it only after confirming no owner session or orphan bridge is
+running and the physical scanner state is known.
 
 ## Known Windows-Lane Risks (carry verbatim)
 
@@ -265,8 +261,21 @@ failure with a fallback discussion — the v2 native-Windows-USB lane, tracked a
 DIST-01/DIST-03 in REQUIREMENTS.md — never an improvised retry loop.
 
 Process-tree note: killing `wsl.exe` does not reliably kill the Linux-side
-bridge; `wsl.exe --terminate <distro>` is the last-resort recovery, and the
-checker's `bridge-which`/`bridge-version` probes double as the orphan detector.
+bridge. The hardware-session launcher checks `/proc/*/cmdline` for the exact
+installed bridge entrypoint before and after latch acquisition. The setup
+checker's `bridge-which`/`bridge-version` probes prove installation and startup,
+not orphan absence. If the launcher console closes abnormally, its Windows job
+terminates the Windows descendants and its detached guardian attempts an
+ownership-matched latch release; neither action proves an in-flight Linux
+operation stopped. The owner stops and inspects the physical scanner state. If
+the bridge or latch survived, `wsl.exe --terminate Ubuntu-24.04` is the
+last-resort orphan recovery. The owner then starts one clean Ubuntu-24.04 shell
+before any ScanStudio app or bridge, verifies no bridge process exists,
+inspects and removes only the known stale
+`~/.scanstudio/.hw-motion-launcher-operation-lock` directory or latch, leaves
+that shell, and re-attaches per Phase 8. A stale lock is never removed merely
+because it is old; terminating the old distro instance first is the proof that
+no old helper still holds it.
 
 ## [f] Evidence Checklist
 

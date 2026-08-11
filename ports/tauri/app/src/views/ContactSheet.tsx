@@ -100,11 +100,16 @@ export interface ContactSheetProps {
   onCapture?: () => void;
 }
 
+type StatusRefreshFeedback = "notEnabled" | "unknown" | "ready" | null;
+
 export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheetProps = {}) {
   const [statusRefreshError, setStatusRefreshError] = useState<Pick<
     EngineError,
     "code" | "message"
   > | null>(null);
+  const [statusRefreshInProgress, setStatusRefreshInProgress] = useState(false);
+  const [statusRefreshFeedback, setStatusRefreshFeedback] =
+    useState<StatusRefreshFeedback>(null);
   const [mediaLoadError, setMediaLoadError] = useState<Pick<
     EngineError,
     "code" | "message"
@@ -141,10 +146,21 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
 
   const checkScanner = async (): Promise<void> => {
     setStatusRefreshError(null);
+    setStatusRefreshFeedback(null);
+    setStatusRefreshInProgress(true);
     try {
-      await sessionStore.refreshStatus();
+      const refreshedStatus = await sessionStore.refreshStatus();
+      setStatusRefreshFeedback(
+        refreshedStatus.motionArmed === true
+          ? "ready"
+          : refreshedStatus.motionArmed === false
+            ? "notEnabled"
+            : "unknown",
+      );
     } catch (error) {
       setStatusRefreshError(requestErrorOf(error));
+    } finally {
+      setStatusRefreshInProgress(false);
     }
   };
 
@@ -265,22 +281,57 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
           <div className={styles.previewReadiness} data-testid="preview-readiness-guidance">
             <span>
               {motionReadiness === "notEnabled"
-                ? "Motion authorization is not enabled for this app session. Reopen ScanStudio using the documented owner-authorized hardware launch procedure; the app never enables motion on your behalf."
-                : "Motion readiness is unavailable. Check scanner status; preview remains disabled until readiness can be confirmed."}
+                ? "Motion authorization is not enabled for this app session. A status check cannot enable it. On Windows, fully quit ScanStudio and open ScanStudio Hardware Session from Start. On other platforms, use the documented owner-authorized hardware launch procedure."
+                : "Motion readiness is unavailable. Check scanner reads the current status only; it does not enable motion."}
             </span>
             <button
               type="button"
               className={styles.controlButton}
+              disabled={statusRefreshInProgress}
+              aria-busy={statusRefreshInProgress}
               onClick={() => void checkScanner()}
             >
-              Check scanner
+              {statusRefreshInProgress ? "Checking…" : "Check scanner"}
             </button>
+            {statusRefreshFeedback === "notEnabled" && (
+              <p
+                className={styles.statusRefreshFeedback}
+                role="status"
+                data-state="not-enabled"
+                data-testid="status-refresh-not-enabled"
+              >
+                Scanner status checked: motion authorization is still not enabled. On Windows,
+                fully quit ScanStudio and open ScanStudio Hardware Session from Start. On other
+                platforms, use the documented owner-authorized hardware launch procedure.
+              </p>
+            )}
+            {statusRefreshFeedback === "unknown" && (
+              <p
+                className={styles.statusRefreshFeedback}
+                role="status"
+                data-state="unknown"
+                data-testid="status-refresh-unknown"
+              >
+                Scanner status checked, but motion readiness is still unavailable. Preview remains
+                disabled until the scanner reports a trusted status.
+              </p>
+            )}
             {statusRefreshError !== null && (
               <p className={styles.failureBanner} role="alert" data-testid="status-refresh-error">
                 {statusRefreshError.code}: {statusRefreshError.message}
               </p>
             )}
           </div>
+        )}
+        {canPreview && motionReady && statusRefreshFeedback === "ready" && (
+          <p
+            className={styles.statusRefreshFeedback}
+            role="status"
+            data-state="ready"
+            data-testid="status-refresh-ready"
+          >
+            Scanner status checked: motion authorization is ready for this app session.
+          </p>
         )}
         {canPreview && motionReady && !transportReady && (
           <p className={styles.mediaGuidance} data-testid="preview-readiness-guidance">

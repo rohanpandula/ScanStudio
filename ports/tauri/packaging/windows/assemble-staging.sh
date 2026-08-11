@@ -50,6 +50,13 @@ require_file "bridge source LICENSE" "$SCANSTUDIO_BRIDGE_SOURCE/LICENSE"
 require_file "CoolscanPy source LICENSE" "$COOLSCANPY_SOURCE/LICENSE"
 require_file "frontend package lock" "$SCANSTUDIO_APP_SOURCE/package-lock.json"
 require_file "Tauri app Cargo lock" "$SCANSTUDIO_APP_SOURCE/src-tauri/Cargo.lock"
+require_file "Windows hardware-session PowerShell launcher" \
+    "$script_dir/Start-ScanStudio-Hardware-Session.ps1"
+require_file "Windows hardware-session double-click launcher" \
+    "$script_dir/Start-ScanStudio-Hardware-Session.cmd"
+require_file "Windows hardware-session WSL latch helper" \
+    "$script_dir/scanstudio-hardware-session-latch.sh"
+require_file "Windows hardware-session NSIS hooks" "$script_dir/installer-hooks.nsh"
 
 # (1) fresh staging root.
 rm -rf "$STAGING_ROOT"
@@ -140,6 +147,12 @@ PYTHON
 # (4) the WSL2-side bridge installer and user-facing setup material, shipped
 # together so an extracted portable zip is self-explanatory offline.
 install -m 755 "$script_dir/install-bridge-wsl.sh" "$STAGING_ROOT/install-bridge-wsl.sh"
+install -m 644 "$script_dir/Start-ScanStudio-Hardware-Session.ps1" \
+    "$STAGING_ROOT/Start-ScanStudio-Hardware-Session.ps1"
+install -m 644 "$script_dir/Start-ScanStudio-Hardware-Session.cmd" \
+    "$STAGING_ROOT/Start-ScanStudio-Hardware-Session.cmd"
+install -m 755 "$script_dir/scanstudio-hardware-session-latch.sh" \
+    "$STAGING_ROOT/scanstudio-hardware-session-latch.sh"
 mkdir -p "$STAGING_ROOT/Documentation"
 install -m 644 "$script_dir/README.md" "$STAGING_ROOT/Documentation/README-WINDOWS.md"
 install -m 644 "$repo_root/runbooks/WINDOWS-WSL-LANE.md" \
