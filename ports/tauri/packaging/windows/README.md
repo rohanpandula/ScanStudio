@@ -70,38 +70,78 @@ are local; Ubuntu system prerequisites are not bundled.
 
 Launching the same safety model as everywhere else applies: preview/scan once
 the Phase 10 runbook's hardware gates are met; the motion latch is never armed
-by this installer or this script.
+by the installer or bridge installer. Only the separate, attended
+hardware-session launcher below owns it.
 
 ### Owner-only launch for live motion
 
-A normal Start-menu or Explorer launch is deliberately unarmed. For an
-owner-attended live session, first close every running ScanStudio window, then
-create the separate non-empty latch inside Ubuntu-24.04 exactly as the live
-runbook describes. Launch the installed app from a fresh Windows PowerShell
-with a process-scoped variable:
+A normal **ScanStudio** Start-menu or Explorer launch is deliberately unarmed.
+The setup checker's **Check scanner** action only refreshes status; it does not
+authorize motion or repair the gates for an already-running process.
+
+For an owner-attended session, first fully quit every ScanStudio window. Use
+the separately named **ScanStudio Hardware Session** Start-menu shortcut and
+keep its console window open. In a portable extraction, double-click
+`Start-ScanStudio-Hardware-Session.cmd` beside `scanstudio-app.exe`. The
+launcher prompts for the explicit name of the junk/test media currently
+loaded. A scripted operator may supply it directly without changing policy:
 
 ```powershell
-$ScanStudioExe = "$env:LOCALAPPDATA\ScanStudio\scanstudio-app.exe"
-$env:SCANSTUDIO_HW_MOTION = "1"
-try {
-    Start-Process -FilePath $ScanStudioExe
-} finally {
-    Remove-Item Env:\SCANSTUDIO_HW_MOTION -ErrorAction SilentlyContinue
-}
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -NoLogo -NoProfile -ExecutionPolicy Bypass -File `
+    "$env:LOCALAPPDATA\ScanStudio\Start-ScanStudio-Hardware-Session.ps1" `
+    -MediaName "junk-roll"
 ```
 
-For the portable archive, set `$ScanStudioExe` to that extracted copy of
-`scanstudio-app.exe`. Do not use `setx` or create a persistent user/system
-variable. The app forwards the exact value `1` into WSL only when it was
-present in the newly launched Windows app process; it adds the required
-`SCANSTUDIO_HW_MOTION/u` entry to that child's `WSLENV` while preserving any
-unrelated existing entries. The app does not create the WSL latch, and the
-bridge still checks both the variable and the non-empty latch on every
-motion-capable request.
+This deliberately starts a fresh PowerShell process; wait for it to finish and
+check its exit code. Do not invoke the PS1 inside an existing operator shell,
+because the launcher supervises and exits its own PowerShell host.
 
-To disarm, fully quit that ScanStudio process and remove
-`~/.scanstudio/hw-motion-armed` inside Ubuntu. A later normal app launch is
-unarmed again.
+No administrator launch is needed. The launcher uses the pinned
+`Ubuntu-24.04` distro and fails before opening ScanStudio if another app
+process, engine process, WSL bridge process, launcher-operation lock, or WSL
+motion-latch object already exists. It checks for a WSL bridge both before and
+immediately after acquiring the latch. It atomically publishes a regular,
+non-symlink, mode-0600 latch under the fixed, shared, mode-0700
+`~/.scanstudio` directory. The complete latch is valid UTF-8, at most 4096
+bytes, and contains both a unique session token and the supplied media name.
+
+Only the new child `scanstudio-app.exe` receives
+`SCANSTUDIO_HW_MOTION=1`; the launcher does not create a persistent user or
+system variable. The app forwards the exact value through `WSLENV` for its
+engine/bridge child, and the bridge still re-checks both the variable and the
+non-empty latch on every motion-capable request. The launcher waits for that
+exact Windows child. It removes any inherited `SCANSTUDIO_STATE_DIR` and
+`SCANSTUDIO_BRIDGE_BASE_DIR` values and their `WSLENV` entries, plus any
+`HOME` entry in `WSLENV`, so neither the helper nor bridge can be redirected
+away from the shared authorization lane.
+When the child exits, the launcher checks its token and media content while
+holding the launcher-operation lock, then removes the matching latch. The CMD
+window pauses after cleanup so the owner can read and verify the result. A later
+normal app launch is unarmed again.
+
+Do not force-close the launcher console. The launcher joins a kill-on-close
+Windows job before it starts the GUI, so its later Windows descendants are
+terminated if the launcher dies. A detached cleanup guardian separately waits
+for that exact launcher process and asks Ubuntu-24.04 to remove only the
+matching token/media latch. This covers the ordinary console-close failure,
+but it does **not** prove that a Linux-side bridge or an already-running scanner
+operation stopped: killing `wsl.exe` alone is not that oracle. Power loss, WSL
+failure, or external same-user latch mutation can also defeat automatic
+cleanup.
+
+After any abnormal close, stop and inspect the physical scanner state. Confirm
+the Windows app/engine are gone and that `~/.scanstudio/hw-motion-armed` is
+absent. If a latch, the exact operation-lock directory
+`~/.scanstudio/.hw-motion-launcher-operation-lock`, or a bridge process
+remains, do not overwrite or delete it while the orphan/helper can still be
+running. Use the live runbook's last-resort
+`wsl.exe --terminate Ubuntu-24.04` recovery first. After termination, start one
+clean Ubuntu-24.04 shell before any ScanStudio app or bridge, verify no bridge
+process exists, inspect and remove only the known stale latch/launcher lock,
+then leave that shell and re-attach/re-run the preflight. Termination proves the
+old helper cannot still hold the lock; it is not itself a place from which to
+run `rm`. The next hardware launcher refuses leftovers rather than guessing.
 
 ## 3. A portable zip archive is also produced in CI
 
@@ -110,8 +150,10 @@ archive** of the verified installed tree, with no installer or registry
 changes. It does not carry the NSIS installer's WebView2 bootstrapper. Use it
 only where Microsoft Edge WebView2 is already installed; otherwise use the
 preview `setup.exe`. Extract it, keep all files together, and run
-`scanstudio-app.exe`. Windows may still apply Mark-of-the-Web or SmartScreen
-checks to an unsigned downloaded executable. The extracted folder also
+`scanstudio-app.exe` for an unarmed setup/status session, or use the separate
+`Start-ScanStudio-Hardware-Session.cmd` only for an attended live session.
+Windows may still apply Mark-of-the-Web or SmartScreen checks to an unsigned
+downloaded executable. The extracted folder also
 contains the resource root with `install-bridge-wsl.sh`, `BridgeRuntime/`,
 `Wheelhouse/`, and `CorrespondingSource/` for the WSL2 setup described above.
 
@@ -136,8 +178,24 @@ current runner images).
 
 ## Verification
 
+- `packaging/windows/tests/test-hardware-session-launcher.sh` runs the
+  macOS/Linux-safe adversarial launcher suite, including concurrent owners,
+  hostile latch object types, invalid labels, and packaging-wiring checks.
+- `packaging/windows/tests/test-hardware-session-launcher.ps1` is run under
+  Windows PowerShell 5.1 with fake `wsl.exe` and `scanstudio-app.exe`
+  processes. It verifies child-only environment scope, exact pinned WSL
+  arguments, failures/exit codes, cleanup, and force-kill job/guardian
+  behavior without opening WSL or touching scanner hardware. The Windows
+  packager runs it against source, installed, and portable launcher layouts.
 - `packaging/windows/assemble-staging.sh` assembles `packaging/.staging/windows/`
   locally on any host (no Windows machine needed).
+- `packaging/windows/build-and-verify.ps1` performs a temporary current-user
+  NSIS install/uninstall, so it must run in a clean Windows account or VM. It
+  refuses to start when it detects an existing or running ScanStudio copy,
+  shortcut, autostart value, or user/machine uninstall registration rather
+  than overwriting real user state. After its temporary uninstall, it removes
+  only the product key that still names its exact temporary install path and
+  verifies that all temporary current-user state is gone.
 - `packaging/windows/verify-bundle.sh <root>` is the macOS/Linux-runnable
   verifier; `packaging/windows/verify-bundle.ps1 -Root <path>` is the
   PowerShell twin CI runs on `windows-latest`. Both assert the same list from

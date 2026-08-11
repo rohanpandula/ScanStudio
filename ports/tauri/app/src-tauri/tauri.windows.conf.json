@@ -7,7 +7,8 @@
         "type": "offlineInstaller"
       },
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "../../packaging/windows/installer-hooks.nsh"
       }
     },
     "resources": {

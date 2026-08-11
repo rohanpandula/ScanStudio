@@ -109,7 +109,7 @@ or rewrite the capture files.
 - If Capture reports that the film shifted, physically refeed it and acquire a fresh preview; ScanStudio discards the old frame registration so it cannot be retried accidentally.
 - Confirm that the app identifies a real scanner before treating it as hardware. The built-in simulator is for safe workflow exploration only.
 - Keep physical film transport under supervision. Stop and inspect the scanner if the physical state is uncertain.
-- Opening ScanStudio authorizes later explicit Preview, Scan, and Eject actions for that app session; it does not move film by itself.
+- Opening ScanStudio does not move film. Platforms with a hardware-motion gate, including the Windows/WSL preview, require their separately documented owner-session launcher before explicit Preview, Scan, or Eject actions are authorized; ordinary Windows Start-menu and Explorer launches remain unarmed.
 - Manual placement caps frames at the scanner's single-pass capture window (38.7 mm); panoramic frames refuse with an explanation instead of silently cropping.
 - Do not post scans, private paths, device serial numbers, or raw capture journals in a public issue.
 

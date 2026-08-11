@@ -276,8 +276,8 @@ describe("ContactSheet", () => {
       expect(screen.getByTestId("preview-button")).toBeDisabled();
       expect(screen.getByTestId("preview-readiness-guidance")).toHaveTextContent(
         motionArmed === false
-          ? /motion authorization.*owner-authorized/i
-          : /motion readiness is unavailable.*check scanner status/i,
+          ? /motion authorization.*status check cannot enable.*ScanStudio Hardware Session from Start/i
+          : /motion readiness is unavailable.*reads the current status only/i,
       );
       await user.click(screen.getByTestId("preview-button"));
       expect(
@@ -285,6 +285,104 @@ describe("ContactSheet", () => {
       ).toBe(false);
     },
   );
+
+  it("shows progress, prevents duplicate checks, and gives restart guidance when motion remains disabled", async () => {
+    const notEnabledStatus: ScannerStatus = {
+      ...EMPTY_STATUS,
+      motionArmed: false,
+      filmPresent: true,
+    };
+    const fixture = contactFixture({
+      device: REAL_DEVICE,
+      status: notEnabledStatus,
+    });
+    await fixture.store.connect(REAL_DEVICE.deviceId);
+    let resolveStatus!: (status: ScannerStatus) => void;
+    const pendingStatus = new Promise<ScannerStatus>((resolve) => {
+      resolveStatus = resolve;
+    });
+    const refreshStatus = vi
+      .spyOn(fixture.store, "refreshStatus")
+      .mockReturnValue(pendingStatus);
+    mocks.sessionStore = fixture.store;
+    const user = userEvent.setup();
+    render(<ContactSheet />);
+
+    const checkScanner = screen.getByRole("button", { name: "Check scanner" });
+    await user.click(checkScanner);
+
+    expect(checkScanner).toBeDisabled();
+    expect(checkScanner).toHaveAccessibleName("Checking…");
+    expect(checkScanner).toHaveAttribute("aria-busy", "true");
+    await user.click(checkScanner);
+    expect(refreshStatus).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveStatus(notEnabledStatus);
+      await pendingStatus;
+    });
+
+    expect(checkScanner).toBeEnabled();
+    expect(checkScanner).toHaveAccessibleName("Check scanner");
+    expect(await screen.findByTestId("status-refresh-not-enabled")).toHaveTextContent(
+      /still not enabled.*fully quit ScanStudio.*ScanStudio Hardware Session from Start/i,
+    );
+  });
+
+  it("confirms when a successful status refresh reports motion ready", async () => {
+    const notEnabledStatus: ScannerStatus = {
+      ...EMPTY_STATUS,
+      motionArmed: false,
+      filmPresent: true,
+    };
+    const readyStatus: ScannerStatus = {
+      ...notEnabledStatus,
+      motionArmed: true,
+    };
+    const fixture = contactFixture({
+      device: REAL_DEVICE,
+      status: notEnabledStatus,
+      onRequest: (method) =>
+        method === "scanner.status" ? { result: readyStatus } : undefined,
+    });
+    await fixture.store.connect(REAL_DEVICE.deviceId);
+    mocks.sessionStore = fixture.store;
+    const user = userEvent.setup();
+    render(<ContactSheet />);
+
+    await user.click(screen.getByRole("button", { name: "Check scanner" }));
+
+    expect(await screen.findByTestId("status-refresh-ready")).toHaveTextContent(
+      "motion authorization is ready for this app session",
+    );
+    expect(screen.getByTestId("preview-button")).toBeEnabled();
+    expect(screen.queryByTestId("preview-readiness-guidance")).toBeNull();
+  });
+
+  it("explains when a successful status refresh still cannot determine motion readiness", async () => {
+    const unknownStatus: ScannerStatus = {
+      ...EMPTY_STATUS,
+      motionArmed: undefined,
+      filmPresent: true,
+    };
+    const fixture = contactFixture({
+      device: REAL_DEVICE,
+      status: unknownStatus,
+      onRequest: (method) =>
+        method === "scanner.status" ? { result: unknownStatus } : undefined,
+    });
+    await fixture.store.connect(REAL_DEVICE.deviceId);
+    mocks.sessionStore = fixture.store;
+    const user = userEvent.setup();
+    render(<ContactSheet />);
+
+    await user.click(screen.getByRole("button", { name: "Check scanner" }));
+
+    expect(await screen.findByTestId("status-refresh-unknown")).toHaveTextContent(
+      /motion readiness is still unavailable.*Preview remains disabled/i,
+    );
+    expect(screen.getByTestId("preview-button")).toBeDisabled();
+  });
 
   it("surfaces a typed scanner-status refresh failure from unknown motion readiness", async () => {
     const fixture = contactFixture({

@@ -104,6 +104,85 @@ if [[ -f "$root/Wheelhouse/SHA256SUMS" ]]; then
     fi
 fi
 
+# The explicit owner-session launcher must preserve the dual gate without
+# changing normal app launches: an exact child-only environment value plus an
+# atomically published, token-owned WSL latch that cannot follow a symlink.
+launcher_ps="$root/Start-ScanStudio-Hardware-Session.ps1"
+launcher_cmd="$root/Start-ScanStudio-Hardware-Session.cmd"
+latch_helper="$root/scanstudio-hardware-session-latch.sh"
+
+launcher_missing=0
+# shellcheck disable=SC2016 # literal PowerShell source assertions
+for expected_text in \
+    "\$DistroName = 'Ubuntu-24.04'" \
+    "Get-Process -Name 'scanstudio-app'" \
+    '[System.Diagnostics.ProcessStartInfo]::new()' \
+    "EnvironmentVariables['SCANSTUDIO_HW_MOTION'] = '1'" \
+    '$process.WaitForExit()' \
+    '-Operation release' \
+    '-Operation check-orphans' \
+    'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE' \
+    'Start-CleanupGuardian' \
+    '$guardianReadyEvent.WaitOne(10000)' \
+    "'SCANSTUDIO_STATE_DIR'" \
+    "'SCANSTUDIO_BRIDGE_BASE_DIR'" \
+    "'HOME'"; do
+    if [[ -f "$launcher_ps" ]] && grep -Fq -- "$expected_text" "$launcher_ps"; then
+        :
+    else
+        printf 'FAIL  hardware-session PowerShell contract missing: %s\n' "$expected_text" >&2
+        launcher_missing=$((launcher_missing + 1))
+    fi
+done
+# shellcheck disable=SC2016 # literal PowerShell source assertion
+if [[ "$launcher_missing" -eq 0 ]] \
+    && ! grep -Eiq -- '(^|[^[:alnum:]_])setx([^[:alnum:]_]|$)' "$launcher_ps" \
+    && ! grep -Eq -- '^[[:space:]]*\$env:SCANSTUDIO_HW_MOTION[[:space:]]*=' "$launcher_ps"; then
+    printf 'PASS  hardware-session launcher uses child-only authorization\n'
+else
+    if [[ "$launcher_missing" -eq 0 ]]; then
+        printf 'FAIL  hardware-session launcher must not persist or process-globally set authorization\n' >&2
+        launcher_missing=$((launcher_missing + 1))
+    fi
+fi
+
+helper_missing=0
+# shellcheck disable=SC2016 # literal POSIX-shell source assertions
+for expected_text in \
+    'chmod 700 "$state_dir"' \
+    'chmod 600 "$owner_file"' \
+    'owner_size" -gt 4096' \
+    'ln "$owner_file" "$latch_path"' \
+    '[ -f "$latch_path" ] && [ ! -L "$latch_path" ]' \
+    'cmp -s "$latch_path" "$owner_file"' \
+    '.hw-motion-launcher-operation-lock' \
+    'check-orphans)'; do
+    if [[ -f "$latch_helper" ]] && grep -Fq -- "$expected_text" "$latch_helper"; then
+        :
+    else
+        printf 'FAIL  WSL latch-helper contract missing: %s\n' "$expected_text" >&2
+        helper_missing=$((helper_missing + 1))
+    fi
+done
+if [[ "$helper_missing" -eq 0 ]]; then
+    printf 'PASS  WSL latch helper is atomic, bounded, and token-owned\n'
+fi
+if grep -Fq -- 'SCANSTUDIO_STATE_DIR' "$latch_helper"; then
+    printf 'FAIL  production latch helper must use only the shared HOME state lane\n' >&2
+    helper_missing=$((helper_missing + 1))
+fi
+
+if [[ -f "$launcher_cmd" ]] \
+    && grep -Fq -- '%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe' "$launcher_cmd" \
+    && grep -Fq -- 'Start-ScanStudio-Hardware-Session.ps1' "$launcher_cmd" \
+    && grep -Fq -- 'pause >nul' "$launcher_cmd"; then
+    printf 'PASS  double-click hardware-session entrypoint uses packaged PowerShell\n'
+else
+    printf 'FAIL  double-click hardware-session entrypoint is incomplete\n' >&2
+    launcher_missing=$((launcher_missing + 1))
+fi
+failures=$((failures + launcher_missing + helper_missing))
+
 # No /Users/ absolute developer paths may leak into the bundle.
 if assert_no_developer_paths "$root"; then
     printf 'PASS  no developer path leakage\n'

@@ -28,6 +28,9 @@
     "windows": {
       "additionalRequiredPaths": [
         "install-bridge-wsl.sh",
+        "Start-ScanStudio-Hardware-Session.ps1",
+        "Start-ScanStudio-Hardware-Session.cmd",
+        "scanstudio-hardware-session-latch.sh",
         "BridgeRuntime/cpython-3.13.14+20260728-x86_64-unknown-linux-gnu.tar.gz",
         "BridgeRuntime/SHA256SUMS",
         "Wheelhouse/SHA256SUMS",
@@ -38,7 +41,7 @@
         "Documentation/WINDOWS-WSL-LANE.md",
         "Documentation/WINDOWS-LIVE-VALIDATION.md"
       ],
-      "notes": "The native Windows app is Python-free. Its WSL2 lane ships sha256-pinned CPython 3.13.14 and a checksummed offline wheelhouse. install-bridge-wsl.sh installs CoolscanPy before scanstudio-bridge from the two shipped CorrespondingSource trees with --no-index and --no-deps."
+      "notes": "The native Windows app is Python-free. Its WSL2 lane ships sha256-pinned CPython 3.13.14 and a checksummed offline wheelhouse. install-bridge-wsl.sh installs CoolscanPy before scanstudio-bridge from the two shipped CorrespondingSource trees with --no-index and --no-deps. The dedicated hardware-session launcher is included in installer and portable roots; normal scanstudio-app.exe launches remain unarmed."
     }
   },
   "forbiddenPathSubstrings": ["/Users/"]

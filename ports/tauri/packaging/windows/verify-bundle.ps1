@@ -111,7 +111,90 @@ if (Test-Path $checksumPath -PathType Leaf) {
     Write-Host 'PASS  wheelhouse checksum ledger resolves locally'
 }
 
-# 4) no file under -Root may contain any forbidden developer-path substring.
+# 4) explicit hardware-session launcher semantics. Normal app shortcuts stay
+# untouched; only this launcher may set the exact gate on its actual child.
+$launcherPath = Join-Path $Root 'Start-ScanStudio-Hardware-Session.ps1'
+$launcherText = if (Test-Path $launcherPath -PathType Leaf) {
+    Get-Content -Raw -Path $launcherPath
+} else { '' }
+$launcherRequiredText = @(
+    '$DistroName = ''Ubuntu-24.04''',
+    'Get-Process -Name ''scanstudio-app''',
+    '[System.Diagnostics.ProcessStartInfo]::new()',
+    'EnvironmentVariables[''SCANSTUDIO_HW_MOTION''] = ''1''',
+    '$process.WaitForExit()',
+    '-Operation release',
+    '-Operation check-orphans',
+    'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE',
+    'Start-CleanupGuardian',
+    '$guardianReadyEvent.WaitOne(10000)',
+    '''SCANSTUDIO_STATE_DIR''',
+    '''SCANSTUDIO_BRIDGE_BASE_DIR''',
+    '''HOME'''
+)
+$launcherOkay = $true
+foreach ($expectedText in $launcherRequiredText) {
+    if (-not $launcherText.Contains($expectedText)) {
+        Write-Host "FAIL  hardware-session PowerShell contract missing: $expectedText" -ForegroundColor Red
+        $failures += 1
+        $launcherOkay = $false
+    }
+}
+if ($launcherText -match '(?im)(^|[^a-z0-9_])setx([^a-z0-9_]|$)' -or
+    $launcherText -match '(?im)^\s*\$env:SCANSTUDIO_HW_MOTION\s*=') {
+    Write-Host 'FAIL  hardware-session launcher must not persist or process-globally set authorization' -ForegroundColor Red
+    $failures += 1
+    $launcherOkay = $false
+}
+if ($launcherOkay) {
+    Write-Host 'PASS  hardware-session launcher uses child-only authorization'
+}
+
+$helperPath = Join-Path $Root 'scanstudio-hardware-session-latch.sh'
+$helperText = if (Test-Path $helperPath -PathType Leaf) {
+    Get-Content -Raw -Path $helperPath
+} else { '' }
+$helperRequiredText = @(
+    'chmod 700 "$state_dir"',
+    'chmod 600 "$owner_file"',
+    'owner_size" -gt 4096',
+    'ln "$owner_file" "$latch_path"',
+    '[ -f "$latch_path" ] && [ ! -L "$latch_path" ]',
+    'cmp -s "$latch_path" "$owner_file"',
+    '.hw-motion-launcher-operation-lock',
+    'check-orphans)'
+)
+$helperOkay = $true
+foreach ($expectedText in $helperRequiredText) {
+    if (-not $helperText.Contains($expectedText)) {
+        Write-Host "FAIL  WSL latch-helper contract missing: $expectedText" -ForegroundColor Red
+        $failures += 1
+        $helperOkay = $false
+    }
+}
+if ($helperOkay) {
+    Write-Host 'PASS  WSL latch helper is atomic, bounded, and token-owned'
+}
+if ($helperText.Contains('SCANSTUDIO_STATE_DIR')) {
+    Write-Host 'FAIL  production latch helper must use only the shared HOME state lane' -ForegroundColor Red
+    $failures += 1
+}
+
+$cmdPath = Join-Path $Root 'Start-ScanStudio-Hardware-Session.cmd'
+$cmdText = if (Test-Path $cmdPath -PathType Leaf) {
+    Get-Content -Raw -Path $cmdPath
+} else { '' }
+if ($cmdText.Contains('%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe') -and
+    $cmdText.Contains('Start-ScanStudio-Hardware-Session.ps1') -and
+    $cmdText.Contains('pause >nul')) {
+    Write-Host 'PASS  double-click hardware-session entrypoint uses packaged PowerShell'
+}
+else {
+    Write-Host 'FAIL  double-click hardware-session entrypoint is incomplete' -ForegroundColor Red
+    $failures += 1
+}
+
+# 5) no file under -Root may contain any forbidden developer-path substring.
 foreach ($substring in @($manifest.forbiddenPathSubstrings)) {
     $matches = Get-ChildItem -Path $Root -Recurse -File -ErrorAction SilentlyContinue |
         Select-String -SimpleMatch -Pattern $substring -List
