@@ -301,6 +301,13 @@ jobs:
             echo "RELEASE_METADATA=$RUNNER_TEMP/release-metadata"
           } >> "$GITHUB_ENV"
           echo "Resolved release version: $STAMP"
+      - name: Verify tag-bound full release notes
+        run: |
+          set -euo pipefail
+          RELEASE_NOTES_PATH="$GITHUB_WORKSPACE/docs/releases/$GITHUB_REF_NAME.md"
+          python3 -I -S -B scripts/verify_release_notes.py \
+            "$RELEASE_NOTES_PATH" "$GITHUB_REF_NAME" "$RELEASE_VERSION"
+          echo "RELEASE_NOTES=$RELEASE_NOTES_PATH" >> "$GITHUB_ENV"
       - name: Stage exactly six packages and generate metadata
         run: |
           set -euo pipefail
@@ -378,20 +385,6 @@ jobs:
               assert entry["sha256"] == ledger[name]
           print("six packages, central checksums, and Mac-only updater pointer verified")
           PY
-      - name: Write release notes
-        run: |
-          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          ScanStudio $RELEASE_VERSION is one prerelease with four clearly separated support levels.
-
-          - **macOS Apple Silicon: Beta.** The Nikon LS-5000 real-film workflow has been validated.
-          - **macOS Intel: Preview.** Built and package-tested natively in CI; real-scanner validation is still pending.
-          - **Windows x64: Preview.** The native installer is built, installed, and checked in CI. The portable archive's contents and engine sidecar are checked; it requires Microsoft Edge WebView2 to already be installed, so clean systems should use setup.exe. The bundled Python bridge and dependency wheelhouse install without PyPI access, but Ubuntu system prerequisites still require apt/network. Real-scanner validation is pending. Scanner access requires WSL2 with Ubuntu 24.04 and usbipd-win.
-          - **Linux x64: Preview.** The AppImage and portable archive are built and package-verified on Ubuntu 22.04, including their contents, engine sidecar, bundled bridge launch/import, and python-sane imports. The Tauri GUI and real scanner have not been validated end to end. The host must provide compatible SANE/libusb runtime packages and scanner permissions.
-
-          The macOS builds are ad-hoc signed and not notarized. The Windows installer is unsigned and may show a SmartScreen warning. The Linux packages are unsigned. Review SHA256SUMS before installing when downloading outside the GitHub Releases page.
-
-          Choose the DMG matching your Mac. Windows users should use setup.exe on a clean system; the portable zip is for systems that already have WebView2. Linux users can choose the AppImage or extracted portable tarball.
-          EOF
       - name: Create and verify a draft GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
@@ -404,7 +397,7 @@ jobs:
             --prerelease \
             --latest=false \
             --title "ScanStudio $RELEASE_VERSION" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --notes-file "$RELEASE_NOTES" \
             "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
             "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
             "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-setup.exe" \
@@ -420,7 +413,13 @@ jobs:
             --jq "first(.[] | select(.tag_name == \"$GITHUB_REF_NAME\"))" \
             > "$RUNNER_TEMP/draft-release.json"
           test -s "$RUNNER_TEMP/draft-release.json"
-          python3 - "$RUNNER_TEMP/draft-release.json" "$RELEASE_ASSETS" "$RELEASE_METADATA" <<'PY'
+          python3 - \
+            "$RUNNER_TEMP/draft-release.json" \
+            "$RELEASE_ASSETS" \
+            "$RELEASE_METADATA" \
+            "$RELEASE_NOTES" \
+            "$GITHUB_REF_NAME" \
+            "$RELEASE_VERSION" <<'PY'
           import hashlib
           import json
           import sys
@@ -428,11 +427,16 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text())
           asset_dir, metadata_dir = map(Path, sys.argv[2:4])
+          notes_path = Path(sys.argv[4])
+          tag, version = sys.argv[5:7]
           local = {path.name: path for path in asset_dir.iterdir() if path.is_file()}
           local.update({name: metadata_dir / name for name in ("SHA256SUMS", "latest.json")})
           remote = {item["name"]: item for item in payload["assets"]}
           assert payload["draft"] is True
           assert payload["prerelease"] is True
+          assert payload["tag_name"] == tag
+          assert payload["name"] == f"ScanStudio {version}"
+          assert payload["body"] == notes_path.read_text(encoding="utf-8")
           assert set(remote) == set(local), (set(remote), set(local))
           def sha256(path):
               digest = hashlib.sha256()
@@ -445,7 +449,7 @@ jobs:
               digest = sha256(path)
               assert remote[name]["size"] == path.stat().st_size, name
               assert remote[name].get("digest") == f"sha256:{digest}", name
-          print("draft release has exactly eight byte-verified assets")
+          print("draft release has exact tag-bound notes and eight byte-verified assets")
           PY
       - name: Publish and re-verify the prerelease
         env:
@@ -456,9 +460,16 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \
             --prerelease \
-            --latest=false
+            --latest=false \
+            --notes-file "$RELEASE_NOTES"
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$RUNNER_TEMP/published-release.json"
-          python3 - "$RUNNER_TEMP/published-release.json" "$RELEASE_ASSETS" "$RELEASE_METADATA" <<'PY'
+          python3 - \
+            "$RUNNER_TEMP/published-release.json" \
+            "$RELEASE_ASSETS" \
+            "$RELEASE_METADATA" \
+            "$RELEASE_NOTES" \
+            "$GITHUB_REF_NAME" \
+            "$RELEASE_VERSION" <<'PY'
           import hashlib
           import json
           import sys
@@ -466,11 +477,16 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text())
           asset_dir, metadata_dir = map(Path, sys.argv[2:4])
+          notes_path = Path(sys.argv[4])
+          tag, version = sys.argv[5:7]
           local = {path.name: path for path in asset_dir.iterdir() if path.is_file()}
           local.update({name: metadata_dir / name for name in ("SHA256SUMS", "latest.json")})
           remote = {item["name"]: item for item in payload["assets"]}
           assert payload["draft"] is False
           assert payload["prerelease"] is True
+          assert payload["tag_name"] == tag
+          assert payload["name"] == f"ScanStudio {version}"
+          assert payload["body"] == notes_path.read_text(encoding="utf-8")
           assert set(remote) == set(local)
           def sha256(path):
               digest = hashlib.sha256()
@@ -484,7 +500,7 @@ jobs:
               assert remote[name]["size"] == path.stat().st_size, name
               assert remote[name].get("digest") == f"sha256:{digest}", name
           print(payload["html_url"])
-          print("published prerelease reverified with exactly eight assets")
+          print("published prerelease reverified with exact tag-bound notes and eight assets")
           PY
       - name: Summarize published release
         run: |
