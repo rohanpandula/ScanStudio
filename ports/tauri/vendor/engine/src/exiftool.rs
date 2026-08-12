@@ -7252,7 +7252,21 @@ mod tests {
     ) -> Option<(PathBuf, PathBuf)> {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let perl = resolve_executable("perl")?;
+        // GitHub's macOS runners can put a Homebrew Perl ahead of the system
+        // interpreter. That user-owned prefix is correctly rejected by
+        // `bind_secure_interpreter`, but these security regressions need a
+        // root-owned interpreter to exercise the approved path. Prefer the
+        // fixed system locations and use PATH only as a final candidate.
+        let mut perl_candidates = vec![PathBuf::from("/usr/bin/perl"), PathBuf::from("/bin/perl")];
+        if let Some(path_perl) = resolve_executable("perl") {
+            perl_candidates.push(path_perl);
+        }
+        let perl = perl_candidates.into_iter().find_map(|candidate| {
+            let canonical = std::fs::canonicalize(candidate).ok()?;
+            bind_secure_interpreter(&canonical, None)
+                .ok()
+                .map(|_| canonical)
+        })?;
         let module_root = root.join("lib");
         let image_root = module_root.join("Image");
         std::fs::create_dir_all(&image_root).ok()?;
