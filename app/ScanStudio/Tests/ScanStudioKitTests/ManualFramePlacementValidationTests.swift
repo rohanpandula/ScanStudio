@@ -147,4 +147,32 @@ struct ManualFramePlacementValidationTests {
             abs(ManualFramePlacementValidation.maximumFrameHeightMillimeters - expected) < 0.001
         )
     }
+
+    @Test("three drag callbacks move exactly one boundary and preserve the count")
+    func repeatedDragCallbacksDoNotCreateGhostBoundaries() {
+        var rows = [0, 100, 200]
+        var currentRow = 100
+        for destination in [110, 120, 130] {
+            rows = ManualFramePlacementValidation.movingBoundary(
+                in: rows,
+                currentRow: currentRow,
+                to: destination
+            )
+            currentRow = destination
+        }
+
+        #expect(rows == [0, 130, 200])
+        #expect(rows.count == 3)
+    }
+
+    @Test("dragging onto an existing boundary is a count-preserving no-op")
+    func dragCollisionDoesNotDeleteABoundary() {
+        let rows = ManualFramePlacementValidation.movingBoundary(
+            in: [0, 100, 200],
+            currentRow: 100,
+            to: 200
+        )
+
+        #expect(rows == [0, 100, 200])
+    }
 }

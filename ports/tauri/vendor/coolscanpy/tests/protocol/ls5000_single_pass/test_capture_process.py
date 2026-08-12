@@ -2710,7 +2710,7 @@ def test_request_rejects_ambiguous_or_out_of_capacity_slots(
         request_factory()
 
 
-def test_default_runner_uses_argv_without_shell_and_isolates_child_signals(
+def test_default_runner_uses_argv_without_shell_and_inherits_bridge_process_group(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2727,8 +2727,29 @@ def test_default_runner_uses_argv_without_shell_and_isolates_child_signals(
     assert result.returncode == 0
     assert recorded["argv"] == ["python", "worker.py", "--live"]
     assert recorded["shell"] is False
-    assert recorded["start_new_session"] is True
+    assert "start_new_session" not in recorded
     assert recorded["capture_output"] is True
+
+
+def test_bridge_owner_descriptor_is_passed_to_capture_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    owner_file = (tmp_path / "owner.lock").open("w+")
+    monkeypatch.setenv("SCANSTUDIO_BRIDGE_OWNER_FD", str(owner_file.fileno()))
+    try:
+        assert capture._bridge_owner_subprocess_kwargs() == {
+            "pass_fds": (owner_file.fileno(),)
+        }
+    finally:
+        owner_file.close()
+
+
+def test_malformed_bridge_owner_descriptor_refuses_worker_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCANSTUDIO_BRIDGE_OWNER_FD", "not-an-fd")
+    with pytest.raises(RuntimeError, match="does not name an open ownership descriptor"):
+        capture._bridge_owner_subprocess_kwargs()
 
 
 def test_roll_fingerprint_skips_trailing_sliver_and_filters_origins_in_lockstep() -> (

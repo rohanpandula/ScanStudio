@@ -9,6 +9,37 @@
 // `request("scanner.list", ...)` etc. directly.
 
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
+
+/// Fixed deadlines for the subprocess boundary. Production responses are
+/// prompt acknowledgements (long-running capture work is reported by
+/// events), so a response that exceeds `requestTimeout` is no longer allowed
+/// to retain a continuation forever. The shorter shutdown phases keep app
+/// termination bounded while still giving the engine a chance to clean up.
+public struct EngineClientConfiguration: Sendable {
+    public var requestTimeout: Duration
+    public var gracefulShutdownTimeout: Duration
+    public var terminateTimeout: Duration
+    public var forceKillTimeout: Duration
+    /// Internal test seam for Foundation `Process` observation races. The
+    /// production default always reads `Process.isRunning` directly.
+    var processIsRunningOverride: (@Sendable (Process) -> Bool)?
+
+    public init(
+        requestTimeout: Duration = .seconds(60),
+        gracefulShutdownTimeout: Duration = .milliseconds(750),
+        terminateTimeout: Duration = .milliseconds(250),
+        forceKillTimeout: Duration = .milliseconds(500)
+    ) {
+        self.requestTimeout = requestTimeout
+        self.gracefulShutdownTimeout = gracefulShutdownTimeout
+        self.terminateTimeout = terminateTimeout
+        self.forceKillTimeout = forceKillTimeout
+        self.processIsRunningOverride = nil
+    }
+}
 
 /// A single already-line-framed byte sequence read from the engine's
 /// stdout, buffered independently of everything else so it's directly
@@ -66,15 +97,23 @@ public protocol EngineClientProtocol: Sendable {
 /// `request(method:params:)` matched by id via continuations, plus an
 /// `AsyncStream` of decoded events (D-04).
 public actor EngineClient {
+    private struct PendingRequest {
+        let continuation: CheckedContinuation<Data, Error>
+        let timeoutTask: Task<Void, Never>
+    }
+
     private let process: Process
     private let stdinHandle: FileHandle
     private let stdoutHandle: FileHandle
+    private let configuration: EngineClientConfiguration
 
     private var lineFramer = LineFramer()
     private var nextRequestId: UInt64 = 0
-    private var pendingContinuations: [UInt64: CheckedContinuation<Data, Error>] = [:]
+    private var pendingRequests: [UInt64: PendingRequest] = [:]
     private var handshakeTask: Task<Void, Error>?
     private var terminationHandled = false
+    private var stdinClosed = false
+    private var terminationTask: Task<Void, Never>?
 
     /// The engine's self-reported version from `engine.hello`, retained so
     /// callers (e.g. `SessionModel`) can surface it instead of the connect
@@ -84,7 +123,10 @@ public actor EngineClient {
     private let eventsContinuation: AsyncStream<EngineEvent>.Continuation
     public nonisolated let events: AsyncStream<EngineEvent>
 
-    public init(engineURL: URL) throws {
+    public init(
+        engineURL: URL,
+        configuration: EngineClientConfiguration = EngineClientConfiguration()
+    ) throws {
         // `Process`/`Pipe` do not ignore SIGPIPE for you: a write to
         // `stdinHandle` that races the child process exiting (e.g. a
         // request in flight when `terminate()` tears the process down, or
@@ -116,6 +158,7 @@ public actor EngineClient {
         self.process = process
         self.stdinHandle = stdinPipe.fileHandleForWriting
         self.stdoutHandle = stdoutPipe.fileHandleForReading
+        self.configuration = configuration
         self.events = stream
         self.eventsContinuation = continuation
 
@@ -144,6 +187,9 @@ public actor EngineClient {
         _ method: String,
         params: Params
     ) async throws -> Result {
+        guard !terminationHandled, terminationTask == nil else {
+            throw Self.clientTerminatedError
+        }
         if method != "engine.hello" {
             try await ensureHandshake()
         }
@@ -188,24 +234,64 @@ public actor EngineClient {
     // MARK: - Request/response plumbing
 
     private func performRequest<Params: Encodable, Result: Decodable>(_ method: String, params: Params) async throws -> Result {
+        guard !terminationHandled, terminationTask == nil else {
+            throw Self.clientTerminatedError
+        }
         nextRequestId += 1
         let id = nextRequestId
         let envelope = RequestEnvelope(id: id, method: method, params: params)
 
-        let responseData: Data = try await withCheckedThrowingContinuation { continuation in
-            pendingContinuations[id] = continuation
-            do {
-                var line = try JSONEncoder().encode(envelope)
-                line.append(0x0A)
-                try stdinHandle.write(contentsOf: line)
-            } catch {
-                pendingContinuations.removeValue(forKey: id)
-                continuation.resume(throwing: error)
+        let responseData: Data = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let requestTimeout = configuration.requestTimeout
+                let timeoutTask = Task { [weak self] in
+                    do {
+                        try await Task.sleep(for: requestTimeout)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    await self?.timeoutRequest(id: id, method: method)
+                }
+                pendingRequests[id] = PendingRequest(
+                    continuation: continuation,
+                    timeoutTask: timeoutTask
+                )
+                do {
+                    var line = try JSONEncoder().encode(envelope)
+                    line.append(0x0A)
+                    try stdinHandle.write(contentsOf: line)
+                } catch {
+                    if let pending = pendingRequests.removeValue(forKey: id) {
+                        pending.timeoutTask.cancel()
+                        pending.continuation.resume(throwing: error)
+                    }
+                }
             }
+        } onCancel: {
+            Task { await self.cancelRequest(id: id) }
         }
 
         let envelope2 = try JSONDecoder().decode(ResponseEnvelope<Result>.self, from: responseData)
         return envelope2.result
+    }
+
+    /// Removes before resuming so a response, timeout, cancellation, and
+    /// process exit can race without ever double-resuming a continuation.
+    private func timeoutRequest(id: UInt64, method: String) {
+        guard let pending = pendingRequests.removeValue(forKey: id) else { return }
+        pending.timeoutTask.cancel()
+        pending.continuation.resume(throwing: EngineRequestError(
+            code: "ENGINE_REQUEST_TIMEOUT",
+            message: "Engine request \"\(method)\" (id \(id)) exceeded its response deadline.",
+            recoverable: true
+        ))
+    }
+
+    private func cancelRequest(id: UInt64) {
+        guard let pending = pendingRequests.removeValue(forKey: id) else { return }
+        pending.timeoutTask.cancel()
+        pending.continuation.resume(throwing: CancellationError())
     }
 
     // MARK: - Incoming data handling
@@ -232,19 +318,20 @@ public actor EngineClient {
         }
 
         guard let id = sniff.id else { return }
-        guard let continuation = pendingContinuations.removeValue(forKey: id) else { return }
+        guard let pending = pendingRequests.removeValue(forKey: id) else { return }
+        pending.timeoutTask.cancel()
 
         // Attempt the error shape first; fall back to treating the line as
         // a success response otherwise (either resolves unambiguously since
         // a response is always exactly one or the other).
         if let errorEnvelope = try? JSONDecoder().decode(ResponseErrorEnvelope.self, from: data) {
-            continuation.resume(throwing: EngineRequestError(
+            pending.continuation.resume(throwing: EngineRequestError(
                 code: errorEnvelope.error.code,
                 message: errorEnvelope.error.message,
                 recoverable: errorEnvelope.error.recoverable
             ))
         } else {
-            continuation.resume(returning: data)
+            pending.continuation.resume(returning: data)
         }
     }
 
@@ -255,15 +342,11 @@ public actor EngineClient {
 
         // T-02-02: pending continuations must be resumed with an error, not
         // leaked, if the child process exits unexpectedly.
-        let error = EngineRequestError(
+        failAllPendingRequests(with: EngineRequestError(
             code: "ENGINE_TERMINATED",
             message: "The scanstudio-engine process exited unexpectedly.",
             recoverable: false
-        )
-        for (_, continuation) in pendingContinuations {
-            continuation.resume(throwing: error)
-        }
-        pendingContinuations.removeAll()
+        ))
         let terminationEvent = Data(
             #"{"event":"engine.terminated","payload":{"code":"ENGINE_TERMINATED","message":"The scanstudio-engine process exited unexpectedly."}}"#.utf8
         )
@@ -271,14 +354,118 @@ public actor EngineClient {
         eventsContinuation.finish()
     }
 
-    /// Best-effort cleanup so the subprocess doesn't outlive the app.
-    /// Safe to call multiple times.
-    public func terminate() {
-        stdoutHandle.readabilityHandler = nil
-        if process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
+    private func failAllPendingRequests(with error: Error) {
+        let requests = pendingRequests
+        pendingRequests.removeAll()
+        for pending in requests.values {
+            pending.timeoutTask.cancel()
+            pending.continuation.resume(throwing: error)
         }
+    }
+
+    private static let clientTerminatedError = EngineRequestError(
+        code: "ENGINE_CLIENT_TERMINATED",
+        message: "The engine client is shutting down.",
+        recoverable: false
+    )
+
+    /// Shuts down once, even when multiple callers race to terminate. The
+    /// detached task is intentionally not a child of the caller: cancelling
+    /// a UI task cannot abandon subprocess cleanup midway through.
+    public func terminate() async {
+        if let terminationTask {
+            await terminationTask.value
+            return
+        }
+
+        let task = Task.detached { [weak self] in
+            guard let self else { return }
+            await self.performTermination()
+        }
+        terminationTask = task
+        await task.value
+    }
+
+    private func performTermination() async {
+        terminationHandled = true
+        stdoutHandle.readabilityHandler = nil
+        handshakeTask?.cancel()
+        handshakeTask = nil
+        failAllPendingRequests(with: Self.clientTerminatedError)
+        eventsContinuation.finish()
+
+        guard isProcessRunning else {
+            closeStdin()
+            return
+        }
+
+        // `engine.shutdown` is the cooperative path: it cancels workers,
+        // flushes its response, and exits. There is deliberately no pending
+        // continuation for this final request; process exit is the ack that
+        // matters and is independently deadline-bounded below.
+        sendShutdownRequest()
+        closeStdin()
+        if await waitForProcessExit(timeout: configuration.gracefulShutdownTimeout) {
+            return
+        }
+
+        // A wedged engine gets one bounded SIGTERM phase before the
+        // non-cooperative SIGKILL fallback.
+        process.terminate()
+        if await waitForProcessExit(timeout: configuration.terminateTimeout) {
+            return
+        }
+
+        #if canImport(Darwin)
+        _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        #endif
+        _ = await waitForProcessExit(timeout: configuration.forceKillTimeout)
+    }
+
+    private func sendShutdownRequest() {
+        guard !stdinClosed, process.isRunning else { return }
+        nextRequestId += 1
+        let envelope = RequestEnvelope(
+            id: nextRequestId,
+            method: "engine.shutdown",
+            params: EmptyParams()
+        )
+        do {
+            var line = try JSONEncoder().encode(envelope)
+            line.append(0x0A)
+            try stdinHandle.write(contentsOf: line)
+        } catch {
+            // The escalation path below handles a closed/broken pipe.
+        }
+    }
+
+    private func closeStdin() {
+        guard !stdinClosed else { return }
+        stdinClosed = true
+        try? stdinHandle.close()
+    }
+
+    private var isProcessRunning: Bool {
+        configuration.processIsRunningOverride?(process) ?? process.isRunning
+    }
+
+    /// Polls only Foundation's non-blocking state against a monotonic
+    /// deadline. `Process` owns observation/reaping for children it launches;
+    /// calling `waitUntilExit` after `isRunning` flips false is still unsafe
+    /// because Foundation can lag internally and block past this deadline.
+    private func waitForProcessExit(timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while isProcessRunning {
+            guard clock.now < deadline else { return false }
+            do {
+                try await Task.sleep(for: .milliseconds(10))
+            } catch {
+                // Termination is non-cancellable once started. Continue to
+                // the fixed deadline even if an enclosing task is cancelled.
+            }
+        }
+        return true
     }
 }
 

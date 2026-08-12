@@ -611,6 +611,8 @@ pub struct BridgeRollApproveParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeScanStartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     pub slots: Vec<u32>,
     pub recipe: BridgeCaptureRecipe,
     pub output: BridgeOutputSpec,

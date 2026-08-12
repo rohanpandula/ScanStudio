@@ -1580,11 +1580,12 @@ def _run_subprocess(
     *,
     cwd: Path,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the worker in its own process group and collect its text output.
+    """Run a worker in the bridge-owned process group.
 
-    ``start_new_session`` keeps an application-level SIGINT/SIGTERM from being
-    forwarded to the scanner child.  The parent may record a stop request, but
-    this function waits for the current worker attempt to finish naturally.
+    The bridge ownership descriptor is inherited when present. It keeps the
+    scanner ownership lock held even if the bridge process dies before this
+    worker, preventing a replacement bridge from racing an in-flight USB
+    operation.
     """
 
     return subprocess.run(
@@ -1594,7 +1595,7 @@ def _run_subprocess(
         capture_output=True,
         text=True,
         shell=False,
-        start_new_session=True,
+        **_bridge_owner_subprocess_kwargs(),
     )
 
 
@@ -1605,12 +1606,7 @@ def _spawn_batch_subprocess(
     stdout: Any,
     stderr: Any,
 ) -> RunningBatchProcess:
-    """Start one isolated child in its own session.
-
-    ``start_new_session`` keeps an application-level SIGINT/SIGTERM from
-    reaching the scanner child implicitly; the returned handle's own
-    ``terminate()``/``kill()`` remain reserved for the failed-preview
-    teardown (see ``RunningBatchProcess``)."""
+    """Start one child in the bridge-owned process group and lifetime fence."""
 
     return subprocess.Popen(
         list(argv),
@@ -1618,8 +1614,31 @@ def _spawn_batch_subprocess(
         stdout=stdout,
         stderr=stderr,
         shell=False,
-        start_new_session=True,
+        **_bridge_owner_subprocess_kwargs(),
     )
+
+
+def _bridge_owner_subprocess_kwargs() -> dict[str, object]:
+    """Return the inherited owner descriptor for a real bridge launch.
+
+    Tests and standalone CoolscanPy callers do not set the environment
+    variable and therefore retain ordinary subprocess behavior. A malformed
+    descriptor fails closed instead of silently launching an unowned worker.
+    """
+
+    raw_descriptor = os.environ.get("SCANSTUDIO_BRIDGE_OWNER_FD")
+    if raw_descriptor is None:
+        return {}
+    try:
+        descriptor = int(raw_descriptor)
+        if descriptor < 0:
+            raise ValueError("negative descriptor")
+        os.fstat(descriptor)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "SCANSTUDIO_BRIDGE_OWNER_FD does not name an open ownership descriptor"
+        ) from exc
+    return {"pass_fds": (descriptor,)}
 
 
 def _sha256_file(path: Path) -> str:

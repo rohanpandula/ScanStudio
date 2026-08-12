@@ -839,6 +839,49 @@ export class SessionStore {
   }
 
   /**
+   * Ejects loaded media through the engine's bounded request channel. This
+   * mirrors the engine's real-backend safety gate locally: no eject request
+   * is sent while a preview, scan, project/device transition, or another
+   * physical boundary owns the session. The authoritative scanner.status
+   * event emitted by the engine updates media state on success.
+   */
+  async eject(): Promise<void> {
+    if (sessionOperationBusy(this.#state)) {
+      throw {
+        code: "SCANNER_BUSY",
+        message: "wait for the active scanner operation to finish before ejecting media",
+        recoverable: true,
+      } satisfies EngineError;
+    }
+    if (!this.#state.connection.connected) {
+      throw {
+        code: "NOT_CONNECTED",
+        message: "scanner is not connected",
+        recoverable: true,
+      } satisfies EngineError;
+    }
+    if (this.#state.connection.status?.mediaLoaded !== true) {
+      throw {
+        code: "NO_MEDIA",
+        message: "no media is loaded",
+        recoverable: true,
+      } satisfies EngineError;
+    }
+    this.#state.connectionChangePending = true;
+    this.#notify();
+    try {
+      await this.transport.sendRequest("scanner.eject", {});
+      // Ejection changes physical registration even if a transport adapter
+      // delays the status event; never let the old preview authorize capture.
+      this.#invalidatePreviewRegistration();
+      this.#state.filmFeedInterrupted = null;
+    } finally {
+      this.#state.connectionChangePending = false;
+      this.#notify();
+    }
+  }
+
+  /**
    * Toggles frame selection (05-03 Task 1, UI-only state -- no wire call).
    * Non-extend toggles membership (add if absent, remove if present) and
    * updates the range anchor; extend selects the inclusive range from the
@@ -1469,11 +1512,18 @@ export class SessionStore {
    * failure" pattern: a rejection resolves to null (never throws), so the
    * caller renders the resolved exitCode/stdout/stderr truthfully -- never
    * an invented success message (threat T-07-04). The engine rebuilds the
-   * argument array server-side; this method sends only frameIndex, never a
-   * client argument list (threat T-07-01).
+   * argument array server-side and verifies the fingerprint of the exact
+   * preview the operator saw; this method never sends a client argument list.
    */
-  async applyMetadata(frameIndex: number): Promise<ApplyMetadataResult | null> {
-    return metadataStore.applyMetadata(this.#metadataRequest(), frameIndex);
+  async applyMetadata(
+    frameIndex: number,
+    previewFingerprint: string,
+  ): Promise<ApplyMetadataResult | null> {
+    return metadataStore.applyMetadata(
+      this.#metadataRequest(),
+      frameIndex,
+      previewFingerprint,
+    );
   }
 
   /**
@@ -1521,14 +1571,10 @@ export class SessionStore {
    */
   async analyzeFrameDefects(
     frameIndex: number,
-    capture: CaptureRecipe,
-    processing: ProcessingRecipe,
   ): Promise<AnalyzeFrameDefectsResult> {
     return defectsStore.analyzeFrameDefects(
       (method: string, params?: unknown) => this.transport.sendRequest(method, params),
       frameIndex,
-      capture,
-      processing,
     );
   }
 

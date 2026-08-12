@@ -49,6 +49,7 @@ struct ManualFramePlacementView: View {
     /// a *value* (not an index) because each drag change re-sorts the array
     /// and the dragged line's index moves; the value is stable and the
     /// gesture below anchors on it. `nil` means no drag is in flight.
+    @State private var dragOriginRow: Int?
     @State private var draggingRow: Int?
 
     /// Cross-strip (display) axis: the strip's own fixed on-screen height.
@@ -268,7 +269,10 @@ struct ManualFramePlacementView: View {
                 .onChanged { value in
                     dragBoundary(anchor: row, locationX: value.location.x)
                 }
-                .onEnded { _ in draggingRow = nil }
+                .onEnded { _ in
+                    dragOriginRow = nil
+                    draggingRow = nil
+                }
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Boundary at row \(row)")
@@ -417,19 +421,24 @@ struct ManualFramePlacementView: View {
         boundaryRows = (boundaryRows + [row]).sorted()
     }
 
-    /// Moves the line whose pre-drag value is `anchor` to `row` and
-    /// re-sorts. Anchoring by value instead of index is the whole trick:
-    /// each `onChanged` re-sorts, but the anchor the gesture closure
-    /// captured stays stable, so subsequent frames keep removing *it*,
-    /// never a now-different sibling.
+    /// Keeps the gesture's origin separate from its current boundary row.
+    /// Every callback replaces the previous callback's destination; the
+    /// captured origin is used only to initialize this in-flight state.
     private func dragBoundary(anchor: Int, locationX: CGFloat) {
-        let row = row(atX: locationX)
-        var rows = boundaryRows.filter { $0 != anchor }
-        if !rows.contains(row) {
-            rows.append(row)
+        if dragOriginRow == nil {
+            dragOriginRow = anchor
+            draggingRow = anchor
         }
-        boundaryRows = rows.sorted()
-        draggingRow = row
+        let currentRow = draggingRow ?? anchor
+        let destinationRow = row(atX: locationX)
+        let moved = ManualFramePlacementValidation.movingBoundary(
+            in: boundaryRows,
+            currentRow: currentRow,
+            to: destinationRow
+        )
+        guard moved != boundaryRows || destinationRow == currentRow else { return }
+        boundaryRows = moved
+        draggingRow = destinationRow
     }
 
     private func reset() {

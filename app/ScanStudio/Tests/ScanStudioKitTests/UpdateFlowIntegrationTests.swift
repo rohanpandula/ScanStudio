@@ -91,10 +91,14 @@ final class UpdateFlowIntegrationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: downloaded), artifact.payload)
 
         // 3. Installer: snapshot current (old) -> swap in new -> rollback old.
-        //    mountAndLocateApp is bypassed for directory fixtures by design
-        //    (see header); the archive is pointed at the release bundle that
+        //    The scoped hdiutil leg is bypassed for directory fixtures by
+        //    design (see header); the archive is pointed at the bundle that
         //    corresponds to the artifact we just verified and downloaded.
-        let installer = try UpdateInstaller(appDirectory: installDirectory, rollbackDirectory: rollbackDirectory)
+        let installer = try UpdateInstaller(
+            appDirectory: installDirectory,
+            rollbackDirectory: rollbackDirectory,
+            bundleVerifier: makeBundleVerifier()
+        )
         XCTAssertNil(installer.availableRollback, "no rollback is available before the first snapshot")
 
         let archive = UpdateArchive(
@@ -154,7 +158,11 @@ final class UpdateFlowIntegrationTests: XCTestCase {
 
         // Nothing may have been swapped, snapshotted, or left staged.
         XCTAssertEqual(try markerContents(installDirectory.appendingPathComponent("ScanStudio.app")), "old")
-        let installer = try UpdateInstaller(appDirectory: installDirectory, rollbackDirectory: rollbackDirectory)
+        let installer = try UpdateInstaller(
+            appDirectory: installDirectory,
+            rollbackDirectory: rollbackDirectory,
+            bundleVerifier: makeBundleVerifier()
+        )
         XCTAssertNil(installer.availableRollback)
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: downloadDir.path)
         XCTAssertTrue(leftovers.isEmpty, "a rejected download must not leave a staged artifact")
@@ -227,7 +235,11 @@ final class UpdateFlowIntegrationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: downloaded), hostArtifact.payload)
 
         let sourceApp = host == .arm64 ? armApp : intelApp
-        let installer = try UpdateInstaller(appDirectory: installDirectory, rollbackDirectory: rollbackDirectory)
+        let installer = try UpdateInstaller(
+            appDirectory: installDirectory,
+            rollbackDirectory: rollbackDirectory,
+            bundleVerifier: makeBundleVerifier()
+        )
         XCTAssertNil(installer.availableRollback)
 
         let archive = UpdateArchive(
@@ -387,20 +399,58 @@ final class UpdateFlowIntegrationTests: XCTestCase {
         let appURL = parent.appendingPathComponent(name, isDirectory: true)
         let contents = appURL.appendingPathComponent("Contents", isDirectory: true)
         let macos = contents.appendingPathComponent("MacOS", isDirectory: true)
+        let resources = contents.appendingPathComponent("Resources", isDirectory: true)
         try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
 
         let infoPlist: [String: Any] = [
+            "CFBundlePackageType": "APPL",
+            "CFBundleIdentifier": UpdatePublisherTrust.bundleIdentifier,
+            "CFBundleExecutable": UpdatePublisherTrust.bundleExecutable,
             "CFBundleShortVersionString": release,
             "ScanStudioRelease": release,
+            "LSMinimumSystemVersion": "14.0",
         ]
         let plistData = try PropertyListSerialization.data(fromPropertyList: infoPlist, format: .xml, options: 0)
         try plistData.write(to: contents.appendingPathComponent("Info.plist"))
-        try Data(marker.utf8).write(to: macos.appendingPathComponent("ScanStudio"))
+        let launcher = macos.appendingPathComponent(UpdatePublisherTrust.bundleExecutable)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: launcher)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: launcher.path)
+        let binary = macos.appendingPathComponent(UpdatePublisherTrust.architectureExecutable)
+        try fakeMachO(for: HostArchitectureProvider.current()).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        try Data(marker.utf8).write(to: resources.appendingPathComponent("marker.txt"))
     }
 
     private func markerContents(_ appURL: URL) throws -> String {
-        try String(contentsOf: appURL.appendingPathComponent("Contents/MacOS/ScanStudio"), encoding: .utf8)
+        try String(contentsOf: appURL.appendingPathComponent("Contents/Resources/marker.txt"), encoding: .utf8)
     }
+
+    private func makeBundleVerifier() -> UpdateBundleVerifier {
+        UpdateBundleVerifier(
+            publisherTrust: UpdatePublisherTrust(
+                authorizedTeamIdentifier: "ABCDEFGHIJ",
+                designatedRequirementData: Data([1])
+            ),
+            signatureValidator: AcceptingIntegrationSignatureValidator(),
+            hostOperatingSystemVersion: OperatingSystemVersion(
+                majorVersion: 99,
+                minorVersion: 0,
+                patchVersion: 0
+            )
+        )
+    }
+
+    private func fakeMachO(for architecture: HostArchitecture) -> Data {
+        let cpu: [UInt8] = architecture == .arm64
+            ? [0x0c, 0x00, 0x00, 0x01]
+            : [0x07, 0x00, 0x00, 0x01]
+        return Data([0xcf, 0xfa, 0xed, 0xfe] + cpu)
+    }
+}
+
+private struct AcceptingIntegrationSignatureValidator: UpdateCodeSignatureValidating {
+    func validateApplication(at appURL: URL, trust: UpdatePublisherTrust) throws {}
 }
 
 /// Canned in-memory URLSession stand-in for the offline flow: `data(from:)`

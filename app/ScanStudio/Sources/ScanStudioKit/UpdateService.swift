@@ -7,7 +7,9 @@
 // tested offline with canned payloads — CI never touches the network.
 
 import CryptoKit
+import Darwin
 import Foundation
+import Security
 
 /// The `hw.machine` string, e.g. `arm64` on Apple Silicon, `x86_64` (or
 /// `x86_64h`) on Intel. Read via a direct `sysctlbyname` syscall — no
@@ -24,7 +26,8 @@ extension ProcessInfo {
         guard sysctlbyname("hw.machine", &machine, &size, nil, 0) == 0 else {
             return ""
         }
-        return String(cString: machine)
+        let bytes = machine.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
@@ -389,25 +392,632 @@ public enum UpdateDownloadError: Error, Equatable {
     case downloadFailed
     /// Downloaded bytes do not match the promised SHA-256 (tampered/corrupt).
     case checksumMismatch
+    /// Reading the staged DMG failed. The associated path makes this
+    /// distinguishable from a complete-file checksum mismatch in diagnostics.
+    case checksumReadFailed(path: String, cause: String)
     /// The DMG could not be attached (or its mount point could not be read).
     case mountFailed
-    /// The mounted bundle failed `codesign --verify --deep --strict`.
+    /// Both normal and forced bounded detach failed.
+    case detachFailed
+    /// The installed app carries no usable, signed publisher trust root.
+    case publisherTrustNotConfigured
+    /// Security.framework rejected the mounted bundle's signature structure.
     case signatureInvalid
+    /// The bundle was validly signed, but not by the pinned publisher or
+    /// designated requirement.
+    case publisherUnauthorized
+    /// A Developer ID signature without a secure timestamp and stapled
+    /// notarization ticket is not an authorized update.
+    case notarizationMissing
+    /// A required bundle metadata value or executable identity did not match.
+    case bundleIdentityMismatch
+    /// `ScanStudioRelease` did not equal the selected feed version.
+    case versionMismatch
+    /// The shipped ScanStudio Mach-O did not match the selected host arch.
+    case architectureMismatch
+    /// The bundle's minimum-macOS declaration is absent, malformed, outside
+    /// the supported floor, or newer than the running host.
+    case operatingSystemUnsupported
+    /// A required bundle file could not be read. Carries the failing path.
+    case bundleReadFailed(String)
     /// The feed described an archive format this downloader cannot handle.
     case invalidArchive
     /// The mounted volume held no usable `.app` bundle.
     case notAnApp
 }
 
+/// Publisher identity rooted in the already-installed application rather than
+/// in the release server. Production construction is deliberately gated on an
+/// explicit `ScanStudioUpdateTeamIdentifier` Info.plist stamp that must match
+/// the running app's valid Developer ID signature. Its exact designated
+/// requirement is persisted in Security.framework's stable binary form.
+///
+/// Ad-hoc/unsigned builds, unstamped builds, and builds without a secure
+/// timestamp plus stapled notarization ticket produce `nil`, leaving update
+/// installation fail-closed until the real Apple identity is available.
+public struct UpdatePublisherTrust: Sendable, Equatable {
+    public static let teamIdentifierInfoKey = "ScanStudioUpdateTeamIdentifier"
+    public static let bundleIdentifier = "dev.scanstudio.live"
+    public static let bundleExecutable = "ScanStudioLauncher"
+    public static let architectureExecutable = "ScanStudio"
+
+    public let authorizedTeamIdentifier: String
+    public let designatedRequirementData: Data
+
+    init?(authorizedTeamIdentifier: String, designatedRequirementData: Data) {
+        guard Self.isValidTeamIdentifier(authorizedTeamIdentifier),
+              !designatedRequirementData.isEmpty else {
+            return nil
+        }
+        self.authorizedTeamIdentifier = authorizedTeamIdentifier
+        self.designatedRequirementData = designatedRequirementData
+    }
+
+    /// Builds the production trust root from the running, locally installed
+    /// app. The Team ID stamp is part of the signed Info.plist; Security.framework
+    /// must independently report the same Team ID and exact designated
+    /// requirement before this returns a policy.
+    public static func currentApplication(bundle: Bundle = .main) -> UpdatePublisherTrust? {
+        guard bundle.bundleIdentifier == bundleIdentifier,
+              bundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String == bundleExecutable,
+              let stampedTeam = bundle.object(forInfoDictionaryKey: teamIdentifierInfoKey) as? String,
+              isValidTeamIdentifier(stampedTeam) else {
+            return nil
+        }
+        return try? SystemUpdateCodeSignatureValidator().publisherTrust(
+            at: bundle.bundleURL,
+            stampedTeamIdentifier: stampedTeam
+        )
+    }
+
+    fileprivate static func isValidTeamIdentifier(_ value: String) -> Bool {
+        value.count == 10 && value.utf8.allSatisfy {
+            ($0 >= Character("A").asciiValue! && $0 <= Character("Z").asciiValue!)
+                || ($0 >= Character("0").asciiValue! && $0 <= Character("9").asciiValue!)
+        }
+    }
+}
+
+protocol UpdateCodeSignatureValidating: Sendable {
+    func validateApplication(at appURL: URL, trust: UpdatePublisherTrust) throws
+}
+
+/// Security.framework implementation of the independent publisher gate. It
+/// validates the complete bundle, nested code, all architectures, exact
+/// designated requirement bytes, Apple Developer ID certificate OIDs, Team ID,
+/// secure timestamp, stapled ticket, and a bounded Gatekeeper assessment.
+private struct SystemUpdateCodeSignatureValidator: UpdateCodeSignatureValidating {
+    func publisherTrust(at appURL: URL, stampedTeamIdentifier: String) throws -> UpdatePublisherTrust {
+        guard UpdatePublisherTrust.isValidTeamIdentifier(stampedTeamIdentifier) else {
+            throw UpdateDownloadError.publisherTrustNotConfigured
+        }
+        let code = try staticCode(at: appURL)
+        try validateStructure(of: code, requirement: nil)
+        let information = try signingInformation(for: code)
+        guard string(kSecCodeInfoIdentifier, in: information) == UpdatePublisherTrust.bundleIdentifier,
+              string(kSecCodeInfoTeamIdentifier, in: information) == stampedTeamIdentifier,
+              hasTimestampAndStapledTicket(information),
+              let actualRequirement = designatedRequirement(in: information),
+              let requirementData = copyData(of: actualRequirement),
+              let trust = UpdatePublisherTrust(
+                authorizedTeamIdentifier: stampedTeamIdentifier,
+                designatedRequirementData: requirementData
+              ) else {
+            throw UpdateDownloadError.publisherTrustNotConfigured
+        }
+        try validateDeveloperID(code, teamIdentifier: stampedTeamIdentifier)
+        try validateNotarization(at: appURL)
+        return trust
+    }
+
+    func validateApplication(at appURL: URL, trust: UpdatePublisherTrust) throws {
+        let code = try staticCode(at: appURL)
+        guard let expectedRequirement = requirement(from: trust.designatedRequirementData) else {
+            throw UpdateDownloadError.publisherTrustNotConfigured
+        }
+        try validateStructure(of: code, requirement: expectedRequirement)
+        try validateDeveloperID(code, teamIdentifier: trust.authorizedTeamIdentifier)
+
+        let information = try signingInformation(for: code)
+        guard string(kSecCodeInfoIdentifier, in: information) == UpdatePublisherTrust.bundleIdentifier,
+              string(kSecCodeInfoTeamIdentifier, in: information) == trust.authorizedTeamIdentifier,
+              let actualRequirement = designatedRequirement(in: information),
+              copyData(of: actualRequirement) == trust.designatedRequirementData else {
+            throw UpdateDownloadError.publisherUnauthorized
+        }
+        guard hasTimestampAndStapledTicket(information) else {
+            throw UpdateDownloadError.notarizationMissing
+        }
+        try validateNotarization(at: appURL)
+    }
+
+    private func staticCode(at url: URL) throws -> SecStaticCode {
+        var code: SecStaticCode?
+        let status = SecStaticCodeCreateWithPath(
+            url as CFURL,
+            SecCSFlags(rawValue: 0),
+            &code
+        )
+        guard status == errSecSuccess, let code else {
+            throw UpdateDownloadError.signatureInvalid
+        }
+        return code
+    }
+
+    private func validateStructure(of code: SecStaticCode, requirement: SecRequirement?) throws {
+        let rawFlags = kSecCSCheckAllArchitectures
+            | kSecCSCheckNestedCode
+            | kSecCSStrictValidate
+            | kSecCSRestrictSymlinks
+            | kSecCSRestrictToAppLike
+            | kSecCSRestrictSidebandData
+        let status = SecStaticCodeCheckValidity(
+            code,
+            SecCSFlags(rawValue: rawFlags),
+            requirement
+        )
+        guard status == errSecSuccess else {
+            throw requirement == nil
+                ? UpdateDownloadError.signatureInvalid
+                : UpdateDownloadError.publisherUnauthorized
+        }
+    }
+
+    private func validateDeveloperID(_ code: SecStaticCode, teamIdentifier: String) throws {
+        guard let requirement = requirement(from: developerIDRequirement(teamIdentifier: teamIdentifier)) else {
+            throw UpdateDownloadError.publisherTrustNotConfigured
+        }
+        let status = SecStaticCodeCheckValidity(
+            code,
+            SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate),
+            requirement
+        )
+        guard status == errSecSuccess else {
+            throw UpdateDownloadError.publisherUnauthorized
+        }
+    }
+
+    private func signingInformation(for code: SecStaticCode) throws -> [String: Any] {
+        var rawInformation: CFDictionary?
+        let flags = SecCSFlags(
+            rawValue: kSecCSSigningInformation
+                | kSecCSRequirementInformation
+                | kSecCSContentInformation
+        )
+        let status = SecCodeCopySigningInformation(code, flags, &rawInformation)
+        guard status == errSecSuccess,
+              let information = rawInformation as? [String: Any] else {
+            throw UpdateDownloadError.signatureInvalid
+        }
+        return information
+    }
+
+    private func hasTimestampAndStapledTicket(_ information: [String: Any]) -> Bool {
+        guard information[kSecCodeInfoTimestamp as String] != nil,
+              let ticket = information[kSecCodeInfoStapledNotarizationTicket as String] as? Data else {
+            return false
+        }
+        return !ticket.isEmpty
+    }
+
+    private func string(_ key: CFString, in information: [String: Any]) -> String? {
+        information[key as String] as? String
+    }
+
+    private func designatedRequirement(in information: [String: Any]) -> SecRequirement? {
+        guard let raw = information[kSecCodeInfoDesignatedRequirement as String] else {
+            return nil
+        }
+        let value = raw as CFTypeRef
+        guard CFGetTypeID(value) == SecRequirementGetTypeID() else { return nil }
+        return unsafeDowncast(value, to: SecRequirement.self)
+    }
+
+    private func copyData(of requirement: SecRequirement) -> Data? {
+        var data: CFData?
+        guard SecRequirementCopyData(requirement, SecCSFlags(rawValue: 0), &data) == errSecSuccess else {
+            return nil
+        }
+        return data as Data?
+    }
+
+    private func requirement(from data: Data) -> SecRequirement? {
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithData(
+            data as CFData,
+            SecCSFlags(rawValue: 0),
+            &requirement
+        ) == errSecSuccess else {
+            return nil
+        }
+        return requirement
+    }
+
+    private func requirement(from text: String) -> SecRequirement? {
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(
+            text as CFString,
+            SecCSFlags(rawValue: 0),
+            &requirement
+        ) == errSecSuccess else {
+            return nil
+        }
+        return requirement
+    }
+
+    private func developerIDRequirement(teamIdentifier: String) -> String {
+        // Team IDs are validated as ten ASCII A-Z/0-9 bytes before reaching
+        // this interpolation, so this requirement cannot be injected.
+        """
+        anchor apple generic and identifier \"\(UpdatePublisherTrust.bundleIdentifier)\" \
+        and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+        and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+        and certificate leaf[subject.OU] = \"\(teamIdentifier)\"
+        """
+    }
+
+    private func validateNotarization(at appURL: URL) throws {
+        let result: UpdateCommandResult
+        do {
+            result = try SystemUpdateCommandRunner().run(
+                "/usr/sbin/spctl",
+                arguments: [
+                    "--assess", "--type", "execute", "--ignore-cache",
+                    "--no-cache", "--raw", appURL.path,
+                ],
+                timeout: 30
+            )
+        } catch {
+            throw UpdateDownloadError.notarizationMissing
+        }
+        guard result.status == 0,
+              let plist = try? PropertyListSerialization.propertyList(
+                from: result.output,
+                options: [],
+                format: nil
+              ) as? [String: Any],
+              plist["assessment:verdict"] as? Bool == true,
+              let authority = plist["assessment:authority"] as? [String: Any],
+              authority["assessment:authority:source"] as? String == "Notarized Developer ID" else {
+            throw UpdateDownloadError.notarizationMissing
+        }
+    }
+}
+
+/// Complete bundle-identity verifier shared by the downloader (mounted source)
+/// and installer (source, private staging copy, and installed destination).
+/// The signature validator is injectable only inside the module's tests; the
+/// public initializer always uses Security.framework.
+final class UpdateBundleVerifier: @unchecked Sendable {
+    private let publisherTrust: UpdatePublisherTrust?
+    private let signatureValidator: any UpdateCodeSignatureValidating
+    private let hostOperatingSystemVersion: OperatingSystemVersion
+
+    convenience init(publisherTrust: UpdatePublisherTrust?) {
+        self.init(
+            publisherTrust: publisherTrust,
+            signatureValidator: SystemUpdateCodeSignatureValidator(),
+            hostOperatingSystemVersion: ProcessInfo.processInfo.operatingSystemVersion
+        )
+    }
+
+    init(
+        publisherTrust: UpdatePublisherTrust?,
+        signatureValidator: any UpdateCodeSignatureValidating,
+        hostOperatingSystemVersion: OperatingSystemVersion
+    ) {
+        self.publisherTrust = publisherTrust
+        self.signatureValidator = signatureValidator
+        self.hostOperatingSystemVersion = hostOperatingSystemVersion
+    }
+
+    func validate(
+        appURL: URL,
+        expectedVersion: UpdateVersion,
+        expectedArchitecture: HostArchitecture
+    ) throws {
+        let publisherTrust = try configuredPublisherTrust()
+        let appValues: URLResourceValues
+        do {
+            appValues = try appURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        } catch {
+            throw UpdateDownloadError.bundleReadFailed(appURL.path)
+        }
+        guard appValues.isDirectory == true, appValues.isSymbolicLink != true else {
+            throw UpdateDownloadError.bundleIdentityMismatch
+        }
+
+        // Validate the sealed bundle first. Metadata reads below therefore
+        // consume bytes covered by an authorized signature.
+        try signatureValidator.validateApplication(at: appURL, trust: publisherTrust)
+
+        let infoURL = appURL.appendingPathComponent("Contents/Info.plist")
+        let information: [String: Any]
+        do {
+            let data = try Data(contentsOf: infoURL, options: .mappedIfSafe)
+            guard let decoded = try PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+            ) as? [String: Any] else {
+                throw UpdateDownloadError.bundleIdentityMismatch
+            }
+            information = decoded
+        } catch let error as UpdateDownloadError {
+            throw error
+        } catch {
+            throw UpdateDownloadError.bundleReadFailed(infoURL.path)
+        }
+
+        guard information["CFBundlePackageType"] as? String == "APPL",
+              information["CFBundleIdentifier"] as? String == UpdatePublisherTrust.bundleIdentifier,
+              information["CFBundleExecutable"] as? String == UpdatePublisherTrust.bundleExecutable else {
+            throw UpdateDownloadError.bundleIdentityMismatch
+        }
+        guard information["ScanStudioRelease"] as? String == expectedVersion.raw else {
+            throw UpdateDownloadError.versionMismatch
+        }
+
+        let launcherURL = appURL.appendingPathComponent(
+            "Contents/MacOS/\(UpdatePublisherTrust.bundleExecutable)"
+        )
+        guard try Self.isRegularNonSymlink(launcherURL),
+              FileManager.default.isExecutableFile(atPath: launcherURL.path) else {
+            throw UpdateDownloadError.bundleIdentityMismatch
+        }
+
+        let architectureURL = appURL.appendingPathComponent(
+            "Contents/MacOS/\(UpdatePublisherTrust.architectureExecutable)"
+        )
+        guard try Self.isRegularNonSymlink(architectureURL) else {
+            throw UpdateDownloadError.bundleIdentityMismatch
+        }
+        do {
+            guard try MachOArchitectureInspector.architectures(at: architectureURL)
+                == [expectedArchitecture] else {
+                throw UpdateDownloadError.architectureMismatch
+            }
+        } catch let error as UpdateDownloadError {
+            throw error
+        } catch {
+            throw UpdateDownloadError.bundleReadFailed(architectureURL.path)
+        }
+
+        guard let minimumRaw = information["LSMinimumSystemVersion"] as? String,
+              let minimum = ParsedOperatingSystemVersion(minimumRaw),
+              let supportedFloor = ParsedOperatingSystemVersion("14.0"),
+              minimum >= supportedFloor,
+              minimum <= ParsedOperatingSystemVersion(hostOperatingSystemVersion) else {
+            throw UpdateDownloadError.operatingSystemUnsupported
+        }
+    }
+
+    func requireConfiguredPublisherTrust() throws {
+        _ = try configuredPublisherTrust()
+    }
+
+    private func configuredPublisherTrust() throws -> UpdatePublisherTrust {
+        guard let publisherTrust else {
+            throw UpdateDownloadError.publisherTrustNotConfigured
+        }
+        return publisherTrust
+    }
+
+    private static func isRegularNonSymlink(_ url: URL) throws -> Bool {
+        do {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            return values.isRegularFile == true && values.isSymbolicLink != true
+        } catch {
+            throw UpdateDownloadError.bundleReadFailed(url.path)
+        }
+    }
+}
+
+private struct ParsedOperatingSystemVersion: Comparable {
+    let major: Int
+    let minor: Int
+    let patch: Int
+
+    init?(_ raw: String) {
+        let parts = raw.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...3).contains(parts.count),
+              let major = Int(parts[0]), major >= 0 else {
+            return nil
+        }
+        let minor = parts.count > 1 ? Int(parts[1]) : 0
+        let patch = parts.count > 2 ? Int(parts[2]) : 0
+        guard let minor, let patch, minor >= 0, patch >= 0 else { return nil }
+        self.major = major
+        self.minor = minor
+        self.patch = patch
+    }
+
+    init(_ version: OperatingSystemVersion) {
+        major = version.majorVersion
+        minor = version.minorVersion
+        patch = version.patchVersion
+    }
+
+    static func < (lhs: ParsedOperatingSystemVersion, rhs: ParsedOperatingSystemVersion) -> Bool {
+        (lhs.major, lhs.minor, lhs.patch) < (rhs.major, rhs.minor, rhs.patch)
+    }
+}
+
+private enum MachOArchitectureInspector {
+    private static let mhMagic = UInt32(0xfeedface)
+    private static let mhMagic64 = UInt32(0xfeedfacf)
+    private static let fatMagic = UInt32(0xcafebabe)
+    private static let fatMagic64 = UInt32(0xcafebabf)
+    private static let cpuArm64 = UInt32(0x0100000c)
+    private static let cpuX8664 = UInt32(0x01000007)
+
+    static func architectures(at url: URL) throws -> Set<HostArchitecture> {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard data.count >= 8 else { throw UpdateDownloadError.architectureMismatch }
+
+        let bigMagic = try uint32(data, offset: 0, byteOrder: .big)
+        let littleMagic = try uint32(data, offset: 0, byteOrder: .little)
+        if littleMagic == mhMagic || littleMagic == mhMagic64 {
+            return try architectureSet([uint32(data, offset: 4, byteOrder: .little)])
+        }
+        if bigMagic == mhMagic || bigMagic == mhMagic64 {
+            return try architectureSet([uint32(data, offset: 4, byteOrder: .big)])
+        }
+        if bigMagic == fatMagic || bigMagic == fatMagic64 {
+            return try fatArchitectures(data, byteOrder: .big, is64Bit: bigMagic == fatMagic64)
+        }
+        if littleMagic == fatMagic || littleMagic == fatMagic64 {
+            return try fatArchitectures(data, byteOrder: .little, is64Bit: littleMagic == fatMagic64)
+        }
+        throw UpdateDownloadError.architectureMismatch
+    }
+
+    private static func fatArchitectures(
+        _ data: Data,
+        byteOrder: ByteOrder,
+        is64Bit: Bool
+    ) throws -> Set<HostArchitecture> {
+        let count = Int(try uint32(data, offset: 4, byteOrder: byteOrder))
+        guard count > 0, count <= 64 else { throw UpdateDownloadError.architectureMismatch }
+        let stride = is64Bit ? 32 : 20
+        guard data.count >= 8 + count * stride else {
+            throw UpdateDownloadError.architectureMismatch
+        }
+        var rawArchitectures: [UInt32] = []
+        rawArchitectures.reserveCapacity(count)
+        for index in 0..<count {
+            rawArchitectures.append(
+                try uint32(data, offset: 8 + index * stride, byteOrder: byteOrder)
+            )
+        }
+        return try architectureSet(rawArchitectures)
+    }
+
+    private static func architectureSet(_ rawValues: [UInt32]) throws -> Set<HostArchitecture> {
+        // Release artifacts are architecture-specific. A fat binary (including
+        // duplicate slices) is not the selected per-arch product.
+        guard rawValues.count == 1 else { throw UpdateDownloadError.architectureMismatch }
+        var result: Set<HostArchitecture> = []
+        for raw in rawValues {
+            switch raw {
+            case cpuArm64: result.insert(.arm64)
+            case cpuX8664: result.insert(.x86_64)
+            default: throw UpdateDownloadError.architectureMismatch
+            }
+        }
+        return result
+    }
+
+    private enum ByteOrder { case big, little }
+
+    private static func uint32(_ data: Data, offset: Int, byteOrder: ByteOrder) throws -> UInt32 {
+        guard offset >= 0, data.count >= offset + 4 else {
+            throw UpdateDownloadError.architectureMismatch
+        }
+        let bytes = data[offset..<(offset + 4)]
+        switch byteOrder {
+        case .big:
+            return bytes.reduce(0) { ($0 << 8) | UInt32($1) }
+        case .little:
+            return bytes.reversed().reduce(0) { ($0 << 8) | UInt32($1) }
+        }
+    }
+}
+
+struct UpdateCommandResult: Sendable {
+    let status: Int32
+    let output: Data
+}
+
+protocol UpdateCommandRunning: Sendable {
+    func run(_ executablePath: String, arguments: [String], timeout: TimeInterval) throws -> UpdateCommandResult
+}
+
+private enum UpdateCommandFailure: Error { case timedOut(Data) }
+
+private struct SystemUpdateCommandRunner: UpdateCommandRunning {
+    func run(_ executablePath: String, arguments: [String], timeout: TimeInterval) throws -> UpdateCommandResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        try process.run()
+
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            if finished.wait(timeout: .now() + 1) == .timedOut {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = finished.wait(timeout: .now() + 1)
+            }
+            let output = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+            throw UpdateCommandFailure.timedOut(output)
+        }
+        let output = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        process.waitUntilExit()
+        return UpdateCommandResult(status: process.terminationStatus, output: output)
+    }
+}
+
+protocol UpdateReadableFile: AnyObject, Sendable {
+    func read(upToCount count: Int) throws -> Data
+    func close() throws
+}
+
+protocol UpdateFileReading: Sendable {
+    func open(_ url: URL) throws -> any UpdateReadableFile
+}
+
+private final class SystemUpdateReadableFile: UpdateReadableFile, @unchecked Sendable {
+    private let handle: FileHandle
+
+    init(url: URL) throws { handle = try FileHandle(forReadingFrom: url) }
+    func read(upToCount count: Int) throws -> Data { try handle.read(upToCount: count) ?? Data() }
+    func close() throws { try handle.close() }
+}
+
+private struct SystemUpdateFileReader: UpdateFileReading {
+    func open(_ url: URL) throws -> any UpdateReadableFile {
+        try SystemUpdateReadableFile(url: url)
+    }
+}
+
 /// Downloads and cryptographically verifies a candidate into a mounted,
-/// signature-checked app bundle that the install core can consume. The three
-/// sanctioned `Process` uses (hdiutil attach/detach, codesign verify) are
-/// isolated behind tiny private helpers so they are auditable.
+/// signature-checked app bundle that the install core can consume. The only
+/// subprocesses are bounded `hdiutil` attach/detach and `spctl` notarization
+/// assessment; signature and designated-requirement trust are evaluated
+/// directly through Security.framework.
 public final class UpdateDownloader {
     private let session: any URLSessionProtocol
+    private let bundleVerifier: UpdateBundleVerifier
+    private let commandRunner: any UpdateCommandRunning
+    private let fileReader: any UpdateFileReading
 
-    public init(session: any URLSessionProtocol = URLSession.shared) {
+    public convenience init(
+        session: any URLSessionProtocol = URLSession.shared,
+        publisherTrust: UpdatePublisherTrust? = nil
+    ) {
+        self.init(
+            session: session,
+            bundleVerifier: UpdateBundleVerifier(publisherTrust: publisherTrust),
+            commandRunner: SystemUpdateCommandRunner(),
+            fileReader: SystemUpdateFileReader()
+        )
+    }
+
+    init(
+        session: any URLSessionProtocol,
+        bundleVerifier: UpdateBundleVerifier,
+        commandRunner: any UpdateCommandRunning,
+        fileReader: any UpdateFileReading
+    ) {
         self.session = session
+        self.bundleVerifier = bundleVerifier
+        self.commandRunner = commandRunner
+        self.fileReader = fileReader
     }
 
     // MARK: - Download + SHA-256
@@ -431,7 +1041,16 @@ public final class UpdateDownloader {
         } catch {
             throw UpdateDownloadError.downloadFailed
         }
-        let actual = Self.sha256(ofFileAt: destination)
+        let actual: String
+        do {
+            actual = try Self.sha256(ofFileAt: destination, using: fileReader)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw UpdateDownloadError.checksumReadFailed(
+                path: destination.path,
+                cause: String(describing: error)
+            )
+        }
         guard actual == candidate.sha256.lowercased() else {
             try? FileManager.default.removeItem(at: destination)
             throw UpdateDownloadError.checksumMismatch
@@ -441,65 +1060,73 @@ public final class UpdateDownloader {
 
     // MARK: - Mount + locate app
 
-    /// Attaches the DMG read-only (`hdiutil attach -nobrowse -readonly
-    /// -plist`), locates the single `.app` bundle at the mount root
-    /// (preferring case-insensitive `ScanStudio.app`, else any single
-    /// `.app`), and returns the mounted app's URL. A volume with no usable
-    /// `.app` is detached again and reported as `.notAnApp`.
-    public func mountAndLocateApp(_ dmgURL: URL) throws -> URL {
-        let result: (status: Int32, output: String)
+    /// Scoped mount API: attaches read-only, requires exactly one application
+    /// `ScanStudio.app`, validates publisher + identity + candidate version +
+    /// architecture + host OS, runs `body`, then always performs a bounded
+    /// detach. A failed normal detach is retried with `-force`; failure of both
+    /// is surfaced as `.detachFailed` rather than silently leaking the mount.
+    public func withVerifiedMountedApp<T>(
+        _ dmgURL: URL,
+        candidate: UpdateCandidate,
+        architecture: HostArchitecture,
+        _ body: (URL) throws -> T
+    ) throws -> T {
+        // Missing publisher configuration is known before any untrusted disk
+        // image is attached; fail here and avoid the mount attack surface.
+        try bundleVerifier.requireConfiguredPublisherTrust()
+        return try withMountedApp(dmgURL) { appURL in
+            try bundleVerifier.validate(
+                appURL: appURL,
+                expectedVersion: candidate.version,
+                expectedArchitecture: architecture
+            )
+            return try body(appURL)
+        }
+    }
+
+    func withMountedApp<T>(_ dmgURL: URL, _ body: (URL) throws -> T) throws -> T {
+        let result: UpdateCommandResult
         do {
-            result = try Self.launch("/usr/bin/hdiutil", arguments: [
-                "attach", "-nobrowse", "-readonly", "-plist", dmgURL.path,
-            ])
+            result = try commandRunner.run(
+                "/usr/bin/hdiutil",
+                arguments: ["attach", "-nobrowse", "-readonly", "-plist", dmgURL.path],
+                timeout: 30
+            )
+        } catch let UpdateCommandFailure.timedOut(output) {
+            if let descriptor = Self.mountDescriptor(from: output),
+               !detach(descriptor.detachTarget) {
+                throw UpdateDownloadError.detachFailed
+            }
+            throw UpdateDownloadError.mountFailed
         } catch {
             throw UpdateDownloadError.mountFailed
         }
-        guard result.status == 0 else { throw UpdateDownloadError.mountFailed }
-        guard let mountRoot = Self.mountPoint(from: result.output) else {
+
+        let descriptor = Self.mountDescriptor(from: result.output)
+        if result.status != 0 {
+            if let descriptor, !detach(descriptor.detachTarget) {
+                throw UpdateDownloadError.detachFailed
+            }
+            throw UpdateDownloadError.mountFailed
+        }
+        guard let descriptor, let mountRoot = descriptor.mountRoot else {
+            if let descriptor, !detach(descriptor.detachTarget) {
+                throw UpdateDownloadError.detachFailed
+            }
             throw UpdateDownloadError.mountFailed
         }
 
-        let apps = Self.appBundles(in: mountRoot)
-        let scanStudio = apps.filter { $0.deletingPathExtension().lastPathComponent.lowercased() == "scanstudio" }
-        var located: URL?
-        if scanStudio.count == 1 {
-            located = scanStudio.first
-        } else if apps.count == 1 {
-            located = apps.first
-        }
-        guard let located else {
-            try? tearDownMount(mountRoot)
-            throw UpdateDownloadError.notAnApp
-        }
-        return located
-    }
-
-    // MARK: - Code-signature verification
-
-    /// Verifies the mounted bundle with `codesign --verify --deep --strict`
-    /// (`/usr/bin/codesign` on macOS 14+). Any non-zero exit is
-    /// `.signatureInvalid` — no archive is produced from an unsigned or
-    /// unverifiable bundle.
-    public func verifyCodeSignature(at appURL: URL) throws {
-        let result: (status: Int32, output: String)
+        let operation: Result<T, Error>
         do {
-            result = try Self.launch("/usr/bin/codesign", arguments: [
-                "--verify", "--deep", "--strict", appURL.path,
-            ])
+            operation = .success(try body(Self.singleApp(in: mountRoot)))
         } catch {
-            throw UpdateDownloadError.signatureInvalid
+            operation = .failure(error)
         }
-        guard result.status == 0 else { throw UpdateDownloadError.signatureInvalid }
-    }
 
-    // MARK: - Mount teardown (internal for tests)
-
-    /// Detaches a mounted volume previously produced by `mountAndLocateApp`.
-    /// Best-effort; failures are ignored. Internal (not private) so the
-    /// offline tests can clean up after themselves.
-    func tearDownMount(_ mountURL: URL) {
-        _ = try? Self.launch("/usr/bin/hdiutil", arguments: ["detach", mountURL.path])
+        guard detach(descriptor.detachTarget) else {
+            throw UpdateDownloadError.detachFailed
+        }
+        return try operation.get()
     }
 
     // MARK: - Primitives
@@ -517,59 +1144,106 @@ public final class UpdateDownloader {
     /// Streams the file through CryptoKit's SHA-256 so arbitrarily large
     /// DMGs are hashed in bounded memory (macOS 14 target → CryptoKit is
     /// always available; no shelling out to `/usr/bin/shasum`).
-    private static func sha256(ofFileAt url: URL) -> String {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+    private static func sha256(ofFileAt url: URL, using reader: any UpdateFileReading) throws -> String {
+        let handle = try reader.open(url)
         defer { try? handle.close() }
         var hasher = SHA256()
-        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+        while true {
+            let chunk = try handle.read(upToCount: 1 << 20)
+            guard !chunk.isEmpty else { break }
             hasher.update(data: chunk)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Runs an external command and returns its exit status and combined
-    /// stdout/stderr. Introduced only for the sanctioned subprocess uses
-    /// (hdiutil attach/detach, codesign verify).
-    private static func launch(_ executablePath: String, arguments: [String]) throws -> (status: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executablePath)
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    private struct MountDescriptor {
+        let mountRoot: URL?
+        let detachTarget: String
     }
 
-    /// Extracts the first `mount-point` from `hdiutil attach -plist` output.
-    private static func mountPoint(from plistOutput: String) -> URL? {
-        guard let data = plistOutput.data(using: .utf8),
-              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+    /// Extracts both mount point and a device/path detach target. Keeping the
+    /// device entry means even a malformed attach response with no mount point
+    /// can still be cleaned up.
+    private static func mountDescriptor(from data: Data) -> MountDescriptor? {
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
               let dict = plist as? [String: Any],
               let entities = dict["system-entities"] as? [[String: Any]] else {
             return nil
         }
+        var firstDevice: String?
         for entity in entities {
+            if firstDevice == nil, let device = entity["dev-entry"] as? String {
+                firstDevice = device
+            }
             if let mountPath = entity["mount-point"] as? String {
-                return URL(fileURLWithPath: mountPath, isDirectory: true)
+                return MountDescriptor(
+                    mountRoot: URL(fileURLWithPath: mountPath, isDirectory: true),
+                    detachTarget: (entity["dev-entry"] as? String) ?? mountPath
+                )
             }
         }
-        return nil
+        guard let firstDevice else { return nil }
+        return MountDescriptor(mountRoot: nil, detachTarget: firstDevice)
     }
 
-    /// Direct `.app` subdirectories (case-insensitive extension) at `directory`.
-    private static func appBundles(in directory: URL) -> [URL] {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
+    /// Requires one and only one application anywhere in the mounted image,
+    /// named ScanStudio.app at the root.
+    /// A second app is an archive-identity failure even when one has the right
+    /// name; no preference/fallback selection is permitted.
+    private static func singleApp(in directory: URL) throws -> URL {
+        var enumerationFailure: String?
+        guard let enumerator = FileManager.default.enumerator(
             at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey]
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [],
+            errorHandler: { url, _ in
+                enumerationFailure = url.path
+                return false
+            }
         ) else {
-            return []
+            throw UpdateDownloadError.bundleReadFailed(directory.path)
         }
-        return contents.filter { url in
-            url.pathExtension.lowercased() == "app"
-                && (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        var apps: [URL] = []
+        while let url = enumerator.nextObject() as? URL {
+            let values: URLResourceValues
+            do {
+                values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            } catch {
+                throw UpdateDownloadError.bundleReadFailed(url.path)
+            }
+            if values.isSymbolicLink == true {
+                enumerator.skipDescendants()
+                continue
+            }
+            if url.pathExtension.lowercased() == "app", values.isDirectory == true {
+                apps.append(url)
+                enumerator.skipDescendants()
+            }
         }
+        if let enumerationFailure {
+            throw UpdateDownloadError.bundleReadFailed(enumerationFailure)
+        }
+        guard apps.count == 1,
+              apps[0].lastPathComponent == "ScanStudio.app",
+              apps[0].deletingLastPathComponent().standardizedFileURL
+                == directory.standardizedFileURL else {
+            throw UpdateDownloadError.notAnApp
+        }
+        return apps[0]
+    }
+
+    private func detach(_ target: String) -> Bool {
+        let normal = try? commandRunner.run(
+            "/usr/bin/hdiutil",
+            arguments: ["detach", target],
+            timeout: 10
+        )
+        if normal?.status == 0 { return true }
+        let forced = try? commandRunner.run(
+            "/usr/bin/hdiutil",
+            arguments: ["detach", "-force", target],
+            timeout: 10
+        )
+        return forced?.status == 0
     }
 }

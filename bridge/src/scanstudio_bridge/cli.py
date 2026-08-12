@@ -59,6 +59,12 @@ def main() -> None:
     base_dir = Path(
         os.environ.get("SCANSTUDIO_BRIDGE_BASE_DIR", str(safety.DEFAULT_BASE_DIR))
     )
+    process_ownership = safety.BridgeProcessOwnership(base_dir)
+    try:
+        process_ownership.acquire()
+    except protocol.BridgeError as err:
+        print(f"scanstudio-bridge: ownership refused: {err.message}", file=sys.stderr)
+        sys.exit(2)
     telemetry = safety.TelemetryLog(base_dir)
     # Plan 10-09 (provenance header): recorded at bridge startup, before the
     # stdin loop reads even the first request (bridge.hello has no
@@ -100,6 +106,7 @@ def main() -> None:
     def emit(event: str, payload: object) -> None:
         _queue_line(out_queue, {"event": event, "payload": protocol.to_wire(payload)})
 
+    shutdown_completed = False
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -134,17 +141,12 @@ def main() -> None:
             )
             continue
 
-        if request.get("method") == "bridge.shutdown":
-            _queue_line(out_queue, {"id": request.get("id"), "result": {}})
-            try:
-                bridge_service.dispatch(request, emit)
-            except Exception as exc:  # noqa: BLE001 -- shutdown must never abort the exit sequence
-                print(f"scanstudio-bridge: error during shutdown: {exc}", file=sys.stderr)
-            break
-
         try:
             result = bridge_service.dispatch(request, emit)
             _queue_line(out_queue, {"id": request.get("id"), "result": result})
+            if request.get("method") == "bridge.shutdown":
+                shutdown_completed = True
+                break
         except protocol.BridgeError as err:
             _queue_line(
                 out_queue,
@@ -174,10 +176,15 @@ def main() -> None:
                 },
             )
 
-    # stdin closed (EOF) or bridge.shutdown broke out of the loop above --
-    # either way, drain the writer and exit cleanly.
+    # On parent loss/EOF, remain the worker's owner until cooperative
+    # cleanup really finishes. A successful bridge.shutdown already proved
+    # the same condition before its acknowledgement was queued.
+    if not shutdown_completed:
+        bridge_service.wait_for_owned_work_before_exit()
+
     out_queue.put(None)
     writer_thread.join(timeout=_WRITER_JOIN_TIMEOUT_SECONDS)
+    process_ownership.close()
     sys.exit(0)
 
 

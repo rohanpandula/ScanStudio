@@ -117,7 +117,8 @@ private actor SequencedProjectFlowEngineStub: EngineClientProtocol {
                 available: true,
                 exiftoolPath: "/usr/bin/exiftool",
                 targets: ["/tmp/first-project/Preview_0002.jpg"],
-                arguments: ["-Title=First Project"]
+                arguments: ["-Title=First Project"],
+                fingerprint: "first-project-metadata-preview"
             )
         case "sim.loadMedia":
             value = ScannerStatus(
@@ -1400,7 +1401,6 @@ struct SessionEventPolicyTests {
         model.toggleFrameSelection(2)
         model.openFrameDetail(2)
         await model.analyzeFrameDefects(2)
-        await model.previewMetadataCommand(2)
         model.beginJob(id: "first-live-job", frames: [2])
         model.handle(event: EngineEvent(
             name: "scan.progress",
@@ -1426,6 +1426,10 @@ struct SessionEventPolicyTests {
                 #"{"event":"scan.completed","payload":{"jobId":"first-live-job","summary":{"completed":[2],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
             )
         ))
+        // A replacement receipt correctly revokes any older metadata target
+        // preview, so populate this audit surface only after the scan whose
+        // receipt is part of the setup.
+        await model.previewMetadataCommand(2)
         await model.scanSingleFrame(99)
 
         #expect(model.selectedFrameIndices == [2])

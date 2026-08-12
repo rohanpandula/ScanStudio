@@ -5,7 +5,9 @@
 //! `BridgeClient` is a pure transport primitive, deliberately wire-shape-
 //! agnostic beyond the envelope: it owns the bridge subprocess, speaks
 //! NDJSON request/response/event over its stdio, correlates responses to
-//! requests by `id`, and detects + recovers from a dead or stuck bridge.
+//! requests by `id`, and detects + recovers from a bridge which has provably
+//! exited. A still-live stuck bridge remains quarantined because it may retain
+//! ownership of an in-flight hardware operation.
 //! It does not know about `crate::domain` or `crate::protocol` at all —
 //! translating bridge wire shapes into engine domain types is Plan 09-03's
 //! job, one layer up.
@@ -46,6 +48,15 @@ const EVENT_STREAM_OWNERSHIP_RECHECK: Duration = Duration::from_millis(100);
 /// bridge process is therefore normal during preview/scan; only a dead
 /// bridge or this hard deadline ends the wait.
 const STREAM_SILENCE_DEADLINE: Duration = Duration::from_secs(600);
+/// Hard allocation bound for one bridge NDJSON record. Receipts contain only
+/// control data and paths; accepting an unbounded stdout line would let a
+/// malformed or compromised bridge exhaust engine memory before any evidence
+/// package size check could run.
+const MAX_BRIDGE_NDJSON_LINE_BYTES: usize = 1024 * 1024;
+/// Backpressure bound for parsed unsolicited bridge events. At most forty
+/// physical slots are supported, so this leaves ample room for progress plus
+/// terminal events while preventing an unbounded producer from filling RAM.
+const MAX_QUEUED_BRIDGE_EVENTS: usize = 128;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -126,6 +137,17 @@ fn spawn_process(
     for (key, value) in extra_env {
         command.env(key, value);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
     let mut child = command
         .spawn()
         .map_err(|err| BridgeCallError::Io(err.to_string()))?;
@@ -137,6 +159,51 @@ fn spawn_process(
     Ok((child, stdin, stdout))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedBridgeLine {
+    Eof,
+    Line(Vec<u8>),
+    Oversized,
+}
+
+fn read_bounded_bridge_line<R: BufRead>(
+    reader: &mut R,
+    maximum: usize,
+) -> std::io::Result<BoundedBridgeLine> {
+    let mut line = Vec::with_capacity(maximum.min(8 * 1024));
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if oversized {
+                Ok(BoundedBridgeLine::Oversized)
+            } else if line.is_empty() {
+                Ok(BoundedBridgeLine::Eof)
+            } else {
+                Ok(BoundedBridgeLine::Line(line))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if !oversized {
+            if consumed <= maximum.saturating_sub(line.len()) {
+                line.extend_from_slice(&available[..consumed]);
+            } else {
+                oversized = true;
+                line.clear();
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return if oversized {
+                Ok(BoundedBridgeLine::Oversized)
+            } else {
+                Ok(BoundedBridgeLine::Line(line))
+            };
+        }
+    }
+}
+
 /// Reads NDJSON lines from the bridge's stdout for as long as the process
 /// lives, dispatching each line either to its correlated `pending` waiter
 /// (by `id`) or to `events_tx` (if it carries an `event` key instead).
@@ -145,7 +212,7 @@ fn spawn_process(
 /// `generation`/`my_generation` guard against a subtle restart race: if
 /// this thread is superseded by a later `restart()` (a new reader thread
 /// spawned for a freshly-respawned process) before it observes EOF on the
-/// now-killed old process, it must not clobber the new generation's
+/// exited old process, it must not clobber the new generation's
 /// `alive = true` nor drain the new generation's legitimately in-flight
 /// `pending` entries. Only the reader thread whose generation still
 /// matches the client's current generation is allowed to declare the
@@ -154,25 +221,34 @@ fn spawn_process(
 fn spawn_reader_thread(
     stdout: ChildStdout,
     pending: Arc<Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>>,
-    events_tx: mpsc::Sender<serde_json::Value>,
+    events_tx: mpsc::SyncSender<BridgeEvent>,
     alive: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     my_generation: u64,
 ) {
     thread::spawn(move || {
-        for line_result in BufReader::new(stdout).lines() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(err) => {
-                    eprintln!("scanstudio-engine: bridge stdout read error: {err}");
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let line = match read_bounded_bridge_line(&mut reader, MAX_BRIDGE_NDJSON_LINE_BYTES) {
+                Ok(BoundedBridgeLine::Eof) => break,
+                Ok(BoundedBridgeLine::Oversized) => {
+                    eprintln!(
+                        "scanstudio-engine: bridge stdout record exceeded the {} byte limit; skipped",
+                        MAX_BRIDGE_NDJSON_LINE_BYTES
+                    );
                     continue;
                 }
+                Ok(BoundedBridgeLine::Line(line)) => line,
+                Err(err) => {
+                    eprintln!("scanstudio-engine: bridge stdout read error: {err}");
+                    break;
+                }
             };
-            if line.trim().is_empty() {
+            if line.iter().all(|byte| byte.is_ascii_whitespace()) {
                 continue;
             }
 
-            let value: serde_json::Value = match serde_json::from_str(&line) {
+            let value: serde_json::Value = match serde_json::from_slice(&line) {
                 Ok(v) => v,
                 Err(err) => {
                     eprintln!("scanstudio-engine: malformed bridge response line, skipping: {err}");
@@ -186,7 +262,10 @@ fn spawn_reader_thread(
                     let _ = sender.send(value);
                 }
             } else if value.get("event").is_some() {
-                let _ = events_tx.send(value);
+                let _ = events_tx.send(BridgeEvent {
+                    generation: my_generation,
+                    value,
+                });
             }
         }
 
@@ -196,10 +275,12 @@ fn spawn_reader_thread(
             // Wake an asynchronous preview/scan consumer immediately. The
             // sender stored on BridgeClient keeps the channel connected, so
             // EOF would otherwise be visible only after its next poll timeout.
-            let _ = events_tx.send(serde_json::json!({
-                "__bridge_client_process_exited__": true,
-                "__bridge_client_generation__": my_generation
-            }));
+            let _ = events_tx.send(BridgeEvent {
+                generation: my_generation,
+                value: serde_json::json!({
+                    "__bridge_client_process_exited__": true
+                }),
+            });
             let mut pending_guard = pending.lock().unwrap();
             let stale_ids: Vec<u64> = pending_guard.keys().copied().collect();
             for id in stale_ids {
@@ -211,6 +292,15 @@ fn spawn_reader_thread(
             }
         }
     });
+}
+
+/// An unsolicited bridge event bound to the exact subprocess generation
+/// whose stdout produced it. Keeping this identity outside the untrusted
+/// JSON prevents an old reader thread or queued pre-restart event from
+/// masquerading as output from the replacement bridge.
+struct BridgeEvent {
+    generation: u64,
+    value: serde_json::Value,
 }
 
 fn hello_request_params() -> serde_json::Value {
@@ -226,12 +316,12 @@ fn hello_request_params() -> serde_json::Value {
 // ---------------------------------------------------------------------
 
 /// Subprocess-supervision primitive: spawns a configured bridge command,
-/// speaks NDJSON request/response/event over its stdio, and transparently
-/// respawns + re-handshakes on a detected hang or crash.
+/// speaks NDJSON request/response/event over its stdio, and respawns +
+/// re-handshakes only after the previous process has provably exited.
 pub struct BridgeClient {
     cmd: String,
     /// Extra environment variables set on the spawned bridge process and
-    /// re-applied on every internal `restart()` respawn, so a restarted
+    /// re-applied on every proven-exit `restart()` respawn, so a restarted
     /// bridge always sees the same environment as the original. Scoped to
     /// the child via `Command::env` — this process's own environment is
     /// never mutated.
@@ -241,8 +331,8 @@ pub struct BridgeClient {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     pending: Arc<Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>>,
-    events_tx: mpsc::Sender<serde_json::Value>,
-    events_rx: Mutex<mpsc::Receiver<serde_json::Value>>,
+    events_tx: mpsc::SyncSender<BridgeEvent>,
+    events_rx: Mutex<mpsc::Receiver<BridgeEvent>>,
     /// Caches the parsed `bridge.hello` result from the most recent
     /// successful handshake (initial spawn or a later restart) so callers
     /// one layer up never need to issue a redundant second `bridge.hello`
@@ -281,7 +371,7 @@ impl BridgeClient {
 
     /// Like [`spawn`](Self::spawn), but additionally sets `extra_env` on
     /// the spawned bridge process — scoped to that child (and re-applied
-    /// to every child respawned by an internal restart), never mutating
+    /// to every child respawned after a proven predecessor exit), never mutating
     /// this process's own environment. Tests use this to configure
     /// `mock_bridge` failure injection; `std::env::set_var` would be
     /// process-global and leak into unrelated bridges spawned
@@ -299,7 +389,7 @@ impl BridgeClient {
 
         let pending: Arc<Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let (events_tx, events_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::sync_channel(MAX_QUEUED_BRIDGE_EVENTS);
         let alive = Arc::new(AtomicBool::new(true));
         let generation = Arc::new(AtomicU64::new(1));
 
@@ -457,21 +547,33 @@ impl BridgeClient {
         }
     }
 
-    /// Best-effort kill + reap of whatever process currently sits in
-    /// `self.child`. Always waits after killing to avoid leaving a zombie
-    /// process behind.
-    fn kill_and_reap_child(&self) {
+    /// Reaps the bridge only after the OS proves it has already exited.
+    /// A live but unresponsive bridge may still own an in-flight USB call;
+    /// it is quarantined instead of killed, and no replacement is spawned.
+    fn reap_child_if_exited(&self) -> bool {
+        let mut child = self.child.lock().unwrap();
+        for _ in 0..10 {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// Used only for a freshly spawned replacement that has not completed
+    /// `bridge.hello` and therefore cannot have opened the scanner.
+    fn terminate_uninitialized_child(&self) {
         let mut child = self.child.lock().unwrap();
         let _ = child.kill();
         let _ = child.wait();
     }
 
-    /// Kills the current subprocess, respawns it, and re-runs the
-    /// `bridge.hello` handshake — exactly one attempt per detected
-    /// failure. Phase 9's scope does not require unbounded reconnect
-    /// retries: a permanently unavailable bridge surfaces
-    /// `ProcessExited`/`Timeout` from every subsequent `call` until the
-    /// process is reconfigured and the engine restarted.
+    /// Reaps a bridge that has provably exited, respawns it, and re-runs
+    /// `bridge.hello`. A still-live hung process is never killed: it and any
+    /// capture descendant retain the process-ownership fence, and later
+    /// calls remain failed closed until that ownership ends.
     fn restart(&self) {
         if self
             .restarting
@@ -486,7 +588,10 @@ impl BridgeClient {
         }
         let _guard = RestartGuard(&self.restarting);
 
-        self.kill_and_reap_child();
+        self.alive.store(false, Ordering::Release);
+        if !self.reap_child_if_exited() {
+            return;
+        }
 
         let new_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
 
@@ -518,7 +623,7 @@ impl BridgeClient {
                 }
                 _ => {
                     self.alive.store(false, Ordering::Release);
-                    self.kill_and_reap_child();
+                    self.terminate_uninitialized_child();
                 }
             },
             Err(_) => {
@@ -527,7 +632,7 @@ impl BridgeClient {
                 // guard above turned into a no-op. Give up after this one
                 // attempt.
                 self.alive.store(false, Ordering::Release);
-                self.kill_and_reap_child();
+                self.terminate_uninitialized_child();
             }
         }
     }
@@ -540,18 +645,28 @@ impl BridgeClient {
     /// stuck" any other way.
     pub fn recv_event(&self, timeout: Duration) -> Result<serde_json::Value, BridgeCallError> {
         let rx = self.events_rx.lock().unwrap();
-        let value = rx.recv_timeout(timeout).map_err(|err| match err {
-            mpsc::RecvTimeoutError::Timeout => BridgeCallError::Timeout,
-            mpsc::RecvTimeoutError::Disconnected => BridgeCallError::ProcessExited,
-        })?;
-        if value
-            .get("__bridge_client_process_exited__")
-            .and_then(|flag| flag.as_bool())
-            == Some(true)
-        {
-            Err(BridgeCallError::ProcessExited)
-        } else {
-            Ok(value)
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(BridgeCallError::Timeout);
+            }
+            let event = rx.recv_timeout(remaining).map_err(|err| match err {
+                mpsc::RecvTimeoutError::Timeout => BridgeCallError::Timeout,
+                mpsc::RecvTimeoutError::Disconnected => BridgeCallError::ProcessExited,
+            })?;
+            if event.generation != self.current_generation() {
+                continue;
+            }
+            if event
+                .value
+                .get("__bridge_client_process_exited__")
+                .and_then(|flag| flag.as_bool())
+                == Some(true)
+            {
+                return Err(BridgeCallError::ProcessExited);
+            }
+            return Ok(event.value);
         }
     }
 
@@ -586,13 +701,12 @@ impl BridgeClient {
 
 impl Drop for BridgeClient {
     fn drop(&mut self) {
-        // Best-effort: never let a dropped BridgeClient leave an orphaned
-        // subprocess running, regardless of whether it answers shutdown.
+        // The bridge acknowledges shutdown only after every owned capture
+        // worker has exited. If it cannot acknowledge in this short window,
+        // leave it alive with its inherited ownership fence rather than
+        // killing a potentially in-flight USB transaction.
         let _ = self.call_with_timeout("bridge.shutdown", serde_json::json!({}), SHUTDOWN_TIMEOUT);
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let _ = self.reap_child_if_exited();
     }
 }
 
@@ -667,10 +781,16 @@ pub struct RealLs5000 {
     /// Production leaves this at zero.
     preview_reader_detach_delay: Duration,
     /// Builder-only regression seam: after a preview terminal has been
-    /// received and ownership checked, force a bridge-generation/session loss
-    /// immediately before terminal state finalization. Production leaves this
-    /// disabled and no environment variable can enable it.
-    preview_terminal_generation_loss_test_hook: bool,
+    /// received and ownership checked, cleanly retire the bridge's logical
+    /// device session and invalidate the engine epoch immediately before
+    /// terminal state finalization. This deliberately does not restart or
+    /// replace the subprocess. Production leaves it disabled and no
+    /// environment variable can enable it.
+    preview_terminal_session_loss_test_hook: bool,
+    /// Pure in-process scan ownership. Metadata Apply consults this instead
+    /// of issuing `device.status`, which could itself time out and quarantine
+    /// the bridge session while the scanner is mid-USB transaction.
+    active_scan_job_id: Arc<Mutex<Option<String>>>,
     device_id: String,
     model: String,
     /// False when the bridge discovered a recognized-but-unsupported Nikon
@@ -764,6 +884,30 @@ struct PreviewApprovalState {
     poisoned: Option<PoisonedPreviewStream>,
 }
 
+struct ActiveRealScanGuard {
+    active: Arc<Mutex<Option<String>>>,
+    job_id: String,
+    clear_on_drop: bool,
+}
+
+impl ActiveRealScanGuard {
+    fn retain_for_recovery(mut self) {
+        self.clear_on_drop = false;
+    }
+}
+
+impl Drop for ActiveRealScanGuard {
+    fn drop(&mut self) {
+        if !self.clear_on_drop {
+            return;
+        }
+        let mut active = self.active.lock().unwrap();
+        if active.as_deref() == Some(self.job_id.as_str()) {
+            *active = None;
+        }
+    }
+}
+
 impl SessionCallError {
     fn into_engine_error(self) -> EngineError {
         match self {
@@ -783,6 +927,16 @@ impl SessionCallError {
 struct PrivateCaptureWorkingDirectory {
     root: std::path::PathBuf,
     owner_token: String,
+    authority: Arc<PrivateCaptureWorkspaceAuthority>,
+}
+
+#[derive(Debug)]
+struct PrivateCaptureWorkspaceAuthority {
+    parent_path: std::path::PathBuf,
+    root_name: std::ffi::OsString,
+    parent: std::fs::File,
+    root: std::fs::File,
+    marker: std::fs::File,
 }
 
 #[derive(Debug, Clone)]
@@ -801,57 +955,970 @@ struct RealCapturePlan {
 }
 
 const PRIVATE_CAPTURE_MARKER: &str = ".scanstudio-capture-work-owner";
-static NEXT_PRIVATE_CAPTURE_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+#[allow(dead_code)] // Production uses the no-op hook; tests swap the namespace at this boundary.
+#[derive(Debug, Clone)]
+enum PrivateWorkspaceCreateHookEvent {
+    DirectoryOpened { path: std::path::PathBuf },
+}
+
+fn private_capture_workspace_token() -> Result<String, EngineError> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("generate private capture workspace token: {error}"),
+        )
+    })?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(unix)]
+mod private_workspace_sys {
+    use std::ffi::{CString, OsStr};
+    use std::io::{self, Write as _};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    fn component(name: &OsStr) -> io::Result<CString> {
+        if name.is_empty() || name.as_bytes().contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace operation requires one non-empty path component",
+            ));
+        }
+        CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace component contains NUL",
+            )
+        })
+    }
+
+    pub(super) fn open_directory_nofollow(path: &std::path::Path) -> io::Result<std::fs::File> {
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "workspace path contains NUL")
+        })?;
+        let descriptor = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn open_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<std::fs::File> {
+        let name = component(name)?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn same_directory(left: &std::fs::File, right: &std::fs::File) -> io::Result<bool> {
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.is_dir()
+            && right.is_dir()
+            && left.dev() == right.dev()
+            && left.ino() == right.ino())
+    }
+
+    pub(super) fn create_directory_exclusive(
+        parent: &std::fs::File,
+        _parent_path: &std::path::Path,
+        name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        let encoded = component(name)?;
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), encoded.as_ptr(), 0o700) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        match open_directory_at(parent, name) {
+            Ok(directory) => Ok(directory),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "HOLD: created private workspace could not be opened authoritatively and was preserved: {error}"
+                ),
+            )),
+        }
+    }
+
+    pub(super) fn create_marker(
+        root: &std::fs::File,
+        _root_path: &std::path::Path,
+        marker_name: &str,
+        contents: &[u8],
+    ) -> io::Result<std::fs::File> {
+        let marker = component(OsStr::new(marker_name))?;
+        let descriptor = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                marker.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(file)
+    }
+
+    pub(super) fn open_regular_child_nofollow(
+        root: &std::fs::File,
+        _root_path: &std::path::Path,
+        name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        let name = component(name)?;
+        let descriptor = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        regular_file_state(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn create_regular_child_exclusive(
+        root: &std::fs::File,
+        _root_path: &std::path::Path,
+        name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        let name = component(name)?;
+        let descriptor = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        regular_file_state(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn regular_file_state(file: &std::fs::File) -> io::Result<(u64, u64, u64, u64)> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace source is not a uniquely linked regular file",
+            ));
+        }
+        Ok((
+            metadata.dev(),
+            metadata.ino(),
+            metadata.nlink(),
+            metadata.len(),
+        ))
+    }
+
+    pub(super) fn verify_directory_authority(
+        parent_path: &std::path::Path,
+        parent: &std::fs::File,
+        root_name: &OsStr,
+        root: &std::fs::File,
+    ) -> io::Result<()> {
+        let reopened_parent = open_directory_nofollow(parent_path)?;
+        if !same_directory(parent, &reopened_parent)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "temporary root identity changed",
+            ));
+        }
+        let reopened_root = open_directory_at(parent, root_name)?;
+        if !same_directory(root, &reopened_root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace identity changed",
+            ));
+        }
+        let mode = root.metadata()?.mode() & 0o777;
+        if mode != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("private workspace permissions changed to {mode:o}"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn retire_exact_regular_file(_file: &std::fs::File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix has no identity-bound regular-file deletion primitive",
+        ))
+    }
+
+    pub(super) fn remove_exact_empty_directory(
+        _parent_path: &std::path::Path,
+        _parent: &std::fs::File,
+        _root_name: &OsStr,
+        _root: std::fs::File,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix has no identity-bound directory deletion primitive",
+        ))
+    }
+
+    pub(super) fn cleanup_failed_creation(
+        _parent: &std::fs::File,
+        _root_name: &OsStr,
+        _root: &std::fs::File,
+        _root_path: &std::path::Path,
+        _marker_name: &str,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "HOLD: failed private workspace creation is preserved because Unix has no identity-bound unlink",
+        ))
+    }
+}
+
+#[cfg(windows)]
+mod private_workspace_sys {
+    use std::ffi::OsStr;
+    use std::io::{self, Write as _};
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+    const FILE_TRAVERSE: u32 = 0x0000_0020;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn SetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information_class: u32,
+            information: *mut std::ffi::c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_file: u8,
+    }
+
+    fn safe_directory(metadata: &std::fs::Metadata) -> bool {
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+
+    fn safe_file(metadata: &std::fs::Metadata) -> bool {
+        metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+
+    fn child_path(root_path: &std::path::Path, name: &OsStr) -> io::Result<std::path::PathBuf> {
+        let mut components = std::path::Path::new(name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace operation requires one normal path component",
+            ));
+        }
+        Ok(root_path.join(name))
+    }
+
+    fn identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+        let metadata = file.metadata()?;
+        if !safe_directory(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace directory is a reparse point or non-directory",
+            ));
+        }
+        crate::exiftool::held_file_identity(file, &metadata)
+            .map(|(volume, file_id, _)| (volume, file_id))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "workspace volume/file identity unavailable",
+                )
+            })
+    }
+
+    pub(super) fn open_directory_nofollow(path: &std::path::Path) -> io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | GENERIC_WRITE)
+            // Omit delete sharing so a junction/symlink replacement cannot
+            // occur while the bridge may use this workspace path.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        if safe_directory(&file.metadata()?) {
+            Ok(file)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace path is a reparse point or non-directory",
+            ))
+        }
+    }
+
+    pub(super) fn create_directory_exclusive(
+        parent: &std::fs::File,
+        _parent_path: &std::path::Path,
+        name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        crate::exiftool::metadata_publish_sys::create_private_directory(parent, name)
+    }
+
+    pub(super) fn create_marker(
+        _root: &std::fs::File,
+        root_path: &std::path::Path,
+        marker_name: &str,
+        contents: &[u8],
+    ) -> io::Result<std::fs::File> {
+        let marker_path = root_path.join(marker_name);
+        let mut file = std::fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+            .open(&marker_path)?;
+        if !safe_file(&file.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace marker is a reparse point or non-file",
+            ));
+        }
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(file)
+    }
+
+    pub(super) fn open_regular_child_nofollow(
+        _root: &std::fs::File,
+        root_path: &std::path::Path,
+        name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        let path = child_path(root_path, name)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            // Deny write and delete sharing while the held source is copied.
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        regular_file_state(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn retire_exact_regular_file(file: &std::fs::File) -> io::Result<()> {
+        let mut disposition = FileDispositionInfo { delete_file: 1 };
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FILE_DISPOSITION_INFO_CLASS,
+                (&mut disposition as *mut FileDispositionInfo).cast(),
+                std::mem::size_of::<FileDispositionInfo>() as u32,
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn remove_exact_empty_directory(
+        parent_path: &std::path::Path,
+        _parent: &std::fs::File,
+        root_name: &OsStr,
+        root: std::fs::File,
+    ) -> io::Result<()> {
+        let expected = identity(&root)?;
+        if !crate::exiftool::metadata_publish_sys::read_directory_names(&root)?.is_empty() {
+            return Err(io::Error::other(
+                "HOLD: private workspace gained content before exact deletion",
+            ));
+        }
+        drop(root);
+        let root_path = child_path(parent_path, root_name)?;
+        let deletable = std::fs::OpenOptions::new()
+            .access_mode(
+                FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | GENERIC_WRITE
+                    | DELETE_ACCESS,
+            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root_path)?;
+        if !safe_directory(&deletable.metadata()?) || identity(&deletable)? != expected {
+            return Err(io::Error::other(
+                "HOLD: private workspace identity changed before exact deletion",
+            ));
+        }
+        if !crate::exiftool::metadata_publish_sys::read_directory_names(&deletable)?.is_empty() {
+            return Err(io::Error::other(
+                "HOLD: private workspace gained content before exact deletion",
+            ));
+        }
+        let mut disposition = FileDispositionInfo { delete_file: 1 };
+        let result = unsafe {
+            SetFileInformationByHandle(
+                deletable.as_raw_handle().cast(),
+                FILE_DISPOSITION_INFO_CLASS,
+                (&mut disposition as *mut FileDispositionInfo).cast(),
+                std::mem::size_of::<FileDispositionInfo>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        drop(deletable);
+        match std::fs::symlink_metadata(root_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "HOLD: a replacement appeared at the retired private workspace name",
+            )),
+        }
+    }
+
+    pub(super) fn create_regular_child_exclusive(
+        _root: &std::fs::File,
+        root_path: &std::path::Path,
+        name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        let path = child_path(root_path, name)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+            .open(path)?;
+        regular_file_state(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn regular_file_state(file: &std::fs::File) -> io::Result<(u64, u64, u64, u64)> {
+        let metadata = file.metadata()?;
+        if !safe_file(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace source is a reparse point or non-file",
+            ));
+        }
+        let (volume, file_id, links) = crate::exiftool::held_file_identity(file, &metadata)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "private workspace source identity unavailable",
+                )
+            })?;
+        if links != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace source is not uniquely linked",
+            ));
+        }
+        Ok((volume, file_id, links, metadata.len()))
+    }
+
+    pub(super) fn verify_directory_authority(
+        parent_path: &std::path::Path,
+        parent: &std::fs::File,
+        root_name: &OsStr,
+        root: &std::fs::File,
+    ) -> io::Result<()> {
+        let reopened_parent = open_directory_nofollow(parent_path)?;
+        if identity(parent)? != identity(&reopened_parent)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "temporary root identity changed",
+            ));
+        }
+        let reopened_root = open_directory_nofollow(&parent_path.join(root_name))?;
+        if identity(root)? != identity(&reopened_root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn cleanup_failed_creation(
+        parent: &std::fs::File,
+        root_name: &OsStr,
+        root: &std::fs::File,
+        root_path: &std::path::Path,
+        marker_name: &str,
+    ) -> io::Result<()> {
+        let _ = (parent, root_name, root, root_path, marker_name);
+        Err(io::Error::other(
+            "HOLD: failed private workspace creation is preserved because its marker handle was not committed to the authority",
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod private_workspace_sys {
+    use std::ffi::OsStr;
+    use std::io;
+
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this platform has no no-follow private workspace primitives",
+        )
+    }
+
+    pub(super) fn open_directory_nofollow(_path: &std::path::Path) -> io::Result<std::fs::File> {
+        Err(unsupported())
+    }
+
+    pub(super) fn create_directory_exclusive(
+        _parent: &std::fs::File,
+        _parent_path: &std::path::Path,
+        _name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        Err(unsupported())
+    }
+
+    pub(super) fn create_marker(
+        _root: &std::fs::File,
+        _root_path: &std::path::Path,
+        _marker_name: &str,
+        _contents: &[u8],
+    ) -> io::Result<std::fs::File> {
+        Err(unsupported())
+    }
+
+    pub(super) fn open_regular_child_nofollow(
+        _root: &std::fs::File,
+        _root_path: &std::path::Path,
+        _name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        Err(unsupported())
+    }
+
+    pub(super) fn create_regular_child_exclusive(
+        _root: &std::fs::File,
+        _root_path: &std::path::Path,
+        _name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        Err(unsupported())
+    }
+
+    pub(super) fn regular_file_state(_file: &std::fs::File) -> io::Result<(u64, u64, u64, u64)> {
+        Err(unsupported())
+    }
+
+    pub(super) fn retire_exact_regular_file(_file: &std::fs::File) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(super) fn remove_exact_empty_directory(
+        _parent_path: &std::path::Path,
+        _parent: &std::fs::File,
+        _root_name: &OsStr,
+        _root: std::fs::File,
+    ) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(super) fn verify_directory_authority(
+        _parent_path: &std::path::Path,
+        _parent: &std::fs::File,
+        _root_name: &OsStr,
+        _root: &std::fs::File,
+    ) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(super) fn cleanup_failed_creation(
+        _parent: &std::fs::File,
+        _root_name: &OsStr,
+        _root: &std::fs::File,
+        _root_path: &std::path::Path,
+        _marker_name: &str,
+    ) -> io::Result<()> {
+        Err(unsupported())
+    }
+}
 
 impl PrivateCaptureWorkingDirectory {
     fn create() -> Result<Self, EngineError> {
-        let parent = std::env::temp_dir().join("scanstudio-engine-capture-work");
-        std::fs::create_dir_all(&parent).map_err(|error| {
+        Self::create_in_with_hook(&std::env::temp_dir(), |_| Ok(()))
+    }
+
+    fn create_in_with_hook<F>(
+        temporary_root: &std::path::Path,
+        mut hook: F,
+    ) -> Result<Self, EngineError>
+    where
+        F: FnMut(&PrivateWorkspaceCreateHookEvent) -> Result<(), EngineError>,
+    {
+        // Resolve any OS-managed temp-root alias once, then retain that exact
+        // normal directory. There is deliberately no predictable shared
+        // `scanstudio-engine-capture-work` component for an attacker to
+        // precreate as a symlink.
+        let parent_path = std::fs::canonicalize(temporary_root).map_err(|error| {
             EngineError::new(
                 ErrorCode::Internal,
-                format!("create private capture workspace parent {}: {error}", parent.display()),
+                format!(
+                    "resolve private capture workspace root {}: {error}",
+                    temporary_root.display()
+                ),
             )
         })?;
+        let parent =
+            private_workspace_sys::open_directory_nofollow(&parent_path).map_err(|error| {
+                EngineError::new(
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "open private capture workspace root {} without following links: {error}",
+                        parent_path.display()
+                    ),
+                )
+                .with_recoverable(true)
+            })?;
         for _ in 0..128 {
-            let ordinal = NEXT_PRIVATE_CAPTURE_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let owner_token = format!("{:x}-{:x}-{:x}", std::process::id(), nanos, ordinal);
-            let root = parent.join(format!("capture-{owner_token}"));
-            match std::fs::create_dir(&root) {
-                Ok(()) => {
-                    let marker = root.join(PRIVATE_CAPTURE_MARKER);
-                    let mut file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&marker)
-                        .map_err(|error| EngineError::new(
-                            ErrorCode::Internal,
-                            format!("create private capture workspace marker {}: {error}", marker.display()),
-                        ))?;
-                    file.write_all(owner_token.as_bytes()).map_err(|error| EngineError::new(
-                        ErrorCode::Internal,
-                        format!("write private capture workspace marker {}: {error}", marker.display()),
-                    ))?;
-                    file.sync_all().map_err(|error| EngineError::new(
-                        ErrorCode::Internal,
-                        format!("sync private capture workspace marker {}: {error}", marker.display()),
-                    ))?;
-                    return Ok(Self { root, owner_token });
-                }
+            let owner_token = private_capture_workspace_token()?;
+            let root_name =
+                std::ffi::OsString::from(format!("scanstudio-engine-capture-{owner_token}"));
+            let root_path = parent_path.join(&root_name);
+            let root = match private_workspace_sys::create_directory_exclusive(
+                &parent,
+                &parent_path,
+                &root_name,
+            ) {
+                Ok(root) => root,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(EngineError::new(
-                    ErrorCode::Internal,
-                    format!("create private capture workspace {}: {error}", root.display()),
-                )),
-            }
+                Err(error) => {
+                    return Err(EngineError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "securely create private capture workspace {}: {error}",
+                            root_path.display()
+                        ),
+                    ))
+                }
+            };
+            let attempt = (|| {
+                hook(&PrivateWorkspaceCreateHookEvent::DirectoryOpened {
+                    path: root_path.clone(),
+                })?;
+                let marker = private_workspace_sys::create_marker(
+                    &root,
+                    &root_path,
+                    PRIVATE_CAPTURE_MARKER,
+                    owner_token.as_bytes(),
+                )
+                .map_err(|error| {
+                    EngineError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "securely create private capture workspace marker in {}: {error}",
+                            root_path.display()
+                        ),
+                    )
+                })?;
+                root.sync_all().map_err(|error| {
+                    EngineError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "sync private capture workspace {}: {error}",
+                            root_path.display()
+                        ),
+                    )
+                })?;
+                parent.sync_all().map_err(|error| {
+                    EngineError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "sync private capture workspace root {}: {error}",
+                            parent_path.display()
+                        ),
+                    )
+                })?;
+                private_workspace_sys::verify_directory_authority(
+                    &parent_path,
+                    &parent,
+                    &root_name,
+                    &root,
+                )
+                .map_err(|error| {
+                    EngineError::new(
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "private capture workspace authority changed during creation at {}: {error}",
+                            root_path.display()
+                        ),
+                    )
+                    .with_recoverable(true)
+                })?;
+                Ok::<std::fs::File, EngineError>(marker)
+            })();
+            let marker = match attempt {
+                Ok(marker) => marker,
+                Err(mut error) => {
+                    // A failed initialization has not transferred its exact
+                    // marker handle into the authority. Preserve the whole
+                    // workspace unless the platform can prove cleanup; never
+                    // drop the handles and then delete by pathname.
+                    if let Err(cleanup) = private_workspace_sys::cleanup_failed_creation(
+                        &parent,
+                        &root_name,
+                        &root,
+                        &root_path,
+                        PRIVATE_CAPTURE_MARKER,
+                    ) {
+                        error.message = format!(
+                            "{}; HOLD: failed private workspace cleanup was not proven at {}: {cleanup}",
+                            error.message,
+                            root_path.display()
+                        );
+                        error = error.with_recoverable(false);
+                    }
+                    return Err(error);
+                }
+            };
+            return Ok(Self {
+                root: root_path,
+                owner_token,
+                authority: Arc::new(PrivateCaptureWorkspaceAuthority {
+                    parent_path,
+                    root_name,
+                    parent,
+                    root,
+                    marker,
+                }),
+            });
         }
         Err(EngineError::new(
             ErrorCode::Internal,
             "could not reserve a collision-isolated private capture workspace",
         ))
+    }
+
+    fn verify_namespace(&self) -> Result<(), EngineError> {
+        private_workspace_sys::verify_directory_authority(
+            &self.authority.parent_path,
+            &self.authority.parent,
+            &self.authority.root_name,
+            &self.authority.root,
+        )
+        .map_err(|error| {
+            EngineError::new(
+                ErrorCode::InvalidParams,
+                format!(
+                    "private capture workspace authority changed at {}; refusing bridge access: {error}",
+                    self.root.display()
+                ),
+            )
+            .with_recoverable(true)
+        })
+    }
+
+    /// Retires a workspace only while `scan.start` is synchronously known not
+    /// to have been accepted. The exact held directory must contain only its
+    /// exact ownership marker; any additional entry or namespace ambiguity is
+    /// recovery-held instead of recursively removed.
+    fn rollback_unused(self) -> Result<(), EngineError> {
+        use std::io::{Read as _, Seek as _};
+
+        self.verify_namespace()?;
+        let entries =
+            crate::exiftool::metadata_publish_sys::read_directory_names(&self.authority.root)
+                .map_err(|error| {
+                    EngineError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "inspect unused private capture workspace {}: {error}",
+                            self.root.display()
+                        ),
+                    )
+                })?;
+        if entries.len() != 1 || entries[0] != std::ffi::OsStr::new(PRIVATE_CAPTURE_MARKER) {
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                self.recovery_message(
+                    "pre-motion cleanup found content beyond the ownership marker",
+                ),
+            ));
+        }
+
+        let mut marker_reader = self.authority.marker.try_clone().map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "retain exact private capture ownership marker in {} for rollback: {error}",
+                    self.root.display()
+                ),
+            )
+        })?;
+        marker_reader
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|error| {
+                EngineError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "rewind private capture ownership marker in {} for rollback: {error}",
+                        self.root.display()
+                    ),
+                )
+            })?;
+        let mut marker_contents = Vec::new();
+        (&mut marker_reader)
+            .take(65)
+            .read_to_end(&mut marker_contents)
+            .map_err(|error| {
+                EngineError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "read private capture ownership marker in {} for rollback: {error}",
+                        self.root.display()
+                    ),
+                )
+            })?;
+        if marker_contents != self.owner_token.as_bytes() {
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                self.recovery_message("pre-motion cleanup found a changed ownership marker"),
+            ));
+        }
+        drop(marker_reader);
+        self.verify_namespace()?;
+
+        let root_path = self.root;
+        let authority = Arc::try_unwrap(self.authority).map_err(|_| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "{}; live workspace consumers prevented exact pre-motion cleanup",
+                    root_path.display()
+                ),
+            )
+        })?;
+        let PrivateCaptureWorkspaceAuthority {
+            parent_path,
+            root_name,
+            parent,
+            root,
+            marker,
+        } = authority;
+
+        private_workspace_sys::retire_exact_regular_file(&marker).map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "HOLD: cannot retire the exact ownership marker from unused private capture workspace {}; preserving it: {error}",
+                    root_path.display()
+                ),
+            )
+        })?;
+        drop(marker);
+        crate::exiftool::metadata_publish_sys::sync_directory(&root).map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "sync unused private capture workspace {} after marker rollback: {error}",
+                    root_path.display()
+                ),
+            )
+        })?;
+        let remaining = crate::exiftool::metadata_publish_sys::read_directory_names(&root)
+            .map_err(|error| {
+                EngineError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "reinspect unused private capture workspace {} before removal: {error}",
+                        root_path.display()
+                    ),
+                )
+            })?;
+        if !remaining.is_empty() {
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "temporary hardware captures are recovery-held at {}: content appeared during pre-motion cleanup",
+                    root_path.display()
+                ),
+            ));
+        }
+        private_workspace_sys::verify_directory_authority(&parent_path, &parent, &root_name, &root)
+            .map_err(|error| {
+                EngineError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "private capture workspace authority changed during rollback at {}: {error}",
+                        root_path.display()
+                    ),
+                )
+            })?;
+        private_workspace_sys::remove_exact_empty_directory(
+            &parent_path,
+            &parent,
+            &root_name,
+            root,
+        )
+        .map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "HOLD: cannot retire the exact empty unused private capture workspace {}; preserving it: {error}",
+                    root_path.display()
+                ),
+            )
+        })?;
+        crate::exiftool::metadata_publish_sys::sync_directory(&parent).map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "sync private capture workspace parent after removing {}: {error}",
+                    root_path.display()
+                ),
+            )
+        })?;
+        Ok(())
     }
 
     fn recovery_message(&self, reason: &str) -> String {
@@ -882,6 +1949,515 @@ impl PrivateCaptureWorkingDirectory {
     }
 }
 
+/// A bridge receipt is untrusted until the exact regular-file identity it
+/// names has been copied through a held descriptor. Two full, bounded reads
+/// of the held source (hash, then copy+hash) make a same-inode rewrite visible;
+/// a private snapshot then gives the renderer a source the bridge no longer
+/// controls. The snapshot descriptor remains held until a final hash and
+/// identity check after all publication work completes.
+const MAX_STABLE_BRIDGE_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StableBridgeSourceFingerprint {
+    volume_id: u64,
+    file_id: u64,
+    links: u64,
+    byte_length: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+struct StableBridgeSource {
+    path: std::path::PathBuf,
+    name: std::ffi::OsString,
+    file: std::fs::File,
+    fingerprint: StableBridgeSourceFingerprint,
+    role: &'static str,
+}
+
+#[allow(dead_code)] // Production uses the no-op hook; deterministic tests mutate at this boundary.
+#[derive(Debug, Clone)]
+enum StableBridgeSourceHookEvent {
+    BeforeSnapshotCopy { source: std::path::PathBuf },
+}
+
+fn stable_bridge_source_error(role: &'static str, detail: impl std::fmt::Display) -> EngineError {
+    EngineError::new(
+        ErrorCode::InvalidParams,
+        format!("bridge {role} source could not be proven stable: {detail}"),
+    )
+    .with_recoverable(true)
+}
+
+fn hash_exact_held_bridge_file(
+    file: &mut std::fs::File,
+    expected_length: u64,
+    role: &'static str,
+) -> Result<[u8; 32], EngineError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::{Read as _, Seek as _};
+
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| stable_bridge_source_error(role, format!("rewind failed: {error}")))?;
+    let mut digest = Sha256::new();
+    let mut remaining = expected_length;
+    let mut buffer = [0_u8; 1024 * 1024];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded bridge read size fits usize");
+        let read = file
+            .read(&mut buffer[..wanted])
+            .map_err(|error| stable_bridge_source_error(role, format!("read failed: {error}")))?;
+        if read == 0 {
+            return Err(stable_bridge_source_error(
+                role,
+                "file became shorter while its held content was hashed",
+            ));
+        }
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|error| stable_bridge_source_error(role, format!("tail read failed: {error}")))?
+        != 0
+    {
+        return Err(stable_bridge_source_error(
+            role,
+            "file became longer while its held content was hashed",
+        ));
+    }
+    Ok(digest.finalize().into())
+}
+
+fn fingerprint_held_bridge_file(
+    file: &mut std::fs::File,
+    role: &'static str,
+) -> Result<StableBridgeSourceFingerprint, EngineError> {
+    let before = private_workspace_sys::regular_file_state(file).map_err(|error| {
+        stable_bridge_source_error(role, format!("inspect held identity: {error}"))
+    })?;
+    if before.3 > MAX_STABLE_BRIDGE_SOURCE_BYTES {
+        return Err(stable_bridge_source_error(
+            role,
+            format!(
+                "{} bytes exceeds the {} byte verification bound",
+                before.3, MAX_STABLE_BRIDGE_SOURCE_BYTES
+            ),
+        ));
+    }
+    let sha256 = hash_exact_held_bridge_file(file, before.3, role)?;
+    let after = private_workspace_sys::regular_file_state(file).map_err(|error| {
+        stable_bridge_source_error(role, format!("reinspect held identity: {error}"))
+    })?;
+    if after != before {
+        return Err(stable_bridge_source_error(
+            role,
+            "identity or length changed while the held content was hashed",
+        ));
+    }
+    Ok(StableBridgeSourceFingerprint {
+        volume_id: before.0,
+        file_id: before.1,
+        links: before.2,
+        byte_length: before.3,
+        sha256,
+    })
+}
+
+fn copy_exact_held_bridge_file(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+    expected_length: u64,
+    role: &'static str,
+) -> Result<[u8; 32], EngineError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    source
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| stable_bridge_source_error(role, format!("rewind failed: {error}")))?;
+    destination
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| stable_bridge_source_error(role, format!("rewind snapshot: {error}")))?;
+    let mut digest = Sha256::new();
+    let mut remaining = expected_length;
+    let mut buffer = [0_u8; 1024 * 1024];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded bridge copy size fits usize");
+        let read = source.read(&mut buffer[..wanted]).map_err(|error| {
+            stable_bridge_source_error(role, format!("copy read failed: {error}"))
+        })?;
+        if read == 0 {
+            return Err(stable_bridge_source_error(
+                role,
+                "file became shorter while its held content was copied",
+            ));
+        }
+        destination.write_all(&buffer[..read]).map_err(|error| {
+            stable_bridge_source_error(role, format!("snapshot write failed: {error}"))
+        })?;
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if source.read(&mut extra).map_err(|error| {
+        stable_bridge_source_error(role, format!("copy tail read failed: {error}"))
+    })? != 0
+    {
+        return Err(stable_bridge_source_error(
+            role,
+            "file became longer while its held content was copied",
+        ));
+    }
+    destination.flush().map_err(|error| {
+        stable_bridge_source_error(role, format!("snapshot flush failed: {error}"))
+    })?;
+    destination.sync_all().map_err(|error| {
+        stable_bridge_source_error(role, format!("snapshot sync failed: {error}"))
+    })?;
+    Ok(digest.finalize().into())
+}
+
+impl StableBridgeSource {
+    fn capture(
+        working: &PrivateCaptureWorkingDirectory,
+        source_path: &std::path::Path,
+        role: &'static str,
+    ) -> Result<Self, EngineError> {
+        Self::capture_with_hook(working, source_path, role, |_| Ok(()))
+    }
+
+    fn capture_with_hook<F>(
+        working: &PrivateCaptureWorkingDirectory,
+        source_path: &std::path::Path,
+        role: &'static str,
+        mut hook: F,
+    ) -> Result<Self, EngineError>
+    where
+        F: FnMut(&StableBridgeSourceHookEvent) -> Result<(), EngineError>,
+    {
+        working.verify_namespace()?;
+        if source_path.parent() != Some(working.root.as_path()) {
+            return Err(stable_bridge_source_error(
+                role,
+                format!(
+                    "receipt path is not a direct child of {}: {}",
+                    working.root.display(),
+                    source_path.display()
+                ),
+            ));
+        }
+        let source_name = source_path.file_name().ok_or_else(|| {
+            stable_bridge_source_error(role, "receipt path has no normal file name")
+        })?;
+        if source_name == PRIVATE_CAPTURE_MARKER {
+            return Err(stable_bridge_source_error(
+                role,
+                "receipt path identifies the workspace ownership marker",
+            ));
+        }
+        let mut source = private_workspace_sys::open_regular_child_nofollow(
+            &working.authority.root,
+            &working.root,
+            source_name,
+        )
+        .map_err(|error| {
+            stable_bridge_source_error(
+                role,
+                format!("open receipt identity without following links: {error}"),
+            )
+        })?;
+        let source_before = fingerprint_held_bridge_file(&mut source, role)?;
+
+        let (snapshot_name, mut snapshot) = loop {
+            let token = private_capture_workspace_token()?;
+            let name = std::ffi::OsString::from(format!(".scanstudio-stable-source-{token}"));
+            match private_workspace_sys::create_regular_child_exclusive(
+                &working.authority.root,
+                &working.root,
+                &name,
+            ) {
+                Ok(file) => break (name, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(stable_bridge_source_error(
+                        role,
+                        format!("reserve private stable snapshot: {error}"),
+                    ))
+                }
+            }
+        };
+
+        hook(&StableBridgeSourceHookEvent::BeforeSnapshotCopy {
+            source: source_path.to_path_buf(),
+        })?;
+        let copied_sha256 = copy_exact_held_bridge_file(
+            &mut source,
+            &mut snapshot,
+            source_before.byte_length,
+            role,
+        )?;
+        let source_after = private_workspace_sys::regular_file_state(&source).map_err(|error| {
+            stable_bridge_source_error(role, format!("reinspect copied source: {error}"))
+        })?;
+        let expected_source_state = (
+            source_before.volume_id,
+            source_before.file_id,
+            source_before.links,
+            source_before.byte_length,
+        );
+        if source_after != expected_source_state || copied_sha256 != source_before.sha256 {
+            return Err(stable_bridge_source_error(
+                role,
+                "held identity or SHA-256 changed between verification and snapshot copy",
+            ));
+        }
+
+        let linked_source = private_workspace_sys::open_regular_child_nofollow(
+            &working.authority.root,
+            &working.root,
+            source_name,
+        )
+        .map_err(|error| {
+            stable_bridge_source_error(role, format!("reopen receipt name after copy: {error}"))
+        })?;
+        if private_workspace_sys::regular_file_state(&linked_source).map_err(|error| {
+            stable_bridge_source_error(role, format!("inspect reopened receipt name: {error}"))
+        })? != expected_source_state
+        {
+            return Err(stable_bridge_source_error(
+                role,
+                "receipt name no longer identifies the held source after snapshot copy",
+            ));
+        }
+
+        let snapshot_state =
+            private_workspace_sys::regular_file_state(&snapshot).map_err(|error| {
+                stable_bridge_source_error(role, format!("inspect stable snapshot: {error}"))
+            })?;
+        if snapshot_state.2 != 1 || snapshot_state.3 != source_before.byte_length {
+            return Err(stable_bridge_source_error(
+                role,
+                "stable snapshot identity or length does not match the copied source",
+            ));
+        }
+        let snapshot_path = working.root.join(&snapshot_name);
+        // Close the write-capable creation handle before retaining the source.
+        // On Windows this lets the read-only no-write-share handle below both
+        // prove the same identity and prevent any later writer from opening it.
+        drop(snapshot);
+        let snapshot = private_workspace_sys::open_regular_child_nofollow(
+            &working.authority.root,
+            &working.root,
+            &snapshot_name,
+        )
+        .map_err(|error| {
+            stable_bridge_source_error(role, format!("reopen stable snapshot: {error}"))
+        })?;
+        if private_workspace_sys::regular_file_state(&snapshot).map_err(|error| {
+            stable_bridge_source_error(role, format!("inspect reopened snapshot: {error}"))
+        })? != snapshot_state
+        {
+            return Err(stable_bridge_source_error(
+                role,
+                "stable snapshot name does not identify the held snapshot",
+            ));
+        }
+        working.verify_namespace()?;
+        Ok(Self {
+            path: snapshot_path,
+            name: snapshot_name,
+            file: snapshot,
+            fingerprint: StableBridgeSourceFingerprint {
+                volume_id: snapshot_state.0,
+                file_id: snapshot_state.1,
+                links: snapshot_state.2,
+                byte_length: snapshot_state.3,
+                sha256: copied_sha256,
+            },
+            role,
+        })
+    }
+
+    fn verify_unchanged(
+        &mut self,
+        working: &PrivateCaptureWorkingDirectory,
+    ) -> Result<(), EngineError> {
+        working.verify_namespace()?;
+        let actual = fingerprint_held_bridge_file(&mut self.file, self.role)?;
+        if actual != self.fingerprint {
+            return Err(stable_bridge_source_error(
+                self.role,
+                "private snapshot content or identity changed during publication",
+            ));
+        }
+        let linked = private_workspace_sys::open_regular_child_nofollow(
+            &working.authority.root,
+            &working.root,
+            &self.name,
+        )
+        .map_err(|error| {
+            stable_bridge_source_error(
+                self.role,
+                format!("reopen private snapshot after publication: {error}"),
+            )
+        })?;
+        let linked_state = private_workspace_sys::regular_file_state(&linked).map_err(|error| {
+            stable_bridge_source_error(
+                self.role,
+                format!("inspect private snapshot after publication: {error}"),
+            )
+        })?;
+        if linked_state
+            != (
+                self.fingerprint.volume_id,
+                self.fingerprint.file_id,
+                self.fingerprint.links,
+                self.fingerprint.byte_length,
+            )
+        {
+            return Err(stable_bridge_source_error(
+                self.role,
+                "private snapshot name no longer identifies the held publication source",
+            ));
+        }
+        working.verify_namespace()
+    }
+}
+
+#[derive(Debug, Default)]
+struct StableBridgeInputs {
+    rgb: Option<StableBridgeSource>,
+    ir: Option<StableBridgeSource>,
+    meter: Option<StableBridgeSource>,
+    raw: Option<StableBridgeSource>,
+    raw_ir: Option<StableBridgeSource>,
+}
+
+impl StableBridgeInputs {
+    fn capture(
+        working: &PrivateCaptureWorkingDirectory,
+        receipt: &BridgeScanReceipt,
+        output: &OutputRecipe,
+    ) -> Result<Self, EngineError> {
+        let rgb = (output.archive.enabled || output.positive.enabled || output.preview.enabled)
+            .then(|| {
+                StableBridgeSource::capture(working, std::path::Path::new(&receipt.rgb_path), "RGB")
+            })
+            .transpose()?;
+        let ir = if output.archive.enabled {
+            receipt
+                .ir_path
+                .as_deref()
+                .map(|path| {
+                    StableBridgeSource::capture(working, std::path::Path::new(path), "infrared")
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let meter = if output.archive.enabled {
+            receipt
+                .meter_rgbi_path
+                .as_deref()
+                .map(|path| {
+                    StableBridgeSource::capture(working, std::path::Path::new(path), "meter RGBI")
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let raw = if output.raw_export.enabled {
+            receipt
+                .raw_export_path
+                .as_deref()
+                .map(|path| {
+                    StableBridgeSource::capture(working, std::path::Path::new(path), "raw negative")
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let raw_ir = if output.raw_export.enabled {
+            receipt
+                .raw_export_ir_path
+                .as_deref()
+                .map(|path| {
+                    StableBridgeSource::capture(working, std::path::Path::new(path), "raw infrared")
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(Self {
+            rgb,
+            ir,
+            meter,
+            raw,
+            raw_ir,
+        })
+    }
+
+    fn rgb_path_or<'a>(&'a self, original: &'a std::path::Path) -> &'a std::path::Path {
+        self.rgb
+            .as_ref()
+            .map(|source| source.path.as_path())
+            .unwrap_or(original)
+    }
+
+    fn ir_path(&self) -> Option<&std::path::Path> {
+        self.ir.as_ref().map(|source| source.path.as_path())
+    }
+
+    fn meter_path(&self) -> Option<&std::path::Path> {
+        self.meter.as_ref().map(|source| source.path.as_path())
+    }
+
+    fn raw_path(&self) -> Option<&std::path::Path> {
+        self.raw.as_ref().map(|source| source.path.as_path())
+    }
+
+    fn raw_ir_path(&self) -> Option<&std::path::Path> {
+        self.raw_ir.as_ref().map(|source| source.path.as_path())
+    }
+
+    fn paths(&self) -> Vec<std::path::PathBuf> {
+        [
+            self.rgb.as_ref(),
+            self.ir.as_ref(),
+            self.meter.as_ref(),
+            self.raw.as_ref(),
+            self.raw_ir.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|source| source.path.clone())
+        .collect()
+    }
+
+    fn verify_unchanged(
+        &mut self,
+        working: &PrivateCaptureWorkingDirectory,
+    ) -> Result<(), EngineError> {
+        for source in [
+            self.rgb.as_mut(),
+            self.ir.as_mut(),
+            self.meter.as_mut(),
+            self.raw.as_mut(),
+            self.raw_ir.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            source.verify_unchanged(working)?;
+        }
+        Ok(())
+    }
+}
+
 impl RealLs5000 {
     /// Spawns `bridge_cmd`, completes the `bridge.hello` handshake (via
     /// `BridgeClient::spawn`), and resolves the one device `device.list`
@@ -896,7 +2472,7 @@ impl RealLs5000 {
 
     /// Like [`new`](Self::new), but additionally sets `bridge_env` on the
     /// spawned bridge subprocess — scoped to that child (and re-applied to
-    /// every child respawned by an internal restart) via
+    /// every child respawned after a proven predecessor exit) via
     /// [`BridgeClient::spawn_with_env`], never mutating this process's own
     /// environment. Tests use this to configure `mock_bridge` failure
     /// injection; `std::env::set_var` would be process-global and leak
@@ -947,9 +2523,10 @@ impl RealLs5000 {
                 )
             })
             .collect();
-        let bridge_device = devices_result.devices.into_iter().next().ok_or_else(|| {
-            EngineError::new(ErrorCode::Internal, "bridge reported zero devices")
-        })?;
+        let bridge_device =
+            devices_result.devices.into_iter().next().ok_or_else(|| {
+                EngineError::new(ErrorCode::Internal, "bridge reported zero devices")
+            })?;
 
         let supported_multisample_passes =
             derive_supported_multisample_passes(&bridge_device.capabilities);
@@ -965,7 +2542,8 @@ impl RealLs5000 {
             preview_approval_state: Mutex::new(PreviewApprovalState::default()),
             preview_silence_deadline: STREAM_SILENCE_DEADLINE,
             preview_reader_detach_delay: Duration::ZERO,
-            preview_terminal_generation_loss_test_hook: false,
+            preview_terminal_session_loss_test_hook: false,
+            active_scan_job_id: Arc::new(Mutex::new(None)),
             device_id: bridge_device.device_id,
             model: bridge_device.model,
             supported: bridge_device.supported,
@@ -1006,12 +2584,24 @@ impl RealLs5000 {
         self
     }
 
-    /// Deterministically exercises the terminal/invalidation interleaving.
+    /// Deterministically exercises the terminal/session-invalidation
+    /// interleaving without pretending that a live subprocess has exited.
     /// This is a builder-only test seam; production construction cannot enable
     /// it through process or bridge environment.
-    pub fn with_preview_terminal_generation_loss_test_hook(mut self) -> Self {
-        self.preview_terminal_generation_loss_test_hook = true;
+    pub fn with_preview_terminal_session_loss_test_hook(mut self) -> Self {
+        self.preview_terminal_session_loss_test_hook = true;
         self
+    }
+
+    /// The regression seam must leave bridge-side and engine-side logical
+    /// session state consistent so an explicit reconnect can establish a new
+    /// session on the same healthy subprocess. `device.close` is safe here:
+    /// the preview terminal has already crossed the wire, so the preview no
+    /// longer owns an in-flight transport operation. This helper is reachable
+    /// only through the builder-only hook above.
+    fn inject_preview_terminal_session_loss_for_test(&self) {
+        let _ = self.bridge.call("device.close", serde_json::json!({}));
+        self.invalidate_current_session();
     }
 
     /// Device discovery info, independent of connection state — mirrors
@@ -1026,6 +2616,13 @@ impl RealLs5000 {
             connection: "USB (bridge)".to_string(),
             supported: self.supported,
         }
+    }
+
+    /// Pure in-process scan ownership snapshot. Unlike `status()`, this does
+    /// not touch the bridge or hardware and is therefore safe to consult from
+    /// metadata-write preflight while a real scan may be active.
+    pub fn active_job_id_snapshot(&self) -> Option<String> {
+        self.active_scan_job_id.lock().unwrap().clone()
     }
 
     pub(crate) fn session_is_connected(&self) -> bool {
@@ -1226,12 +2823,7 @@ impl RealLs5000 {
     /// Only the worker itself may call this after it has stopped receiving
     /// bridge events; request-side invalidation must retain the reader gate
     /// so a successor cannot consume a predecessor's untagged terminal.
-    fn release_preview_event_reader(
-        &self,
-        token: u64,
-        session_epoch: u64,
-        bridge_generation: u64,
-    ) {
+    fn release_preview_event_reader(&self, token: u64, session_epoch: u64, bridge_generation: u64) {
         let mut state = self.preview_approval_state.lock().unwrap();
         if state.active.as_ref().is_some_and(|active| {
             active.token == token
@@ -1318,8 +2910,7 @@ impl RealLs5000 {
     ) -> Result<(), EngineError> {
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.as_ref().is_some_and(|active| {
-            active.session_epoch == session_epoch
-                && active.bridge_generation == bridge_generation
+            active.session_epoch == session_epoch && active.bridge_generation == bridge_generation
         }) || state.poisoned.as_ref().is_some_and(|poisoned| {
             poisoned.session_epoch == session_epoch
                 && poisoned.bridge_generation == bridge_generation
@@ -1339,8 +2930,7 @@ impl RealLs5000 {
     ) -> Result<(), EngineError> {
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.as_ref().is_some_and(|active| {
-            active.session_epoch == session_epoch
-                && active.bridge_generation == bridge_generation
+            active.session_epoch == session_epoch && active.bridge_generation == bridge_generation
         }) {
             return Err(EngineError::new(
                 ErrorCode::ScannerBusy,
@@ -1392,8 +2982,7 @@ impl RealLs5000 {
         // the epoch. Keep it held across the identity proof and active ->
         // completed/retired transition so no request can interleave between
         // them. A bridge-generation loss is still detected by the proof.
-        let session_is_current =
-            self.session_identity_is_current(session_epoch, bridge_generation);
+        let session_is_current = self.session_identity_is_current(session_epoch, bridge_generation);
         state.active = None;
         state.completed = None;
         if session_is_current {
@@ -1422,10 +3011,12 @@ impl RealLs5000 {
     ) {
         if self.active_session_identity() == Ok((session_epoch, bridge_generation)) {
             let mut state = self.preview_approval_state.lock().unwrap();
-            if state.active.is_none() && state.completed.as_ref().is_some_and(|binding| {
-                binding.session_epoch == session_epoch
-                    && binding.bridge_generation == bridge_generation
-            }) {
+            if state.active.is_none()
+                && state.completed.as_ref().is_some_and(|binding| {
+                    binding.session_epoch == session_epoch
+                        && binding.bridge_generation == bridge_generation
+                })
+            {
                 state.completed = None;
             }
         }
@@ -1560,12 +3151,7 @@ impl RealLs5000 {
         if expected_epoch == 0
             || self
                 .active_session_epoch
-                .compare_exchange(
-                    expected_epoch,
-                    0,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(expected_epoch, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
             return false;
@@ -1607,10 +3193,7 @@ impl RealLs5000 {
             )
         })?;
         if !status.preview_established {
-            self.clear_completed_preview_if_session_is_current(
-                session_epoch,
-                bridge_generation,
-            );
+            self.clear_completed_preview_if_session_is_current(session_epoch, bridge_generation);
         }
         Ok(map_status(&status, self.detected_holder()))
     }
@@ -1687,12 +3270,7 @@ impl RealLs5000 {
 
     /// Optional delay exists only for the deterministic integration seam; the
     /// release itself must be the final action of a lost worker.
-    fn detach_lost_preview_reader(
-        &self,
-        token: u64,
-        session_epoch: u64,
-        bridge_generation: u64,
-    ) {
+    fn detach_lost_preview_reader(&self, token: u64, session_epoch: u64, bridge_generation: u64) {
         if !self.preview_reader_detach_delay.is_zero() {
             thread::sleep(self.preview_reader_detach_delay);
         }
@@ -1713,11 +3291,7 @@ impl RealLs5000 {
     /// scanner-addressable `slot`. This is intentionally a single
     /// session-scoped request: it never starts a preview, moves film, starts
     /// capture, or follows up with `device.status`.
-    pub fn roll_approve(
-        &self,
-        frame_index: u32,
-        operation_id: &str,
-    ) -> Result<(), EngineError> {
+    pub fn roll_approve(&self, frame_index: u32, operation_id: &str) -> Result<(), EngineError> {
         if operation_id.trim().is_empty() {
             return Err(EngineError::new(
                 ErrorCode::InvalidParams,
@@ -1725,7 +3299,12 @@ impl RealLs5000 {
             ));
         }
         let (session_epoch, bridge_generation) = self.active_session_identity()?;
-        let binding = self.preview_approval_state.lock().unwrap().completed.clone();
+        let binding = self
+            .preview_approval_state
+            .lock()
+            .unwrap()
+            .completed
+            .clone();
         if !binding.as_ref().is_some_and(|binding| {
             binding.operation_id == operation_id
                 && binding.session_epoch == session_epoch
@@ -1757,15 +3336,12 @@ impl RealLs5000 {
         // existed (see BridgeRollApproveParams's own field comment).
         let params = BridgeRollApproveParams {
             slot: frame_index,
-            fingerprint: binding.as_ref().and_then(|binding| binding.fingerprint.clone()),
+            fingerprint: binding
+                .as_ref()
+                .and_then(|binding| binding.fingerprint.clone()),
         };
         let value = serde_json::to_value(params).expect("BridgeRollApproveParams serializes");
-        self.call_session_scoped(
-            session_epoch,
-            bridge_generation,
-            "roll.approve",
-            value,
-        )?;
+        self.call_session_scoped(session_epoch, bridge_generation, "roll.approve", value)?;
         Ok(())
     }
 
@@ -2124,8 +3700,7 @@ impl ScannerBackend for RealLs5000 {
             let mut received_thumbnails = HashMap::new();
             let silence_deadline = Instant::now() + backend_for_thread.preview_silence_deadline;
             loop {
-                if !backend_for_thread
-                    .session_identity_is_current(session_epoch, bridge_generation)
+                if !backend_for_thread.session_identity_is_current(session_epoch, bridge_generation)
                 {
                     backend_for_thread.close_lost_preview_reader(
                         preview_token,
@@ -2137,10 +3712,9 @@ impl ScannerBackend for RealLs5000 {
                     );
                     return;
                 }
-                let poll_timeout = HEALTH_TIMEOUT.min(
-                    silence_deadline.saturating_duration_since(Instant::now()),
-                )
-                .min(EVENT_STREAM_OWNERSHIP_RECHECK);
+                let poll_timeout = HEALTH_TIMEOUT
+                    .min(silence_deadline.saturating_duration_since(Instant::now()))
+                    .min(EVENT_STREAM_OWNERSHIP_RECHECK);
                 match backend_for_thread.bridge.recv_event(poll_timeout) {
                     Ok(value) => {
                         // The event receiver spans bridge subprocess
@@ -2170,10 +3744,8 @@ impl ScannerBackend for RealLs5000 {
                                 // sides' mocks agreed with their own reader.
                                 // Decode the thumbnail itself as the single
                                 // source of truth and count what we drop.
-                                let decoded = value
-                                    .pointer("/payload/thumbnail")
-                                    .cloned()
-                                    .and_then(|t| {
+                                let decoded =
+                                    value.pointer("/payload/thumbnail").cloned().and_then(|t| {
                                         serde_json::from_value::<BridgeThumbnail>(t).ok()
                                     });
                                 let Some(bridge_thumbnail) = decoded else {
@@ -2209,11 +3781,9 @@ impl ScannerBackend for RealLs5000 {
                                 received_count += 1;
                             }
                             "roll.previewComplete" => {
-                                if backend_for_thread
-                                    .preview_terminal_generation_loss_test_hook
-                                {
-                                    backend_for_thread.bridge.restart();
-                                    backend_for_thread.invalidate_current_session();
+                                if backend_for_thread.preview_terminal_session_loss_test_hook {
+                                    backend_for_thread
+                                        .inject_preview_terminal_session_loss_for_test();
                                 }
                                 let approval_operation_id = if dropped_count == 0 {
                                     operation_id.as_deref()
@@ -2430,12 +4000,10 @@ impl ScannerBackend for RealLs5000 {
                                     // Do not even classify a received value
                                     // until its process generation is still
                                     // the one this discard-only reader owns.
-                                    if !backend_for_thread
-                                        .session_identity_is_current(
-                                            session_epoch,
-                                            bridge_generation,
-                                        )
-                                    {
+                                    if !backend_for_thread.session_identity_is_current(
+                                        session_epoch,
+                                        bridge_generation,
+                                    ) {
                                         backend_for_thread.invalidate_async_session(
                                             session_epoch,
                                             &event_tx,
@@ -2453,10 +4021,10 @@ impl ScannerBackend for RealLs5000 {
                                         Some("roll.previewComplete" | "roll.previewError")
                                     ) {
                                         if backend_for_thread
-                                            .preview_terminal_generation_loss_test_hook
+                                            .preview_terminal_session_loss_test_hook
                                         {
-                                            backend_for_thread.bridge.restart();
-                                            backend_for_thread.invalidate_current_session();
+                                            backend_for_thread
+                                                .inject_preview_terminal_session_loss_for_test();
                                         }
                                         if !backend_for_thread.finalize_poisoned_preview_terminal(
                                             preview_token,
@@ -2515,7 +4083,7 @@ impl ScannerBackend for RealLs5000 {
         Ok(frames.unwrap_or_default())
     }
 
-    fn scan_start(
+    fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
         recipe: CaptureRecipe,
@@ -2531,160 +4099,47 @@ impl ScannerBackend for RealLs5000 {
         // hardware scans. Accepted here only so this backend satisfies the
         // shared ScannerBackend trait; unused.
         project_directory: Option<std::path::PathBuf>,
+        output_authorities: Option<crate::render::JobOutputAuthorities>,
         event_tx: mpsc::Sender<String>,
     ) -> Result<String, EngineError> {
-        let (session_epoch, bridge_generation) = backend.active_session_identity()?;
-        backend.ensure_preview_stream_allows_scan(session_epoch, bridge_generation)?;
-        // Adversarial review S3 (2026-08-08): when this exact session has a
-        // completed-preview binding (BRIDGE.md's own "slots must be a
-        // subset of the last preview's detected slots" is bridge-enforced,
-        // but the engine must not rely on the bridge alone to catch a
-        // "hidden slot" request), every requested frame must be one the
-        // binding's own completed preview actually returned -- otherwise a
-        // caller could request a frame the operator was never shown at all.
-        //
-        // Deliberately conditional on a binding actually existing, not an
-        // unconditional requirement: a preview whose thumbnail STREAM
-        // partially failed to decode (`dropped_count > 0` in
-        // `acquire_thumbnails`'s worker) still lets `scan.start` proceed
-        // today for the frames that DID decode, even though this backend's
-        // own `completed` binding is deliberately left unset for that
-        // narrow case (see `finalize_active_preview_terminal`'s caller).
-        // Falling through here for a `None` binding keeps that existing,
-        // already-shipped path byte-identical; the bridge's own subset
-        // check still applies to it exactly as before.
-        {
-            let binding = backend.preview_approval_state.lock().unwrap().completed.clone();
-            let binding_is_current_session = binding.as_ref().is_some_and(|binding| {
-                binding.session_epoch == session_epoch
-                    && binding.bridge_generation == bridge_generation
-            });
-            if binding_is_current_session {
-                let binding = binding.expect("checked by binding_is_current_session above");
-                if let Some(&missing_frame) = frames
-                    .iter()
-                    .find(|frame_index| !binding.thumbnails.contains_key(frame_index))
-                {
-                    return Err(EngineError::new(
-                        ErrorCode::InvalidParams,
-                        format!(
-                            "frame {missing_frame} was never returned by the completed preview and cannot be scanned"
-                        ),
-                    ));
-                }
-            }
-        }
-        let processing = processing.effective();
-        let recipe = recipe.effective_for_process(processing.film_process);
-        // Device-sourced, model-agnostic (see
-        // derive_supported_multisample_passes): the real device's
-        // `multiSample: false` capability means "no *variable* multi-
-        // sample control exposed by the transport", never "cannot
-        // multisample" — the LS-5000 always can, it's a hallmark feature.
-        // The rejection names the field and states the real reason (fixed
-        // by hardware capability), so the engine/UI never sees a false
-        // "multisampling unsupported" claim.
-        if !backend
-            .supported_multisample_passes
-            .contains(&recipe.multisample_passes)
-        {
-            return Err(EngineError::new(
-                ErrorCode::InvalidParams,
-                format!(
-                    "multisamplePasses must be one of {:?} for this device (fixed by hardware capability, not a multisampling limitation)",
-                    backend.supported_multisample_passes
-                ),
-            ));
-        }
+        let (session_epoch, bridge_generation, recipe, processing) =
+            prepare_real_scan_start(backend, &frames, recipe, processing)?;
 
-        let capture_plan = build_real_capture_plan(&frames, &recipe, &output, &overrides)?;
-        let bridge_params = build_scan_start_params_with_bridge_output(
-            frames.clone(),
-            &recipe,
-            &processing,
-            capture_plan.bridge_output.clone(),
-        );
-        let params_value = serde_json::to_value(&bridge_params)
-            .expect("serializing BridgeScanStartParams cannot fail");
-
-        let job_id = match backend.call_session_scoped_detailed(
-            session_epoch,
-            bridge_generation,
-            "scan.start",
-            params_value,
-        ) {
-            Ok(value) => decode_scan_start_job_id(value)?,
-            // A clean rejection (INVALID_PARAMS, NOT_CONNECTED, etc.) —
-            // the bridge itself is fine, it just refused this request.
-            // Return early, exactly like every other synchronous
-            // validation failure.
-            Err(SessionCallError::BridgeRejected(mut engine_error)) => {
-                if let Some(working) = capture_plan.private_working_directory.as_ref() {
-                    engine_error.message = format!(
-                        "{}; {}",
-                        engine_error.message,
-                        working.recovery_message(
-                            "bridge rejected scan.start; workspace was preserved without cleanup",
-                        )
-                    );
-                }
-                return Err(engine_error);
-            }
-            // Timeout / ProcessExited / Io means that the bridge process
-            // which owned the physical device has been lost or restarted.
-            // A replacement process has neither an open Device nor the
-            // preview/session state that made this motion request safe, so
-            // fail closed: never retry scan.start after this boundary.
-            Err(SessionCallError::OwnershipLost(ownership_error)) => {
-                let mut message = format!(
-                    "bridge session was lost before scan.start; reconnect required; motion request was not retried: {}",
-                    ownership_error.message
-                );
-                if let Some(working) = capture_plan.private_working_directory.as_ref() {
-                    message.push_str("; ");
-                    message.push_str(&working.recovery_message(
-                        "bridge start lost its response or closed before terminal confirmation",
-                    ));
-                }
-                emit(
-                    &event_tx,
-                    "scan.frameState",
-                    FrameStatePayload {
-                        job_id: String::new(),
-                        frame_index: *frames.first().unwrap_or(&0),
-                        state: FrameState::Failed,
-                        attempt: 1,
-                        error: Some(ErrorPayload {
-                            code: ErrorCode::NotConnected,
-                            message: message.clone(),
-                            recoverable: false,
-                        }),
-                    },
-                );
-                return Err(EngineError::new(ErrorCode::NotConnected, message));
+        // Hold exact project-root-anchored destination capabilities before
+        // scan.start can move hardware. The bridge is deliberately routed to
+        // a private capture workspace below; retained masters and derivatives
+        // are published later only through these held handles.
+        // Capture overrides are provenance-only on the real transport today:
+        // `build_scan_start_params_with_bridge_output` sends one batch recipe
+        // to the bridge. Destination authority must therefore follow that
+        // exact recipe too, or a legacy per-frame override can incorrectly
+        // add/remove the IR and raw-sidecar capabilities needed by the bytes
+        // the bridge will actually produce.
+        let output_authorities = match output_authorities {
+            Some(authorities) => authorities,
+            None => {
+                let authority_overrides = real_batch_output_authority_overrides(&overrides);
+                crate::render::acquire_job_output_authorities(
+                    project_directory.as_deref(),
+                    &frames,
+                    &recipe,
+                    &output,
+                    &authority_overrides,
+                )?
             }
         };
-        let backend_for_thread = Arc::clone(backend);
-        let thread_job_id = job_id.clone();
-        let thread_project_directory = project_directory.clone();
-        thread::spawn(move || {
-            run_real_scan_job(
-                backend_for_thread,
-                thread_job_id,
-                frames,
-                recipe,
-                processing,
-                output,
-                overrides,
-                capture_plan,
-                thread_project_directory,
-                event_tx,
-                session_epoch,
-                bridge_generation,
-            );
-        });
-
-        Ok(job_id)
+        dispatch_real_scan_with_output_authorities(
+            backend,
+            frames,
+            recipe,
+            processing,
+            output,
+            overrides,
+            output_authorities,
+            event_tx,
+            session_epoch,
+            bridge_generation,
+        )
     }
 
     fn scan_stop(
@@ -2700,13 +4155,12 @@ impl ScannerBackend for RealLs5000 {
             "scan.stop",
             serde_json::json!({ "jobId": job_id }),
         )?;
-        let result: BridgeScanStopResult =
-            serde_json::from_value(result_value).map_err(|err| {
-                EngineError::new(
-                    ErrorCode::Internal,
-                    format!("malformed scan.stop result: {err}"),
-                )
-            })?;
+        let result: BridgeScanStopResult = serde_json::from_value(result_value).map_err(|err| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!("malformed scan.stop result: {err}"),
+            )
+        })?;
         // BRIDGE.md: "scan.stop has no mode — no safe immediate abort
         // exists against real hardware" — the result always reports
         // AfterCurrentFrame, regardless of what the caller requested.
@@ -2719,6 +4173,295 @@ impl ScannerBackend for RealLs5000 {
         // safety net if this call fails or hangs.
         let _ = self.bridge.call("bridge.shutdown", serde_json::json!({}));
     }
+}
+
+fn prepare_real_scan_start(
+    backend: &Arc<RealLs5000>,
+    frames: &[u32],
+    recipe: CaptureRecipe,
+    processing: ProcessingRecipe,
+) -> Result<(u64, u64, CaptureRecipe, ProcessingRecipe), EngineError> {
+    let (session_epoch, bridge_generation) = backend.active_session_identity()?;
+    backend.ensure_preview_stream_allows_scan(session_epoch, bridge_generation)?;
+    // When this exact session has a completed-preview binding, every
+    // requested frame must be one that binding actually returned. This stays
+    // conditional because a partially decoded preview intentionally has no
+    // complete binding; the bridge still enforces its own subset rule there.
+    {
+        let binding = backend
+            .preview_approval_state
+            .lock()
+            .unwrap()
+            .completed
+            .clone();
+        let binding_is_current_session = binding.as_ref().is_some_and(|binding| {
+            binding.session_epoch == session_epoch && binding.bridge_generation == bridge_generation
+        });
+        if binding_is_current_session {
+            let binding = binding.expect("checked by binding_is_current_session above");
+            if let Some(&missing_frame) = frames
+                .iter()
+                .find(|frame_index| !binding.thumbnails.contains_key(frame_index))
+            {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "frame {missing_frame} was never returned by the completed preview and cannot be scanned"
+                    ),
+                ));
+            }
+        }
+    }
+    let processing = processing.effective();
+    let recipe = recipe.effective_for_process(processing.film_process);
+    // A false `multiSample` transport capability means no variable control,
+    // not that this LS-5000 cannot multisample. Validate against the exact
+    // device-sourced pass set and keep the reason honest in the error.
+    if !backend
+        .supported_multisample_passes
+        .contains(&recipe.multisample_passes)
+    {
+        return Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "multisamplePasses must be one of {:?} for this device (fixed by hardware capability, not a multisampling limitation)",
+                backend.supported_multisample_passes
+            ),
+        ));
+    }
+    Ok((session_epoch, bridge_generation, recipe, processing))
+}
+
+fn with_private_workspace_rollback(
+    mut primary: EngineError,
+    working: PrivateCaptureWorkingDirectory,
+) -> EngineError {
+    if let Err(cleanup) = working.rollback_unused() {
+        primary.message = format!(
+            "{}; pre-motion private-workspace rollback was incomplete: {}",
+            primary.message, cleanup.message
+        );
+        primary = primary.with_recoverable(false);
+    }
+    primary
+}
+
+fn with_pre_motion_scan_cleanup(
+    mut primary: EngineError,
+    output_authorities: &mut crate::render::JobOutputAuthorities,
+    capture_plan: Option<&mut RealCapturePlan>,
+) -> EngineError {
+    let mut failures = Vec::new();
+    if let Some(working) = capture_plan.and_then(|plan| plan.private_working_directory.take()) {
+        if let Err(error) = working.rollback_unused() {
+            failures.push(format!("private workspace: {}", error.message));
+        }
+    }
+    if let Err(error) = output_authorities.rollback_pre_motion_evidence_reservations() {
+        failures.push(format!("capture evidence: {}", error.message));
+    }
+    if !failures.is_empty() {
+        primary.message = format!(
+            "{}; pre-motion cleanup was incomplete and resources are recovery-held: {}",
+            primary.message,
+            failures.join("; ")
+        );
+        primary = primary.with_recoverable(false);
+    }
+    primary
+}
+
+fn with_ambiguous_scan_start_recovery_holds(
+    mut primary: EngineError,
+    output_authorities: &crate::render::JobOutputAuthorities,
+    capture_plan: &RealCapturePlan,
+    reason: &str,
+) -> EngineError {
+    if let Some(working) = capture_plan.private_working_directory.as_ref() {
+        primary.message = format!("{}; {}", primary.message, working.recovery_message(reason));
+    }
+    let evidence_holds = output_authorities
+        .reserved_evidence_packages()
+        .iter()
+        .map(|package| package.final_path().display().to_string())
+        .collect::<Vec<_>>();
+    if !evidence_holds.is_empty() {
+        primary.message = format!(
+            "{}; capture evidence reservations are recovery-held at {}",
+            primary.message,
+            evidence_holds.join(", ")
+        );
+    }
+    primary.with_recoverable(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_real_scan_with_output_authorities(
+    backend: &Arc<RealLs5000>,
+    frames: Vec<u32>,
+    recipe: CaptureRecipe,
+    processing: ProcessingRecipe,
+    output: OutputRecipe,
+    overrides: std::collections::HashMap<u32, domain::FrameOverrides>,
+    mut output_authorities: crate::render::JobOutputAuthorities,
+    event_tx: mpsc::Sender<String>,
+    session_epoch: u64,
+    bridge_generation: u64,
+) -> Result<String, EngineError> {
+    let requested_job_id = generate_scan_operation_token()?;
+    let active_scan_guard = {
+        let mut active = backend.active_scan_job_id.lock().unwrap();
+        if let Some(active_job_id) = active.as_deref() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                format!("scan job {active_job_id} is already active"),
+            ));
+        }
+        *active = Some(requested_job_id.clone());
+        ActiveRealScanGuard {
+            active: Arc::clone(&backend.active_scan_job_id),
+            job_id: requested_job_id.clone(),
+            clear_on_drop: true,
+        }
+    };
+    // Bind and create-reserve every optional full-capture package from the
+    // already-held archive destinations before the bridge receives
+    // `scan.start`. Existing packages, planted links/reparse points, physical
+    // aliases, and namespace swaps therefore fail before hardware motion.
+    output_authorities.reserve_evidence_packages(&requested_job_id)?;
+    let mut capture_plan = match build_real_capture_plan(&frames, &recipe, &output, &overrides) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(with_pre_motion_scan_cleanup(
+                error,
+                &mut output_authorities,
+                None,
+            ));
+        }
+    };
+    let bridge_params = build_scan_start_params_with_bridge_output(
+        Some(requested_job_id.clone()),
+        frames.clone(),
+        &recipe,
+        &processing,
+        capture_plan.bridge_output.clone(),
+    );
+    let params_value = serde_json::to_value(&bridge_params)
+        .expect("serializing BridgeScanStartParams cannot fail");
+
+    if let Some(working) = capture_plan.private_working_directory.as_ref() {
+        // This is the last synchronous boundary before the external bridge
+        // receives a pathname. A moved/replaced workspace is a typed refusal;
+        // no hardware capture may start into it.
+        if let Err(error) = working.verify_namespace() {
+            return Err(with_pre_motion_scan_cleanup(
+                error,
+                &mut output_authorities,
+                Some(&mut capture_plan),
+            ));
+        }
+    }
+
+    let returned_job_id = match backend.call_session_scoped_detailed(
+        session_epoch,
+        bridge_generation,
+        "scan.start",
+        params_value,
+    ) {
+        Ok(value) => match decode_scan_start_job_id(value) {
+            Ok(job_id) => job_id,
+            Err(error) => {
+                let held_error = with_ambiguous_scan_start_recovery_holds(
+                    error,
+                    &output_authorities,
+                    &capture_plan,
+                    "scan.start returned a successful but malformed response after possible hardware acceptance",
+                );
+                active_scan_guard.retain_for_recovery();
+                return Err(held_error);
+            }
+        },
+        Err(SessionCallError::BridgeRejected(engine_error)) => {
+            return Err(with_pre_motion_scan_cleanup(
+                engine_error,
+                &mut output_authorities,
+                Some(&mut capture_plan),
+            ));
+        }
+        // A replacement process has neither the Device nor preview/session
+        // state that made this motion request safe. Never retry scan.start
+        // after losing this ownership boundary.
+        Err(SessionCallError::OwnershipLost(ownership_error)) => {
+            let held_error = with_ambiguous_scan_start_recovery_holds(
+                EngineError::new(
+                    ErrorCode::NotConnected,
+                    format!(
+                        "bridge session was lost during scan.start; reconnect required; motion request was not retried: {}",
+                        ownership_error.message
+                    ),
+                ),
+                &output_authorities,
+                &capture_plan,
+                "bridge start lost its response or closed before terminal confirmation",
+            );
+            emit(
+                &event_tx,
+                "scan.frameState",
+                FrameStatePayload {
+                    job_id: String::new(),
+                    frame_index: *frames.first().unwrap_or(&0),
+                    state: FrameState::Failed,
+                    attempt: 1,
+                    error: Some(ErrorPayload {
+                        code: ErrorCode::NotConnected,
+                        message: held_error.message.clone(),
+                        recoverable: false,
+                    }),
+                },
+            );
+            active_scan_guard.retain_for_recovery();
+            return Err(held_error);
+        }
+    };
+    if returned_job_id != requested_job_id {
+        let held_error = with_ambiguous_scan_start_recovery_holds(
+            EngineError::new(
+                ErrorCode::Internal,
+                format!(
+                    "scan.start returned jobId {returned_job_id:?}, but this engine owns operation token {requested_job_id:?}"
+                ),
+            ),
+            &output_authorities,
+            &capture_plan,
+            "scan.start returned a mismatched operation token after possible hardware acceptance",
+        );
+        active_scan_guard.retain_for_recovery();
+        return Err(held_error);
+    }
+    let job_id = requested_job_id;
+    let backend_for_thread = Arc::clone(backend);
+    let thread_job_id = job_id.clone();
+    thread::spawn(move || {
+        // Clears the local activity capability on every normal return or
+        // unwind, but only if it still names this exact job.
+        let _active_scan_guard = active_scan_guard;
+        run_real_scan_job(
+            backend_for_thread,
+            thread_job_id,
+            frames,
+            recipe,
+            processing,
+            output,
+            overrides,
+            output_authorities,
+            capture_plan,
+            event_tx,
+            session_epoch,
+            bridge_generation,
+        );
+    });
+
+    Ok(job_id)
 }
 
 /// Maps a `BridgeCallError` (Plan 09-02's transport-level error vocabulary)
@@ -2873,7 +4616,10 @@ fn map_status(
     bridge: &BridgeDeviceStatus,
     detected_holder: Option<DetectedHolder>,
 ) -> ScannerStatus {
-    let live_holder = bridge.adapter.as_deref().and_then(holder_from_adapter_ascii);
+    let live_holder = bridge
+        .adapter
+        .as_deref()
+        .and_then(holder_from_adapter_ascii);
     let detected_holder = bridge
         .connected
         .then_some(live_holder.or(detected_holder))
@@ -2982,6 +4728,7 @@ fn build_scan_start_params(
     slot_outputs: Option<std::collections::HashMap<String, BridgeSlotOutputSpec>>,
 ) -> BridgeScanStartParams {
     build_scan_start_params_with_bridge_output(
+        None,
         slots,
         recipe,
         processing,
@@ -2995,12 +4742,14 @@ fn build_scan_start_params(
 }
 
 fn build_scan_start_params_with_bridge_output(
+    job_id: Option<String>,
     slots: Vec<u32>,
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
     bridge_output: BridgeOutputSpec,
 ) -> BridgeScanStartParams {
     BridgeScanStartParams {
+        job_id,
         slots,
         recipe: BridgeCaptureRecipe {
             resolution_dpi: recipe.resolution_dpi,
@@ -3016,6 +4765,17 @@ fn build_scan_start_params_with_bridge_output(
         // derivatives remain engine-rendered and have no bridge equivalent.
         output: bridge_output,
     }
+}
+
+fn generate_scan_operation_token() -> Result<String, EngineError> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to generate scan operation token: {err}"),
+        )
+    })?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -3064,71 +4824,84 @@ fn effective_output_for_slot<'a>(
         .unwrap_or(output)
 }
 
+fn real_batch_output_authority_overrides(
+    overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
+) -> std::collections::HashMap<u32, domain::FrameOverrides> {
+    overrides
+        .iter()
+        .map(|(slot, values)| {
+            let mut values = values.clone();
+            values.capture = None;
+            (*slot, values)
+        })
+        .collect()
+}
+
 /// Plans the bridge's mandatory RGB/IR/meter capture locations independently
-/// from user-retained outputs. For archive-off frames every bridge write is
-/// routed into one newly-created, job-private directory with private names;
-/// user output folders never receive an intermediate TIFF or sidecar.
+/// from user-retained outputs. Every bridge write is routed into one
+/// newly-created, job-private directory with private names; user output
+/// folders never receive an intermediate TIFF or sidecar.
 fn build_real_capture_plan(
     slots: &[u32],
     recipe: &CaptureRecipe,
     output: &OutputRecipe,
     overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
 ) -> Result<RealCapturePlan, EngineError> {
-    let private_slots: std::collections::HashSet<u32> = slots
-        .iter()
-        .copied()
-        .filter(|slot| !effective_output_for_slot(*slot, output, overrides).archive.enabled)
-        .collect();
-    let private_working_directory = (!private_slots.is_empty())
-        .then(PrivateCaptureWorkingDirectory::create)
-        .transpose()?;
+    // An external bridge process cannot inherit a destination handle opened
+    // after its startup. Therefore every hardware capture, including retained
+    // masters, first lands in one unpredictable engine-owned workspace. Rust
+    // later copies the exact held source bytes into the approved destination
+    // with handle-relative publication. Passing a user pathname to the bridge
+    // would reintroduce the ancestor-swap race this plan is closing.
+    let working = PrivateCaptureWorkingDirectory::create()?;
+    match build_real_capture_plan_for_workspace(slots, recipe, output, overrides, &working) {
+        Ok(mut plan) => {
+            plan.private_working_directory = Some(working);
+            Ok(plan)
+        }
+        Err(error) => Err(with_private_workspace_rollback(error, working)),
+    }
+}
+
+fn build_real_capture_plan_for_workspace(
+    slots: &[u32],
+    recipe: &CaptureRecipe,
+    output: &OutputRecipe,
+    overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
+    working: &PrivateCaptureWorkingDirectory,
+) -> Result<RealCapturePlan, EngineError> {
+    let private_slots: std::collections::HashSet<u32> = slots.iter().copied().collect();
 
     let base_output = effective_output_for_slot(*slots.first().unwrap_or(&0), output, overrides);
-    let base_spec = if base_output.archive.enabled {
-        BridgeSlotOutputSpec {
-            destination: base_output.archive.destination.clone(),
-            filename_template: bridge_archive_template(&base_output.archive.filename_template),
-            raw_export: bridge_raw_export_spec(&base_output.raw_export),
-        }
-    } else {
-        let working = private_working_directory.as_ref().expect("private slot has working directory");
-        BridgeSlotOutputSpec {
-            destination: working.root.display().to_string(),
-            filename_template: format!("capture-{}-####.tif", working.owner_token),
-            raw_export: bridge_raw_export_spec(&base_output.raw_export),
-        }
+    let base_spec = BridgeSlotOutputSpec {
+        destination: working.root.display().to_string(),
+        filename_template: format!("capture-{}-####.tif", working.owner_token),
+        raw_export: private_bridge_raw_export_spec(&base_output.raw_export, working),
     };
 
     let mut expected_by_slot = HashMap::new();
     let mut slot_outputs = HashMap::new();
-    let mut differs_from_base = false;
     for slot in slots {
         let effective = effective_output_for_slot(*slot, output, overrides);
-        let spec = if effective.archive.enabled {
-            BridgeSlotOutputSpec {
-                destination: effective.archive.destination.clone(),
-                filename_template: bridge_archive_template(&effective.archive.filename_template),
-                raw_export: bridge_raw_export_spec(&effective.raw_export),
-            }
-        } else {
-            let working = private_working_directory.as_ref().expect("private slot has working directory");
-            BridgeSlotOutputSpec {
-                destination: working.root.display().to_string(),
-                filename_template: format!("capture-{}-####.tif", working.owner_token),
-                raw_export: bridge_raw_export_spec(&effective.raw_export),
-            }
+        let spec = BridgeSlotOutputSpec {
+            destination: working.root.display().to_string(),
+            filename_template: format!("capture-{}-####.tif", working.owner_token),
+            raw_export: private_bridge_raw_export_spec(&effective.raw_export, working),
         };
-        differs_from_base |= spec != base_spec;
-        let rgb = std::path::Path::new(&spec.destination)
-            .join(crate::render::resolve_filename(&spec.filename_template, *slot));
+        let rgb = std::path::Path::new(&spec.destination).join(crate::render::resolve_filename(
+            &spec.filename_template,
+            *slot,
+        ));
         // Force the sidecar derivation to validate the private base name
         // while receipt validation below derives the same exact paths.
         let _ = crate::render::archive_sidecar_path(&rgb, "IR")?;
         let _ = crate::render::archive_sidecar_path(&rgb, "METER")?;
-        let raw_export = effective
-            .raw_export
-            .enabled
-            .then(|| crate::render::resolve_raw_export_output_path(effective, *slot));
+        let raw_export = spec.raw_export.as_ref().map(|raw| {
+            std::path::Path::new(&raw.destination).join(crate::render::resolve_filename(
+                &raw.filename_template,
+                *slot,
+            ))
+        });
         let raw_export_ir = raw_export.as_ref().and_then(|path| {
             (recipe.channels == Channels::Rgbi
                 && effective.raw_export.tiff_infrared == domain::RawTiffInfrared::Sidecar)
@@ -3148,16 +4921,15 @@ fn build_real_capture_plan(
     // A private route always sends a complete per-slot plan, even when all
     // private slots share a root/template. This leaves no bridge-side
     // fallback that could accidentally use a user archive destination.
-    let use_slot_outputs = private_working_directory.is_some() || differs_from_base;
     Ok(RealCapturePlan {
         bridge_output: BridgeOutputSpec {
             destination: base_spec.destination,
             filename_template: base_spec.filename_template,
-            slot_outputs: use_slot_outputs.then_some(slot_outputs),
+            slot_outputs: Some(slot_outputs),
             raw_export: base_spec.raw_export,
         },
         expected_by_slot,
-        private_working_directory,
+        private_working_directory: None,
         private_slots,
     })
 }
@@ -3165,6 +4937,7 @@ fn build_real_capture_plan(
 /// Applies the same TIFF extension policy used by preflight, simulator
 /// writes, receipt validation, and derivative rendering before the archive
 /// template crosses the independent bridge protocol boundary.
+#[cfg(test)]
 fn ensure_archive_extension(filename_template: &str) -> String {
     crate::render::normalize_output_filename_template(
         filename_template,
@@ -3176,6 +4949,7 @@ fn ensure_archive_extension(filename_template: &str) -> String {
 /// marker. The bridge protocol has always documented `####` substitution,
 /// so sending the marker keeps legacy and current bridge builds on the same
 /// four-digit path the engine reserves and later validates from the receipt.
+#[cfg(test)]
 fn bridge_archive_template(filename_template: &str) -> String {
     let normalized = ensure_archive_extension(filename_template);
     if normalized.contains('#') || crate::render::is_reserved_sequence_template(&normalized) {
@@ -3205,6 +4979,20 @@ fn bridge_raw_export_spec(recipe: &domain::RawExportRecipe) -> Option<BridgeRawE
             domain::RawTiffInfrared::Sidecar => BridgeRawTiffInfrared::Sidecar,
         },
     })
+}
+
+fn private_bridge_raw_export_spec(
+    recipe: &domain::RawExportRecipe,
+    working: &PrivateCaptureWorkingDirectory,
+) -> Option<BridgeRawExportSpec> {
+    let mut spec = bridge_raw_export_spec(recipe)?;
+    let extension = match recipe.file_format {
+        domain::RawExportFormat::LinearDng => "dng",
+        domain::RawExportFormat::LinearTiff => "tif",
+    };
+    spec.destination = working.root.display().to_string();
+    spec.filename_template = format!("raw-{}-####.{extension}", working.owner_token);
+    Some(spec)
 }
 
 fn bridge_raw_export_template(recipe: &domain::RawExportRecipe) -> String {
@@ -3339,9 +5127,7 @@ fn map_exposure_authority(authority: &BridgeExposureAuthority) -> domain::Exposu
         rgb_source: authority.rgb_source.clone(),
         ir_source: authority.ir_source.clone(),
         commanded_channels_raw_10ns: authority.commanded_channels_raw_10ns.clone(),
-        active_controller_channels_raw_10ns: authority
-            .active_controller_channels_raw_10ns
-            .clone(),
+        active_controller_channels_raw_10ns: authority.active_controller_channels_raw_10ns.clone(),
         device_bound_clamped_channels_raw_10ns: authority
             .device_bound_clamped_channels_raw_10ns
             .clone(),
@@ -3453,8 +5239,7 @@ fn compute_duty_cycle_report(samples: &[FrameIdleSample]) -> Option<DutyCycleRep
         return None;
     }
     let max_idle_ms = samples.iter().map(|s| s.idle_ms).max().unwrap_or(0);
-    let mean_idle_ms =
-        samples.iter().map(|s| s.idle_ms as f64).sum::<f64>() / samples.len() as f64;
+    let mean_idle_ms = samples.iter().map(|s| s.idle_ms as f64).sum::<f64>() / samples.len() as f64;
     Some(DutyCycleReport {
         per_frame_idle_ms: samples.to_vec(),
         mean_idle_ms,
@@ -3572,25 +5357,14 @@ fn emit_terminal_job_failure(
 /// outcome but never *why the job itself* stopped, leaving that reason
 /// nowhere but engine stderr once this process exits.
 fn finalize_evidence_status_after_bridge_terminal(
-    output: &OutputRecipe,
-    overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
-    capture_plan: &RealCapturePlan,
+    output_authorities: &crate::render::JobOutputAuthorities,
     job_id: &str,
     evidence: &Arc<Mutex<Vec<crate::evidence_package::EvidenceFrame>>>,
     settings: &serde_json::Value,
     terminal_error: Option<&str>,
 ) -> EvidenceFinalization {
-    let mut requested_destinations = std::collections::BTreeMap::<String, Vec<u32>>::new();
-    for slot in capture_plan.expected_by_slot.keys() {
-        let effective = effective_output_for_slot(*slot, output, overrides);
-        if effective.archive.enabled && effective.archive.full_capture_package {
-            requested_destinations
-                .entry(effective.archive.destination.clone())
-                .or_default()
-                .push(*slot);
-        }
-    }
-    if requested_destinations.is_empty() {
+    let packages = output_authorities.reserved_evidence_packages();
+    if packages.is_empty() {
         return EvidenceFinalization {
             summary: "disabled".to_string(),
             cleanup_gate: EvidenceCleanupGate::NotRequested,
@@ -3598,40 +5372,30 @@ fn finalize_evidence_status_after_bridge_terminal(
     }
 
     // A package is a retained-master artifact, never a way to make a
-    // derivative-only private bridge capture user-visible. Grouping by the
-    // effective frame destination also permits explicit per-frame archive
-    // destinations without letting the roll-wide default silently win.
+    // derivative-only private bridge capture user-visible. Eligible slots
+    // were attached to each exact held archive destination before motion.
     let observed_frames = evidence
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-    let mut frames_by_destination = requested_destinations
-        .iter()
-        .map(|(destination, _)| (destination.clone(), Vec::new()))
-        .collect::<std::collections::BTreeMap<_, Vec<_>>>();
-    for frame in observed_frames {
-        let Some((destination, _)) = requested_destinations
-            .iter()
-            .find(|(_, slots)| slots.contains(&frame.frame_index))
-        else {
-            continue;
-        };
-        frames_by_destination
-            .get_mut(destination)
-            .expect("requested evidence destination was initialized")
-            .push(frame);
-    }
-
     let mut failures = Vec::new();
     let mut finalized = Vec::new();
     let mut every_package_verified_complete = true;
-    for (destination, frames) in frames_by_destination {
+    for package in packages {
+        let (frames, coverage_error) =
+            select_evidence_frames_for_package(package.eligible_slots(), &observed_frames);
+        let package_terminal_error = match (terminal_error, coverage_error.as_deref()) {
+            (Some(terminal), Some(coverage)) => Some(format!("{terminal}; {coverage}")),
+            (Some(terminal), None) => Some(terminal.to_string()),
+            (None, Some(coverage)) => Some(coverage.to_string()),
+            (None, None) => None,
+        };
         match crate::evidence_package::finalize(
-            std::path::Path::new(&destination),
+            package,
             job_id,
             &frames,
             settings,
-            terminal_error,
+            package_terminal_error.as_deref(),
         ) {
             Ok(result) => {
                 every_package_verified_complete &= result.status == "complete";
@@ -3651,6 +5415,81 @@ fn finalize_evidence_status_after_bridge_terminal(
         } else {
             EvidenceCleanupGate::Hold
         },
+    }
+}
+
+/// Selects exactly one observed receipt for every slot covered by a held
+/// package authority. Missing or duplicate receipts make the package
+/// incomplete even when every artifact that did arrive can be copied and
+/// audited. This prevents a successful subset from opening the private-
+/// capture cleanup gate for the whole requested package.
+fn select_evidence_frames_for_package(
+    eligible_slots: &[u32],
+    observed_frames: &[crate::evidence_package::EvidenceFrame],
+) -> (Vec<crate::evidence_package::EvidenceFrame>, Option<String>) {
+    let expected = eligible_slots
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut duplicate_slots = std::collections::BTreeSet::new();
+    let mut selected = Vec::with_capacity(expected.len());
+    for frame in observed_frames {
+        if !expected.contains(&frame.frame_index) {
+            continue;
+        }
+        if seen.insert(frame.frame_index) {
+            selected.push(frame.clone());
+        } else {
+            duplicate_slots.insert(frame.frame_index);
+        }
+    }
+    selected.sort_by_key(|frame| frame.frame_index);
+
+    let mut reasons = Vec::new();
+    if expected.len() != eligible_slots.len() {
+        reasons.push("held evidence authority contains duplicate eligible slots".to_string());
+    }
+    let missing_slots = expected.difference(&seen).copied().collect::<Vec<_>>();
+    if !missing_slots.is_empty() {
+        reasons.push(format!(
+            "capture evidence is missing eligible frame receipts {missing_slots:?}"
+        ));
+    }
+    if !duplicate_slots.is_empty() {
+        reasons.push(format!(
+            "capture evidence contains duplicate frame receipts {:?}",
+            duplicate_slots.into_iter().collect::<Vec<_>>()
+        ));
+    }
+    let error = (!reasons.is_empty()).then(|| reasons.join("; "));
+    (selected, error)
+}
+
+fn admit_evidence_frame_slot(
+    requested_slots: &std::collections::HashSet<u32>,
+    remaining: &[u32],
+    slot: u32,
+    first_error: &mut Option<String>,
+) -> bool {
+    let error = if !requested_slots.contains(&slot) {
+        Some(format!(
+            "bridge emitted an unrequested frameCompleted slot {slot}; evidence admission refused before source access"
+        ))
+    } else if !remaining.contains(&slot) {
+        Some(format!(
+            "bridge emitted a duplicate or already-resolved frameCompleted slot {slot}; evidence admission refused before source access"
+        ))
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        if first_error.is_none() {
+            *first_error = Some(error);
+        }
+        false
+    } else {
+        true
     }
 }
 
@@ -3782,7 +5621,10 @@ fn snapshot_flat_private_workspace(
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|error| format!("inspect workspace entry {}: {error}", path.display()))?;
         if metadata.file_type().is_symlink() {
-            return Err(format!("workspace contains an ambiguous symlink {}", path.display()));
+            return Err(format!(
+                "workspace contains an ambiguous symlink {}",
+                path.display()
+            ));
         }
         let identity = private_file_identity(&metadata);
         if !metadata.is_file() || identity.links != 1 {
@@ -3918,10 +5760,7 @@ mod private_cleanup_sys {
         }
     }
 
-    pub fn create_directory_exclusive(
-        parent: &std::fs::File,
-        name: &OsStr,
-    ) -> io::Result<()> {
+    pub fn create_directory_exclusive(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
         let name = component(name)?;
         let result = unsafe { mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
         if result == 0 {
@@ -3964,10 +5803,7 @@ mod private_cleanup_sys {
         Err(unsupported())
     }
 
-    pub fn create_directory_exclusive(
-        _parent: &std::fs::File,
-        _name: &OsStr,
-    ) -> io::Result<()> {
+    pub fn create_directory_exclusive(_parent: &std::fs::File, _name: &OsStr) -> io::Result<()> {
         Err(unsupported())
     }
 }
@@ -4041,28 +5877,20 @@ where
         .map_err(|reason| PrivateCleanupHold::new(reason, [working.root.clone()]))?;
     let workspace_identity = identity_at_path(&working.root)
         .map_err(|reason| PrivateCleanupHold::new(reason, [working.root.clone()]))?;
-    let initial_snapshot = snapshot_flat_private_workspace(
-        &working.root,
-        &working.owner_token,
-        &known_names,
-    )
-    .map_err(|reason| PrivateCleanupHold::new(reason, [working.root.clone()]))?;
+    let initial_snapshot =
+        snapshot_flat_private_workspace(&working.root, &working.owner_token, &known_names)
+            .map_err(|reason| PrivateCleanupHold::new(reason, [working.root.clone()]))?;
 
-    let parent = working
-        .root
-        .parent()
-        .ok_or_else(|| {
+    let parent = working.root.parent().ok_or_else(|| {
+        PrivateCleanupHold::new("private workspace has no parent", [working.root.clone()])
+    })?;
+    let parent_directory =
+        private_cleanup_sys::open_directory_nofollow(parent).map_err(|error| {
             PrivateCleanupHold::new(
-                "private workspace has no parent",
+                format!("open private workspace parent without following links: {error}"),
                 [working.root.clone()],
             )
         })?;
-    let parent_directory = private_cleanup_sys::open_directory_nofollow(parent).map_err(|error| {
-        PrivateCleanupHold::new(
-            format!("open private workspace parent without following links: {error}"),
-            [working.root.clone()],
-        )
-    })?;
     let quarantine = parent.join(format!(
         ".scanstudio-capture-quarantine-{}",
         working.owner_token
@@ -4082,9 +5910,7 @@ where
     )
     .map_err(|error| {
         PrivateCleanupHold::new(
-            format!(
-                "atomically quarantine private workspace without replacement: {error}"
-            ),
+            format!("atomically quarantine private workspace without replacement: {error}"),
             [working.root.clone(), quarantine.clone()],
         )
     })?;
@@ -4097,12 +5923,9 @@ where
             [working.root.clone(), quarantine.clone()],
         ));
     }
-    let quarantine_snapshot = snapshot_flat_private_workspace(
-        &quarantine,
-        &working.owner_token,
-        &known_names,
-    )
-    .map_err(|reason| PrivateCleanupHold::new(reason, [quarantine.clone()]))?;
+    let quarantine_snapshot =
+        snapshot_flat_private_workspace(&quarantine, &working.owner_token, &known_names)
+            .map_err(|reason| PrivateCleanupHold::new(reason, [quarantine.clone()]))?;
     if quarantine_snapshot != initial_snapshot {
         return Err(PrivateCleanupHold::new(
             "private workspace entry identities changed during quarantine",
@@ -4110,8 +5933,8 @@ where
         ));
     }
 
-    let quarantine_directory = private_cleanup_sys::open_directory_nofollow(&quarantine)
-        .map_err(|error| {
+    let quarantine_directory =
+        private_cleanup_sys::open_directory_nofollow(&quarantine).map_err(|error| {
             PrivateCleanupHold::new(
                 format!("open quarantined workspace without following links: {error}"),
                 [quarantine.clone()],
@@ -4134,12 +5957,13 @@ where
             [quarantine.clone(), staging.clone()],
         )
     })?;
-    let staging_directory = private_cleanup_sys::open_directory_nofollow(&staging).map_err(|error| {
-        PrivateCleanupHold::new(
-            format!("open identity tombstone without following links: {error}"),
-            [quarantine.clone(), staging.clone()],
-        )
-    })?;
+    let staging_directory =
+        private_cleanup_sys::open_directory_nofollow(&staging).map_err(|error| {
+            PrivateCleanupHold::new(
+                format!("open identity tombstone without following links: {error}"),
+                [quarantine.clone(), staging.clone()],
+            )
+        })?;
 
     let mut sorted_names: Vec<_> = quarantine_snapshot.keys().cloned().collect();
     sorted_names.sort();
@@ -4165,7 +5989,10 @@ where
         let expected = quarantine_snapshot[name];
         if identity_at_path(&source).ok() != Some(expected) {
             return Err(failure_with_secure_rollback(
-                format!("verified source identity changed before no-replace move: {}", source.display()),
+                format!(
+                    "verified source identity changed before no-replace move: {}",
+                    source.display()
+                ),
                 &quarantine_directory,
                 &staging_directory,
                 &quarantine,
@@ -4192,7 +6019,10 @@ where
         }
         if identity_at_path(&destination).ok() != Some(expected) {
             let mut hold = failure_with_secure_rollback(
-                format!("staged destination identity does not match source: {}", destination.display()),
+                format!(
+                    "staged destination identity does not match source: {}",
+                    destination.display()
+                ),
                 &quarantine_directory,
                 &staging_directory,
                 &quarantine,
@@ -4257,10 +6087,9 @@ where
         .filter(|name| name.as_os_str() != PRIVATE_CAPTURE_MARKER)
     {
         let path = staging.join(name);
-        hook(&PrivateCleanupHookEvent::BeforeFinalDelete { path: path.clone() })
-            .map_err(|reason| {
-                PrivateCleanupHold::new(reason, [quarantine.clone(), staging.clone()])
-            })?;
+        hook(&PrivateCleanupHookEvent::BeforeFinalDelete { path: path.clone() }).map_err(
+            |reason| PrivateCleanupHold::new(reason, [quarantine.clone(), staging.clone()]),
+        )?;
         let expected = quarantine_snapshot[name];
         let file = private_cleanup_sys::open_regular_for_truncate(&staging_directory, name)
             .map_err(|error| {
@@ -4269,10 +6098,15 @@ where
                     [quarantine.clone(), staging.clone()],
                 )
             })?;
-        let opened_identity = file.metadata().map(|metadata| private_file_identity(&metadata));
+        let opened_identity = file
+            .metadata()
+            .map(|metadata| private_file_identity(&metadata));
         if opened_identity.ok() != Some(expected) {
             return Err(PrivateCleanupHold::new(
-                format!("final staged name no longer identifies the verified capture: {}", path.display()),
+                format!(
+                    "final staged name no longer identifies the verified capture: {}",
+                    path.display()
+                ),
                 [quarantine.clone(), staging.clone()],
             ));
         }
@@ -4284,7 +6118,10 @@ where
         })?;
         if identity_at_path(&path).ok() != Some(expected) {
             return Err(PrivateCleanupHold::new(
-                format!("staged name changed while its verified inode was retired: {}", path.display()),
+                format!(
+                    "staged name changed while its verified inode was retired: {}",
+                    path.display()
+                ),
                 [quarantine.clone(), staging.clone()],
             ));
         }
@@ -4307,10 +6144,8 @@ fn failure_with_secure_rollback<F>(
 where
     F: FnMut(&PrivateCleanupHookEvent) -> Result<(), String>,
 {
-    let mut hold = PrivateCleanupHold::new(
-        reason,
-        [quarantine.to_path_buf(), staging.to_path_buf()],
-    );
+    let mut hold =
+        PrivateCleanupHold::new(reason, [quarantine.to_path_buf(), staging.to_path_buf()]);
     for (name, expected) in moved_names.iter().rev() {
         let source = staging.join(name);
         let destination = quarantine.join(name);
@@ -4376,9 +6211,16 @@ fn finalize_private_capture_workspace(
             evidence_finalization.summary
         ));
     }
-    if terminal_failed.iter().any(|slot| capture_plan.private_slots.contains(slot))
-        || !capture_plan.private_slots.iter().all(|slot| terminal_completed.contains(slot))
-        || !capture_plan.private_slots.is_subset(successful_private_slots)
+    if terminal_failed
+        .iter()
+        .any(|slot| capture_plan.private_slots.contains(slot))
+        || !capture_plan
+            .private_slots
+            .iter()
+            .all(|slot| terminal_completed.contains(slot))
+        || !capture_plan
+            .private_slots
+            .is_subset(successful_private_slots)
     {
         return working.recovery_message(
             "bridge terminal summary or derivative outcomes did not prove every private capture completed successfully",
@@ -4431,8 +6273,8 @@ fn finalize_private_capture_workspace(
 /// status. `false` (the rare true-watchdog case, or a bridge that has gone
 /// fully silent) means that precondition is NOT established — the
 /// underlying call may still genuinely be in flight — so the caller must
-/// skip the poll, preserving this function's original "never risk
-/// restarting the bridge mid-USB-transaction" guarantee.
+/// skip the poll, preserving this function's "never issue another bridge
+/// request mid-USB-transaction" guarantee.
 fn drain_late_bridge_closure_for(backend: &Arc<RealLs5000>, job_id: &str) -> bool {
     const DRAIN_WINDOW: Duration = Duration::from_millis(500);
     let deadline = Instant::now() + DRAIN_WINDOW;
@@ -4459,6 +6301,29 @@ fn drain_late_bridge_closure_for(backend: &Arc<RealLs5000>, job_id: &str) -> boo
     }
 }
 
+/// Accepts only the scan-scoped event vocabulary and only when the
+/// bridge-supplied operation identity exactly matches the job this worker
+/// owns. Missing, malformed, unknown, and other-job events are all
+/// discarded before they can refresh the watchdog or mutate job state.
+fn bridge_event_belongs_to_scan_job(value: &serde_json::Value, job_id: &str) -> bool {
+    let Some(event_name) = value.get("event").and_then(|event| event.as_str()) else {
+        return false;
+    };
+    if !matches!(
+        event_name,
+        "scan.progress"
+            | "scan.frameRetrying"
+            | "scan.frameCompleted"
+            | "hardware.anomaly"
+            | "scan.frameFailed"
+            | "scan.error"
+            | "scan.completed"
+    ) {
+        return false;
+    }
+    value.pointer("/payload/jobId").and_then(|id| id.as_str()) == Some(job_id)
+}
+
 /// Worker-thread body for `RealLs5000::scan_start`, driven by bridge
 /// events instead of internal timers (mirrors `sim.rs::run_scan_job`'s
 /// overall shape). `total_frames` is fixed at the *original* requested
@@ -4473,10 +6338,11 @@ fn drain_late_bridge_closure_for(backend: &Arc<RealLs5000>, job_id: &str) -> boo
 /// (CoolscanPy's per-slot `Roll.scan` call is blocking, exactly like
 /// `Roll.preview` — zero events while it runs is normal) up to a rolling
 /// deadline, then reports an honest failure. It deliberately no longer
-/// retries by re-issuing `scan.start`: that old recovery path could itself
-/// call `BridgeClient::call()`, whose own timeout handling restarts
-/// (kills) the bridge subprocess — precisely the "never kill mid-USB-
-/// transaction" hazard this fix exists to close (see
+/// retries by re-issuing `scan.start`: that old recovery path issued another
+/// bridge request while the original hardware operation could still be in
+/// flight. Older supervision also killed on timeout; current supervision
+/// instead quarantines a still-live owner. Avoiding the second request closes
+/// both versions of the mid-USB-transaction hazard (see
 /// `HARDWARE-NOTES-20260723.md`). No test exercised that old retry path
 /// (confirmed: `scan_start_crash_mid_job_emits_feed_jam_then_recovers`
 /// only exercises the crash-handling around the *initiating*
@@ -4500,8 +6366,8 @@ fn run_real_scan_job(
     processing: ProcessingRecipe,
     output: OutputRecipe,
     overrides: std::collections::HashMap<u32, domain::FrameOverrides>,
+    output_authorities: crate::render::JobOutputAuthorities,
     capture_plan: RealCapturePlan,
-    project_directory: Option<std::path::PathBuf>,
     event_tx: mpsc::Sender<String>,
     session_epoch: u64,
     bridge_generation: u64,
@@ -4533,6 +6399,7 @@ fn run_real_scan_job(
     let processing_for_inner = processing.clone();
     let output_for_inner = output.clone();
     let overrides_for_inner = overrides.clone();
+    let output_authorities_for_inner = output_authorities.clone();
     let capture_plan_for_inner = capture_plan.clone();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -4544,8 +6411,8 @@ fn run_real_scan_job(
             processing_for_inner,
             output_for_inner,
             overrides_for_inner,
+            output_authorities_for_inner,
             capture_plan_for_inner,
-            project_directory,
             event_tx_for_inner,
             shared_progress_for_inner,
             shared_evidence_for_inner,
@@ -4609,10 +6476,11 @@ fn run_real_scan_job(
 /// (CoolscanPy's per-slot `Roll.scan` call is blocking, exactly like
 /// `Roll.preview` — zero events while it runs is normal) up to a rolling
 /// deadline, then reports an honest failure. It deliberately no longer
-/// retries by re-issuing `scan.start`: that old recovery path could itself
-/// call `BridgeClient::call()`, whose own timeout handling restarts
-/// (kills) the bridge subprocess — precisely the "never kill mid-USB-
-/// transaction" hazard this fix exists to close (see
+/// retries by re-issuing `scan.start`: that old recovery path issued another
+/// bridge request while the original hardware operation could still be in
+/// flight. Older supervision also killed on timeout; current supervision
+/// instead quarantines a still-live owner. Avoiding the second request closes
+/// both versions of the mid-USB-transaction hazard (see
 /// `HARDWARE-NOTES-20260723.md`). No test exercised that old retry path
 /// (confirmed: `scan_start_crash_mid_job_emits_feed_jam_then_recovers`
 /// only exercises the crash-handling around the *initiating*
@@ -4636,8 +6504,8 @@ fn run_real_scan_job_inner(
     processing: ProcessingRecipe,
     output: OutputRecipe,
     overrides: std::collections::HashMap<u32, domain::FrameOverrides>,
+    output_authorities: crate::render::JobOutputAuthorities,
     capture_plan: RealCapturePlan,
-    project_directory: Option<std::path::PathBuf>,
     event_tx: mpsc::Sender<String>,
     shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>)>>,
     shared_evidence: Arc<Mutex<Vec<crate::evidence_package::EvidenceFrame>>>,
@@ -4648,19 +6516,15 @@ fn run_real_scan_job_inner(
     // an unconditional bridge.call("device.status", ...) right before the
     // silence watchdog below is even armed (`silence_deadline` is not set
     // until after this point). That call is bounded only by
-    // BridgeClient's own `request_timeout`/`restart()` machinery, NOT by
+    // BridgeClient's own `request_timeout`/quarantine machinery, NOT by
     // this function's watchdog — so a slow or stuck reply from the bridge
     // here could (a) delay entry into the watchdog loop by the full
     // request_timeout, well past whatever short SCANSTUDIO_SCAN_SILENCE_
-    // DEADLINE_SECS the caller configured, and (b) trigger
-    // BridgeClient::restart() (kill + respawn the bridge subprocess) —
-    // exactly the "never kill mid-USB-transaction" hazard this whole
-    // watchdog exists to close (HARDWARE-NOTES-20260723.md), and — worse —
-    // if the killed process cannot actually be reaped (e.g. genuinely
-    // wedged in a kernel-level USB wait), `BridgeClient::restart()`'s
-    // `child.wait()` never returns, permanently parking this thread BEFORE
-    // the watchdog loop is ever reached, no matter how correct that loop's
-    // own logic is. This is the identical reasoning the Err(_) branch's own
+    // DEADLINE_SECS the caller configured, and (b) quarantine the bridge's
+    // sole process owner while the USB operation may still be in flight.
+    // Older supervision killed and synchronously reaped that owner here;
+    // current supervision correctly refuses replacement until exit is
+    // proven. This is the identical reasoning the Err(_) branch's own
     // terminal-failure path below already applies to omit ITS OWN
     // status() call (see that comment) — this fix just extends the same
     // principle to this function's entry, the one place it was missed.
@@ -4672,6 +6536,10 @@ fn run_real_scan_job_inner(
     // of information the client relied on.
 
     let total_frames = frames.len() as u32;
+    let requested_slots = frames
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
     let mut remaining: Vec<u32> = frames;
     let mut completed: Vec<u32> = Vec::new();
     let mut failed: Vec<u32> = Vec::new();
@@ -4685,6 +6553,10 @@ fn run_real_scan_job_inner(
     // for recovery.
     let mut successful_private_slots = std::collections::HashSet::<u32>::new();
     let mut observed_private_capture_paths = Vec::<std::path::PathBuf>::new();
+    // Retain at most one protocol-admission error. A hostile bridge may emit
+    // arbitrarily many duplicate or unrequested completion events; none may
+    // trigger evidence snapshots/copies or unbounded diagnostic growth.
+    let mut evidence_admission_error: Option<String> = None;
     // Collected only after a frame's bridge capture and engine receipt have
     // both succeeded. Packaging waits for terminal scan.completed below.
     let sync_progress = |completed: &[u32], failed: &[u32]| {
@@ -4761,10 +6633,18 @@ fn run_real_scan_job_inner(
             HEALTH_TIMEOUT.min(silence_deadline.saturating_duration_since(Instant::now()));
         match backend.bridge.recv_event(poll_timeout) {
             Ok(value) => {
-                // Any scan-scoped event — recognized or not — proves the
-                // bridge is actively communicating: push the silence
-                // window forward before dispatching on the event name.
-                silence_deadline = Instant::now() + backend.scan_silence_deadline;
+                // Timestamp the event as soon as this loop receives it. In
+                // particular, a frame-completion timestamp must not include
+                // the derivative/publication work performed by its arm:
+                // the bridge may already be waiting for the next frame while
+                // that engine-side work runs.
+                let event_arrived_at = Instant::now();
+                if !bridge_event_belongs_to_scan_job(&value, &job_id) {
+                    continue;
+                }
+                // Only a recognized event carrying this job's exact token
+                // proves that this operation is actively communicating.
+                silence_deadline = event_arrived_at + backend.scan_silence_deadline;
                 match value.get("event").and_then(|v| v.as_str()).unwrap_or("") {
                     "scan.progress" => {
                         let Some(payload) = value.get("payload").cloned() else {
@@ -4779,7 +6659,10 @@ fn run_real_scan_job_inner(
                             if let Some(prev) = last_resolved_at {
                                 idle_samples.push(FrameIdleSample {
                                     frame_index: progress.slot,
-                                    idle_ms: prev.elapsed().as_millis() as u64,
+                                    idle_ms: event_arrived_at
+                                        .saturating_duration_since(prev)
+                                        .as_millis()
+                                        as u64,
                                 });
                             }
                         }
@@ -4857,6 +6740,14 @@ fn run_real_scan_job_inner(
                         else {
                             continue;
                         };
+                        if !admit_evidence_frame_slot(
+                            &requested_slots,
+                            &remaining,
+                            frame_completed.slot,
+                            &mut evidence_admission_error,
+                        ) {
+                            continue;
+                        }
                         let frame_overrides = overrides.get(&frame_completed.slot);
                         let effective_output = frame_overrides
                             .and_then(|value| value.output.as_ref())
@@ -4872,69 +6763,80 @@ fn run_real_scan_job_inner(
                         // engine must not crop it a second time. Rotation and
                         // flips are different: they are derivative-only pixel
                         // geometry and still belong in the renderer.
-                        let derivative_geometry = effective_alignment.map(|value| {
-                            domain::FrameAlignment {
+                        let derivative_geometry =
+                            effective_alignment.map(|value| domain::FrameAlignment {
                                 offset_rows: 0,
                                 approved: false,
                                 derivative_transform: value.derivative_transform,
-                            }
-                        });
+                            });
 
-                        let receipt_path_validation = if frame_completed.receipt.slot
-                            != frame_completed.slot
+                        let receipt_path_validation = if let Some(working) =
+                            capture_plan.private_working_directory.as_ref()
                         {
-                            Err(EngineError::new(
-                                ErrorCode::InvalidParams,
-                                format!(
+                            working.verify_namespace()
+                        } else {
+                            Ok(())
+                        }
+                        .and_then(|()| {
+                            if frame_completed.receipt.slot != frame_completed.slot {
+                                Err(EngineError::new(
+                                    ErrorCode::InvalidParams,
+                                    format!(
                                     "bridge frameCompleted slot {} disagrees with receipt slot {}",
                                     frame_completed.slot, frame_completed.receipt.slot
                                 ),
-                            ))
-                        } else if let Some(expected) = capture_plan.expected_by_slot.get(&frame_completed.slot) {
-                            crate::render::validate_bridge_capture_receipt_paths_for_expected(
-                                &expected.rgb,
-                                frame_completed.slot,
-                                recipe.channels,
-                                std::path::Path::new(&frame_completed.receipt.rgb_path),
-                                frame_completed
-                                    .receipt
-                                    .ir_path
-                                    .as_deref()
-                                    .map(std::path::Path::new),
-                                frame_completed
-                                    .receipt
-                                    .meter_rgbi_path
-                                    .as_deref()
-                                    .map(std::path::Path::new),
-                            )
-                            .and_then(|()| {
-                                crate::render::validate_bridge_raw_export_receipt_path(
-                                    expected.raw_export.as_deref(),
+                                ))
+                            } else if let Some(expected) =
+                                capture_plan.expected_by_slot.get(&frame_completed.slot)
+                            {
+                                crate::render::validate_bridge_capture_receipt_paths_for_expected(
+                                    &expected.rgb,
+                                    frame_completed.slot,
+                                    recipe.channels,
+                                    std::path::Path::new(&frame_completed.receipt.rgb_path),
                                     frame_completed
                                         .receipt
-                                        .raw_export_path
+                                        .ir_path
                                         .as_deref()
                                         .map(std::path::Path::new),
-                                    frame_completed.slot,
+                                    frame_completed
+                                        .receipt
+                                        .meter_rgbi_path
+                                        .as_deref()
+                                        .map(std::path::Path::new),
                                 )
                                 .and_then(|()| {
                                     crate::render::validate_bridge_raw_export_receipt_path(
-                                        expected.raw_export_ir.as_deref(),
+                                        expected.raw_export.as_deref(),
                                         frame_completed
                                             .receipt
-                                            .raw_export_ir_path
+                                            .raw_export_path
                                             .as_deref()
                                             .map(std::path::Path::new),
                                         frame_completed.slot,
                                     )
+                                    .and_then(|()| {
+                                        crate::render::validate_bridge_raw_export_receipt_path(
+                                            expected.raw_export_ir.as_deref(),
+                                            frame_completed
+                                                .receipt
+                                                .raw_export_ir_path
+                                                .as_deref()
+                                                .map(std::path::Path::new),
+                                            frame_completed.slot,
+                                        )
+                                    })
                                 })
-                            })
-                        } else {
-                            Err(EngineError::new(
-                                ErrorCode::InvalidParams,
-                                format!("bridge completed unplanned frame {}", frame_completed.slot),
-                            ))
-                        };
+                            } else {
+                                Err(EngineError::new(
+                                    ErrorCode::InvalidParams,
+                                    format!(
+                                        "bridge completed unplanned frame {}",
+                                        frame_completed.slot
+                                    ),
+                                ))
+                            }
+                        });
                         if let Err(error) = receipt_path_validation {
                             // The bridge says hardware captured this frame,
                             // but an unexpected file path is never safe to
@@ -4960,7 +6862,7 @@ fn run_real_scan_job_inner(
                             }
                             sync_progress(&completed, &failed);
                             emit_frame_progress(&completed, &failed, &remaining);
-                            last_resolved_at = Some(Instant::now());
+                            last_resolved_at = Some(event_arrived_at);
                             continue;
                         }
 
@@ -4977,12 +6879,23 @@ fn run_real_scan_job_inner(
                             &frame_completed.receipt,
                         );
                         if let Ok(mut evidence) = shared_evidence.lock() {
-                            let receipt_output = crate::render::receipt_output_recipe(effective_output);
+                            let receipt_output =
+                                crate::render::receipt_output_recipe(effective_output);
                             evidence.push(crate::evidence_package::EvidenceFrame {
                                 frame_index: frame_completed.slot,
-                                rgb_path: std::path::PathBuf::from(&frame_completed.receipt.rgb_path),
-                                ir_path: frame_completed.receipt.ir_path.as_ref().map(std::path::PathBuf::from),
-                                meter_path: frame_completed.receipt.meter_rgbi_path.as_ref().map(std::path::PathBuf::from),
+                                rgb_path: std::path::PathBuf::from(
+                                    &frame_completed.receipt.rgb_path,
+                                ),
+                                ir_path: frame_completed
+                                    .receipt
+                                    .ir_path
+                                    .as_ref()
+                                    .map(std::path::PathBuf::from),
+                                meter_path: frame_completed
+                                    .receipt
+                                    .meter_rgbi_path
+                                    .as_ref()
+                                    .map(std::path::PathBuf::from),
                                 bridge_receipt: serde_json::to_value(&frame_completed.receipt)
                                     .expect("BridgeScanReceipt must serialize"),
                                 engine_receipt: serde_json::json!({
@@ -4995,29 +6908,113 @@ fn run_real_scan_job_inner(
                                     },
                                     "derivativeOutcome": {"status": "pending"}
                                 }),
-                                attempts_root: frame_completed.receipt.attempts_root.as_ref().map(std::path::PathBuf::from),
+                                attempts_root: frame_completed
+                                    .receipt
+                                    .attempts_root
+                                    .as_ref()
+                                    .map(std::path::PathBuf::from),
                             });
                         }
-                        let derivative = crate::render::render_derivative_from_archive_with_processing(
-                            std::path::Path::new(&frame_completed.receipt.rgb_path),
-                            frame_completed.slot,
-                            &effective_processing,
-                            effective_output,
-                            Some(frame_completed.receipt.storage_transform.as_str()),
-                            None,
-                            // The driver session already applied the preview's
-                            // spacing offset while positioning this real
-                            // frame. Reusing that transport offset as a pixel
-                            // crop would shift the completed raster twice.
-                            None,
-                            derivative_geometry.as_ref(),
-                            nikonlook_exposure_10ns_from_receipt(&frame_completed.receipt.exposure),
-                            frame_completed.receipt.dpi,
-                        );
+                        let mut stable_snapshot_paths = Vec::new();
+                        let derivative = (|| {
+                            let working = capture_plan
+                                .private_working_directory
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    EngineError::new(
+                                        ErrorCode::InvalidParams,
+                                        "real bridge publication requires a held private capture workspace",
+                                    )
+                                    .with_recoverable(true)
+                                })?;
+                            let mut sources = StableBridgeInputs::capture(
+                                working,
+                                &frame_completed.receipt,
+                                effective_output,
+                            )?;
+                            stable_snapshot_paths = sources.paths();
+                            let publication = output_authorities
+                                .frame(frame_completed.slot)
+                                .and_then(|authorities| {
+                                    crate::render::render_derivative_from_archive_with_processing_authorized(
+                                        sources.rgb_path_or(std::path::Path::new(
+                                            &frame_completed.receipt.rgb_path,
+                                        )),
+                                        // IR and meter are archive-retention sources,
+                                        // not derivative prerequisites. Archive-off
+                                        // scans deliberately pass neither sidecar.
+                                        sources.ir_path(),
+                                        sources.meter_path(),
+                                        frame_completed.slot,
+                                        &effective_processing,
+                                        effective_output,
+                                        Some(frame_completed.receipt.storage_transform.as_str()),
+                                        None,
+                                        // The driver session already applied the preview's
+                                        // spacing offset while positioning this real
+                                        // frame. Reusing that transport offset as a pixel
+                                        // crop would shift the completed raster twice.
+                                        None,
+                                        derivative_geometry.as_ref(),
+                                        nikonlook_exposure_10ns_from_receipt(&frame_completed.receipt.exposure),
+                                        frame_completed.receipt.dpi,
+                                        authorities,
+                                    )
+                                    .and_then(|written| {
+                                        crate::render::publish_real_raw_export_authorized(
+                                            sources.raw_path(),
+                                            sources.raw_ir_path(),
+                                            authorities,
+                                        )
+                                        .map(|raw_paths| (written, raw_paths))
+                                    })
+                                });
+                            let stability = sources.verify_unchanged(working);
+                            match (publication, stability) {
+                                (_, Err(error)) => Err(error),
+                                (result, Ok(())) => result,
+                            }
+                        })()
+                        .and_then(|(written, raw_paths)| {
+                            let metadata_bindings = output_authorities
+                                .project_root()
+                                .map(|root| {
+                                    crate::exiftool::bind_metadata_output_publications_at(
+                                        root.directory_handle(),
+                                        root.requested_path(),
+                                        root.canonical_path(),
+                                        &written.metadata_publications,
+                                    )
+                                })
+                                .transpose()?;
+                            Ok((written, raw_paths, metadata_bindings))
+                        });
 
                         match derivative {
-                            Ok(written) => {
+                            Ok((written, raw_paths, metadata_bindings)) => {
                                 let mut receipt = base_receipt;
+                                if effective_output.archive.enabled {
+                                    let authorities =
+                                        output_authorities.frame(frame_completed.slot).expect(
+                                            "successful authorized render retains frame authority",
+                                        );
+                                    receipt.rgb_path = authorities
+                                        .archive
+                                        .as_ref()
+                                        .map(|output| output.final_path().display().to_string());
+                                    receipt.ir_path = frame_completed
+                                        .receipt
+                                        .ir_path
+                                        .as_ref()
+                                        .and_then(|_| authorities.archive_ir.as_ref())
+                                        .map(|output| output.final_path().display().to_string());
+                                    receipt.meter_rgbi_path = frame_completed
+                                        .receipt
+                                        .meter_rgbi_path
+                                        .as_ref()
+                                        .and_then(|_| authorities.archive_meter.as_ref())
+                                        .map(|output| output.final_path().display().to_string());
+                                }
                                 receipt.outputs = Some(domain::WrittenOutputs {
                                     archive_path: written
                                         .archive_path
@@ -5032,11 +7029,16 @@ fn run_real_scan_job_inner(
                                     raw_negative_path: frame_completed
                                         .receipt
                                         .raw_export_path
-                                        .clone(),
+                                        .as_ref()
+                                        .and(raw_paths.0.as_ref())
+                                        .map(|path| path.display().to_string()),
                                     raw_negative_ir_path: frame_completed
                                         .receipt
                                         .raw_export_ir_path
-                                        .clone(),
+                                        .as_ref()
+                                        .and(raw_paths.1.as_ref())
+                                        .map(|path| path.display().to_string()),
+                                    metadata_bindings,
                                     derivative_transform: written.derivative_transform,
                                 });
                                 // Which nikonlook bundle/path/gains actually
@@ -5045,11 +7047,15 @@ fn run_real_scan_job_inner(
                                 receipt.nikonlook = written.nikonlook;
                                 receipt.auto_crop = written.auto_crop;
                                 if let Ok(mut evidence) = shared_evidence.lock() {
-                                    if let Some(frame) = evidence.iter_mut().rev().find(|value| value.frame_index == frame_completed.slot) {
-                                        frame.engine_receipt["receipt"] = serde_json::to_value(&receipt)
-                                            .expect("ScanReceipt must serialize");
-                                        frame.engine_receipt["derivativeOutcome"] =
-                                            serde_json::json!({"status": "completed", "outputs": receipt.outputs});
+                                    if let Some(frame) = evidence
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|value| value.frame_index == frame_completed.slot)
+                                    {
+                                        frame.engine_receipt["receipt"] =
+                                            serde_json::to_value(&receipt)
+                                                .expect("ScanReceipt must serialize");
+                                        frame.engine_receipt["derivativeOutcome"] = serde_json::json!({"status": "completed", "outputs": receipt.outputs});
                                     }
                                 }
                                 // A receipt persistence failure here does not
@@ -5071,13 +7077,17 @@ fn run_real_scan_job_inner(
                                 // SessionModel.applyFrameState already stores
                                 // per frame regardless of state and already
                                 // logs as a diagnostic.
-                                let manifest_persist_error = match &project_directory {
-                                    Some(directory) => crate::manifest::persist_frame_receipt(
-                                        directory,
-                                        frame_completed.slot,
-                                        &receipt,
-                                    )
-                                    .err(),
+                                let manifest_persist_error = match output_authorities.project_root()
+                                {
+                                    Some(project_root) => {
+                                        crate::manifest::persist_frame_receipt_at(
+                                            project_root.directory_handle(),
+                                            project_root.canonical_path(),
+                                            frame_completed.slot,
+                                            &receipt,
+                                        )
+                                        .err()
+                                    }
                                     None => None,
                                 };
                                 if let Some(err) = &manifest_persist_error {
@@ -5085,7 +7095,11 @@ fn run_real_scan_job_inner(
                                         "scanstudio-engine: failed to persist frame receipt to manifest: {err}"
                                     );
                                     if let Ok(mut evidence) = shared_evidence.lock() {
-                                        if let Some(frame) = evidence.iter_mut().rev().find(|value| value.frame_index == frame_completed.slot) {
+                                        if let Some(frame) = evidence
+                                            .iter_mut()
+                                            .rev()
+                                            .find(|value| value.frame_index == frame_completed.slot)
+                                        {
                                             frame.engine_receipt["manifestPersistence"] = serde_json::json!({
                                                 "status": "failed",
                                                 "error": ErrorPayload::from(err),
@@ -5101,7 +7115,9 @@ fn run_real_scan_job_inner(
                                         frame_index: frame_completed.slot,
                                         state: FrameState::Completed,
                                         attempt: 1,
-                                        error: manifest_persist_error.as_ref().map(ErrorPayload::from),
+                                        error: manifest_persist_error
+                                            .as_ref()
+                                            .map(ErrorPayload::from),
                                     },
                                 );
                                 emit(
@@ -5117,31 +7133,63 @@ fn run_real_scan_job_inner(
                                 completed.push(frame_completed.slot);
                                 if capture_plan.private_slots.contains(&frame_completed.slot) {
                                     successful_private_slots.insert(frame_completed.slot);
-                                    observed_private_capture_paths.push(std::path::PathBuf::from(&frame_completed.receipt.rgb_path));
+                                    observed_private_capture_paths.push(std::path::PathBuf::from(
+                                        &frame_completed.receipt.rgb_path,
+                                    ));
                                     if let Some(path) = frame_completed.receipt.ir_path.as_ref() {
-                                        observed_private_capture_paths.push(std::path::PathBuf::from(path));
+                                        observed_private_capture_paths
+                                            .push(std::path::PathBuf::from(path));
                                     }
-                                    if let Some(path) = frame_completed.receipt.meter_rgbi_path.as_ref() {
-                                        observed_private_capture_paths.push(std::path::PathBuf::from(path));
+                                    if let Some(path) =
+                                        frame_completed.receipt.meter_rgbi_path.as_ref()
+                                    {
+                                        observed_private_capture_paths
+                                            .push(std::path::PathBuf::from(path));
                                     }
+                                    if let Some(path) =
+                                        frame_completed.receipt.raw_export_path.as_ref()
+                                    {
+                                        observed_private_capture_paths
+                                            .push(std::path::PathBuf::from(path));
+                                    }
+                                    if let Some(path) =
+                                        frame_completed.receipt.raw_export_ir_path.as_ref()
+                                    {
+                                        observed_private_capture_paths
+                                            .push(std::path::PathBuf::from(path));
+                                    }
+                                    observed_private_capture_paths.extend(stable_snapshot_paths);
                                 }
                             }
                             Err(err) => {
-                                let err = if capture_plan.private_slots.contains(&frame_completed.slot) {
-                                    if let Some(working) = capture_plan.private_working_directory.as_ref() {
-                                        EngineError::new(
-                                            err.code,
-                                            format!("{}; {}", err.message, working.recovery_message("derivative rendering failed")),
-                                        )
-                                        .with_recoverable(err.recoverable())
+                                let err =
+                                    if capture_plan.private_slots.contains(&frame_completed.slot) {
+                                        if let Some(working) =
+                                            capture_plan.private_working_directory.as_ref()
+                                        {
+                                            EngineError::new(
+                                                err.code,
+                                                format!(
+                                                    "{}; {}",
+                                                    err.message,
+                                                    working.recovery_message(
+                                                        "derivative rendering failed"
+                                                    )
+                                                ),
+                                            )
+                                            .with_recoverable(err.recoverable())
+                                        } else {
+                                            err
+                                        }
                                     } else {
                                         err
-                                    }
-                                } else {
-                                    err
-                                };
+                                    };
                                 if let Ok(mut evidence) = shared_evidence.lock() {
-                                    if let Some(frame) = evidence.iter_mut().rev().find(|value| value.frame_index == frame_completed.slot) {
+                                    if let Some(frame) = evidence
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|value| value.frame_index == frame_completed.slot)
+                                    {
                                         frame.engine_receipt["derivativeOutcome"] = serde_json::json!({
                                             "status": "failed",
                                             "error": ErrorPayload::from(&err),
@@ -5170,7 +7218,7 @@ fn run_real_scan_job_inner(
                         }
                         sync_progress(&completed, &failed);
                         emit_frame_progress(&completed, &failed, &remaining);
-                        last_resolved_at = Some(Instant::now());
+                        last_resolved_at = Some(event_arrived_at);
                     }
                     "hardware.anomaly" => {
                         // BRIDGE.md's SAFE-02 anomaly halt (10-08: this
@@ -5247,7 +7295,7 @@ fn run_real_scan_job_inner(
                         }
                         sync_progress(&completed, &failed);
                         emit_frame_progress(&completed, &failed, &remaining);
-                        last_resolved_at = Some(Instant::now());
+                        last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.frameFailed" => {
                         // BRIDGE.md "scan.frameFailed (additive,
@@ -5304,7 +7352,7 @@ fn run_real_scan_job_inner(
                         }
                         sync_progress(&completed, &failed);
                         emit_frame_progress(&completed, &failed, &remaining);
-                        last_resolved_at = Some(Instant::now());
+                        last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.error" => {
                         // BRIDGE.md "scan.error (additive, 2026-07-23)":
@@ -5356,15 +7404,18 @@ fn run_real_scan_job_inner(
                                 "processing": processing,
                                 "output": output,
                             });
-                            let package_finalization = finalize_evidence_status_after_bridge_terminal(
-                                &output,
-                                &overrides,
-                                &capture_plan,
-                                &job_id,
-                                &shared_evidence,
-                                &settings,
-                                Some(&error.message),
-                            );
+                            let evidence_terminal_error = evidence_admission_error
+                                .as_deref()
+                                .map(|admission| format!("{}; {admission}", error.message))
+                                .unwrap_or_else(|| error.message.clone());
+                            let package_finalization =
+                                finalize_evidence_status_after_bridge_terminal(
+                                    &output_authorities,
+                                    &job_id,
+                                    &shared_evidence,
+                                    &settings,
+                                    Some(&evidence_terminal_error),
+                                );
                             if let Some(working) = capture_plan.private_working_directory.as_ref() {
                                 format!("{}; {}", package_finalization.summary, working.recovery_message("scan.error ended this engine job before derivative/terminal reconciliation"))
                             } else {
@@ -5400,10 +7451,9 @@ fn run_real_scan_job_inner(
                         // here directly: scan.error can (rarely) correlate
                         // with a genuinely stuck bridge call (the soft-
                         // timeout watchdog case), and a status() request's
-                        // own timeout path can itself restart (kill) the
-                        // bridge subprocess — the "never kill mid-USB-
-                        // transaction" hazard this codepath exists to
-                        // avoid. drain_late_bridge_closure_for's return
+                        // own timeout path can quarantine the only bridge
+                        // subprocess while its USB operation is still in
+                        // flight. drain_late_bridge_closure_for's return
                         // value distinguishes the two: seeing this job's
                         // own real terminal event during the drain (the
                         // common case — the same worker thread's `finally`
@@ -5418,11 +7468,7 @@ fn run_real_scan_job_inner(
                         // flight) skips the poll, preserving the original
                         // guarantee.
                         if mapped_code == ErrorCode::NotConnected {
-                            backend.invalidate_async_session(
-                                session_epoch,
-                                &event_tx,
-                                None,
-                            );
+                            backend.invalidate_async_session(session_epoch, &event_tx, None);
                         } else if observed_bridge_terminal {
                             backend.emit_terminal_status_or_invalidate(
                                 session_epoch,
@@ -5456,16 +7502,13 @@ fn run_real_scan_job_inner(
                             "processing": processing,
                             "output": output,
                         });
-                        let package_finalization =
-                            finalize_evidence_status_after_bridge_terminal(
-                                &output,
-                                &overrides,
-                                &capture_plan,
-                                &job_id,
-                                &shared_evidence,
-                                &settings,
-                                None,
-                            );
+                        let package_finalization = finalize_evidence_status_after_bridge_terminal(
+                            &output_authorities,
+                            &job_id,
+                            &shared_evidence,
+                            &settings,
+                            evidence_admission_error.as_deref(),
+                        );
                         let private_capture_status = finalize_private_capture_workspace(
                             &capture_plan,
                             &completed_after_derivatives,
@@ -5474,7 +7517,10 @@ fn run_real_scan_job_inner(
                             &observed_private_capture_paths,
                             &package_finalization,
                         );
-                        let evidence_package_status = if capture_plan.private_working_directory.is_some() {
+                        let evidence_package_status = if capture_plan
+                            .private_working_directory
+                            .is_some()
+                        {
                             format!("{}; {private_capture_status}", package_finalization.summary)
                         } else {
                             package_finalization.summary
@@ -5521,17 +7567,13 @@ fn run_real_scan_job_inner(
             Err(_) => {
                 let bridge_healthy = backend.bridge.is_healthy();
                 let bridge_generation_current = backend.bridge.current_generation();
-                let bridge_generation_lost =
-                    bridge_generation_current != bridge_generation;
+                let bridge_generation_lost = bridge_generation_current != bridge_generation;
                 // Silence while the bridge process is alive is the NORMAL
                 // shape of a blocking CoolscanPy fine-scan pass (mirrors
                 // acquire_thumbnails's own tolerance — see its doc
                 // comment) — keep waiting until the process dies or the
                 // rolling deadline above is genuinely exhausted.
-                if Instant::now() < silence_deadline
-                    && bridge_healthy
-                    && !bridge_generation_lost
-                {
+                if Instant::now() < silence_deadline && bridge_healthy && !bridge_generation_lost {
                     continue;
                 }
                 // A dead bridge or an exhausted silence deadline is a
@@ -5543,12 +7585,11 @@ fn run_real_scan_job_inner(
                 // its in-flight USB work. HARDWARE-NOTES-20260723.md:
                 // "NEVER kill a process mid-USB-transaction: half-read
                 // bulk pipes poison subsequent sessions (libusb -8 desync)
-                // until power cycle" — BridgeClient::call()'s own timeout
-                // path restarts (kills+respawns) the bridge subprocess, so
-                // this branch deliberately never calls it again once it
-                // has decided to fail the job (recv_event, used above for
-                // polling, never triggers a restart on its own timeout —
-                // only call() does).
+                // until power cycle" — BridgeClient::call()'s timeout path
+                // now quarantines rather than replaces a still-live owner,
+                // but this branch deliberately never sends it another
+                // request once it has decided to fail the job. recv_event,
+                // used above for polling, does not mutate process ownership.
                 let ownership_lost = !bridge_healthy || bridge_generation_lost;
                 let connection_evidence = format!(
                     "sessionEpoch={session_epoch}; bridgeGenerationStart={bridge_generation}; bridgeGenerationCurrent={bridge_generation_current}; bridgeHealthy={bridge_healthy}"
@@ -5593,11 +7634,7 @@ fn run_real_scan_job_inner(
                 if ownership_lost {
                     // Pure in-process ownership transition: no device call,
                     // process restart, automatic open, or motion retry.
-                    backend.invalidate_async_session(
-                        session_epoch,
-                        &event_tx,
-                        None,
-                    );
+                    backend.invalidate_async_session(session_epoch, &event_tx, None);
                 }
                 return;
             }
@@ -5614,6 +7651,443 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
+    fn evidence_frame(frame_index: u32) -> crate::evidence_package::EvidenceFrame {
+        crate::evidence_package::EvidenceFrame {
+            frame_index,
+            rgb_path: std::path::PathBuf::from(format!("frame-{frame_index}.tif")),
+            ir_path: None,
+            meter_path: None,
+            bridge_receipt: json!({"slot": frame_index}),
+            engine_receipt: json!({"frameIndex": frame_index}),
+            attempts_root: None,
+        }
+    }
+
+    #[test]
+    fn bridge_line_reader_drains_oversized_records_without_losing_the_next_record() {
+        let bytes = b"0123456789\n{\"id\":1}\n";
+        let mut reader = std::io::BufReader::with_capacity(3, std::io::Cursor::new(bytes));
+
+        assert_eq!(
+            read_bounded_bridge_line(&mut reader, 8).unwrap(),
+            BoundedBridgeLine::Oversized
+        );
+        assert_eq!(
+            read_bounded_bridge_line(&mut reader, 16).unwrap(),
+            BoundedBridgeLine::Line(b"{\"id\":1}\n".to_vec())
+        );
+        assert_eq!(
+            read_bounded_bridge_line(&mut reader, 16).unwrap(),
+            BoundedBridgeLine::Eof
+        );
+
+        let mut exact = std::io::Cursor::new(b"1234567\n");
+        assert_eq!(
+            read_bounded_bridge_line(&mut exact, 8).unwrap(),
+            BoundedBridgeLine::Line(b"1234567\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn evidence_package_coverage_rejects_a_successful_subset() {
+        let observed = vec![evidence_frame(1)];
+        let (selected, error) = select_evidence_frames_for_package(&[1, 2], &observed);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|frame| frame.frame_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("capture evidence is missing eligible frame receipts [2]")
+        );
+    }
+
+    #[test]
+    fn evidence_package_coverage_deduplicates_receipts_and_refuses_complete() {
+        let observed = vec![evidence_frame(2), evidence_frame(1), evidence_frame(1)];
+        let (selected, error) = select_evidence_frames_for_package(&[1, 2], &observed);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|frame| frame.frame_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("capture evidence contains duplicate frame receipts [1]")
+        );
+    }
+
+    #[test]
+    fn evidence_slot_admission_rejects_duplicates_and_unrequested_slots_boundedly() {
+        let requested = [1_u32, 2].into_iter().collect();
+        let remaining = vec![2_u32];
+        let mut error = None;
+
+        assert!(!admit_evidence_frame_slot(
+            &requested, &remaining, 1, &mut error
+        ));
+        let first = error
+            .clone()
+            .expect("duplicate admission records one error");
+        assert!(first.contains("duplicate or already-resolved"));
+        assert!(!admit_evidence_frame_slot(
+            &requested, &remaining, 999, &mut error
+        ));
+        assert_eq!(
+            error.as_deref(),
+            Some(first.as_str()),
+            "hostile event floods retain only the first bounded diagnostic"
+        );
+        assert!(admit_evidence_frame_slot(
+            &requested, &remaining, 2, &mut error
+        ));
+    }
+
+    #[cfg(unix)]
+    fn private_workspace_test_root(label: &str) -> std::path::PathBuf {
+        let token = private_capture_workspace_token().expect("test workspace token");
+        let root =
+            std::env::temp_dir().join(format!("scanstudio-private-workspace-test-{label}-{token}"));
+        std::fs::create_dir(&root).expect("create private workspace test root");
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_workspace_ignores_precreated_predictable_parent_symlink() {
+        use std::os::unix::fs::{symlink, MetadataExt as _};
+
+        let test_root = private_workspace_test_root("parent-link");
+        let outside = test_root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside sentinel").unwrap();
+        let legacy_parent = test_root.join("scanstudio-engine-capture-work");
+        symlink(&outside, &legacy_parent).unwrap();
+
+        let working = PrivateCaptureWorkingDirectory::create_in_with_hook(&test_root, |_| Ok(()))
+            .expect("cryptorandom workspace creation must not traverse the legacy parent link");
+
+        let canonical_test_root = std::fs::canonicalize(&test_root).unwrap();
+        assert_eq!(working.root.parent(), Some(canonical_test_root.as_path()));
+        assert_ne!(working.root.parent(), Some(legacy_parent.as_path()));
+        assert_eq!(
+            std::fs::metadata(&working.root).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside sentinel");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            1,
+            "workspace creation must not add any outside entry"
+        );
+
+        let workspace_root = working.root.clone();
+        drop(working);
+        std::fs::remove_file(workspace_root.join(PRIVATE_CAPTURE_MARKER)).unwrap();
+        std::fs::remove_dir(&workspace_root).unwrap();
+        std::fs::remove_file(&legacy_parent).unwrap();
+        std::fs::remove_file(&sentinel).unwrap();
+        std::fs::remove_dir(&outside).unwrap();
+        std::fs::remove_dir(&test_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_workspace_swap_before_marker_is_typed_and_never_writes_outside() {
+        use std::os::unix::fs::symlink;
+
+        let test_root = private_workspace_test_root("swap");
+        let outside = test_root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside sentinel").unwrap();
+        let moved = test_root.join("moved-engine-workspace");
+        let mut swapped_path = None;
+
+        let error = PrivateCaptureWorkingDirectory::create_in_with_hook(&test_root, |event| {
+            let PrivateWorkspaceCreateHookEvent::DirectoryOpened { path } = event;
+            std::fs::rename(path, &moved).unwrap();
+            symlink(&outside, path).unwrap();
+            swapped_path = Some(path.clone());
+            Ok(())
+        })
+        .expect_err("namespace replacement must be refused before bridge access");
+
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("authority changed"));
+        assert!(error.message.contains("HOLD"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside sentinel");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            1,
+            "handle-relative marker creation must not add an outside entry"
+        );
+        assert!(!outside.join(PRIVATE_CAPTURE_MARKER).exists());
+
+        std::fs::remove_file(swapped_path.expect("hook captured workspace path")).unwrap();
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+        assert!(moved.join(PRIVATE_CAPTURE_MARKER).is_file());
+        std::fs::remove_file(moved.join(PRIVATE_CAPTURE_MARKER)).unwrap();
+        std::fs::remove_dir(&moved).unwrap();
+        std::fs::remove_file(&sentinel).unwrap();
+        std::fs::remove_dir(&outside).unwrap();
+        std::fs::remove_dir(&test_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unused_private_workspace_rollback_is_recovery_held_without_identity_bound_unlink() {
+        let test_root = private_workspace_test_root("unused-rollback");
+        let working = PrivateCaptureWorkingDirectory::create_in_with_hook(&test_root, |_| Ok(()))
+            .expect("create private workspace");
+        let workspace_root = working.root.clone();
+
+        let error = working
+            .rollback_unused()
+            .expect_err("Unix must preserve even marker-only workspaces without exact deletion");
+
+        assert!(
+            error.message.contains("HOLD") && error.message.contains("preserving"),
+            "{error:?}"
+        );
+        assert!(workspace_root.is_dir());
+        assert_eq!(
+            std::fs::read(workspace_root.join(PRIVATE_CAPTURE_MARKER))
+                .unwrap()
+                .len(),
+            32
+        );
+        std::fs::remove_file(workspace_root.join(PRIVATE_CAPTURE_MARKER)).unwrap();
+        std::fs::remove_dir(&workspace_root).unwrap();
+        std::fs::remove_dir(&test_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unused_private_workspace_rollback_preserves_unaccounted_content() {
+        let test_root = private_workspace_test_root("unused-foreign");
+        let working = PrivateCaptureWorkingDirectory::create_in_with_hook(&test_root, |_| Ok(()))
+            .expect("create private workspace");
+        let workspace_root = working.root.clone();
+        let foreign = workspace_root.join("foreign.txt");
+        std::fs::write(&foreign, b"foreign content").unwrap();
+
+        let error = working
+            .rollback_unused()
+            .expect_err("unaccounted content must force a recovery hold");
+
+        assert!(error.message.contains("recovery-held"), "{error:?}");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign content");
+        assert!(workspace_root.join(PRIVATE_CAPTURE_MARKER).is_file());
+        std::fs::remove_dir_all(&workspace_root).unwrap();
+        std::fs::remove_dir(&test_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_and_pre_send_failures_both_preserve_resources_without_unix_exact_delete() {
+        let project = private_workspace_test_root("scan-start-boundary");
+        let archive = project.join("archive");
+        std::fs::create_dir(&archive).unwrap();
+        let mut output = OutputRecipe::default();
+        output.archive.destination = archive.display().to_string();
+        output.positive.enabled = false;
+        output.preview.enabled = false;
+        output.raw_export.enabled = false;
+        let recipe = CaptureRecipe::default();
+        let overrides = std::collections::HashMap::new();
+        let mut authorities = crate::render::acquire_job_output_authorities(
+            Some(&project),
+            &[1],
+            &recipe,
+            &output,
+            &overrides,
+        )
+        .unwrap();
+        let job_id = "ambiguous-start-boundary-test";
+        authorities.reserve_evidence_packages(job_id).unwrap();
+        let package_path = authorities.reserved_evidence_packages()[0]
+            .final_path()
+            .to_path_buf();
+        let mut plan = build_real_capture_plan(&[1], &recipe, &output, &overrides).unwrap();
+        let workspace_path = plan
+            .private_working_directory
+            .as_ref()
+            .unwrap()
+            .root
+            .clone();
+
+        let held_error = with_ambiguous_scan_start_recovery_holds(
+            EngineError::new(ErrorCode::Internal, "malformed successful response"),
+            &authorities,
+            &plan,
+            "scan.start may already have been accepted",
+        );
+        assert!(!held_error.recoverable());
+        assert!(held_error.message.contains("recovery-held"));
+        assert!(workspace_path.is_dir());
+        assert!(package_path.is_dir());
+        assert!(plan.private_working_directory.is_some());
+        assert_eq!(authorities.reserved_evidence_packages().len(), 1);
+
+        let cleanup_error = with_pre_motion_scan_cleanup(
+            EngineError::new(
+                ErrorCode::InvalidParams,
+                "test-only proven pre-send refusal",
+            ),
+            &mut authorities,
+            Some(&mut plan),
+        );
+        assert!(
+            cleanup_error.message.starts_with(
+                "test-only proven pre-send refusal; pre-motion cleanup was incomplete"
+            ),
+            "{cleanup_error:?}"
+        );
+        assert!(cleanup_error.message.contains("HOLD"));
+        assert!(!cleanup_error.recoverable());
+        assert!(workspace_path.is_dir());
+        assert!(package_path.is_dir());
+        assert!(plan.private_working_directory.is_none());
+        assert!(authorities.reserved_evidence_packages().is_empty());
+
+        drop(plan);
+        drop(authorities);
+        std::fs::remove_dir_all(&project).unwrap();
+    }
+
+    #[test]
+    fn real_output_authorities_ignore_unmapped_capture_overrides() {
+        let mut output = OutputRecipe::default();
+        output.preview.enabled = false;
+        let processing = ProcessingRecipe {
+            autofocus_each_frame: false,
+            ..ProcessingRecipe::default()
+        };
+        let alignment = domain::FrameAlignment::approved(17);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            4,
+            domain::FrameOverrides {
+                capture: Some(CaptureRecipe {
+                    channels: Channels::Rgb,
+                    ..CaptureRecipe::default()
+                }),
+                processing: Some(processing.clone()),
+                output: Some(output.clone()),
+                alignment: Some(alignment.clone()),
+            },
+        );
+
+        let authority_overrides = real_batch_output_authority_overrides(&overrides);
+        let values = authority_overrides
+            .get(&4)
+            .expect("frame override retained");
+        assert_eq!(
+            values.capture, None,
+            "the real bridge receives the batch capture recipe, so destination authority must too"
+        );
+        assert_eq!(values.processing.as_ref(), Some(&processing));
+        assert_eq!(values.output.as_ref(), Some(&output));
+        assert_eq!(values.alignment.as_ref(), Some(&alignment));
+        assert!(
+            overrides.get(&4).unwrap().capture.is_some(),
+            "authority sanitization must not erase capture provenance passed to the worker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_bridge_source_rejects_a_same_identity_rewrite_between_hash_and_copy() {
+        let test_root = private_workspace_test_root("source-rewrite");
+        let working = PrivateCaptureWorkingDirectory::create_in_with_hook(&test_root, |_| Ok(()))
+            .expect("private workspace");
+        let source = working.root.join("capture.tif");
+        std::fs::write(&source, b"bridge-source-v1").unwrap();
+
+        let error = StableBridgeSource::capture_with_hook(&working, &source, "RGB", |event| {
+            let StableBridgeSourceHookEvent::BeforeSnapshotCopy { source } = event;
+            std::fs::write(source, b"bridge-source-v2").unwrap();
+            Ok(())
+        })
+        .expect_err("a same-length rewrite between the two reads must be detected");
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("SHA-256 changed"), "{error:?}");
+
+        let workspace_root = working.root.clone();
+        drop(working);
+        std::fs::remove_dir_all(workspace_root).unwrap();
+        std::fs::remove_dir(test_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_bridge_snapshot_isolated_from_source_and_hash_checked_after_publication() {
+        let test_root = private_workspace_test_root("snapshot-hash");
+        let working = PrivateCaptureWorkingDirectory::create_in_with_hook(&test_root, |_| Ok(()))
+            .expect("private workspace");
+        let source = working.root.join("capture.tif");
+        std::fs::write(&source, b"bridge-source-v1").unwrap();
+        let mut stable =
+            StableBridgeSource::capture(&working, &source, "RGB").expect("stable source snapshot");
+
+        std::fs::write(&source, b"bridge-source-v2").unwrap();
+        assert_eq!(
+            std::fs::read(&stable.path).unwrap(),
+            b"bridge-source-v1",
+            "renderer input must be isolated from later bridge writes"
+        );
+        stable
+            .verify_unchanged(&working)
+            .expect("unchanged snapshot verifies");
+
+        std::fs::write(&stable.path, b"bridge-source-v2").unwrap();
+        let error = stable
+            .verify_unchanged(&working)
+            .expect_err("post-publication snapshot mutation must fail");
+        assert!(error.message.contains("content or identity changed"));
+
+        let workspace_root = working.root.clone();
+        drop(stable);
+        drop(working);
+        std::fs::remove_dir_all(workspace_root).unwrap();
+        std::fs::remove_dir(test_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_bridge_snapshot_rejects_a_same_name_identity_replacement() {
+        let test_root = private_workspace_test_root("snapshot-identity");
+        let working = PrivateCaptureWorkingDirectory::create_in_with_hook(&test_root, |_| Ok(()))
+            .expect("private workspace");
+        let source = working.root.join("capture.tif");
+        std::fs::write(&source, b"bridge-source-v1").unwrap();
+        let mut stable =
+            StableBridgeSource::capture(&working, &source, "RGB").expect("stable source snapshot");
+        let displaced = working.root.join("displaced-stable-source");
+        std::fs::rename(&stable.path, &displaced).unwrap();
+        std::fs::write(&stable.path, b"bridge-source-v1").unwrap();
+
+        let error = stable
+            .verify_unchanged(&working)
+            .expect_err("same-name replacement must not inherit the held identity");
+        assert!(error.message.contains("no longer identifies"));
+
+        let workspace_root = working.root.clone();
+        drop(stable);
+        drop(working);
+        std::fs::remove_dir_all(workspace_root).unwrap();
+        std::fs::remove_dir(test_root).unwrap();
+    }
+
     fn capabilities(capacity: Option<u32>, frame_control: bool) -> BridgeCapabilities {
         BridgeCapabilities {
             ir_channel: true,
@@ -5629,9 +8103,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_real_scan_guard_clears_only_its_own_job() {
+        let active = Arc::new(Mutex::new(Some("job-1".to_string())));
+        let guard = ActiveRealScanGuard {
+            active: Arc::clone(&active),
+            job_id: "job-1".to_string(),
+            clear_on_drop: true,
+        };
+        drop(guard);
+        assert_eq!(*active.lock().unwrap(), None);
+
+        *active.lock().unwrap() = Some("newer-job".to_string());
+        let stale_guard = ActiveRealScanGuard {
+            active: Arc::clone(&active),
+            job_id: "older-job".to_string(),
+            clear_on_drop: true,
+        };
+        drop(stale_guard);
+        assert_eq!(active.lock().unwrap().as_deref(), Some("newer-job"));
+
+        let recovery_guard = ActiveRealScanGuard {
+            active: Arc::clone(&active),
+            job_id: "newer-job".to_string(),
+            clear_on_drop: true,
+        };
+        recovery_guard.retain_for_recovery();
+        assert_eq!(
+            active.lock().unwrap().as_deref(),
+            Some("newer-job"),
+            "ambiguous bridge acceptance must retain the in-process scan fence"
+        );
+    }
+
     #[cfg(target_os = "macos")]
-    fn private_cleanup_fixture(
-    ) -> (
+    fn private_cleanup_fixture() -> (
         PrivateCaptureWorkingDirectory,
         [std::path::PathBuf; 2],
         std::path::PathBuf,
@@ -5639,8 +8145,8 @@ mod tests {
     ) {
         let working = PrivateCaptureWorkingDirectory::create()
             .expect("create isolated private cleanup fixture");
-        let capture_paths = ["capture-0001.tif", "capture-0001_IR.tif"]
-            .map(|name| working.root.join(name));
+        let capture_paths =
+            ["capture-0001.tif", "capture-0001_IR.tif"].map(|name| working.root.join(name));
         std::fs::write(&capture_paths[0], b"engine-rgb").unwrap();
         std::fs::write(&capture_paths[1], b"engine-ir").unwrap();
         let parent = working.root.parent().expect("workspace parent");
@@ -5668,17 +8174,14 @@ mod tests {
     #[test]
     fn quarantine_move_never_replaces_a_raced_same_name_destination() {
         let (working, captures, quarantine, tombstone) = private_cleanup_fixture();
-        let result = quarantine_and_retire_known_private_files_with_hook(
-            &working,
-            &captures,
-            |event| {
+        let result =
+            quarantine_and_retire_known_private_files_with_hook(&working, &captures, |event| {
                 if let PrivateCleanupHookEvent::BeforeQuarantineMove { destination, .. } = event {
                     std::fs::create_dir(destination).unwrap();
                     std::fs::write(destination.join("foreign.txt"), b"foreign quarantine").unwrap();
                 }
                 Ok(())
-            },
-        );
+            });
 
         let hold = result.expect_err("RENAME_EXCL must reject the raced quarantine");
         assert_eq!(std::fs::read(&captures[0]).unwrap(), b"engine-rgb");
@@ -5695,21 +8198,16 @@ mod tests {
     fn stage_move_never_replaces_a_destination_inserted_immediately_before_move() {
         let (working, captures, quarantine, tombstone) = private_cleanup_fixture();
         let mut injected = false;
-        let result = quarantine_and_retire_known_private_files_with_hook(
-            &working,
-            &captures,
-            |event| {
+        let result =
+            quarantine_and_retire_known_private_files_with_hook(&working, &captures, |event| {
                 if let PrivateCleanupHookEvent::BeforeStageMove { destination, .. } = event {
-                    if !injected
-                        && destination.file_name() == captures[0].file_name()
-                    {
+                    if !injected && destination.file_name() == captures[0].file_name() {
                         std::fs::write(destination, b"foreign staging").unwrap();
                         injected = true;
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         let hold = result.expect_err("atomic no-replace stage move must fail closed");
         assert_eq!(
@@ -5730,10 +8228,8 @@ mod tests {
         let (working, captures, quarantine, tombstone) = private_cleanup_fixture();
         let mut stage_collision = false;
         let mut rollback_collision = false;
-        let result = quarantine_and_retire_known_private_files_with_hook(
-            &working,
-            &captures,
-            |event| {
+        let result =
+            quarantine_and_retire_known_private_files_with_hook(&working, &captures, |event| {
                 match event {
                     PrivateCleanupHookEvent::BeforeStageMove { destination, .. }
                         if !stage_collision
@@ -5752,8 +8248,7 @@ mod tests {
                     _ => {}
                 }
                 Ok(())
-            },
-        );
+            });
 
         let hold = result.expect_err("rollback collision must preserve both identities");
         assert_eq!(
@@ -5783,10 +8278,8 @@ mod tests {
         let (working, captures, quarantine, tombstone) = private_cleanup_fixture();
         let backup = quarantine.join("engine-source-original.tif");
         let mut injected = false;
-        let result = quarantine_and_retire_known_private_files_with_hook(
-            &working,
-            &captures,
-            |event| {
+        let result =
+            quarantine_and_retire_known_private_files_with_hook(&working, &captures, |event| {
                 if let PrivateCleanupHookEvent::BeforeStageMove { source, .. } = event {
                     if !injected && source.file_name() == captures[0].file_name() {
                         std::fs::rename(source, &backup).unwrap();
@@ -5795,8 +8288,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         let hold = result.expect_err("source identity mismatch must fail closed");
         assert_eq!(std::fs::read(&backup).unwrap(), b"engine-rgb");
@@ -5814,10 +8306,8 @@ mod tests {
         let (working, captures, quarantine, tombstone) = private_cleanup_fixture();
         let backup = tombstone.join("engine-final-original.tif");
         let mut injected = false;
-        let result = quarantine_and_retire_known_private_files_with_hook(
-            &working,
-            &captures,
-            |event| {
+        let result =
+            quarantine_and_retire_known_private_files_with_hook(&working, &captures, |event| {
                 if let PrivateCleanupHookEvent::BeforeFinalDelete { path } = event {
                     if !injected && path.file_name() == captures[0].file_name() {
                         std::fs::rename(path, &backup).unwrap();
@@ -5826,8 +8316,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         let hold = result.expect_err("final identity mismatch must preserve both files");
         assert_eq!(std::fs::read(&backup).unwrap(), b"engine-rgb");
@@ -5866,10 +8355,8 @@ mod tests {
             if matches!(late_entry, LateEntry::Symlink) {
                 std::fs::write(&outside_target, b"foreign target").unwrap();
             }
-            let result = quarantine_and_retire_known_private_files_with_hook(
-                &working,
-                &captures,
-                |event| {
+            let result =
+                quarantine_and_retire_known_private_files_with_hook(&working, &captures, |event| {
                     if let PrivateCleanupHookEvent::BeforeQuarantineSeal { quarantine } = event {
                         match late_entry {
                             LateEntry::File => {
@@ -5892,10 +8379,10 @@ mod tests {
                         }
                     }
                     Ok(())
-                },
-            );
+                });
 
-            let hold = result.expect_err("an unknown quarantine entry must preserve all identities");
+            let hold =
+                result.expect_err("an unknown quarantine entry must preserve all identities");
             assert_eq!(
                 std::fs::read(quarantine.join(captures[0].file_name().unwrap())).unwrap(),
                 b"engine-rgb"
@@ -5906,7 +8393,10 @@ mod tests {
             );
             match late_entry {
                 LateEntry::File => {
-                    assert_eq!(std::fs::read(quarantine.join("late.txt")).unwrap(), b"foreign file");
+                    assert_eq!(
+                        std::fs::read(quarantine.join("late.txt")).unwrap(),
+                        b"foreign file"
+                    );
                 }
                 LateEntry::Directory => {
                     assert_eq!(
@@ -5916,7 +8406,10 @@ mod tests {
                 }
                 LateEntry::Symlink => {
                     let link = quarantine.join("late-link");
-                    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+                    assert!(std::fs::symlink_metadata(&link)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
                     assert_eq!(std::fs::read(&outside_target).unwrap(), b"foreign target");
                 }
             }
@@ -6097,7 +8590,10 @@ mod tests {
 
         let status = map_status(&bridge_status, None);
 
-        assert!(status.media_loaded, "only the completed preview establishes media");
+        assert!(
+            status.media_loaded,
+            "only the completed preview establishes media"
+        );
         assert_eq!(status.frame_count, Some(6));
         assert_eq!(status.adapter, None, "a count must not invent a holder");
         assert_eq!(status.carrier, None, "a count must not invent a carrier");
@@ -6223,10 +8719,8 @@ mod tests {
 
     #[test]
     fn split_command_preserves_an_existing_executable_path_with_spaces() {
-        let executable = std::env::temp_dir().join(format!(
-            "scanstudio bridge path {}",
-            std::process::id()
-        ));
+        let executable =
+            std::env::temp_dir().join(format!("scanstudio bridge path {}", std::process::id()));
         std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("fixture executable");
 
         let command = executable.to_str().expect("utf-8 fixture path");
@@ -6265,9 +8759,7 @@ mod tests {
             map_bridge_error_code_str("FILM_FEED_INTERRUPTED"),
             ErrorCode::FilmFeedInterrupted
         );
-        assert!(!map_bridge_error_code_recoverable(
-            "FILM_FEED_INTERRUPTED"
-        ));
+        assert!(!map_bridge_error_code_recoverable("FILM_FEED_INTERRUPTED"));
     }
 
     #[test]
@@ -6296,8 +8788,14 @@ mod tests {
 
     #[test]
     fn ensure_archive_extension_leaves_an_already_extensioned_template_alone() {
-        assert_eq!(ensure_archive_extension("Archive_####.tif"), "Archive_####.tif");
-        assert_eq!(ensure_archive_extension("MyArchive_####.tiff"), "MyArchive_####.tiff");
+        assert_eq!(
+            ensure_archive_extension("Archive_####.tif"),
+            "Archive_####.tif"
+        );
+        assert_eq!(
+            ensure_archive_extension("MyArchive_####.tiff"),
+            "MyArchive_####.tiff"
+        );
     }
 
     #[test]
@@ -6409,14 +8907,54 @@ mod tests {
         per_frame.archive.filename_template = "KodakGold200-Canon7E-####".into();
         per_frame.archive.destination = "/B".into();
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert(2, domain::FrameOverrides { output: Some(per_frame), ..Default::default() });
+        overrides.insert(
+            2,
+            domain::FrameOverrides {
+                output: Some(per_frame),
+                ..Default::default()
+            },
+        );
         let templates = bridge_slot_outputs(&[1, 2], &output, &overrides);
         let params = build_scan_start_params(
-            vec![1, 2], &CaptureRecipe::default(), &ProcessingRecipe::default(), &output, templates,
+            vec![1, 2],
+            &CaptureRecipe::default(),
+            &ProcessingRecipe::default(),
+            &output,
+            templates,
         );
-        assert_eq!(params.output.slot_outputs.as_ref().unwrap().get("1").unwrap().filename_template, "ScanStudio#.tif");
-        assert_eq!(params.output.slot_outputs.as_ref().unwrap().get("2").unwrap().filename_template, "KodakGold200-Canon7E-####.tif");
-        assert_eq!(params.output.slot_outputs.as_ref().unwrap().get("2").unwrap().destination, "/B");
+        assert_eq!(
+            params
+                .output
+                .slot_outputs
+                .as_ref()
+                .unwrap()
+                .get("1")
+                .unwrap()
+                .filename_template,
+            "ScanStudio#.tif"
+        );
+        assert_eq!(
+            params
+                .output
+                .slot_outputs
+                .as_ref()
+                .unwrap()
+                .get("2")
+                .unwrap()
+                .filename_template,
+            "KodakGold200-Canon7E-####.tif"
+        );
+        assert_eq!(
+            params
+                .output
+                .slot_outputs
+                .as_ref()
+                .unwrap()
+                .get("2")
+                .unwrap()
+                .destination,
+            "/B"
+        );
     }
 
     #[test]
@@ -6506,21 +9044,29 @@ mod tests {
         );
         drop(event_tx);
 
-        let events: Vec<Value> = event_rx.into_iter()
+        let events: Vec<Value> = event_rx
+            .into_iter()
             .map(|line| serde_json::from_str(&line).expect("valid JSON"))
             .collect();
 
         let frame_state_failed = events
             .iter()
-            .find(|event| event["event"] == "scan.frameState" && event["payload"]["state"] == "failed")
+            .find(|event| {
+                event["event"] == "scan.frameState" && event["payload"]["state"] == "failed"
+            })
             .expect("expected scan.frameState(failed) for the unknown slot");
         assert_eq!(frame_state_failed["payload"]["frameIndex"], json!(2));
 
         let job_state_failed = events
             .iter()
-            .find(|event| event["event"] == "scan.jobState" && event["payload"]["state"] == "failed")
+            .find(|event| {
+                event["event"] == "scan.jobState" && event["payload"]["state"] == "failed"
+            })
             .expect("expected scan.jobState(failed)");
-        assert_eq!(job_state_failed["payload"]["jobId"], json!("panic-test-job"));
+        assert_eq!(
+            job_state_failed["payload"]["jobId"],
+            json!("panic-test-job")
+        );
 
         let completed_event = events
             .iter()
@@ -6530,10 +9076,7 @@ mod tests {
             completed_event["payload"]["summary"]["completed"],
             json!([1])
         );
-        assert_eq!(
-            completed_event["payload"]["summary"]["failed"],
-            json!([2])
-        );
+        assert_eq!(completed_event["payload"]["summary"]["failed"], json!([2]));
     }
 
     #[test]
@@ -6561,10 +9104,34 @@ mod tests {
 
     #[test]
     fn derivative_failures_cannot_be_relabelled_completed_by_bridge_summary() {
-        let (completed, failed) =
-            reconcile_derivative_failures(vec![14, 17], vec![22], &[17, 22]);
+        let (completed, failed) = reconcile_derivative_failures(vec![14, 17], vec![22], &[17, 22]);
 
         assert_eq!(completed, vec![14]);
         assert_eq!(failed, vec![22, 17]);
+    }
+
+    #[test]
+    fn scan_event_filter_rejects_a_delayed_terminal_from_an_earlier_job() {
+        let stale = json!({
+            "event": "scan.completed",
+            "payload": {
+                "jobId": "job-a",
+                "summary": {"completed": [1], "failed": [], "stopped": false}
+            }
+        });
+        assert!(!bridge_event_belongs_to_scan_job(&stale, "job-b"));
+        assert!(bridge_event_belongs_to_scan_job(&stale, "job-a"));
+    }
+
+    #[test]
+    fn scan_event_filter_rejects_missing_tokens_and_unrelated_events() {
+        assert!(!bridge_event_belongs_to_scan_job(
+            &json!({"event": "scan.progress", "payload": {"slot": 1}}),
+            "job-a"
+        ));
+        assert!(!bridge_event_belongs_to_scan_job(
+            &json!({"event": "roll.previewComplete", "payload": {"jobId": "job-a"}}),
+            "job-a"
+        ));
     }
 }

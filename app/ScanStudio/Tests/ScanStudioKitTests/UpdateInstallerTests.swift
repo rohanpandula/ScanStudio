@@ -100,6 +100,31 @@ final class UpdateInstallerTests: XCTestCase {
         }
     }
 
+    func testInstallRejectsSameOrOlderVersionBeforeSnapshot() throws {
+        let olderSource = root.appendingPathComponent("OlderSource", isDirectory: true)
+        try FileManager.default.createDirectory(at: olderSource, withIntermediateDirectories: true)
+        try makeFakeApp(
+            "ScanStudio.app",
+            at: olderSource,
+            release: "0.3.0-alpha.9",
+            marker: "downgrade"
+        )
+        let installer = try makeInstaller()
+
+        XCTAssertThrowsError(
+            try installer.install(
+                makeArchive(appName: "ScanStudio.app", in: olderSource, version: "0.3.0-alpha.9")
+            )
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .versionMismatch)
+        }
+        XCTAssertEqual(
+            try markerContents(at: applicationsDirectory.appendingPathComponent("ScanStudio.app")),
+            "old"
+        )
+        XCTAssertNil(installer.availableRollback)
+    }
+
     func testSnapshotMissingAppNoop() throws {
         let emptyDirectory = root.appendingPathComponent("Empty", isDirectory: true)
         try FileManager.default.createDirectory(at: emptyDirectory, withIntermediateDirectories: true)
@@ -194,7 +219,8 @@ final class UpdateInstallerTests: XCTestCase {
         let installer = try UpdateInstaller(
             appDirectory: unwritable,
             rollbackDirectory: rollbackDirectory,
-            authorizedDestinations: [fallback]
+            authorizedDestinations: [fallback],
+            bundleVerifier: makeBundleVerifier()
         )
         let archive = makeArchive(appName: "ScanStudio.app", in: sourceDirectory, version: "0.3.0-alpha.11")
 
@@ -212,10 +238,61 @@ final class UpdateInstallerTests: XCTestCase {
                        "rollback must restore the previous app in the fallback destination")
     }
 
+    func testFirstInstallCreatesEmptyFallbackWithoutReplacement() throws {
+        let unwritable = root.appendingPathComponent("Unwritable", isDirectory: true)
+        try FileManager.default.createDirectory(at: unwritable, withIntermediateDirectories: true)
+        guard makeNonWritable(unwritable) else {
+            throw XCTSkip("chmod was refused; cannot simulate a non-writable directory")
+        }
+        nonWritableDirs.append(unwritable)
+
+        // The authorized fallback does not exist yet: this is the documented
+        // first-install case that replaceItemAt cannot handle.
+        let fallback = root.appendingPathComponent("New User Applications", isDirectory: true)
+        let installer = try UpdateInstaller(
+            appDirectory: unwritable,
+            rollbackDirectory: rollbackDirectory,
+            authorizedDestinations: [fallback],
+            bundleVerifier: makeBundleVerifier()
+        )
+
+        try installer.install(
+            makeArchive(appName: "ScanStudio.app", in: sourceDirectory, version: "0.3.0-alpha.11")
+        )
+
+        XCTAssertEqual(
+            try markerContents(at: fallback.appendingPathComponent("ScanStudio.app")),
+            "new"
+        )
+        XCTAssertNil(installer.availableRollback, "an empty first install has no prior bundle")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: fallback.path)
+            .filter { $0.hasPrefix(".ScanStudio.stage.") || $0.hasPrefix(".ScanStudio.prev.") }
+        XCTAssertTrue(leftovers.isEmpty, "private staging/backup siblings must be cleaned")
+    }
+
     // MARK: - Fixture helpers
 
     private func makeInstaller() throws -> UpdateInstaller {
-        try UpdateInstaller(appDirectory: applicationsDirectory, rollbackDirectory: rollbackDirectory)
+        try UpdateInstaller(
+            appDirectory: applicationsDirectory,
+            rollbackDirectory: rollbackDirectory,
+            bundleVerifier: makeBundleVerifier()
+        )
+    }
+
+    private func makeBundleVerifier() -> UpdateBundleVerifier {
+        UpdateBundleVerifier(
+            publisherTrust: UpdatePublisherTrust(
+                authorizedTeamIdentifier: "ABCDEFGHIJ",
+                designatedRequirementData: Data([1])
+            ),
+            signatureValidator: AcceptingUpdateSignatureValidator(),
+            hostOperatingSystemVersion: OperatingSystemVersion(
+                majorVersion: 99,
+                minorVersion: 0,
+                patchVersion: 0
+            )
+        )
     }
 
     /// Makes `directory` un-writable (chmod 0555) so destination-resolution
@@ -248,17 +325,29 @@ final class UpdateInstallerTests: XCTestCase {
         let appURL = parent.appendingPathComponent(name, isDirectory: true)
         let contents = appURL.appendingPathComponent("Contents", isDirectory: true)
         let macos = contents.appendingPathComponent("MacOS", isDirectory: true)
+        let resources = contents.appendingPathComponent("Resources", isDirectory: true)
         try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
 
         let infoPlist: [String: Any] = [
+            "CFBundlePackageType": "APPL",
+            "CFBundleIdentifier": UpdatePublisherTrust.bundleIdentifier,
+            "CFBundleExecutable": UpdatePublisherTrust.bundleExecutable,
             "CFBundleShortVersionString": release,
-            "ScanStudioRelease": release
+            "ScanStudioRelease": release,
+            "LSMinimumSystemVersion": "14.0",
         ]
         let plistData = try PropertyListSerialization.data(fromPropertyList: infoPlist, format: .xml, options: 0)
         try plistData.write(to: contents.appendingPathComponent("Info.plist"))
 
-        try marker.data(using: .utf8)!
-            .write(to: macos.appendingPathComponent("ScanStudio"))
+        let launcher = macos.appendingPathComponent(UpdatePublisherTrust.bundleExecutable)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: launcher)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: launcher.path)
+
+        let binary = macos.appendingPathComponent(UpdatePublisherTrust.architectureExecutable)
+        try fakeMachO(for: HostArchitectureProvider.current()).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        try Data(marker.utf8).write(to: resources.appendingPathComponent("marker.txt"))
     }
 
     private func markerContents(at appURL: URL) throws -> String {
@@ -267,6 +356,19 @@ final class UpdateInstallerTests: XCTestCase {
     }
 
     private func sourceMarkerURL(at appURL: URL) -> URL {
-        appURL.appendingPathComponent("Contents/MacOS/ScanStudio")
+        appURL.appendingPathComponent("Contents/Resources/marker.txt")
     }
+
+    private func fakeMachO(for architecture: HostArchitecture) -> Data {
+        // Little-endian MH_MAGIC_64 + cputype are sufficient for the updater's
+        // architecture parser fixture.
+        let cpu: [UInt8] = architecture == .arm64
+            ? [0x0c, 0x00, 0x00, 0x01]
+            : [0x07, 0x00, 0x00, 0x01]
+        return Data([0xcf, 0xfa, 0xed, 0xfe] + cpu)
+    }
+}
+
+private struct AcceptingUpdateSignatureValidator: UpdateCodeSignatureValidating {
+    func validateApplication(at appURL: URL, trust: UpdatePublisherTrust) throws {}
 }

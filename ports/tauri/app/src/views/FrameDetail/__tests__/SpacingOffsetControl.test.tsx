@@ -182,7 +182,7 @@ describe("SpacingOffsetControl", () => {
 
     const tile = screen.getByTestId("replacement-tile") as HTMLImageElement;
     expect(tile.src).toBe(
-      "scanstudio-preview://localhost/?path=" +
+      "scanstudio-preview://localhost/?id=" +
         encodeURIComponent("/scans/original/frame-0002.png"),
     );
 
@@ -196,7 +196,7 @@ describe("SpacingOffsetControl", () => {
     await waitFor(() => {
       const replaced = screen.getByTestId("replacement-tile") as HTMLImageElement;
       expect(replaced.src).toBe(
-        "scanstudio-preview://localhost/?path=" +
+        "scanstudio-preview://localhost/?id=" +
           encodeURIComponent("/scans/replaced/frame.png"),
       );
     });

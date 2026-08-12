@@ -56,6 +56,17 @@ else
     failures=$((failures + 1))
 fi
 
+identity_verifier="$script_dir/../../../../scripts/verify_coolscanpy_source.py"
+if "$HOST_PYTHON" -I -B "$identity_verifier" \
+    "$root/CorrespondingSource/coolscanpy" \
+    --provenance "$root/provenance.json" \
+    --metadata-root "$root/BridgeRuntime/site-packages"; then
+    printf 'PASS  exact CoolscanPy source/version/capture identity\n'
+else
+    printf 'FAIL  exact CoolscanPy source/version/capture identity\n' >&2
+    failures=$((failures + 1))
+fi
+
 # perPlatform.linux.requiredSitePackageEntries (under BridgeRuntime/site-packages).
 entries="$(python3 -c '
 import json, sys
@@ -136,11 +147,11 @@ if [[ "$host_is_linux" -eq 1 ]]; then
     # This is the check whose absence let the packaging gap ship: the injected
     # import above passes even when the worker cannot start. Import the worker
     # module itself, exactly as the child does, with no argv paths.
-    worker_bootstrap='import coolscanpy, numpy, cv2, tifffile, sane, usb; import coolscanpy.protocol.ls5000_single_pass.worker'
+    worker_bootstrap='from importlib.metadata import version; from pathlib import Path; import tomllib; import coolscanpy, numpy, cv2, tifffile, sane, usb; from coolscanpy.protocol.ls5000_single_pass.bundle import CAPTURE_BUNDLE_SHA256, verify_capture_bundle; project=tomllib.loads((Path(coolscanpy.__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))["project"]; assert coolscanpy.__version__ == project["version"] == version("coolscanpy"); assert verify_capture_bundle(require_python_sources=True) == CAPTURE_BUNDLE_SHA256; import coolscanpy.protocol.ls5000_single_pass.worker'
     if "$root/BridgeRuntime/python/bin/python3.13" -I -B -c "$worker_bootstrap" 2>/dev/null; then
-        printf 'PASS  isolated capture-worker import (no path injection)\n'
+        printf 'PASS  isolated capture-worker import + exact version/capture preflight (no path injection)\n'
     else
-        printf 'FAIL  isolated capture-worker import (no path injection) -- coolscanpy/deps not on the bundled interpreter default path\n' >&2
+        printf 'FAIL  isolated capture-worker import + exact version/capture preflight (no path injection)\n' >&2
         failures=$((failures + 1))
     fi
     if [[ -x "$root/scanstudio-bridge" ]] \

@@ -38,6 +38,13 @@ require_file "CoolscanPy source LICENSE" "$COOLSCANPY_SOURCE/LICENSE"
 require_file "frontend package lock" "$SCANSTUDIO_APP_SOURCE/package-lock.json"
 require_file "Tauri app Cargo lock" "$SCANSTUDIO_APP_SOURCE/src-tauri/Cargo.lock"
 
+COOLSCANPY_IDENTITY_VERIFIER="$repo_root/../../scripts/verify_coolscanpy_source.py"
+require_file "CoolscanPy package identity verifier" "$COOLSCANPY_IDENTITY_VERIFIER"
+COOLSCANPY_VERSION="$(
+    "$HOST_PYTHON" -I -B "$COOLSCANPY_IDENTITY_VERIFIER" \
+        "$COOLSCANPY_SOURCE" --print-version
+)"
+
 # (1) fresh staging root.
 rm -rf "$STAGING_ROOT"
 mkdir -p "$STAGING_ROOT"
@@ -166,6 +173,14 @@ cat > "$INTERP_SITE_PACKAGES/scanstudio-bridge-runtime.pth" <<'PTH'
 import os,sys; _br=os.path.dirname(sys.prefix); _p=[os.path.join(_br,'site-packages'),os.path.join(os.path.dirname(_br),'CorrespondingSource','coolscanpy','src')]; sys.path[:0]=[q for q in _p if os.path.isdir(q) and q not in sys.path]
 PTH
 
+# Source-based Linux packages still carry distribution metadata so runtime
+# provenance, importlib.metadata, and the corresponding source all report the
+# same version.  The value is parsed once from the shipped project metadata.
+coolscanpy_dist_info="$SITE_PACKAGES_DIR/coolscanpy-$COOLSCANPY_VERSION.dist-info"
+mkdir -p "$coolscanpy_dist_info"
+printf 'Metadata-Version: 2.1\nName: coolscanpy\nVersion: %s\nLicense-Expression: GPL-3.0-only\n' \
+    "$COOLSCANPY_VERSION" > "$coolscanpy_dist_info/METADATA"
+
 # (5) per-wheel license collection.
 collect_python_wheel_licenses "$SITE_PACKAGES_DIR" "$STAGING_ROOT/Licenses/python-wheels"
 
@@ -250,7 +265,14 @@ PYTHON
 # (9b) provenance: records package-time git HEAD SHAs of both GPL sources.
 write_provenance_json "$STAGING_ROOT/provenance.json" \
     scanstudio-bridge "$SCANSTUDIO_BRIDGE_SOURCE" "0.1.0" \
-    coolscanpy "$COOLSCANPY_SOURCE" "0.1.3"
+    coolscanpy "$COOLSCANPY_SOURCE" "$COOLSCANPY_VERSION"
+
+# Verify the final assembled source, dist-info, and provenance together.
+# This runs even on a non-Linux staging host and needs only the host stdlib.
+"$HOST_PYTHON" -I -B "$COOLSCANPY_IDENTITY_VERIFIER" \
+    "$STAGING_ROOT/CorrespondingSource/coolscanpy" \
+    --provenance "$STAGING_ROOT/provenance.json" \
+    --metadata-root "$SITE_PACKAGES_DIR"
 
 # (10) launcher (Task 4's output; tolerated if this runs standalone first).
 launcher_src="$script_dir/launcher/scanstudio-launcher.sh"

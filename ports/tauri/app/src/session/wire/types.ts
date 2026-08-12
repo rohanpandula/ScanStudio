@@ -293,6 +293,8 @@ export interface DefectInstance {
 /** project.analyzeFrameDefects response shape (07-02 Task 2). */
 export interface AnalyzeFrameDefectsResult {
   frameIndex: number;
+  capture: CaptureRecipe;
+  processing: ProcessingRecipe;
   defects: DefectInstance[];
   simulated: boolean;
   digitalIceEnabled: boolean;
@@ -311,6 +313,7 @@ export interface PreviewMetadataCommandResult {
   exiftoolPath: string | null;
   targets: string[];
   arguments: string[];
+  fingerprint: string;
 }
 
 export interface ApplyMetadataResult {
@@ -319,6 +322,8 @@ export interface ApplyMetadataResult {
   stdout: string;
   stderr: string;
   targets: string[];
+  arguments: string[];
+  fingerprint: string;
 }
 
 export interface EngineError {
@@ -842,7 +847,8 @@ export function isPreviewMetadataCommandResult(
     typeof value.available === "boolean" &&
     isStringOrNull(value.exiftoolPath) &&
     isStringArray(value.targets) &&
-    isStringArray(value.arguments)
+    isStringArray(value.arguments) &&
+    typeof value.fingerprint === "string"
   );
 }
 
@@ -853,7 +859,9 @@ export function isApplyMetadataResult(value: unknown): value is ApplyMetadataRes
     typeof value.exitCode === "number" &&
     typeof value.stdout === "string" &&
     typeof value.stderr === "string" &&
-    isStringArray(value.targets)
+    isStringArray(value.targets) &&
+    isStringArray(value.arguments) &&
+    typeof value.fingerprint === "string"
   );
 }
 

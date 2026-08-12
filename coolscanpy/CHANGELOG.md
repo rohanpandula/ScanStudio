@@ -1,3 +1,17 @@
+# Changelog
+
+## Unreleased
+
+## 0.7.1 - 2026-08-11
+
+- Capture workers launched under ScanStudio now inherit the bridge's exact
+  ownership descriptor instead of escaping into an independent session. A
+  surviving worker therefore keeps replacement bridges fenced from the
+  scanner, and a malformed ownership descriptor refuses worker launch.
+- Source-tree imports derive `coolscanpy.__version__` from the same PEP 621
+  project metadata used to build distributions, eliminating the stale version
+  fallback while preserving installed-package metadata as the authority.
+
 ## 0.7.0 - 2026-08-10
 
 - Adapter identity: motion-free VPD 00h/01h probe
@@ -23,10 +37,6 @@
 - unload-timer: GET B4h with the live 3600s/enabled reading.
 - perforation: 8Eh probe.
 - wedge-recovery: dry-run planner with 81h live acceptance.
-
-# Changelog
-
-## Unreleased
 
 ## 0.5.0 - 2026-08-09
 

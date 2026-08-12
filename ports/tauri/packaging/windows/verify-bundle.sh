@@ -49,6 +49,97 @@ else
     failures=$((failures + 1))
 fi
 
+identity_verifier="$repo_root/../../scripts/verify_coolscanpy_source.py"
+if "$HOST_PYTHON" -I -B "$identity_verifier" \
+    "$root/CorrespondingSource/coolscanpy" \
+    --provenance "$root/provenance.json"; then
+    printf 'PASS  exact CoolscanPy source/version/capture identity\n'
+else
+    printf 'FAIL  exact CoolscanPy source/version/capture identity\n' >&2
+    failures=$((failures + 1))
+fi
+
+# On the Linux x86_64 resource-builder, install the exact staged source and
+# staged wheels into the exact staged CPython archive, then run the worker's
+# isolated import and capture-bundle preflight.  This is the WSL runtime shape
+# that the Windows app will use; non-Linux hosts still perform the byte-exact
+# source gate above.
+verify_installed_capture_runtime() (
+    local runtime_root python_bin source_copy
+    local -a wheels=()
+    runtime_root="$(mktemp -d)" || return
+    trap 'rm -rf -- "$runtime_root"' EXIT
+
+    (
+        cd "$root/BridgeRuntime" \
+            && sha256sum --check --strict SHA256SUMS
+    ) || return
+    (
+        cd "$root/Wheelhouse" \
+            && sha256sum --check --strict SHA256SUMS
+    ) || return
+    tar -xzf "$root/BridgeRuntime/cpython-3.13.14+20260728-x86_64-unknown-linux-gnu.tar.gz" \
+        -C "$runtime_root" || return
+    python_bin="$runtime_root/python/bin/python3.13"
+    [[ -x "$python_bin" ]] || return
+    source_copy="$runtime_root/coolscanpy-source"
+    mkdir -p "$source_copy" || return
+    cp -Rp "$root/CorrespondingSource/coolscanpy/." "$source_copy/" || return
+    while IFS= read -r -d '' wheel; do
+        wheels+=("$wheel")
+    done < <(find "$root/Wheelhouse" -maxdepth 1 -type f -name '*.whl' -print0)
+    [[ ${#wheels[@]} -gt 0 ]] || return
+    "$python_bin" -m pip install --disable-pip-version-check \
+        --no-index --no-deps "${wheels[@]}" >/dev/null || return
+    "$python_bin" -m pip install --disable-pip-version-check \
+        --no-index --no-deps --no-build-isolation \
+        "$source_copy" >/dev/null || return
+    "$python_bin" -I -B - \
+        "$source_copy/pyproject.toml" \
+        "$root/provenance.json" <<'PYTHON'
+from importlib.metadata import version
+import json
+from pathlib import Path
+import sys
+import tomllib
+
+import coolscanpy
+from coolscanpy.protocol.ls5000_single_pass.bundle import (
+    CAPTURE_BUNDLE_SHA256,
+    verify_capture_bundle,
+)
+import coolscanpy.protocol.ls5000_single_pass.worker
+
+with Path(sys.argv[1]).open("rb") as handle:
+    project_version = tomllib.load(handle)["project"]["version"]
+provenance_version = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))[
+    "sources"
+]["coolscanpy"]["version"]
+if not (
+    coolscanpy.__version__
+    == version("coolscanpy")
+    == project_version
+    == provenance_version
+):
+    raise SystemExit("CoolscanPy runtime/package/provenance versions disagree")
+if verify_capture_bundle(require_python_sources=True) != CAPTURE_BUNDLE_SHA256:
+    raise SystemExit("CoolscanPy capture-bundle identity changed after installation")
+if not Path(coolscanpy.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()):
+    raise SystemExit("isolated preflight imported CoolscanPy outside packaged CPython")
+PYTHON
+)
+
+if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+    if verify_installed_capture_runtime; then
+        printf 'PASS  installed WSL capture-worker version/capture preflight\n'
+    else
+        printf 'FAIL  installed WSL capture-worker version/capture preflight\n' >&2
+        failures=$((failures + 1))
+    fi
+else
+    printf 'SKIP  installed WSL capture-worker preflight (requires Linux x86_64 host)\n'
+fi
+
 # The offline wheelhouse must contain every pinned requirement, and its
 # installer must preserve the local-project ordering and fail-closed flags.
 requirements="$root/wsl-requirements.txt"

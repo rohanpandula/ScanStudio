@@ -4,31 +4,24 @@
 // SessionStore internals and is unit-testable with a fake request. Plain
 // TypeScript, no React, no UI.
 
-import type {
-  AnalyzeFrameDefectsResult,
-  CaptureRecipe,
-  ProcessingRecipe,
-} from "../wire/types";
+import type { AnalyzeFrameDefectsResult } from "../wire/types";
 
 /** The injected request channel: method-name string + optional params. */
 export type DefectRequest = (method: string, params?: unknown) => Promise<unknown>;
 
 /**
  * project.analyzeFrameDefects -> AnalyzeFrameDefectsResult, returned
- * unchanged. The engine resolves the frame's effective capture/processing
- * (including its own overrides) and chooses the data source (real RGB+IR
+ * unchanged. Only the frame identity crosses the renderer boundary: the
+ * engine resolves effective capture/processing authoritatively from project
+ * state, frame overrides, and the latest receipt, then chooses real RGB+IR
  * receipt analysis vs. the seeded synthetic generator) and reports
  * `simulated` honestly -- the UI must not re-derive or mask that flag.
  */
 export async function analyzeFrameDefects(
   request: DefectRequest,
   frameIndex: number,
-  capture: CaptureRecipe,
-  processing: ProcessingRecipe,
 ): Promise<AnalyzeFrameDefectsResult> {
   return (await request("project.analyzeFrameDefects", {
     frameIndex,
-    capture,
-    processing,
   })) as AnalyzeFrameDefectsResult;
 }

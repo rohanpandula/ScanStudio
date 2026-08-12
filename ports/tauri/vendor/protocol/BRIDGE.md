@@ -47,7 +47,7 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | Method | Params | Result | Notable errors |
 |---|---|---|---|
 | `bridge.hello` | `{clientName: string, protocolVersion: 1}` | `{bridgeName: "scanstudio-bridge", bridgeVersion: string, protocolVersion: 1, capabilities: ["ls5000-coolscanpy"]}` | `INVALID_PARAMS` |
-| `bridge.shutdown` | `{}` | `{}` | — |
+| `bridge.shutdown` | `{}` | `{}` | `HARDWARE_LANE_BUSY` while an owned worker remains active |
 | `device.list` | `{}` | `{devices: [DeviceInfo]}` | — |
 | `device.open` | `{deviceId: string}` | `{device: DeviceInfo, status: DeviceStatus}` | `DEVICE_NOT_FOUND`, `ALREADY_CONNECTED`, `DEVICE_BUSY` |
 | `device.status` | `{}` | `DeviceStatus` | `NOT_CONNECTED` |
@@ -57,7 +57,7 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | `roll.setSpacingOffset` | `{slot: number, offsetRows: number}` | `{thumbnail: Thumbnail}` | `NOT_CONNECTED`, `NO_PREVIEW`, `INVALID_PARAMS` |
 | `roll.manualFrames` | `{rows: [number]}` | `{count: number, fingerprint: string, thumbnails: [Thumbnail], snaps: [BoundarySnap]}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `METER_UNUSABLE` |
 | `roll.previewStrip` | `{}` | `PreviewStrip` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `METER_UNUSABLE` |
-| `scan.start` | `{slots: [number], recipe: CaptureRecipe, output: OutputSpec}` | `{jobId: string}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `REFEED_REQUIRED`; via `scan.error`/`scan.frameFailed`: `ROLL_MISMATCH` |
+| `scan.start` | `{jobId?: string, slots: [number], recipe: CaptureRecipe, output: OutputSpec}` | `{jobId: string}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `REFEED_REQUIRED`; via `scan.error`/`scan.frameFailed`: `ROLL_MISMATCH` |
 | `scan.stop` | `{jobId: string}` | `{acknowledged: bool}` | `UNKNOWN_JOB` |
 | `device.eject` | `{}` | `{}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED` |
 
@@ -69,7 +69,7 @@ Must be the first request; anything sent before it gets `INVALID_PARAMS`. Only `
 
 ### `bridge.shutdown`
 
-`{}` → `{}`; then the bridge releases the hardware lane lock if held, closes the open device if one is open, best-effort bounded-cancels an in-flight job, flushes the response, and exits 0. Cancellation is bounded so an active operation cannot keep shutdown waiting on it indefinitely.
+`{}` → `{}` only after every owned capture worker has exited, its terminal cleanup has run, and the open device has closed. The bridge first requests a cooperative stop and waits for a bounded interval; if the worker remains active it returns `HARDWARE_LANE_BUSY` and stays alive, retaining its process-ownership fence. EOF/parent loss waits without abandoning the worker. A capture worker inherits the bridge's locked ownership descriptor, so even an unexpected bridge death leaves a surviving worker able to fence every replacement bridge until the worker itself exits.
 
 ### `device.close`
 
@@ -103,7 +103,7 @@ Renders the last completed preview attempt's whole captured raster to one image,
 
 ### `scan.start` (MOTION-CAPABLE)
 
-`slots` must be a subset of the last preview's detected slots. `recipe` is validated per "Recipe constraints" below — a mismatch is `INVALID_PARAMS` naming the first mismatched field, never silently substituted. `output` gives the destination directory plus a filename template. Once accepted, a worker thread reports progress and outcome purely through events: `scan.progress`, `scan.frameRetrying` (zero or more per slot), `scan.frameCompleted`, then `scan.completed`. Only one job runs at a time; a concurrent second `scan.start` gets `HARDWARE_LANE_BUSY`.
+`slots` must be a subset of the last preview's detected slots. `recipe` is validated per "Recipe constraints" below — a mismatch is `INVALID_PARAMS` naming the first mismatched field, never silently substituted. `output` gives the destination directory plus a filename template. The app engine supplies `jobId` as a cryptographically random, 32-character lowercase hexadecimal operation token; the bridge echoes that exact token in the response and every job event and refuses reuse within one bridge generation. Legacy direct clients may omit it, in which case the bridge creates an equivalent random token. Once accepted, a worker thread reports progress and outcome purely through events: `scan.progress`, `scan.frameRetrying` (zero or more per slot), `scan.frameCompleted`, then `scan.completed`. Only one job runs at a time; a concurrent second `scan.start` gets `HARDWARE_LANE_BUSY`.
 
 The engine may supply a private, job-owned `output` route when the user has elected not to retain a master TIFF. It remains a normal bridge capture contract: the bridge must write RGB plus applicable IR/meter artifacts exactly at that route and report those exact paths. The private route is not a user destination and must never be inferred from a project manifest or receipt as a retained output.
 

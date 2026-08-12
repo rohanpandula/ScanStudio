@@ -10,7 +10,7 @@
 // the feature"), then renders the resolved exitCode/stdout/stderr verbatim --
 // never a friendlier invented success message (threat T-07-04).
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   ApplyMetadataResult,
   ExifToolDetection,
@@ -68,12 +68,25 @@ export default function FrameMetadataOverride({
   );
   const [applyBusy, setApplyBusy] = useState(false);
   const [applyResult, setApplyResult] = useState<ApplyMetadataResult | null>(null);
+  const [previewInvalidated, setPreviewInvalidated] = useState(false);
+
+  useEffect(() => {
+    // A new preview object is the only event that re-authorizes Apply after
+    // a metadata mutation. Never re-enable against the old displayed array.
+    setPreviewInvalidated(false);
+  }, [metadataPreview]);
+
+  const invalidatePreview = (): void => {
+    setPreviewInvalidated(true);
+    setApplyResult(null);
+  };
 
   const handleToggle = (): void => {
     if (enabled) {
       // Turning the override off after it had a value reverts to the
       // roll-wide default (whole-object null, never a cleared diff).
       if (override !== null) {
+        invalidatePreview();
         onSetOverride(null);
       }
       setEnabled(false);
@@ -88,8 +101,9 @@ export default function FrameMetadataOverride({
 
   const exifToolAvailable =
     exifToolDetection !== null && exifToolDetection.available === true;
+  const authoritativePreview = previewInvalidated ? null : metadataPreview;
   const canApply =
-    metadataPreview !== null && metadataPreview.targets.length > 0 && !applyBusy;
+    authoritativePreview !== null && authoritativePreview.targets.length > 0 && !applyBusy;
 
   const runApply = async (): Promise<void> => {
     setApplyBusy(true);
@@ -101,9 +115,9 @@ export default function FrameMetadataOverride({
   };
 
   const copyArguments = async (): Promise<void> => {
-    if (metadataPreview === null || metadataPreview.arguments.length === 0) return;
+    if (authoritativePreview === null || authoritativePreview.arguments.length === 0) return;
     try {
-      await navigator.clipboard?.writeText(metadataPreview.arguments.join("\n"));
+      await navigator.clipboard?.writeText(authoritativePreview.arguments.join("\n"));
     } catch {
       // Clipboard unavailable (non-secure context / jsdom): the block is
       // still fully readable and the copy button is purely additive.
@@ -132,7 +146,10 @@ export default function FrameMetadataOverride({
             type="button"
             className={styles.dangerButton}
             data-testid="clear-metadata-override"
-            onClick={() => onSetOverride(null)}
+            onClick={() => {
+              invalidatePreview();
+              onSetOverride(null);
+            }}
           >
             Revert to roll default
           </button>
@@ -144,6 +161,7 @@ export default function FrameMetadataOverride({
           rollMetadata={draft}
           onSave={(next) => {
             setDraft({ ...next });
+            invalidatePreview();
             onSetOverride(next);
           }}
           exifToolDetection={exifToolDetection}
@@ -191,24 +209,24 @@ export default function FrameMetadataOverride({
               Apply Metadata
             </button>
           </div>
-          {metadataPreview !== null && (
+          {authoritativePreview !== null && (
             <div>
               <div className={styles.startRow}>
                 <span className={styles.fieldLabel} data-testid="argument-count">
-                  Arguments ({metadataPreview.arguments.length})
+                  Arguments ({authoritativePreview.arguments.length})
                 </span>
                 <button
                   type="button"
                   className={styles.controlButton}
                   data-testid="copy-arguments"
-                  disabled={metadataPreview.arguments.length === 0}
+                  disabled={authoritativePreview.arguments.length === 0}
                   onClick={() => void copyArguments()}
                 >
                   Copy
                 </button>
               </div>
               <pre className={styles.argBlock} data-testid="exiftool-arguments">
-                {metadataPreview.arguments.map((argument, index) => (
+                {authoritativePreview.arguments.map((argument, index) => (
                   <span className={styles.argLine} key={`${index}-${argument}`}>
                     {argument}
                   </span>

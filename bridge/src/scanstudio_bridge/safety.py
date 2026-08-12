@@ -15,6 +15,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import secrets
 import stat
 import uuid
 from datetime import datetime, timezone
@@ -32,8 +33,12 @@ MAX_FRAME_RETRIES = 2  # additional attempts beyond the first; 3 total
 
 _LATCH_FILENAME = "hw-motion-armed"
 _LANE_LOCK_FILENAME = "hw-lane.lock"
+_PROCESS_OWNER_LOCK_FILENAME = "bridge-process-owner.lock"
 _TELEMETRY_DIRNAME = "hw-telemetry"
 _MAX_LATCH_BYTES = 4096
+
+PROCESS_OWNER_FD_ENV_VAR = "SCANSTUDIO_BRIDGE_OWNER_FD"
+PROCESS_OWNER_TOKEN_ENV_VAR = "SCANSTUDIO_BRIDGE_OWNER_TOKEN"
 
 
 def armed_media(base_dir: Path = DEFAULT_BASE_DIR) -> str | None:
@@ -106,6 +111,82 @@ class HardwareLane:
             fcntl.flock(self._fh, fcntl.LOCK_UN)
             self._fh.close()
             self._fh = None
+
+
+class BridgeProcessOwnership:
+    """Cross-process lifetime fence for a bridge and every capture worker.
+
+    The bridge holds an exclusive advisory lock and passes the open
+    descriptor into each capture subprocess. If the bridge dies while a
+    worker survives, that worker still owns the lock, so a replacement
+    bridge fails closed before it can open or move the scanner. The random
+    token is diagnostic correlation; the inherited descriptor is the
+    unforgeable lifetime capability.
+    """
+
+    def __init__(self, base_dir: Path = DEFAULT_BASE_DIR) -> None:
+        self._path = base_dir / _PROCESS_OWNER_LOCK_FILENAME
+        self._fd = -1
+        self.token = secrets.token_hex(16)
+
+    @property
+    def fd(self) -> int:
+        if self._fd < 0:
+            raise RuntimeError("bridge process ownership has not been acquired")
+        return self._fd
+
+    def acquire(self) -> "BridgeProcessOwnership":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            self._path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise BridgeError(
+                    ErrorCode.INTERNAL,
+                    "bridge ownership lock is not a regular file owned by this user",
+                )
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise BridgeError(
+                    ErrorCode.HARDWARE_LANE_BUSY,
+                    "another bridge or surviving capture worker still owns the scanner process group",
+                ) from exc
+            record = json.dumps(
+                {"bridgePid": os.getpid(), "launchToken": self.token},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, record)
+            os.fsync(descriptor)
+            os.set_inheritable(descriptor, True)
+        except Exception:
+            os.close(descriptor)
+            raise
+
+        self._fd = descriptor
+        os.environ[PROCESS_OWNER_FD_ENV_VAR] = str(descriptor)
+        os.environ[PROCESS_OWNER_TOKEN_ENV_VAR] = self.token
+        return self
+
+    def close(self) -> None:
+        if self._fd < 0:
+            return
+        descriptor = self._fd
+        self._fd = -1
+        if os.environ.get(PROCESS_OWNER_FD_ENV_VAR) == str(descriptor):
+            os.environ.pop(PROCESS_OWNER_FD_ENV_VAR, None)
+        if os.environ.get(PROCESS_OWNER_TOKEN_ENV_VAR) == self.token:
+            os.environ.pop(PROCESS_OWNER_TOKEN_ENV_VAR, None)
+        # Do not call LOCK_UN here: capture workers inherit this exact open
+        # file description, and an explicit unlock by the bridge would also
+        # release their fail-closed fence. Closing only this descriptor keeps
+        # the lock alive until the last inherited worker descriptor closes.
+        os.close(descriptor)
 
 
 class TelemetryLog:

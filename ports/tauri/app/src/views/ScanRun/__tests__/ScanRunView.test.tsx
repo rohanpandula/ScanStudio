@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionStore } from "../../../session/store/session";
 import { createScriptedTransport } from "../../../session/testing/harness";
-import type { DeviceInfo, ScanProject } from "../../../session/wire/types";
+import type { DeviceInfo, EngineError, ScanProject } from "../../../session/wire/types";
 import ScanRunView from "../ScanRunView";
 import { captureDurationLabel } from "../ScanRunView";
 
@@ -62,7 +62,7 @@ interface Fixture {
   calls: Array<{ method: string; params: Record<string, unknown> }>;
 }
 
-async function runFixture(): Promise<Fixture> {
+async function runFixture(ejectError?: EngineError): Promise<Fixture> {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   const handle = createScriptedTransport({
     onRequest: (method, params) => {
@@ -102,6 +102,9 @@ async function runFixture(): Promise<Fixture> {
       if (method === "scanner.acquireThumbnails") return { result: { accepted: true, frames: [] } };
       if (method === "scan.start") return { result: { jobId: "job-1" } };
       if (method === "scan.stop") return { result: { acknowledged: true, mode: "afterCurrentFrame" } };
+      if (method === "scanner.eject") {
+        return ejectError === undefined ? { result: {} } : { error: ejectError };
+      }
       if (method === "project.pendingFrames") {
         return {
           result: { frames: [3, 4], totalFrames: 36, completedCount: 2, excludedCount: 0 },
@@ -257,6 +260,45 @@ describe("ScanRunView", () => {
     });
     render(<ScanRunView jobId="job-1" />);
     expect(screen.getByTestId("eject-control")).toBeDisabled();
+  });
+
+  it("sends exactly one eject request after a terminal job and renders success", async () => {
+    const fixture = await runFixture();
+    mocks.sessionStore = fixture.store;
+    act(() => {
+      fixture.emitEvent({ event: "scan.jobState", payload: { jobId: "job-1", state: "scanning" } });
+      fixture.emitEvent({ event: "scan.jobState", payload: { jobId: "job-1", state: "completed" } });
+    });
+    const user = userEvent.setup();
+    render(<ScanRunView jobId="job-1" />);
+
+    expect(screen.getByTestId("eject-control")).toBeEnabled();
+    await user.click(screen.getByTestId("eject-control"));
+
+    expect(fixture.calls.filter((call) => call.method === "scanner.eject")).toHaveLength(1);
+    expect(await screen.findByTestId("eject-success")).toHaveTextContent("Eject completed.");
+  });
+
+  it("renders the engine's exact typed eject error", async () => {
+    const expected: EngineError = {
+      code: "SCANNER_BUSY",
+      message: "transport is still settling",
+      recoverable: true,
+    };
+    const fixture = await runFixture(expected);
+    mocks.sessionStore = fixture.store;
+    act(() => {
+      fixture.emitEvent({ event: "scan.jobState", payload: { jobId: "job-1", state: "scanning" } });
+      fixture.emitEvent({ event: "scan.jobState", payload: { jobId: "job-1", state: "failed" } });
+    });
+    const user = userEvent.setup();
+    render(<ScanRunView jobId="job-1" />);
+
+    await user.click(screen.getByTestId("eject-control"));
+
+    expect(await screen.findByTestId("eject-error")).toHaveTextContent(
+      "SCANNER_BUSY — transport is still settling",
+    );
   });
 
   it("renders a stopped job's remaining frames as skipped, never failed", async () => {

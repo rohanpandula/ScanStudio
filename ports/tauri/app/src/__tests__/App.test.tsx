@@ -113,6 +113,119 @@ describe("App release surfaces", () => {
       "wsl_write_mode_report",
     ]);
   });
+
+  it("keeps real-hardware Stop controls visible by refusing Windows setup navigation", async () => {
+    useUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    const handle = createScriptedTransport({
+      onRequest: (method) => {
+        if (method === "scanner.connect") {
+          return {
+            result: {
+              device: {
+                deviceId: "real-ls5000-0",
+                model: "Nikon LS-5000",
+                kind: "real" as const,
+                firmware: "1.02",
+                connection: "usb",
+              },
+              status: { ...CONNECTED_STATUS, motionArmed: true, filmPresent: true },
+            },
+          };
+        }
+        if (method === "project.create") {
+          return { result: { project: PROJECT, directory: "/tmp/app-real" } };
+        }
+        if (method === "scan.start") return { result: { jobId: "job-real-1" } };
+        if (method === "scan.stop") {
+          return { result: { acknowledged: true, mode: "afterCurrentFrame" } };
+        }
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+    await store.connect("real-ls5000-0");
+    await store.createProject("App Roll", "roll36", 36, "c41ColorNegative");
+    store.toggleFrameSelection(1, false);
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId("capture-action"));
+    await act(async () => {
+      await store.startScan([1], {
+        resolutionDpi: 4000,
+        bitDepth: 16,
+        multisamplePasses: 1,
+        channels: "rgbi",
+      });
+    });
+
+    expect(await screen.findByTestId("stop-after-current")).toBeVisible();
+    const setup = screen.getByTestId("windows-setup-action");
+    expect(setup).toBeDisabled();
+    await user.click(setup);
+    expect(screen.queryByTestId("setup-checker")).toBeNull();
+    expect(screen.getByTestId("stop-after-current")).toBeVisible();
+  });
+
+  it("leaves Windows setup if a real-hardware job becomes active while setup is open", async () => {
+    useUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "wsl_run_checks") return Promise.resolve([]);
+      if (command === "wsl_max_read_report") {
+        return Promise.resolve({ maxBytes: null, entriesScanned: 0 });
+      }
+      if (command === "wsl_write_mode_report") return Promise.resolve("stage-then-move");
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
+    const handle = createScriptedTransport({
+      onRequest: (method) => {
+        if (method === "scanner.connect") {
+          return {
+            result: {
+              device: {
+                deviceId: "real-ls5000-0",
+                model: "Nikon LS-5000",
+                kind: "real" as const,
+                firmware: "1.02",
+                connection: "usb",
+              },
+              status: { ...CONNECTED_STATUS, motionArmed: true, filmPresent: true },
+            },
+          };
+        }
+        if (method === "project.create") {
+          return { result: { project: PROJECT, directory: "/tmp/app-real-delayed" } };
+        }
+        if (method === "scan.start") return { result: { jobId: "job-real-delayed" } };
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+    await store.connect("real-ls5000-0");
+    await store.createProject("App Roll", "roll36", 36, "c41ColorNegative");
+    store.toggleFrameSelection(1, false);
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId("capture-action"));
+    expect(await screen.findByTestId("capture-workflow-view")).toBeVisible();
+    await user.click(screen.getByTestId("windows-setup-action"));
+    expect(await screen.findByTestId("setup-checker")).toBeVisible();
+
+    await act(async () => {
+      await store.startScan([1], {
+        resolutionDpi: 4000,
+        bitDepth: 16,
+        multisamplePasses: 1,
+        channels: "rgbi",
+      });
+    });
+
+    expect(screen.queryByTestId("setup-checker")).toBeNull();
+    expect(await screen.findByTestId("stop-after-current")).toBeVisible();
+  });
 });
 
 describe("App shell reachability (06-03 Task 2)", () => {

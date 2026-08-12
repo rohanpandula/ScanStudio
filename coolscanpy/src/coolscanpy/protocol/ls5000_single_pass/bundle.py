@@ -34,7 +34,9 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # Prior reseal 2026-08-07 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md,
     # Rung 4): both files gained CaptureBatchRequest/LiveBatchJob's
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
-    "capture_process.py": "6208a95b23bba84ee0903a07a0d583a9840c5332cbdc60f38a4b574a050d24e2",
+    # Resealed 2026-08-11: capture descendants remain in the bridge-owned
+    # process group and inherit its exclusive process-ownership fence.
+    "capture_process.py": "a7a4eb4d09c6c6daf399e4a868375a291cf80f220f45a1c13bc36ebff37e1cc9",
     "worker.py": "d826249919c94b67f76b6a36400374a090ef2c9b2c05138f51913e9576e67650",
     "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",

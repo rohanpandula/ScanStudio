@@ -547,9 +547,9 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
               // convertFileSrc, never base64-over-invoke.
               content = (
                 <img
-                  src={`scanstudio-preview://localhost/?path=${encodeURIComponent(
-                    thumbnail.imagePath,
-                  )}`}
+                      src={`scanstudio-preview://localhost/?id=${encodeURIComponent(
+                        thumbnail.imagePath,
+                      )}`}
                   alt={`Frame ${frameIndex}`}
                   data-testid={`tile-image-${frameIndex}`}
                   data-axis-swapped={swapsAxes}

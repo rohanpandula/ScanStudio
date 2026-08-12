@@ -11,17 +11,22 @@ import { invoke } from "@tauri-apps/api/core";
  * `null` on any failure (missing file, outside the allowed scope, no Tauri
  * runtime) rather than throwing, matching resolveDiagnosticBundleRaster's
  * `readFile` contract. */
-export async function readPreviewRasterBytes(path: string): Promise<Uint8Array | null> {
+export async function readPreviewRasterBytes(previewId: string): Promise<Uint8Array | null> {
   try {
-    const bytes = await invoke<number[]>("read_preview_raster", { path });
+    const bytes = await invoke<number[]>("read_preview_raster", { previewId });
     return new Uint8Array(bytes);
   } catch {
     return null;
   }
 }
 
-/** Writes the assembled bundle zip to `path` via the write_diagnostic_bundle
- * command. */
-export async function writeDiagnosticBundleFile(path: string, bytes: Uint8Array): Promise<void> {
-  await invoke("write_diagnostic_bundle", { path, bytes: Array.from(bytes) });
+/** Opens the native, one-use save panel and writes only its selected path. */
+export async function saveDiagnosticBundleFile(
+  suggestedName: string,
+  bytes: Uint8Array,
+): Promise<boolean> {
+  return await invoke<boolean>("save_diagnostic_bundle", {
+    suggestedName,
+    bytes: Array.from(bytes),
+  });
 }

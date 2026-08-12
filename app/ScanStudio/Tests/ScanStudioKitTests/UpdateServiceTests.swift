@@ -7,6 +7,7 @@
 // create` and skip gracefully when hdiutil is unavailable.
 
 import CryptoKit
+import Security
 import XCTest
 
 @testable import ScanStudioKit
@@ -490,7 +491,7 @@ final class UpdateServiceTests: XCTestCase {
     func testMountLocateApp() async throws {
         try requireHDIUtil()
 
-        let appRoot = root.appendingPathComponent("Sample.app", isDirectory: true)
+        let appRoot = root.appendingPathComponent("ScanStudio.app", isDirectory: true)
         let macos = appRoot.appendingPathComponent("Contents/MacOS", isDirectory: true)
         try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
         try Data("marker".utf8).write(to: macos.appendingPathComponent("Sample"))
@@ -501,12 +502,11 @@ final class UpdateServiceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dmgURL) }
 
         let downloader = UpdateDownloader()
-        let appURL = try downloader.mountAndLocateApp(dmgURL)
-        defer { downloader.tearDownMount(appURL.deletingLastPathComponent()) }
-
-        XCTAssertEqual(appURL.lastPathComponent.lowercased(), "sample.app")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path),
-                      "locate must return an existing bundle on the mounted volume")
+        try downloader.withMountedApp(dmgURL) { appURL in
+            XCTAssertEqual(appURL.lastPathComponent, "ScanStudio.app")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path),
+                          "locate must return an existing bundle on the mounted volume")
+        }
     }
 
     func testMountLocateAppNoAppThrows() async throws {
@@ -521,23 +521,288 @@ final class UpdateServiceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dmgURL) }
 
         let downloader = UpdateDownloader()
-        XCTAssertThrowsError(try downloader.mountAndLocateApp(dmgURL)) { error in
+        XCTAssertThrowsError(try downloader.withMountedApp(dmgURL) { _ in () }) { error in
             XCTAssertEqual(error as? UpdateDownloadError, .notAnApp)
         }
     }
 
     // MARK: - 9. Signature gate
 
-    func testSignatureInvalidForPlainDir() throws {
+    func testPublisherTrustAbsentFailsClosedBeforeBundleReads() throws {
         let plain = root.appendingPathComponent("Plain.app", isDirectory: true)
         let macos = plain.appendingPathComponent("Contents/MacOS", isDirectory: true)
         try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
         try Data("x".utf8).write(to: macos.appendingPathComponent("ScanStudio"))
 
-        let downloader = UpdateDownloader()
-        XCTAssertThrowsError(try downloader.verifyCodeSignature(at: plain)) { error in
-            XCTAssertEqual(error as? UpdateDownloadError, .signatureInvalid)
+        let verifier = UpdateBundleVerifier(publisherTrust: nil)
+        XCTAssertThrowsError(
+            try verifier.validate(
+                appURL: plain,
+                expectedVersion: UpdateVersion(raw: "0.3.0-alpha.11")!,
+                expectedArchitecture: HostArchitectureProvider.current()
+            )
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .publisherTrustNotConfigured)
         }
+    }
+
+    func testAuthorizedBundleMatchesIdentityVersionArchitectureAndOS() throws {
+        let app = try makeValidApp(version: "0.3.0-alpha.11")
+
+        XCTAssertNoThrow(
+            try makeBundleVerifier().validate(
+                appURL: app,
+                expectedVersion: UpdateVersion(raw: "0.3.0-alpha.11")!,
+                expectedArchitecture: HostArchitectureProvider.current()
+            )
+        )
+    }
+
+    func testUnauthorizedSignerRejectedEvenWithCorrectMetadata() throws {
+        let app = try makeValidApp(version: "0.3.0-alpha.11")
+        let verifier = makeBundleVerifier(signatureValidator: RejectingUpdateSignatureValidator())
+
+        XCTAssertThrowsError(
+            try verifier.validate(
+                appURL: app,
+                expectedVersion: UpdateVersion(raw: "0.3.0-alpha.11")!,
+                expectedArchitecture: HostArchitectureProvider.current()
+            )
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .publisherUnauthorized)
+        }
+    }
+
+    func testWrongBundleIdentifierRejected() throws {
+        let app = try makeValidApp(
+            version: "0.3.0-alpha.11",
+            overrides: ["CFBundleIdentifier": "example.wrong"]
+        )
+        assertBundleError(.bundleIdentityMismatch, app: app)
+    }
+
+    func testWrongBundleExecutableRejected() throws {
+        let app = try makeValidApp(
+            version: "0.3.0-alpha.11",
+            overrides: ["CFBundleExecutable": "WrongLauncher"]
+        )
+        assertBundleError(.bundleIdentityMismatch, app: app)
+    }
+
+    func testWrongSelectedVersionRejected() throws {
+        let app = try makeValidApp(version: "0.3.0-alpha.10")
+        assertBundleError(.versionMismatch, app: app)
+    }
+
+    func testWrongArchitectureRejected() throws {
+        let wrong: HostArchitecture = HostArchitectureProvider.current() == .arm64 ? .x86_64 : .arm64
+        let app = try makeValidApp(version: "0.3.0-alpha.11", architecture: wrong)
+        assertBundleError(.architectureMismatch, app: app)
+    }
+
+    func testUnsupportedMinimumOSRejected() throws {
+        let app = try makeValidApp(
+            version: "0.3.0-alpha.11",
+            overrides: ["LSMinimumSystemVersion": "100.0"]
+        )
+        assertBundleError(.operatingSystemUnsupported, app: app)
+    }
+
+    func testMinimumOSBelowSupportedFloorRejected() throws {
+        let app = try makeValidApp(
+            version: "0.3.0-alpha.11",
+            overrides: ["LSMinimumSystemVersion": "13.0"]
+        )
+        assertBundleError(.operatingSystemUnsupported, app: app)
+    }
+
+    func testAdHocSignerRejectedBySystemPublisherGate() throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/codesign") else {
+            throw XCTSkip("codesign unavailable")
+        }
+        let app = try makeValidApp(version: "0.3.0-alpha.11")
+        let productBinary = app.appendingPathComponent("Contents/MacOS/ScanStudio")
+        try FileManager.default.removeItem(at: productBinary)
+        let testExecutable = try XCTUnwrap(Bundle(for: Self.self).executableURL)
+        try FileManager.default.copyItem(at: testExecutable, to: productBinary)
+
+        let signing = Process()
+        signing.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        signing.arguments = ["--force", "--deep", "--sign", "-", app.path]
+        try signing.run()
+        signing.waitUntilExit()
+        guard signing.terminationStatus == 0 else {
+            throw XCTSkip("could not create an ad-hoc signed fixture")
+        }
+
+        let designated = try designatedRequirementData(at: app)
+        let trust = try XCTUnwrap(
+            UpdatePublisherTrust(
+                authorizedTeamIdentifier: "ABCDEFGHIJ",
+                designatedRequirementData: designated
+            )
+        )
+        let verifier = UpdateBundleVerifier(publisherTrust: trust)
+
+        XCTAssertThrowsError(
+            try verifier.validate(
+                appURL: app,
+                expectedVersion: UpdateVersion(raw: "0.3.0-alpha.11")!,
+                expectedArchitecture: HostArchitectureProvider.current()
+            )
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .publisherUnauthorized)
+        }
+    }
+
+    // MARK: - Scoped mount cleanup
+
+    func testMissingPublisherTrustRejectsBeforeAttach() throws {
+        let runner = CannedUpdateCommandRunner(mountRoot: root)
+        let downloader = makeDownloader(commandRunner: runner)
+        let candidate = UpdateCandidate(
+            version: UpdateVersion(raw: "0.3.0-alpha.11")!,
+            downloadURL: URL(string: "https://example.com/update.dmg")!,
+            sha256: String(repeating: "a", count: 64),
+            releaseNotesURL: nil
+        )
+
+        XCTAssertThrowsError(
+            try downloader.withVerifiedMountedApp(
+                root.appendingPathComponent("fixture.dmg"),
+                candidate: candidate,
+                architecture: HostArchitectureProvider.current()
+            ) { _ in () }
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .publisherTrustNotConfigured)
+        }
+        XCTAssertEqual(runner.attachCount, 0)
+    }
+
+    func testScopedMountDetachesAfterSuccess() throws {
+        let mountRoot = try makeMountRoot(appCount: 1)
+        let runner = CannedUpdateCommandRunner(mountRoot: mountRoot)
+        let downloader = makeDownloader(commandRunner: runner)
+
+        let value = try downloader.withMountedApp(root.appendingPathComponent("fixture.dmg")) { appURL in
+            XCTAssertEqual(appURL.lastPathComponent, "ScanStudio.app")
+            return 42
+        }
+
+        XCTAssertEqual(value, 42)
+        XCTAssertEqual(runner.normalDetachCount, 1)
+        XCTAssertEqual(runner.forcedDetachCount, 0)
+    }
+
+    func testScopedMountDetachesWhenBodyThrows() throws {
+        let mountRoot = try makeMountRoot(appCount: 1)
+        let runner = CannedUpdateCommandRunner(mountRoot: mountRoot)
+        let downloader = makeDownloader(commandRunner: runner)
+
+        XCTAssertThrowsError(
+            try downloader.withMountedApp(root.appendingPathComponent("fixture.dmg")) { _ in
+                throw URLError(.cancelled)
+            }
+        ) { error in
+            XCTAssertEqual(error as? URLError, URLError(.cancelled))
+        }
+        XCTAssertEqual(runner.normalDetachCount, 1)
+    }
+
+    func testMultipleAppsRejectedAndDetached() throws {
+        let mountRoot = try makeMountRoot(appCount: 2)
+        let runner = CannedUpdateCommandRunner(mountRoot: mountRoot)
+        let downloader = makeDownloader(commandRunner: runner)
+
+        XCTAssertThrowsError(
+            try downloader.withMountedApp(root.appendingPathComponent("fixture.dmg")) { _ in () }
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .notAnApp)
+        }
+        XCTAssertEqual(runner.normalDetachCount, 1)
+    }
+
+    func testNestedHiddenSecondAppRejectedAndDetached() throws {
+        let mountRoot = try makeMountRoot(appCount: 1)
+        try FileManager.default.createDirectory(
+            at: mountRoot.appendingPathComponent("Extras/.Hidden.app", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let runner = CannedUpdateCommandRunner(mountRoot: mountRoot)
+        let downloader = makeDownloader(commandRunner: runner)
+
+        XCTAssertThrowsError(
+            try downloader.withMountedApp(root.appendingPathComponent("fixture.dmg")) { _ in () }
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .notAnApp)
+        }
+        XCTAssertEqual(runner.normalDetachCount, 1)
+    }
+
+    func testDetachFailureFallsBackToBoundedForce() throws {
+        let mountRoot = try makeMountRoot(appCount: 1)
+        let runner = CannedUpdateCommandRunner(
+            mountRoot: mountRoot,
+            normalDetachStatus: 1,
+            forcedDetachStatus: 0
+        )
+        let downloader = makeDownloader(commandRunner: runner)
+
+        XCTAssertNoThrow(
+            try downloader.withMountedApp(root.appendingPathComponent("fixture.dmg")) { _ in () }
+        )
+        XCTAssertEqual(runner.normalDetachCount, 1)
+        XCTAssertEqual(runner.forcedDetachCount, 1)
+    }
+
+    func testBothDetachAttemptsFailClosed() throws {
+        let mountRoot = try makeMountRoot(appCount: 1)
+        let runner = CannedUpdateCommandRunner(
+            mountRoot: mountRoot,
+            normalDetachStatus: 1,
+            forcedDetachStatus: 1
+        )
+        let downloader = makeDownloader(commandRunner: runner)
+
+        XCTAssertThrowsError(
+            try downloader.withMountedApp(root.appendingPathComponent("fixture.dmg")) { _ in () }
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, .detachFailed)
+        }
+        XCTAssertEqual(runner.normalDetachCount, 1)
+        XCTAssertEqual(runner.forcedDetachCount, 1)
+    }
+
+    func testMidStreamChecksumReadErrorIsNotReportedAsMismatch() async throws {
+        let stub = StubURLSession()
+        let dmgURL = URL(string: "https://example.com/ScanStudio-0.3.0-alpha.11-macOS-arm64.dmg")!
+        stub.dataByURL[dmgURL] = Data("downloaded bytes".utf8)
+        let outDir = root.appendingPathComponent("read-error-download", isDirectory: true)
+        let expectedPath = outDir.appendingPathComponent("ScanStudio-0.3.0-alpha.11.dmg").path
+        let downloader = UpdateDownloader(
+            session: stub,
+            bundleVerifier: UpdateBundleVerifier(publisherTrust: nil),
+            commandRunner: CannedUpdateCommandRunner(mountRoot: root),
+            fileReader: FaultingUpdateFileReader()
+        )
+        let candidate = UpdateCandidate(
+            version: UpdateVersion(raw: "0.3.0-alpha.11")!,
+            downloadURL: dmgURL,
+            sha256: String(repeating: "a", count: 64),
+            releaseNotesURL: nil
+        )
+
+        do {
+            _ = try await downloader.download(candidate, to: outDir)
+            XCTFail("expected checksumReadFailed")
+        } catch let error as UpdateDownloadError {
+            guard case .checksumReadFailed(let path, let cause) = error else {
+                return XCTFail("expected checksumReadFailed, got \(error)")
+            }
+            XCTAssertEqual(path, expectedPath)
+            XCTAssertFalse(cause.isEmpty)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expectedPath))
     }
 
     // MARK: - Fixture helpers
@@ -552,6 +817,135 @@ final class UpdateServiceTests: XCTestCase {
         GitHubUpdateChecker.releasePointerURL(tag: tag)
     }
 
+    private func makeBundleVerifier(
+        signatureValidator: any UpdateCodeSignatureValidating = AcceptingServiceSignatureValidator()
+    ) -> UpdateBundleVerifier {
+        UpdateBundleVerifier(
+            publisherTrust: UpdatePublisherTrust(
+                authorizedTeamIdentifier: "ABCDEFGHIJ",
+                designatedRequirementData: Data([1])
+            ),
+            signatureValidator: signatureValidator,
+            hostOperatingSystemVersion: OperatingSystemVersion(
+                majorVersion: 99,
+                minorVersion: 0,
+                patchVersion: 0
+            )
+        )
+    }
+
+    private func assertBundleError(
+        _ expected: UpdateDownloadError,
+        app: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(
+            try makeBundleVerifier().validate(
+                appURL: app,
+                expectedVersion: UpdateVersion(raw: "0.3.0-alpha.11")!,
+                expectedArchitecture: HostArchitectureProvider.current()
+            ),
+            file: file,
+            line: line
+        ) { error in
+            XCTAssertEqual(error as? UpdateDownloadError, expected, file: file, line: line)
+        }
+    }
+
+    private func makeValidApp(
+        version: String,
+        architecture: HostArchitecture = HostArchitectureProvider.current(),
+        overrides: [String: Any] = [:]
+    ) throws -> URL {
+        let app = root.appendingPathComponent("Bundle-\(UUID().uuidString)/ScanStudio.app", isDirectory: true)
+        let contents = app.appendingPathComponent("Contents", isDirectory: true)
+        let macOS = contents.appendingPathComponent("MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        var information: [String: Any] = [
+            "CFBundlePackageType": "APPL",
+            "CFBundleIdentifier": UpdatePublisherTrust.bundleIdentifier,
+            "CFBundleExecutable": UpdatePublisherTrust.bundleExecutable,
+            "CFBundleShortVersionString": "0.3.0",
+            "ScanStudioRelease": version,
+            "LSMinimumSystemVersion": "14.0",
+        ]
+        for (key, value) in overrides { information[key] = value }
+        let plist = try PropertyListSerialization.data(fromPropertyList: information, format: .xml, options: 0)
+        try plist.write(to: contents.appendingPathComponent("Info.plist"))
+
+        let launcher = macOS.appendingPathComponent(UpdatePublisherTrust.bundleExecutable)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: launcher)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: launcher.path)
+        let binary = macOS.appendingPathComponent(UpdatePublisherTrust.architectureExecutable)
+        try fakeMachO(for: architecture).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        return app
+    }
+
+    private func fakeMachO(for architecture: HostArchitecture) -> Data {
+        let cpu: [UInt8] = architecture == .arm64
+            ? [0x0c, 0x00, 0x00, 0x01]
+            : [0x07, 0x00, 0x00, 0x01]
+        return Data([0xcf, 0xfa, 0xed, 0xfe] + cpu)
+    }
+
+    private func designatedRequirementData(at app: URL) throws -> Data {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(app as CFURL, SecCSFlags(rawValue: 0), &code) == errSecSuccess,
+              let code else {
+            throw XCTSkip("Security.framework could not open ad-hoc fixture")
+        }
+        var rawInformation: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            code,
+            SecCSFlags(rawValue: kSecCSRequirementInformation),
+            &rawInformation
+        ) == errSecSuccess,
+              let information = rawInformation as? [String: Any],
+              let rawRequirement = information[kSecCodeInfoDesignatedRequirement as String] else {
+            throw XCTSkip("ad-hoc fixture has no designated requirement")
+        }
+        let cfRequirement = rawRequirement as CFTypeRef
+        guard CFGetTypeID(cfRequirement) == SecRequirementGetTypeID() else {
+            throw XCTSkip("unexpected designated-requirement type")
+        }
+        let requirement = unsafeDowncast(cfRequirement, to: SecRequirement.self)
+        var data: CFData?
+        guard SecRequirementCopyData(requirement, SecCSFlags(rawValue: 0), &data) == errSecSuccess,
+              let data else {
+            throw XCTSkip("could not serialize designated requirement")
+        }
+        return data as Data
+    }
+
+    private func makeMountRoot(appCount: Int) throws -> URL {
+        let mount = root.appendingPathComponent("mount-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
+        if appCount > 0 {
+            try FileManager.default.createDirectory(
+                at: mount.appendingPathComponent("ScanStudio.app", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        if appCount > 1 {
+            try FileManager.default.createDirectory(
+                at: mount.appendingPathComponent("Other.app", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        return mount
+    }
+
+    private func makeDownloader(commandRunner: CannedUpdateCommandRunner) -> UpdateDownloader {
+        UpdateDownloader(
+            session: StubURLSession(),
+            bundleVerifier: UpdateBundleVerifier(publisherTrust: nil),
+            commandRunner: commandRunner,
+            fileReader: NeverOpenedUpdateFileReader()
+        )
+    }
+
     private func requireHDIUtil() throws {
         guard FileManager.default.fileExists(atPath: "/usr/bin/hdiutil") else {
             throw XCTSkip("hdiutil not available; skipping mount tests")
@@ -559,7 +953,7 @@ final class UpdateServiceTests: XCTestCase {
     }
 
     /// Builds a real minimal read-only DMG from `folder` via `hdiutil create`,
-    /// so `mountAndLocateApp` runs against an actual mounted volume.
+    /// so the scoped mount path runs against an actual mounted volume.
     private static func createMinimalDMG(from folder: URL, volname: String, to output: URL) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
@@ -581,6 +975,85 @@ final class UpdateServiceTests: XCTestCase {
             )
         }
     }
+}
+
+private struct AcceptingServiceSignatureValidator: UpdateCodeSignatureValidating {
+    func validateApplication(at appURL: URL, trust: UpdatePublisherTrust) throws {}
+}
+
+private struct RejectingUpdateSignatureValidator: UpdateCodeSignatureValidating {
+    func validateApplication(at appURL: URL, trust: UpdatePublisherTrust) throws {
+        throw UpdateDownloadError.publisherUnauthorized
+    }
+}
+
+private final class CannedUpdateCommandRunner: UpdateCommandRunning, @unchecked Sendable {
+    private let mountRoot: URL
+    private let normalDetachStatus: Int32
+    private let forcedDetachStatus: Int32
+    private(set) var attachCount = 0
+    private(set) var normalDetachCount = 0
+    private(set) var forcedDetachCount = 0
+
+    init(
+        mountRoot: URL,
+        normalDetachStatus: Int32 = 0,
+        forcedDetachStatus: Int32 = 0
+    ) {
+        self.mountRoot = mountRoot
+        self.normalDetachStatus = normalDetachStatus
+        self.forcedDetachStatus = forcedDetachStatus
+    }
+
+    func run(_ executablePath: String, arguments: [String], timeout: TimeInterval) throws -> UpdateCommandResult {
+        if arguments.first == "attach" {
+            attachCount += 1
+            let plist: [String: Any] = [
+                "system-entities": [[
+                    "dev-entry": "/dev/disk-test",
+                    "mount-point": mountRoot.path,
+                ]],
+            ]
+            return UpdateCommandResult(
+                status: 0,
+                output: try PropertyListSerialization.data(
+                    fromPropertyList: plist,
+                    format: .xml,
+                    options: 0
+                )
+            )
+        }
+        if arguments.contains("-force") {
+            forcedDetachCount += 1
+            return UpdateCommandResult(status: forcedDetachStatus, output: Data())
+        }
+        normalDetachCount += 1
+        return UpdateCommandResult(status: normalDetachStatus, output: Data())
+    }
+}
+
+private struct NeverOpenedUpdateFileReader: UpdateFileReading {
+    func open(_ url: URL) throws -> any UpdateReadableFile {
+        throw URLError(.cannotOpenFile)
+    }
+}
+
+private struct FaultingUpdateFileReader: UpdateFileReading {
+    func open(_ url: URL) throws -> any UpdateReadableFile {
+        FaultingUpdateReadableFile()
+    }
+}
+
+private final class FaultingUpdateReadableFile: UpdateReadableFile, @unchecked Sendable {
+    private var readCount = 0
+
+    func read(upToCount count: Int) throws -> Data {
+        defer { readCount += 1 }
+        if readCount == 0 { return Data("prefix".utf8) }
+        throw CocoaError(.fileReadUnknown)
+    }
+
+    func close() throws {}
 }
 
 /// Canned in-memory URLSession stand-in: `data(from:)`/`download(from:)`

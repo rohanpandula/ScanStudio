@@ -48,22 +48,6 @@ function effectiveMetadata(override: MetadataSet | null, roll: MetadataSet | nul
   return { keywords: [] };
 }
 
-const DEFAULT_CAPTURE = {
-  resolutionDpi: 4000,
-  bitDepth: 16 as const,
-  multisamplePasses: 1 as const,
-  channels: "rgbi" as const,
-};
-
-const DEFAULT_PROCESSING = {
-  filmProcess: "positive" as const,
-  autofocusEachFrame: false,
-  autoExposureEachFrame: false,
-  digitalIceEnabled: true,
-  digitalIceMode: "hybrid" as const,
-  softwareDustRemovalBw: false,
-};
-
 export default function FrameDetailView({
   frameIndex,
   onClose,
@@ -79,11 +63,35 @@ export default function FrameDetailView({
   const override = frame?.metadataOverride ?? null;
   const derivativeTransform = sessionStore.frameDerivativeTransform(frameIndex);
   const transformsEditable = sessionStore.frameTransformsAreEditable();
+  const frameReceipts = frame?.receipts ?? [];
+  const latestReceipt = frameReceipts[frameReceipts.length - 1];
+  const resolvedMetadata = effectiveMetadata(override, roll);
+  const metadataAuthorityKey = JSON.stringify({
+    projectId: project?.id ?? null,
+    metadata: resolvedMetadata,
+    outputs: latestReceipt?.outputs ?? null,
+  });
+  const defectRecipeKey = JSON.stringify({
+    projectId: project?.id ?? null,
+    filmProcess: project?.filmProcess ?? null,
+    captureOverride: frame?.captureOverride ?? null,
+    processingOverride: frame?.processingOverride ?? null,
+    receiptCapture:
+      latestReceipt === undefined
+        ? null
+        : {
+            resolutionDpi: latestReceipt.resolutionDpi,
+            bitDepth: latestReceipt.bitDepth,
+            multisamplePasses: latestReceipt.passes,
+            channels: latestReceipt.channels,
+          },
+    receiptProcessing: latestReceipt?.processing ?? null,
+  });
 
-  // ExifTool detection + preview + defect analysis are effect-driven
-  // (fetch-on-open), so the panel and overlay stay honest: detection shows
-  // the capability chip, preview shows the exact command, and the overlay
-  // renders whatever the engine reports (including simulated).
+  // Detection and the initial command preview are fetched on open. Recipe
+  // analysis is separately keyed to its project authority, and metadata
+  // authority changes invalidate (rather than silently refresh) the command
+  // the operator previously reviewed.
   const [exifToolDetection, setExifToolDetection] = useState<ExifToolDetection | null>(null);
   const [metadataPreview, setMetadataPreview] = useState<PreviewMetadataCommandResult | null>(
     null,
@@ -93,7 +101,6 @@ export default function FrameDetailView({
   useEffect(() => {
     setExifToolDetection(null);
     setMetadataPreview(null);
-    setDefectResult(null);
     void sessionStore
       .detectExifTool()
       .then((result) => {
@@ -105,13 +112,26 @@ export default function FrameDetailView({
     void sessionStore
       .previewMetadataCommand(frameIndex)
       .then((result) => {
-        if (result !== undefined && result !== null && Array.isArray(result.arguments)) {
+        if (
+          result !== undefined &&
+          result !== null &&
+          Array.isArray(result.arguments) &&
+          typeof result.fingerprint === "string"
+        ) {
           setMetadataPreview(result);
         }
       })
       .catch(() => setMetadataPreview(null));
+  }, [frameIndex]);
+
+  useEffect(() => {
+    setMetadataPreview(null);
+  }, [frameIndex, metadataAuthorityKey]);
+
+  useEffect(() => {
+    setDefectResult(null);
     void sessionStore
-      .analyzeFrameDefects(frameIndex, DEFAULT_CAPTURE, DEFAULT_PROCESSING)
+      .analyzeFrameDefects(frameIndex)
       .then((result) => {
         // Guard: the scripted transports in existing tests return undefined
         // for unscripted methods; only a well-formed result may drive the
@@ -121,7 +141,7 @@ export default function FrameDetailView({
         }
       })
       .catch(() => setDefectResult(null));
-  }, [frameIndex]);
+  }, [frameIndex, defectRecipeKey]);
 
   if (thumbnail === undefined) {
     return (
@@ -203,24 +223,34 @@ export default function FrameDetailView({
       </div>
       <FrameMetadataOverride
         frameIndex={frameIndex}
-        effectiveMetadata={effectiveMetadata(override, roll)}
+        effectiveMetadata={resolvedMetadata}
         override={override}
-        onSetOverride={(next: MetadataSet | null) =>
-          void sessionStore.setFrameMetadataOverride(frameIndex, next)
-        }
+        onSetOverride={(next: MetadataSet | null) => {
+          setMetadataPreview(null);
+          void sessionStore.setFrameMetadataOverride(frameIndex, next);
+        }}
         exifToolDetection={exifToolDetection}
         metadataPreview={metadataPreview}
         onPreviewCommand={() =>
           void sessionStore
             .previewMetadataCommand(frameIndex)
             .then((result) => {
-              if (result !== undefined && result !== null && Array.isArray(result.arguments)) {
+              if (
+                result !== undefined &&
+                result !== null &&
+                Array.isArray(result.arguments) &&
+                typeof result.fingerprint === "string"
+              ) {
                 setMetadataPreview(result);
               }
             })
             .catch(() => setMetadataPreview(null))
         }
-        onApply={() => sessionStore.applyMetadata(frameIndex)}
+        onApply={() =>
+          metadataPreview === null
+            ? Promise.resolve(null)
+            : sessionStore.applyMetadata(frameIndex, metadataPreview.fingerprint)
+        }
       />
       <SpacingOffsetControl frameIndex={frameIndex} />
       <ApprovalPanel frameIndex={frameIndex} />

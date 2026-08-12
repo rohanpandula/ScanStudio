@@ -398,6 +398,7 @@ private struct WorkspaceErrorBanner: View {
     @State private var isShowingTechnicalDetails = false
     @State private var didCopyTechnicalDetails = false
     @State private var didSaveDiagnosticBundle = false
+    @State private var diagnosticBundleSaveError: String?
 
     private var isLoadingManualPlacement: Bool {
         sessionModel.manualPlacementStripState == .loading
@@ -555,6 +556,16 @@ private struct WorkspaceErrorBanner: View {
                             .accessibilityLabel("Save diagnostic bundle")
                         }
 
+                        if let diagnosticBundleSaveError {
+                            Text(diagnosticBundleSaveError)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(Color.scanStudioRed)
+                                .textSelection(.enabled)
+                                .accessibilityLabel(
+                                    "Diagnostic bundle save failed: \(diagnosticBundleSaveError)"
+                                )
+                        }
+
                         ScrollView(.vertical) {
                             Text(presentation.technicalDetails)
                                 .font(.system(size: 10, design: .monospaced))
@@ -598,6 +609,8 @@ private struct WorkspaceErrorBanner: View {
     /// builds the archive itself, so the saved bundle always matches
     /// whatever ScanStudioKit assembled (T-ERR-04).
     private func saveDiagnosticBundle() {
+        didSaveDiagnosticBundle = false
+        diagnosticBundleSaveError = nil
         let panel = NSSavePanel()
         panel.title = "Save Diagnostic Bundle"
         panel.nameFieldStringValue = "ScanStudio-Diagnostics-\(Self.diagnosticBundleTimestamp()).zip"
@@ -607,13 +620,19 @@ private struct WorkspaceErrorBanner: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         let data = sessionModel.makeDiagnosticBundleData()
-        // Best-effort local save: a write failure leaves the banner's
-        // existing error state untouched rather than fabricating a new one.
-        try? data.write(to: url, options: .atomic)
-        didSaveDiagnosticBundle = true
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1.5))
-            didSaveDiagnosticBundle = false
+        do {
+            try DiagnosticBundleFileWriter.write(data, to: url)
+            didSaveDiagnosticBundle = true
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1.5))
+                didSaveDiagnosticBundle = false
+            }
+        } catch let error as DiagnosticBundleSaveError {
+            diagnosticBundleSaveError = error.localizedDescription
+        } catch {
+            diagnosticBundleSaveError =
+                "DIAGNOSTIC_WRITE_FAILED: Could not save the diagnostic bundle: "
+                + error.localizedDescription
         }
     }
 

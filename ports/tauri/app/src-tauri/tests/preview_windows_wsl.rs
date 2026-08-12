@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use scanstudio_app_lib::preview::handle_with_windows_wsl_share;
+use scanstudio_app_lib::preview::{handle_with_windows_wsl_share, PreviewAccess};
 use tauri::http::Request;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -35,9 +35,9 @@ fn preview_file(share: &Path, user: &str, session: &str, filename: &str) -> Path
         .join(filename)
 }
 
-fn request_for_wsl_path(path: &str) -> Request<Vec<u8>> {
+fn request_for_wsl_path(access: &PreviewAccess, path: &str) -> Request<Vec<u8>> {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
-    query.append_pair("path", path);
+    query.append_pair("id", &access.issue(path));
     Request::builder()
         .uri(format!(
             "scanstudio-preview://localhost/?{}",
@@ -70,6 +70,7 @@ fn windows_uri_serves_initial_and_spacing_adjusted_real_preview_tiles() {
 
     let initial_session = "0123456789abcdef0123456789abcdef";
     let adjusted_session = "abcdef0123456789abcdef0123456789";
+    let access = PreviewAccess::default();
     save_tiff(
         &preview_file(&share, "wsl-user", initial_session, "slot-0002.tif"),
         [12, 34, 56],
@@ -79,15 +80,15 @@ fn windows_uri_serves_initial_and_spacing_adjusted_real_preview_tiles() {
         [210, 180, 90],
     );
 
-    let initial = request_for_wsl_path(&format!(
+    let initial = request_for_wsl_path(&access, &format!(
         "/home/wsl-user/.scanstudio/previews/{initial_session}/slot-0002.tif"
     ));
-    let adjusted = request_for_wsl_path(&format!(
+    let adjusted = request_for_wsl_path(&access, &format!(
         "/home/wsl-user/.scanstudio/previews/{adjusted_session}/slot-0002.tif"
     ));
 
-    let initial_response = handle_with_windows_wsl_share(home.clone(), &share, &initial);
-    let adjusted_response = handle_with_windows_wsl_share(home, &share, &adjusted);
+    let initial_response = handle_with_windows_wsl_share(home.clone(), &share, &access, &initial);
+    let adjusted_response = handle_with_windows_wsl_share(home, &share, &access, &adjusted);
 
     assert_eq!(initial_response.status(), 200);
     assert_eq!(adjusted_response.status(), 200);
@@ -102,6 +103,7 @@ fn windows_uri_rejects_traversal_alternate_roots_and_arbitrary_files() {
     let (root, _guard) = fixture_root();
     let share = root.join("pinned-Ubuntu-24.04-share");
     let home = root.join("windows-home");
+    let access = PreviewAccess::default();
     std::fs::create_dir_all(&home).unwrap();
 
     for attack in [
@@ -113,7 +115,12 @@ fn windows_uri_rejects_traversal_alternate_roots_and_arbitrary_files() {
         "/home/../wsl-user/.scanstudio/previews/0123456789abcdef0123456789abcdef/slot-0001.tif",
     ] {
         let response =
-            handle_with_windows_wsl_share(home.clone(), &share, &request_for_wsl_path(attack));
+            handle_with_windows_wsl_share(
+                home.clone(),
+                &share,
+                &access,
+                &request_for_wsl_path(&access, attack),
+            );
         assert_eq!(
             response.status(),
             403,
@@ -130,6 +137,7 @@ fn windows_uri_rejects_a_preview_leaf_symlink_that_escapes_the_allowed_root() {
     let (root, _guard) = fixture_root();
     let share = root.join("pinned-Ubuntu-24.04-share");
     let home = root.join("windows-home");
+    let access = PreviewAccess::default();
     std::fs::create_dir_all(&home).unwrap();
 
     let session = "0123456789abcdef0123456789abcdef";
@@ -142,7 +150,8 @@ fn windows_uri_rejects_a_preview_leaf_symlink_that_escapes_the_allowed_root() {
     let response = handle_with_windows_wsl_share(
         home,
         &share,
-        &request_for_wsl_path(&format!(
+        &access,
+        &request_for_wsl_path(&access, &format!(
             "/home/wsl-user/.scanstudio/previews/{session}/slot-0001.tif"
         )),
     );

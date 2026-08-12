@@ -337,6 +337,30 @@ def _opened_service(tmp_path: Path, transport: object | None = None) -> service.
     return svc
 
 
+def test_shutdown_refuses_to_acknowledge_a_still_live_owned_worker(tmp_path: Path) -> None:
+    class _StillAliveThread:
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return True
+
+    transport = _StubTransport()
+    svc = _make_service(tmp_path, transport)
+    svc._last_job = {
+        "job_id": "owned-job",
+        "terminal": False,
+        "thread": _StillAliveThread(),
+    }
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch({"id": 7, "method": "bridge.shutdown", "params": {}}, lambda *_a: None)
+
+    assert excinfo.value.code == ErrorCode.HARDWARE_LANE_BUSY
+    assert "not acknowledged" in excinfo.value.message
+    assert transport.stop_requested is True
+
+
 class _RecordingEmit:
     """Thread-safe emit() collector shared between the dispatching test
     thread and BridgeService's worker threads."""
@@ -1041,7 +1065,7 @@ def test_roll_preview_complete_device_status_polled_from_callback_sees_lane_not_
     def emit(event: str, payload: dict) -> None:
         if event == "roll.previewComplete":
             status = svc.dispatch(
-                {"id": "status-poll", "method": "device.status"}, lambda *_a: None
+                {"id": 98, "method": "device.status"}, lambda *_a: None
             )
             with lock:
                 lane_held_snapshots.append(status["laneHeld"])
@@ -1072,7 +1096,7 @@ def test_roll_preview_error_device_status_polled_from_callback_sees_lane_not_hel
     def emit(event: str, payload: dict) -> None:
         if event == "roll.previewError":
             status = svc.dispatch(
-                {"id": "status-poll", "method": "device.status"}, lambda *_a: None
+                {"id": 98, "method": "device.status"}, lambda *_a: None
             )
             with lock:
                 lane_held_snapshots.append(status["laneHeld"])
@@ -1155,6 +1179,149 @@ def test_scan_stop_on_already_terminal_job_returns_acknowledged_false(
 
     result = svc.dispatch({"id": 4, "method": "scan.stop", "params": {"jobId": job_id}}, emit)
     assert result == {"acknowledged": False}
+
+
+def test_scan_start_echoes_engine_operation_token_and_refuses_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm(monkeypatch, tmp_path)
+    transport = _StubTransport(preview_thumbnails=1)
+    svc = _opened_service(tmp_path, transport)
+    emit = _RecordingEmit()
+    svc.dispatch(
+        {"id": 2, "method": "roll.preview", "params": {"material": "colorNegative"}}, emit
+    )
+    _wait_for_preview_complete_and_lane_free(svc, emit)
+
+    token = "0123456789abcdef0123456789abcdef"
+    params = {
+        "jobId": token,
+        "slots": [1],
+        "recipe": _wire_recipe(),
+        "output": {
+            "destination": str(tmp_path / "out"),
+            "filenameTemplate": "frame-####.tif",
+        },
+    }
+    assert svc.dispatch({"id": 3, "method": "scan.start", "params": params}, emit) == {
+        "jobId": token
+    }
+    _wait_for(lambda: emit.has("scan.completed"))
+    _wait_for(lambda: not svc._motion_op_active)
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch({"id": 4, "method": "scan.start", "params": params}, emit)
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert "already used" in excinfo.value.message
+
+
+def test_scan_start_ingress_rejects_coercible_nonfinite_missing_and_unknown_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm(monkeypatch, tmp_path)
+    svc = _opened_service(tmp_path, _StubTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    output = {
+        "destination": str(tmp_path / "out"),
+        "filenameTemplate": "frame-####.tif",
+    }
+    missing_recipe_field = _wire_recipe()
+    del missing_recipe_field["bitDepth"]
+    bad_params = [
+        {"slots": [True], "recipe": _wire_recipe(), "output": output},
+        {"slots": ["1"], "recipe": _wire_recipe(), "output": output},
+        {
+            "slots": [1],
+            "recipe": {**_wire_recipe(), "resolutionDpi": "4000"},
+            "output": output,
+        },
+        {
+            "slots": [1],
+            "recipe": {**_wire_recipe(), "resolutionDpi": True},
+            "output": output,
+        },
+        {
+            "slots": [1],
+            "recipe": {**_wire_recipe(), "resolutionDpi": float("nan")},
+            "output": output,
+        },
+        {"slots": [1], "recipe": missing_recipe_field, "output": output},
+        {
+            "slots": [1],
+            "recipe": {**_wire_recipe(), "unexpected": 1},
+            "output": output,
+        },
+        {
+            "slots": [1],
+            "recipe": _wire_recipe(),
+            "output": output,
+            "unexpected": 1,
+        },
+        {"slots": [1], "recipe": _wire_recipe()},
+    ]
+
+    for request_id, params in enumerate(bad_params, start=20):
+        with pytest.raises(BridgeError) as excinfo:
+            svc.dispatch(
+                {"id": request_id, "method": "scan.start", "params": params},
+                lambda *_a: None,
+            )
+        assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+        assert svc._lane_held is False
+        assert svc._motion_op_active is False
+
+
+def test_other_hardware_ingress_rejects_bool_strings_and_unknown_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm(monkeypatch, tmp_path)
+    transport = _StubTransport()
+    svc = _opened_service(tmp_path, transport)
+
+    bad_preview_requests = [
+        {"material": True},
+        {"material": "1"},
+        {"material": "colorNegative", "slots": [True]},
+        {"material": "colorNegative", "slots": ["1"]},
+        {"material": "colorNegative", "unexpected": 1},
+        {},
+    ]
+    for request_id, params in enumerate(bad_preview_requests, start=40):
+        with pytest.raises(BridgeError) as excinfo:
+            svc.dispatch(
+                {"id": request_id, "method": "roll.preview", "params": params},
+                lambda *_a: None,
+            )
+        assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    for request_id, params in enumerate(
+        [
+            {"slot": True, "offsetRows": 0},
+            {"slot": "1", "offsetRows": 0},
+            {"slot": 1, "offsetRows": "0"},
+            {"slot": 1, "offsetRows": 0, "unexpected": False},
+        ],
+        start=50,
+    ):
+        with pytest.raises(BridgeError) as excinfo:
+            svc.dispatch(
+                {
+                    "id": request_id,
+                    "method": "roll.setSpacingOffset",
+                    "params": params,
+                },
+                lambda *_a: None,
+            )
+        assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {"id": 60, "method": "device.eject", "params": {"force": True}},
+            lambda *_a: None,
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert transport.eject_called is False
 
 
 def test_device_close_raises_hardware_lane_busy_while_job_active(
@@ -1622,7 +1789,7 @@ def test_scan_completed_device_status_polled_from_callback_sees_lane_not_held(
     def emit(event: str, payload: dict) -> None:
         if event == "scan.completed":
             status = svc.dispatch(
-                {"id": "status-poll", "method": "device.status"}, lambda *_a: None
+                {"id": 98, "method": "device.status"}, lambda *_a: None
             )
             with lock:
                 lane_held_snapshots.append(status["laneHeld"])

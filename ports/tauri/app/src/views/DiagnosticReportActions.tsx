@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
 import { diagnosticTimeline } from "../session";
 import { buildDiagnosticBundleZip, resolveDiagnosticBundleRaster } from "../session/diagnosticBundle";
-import { readPreviewRasterBytes, writeDiagnosticBundleFile } from "../session/diagnosticBundleIO";
+import { readPreviewRasterBytes, saveDiagnosticBundleFile } from "../session/diagnosticBundleIO";
 import { buildErrorReportText, type ErrorReportContext, type SetupCheckProbeSummary } from "../session/errorReport";
 import { describeCpuArchitecture, describeOperatingSystem, getScanStudioVersion } from "../session/hostEnvironment";
 import { setupCheckResults } from "../session/setupCheckResults";
@@ -101,14 +100,11 @@ export default function DiagnosticReportActions({
         unavailableRasterReason: unavailableReason,
       });
 
-      const destination = await save({
-        title: "Save Diagnostic Bundle",
-        defaultPath: `ScanStudio-Diagnostics-${timestampForFilename()}.zip`,
-        filters: [{ name: "Zip Archive", extensions: ["zip"] }],
-      });
-      if (destination === null) return;
-
-      await writeDiagnosticBundleFile(destination, zipBytes);
+      const saved = await saveDiagnosticBundleFile(
+        `ScanStudio-Diagnostics-${timestampForFilename()}.zip`,
+        zipBytes,
+      );
+      if (!saved) return;
       setDidSaveBundle(true);
       setTimeout(() => setDidSaveBundle(false), 1500);
     } finally {

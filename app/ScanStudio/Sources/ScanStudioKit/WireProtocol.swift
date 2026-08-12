@@ -1573,13 +1573,19 @@ public struct PreviewMetadataCommandResult: Decodable, Sendable {
     public let exiftoolPath: String?
     public let targets: [String]
     public let arguments: [String]
+    /// Engine-minted digest binding the exact argument vector (including
+    /// resolved output targets) displayed by the preview. The client must
+    /// return this value unchanged on `project.applyMetadata`.
+    public let fingerprint: String
 }
 
 public struct ApplyMetadataParams: Codable, Sendable {
     public let frameIndex: Int
+    public let previewFingerprint: String
 
-    public init(frameIndex: Int) {
+    public init(frameIndex: Int, previewFingerprint: String) {
         self.frameIndex = frameIndex
+        self.previewFingerprint = previewFingerprint
     }
 }
 
@@ -1593,6 +1599,11 @@ public struct ApplyMetadataResult: Decodable, Sendable {
     public let stdout: String
     public let stderr: String
     public let targets: [String]
+    /// The exact argument vector rebuilt and executed by the engine.
+    public let arguments: [String]
+    /// The engine's digest of `arguments`, echoed so the client can verify
+    /// that the reported execution still matches the displayed preview.
+    public let fingerprint: String
 }
 
 /// Result for `project.pendingFrames`: the exact set of frame indices that

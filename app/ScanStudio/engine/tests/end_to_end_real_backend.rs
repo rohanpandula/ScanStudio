@@ -665,7 +665,7 @@ fn roll_set_spacing_offset_enforces_frame_specific_inclusive_bounds_locally() {
 #[test]
 fn real_scan_does_not_reapply_transport_alignment_as_a_derivative_crop() {
     let project_directory = unique_output_destination("transport-alignment-project");
-    let positive_directory = unique_output_destination("transport-alignment-positive");
+    let positive_directory = project_directory.join("Positive");
     let (mut child, mut stdin, rx, reader_handle) =
         spawn_connected_engine_with_bridge_env("e2e-transport-alignment-no-double-crop", &[]);
 
@@ -799,7 +799,6 @@ fn real_scan_does_not_reapply_transport_alignment_as_a_derivative_crop() {
     assert!(exit.success(), "engine did not exit 0: {exit:?}");
     let _ = reader_handle.join();
     let _ = std::fs::remove_dir_all(project_directory);
-    let _ = std::fs::remove_dir_all(positive_directory);
 }
 
 /// Preview already owns the manual-review decision. The public engine event
@@ -2627,7 +2626,7 @@ fn pending_frames_reflects_real_hardware_receipts_from_fresh_disk_read() {
             },
             "output": {
                 "archive": {
-                    "destination": unique_output_destination("pending-frames").display().to_string(),
+                    "destination": project_directory.join("Archive").display().to_string(),
                     "filenameTemplate": "frame-####"
                 },
                 "positive": {"enabled": false},
@@ -2989,7 +2988,7 @@ fn bridge_crash_mid_batch_reports_honest_failure_with_zero_receipt_loss() {
             },
             "output": {
                 "archive": {
-                    "destination": unique_output_destination("bridge-crash").display().to_string(),
+                    "destination": project_directory.join("Archive").display().to_string(),
                     "filenameTemplate": "frame-####"
                 },
                 "positive": {"enabled": false},
@@ -3187,7 +3186,7 @@ fn bridge_respawn_invalidates_real_session_and_requires_reconnect() {
             },
             "output": {
                 "archive": {
-                    "destination": unique_output_destination("resume-after-crash-initial").display().to_string(),
+                    "destination": project_directory.join("Archive").display().to_string(),
                     "filenameTemplate": "frame-####"
                 },
                 "positive": {"enabled": false},
