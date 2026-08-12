@@ -395,6 +395,21 @@ struct WebRuntimeMacOSVerificationTests {
         }
     }
 
+    @Test("production command runner returns finite output after observing EOF")
+    func productionRunnerReturnsFiniteOutput() throws {
+        let runner = FoundationBoundedWebRuntimeCommandRunner()
+        let result = try runner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/printf"),
+            arguments: ["finite-output"],
+            timeout: 10,
+            maximumOutputBytes: 1_024
+        )
+
+        #expect(result.terminationStatus == 0)
+        #expect(result.standardOutput == Data("finite-output".utf8))
+        #expect(result.standardError.isEmpty)
+    }
+
     @Test("production command runner terminates a child when its task is cancelled")
     func productionRunnerHonorsTaskCancellation() async throws {
         let runner = FoundationBoundedWebRuntimeCommandRunner()

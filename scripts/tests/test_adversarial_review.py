@@ -869,13 +869,26 @@ class SubmoduleDiffTests(GitRepositoryTestCase):
         )
         run("git", "-C", "vendor", "checkout", "-q", first)
         run("git", "config", "-f", ".gitmodules", "submodule.vendor.ignore", "all")
-        run("git", "add", ".")
+        run("git", "add", ".gitmodules")
+        # Construct both sides of the comparison directly in the index.
+        # Git 2.54 honors ignore=all even while staging the base tree, so a
+        # broad `git add` can otherwise retain the submodule's newer gitlink.
+        run(
+            "git",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{first},vendor",
+        )
         run("git", "commit", "-qm", "base")
         base = rev_parse(self.repository)
+        committed_base_gitlink = subprocess.check_output(
+            ["git", "ls-tree", "HEAD", "vendor"],
+            cwd=self.repository,
+            text=True,
+        )
+        self.assertIn(first, committed_base_gitlink)
         run("git", "-C", "vendor", "checkout", "-q", second)
-        # Build the deliberately hidden gitlink directly. Newer Git versions
-        # honor `submodule.vendor.ignore=all` for ordinary `git add`, which can
-        # otherwise leave this adversarial fixture with nothing to commit.
         run(
             "git",
             "update-index",

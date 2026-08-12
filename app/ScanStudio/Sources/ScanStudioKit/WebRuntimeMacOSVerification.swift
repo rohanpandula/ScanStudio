@@ -159,6 +159,12 @@ public final class FoundationBoundedWebRuntimeCommandRunner: WebRuntimeCommandRu
             try? stderrPipe.fileHandleForWriting.close()
             throw WebRuntimeDistributionError.cacheUnavailable
         }
+        // `Process` inherits its own descriptors during `run()`. Close the
+        // parent's copies now so each reader observes EOF when the child exits
+        // or is killed. Retaining either write end can strand the other reader
+        // until its grace period and misclassify bounded output as a timeout.
+        try? stdoutPipe.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
 
         let deadline = Date().addingTimeInterval(timeout)
         while true {
