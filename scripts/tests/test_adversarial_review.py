@@ -873,9 +873,24 @@ class SubmoduleDiffTests(GitRepositoryTestCase):
         run("git", "commit", "-qm", "base")
         base = rev_parse(self.repository)
         run("git", "-C", "vendor", "checkout", "-q", second)
-        run("git", "add", "vendor")
+        # Build the deliberately hidden gitlink directly. Newer Git versions
+        # honor `submodule.vendor.ignore=all` for ordinary `git add`, which can
+        # otherwise leave this adversarial fixture with nothing to commit.
+        run(
+            "git",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{second},vendor",
+        )
         run("git", "commit", "-qm", "advance gitlink")
         reviewed = rev_parse(self.repository)
+        committed_gitlink = subprocess.check_output(
+            ["git", "ls-tree", "HEAD", "vendor"],
+            cwd=self.repository,
+            text=True,
+        )
+        self.assertIn(second, committed_gitlink)
         diff = canonical_diff(base, reviewed)
         self.assertIn(b"diff --git a/vendor b/vendor", diff)
         self.assertIn(second.encode(), diff)
