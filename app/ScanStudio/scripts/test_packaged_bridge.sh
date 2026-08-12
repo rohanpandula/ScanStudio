@@ -80,12 +80,99 @@ if [[ "$libusb_architectures" != "$app_architectures" ]]; then
     exit 1
 fi
 
+site_packages="$relocated_app/Contents/Resources/BridgeRuntime/site-packages"
+python_sane_extensions=("$site_packages"/_sane*.so(N.))
+python_sane_dist_info=("$site_packages"/python_sane-*.dist-info(N/))
+if (( ${#python_sane_extensions} != 1 || ${#python_sane_dist_info} != 1 )); then
+    print -u2 "packaged bridge check failed: expected exactly one regular python-sane extension and one dist-info directory"
+    exit 1
+fi
+python_sane_extension="${python_sane_extensions[1]}"
+case "$app_architectures" in
+    arm64)
+        python_sane_host_path="/opt/homebrew/opt/sane-backends/lib/libsane.1.dylib"
+        ;;
+    x86_64)
+        python_sane_host_path="/usr/local/opt/sane-backends/lib/libsane.1.dylib"
+        ;;
+    *)
+        print -u2 "packaged bridge check failed: unsupported app architecture '$app_architectures' for python-sane"
+        exit 1
+        ;;
+esac
+python_sane_minimum="$(vtool -show-build "$python_sane_extension" | awk '$1 == "minos" { print $2; exit }')"
+if [[ "$(lipo -archs "$python_sane_extension")" != "$app_architectures" \
+    || "$python_sane_minimum" != "$app_minimum" ]]; then
+    print -u2 "packaged bridge check failed: python-sane architecture/minimum OS does not match the app"
+    exit 1
+fi
+if otool -l "$python_sane_extension" \
+    | awk '$2 == "LC_RPATH" { found=1 } END { exit !found }'; then
+    print -u2 "packaged bridge check failed: python-sane contains LC_RPATH"
+    exit 1
+fi
+python_sane_dependencies="$(otool -L "$python_sane_extension" | tail -n +2 | awk '{print $1}')"
+if [[ "$(print -r -- "$python_sane_dependencies" | grep -Fxc "$python_sane_host_path")" != 1 ]] \
+    || print -r -- "$python_sane_dependencies" | grep -Fq '__ScanStudio_SANE_Link_SDK' \
+    || print -r -- "$python_sane_dependencies" | grep -vFx "$python_sane_host_path" \
+        | grep -Ev '^(/usr/lib/|/System/Library/)' | grep -q .; then
+    print -u2 "packaged bridge check failed: python-sane linkage is not the canonical host SANE ABI plus system libraries"
+    otool -L "$python_sane_extension" >&2
+    exit 1
+fi
+if ! nm -g "$python_sane_extension" | awk '{print $3}' | grep -Fxq _PyInit__sane \
+    || ! grep -q '^Name: python-sane$' "${python_sane_dist_info[1]}/METADATA" \
+    || ! grep -q '^Version: 2.9.2$' "${python_sane_dist_info[1]}/METADATA"; then
+    print -u2 "packaged bridge check failed: python-sane ABI or distribution metadata changed"
+    exit 1
+fi
+python_sane_source="$relocated_app/Contents/Resources/CorrespondingSource/python-sane/python_sane-2.9.2.tar.gz"
+python_sane_builder="$relocated_app/Contents/Resources/CorrespondingSource/python-sane/build_sane_link_sdk.sh"
+python_sane_rebuild="$relocated_app/Contents/Resources/CorrespondingSource/python-sane/REBUILD.txt"
+if [[ ! -f "$python_sane_source" || -L "$python_sane_source" \
+    || ! -x "$python_sane_builder" || -L "$python_sane_builder" \
+    || ! -f "$python_sane_rebuild" || -L "$python_sane_rebuild" ]]; then
+    print -u2 "packaged bridge check failed: python-sane source or rebuild controls are missing, non-regular, or symlinks"
+    exit 1
+fi
+if [[ "$(stat -f '%z' "$python_sane_source")" != 22513 \
+    || "$(shasum -a 256 "$python_sane_source" | awk '{print $1}')" \
+        != 50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe ]] \
+    || ! cmp -s "$python_sane_builder" "$script_dir/build_sane_link_sdk.sh" \
+    || ! zsh -n "$python_sane_builder" \
+    || ! grep -q 'f99205c903dfe2fb8990f0c531232c9a00ec9c2c66ac7cb0ce50b4af9f407a72' "$python_sane_builder" \
+    || ! grep -q '50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe' "$python_sane_builder" \
+    || ! grep -q 'SCANSTUDIO_PYTHON_SANE_SOURCE_ARCHIVE' "$python_sane_builder" \
+    || ! grep -q 'macOS deployment target 14.0' "$python_sane_rebuild"; then
+    print -u2 "packaged bridge check failed: python-sane source provenance or rebuild controls changed"
+    exit 1
+fi
+runtime_scan_targets=(
+    "$relocated_app/Contents/MacOS"
+    "$relocated_app/Contents/Frameworks"
+    "$relocated_app/Contents/Resources/BridgeRuntime"
+)
+if find "${runtime_scan_targets[@]}" -type f \
+    \( -name 'libsane*.dylib' -o -name 'libsane*.so*' \) -print -quit | grep -q . \
+    || grep -R -a -q -F '__ScanStudio_SANE_Link_SDK' "${runtime_scan_targets[@]}" \
+    || grep -R -a -q -E '/(var/folders|private/tmp)/[^/[:space:]]+/(sane|python.sane)' \
+        "${runtime_scan_targets[@]}"; then
+    print -u2 "packaged bridge check failed: private SANE SDK identity/path or SANE runtime leaked into executable app content"
+    exit 1
+fi
+
 base_dir="$workdir/isolated bridge base"
 output="$workdir/bridge.ndjson"
 bridge="$relocated_app/Contents/MacOS/scanstudio-bridge"
 engine="$relocated_app/Contents/MacOS/scanstudio-engine"
 runtime_python="$relocated_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"
+runtime_sysconfig="$relocated_app/Contents/Resources/BridgeRuntime/python/lib/python3.13/_sysconfigdata__darwin_darwin.py"
 coolscanpy_pyproject="$relocated_app/Contents/Resources/CorrespondingSource/coolscanpy/pyproject.toml"
+if [[ ! -f "$runtime_sysconfig" || -L "$runtime_sysconfig" ]] \
+    || grep -a -q -E '/(private/)?var/folders/|/(private/)?tmp/|/Users/' "$runtime_sysconfig"; then
+    print -u2 "packaged bridge check failed: bundled CPython sysconfig retains a private build path"
+    exit 1
+fi
 coolscanpy_version="$(
     "$runtime_python" -I -B - "$coolscanpy_pyproject" <<'PYTHON'
 import sys
@@ -143,8 +230,24 @@ source_verify="$workdir/corresponding source verify"
 mkdir -p "$source_verify"
 ditto "$relocated_app/Contents/Resources/CorrespondingSource/scanstudio-bridge" "$source_verify/scanstudio-bridge"
 ditto "$relocated_app/Contents/Resources/CorrespondingSource/coolscanpy" "$source_verify/coolscanpy"
-if ! (cd "$source_verify/scanstudio-bridge" && uv sync --locked --offline --no-install-project --no-dev); then
-    print -u2 "packaged bridge check failed: corresponding source cannot resolve its shipped sibling CoolscanPy source with uv sync --locked"
+uv_executable="$(command -v uv || true)"
+uv_version_output="${uv_executable:+$("$uv_executable" --version 2>/dev/null || true)}"
+if [[ -z "$uv_executable" || ! -x "$uv_executable" \
+    || "${${(z)uv_version_output}[1,2]}" != "uv 0.11.30" ]]; then
+    print -u2 "packaged bridge check failed: exact uv 0.11.30 is required to verify corresponding source"
+    exit 1
+fi
+source_verify_home="$workdir/source-verify-home"
+mkdir -m 700 "$source_verify_home"
+if ! (
+    cd "$source_verify/scanstudio-bridge"
+    env -i \
+        HOME="$source_verify_home" PATH="${uv_executable:h}:/usr/bin:/bin" \
+        LANG=C LC_ALL=C UV_PYTHON_DOWNLOADS=never \
+        "$uv_executable" --no-config lock --check --offline --no-cache \
+            --python "$runtime_python"
+); then
+    print -u2 "packaged bridge check failed: corresponding-source lock does not prove its shipped sibling CoolScanPy source relation"
     exit 1
 fi
 "$script_dir/test_launcher.sh" \

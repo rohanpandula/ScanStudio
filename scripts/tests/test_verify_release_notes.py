@@ -10,9 +10,9 @@ import unittest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 VERIFIER_PATH = REPOSITORY_ROOT / "scripts" / "verify_release_notes.py"
-COMMITTED_NOTES = REPOSITORY_ROOT / "docs" / "releases" / "v0.7.0-beta.6.md"
-TAG = "v0.7.0-beta.6"
-VERSION = "0.7.0-beta.6"
+COMMITTED_NOTES = REPOSITORY_ROOT / "docs" / "releases" / "v0.7.0-beta.7.md"
+TAG = "v0.7.0-beta.7"
+VERSION = "0.7.0-beta.7"
 
 _SPEC = importlib.util.spec_from_file_location("verify_release_notes", VERIFIER_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -50,7 +50,7 @@ class VerifyReleaseNotesTests(unittest.TestCase):
             repository_root=root,
         )
 
-    def test_committed_beta6_notes_pass_cli_verification(self) -> None:
+    def test_committed_beta7_notes_pass_cli_verification(self) -> None:
         completed = subprocess.run(
             [
                 sys.executable,
@@ -68,6 +68,20 @@ class VerifyReleaseNotesTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn(f"tag={TAG}", completed.stdout)
+
+    def test_committed_notes_bind_cancelled_beta6_and_release_toolchain(self) -> None:
+        self.assertIn("The `v0.7.0-beta.6` tag build was cancelled", self.valid_text)
+        self.assertIn("no release assets were created", self.valid_text)
+        self.assertIn(
+            "`v0.7.0-beta.7` is therefore the first published artifact set",
+            self.valid_text,
+        )
+        self.assertIn("hash-pinned `uv` 0.11.30", self.valid_text)
+        self.assertIn("Node.js 22.23.2", self.valid_text)
+        self.assertIn("managed CPython 3.13.14 build 20260718", self.valid_text)
+        self.assertIn("exact Rust 1.97.1", self.valid_text)
+        self.assertIn("hash-pinned sane-backends 1.4.0", self.valid_text)
+        self.assertIn("private Tauri tools tree", self.valid_text)
 
     def test_release_workflow_binds_draft_and_published_bodies(self) -> None:
         workflow = (
@@ -92,7 +106,7 @@ class VerifyReleaseNotesTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 _VERIFIER.ReleaseNotesError, "tag/version mismatch"
             ):
-                self.verify(notes, root, tag="v0.7.0-beta.7")
+                self.verify(notes, root, tag="v0.7.0-beta.8")
 
     def test_version_must_use_the_release_filename_grammar(self) -> None:
         temporary, root, notes = self.make_repository()
@@ -100,7 +114,7 @@ class VerifyReleaseNotesTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 _VERIFIER.ReleaseNotesError, "invalid release version"
             ):
-                self.verify(notes, root, tag="v../../beta.6", version="../../beta.6")
+                self.verify(notes, root, tag="v../../beta.7", version="../../beta.7")
 
     def test_filename_is_derived_from_the_validated_tag(self) -> None:
         temporary, root, notes = self.make_repository()

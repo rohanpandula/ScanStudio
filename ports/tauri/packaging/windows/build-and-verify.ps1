@@ -25,6 +25,16 @@ $stagingRoot = Join-Path $portRoot 'packaging\.staging\windows'
 $verifier = Join-Path $PSScriptRoot 'verify-bundle.ps1'
 $launcherBlackBox = Join-Path $PSScriptRoot 'tests\test-hardware-session-launcher.ps1'
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$pinnedToolsInstaller = Join-Path $portRoot 'packaging\install_pinned_tauri_tools.py'
+$cargoTarget = Join-Path $appRoot 'src-tauri\target'
+$tauriToolsRoot = Join-Path $cargoTarget '.tauri'
+$webViewGuid = 'e4dd9b83-b7e3-4d17-8d7c-e14cdd7c3a51'
+$webViewFileName = 'MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
+$webViewSha256 = 'f8d4ab074c22a0cd136434f37c6b34dfb64ebf8a32ce42e03bd8f2a6b51a3892'
+$nsisPluginSha256 = '5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709'
+$pinnedWebView = Join-Path $tauriToolsRoot "x64\$webViewGuid\$webViewFileName"
+$pinnedMakensis = Join-Path $tauriToolsRoot 'NSIS\makensis.exe'
+$pinnedNsisPlugin = Join-Path $tauriToolsRoot 'NSIS\Plugins\x86-unicode\additional\nsis_tauri_utils.dll'
 
 if (-not (Test-Path $stagingRoot -PathType Container)) {
     throw "Windows staging is missing: $stagingRoot"
@@ -177,6 +187,132 @@ function Test-RegistryValueExists {
 
     $properties = Get-ItemProperty -LiteralPath $Path -ErrorAction SilentlyContinue
     return $null -ne $properties -and $null -ne $properties.PSObject.Properties[$Name]
+}
+
+function Invoke-PinnedTauriToolCheck {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('prepare', 'verify')]
+        [string]$Operation
+    )
+
+    & python `
+        -I `
+        -S `
+        -B `
+        $pinnedToolsInstaller `
+        $Operation `
+        windows `
+        --target-directory `
+        $cargoTarget
+    if ($LASTEXITCODE -ne 0) {
+        throw "Pinned Tauri tool $Operation failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Get-HeldStreamSha256 {
+    param([Parameter(Mandatory = $true)][System.IO.FileStream]$Stream)
+
+    $Stream.Position = 0
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $algorithm.ComputeHash($Stream)
+    }
+    finally {
+        $algorithm.Dispose()
+        $Stream.Position = 0
+    }
+    return ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+}
+
+function Assert-HeldPinnedFile {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileStream]$Stream,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $actual = Get-HeldStreamSha256 -Stream $Stream
+    if ($actual -cne $ExpectedSha256) {
+        throw "$Description held-file SHA-256 mismatch: expected $ExpectedSha256, got $actual"
+    }
+}
+
+function Assert-PinnedWebViewAuthenticode {
+    if (-not (Test-Path -LiteralPath $pinnedWebView -PathType Leaf)) {
+        throw "Pinned WebView2 offline installer is missing: $pinnedWebView"
+    }
+    $attributes = (Get-Item -LiteralPath $pinnedWebView -Force).Attributes
+    if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Pinned WebView2 offline installer is a reparse point: $pinnedWebView"
+    }
+    $actualHash = (Get-FileHash -LiteralPath $pinnedWebView -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -cne $webViewSha256) {
+        throw "Pinned WebView2 SHA-256 mismatch: expected $webViewSha256, got $actualHash"
+    }
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $pinnedWebView
+    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+        throw "Pinned WebView2 Authenticode status is $($signature.Status): $($signature.StatusMessage)"
+    }
+    if ($null -eq $signature.SignerCertificate -or
+        $signature.SignerCertificate.Subject -notmatch '(^|, )O=Microsoft Corporation(,|$)') {
+        throw "Pinned WebView2 signer is not Microsoft Corporation: $($signature.SignerCertificate.Subject)"
+    }
+    if ($null -eq $signature.TimeStamperCertificate) {
+        throw 'Pinned WebView2 Authenticode signature has no timestamp certificate.'
+    }
+    Write-Host "WebView2 Authenticode valid: $($signature.SignerCertificate.Subject)"
+}
+
+function Assert-GeneratedNsisUsesPinnedWebView {
+    $expectedNsi = Join-Path $cargoTarget 'release\nsis\x64\installer.nsi'
+    if (-not (Test-Path -LiteralPath $expectedNsi -PathType Leaf)) {
+        throw "Generated NSIS source is missing from its exact path: $expectedNsi"
+    }
+    $attributes = (Get-Item -LiteralPath $expectedNsi -Force).Attributes
+    if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Generated NSIS source is a reparse point: $expectedNsi"
+    }
+    $allNsi = @(
+        Get-ChildItem -LiteralPath (Join-Path $cargoTarget 'release\nsis') `
+            -Recurse `
+            -File `
+            -Filter 'installer.nsi'
+    )
+    if ($allNsi.Count -ne 1 -or
+        [IO.Path]::GetFullPath($allNsi[0].FullName) -ine [IO.Path]::GetFullPath($expectedNsi)) {
+        throw "Expected exactly one generated installer.nsi at $expectedNsi, found: $($allNsi.FullName)"
+    }
+
+    $source = [IO.File]::ReadAllText($expectedNsi)
+    $pathMatches = [regex]::Matches(
+        $source,
+        '(?m)^!define WEBVIEW2INSTALLERPATH "([^"\r\n]+)"\r?$'
+    )
+    if ($pathMatches.Count -ne 1) {
+        throw "Generated NSIS source must define WEBVIEW2INSTALLERPATH exactly once; found $($pathMatches.Count)"
+    }
+    $generatedWebViewPath = $pathMatches[0].Groups[1].Value
+    if (-not (Test-SameFileSystemPath -Left $generatedWebViewPath -Right $pinnedWebView)) {
+        throw "Generated NSIS source names '$generatedWebViewPath', expected held file '$pinnedWebView'"
+    }
+    $modeMatches = [regex]::Matches(
+        $source,
+        '(?m)^!define INSTALLWEBVIEW2MODE "offlineInstaller"\r?$'
+    )
+    if ($modeMatches.Count -ne 1) {
+        throw "Generated NSIS source must select offlineInstaller exactly once; found $($modeMatches.Count)"
+    }
+    $fileUses = [regex]::Matches(
+        $source,
+        '(?m)^\s*File "/oname=\$TEMP\\MicrosoftEdgeWebView2RuntimeInstaller\.exe" "\$\{WEBVIEW2INSTALLERPATH\}"\r?$'
+    )
+    if ($fileUses.Count -ne 1) {
+        throw "Generated NSIS source must embed the pinned WebView2 define exactly once; found $($fileUses.Count)"
+    }
+    $nsiHash = (Get-FileHash -LiteralPath $expectedNsi -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Host "Generated NSIS source verified: $expectedNsi SHA-256 $nsiHash"
 }
 
 function Assert-NoExistingScanStudioInstall {
@@ -631,19 +767,67 @@ Invoke-HardwareSessionLauncherBlackBox -Root $PSScriptRoot
 
 $buildConfig = Join-Path ([System.IO.Path]::GetTempPath()) ("scanstudio-tauri-version-" + [guid]::NewGuid().ToString('N') + '.json')
 @{ version = $Version } | ConvertTo-Json -Compress | Set-Content -LiteralPath $buildConfig -Encoding utf8NoBOM -NoNewline
+$pinnedToolHandles = [Collections.Generic.List[System.IO.FileStream]]::new()
+$heldMakensisSha256 = ''
 
 Push-Location $appRoot
 try {
     npm ci
+    $tauriCli = Join-Path $appRoot 'node_modules\.bin\tauri.cmd'
+    $tauriCliVersion = (& $tauriCli --version | Out-String).Trim()
+    if ($tauriCliVersion -cne 'tauri-cli 2.11.4') {
+        throw "Unexpected Tauri CLI version: $tauriCliVersion"
+    }
     npm run sync-engine
     npm test
     npx tsc --noEmit
     npm run build
     cargo test --locked --manifest-path src-tauri\Cargo.toml
+    Invoke-PinnedTauriToolCheck -Operation prepare
+    Invoke-PinnedTauriToolCheck -Operation verify
+    Assert-PinnedWebViewAuthenticode
+
+    foreach ($pinnedToolPath in @($pinnedWebView, $pinnedMakensis, $pinnedNsisPlugin)) {
+        $held = [IO.File]::Open(
+            $pinnedToolPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        $pinnedToolHandles.Add($held)
+    }
+    Assert-HeldPinnedFile `
+        -Stream $pinnedToolHandles[0] `
+        -ExpectedSha256 $webViewSha256 `
+        -Description 'WebView2 offline installer'
+    $heldMakensisSha256 = Get-HeldStreamSha256 -Stream $pinnedToolHandles[1]
+    Assert-HeldPinnedFile `
+        -Stream $pinnedToolHandles[2] `
+        -ExpectedSha256 $nsisPluginSha256 `
+        -Description 'NSIS Tauri plugin'
+
     npm run tauri -- build --ci --bundles nsis --config $buildConfig -- --locked
+    Invoke-PinnedTauriToolCheck -Operation verify
+    Assert-HeldPinnedFile `
+        -Stream $pinnedToolHandles[0] `
+        -ExpectedSha256 $webViewSha256 `
+        -Description 'WebView2 offline installer'
+    Assert-HeldPinnedFile `
+        -Stream $pinnedToolHandles[1] `
+        -ExpectedSha256 $heldMakensisSha256 `
+        -Description 'NSIS compiler'
+    Assert-HeldPinnedFile `
+        -Stream $pinnedToolHandles[2] `
+        -ExpectedSha256 $nsisPluginSha256 `
+        -Description 'NSIS Tauri plugin'
+    Assert-PinnedWebViewAuthenticode
+    Assert-GeneratedNsisUsesPinnedWebView
 }
 finally {
     Pop-Location
+    foreach ($handle in $pinnedToolHandles) {
+        $handle.Dispose()
+    }
     Remove-Item -LiteralPath $buildConfig -Force -ErrorAction SilentlyContinue
 }
 

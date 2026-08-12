@@ -12,8 +12,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  authorize:
+    name: Authorize tag from reviewed main history
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify tag commit, main containment, and full notes
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          version="${GITHUB_REF_NAME#v}"
+          python3 -I -S -B scripts/verify_release_notes.py \
+            "docs/releases/$GITHUB_REF_NAME.md" "$GITHUB_REF_NAME" "$version"
+
   release:
     name: Build and verify ${{ matrix.arch }} DMG
+    needs: authorize
     # A universal bundle is impossible because the pinned cv2/numpy wheels are
     # not universal, so each architecture is built natively on its own runner
     # through the SAME verified `make dmg` path (codesign --deep --strict,
@@ -46,6 +65,7 @@ jobs:
       # the same verified `make dmg` path used locally, so a release is only
       # publishable if the exact signed app passes the packaging verification.
       UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -54,32 +74,25 @@ jobs:
         # Owner policy (2026-08-08): a release may not ship driver code that
         # standalone `pip install coolscanpy` users would not have -- version
         # skew between the two makes field reports for the same film
-        # incomparable. Content-compared against the latest published sdist
-        # (version strings are checked second; an unbumped version with
-        # changed code is exactly the failure mode). Publish the matching
-        # coolscanpy release from the canonical repo first, then re-tag.
+        # incomparable. Content is compared against the exact authenticated
+        # 0.7.1 sdist (version strings are checked second; an unbumped version
+        # with changed code is exactly the failure mode). Publish the matching
+        # coolscanpy release from the canonical repo before tagging ScanStudio.
         run: bash scripts/check_coolscanpy_pypi_sync.sh
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          python-version: "3.13"
-      - name: Install optional SANE binding build prerequisite
-        # The release does not copy Homebrew's libusb: package_app.sh builds
-        # the signed app-owned copy from hash-pinned source. sane-backends is
-        # needed only to compile the optional python-sane compatibility
-        # binding included in the bundle.
-        run: brew install sane-backends
-      - name: Point the compiler at Homebrew's headers and libraries
-        # GitHub Actions does not expand $(...) inside an `env:` block and the
-        # Homebrew prefix varies by runner arch (/opt/homebrew on arm64,
-        # /usr/local on x86_64), so resolve it here and export it through
-        # GITHUB_ENV for every later step in this job.
+          toolchain: '1.97.1'
+      - name: Install exact uv and managed Python build toolchain
         run: |
-          echo "CPPFLAGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
-          echo "LDFLAGS=-L$(brew --prefix)/lib" >> "$GITHUB_ENV"
-      - name: Install locked bridge dependencies (with scanner extra)
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
+      - name: Verify exact Rust toolchain
+        run: python3 -I -S -B scripts/verify_pinned_rust.py
+      - name: Install locked production bridge dependencies
         working-directory: bridge
-        run: uv sync --locked --extra scanner
+        # package_app.sh compiles exact python-sane 2.9.2 separately against
+        # the source-pinned, private SANE 1.4.0 link SDK.
+        run: uv sync --locked --no-dev --no-install-package python-sane
       - name: Resolve release version from the tag
         # The workflow only runs on `v*` tag pushes, so the exact-match tag
         # is authoritative; fall back to GITHUB_REF_NAME minus the leading v.
@@ -137,23 +150,31 @@ jobs:
 
   windows-resources:
     name: Assemble Windows offline resources
+    needs: authorize
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: ports/tauri/app/package-lock.json
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: '3.13'
+      - name: Install exact Node and Python build toolchains
+        run: |
+          python3 -I -S -B scripts/install_pinned_node.py \
+            --install-root "$RUNNER_TEMP/scanstudio-node"
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-      - name: Install pinned Rust dependency notice generator
-        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+        with:
+          toolchain: '1.97.1'
+      - name: Verify exact Rust toolchain
+        run: python3 -I -S -B scripts/verify_pinned_rust.py
+      - name: Install authenticated Rust dependency notice generator
+        run: |
+          python3 -I -S -B scripts/install_pinned_cargo_about.py \
+            --install-root "$RUNNER_TEMP/scanstudio-cargo-about"
       - name: Assemble and verify the WSL2 resource bundle
         working-directory: ports/tauri
         env:
@@ -175,6 +196,9 @@ jobs:
     needs: windows-resources
     runs-on: windows-latest
     timeout-minutes: 90
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -189,17 +213,20 @@ jobs:
           New-Item -ItemType Directory -Force -Path ports/tauri/packaging/.staging | Out-Null
           tar -xzf "$env:RUNNER_TEMP/windows-staging/windows-staging.tar.gz" -C ports/tauri/packaging/.staging
           if ($LASTEXITCODE -ne 0) { throw "Could not restore Windows staging" }
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: ports/tauri/app/package-lock.json
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: '3.13'
+      - name: Install exact Node and Python build toolchains
+        shell: pwsh
+        run: |
+          python -I -S -B scripts/install_pinned_node.py `
+            --install-root "$env:RUNNER_TEMP\scanstudio-node"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Node installation failed" }
+          python -I -S -B scripts/install_pinned_uv_python.py `
+            --install-root "$env:RUNNER_TEMP\scanstudio-uv-python"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned uv/Python installation failed" }
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-      - name: Install NSIS
-        run: choco install nsis --yes --no-progress
+        with:
+          toolchain: '1.97.1'
+      - name: Verify exact Rust toolchain
+        run: python -I -S -B scripts/verify_pinned_rust.py
       - name: Resolve release version from the tag
         shell: pwsh
         run: |
@@ -220,31 +247,37 @@ jobs:
 
   linux:
     name: Build and verify Linux x64 Preview
+    needs: authorize
     runs-on: ubuntu-22.04
+    container: ubuntu@sha256:0199853f6d6b20b0424f3c5694a72a62764f01e6a771b1eb48a4197848986c7e
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Install Linux build and runtime prerequisites
+        run: scripts/install_ubuntu_build_prerequisites.sh
+      - name: Install exact Node and Python build toolchains
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential curl file libayatana-appindicator3-dev libfuse2 libgtk-3-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev librsvg2-dev \
-            libsane-dev libssl-dev libusb-1.0-0 libwebkit2gtk-4.1-dev squashfs-tools \
-            libxdo-dev patchelf pkg-config sane-utils wget
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: ports/tauri/app/package-lock.json
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: '3.13'
+          python3 -I -S -B scripts/install_pinned_node.py \
+            --install-root "$RUNNER_TEMP/scanstudio-node"
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-      - name: Install pinned Rust dependency notice generator
-        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+        with:
+          toolchain: '1.97.1'
+      - name: Verify exact Rust toolchain
+        run: python3 -I -S -B scripts/verify_pinned_rust.py
+      - name: Install authenticated Rust dependency notice generator
+        run: |
+          python3 -I -S -B scripts/install_pinned_cargo_about.py \
+            --install-root "$RUNNER_TEMP/scanstudio-cargo-about"
       - name: Resolve release version from the tag
         run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Build, extract, smoke-test, and re-extract both Linux packages

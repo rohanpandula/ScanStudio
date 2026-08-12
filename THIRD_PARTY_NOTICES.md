@@ -30,8 +30,15 @@ the package check proves a relocated bundled Python process resolves that
 exact app-owned file rather than a Homebrew copy.
 
 The bundle also includes `python-sane` for CoolscanPy's optional plain-scan
-and software-eject paths. It deliberately does **not** include an operating-
-system SANE backend; the bundled `_sane` extension expects a compatible host
+and software-eject paths. Version 2.9.2 is compiled from the exact sdist in the
+bridge lock (SHA-256
+`50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe`)
+against a private build-only SANE 1.4.0 link SDK. That SDK is built from the
+upstream release archive with SHA-256
+`f99205c903dfe2fb8990f0c531232c9a00ec9c2c66ac7cb0ce50b4af9f407a72`;
+neither it nor a SANE runtime is distributed. The package retains python-sane's
+permissive `COPYING` text, exact source archive, and rebuild controls under
+`Contents/Resources`. The bundled `_sane` extension expects a compatible host
 `libsane.1.dylib` when one of those optional paths is used. The supported
 LS-5000 color-roll workflow does not require SANE: discovery and connection
 fall back to direct USB when SANE is absent, while status, preview, and color
@@ -103,7 +110,7 @@ Before distributing `ScanStudio.app`, a DMG, or any other binary artifact:
 1. Regenerate the resolved dependency inventory from the exact `Cargo.lock` used to build the release.
 2. Include the full text of every selected Rust dependency license and the required copyright notices in the shipped archive or app bundle.
 3. Include the MIT license for this project.
-4. A `make package` bundle includes `scanstudio-bridge`: verify its GPL-3.0-only license, CoolscanPy source, CPython license, Python wheel metadata/licenses, and libusb license, notice, binary, complete pinned source archive, exact build script, and rebuild instructions are present in `Contents/Resources/Licenses`, `Contents/Resources/CorrespondingSource`, and `Contents/Frameworks`.
+4. A `make package` bundle includes `scanstudio-bridge`: verify its GPL-3.0-only license, CoolscanPy source, CPython license, Python wheel metadata/licenses, python-sane source/rebuild controls, and libusb license, notice, binary, complete pinned source archive, exact build script, and rebuild instructions are present in `Contents/Resources/Licenses`, `Contents/Resources/CorrespondingSource`, and `Contents/Frameworks`; also verify no SANE link SDK or SANE runtime was shipped.
 5. Keep Nikon software and private evidence out of the release.
 6. Recheck this document after every dependency or packaging change.
 

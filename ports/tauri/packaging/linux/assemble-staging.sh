@@ -26,6 +26,16 @@ SCANSTUDIO_APP_SOURCE="${SCANSTUDIO_APP_SOURCE:-$repo_root/app}"
 CPYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 CPYTHON_SHA256="6734c3e643c75e860c36ee3a7904e8e6bafbf3232d89b17ffd5fbfa72ab2816c"
 
+# Committed target-specific lock for every package artifact used below. The
+# verifier binds package/version, target ABI, exact filename, byte size, and
+# SHA-256 before any wheel is extracted or any sdist is built.
+PYTHON_ARTIFACT_LOCK="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.lock.json"
+PYTHON_ARTIFACT_SHA256="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.sha256"
+PYTHON_WHEEL_REQUIREMENTS="$repo_root/packaging/python-wheels-linux-cp313-x86_64.requirements.txt"
+PYTHON_SANE_REQUIREMENTS="$repo_root/packaging/python-sane-linux-cp313-x86_64.requirements.txt"
+PYTHON_ARTIFACT_VERIFIER="$repo_root/packaging/verify_python_artifact_lock.py"
+PYTHON_SANE_URL="https://files.pythonhosted.org/packages/source/p/python-sane/python_sane-2.9.2.tar.gz"
+
 SITE_PACKAGES_DIR="$STAGING_ROOT/BridgeRuntime/site-packages"
 PYTHON_BIN="$STAGING_ROOT/BridgeRuntime/python/bin/python3.13"
 
@@ -37,6 +47,17 @@ require_file "bridge source LICENSE" "$SCANSTUDIO_BRIDGE_SOURCE/LICENSE"
 require_file "CoolscanPy source LICENSE" "$COOLSCANPY_SOURCE/LICENSE"
 require_file "frontend package lock" "$SCANSTUDIO_APP_SOURCE/package-lock.json"
 require_file "Tauri app Cargo lock" "$SCANSTUDIO_APP_SOURCE/src-tauri/Cargo.lock"
+require_file "Python artifact lock" "$PYTHON_ARTIFACT_LOCK"
+require_file "Python artifact checksum ledger" "$PYTHON_ARTIFACT_SHA256"
+require_file "Python wheel requirements" "$PYTHON_WHEEL_REQUIREMENTS"
+require_file "python-sane requirements" "$PYTHON_SANE_REQUIREMENTS"
+require_file "Python artifact verifier" "$PYTHON_ARTIFACT_VERIFIER"
+
+"$HOST_PYTHON" -I -B "$PYTHON_ARTIFACT_VERIFIER" \
+    --lock "$PYTHON_ARTIFACT_LOCK" \
+    --wheel-requirements "$PYTHON_WHEEL_REQUIREMENTS" \
+    --sdist-requirements "$PYTHON_SANE_REQUIREMENTS" \
+    --sha256sums "$PYTHON_ARTIFACT_SHA256"
 
 COOLSCANPY_IDENTITY_VERIFIER="$repo_root/../../scripts/verify_coolscanpy_source.py"
 require_file "CoolscanPy package identity verifier" "$COOLSCANPY_IDENTITY_VERIFIER"
@@ -54,7 +75,10 @@ download_dir="$(mktemp -d)"
 extract_tmp="$(mktemp -d)"
 trap 'rm -rf "$download_dir" "$extract_tmp"' EXIT
 cpython_tarball="$download_dir/cpython.tar.gz"
-curl -fL --retry 3 -o "$cpython_tarball" "$CPYTHON_URL"
+curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+    --connect-timeout 20 --max-time 600 --speed-limit 1024 --speed-time 60 \
+    --max-filesize 268435456 --retry 3 --retry-delay 1 --retry-all-errors \
+    --output "$cpython_tarball" "$CPYTHON_URL"
 verify_sha256 "$CPYTHON_SHA256" "$cpython_tarball"
 tar -xzf "$cpython_tarball" -C "$extract_tmp"
 mkdir -p "$STAGING_ROOT/BridgeRuntime"
@@ -79,10 +103,9 @@ mkdir -p "$STAGING_ROOT/CorrespondingSource"
 copy_corresponding_source "$SCANSTUDIO_BRIDGE_SOURCE" "$STAGING_ROOT/CorrespondingSource/scanstudio-bridge"
 copy_corresponding_source "$COOLSCANPY_SOURCE" "$STAGING_ROOT/CorrespondingSource/coolscanpy"
 
-# (4) curated site-packages. The seven exact versions are resolved for the
-# pinned CPython ABI and verified by the strict bundle gate below. Python
-# wheels are downloaded for the Linux target via the bundled interpreter's own
-# pip, unzipped into site-packages, and the .whl archives deleted.
+# (4) curated site-packages. The seven runtime wheels are selected from one
+# committed, hash-required target download and verified as an exact artifact
+# set before the bounded no-link extractor writes anything into site-packages.
 mkdir -p "$SITE_PACKAGES_DIR"
 # The bundled CPython is a Linux-only binary and cannot execute on non-Linux
 # hosts (the local macOS packaging gate). `pip download` with explicit
@@ -90,29 +113,31 @@ mkdir -p "$SITE_PACKAGES_DIR"
 # the identical target wheels from any interpreter, so fall back to the host
 # python3's pip on such hosts while keeping the bundled interpreter's pip
 # authoritative on a real Linux build host.
-CURATED_PACKAGES=(
-    "numpy==2.5.1"
-    "tifffile==2026.7.31"
-    "imagecodecs==2026.6.26"
-    "opencv-python-headless==4.14.0.94"
-    "pyusb==1.3.1"
-    "Jinja2==3.1.6"
-    "MarkupSafe==3.0.3"
-)
-PIP_DOWNLOAD_ARGS=(download --no-deps --only-binary=:all: --python-version 313 \
-    --implementation cp --abi cp313 --platform manylinux_2_28_x86_64 \
-    -d "$SITE_PACKAGES_DIR")
 pip_python="$PYTHON_BIN"
 if [[ "$(uname -s)" != "Linux" ]] && ! "$PYTHON_BIN" -I -c 'import sys' >/dev/null 2>&1; then
-    pip_python="python3"
+    pip_python="$HOST_PYTHON"
 fi
-for package in "${CURATED_PACKAGES[@]}"; do
-    "$pip_python" -m pip "${PIP_DOWNLOAD_ARGS[@]}" "$package"
-done
-while IFS= read -r -d '' wheel; do
-    python3 -m zipfile -e "$wheel" "$SITE_PACKAGES_DIR"
-    rm -f "$wheel"
-done < <(find "$SITE_PACKAGES_DIR" -maxdepth 1 -type f -name '*.whl' -print0)
+python_artifacts="$download_dir/python-artifacts"
+mkdir -p "$python_artifacts"
+"$pip_python" -I -B -m pip --isolated --disable-pip-version-check \
+    --no-cache-dir download --require-hashes --no-deps --only-binary=:all: \
+    --python-version 313 --implementation cp --abi cp313 \
+    --platform manylinux_2_28_x86_64 --index-url https://pypi.org/simple \
+    --dest "$python_artifacts" --requirement "$PYTHON_WHEEL_REQUIREMENTS"
+
+sane_sdist="$python_artifacts/python_sane-2.9.2.tar.gz"
+curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+    --connect-timeout 20 --max-time 180 --speed-limit 1024 --speed-time 30 \
+    --max-filesize 1048576 --retry 3 --retry-delay 1 --retry-all-errors \
+    --output "$sane_sdist" "$PYTHON_SANE_URL"
+
+"$HOST_PYTHON" -I -B "$PYTHON_ARTIFACT_VERIFIER" \
+    --lock "$PYTHON_ARTIFACT_LOCK" \
+    --wheel-requirements "$PYTHON_WHEEL_REQUIREMENTS" \
+    --sdist-requirements "$PYTHON_SANE_REQUIREMENTS" \
+    --sha256sums "$PYTHON_ARTIFACT_SHA256" \
+    --directory "$python_artifacts" \
+    --extract-wheels "$SITE_PACKAGES_DIR" --wheel-role runtime
 
 # python-sane has no prebuilt wheel. A real Linux bundle must compile it for
 # the bundled CPython 3.13 against the build host's libsane-dev. The exact
@@ -128,20 +153,13 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     build_tools="$download_dir/python-build-tools"
     mkdir -p "$sane_build" "$build_tools"
 
-    setuptools_wheel="$download_dir/setuptools-83.0.0-py3-none-any.whl"
-    curl -fL --retry 3 -o "$setuptools_wheel" \
-        "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl"
-    verify_sha256 \
-        "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3" \
-        "$setuptools_wheel"
-    python3 -m zipfile -e "$setuptools_wheel" "$build_tools"
-
-    sane_sdist="$download_dir/python_sane-2.9.2.tar.gz"
-    curl -fL --retry 3 -o "$sane_sdist" \
-        "https://files.pythonhosted.org/packages/source/p/python-sane/python_sane-2.9.2.tar.gz"
-    verify_sha256 \
-        "50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe" \
-        "$sane_sdist"
+    "$HOST_PYTHON" -I -B "$PYTHON_ARTIFACT_VERIFIER" \
+        --lock "$PYTHON_ARTIFACT_LOCK" \
+        --wheel-requirements "$PYTHON_WHEEL_REQUIREMENTS" \
+        --sdist-requirements "$PYTHON_SANE_REQUIREMENTS" \
+        --sha256sums "$PYTHON_ARTIFACT_SHA256" \
+        --directory "$python_artifacts" \
+        --extract-wheels "$build_tools" --wheel-role build
 
     CC=gcc CXX=g++ PYTHONPATH="$build_tools" "$PYTHON_BIN" -m pip wheel \
         --disable-pip-version-check --no-index --no-deps --no-build-isolation \

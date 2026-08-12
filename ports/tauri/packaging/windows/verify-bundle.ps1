@@ -68,6 +68,28 @@ $requirementsPath = Join-Path $Root 'wsl-requirements.txt'
 $requirementsText = if (Test-Path $requirementsPath -PathType Leaf) {
     Get-Content -Raw -Path $requirementsPath
 } else { '' }
+$packagingRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$artifactVerifier = Join-Path $packagingRoot 'verify_python_artifact_lock.py'
+$artifactLock = Join-Path $packagingRoot 'python-artifacts-linux-cp313-x86_64.lock.json'
+$artifactSha256 = Join-Path $packagingRoot 'python-artifacts-linux-cp313-x86_64.sha256'
+$wheelRequirements = Join-Path $packagingRoot 'python-wheels-linux-cp313-x86_64.requirements.txt'
+$saneRequirements = Join-Path $packagingRoot 'python-sane-linux-cp313-x86_64.requirements.txt'
+$wheelhouse = Join-Path $Root 'Wheelhouse'
+& python -I -B $artifactVerifier `
+    --lock $artifactLock `
+    --wheel-requirements $wheelRequirements `
+    --sdist-requirements $saneRequirements `
+    --combined-requirements $requirementsPath `
+    --sha256sums $artifactSha256 `
+    --directory $wheelhouse `
+    --allow-ledger
+if ($LASTEXITCODE -eq 0) {
+    Write-Host 'PASS  exact locked WSL Python artifact set'
+}
+else {
+    Write-Host 'FAIL  exact locked WSL Python artifact set' -ForegroundColor Red
+    $failures += 1
+}
 $pins = @(
     'setuptools==83.0.0',
     'numpy==2.5.1',
@@ -80,7 +102,7 @@ $pins = @(
     'python-sane==2.9.2'
 )
 foreach ($pin in $pins) {
-    if ($requirementsText.Contains("$pin --hash=sha256:")) {
+    if ($requirementsText.IndexOf("$pin --hash=sha256:", [StringComparison]::OrdinalIgnoreCase) -ge 0) {
         Write-Host "PASS  pinned offline requirement $pin"
     }
     else {

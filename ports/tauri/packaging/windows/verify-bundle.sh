@@ -143,6 +143,23 @@ fi
 # The offline wheelhouse must contain every pinned requirement, and its
 # installer must preserve the local-project ordering and fail-closed flags.
 requirements="$root/wsl-requirements.txt"
+artifact_verifier="$repo_root/packaging/verify_python_artifact_lock.py"
+artifact_lock="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.lock.json"
+artifact_sha256="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.sha256"
+wheel_requirements="$repo_root/packaging/python-wheels-linux-cp313-x86_64.requirements.txt"
+sane_requirements="$repo_root/packaging/python-sane-linux-cp313-x86_64.requirements.txt"
+if "$HOST_PYTHON" -I -B "$artifact_verifier" \
+    --lock "$artifact_lock" \
+    --wheel-requirements "$wheel_requirements" \
+    --sdist-requirements "$sane_requirements" \
+    --combined-requirements "$requirements" \
+    --sha256sums "$artifact_sha256" \
+    --directory "$root/Wheelhouse" --allow-ledger; then
+    printf 'PASS  exact locked WSL Python artifact set\n'
+else
+    printf 'FAIL  exact locked WSL Python artifact set\n' >&2
+    failures=$((failures + 1))
+fi
 for requirement in \
     'setuptools==83.0.0' \
     'numpy==2.5.1' \
@@ -153,7 +170,7 @@ for requirement in \
     'jinja2==3.1.6' \
     'MarkupSafe==3.0.3' \
     'python-sane==2.9.2'; do
-    if [[ -f "$requirements" ]] && grep -Fq "$requirement --hash=sha256:" "$requirements"; then
+    if [[ -f "$requirements" ]] && grep -Fiq "$requirement --hash=sha256:" "$requirements"; then
         printf 'PASS  pinned offline requirement %s\n' "$requirement"
     else
         printf 'FAIL  pinned offline requirement %s\n' "$requirement" >&2

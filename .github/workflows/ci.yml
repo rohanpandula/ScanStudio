@@ -25,6 +25,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+        with:
+          toolchain: '1.97.1'
+      - name: Verify exact Rust toolchain
+        run: python3 -I -S -B scripts/verify_pinned_rust.py
       - name: Test Swift app and Rust engine
         working-directory: app/ScanStudio
         run: make test
@@ -38,13 +42,15 @@ jobs:
     # every job keeps test and package environments interchangeable.
     env:
       UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
-        with:
-          python-version: "3.13"
+      - name: Install exact uv and managed Python build toolchain
+        run: |
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
       - name: Install bridge dependencies
         working-directory: bridge
         run: uv sync --locked
@@ -57,13 +63,15 @@ jobs:
     runs-on: macos-15
     env:
       UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
-        with:
-          python-version: "3.13"
+      - name: Install exact uv and managed Python build toolchain
+        run: |
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
       - name: Test direct-USB library and packaging logic
         working-directory: coolscanpy
         run: uv run pytest
@@ -119,32 +127,25 @@ jobs:
             upload-artifact: false
     env:
       UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          python-version: "3.13"
-      - name: Install optional SANE binding build prerequisite
-        # The release does not copy Homebrew's libusb: package_app.sh builds
-        # the signed app-owned copy from hash-pinned source at the declared
-        # deployment target. sane-backends is needed only to compile the
-        # optional python-sane compatibility binding included in the bundle.
-        run: brew install sane-backends
-      - name: Point the compiler at Homebrew's headers and libraries
-        # GitHub Actions does not expand $(...) inside an `env:` block, and
-        # Homebrew's prefix varies by runner architecture (/opt/homebrew on
-        # Apple silicon, /usr/local on Intel), so resolve it here and export
-        # it through GITHUB_ENV for every later step in this job -- python-sane
-        # needs sane.h to build its C extension against.
+          toolchain: '1.97.1'
+      - name: Install exact uv and managed Python build toolchain
         run: |
-          echo "CPPFLAGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
-          echo "LDFLAGS=-L$(brew --prefix)/lib" >> "$GITHUB_ENV"
-      - name: Install locked bridge dependencies (with scanner extra)
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
+      - name: Verify exact Rust toolchain
+        run: python3 -I -S -B scripts/verify_pinned_rust.py
+      - name: Install locked production bridge dependencies
         working-directory: bridge
-        run: uv sync --locked --extra scanner
+        # python-sane is intentionally built by package_app.sh from its exact
+        # locked sdist against the private source-pinned SANE link SDK.
+        run: uv sync --locked --no-dev --no-install-package python-sane
       - name: Build and verify the local package
         # make package runs package_app.sh then test_packaged_bridge.sh on the
         # built ScanStudio.app -- the relocation-safe bridge check -- so this
@@ -173,13 +174,15 @@ jobs:
     needs: package
     env:
       UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
-        with:
-          python-version: "3.13"
+      - name: Install exact uv and managed Python build toolchain
+        run: |
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
       - name: Warm the locked dependency cache for offline source verification
         working-directory: bridge
         run: uv sync --locked
@@ -202,13 +205,15 @@ jobs:
     needs: package
     env:
       UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
-        with:
-          python-version: "3.13"
+      - name: Install exact uv and managed Python build toolchain
+        run: |
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
       - name: Warm the locked dependency cache
         # Keeps the runner environment interchangeable with the other uv-managed
         # jobs (see the bridge job note) so script behaviour is reproducible.
