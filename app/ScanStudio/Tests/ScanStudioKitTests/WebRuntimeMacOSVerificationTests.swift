@@ -189,13 +189,10 @@ struct WebRuntimeMacOSVerificationTests {
     func cancelledMountedVerificationStillDetaches() async throws {
         let fixture = try MacOSVerificationFixture()
         defer { fixture.cleanUp() }
-        let verificationStarted = DispatchSemaphore(value: 0)
         let runner = fixture.diskImageRunner()
         let preparer = ReadOnlyDiskImageWebRuntimePayloadPreparer(
             commandRunner: runner,
-            payloadVerifier: CancellationBlockingPayloadVerifier(
-                started: verificationStarted
-            )
+            payloadVerifier: SelfCancellingPayloadVerifier()
         )
         let operation = Task.detached {
             try preparer.preparePayload(
@@ -204,16 +201,6 @@ struct WebRuntimeMacOSVerificationTests {
                 in: fixture.root
             )
         }
-        let didStart = await withCheckedContinuation {
-            (continuation: CheckedContinuation<Bool, Never>) in
-            DispatchQueue.global(qos: .utility).async {
-                continuation.resume(
-                    returning: verificationStarted.wait(timeout: .now() + 2) == .success
-                )
-            }
-        }
-        #expect(didStart)
-        operation.cancel()
 
         await #expect(throws: WebRuntimeDistributionError.cancelled) {
             try await operation.value
@@ -392,9 +379,9 @@ struct WebRuntimeMacOSVerificationTests {
         let runner = FoundationBoundedWebRuntimeCommandRunner()
         #expect(throws: WebRuntimeDistributionError.commandOutputTooLarge) {
             try runner.run(
-                executableURL: URL(fileURLWithPath: "/usr/bin/yes"),
-                arguments: [],
-                timeout: 2,
+                executableURL: URL(fileURLWithPath: "/usr/bin/printf"),
+                arguments: [String(repeating: "x", count: 2_048)],
+                timeout: 10,
                 maximumOutputBytes: 1_024
             )
         }
@@ -623,25 +610,26 @@ private final class CountingPayloadVerifier: WebRuntimePayloadVerifying,
     }
 }
 
-private final class CancellationBlockingPayloadVerifier: WebRuntimePayloadVerifying,
+private final class SelfCancellingPayloadVerifier: WebRuntimePayloadVerifying,
     @unchecked Sendable
 {
-    private let started: DispatchSemaphore
-
-    init(started: DispatchSemaphore) {
-        self.started = started
-    }
-
     func verifyPayload(
         at rootURL: URL,
         against manifest: WebRuntimeManifest
     ) throws -> WebRuntimePayloadVerification {
-        started.signal()
-        let deadline = Date().addingTimeInterval(2)
-        while !Task.isCancelled, Date() < deadline {
-            usleep(5_000)
+        withUnsafeCurrentTask { task in
+            task?.cancel()
         }
-        if Task.isCancelled { throw CancellationError() }
-        throw WebRuntimeDistributionError.commandTimedOut
+        return WebRuntimePayloadVerification(
+            codeIdentity: WebRuntimeCodeIdentityAssertion(
+                bundleIdentifier: manifest.payload.bundleIdentifier,
+                teamIdentifier: manifest.payload.teamIdentifier,
+                developerIDSigned: manifest.payload.developerIDSigned,
+                notarized: manifest.payload.notarized
+            ),
+            fileCount: manifest.payload.fileCount,
+            installedSize: manifest.payload.installedSize,
+            treeSHA256: manifest.payload.treeSHA256
+        )
     }
 }

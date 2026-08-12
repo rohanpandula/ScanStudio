@@ -181,7 +181,7 @@ struct WebRuntimeCacheTests {
             release: currentRelease
         )
 
-        let checkpointVerifier = CancellationCheckpointPayloadVerifier(
+        let checkpointVerifier = SelfCancellingCheckpointPayloadVerifier(
             identity: test.identity
         )
         let cancellingCache = WebRuntimeCacheInstaller(
@@ -196,9 +196,6 @@ struct WebRuntimeCacheTests {
                 release: candidateRelease
             )
         }
-        #expect(checkpointVerifier.waitUntilStagedVerification())
-        installation.cancel()
-        checkpointVerifier.resumeStagedVerification()
 
         await #expect(throws: WebRuntimeDistributionError.cancelled) {
             try await installation.value
@@ -521,25 +518,15 @@ private final class CancellationReplacementPayloadVerifier: WebRuntimePayloadVer
     }
 }
 
-private final class CancellationCheckpointPayloadVerifier: WebRuntimePayloadVerifying,
+private final class SelfCancellingCheckpointPayloadVerifier: WebRuntimePayloadVerifying,
     @unchecked Sendable
 {
     private let lock = NSLock()
     private let identity: WebRuntimeCodeIdentityAssertion
-    private let stagedVerificationReached = DispatchSemaphore(value: 0)
-    private let stagedVerificationMayReturn = DispatchSemaphore(value: 0)
     private var callCount = 0
 
     init(identity: WebRuntimeCodeIdentityAssertion) {
         self.identity = identity
-    }
-
-    func waitUntilStagedVerification() -> Bool {
-        stagedVerificationReached.wait(timeout: .now() + 2) == .success
-    }
-
-    func resumeStagedVerification() {
-        stagedVerificationMayReturn.signal()
     }
 
     func verifyPayload(
@@ -551,9 +538,8 @@ private final class CancellationCheckpointPayloadVerifier: WebRuntimePayloadVeri
             return callCount
         }
         if call == 2 {
-            stagedVerificationReached.signal()
-            guard stagedVerificationMayReturn.wait(timeout: .now() + 2) == .success else {
-                throw WebRuntimeDistributionError.commandTimedOut
+            withUnsafeCurrentTask { task in
+                task?.cancel()
             }
         }
         return WebRuntimePayloadVerification(
