@@ -16,7 +16,7 @@ try:
     __version__ = _pkg_version("coolscanpy")
 except PackageNotFoundError:  # pragma: no cover - direct source-tree import
     # Corresponding-source packages deliberately remain importable without an
-    # installed dist-info record.  Read the same PEP 621 field packaging uses
+    # installed dist-info record. Read the same PEP 621 field packaging uses
     # instead of maintaining a second, drift-prone version literal here.
     from pathlib import Path as _Path
     import tomllib as _tomllib
