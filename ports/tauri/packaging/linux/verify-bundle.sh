@@ -56,6 +56,42 @@ else
     failures=$((failures + 1))
 fi
 
+# The source lock, target selectors, hashed requirements, exact filenames,
+# and committed checksum ledger must remain internally identical. Assembly
+# verifies the downloaded bytes against this lock before extraction; this gate
+# additionally requires the exact distribution identities in the staged tree.
+artifact_verifier="$script_dir/../verify_python_artifact_lock.py"
+artifact_lock="$script_dir/../python-artifacts-linux-cp313-x86_64.lock.json"
+artifact_sha256="$script_dir/../python-artifacts-linux-cp313-x86_64.sha256"
+wheel_requirements="$script_dir/../python-wheels-linux-cp313-x86_64.requirements.txt"
+sane_requirements="$script_dir/../python-sane-linux-cp313-x86_64.requirements.txt"
+if "$HOST_PYTHON" -I -B "$artifact_verifier" \
+    --lock "$artifact_lock" \
+    --wheel-requirements "$wheel_requirements" \
+    --sdist-requirements "$sane_requirements" \
+    --sha256sums "$artifact_sha256"; then
+    printf 'PASS  exact Linux Python artifact lock\n'
+else
+    printf 'FAIL  exact Linux Python artifact lock\n' >&2
+    failures=$((failures + 1))
+fi
+
+for distribution in \
+    'numpy-2.5.1.dist-info' \
+    'tifffile-2026.7.31.dist-info' \
+    'imagecodecs-2026.6.26.dist-info' \
+    'opencv_python_headless-4.14.0.94.dist-info' \
+    'pyusb-1.3.1.dist-info' \
+    'jinja2-3.1.6.dist-info' \
+    'markupsafe-3.0.3.dist-info'; do
+    if [[ -d "$root/BridgeRuntime/site-packages/$distribution" ]]; then
+        printf 'PASS  exact Python distribution %s\n' "$distribution"
+    else
+        printf 'FAIL  exact Python distribution %s\n' "$distribution" >&2
+        failures=$((failures + 1))
+    fi
+done
+
 identity_verifier="$script_dir/../../../../scripts/verify_coolscanpy_source.py"
 if "$HOST_PYTHON" -I -B "$identity_verifier" \
     "$root/CorrespondingSource/coolscanpy" \

@@ -18,6 +18,8 @@ port_root="$(cd "$script_dir/../.." && pwd)"
 app_root="$port_root/app"
 staging_root="$port_root/packaging/.staging/linux"
 verifier="$script_dir/verify-bundle.sh"
+pinned_tools="$port_root/packaging/install_pinned_tauri_tools.py"
+cargo_target="$app_root/src-tauri/target"
 
 temporary_root="$(mktemp -d)"
 trap 'rm -rf "$temporary_root"' EXIT
@@ -104,12 +106,20 @@ PY
 (
     cd "$app_root"
     npm ci
+    tauri_cli_version="$(./node_modules/.bin/tauri --version)"
+    if [[ "$tauri_cli_version" != 'tauri-cli 2.11.4' ]]; then
+        printf 'unexpected Tauri CLI version: %s\n' "$tauri_cli_version" >&2
+        exit 1
+    fi
     npm run sync-engine
     npm test
     npx tsc --noEmit
     npm run build
     cargo test --locked --manifest-path src-tauri/Cargo.toml
+    python3 -I -S -B "$pinned_tools" prepare linux --target-directory "$cargo_target"
+    python3 -I -S -B "$pinned_tools" verify linux --target-directory "$cargo_target"
     npm run tauri -- build --ci --bundles appimage --config "$build_config" --verbose -- --locked
+    python3 -I -S -B "$pinned_tools" verify linux --target-directory "$cargo_target"
 )
 
 mapfile -t appimages < <(find "$app_root/src-tauri/target/release/bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)

@@ -15,7 +15,6 @@ coolscanpy_source="${COOLSCANPY_SOURCE:-$package_root/../../coolscanpy}"
 # links libpython through @executable_path, unlike the machine's Homebrew
 # Framework Python, whose absolute Cellar linkage cannot be relocated.
 bridge_python="${SCANSTUDIO_BRIDGE_PYTHON:-$bridge_source/.venv/bin/python}"
-bridge_site_packages="${SCANSTUDIO_BRIDGE_SITE_PACKAGES:-$bridge_source/.venv/lib/python3.13/site-packages}"
 
 require_directory() {
     local label="$1"
@@ -77,21 +76,18 @@ copy_python_runtime_dependencies() {
 
 require_directory "bridge source (SCANSTUDIO_BRIDGE_SOURCE)" "$bridge_source"
 require_directory "CoolscanPy source (COOLSCANPY_SOURCE)" "$coolscanpy_source"
-require_directory "bridge site-packages (SCANSTUDIO_BRIDGE_SITE_PACKAGES)" "$bridge_site_packages"
 if [[ ! -x "$bridge_python" ]]; then
-    print -u2 "ScanStudio package prerequisite missing: Python 3.13 ('$bridge_python'). Set SCANSTUDIO_BRIDGE_PYTHON to an installed Python 3.13 interpreter."
+    print -u2 "ScanStudio package prerequisite missing: exact CPython 3.13.14 ('$bridge_python'). Set SCANSTUDIO_BRIDGE_PYTHON to the reviewed uv-managed interpreter."
     exit 127
+fi
+if ! "$bridge_python" -I -B -c 'import platform, sys; assert platform.python_implementation() == "CPython" and sys.version_info[:3] == (3, 13, 14)'; then
+    print -u2 "Refusing to package with anything other than exact CPython 3.13.14."
+    exit 66
 fi
 if [[ ! -f "$bridge_source/LICENSE" || ! -f "$coolscanpy_source/LICENSE" ]]; then
     print -u2 "Refusing to package bridge without its GPL source license and CoolscanPy's GPL source license."
     exit 66
 fi
-if [[ ! -f "$bridge_site_packages/sane.py" ]] \
-    || ! find "$bridge_site_packages" -maxdepth 1 -type d -name 'python_sane-*.dist-info' -print -quit | grep -q .; then
-    print -u2 "Refusing to package the optional plain-scan/eject compatibility binding without python-sane. Install the scanner extra into SCANSTUDIO_BRIDGE_SITE_PACKAGES."
-    exit 66
-fi
-
 # Version and sealed capture identity have one source of truth: the exact
 # CoolscanPy pyproject/lock/source tree copied below.  Run the stdlib-only gate
 # before spending time on native builds, then use its parsed version for every
@@ -106,9 +102,14 @@ coolscanpy_version="$(
         "$coolscanpy_source" --print-version
 )"
 
-bridge_runtime_prefix="$($bridge_python -c 'import sys; print(sys.base_prefix)')"
+bridge_runtime_prefix="$($bridge_python -I -B -c 'import sys; print(sys.base_prefix)')"
+bridge_sysconfig_prefix="$($bridge_python -I -B -c 'import sysconfig; print(sysconfig.get_config_var("prefix"))')"
 if [[ ! -x "$bridge_runtime_prefix/bin/python3.13" ]]; then
     print -u2 "Refusing to package a non-relocatable Python runtime: expected '$bridge_runtime_prefix/bin/python3.13'."
+    exit 66
+fi
+if [[ "$bridge_sysconfig_prefix" != /* ]]; then
+    print -u2 "Refusing to package a Python runtime with a non-absolute sysconfig prefix: '$bridge_sysconfig_prefix'."
     exit 66
 fi
 if otool -L "$bridge_runtime_prefix/bin/python3.13" | tail -n +2 | grep -qE '/(opt/homebrew|usr/local|Users)/'; then
@@ -145,6 +146,29 @@ cleanup() {
     rm -rf "$staging_root"
 }
 trap cleanup EXIT
+
+# Build the optional python-sane compatibility extension from its exact
+# locked 2.9.2 sdist against a private, source-built SANE 1.4.0 link SDK.
+# The helper rewrites the SDK-only sentinel dependency to the canonical host
+# SANE path only after proving the link provenance, ABI, architecture, and
+# macOS floor. Neither the SDK nor a SANE runtime is copied into the app.
+sane_link_sdk="$staging_root/sane-link-sdk"
+package_venv="$staging_root/bridge-package-venv"
+"$script_dir/build_sane_link_sdk.sh" \
+    "$sane_link_sdk" "$package_venv" "$bridge_source" "$bridge_python"
+bridge_site_packages="$package_venv/lib/python3.13/site-packages"
+require_directory "private locked package site-packages" "$bridge_site_packages"
+python_sane_provenance="$package_venv/.scanstudio-python-sane-provenance"
+require_directory "pinned python-sane provenance" "$python_sane_provenance"
+python_sane_extension_name="$(<"$python_sane_provenance/EXTENSION_BASENAME")"
+python_sane_extension_sha256="$(<"$python_sane_provenance/EXTENSION_SHA256")"
+python_sane_host_path="$(<"$python_sane_provenance/CANONICAL_HOST_SANE_PATH")"
+source_python_sane_extension="$bridge_site_packages/$python_sane_extension_name"
+if [[ ! -f "$source_python_sane_extension" || -L "$source_python_sane_extension" ]] \
+    || [[ "$(shasum -a 256 "$source_python_sane_extension" | awk '{print $1}')" != "$python_sane_extension_sha256" ]]; then
+    print -u2 "Refusing to package when the prepared python-sane extension disagrees with its pinned-source receipt."
+    exit 1
+fi
 
 # Build libusb from a hash-pinned upstream archive at the app's declared
 # deployment target. Copying the builder's Homebrew dylib is not acceptable:
@@ -225,6 +249,53 @@ mkdir -p "$staged_app/Contents/Resources/BridgeRuntime" \
 rsync -a --delete --exclude '__pycache__/' --exclude '*.pyc' \
     "$bridge_runtime_prefix/" "$staged_app/Contents/Resources/BridgeRuntime/python/"
 copy_python_runtime_dependencies "$bridge_site_packages" "$staged_app/Contents/Resources/BridgeRuntime/site-packages"
+staged_site_packages="$staged_app/Contents/Resources/BridgeRuntime/site-packages"
+staged_python_sane_extensions=("$staged_site_packages"/_sane*.so(N.))
+staged_python_sane_dist_info=("$staged_site_packages"/python_sane-*.dist-info(N/))
+if (( ${#staged_python_sane_extensions} != 1 || ${#staged_python_sane_dist_info} != 1 )); then
+    print -u2 "Refusing package: expected exactly one regular python-sane extension and one dist-info directory."
+    exit 1
+fi
+staged_python_sane_extension="${staged_python_sane_extensions[1]}"
+if [[ "${staged_python_sane_extension:t}" != "$python_sane_extension_name" ]] \
+    || [[ "$(shasum -a 256 "$staged_python_sane_extension" | awk '{print $1}')" != "$python_sane_extension_sha256" ]]; then
+    print -u2 "Refusing package: staged python-sane bytes differ from the pinned-source prepared extension."
+    exit 1
+fi
+if [[ "$(lipo -archs "$staged_python_sane_extension")" != "$app_architectures" ]]; then
+    print -u2 "Refusing package: python-sane extension architecture does not match the app."
+    exit 1
+fi
+python_sane_minimum="$(vtool -show-build "$staged_python_sane_extension" | awk '$1 == "minos" { print $2; exit }')"
+if [[ "$python_sane_minimum" != "$app_minimum" ]]; then
+    print -u2 "Refusing package: python-sane minimum macOS is '$python_sane_minimum', expected '$app_minimum'."
+    exit 1
+fi
+if otool -l "$staged_python_sane_extension" \
+    | awk '$2 == "LC_RPATH" { found=1 } END { exit !found }'; then
+    print -u2 "Refusing package: python-sane extension contains LC_RPATH."
+    exit 1
+fi
+python_sane_dependencies="$(otool -L "$staged_python_sane_extension" | tail -n +2 | awk '{print $1}')"
+if [[ "$(print -r -- "$python_sane_dependencies" | grep -Fxc "$python_sane_host_path")" != 1 ]] \
+    || print -r -- "$python_sane_dependencies" | grep -Fq '__ScanStudio_SANE_Link_SDK' \
+    || print -r -- "$python_sane_dependencies" | grep -vFx "$python_sane_host_path" \
+        | grep -Ev '^(/usr/lib/|/System/Library/)' | grep -q .; then
+    print -u2 "Refusing package: python-sane linkage is not exactly the reviewed host-SANE ABI plus system libraries."
+    otool -L "$staged_python_sane_extension" >&2
+    exit 1
+fi
+if ! grep -q '^Name: python-sane$' "${staged_python_sane_dist_info[1]}/METADATA" \
+    || ! grep -q '^Version: 2.9.2$' "${staged_python_sane_dist_info[1]}/METADATA"; then
+    print -u2 "Refusing package: python-sane distribution metadata is not exactly 2.9.2."
+    exit 1
+fi
+if find "$staged_site_packages" -maxdepth 1 -type f \
+    \( -name 'libsane*.dylib' -o -name 'libsane*.so*' \) -print -quit | grep -q . \
+    || grep -R -a -q -F "$sane_link_sdk" "$staged_site_packages"; then
+    print -u2 "Refusing package: private SANE SDK or runtime material leaked into staged site-packages."
+    exit 1
+fi
 # The GPL source is intentionally imported from CorrespondingSource rather
 # than an editable wheel. Retain just the neutral distribution metadata that
 # the bridge uses to report its own version; it contains no local checkout
@@ -274,7 +345,17 @@ if ! command -v uv >/dev/null 2>&1; then
     print -u2 "Refusing to package GPL corresponding source without uv: it is required to generate the portable sibling-source lockfile."
     exit 127
 fi
-(cd "$staged_bridge_source" && uv lock --offline)
+uv_executable="$(command -v uv)"
+uv_lock_home="$staging_root/uv-lock-home"
+mkdir -m 700 "$uv_lock_home"
+(
+    cd "$staged_bridge_source"
+    env -i \
+        HOME="$uv_lock_home" PATH="${uv_executable:h}:/usr/bin:/bin" \
+        LANG=C LC_ALL=C UV_PYTHON_DOWNLOADS=never \
+        "$uv_executable" --no-config lock --offline --no-cache \
+            --managed-python --python "$bridge_python"
+)
 install_name_tool -id '@rpath/libpython3.13.dylib' \
     "$staged_app/Contents/Resources/BridgeRuntime/python/lib/libpython3.13.dylib"
 # uv's generated sysconfig table records its build cache prefix. It is not a
@@ -282,18 +363,79 @@ install_name_tool -id '@rpath/libpython3.13.dylib' \
 # public bundle. Replace it with an intentionally non-filesystem placeholder;
 # CPython derives the real prefix from its relocated executable.
 runtime_sysconfig="$staged_app/Contents/Resources/BridgeRuntime/python/lib/python3.13/_sysconfigdata__darwin_darwin.py"
-"$bridge_python" - "$runtime_sysconfig" "$bridge_runtime_prefix" <<'PYTHON'
+"$bridge_python" -I -B - \
+    "$runtime_sysconfig" "$bridge_runtime_prefix" "$bridge_sysconfig_prefix" <<'PYTHON'
+import ast
 from pathlib import Path
+import pprint
+import re
 import sys
 
 config_path = Path(sys.argv[1])
-build_prefix = sys.argv[2]
-contents = config_path.read_text()
-if build_prefix not in contents:
-    raise SystemExit("packaged CPython sysconfig table did not contain its expected build prefix")
-config_path.write_text(contents.replace(build_prefix, "/__SCANSTUDIO_BUNDLED_PYTHON__"))
+runtime_prefixes = sorted(set(sys.argv[2:]), key=len, reverse=True)
+contents = config_path.read_text(encoding="utf-8")
+module = ast.parse(contents, filename=str(config_path))
+assignments = [
+    node for node in module.body
+    if isinstance(node, ast.Assign)
+    and len(node.targets) == 1
+    and isinstance(node.targets[0], ast.Name)
+    and node.targets[0].id == "build_time_vars"
+]
+if len(assignments) != 1:
+    raise SystemExit("packaged CPython sysconfig table has an unexpected structure")
+build_time_vars = ast.literal_eval(assignments[0].value)
+if not isinstance(build_time_vars, dict):
+    raise SystemExit("packaged CPython sysconfig table is not a literal dictionary")
+
+placeholder = "/__SCANSTUDIO_BUNDLED_PYTHON__"
+path_component = r"[^/\s:;,'\"(){}\[\]<>]+"
+ephemeral_roots = (
+    re.compile(
+        rf"/(?:private/)?var/folders/{path_component}/{path_component}/"
+        rf"(?:T|C)/{path_component}"
+    ),
+    re.compile(rf"/(?:private/)?tmp/{path_component}"),
+)
+replacement_count = 0
+
+def scrub(value):
+    global replacement_count
+    if isinstance(value, str):
+        for prefix in runtime_prefixes:
+            count = value.count(prefix)
+            if count:
+                value = value.replace(prefix, placeholder)
+                replacement_count += count
+        for pattern in ephemeral_roots:
+            value, count = pattern.subn(placeholder, value)
+            replacement_count += count
+        return value
+    if isinstance(value, dict):
+        return {scrub(key): scrub(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(scrub(item) for item in value)
+    return value
+
+sanitized = scrub(build_time_vars)
+if replacement_count == 0:
+    raise SystemExit("packaged CPython sysconfig table contained no expected build prefix")
+rendered = (
+    "# system configuration generated and used by the sysconfig module\n"
+    "build_time_vars = "
+    + pprint.pformat(sanitized, sort_dicts=True, width=120)
+    + "\n"
+)
+if re.search(r"/(?:private/)?var/folders/|/(?:private/)?tmp/|/Users/", rendered):
+    raise SystemExit("packaged CPython sysconfig table retains a private build path")
+if any(prefix in rendered for prefix in runtime_prefixes):
+    raise SystemExit("packaged CPython sysconfig table retains its runtime build prefix")
+config_path.write_text(rendered, encoding="utf-8")
 PYTHON
-"$staged_app/Contents/Resources/BridgeRuntime/python/bin/python3.13" -c 'import sysconfig; assert sysconfig.get_config_var("VERSION") == "3.13"'
+"$staged_app/Contents/Resources/BridgeRuntime/python/bin/python3.13" \
+    -I -B -c 'import sysconfig; assert sysconfig.get_config_var("VERSION") == "3.13"'
 # The import above validates the scrubbed table but can recreate bytecode with
 # the build machine's filename metadata. Remove that generated bytecode before
 # signing; CPython can regenerate ordinary caches after installation.
@@ -322,6 +464,17 @@ print -r -- $'Rebuild the bundled libusb library on macOS with Apple command-lin
     > "$staged_app/Contents/Resources/CorrespondingSource/libusb/REBUILD.txt"
 print -r -- $'libusb 1.0.30\nLicense: LGPL-2.1-or-later\nSource: https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2\nSource SHA-256: fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf\nBundled library: Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib\nThe complete pinned source archive, exact build script, and rebuild instructions are under Contents/Resources/CorrespondingSource/libusb.\n' \
     > "$staged_app/Contents/Resources/Licenses/libusb-NOTICE.txt"
+mkdir -p "$staged_app/Contents/Resources/CorrespondingSource/python-sane"
+install -m 644 \
+    "$python_sane_provenance/python_sane-2.9.2.tar.gz" \
+    "$staged_app/Contents/Resources/CorrespondingSource/python-sane/python_sane-2.9.2.tar.gz"
+install -m 755 \
+    "$script_dir/build_sane_link_sdk.sh" \
+    "$staged_app/Contents/Resources/CorrespondingSource/python-sane/build_sane_link_sdk.sh"
+print -r -- $'Rebuild the bundled python-sane extension on macOS with Apple command-line developer tools, exact uv 0.11.30, the ScanStudio bridge/CoolScanPy sibling source tree, and exact CPython 3.13.14:\n\n  SCANSTUDIO_PYTHON_SANE_SOURCE_ARCHIVE="$PWD/python_sane-2.9.2.tar.gz" \\\n  ./build_sane_link_sdk.sh \\\n    "$PWD/rebuilt-sane-link-sdk" "$PWD/rebuilt-python-sane-venv" \\\n    /path/to/scanstudio-bridge /path/to/exact/python3.13\n\nThe script verifies the adjacent source archive SHA-256 (50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe), downloads and verifies sane-backends 1.4.0 for a private build-only link SDK, and targets macOS deployment target 14.0. It proves the SDK-only Mach-O identity, architecture, minimum OS, ABI, dependencies, and lack of RPATH before rewriting the extension to the architecture-specific canonical host libsane.1.dylib path. No SANE runtime library is bundled.\n' \
+    > "$staged_app/Contents/Resources/CorrespondingSource/python-sane/REBUILD.txt"
+print -r -- $'python-sane 2.9.2\nLicense: permissive python-sane license; see the packaged COPYING text\nSource: https://files.pythonhosted.org/packages/45/e9/e8baff69fc2347606c547201204d4b4843c7ad8ecb9164eceee42016eff6/python_sane-2.9.2.tar.gz\nSource SHA-256: 50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe\nThe exact source archive and source-build instructions are under Contents/Resources/CorrespondingSource/python-sane. The package contains only the extension and Python module, never the private SANE link SDK or a SANE runtime.\n' \
+    > "$staged_app/Contents/Resources/Licenses/python-sane-NOTICE.txt"
 for dist_info in "$staged_app/Contents/Resources/BridgeRuntime/site-packages"/*.dist-info; do
     [[ -d "$dist_info" ]] || continue
     dist_name="${dist_info:t}"
@@ -448,9 +601,27 @@ listed in python-wheels. libusb 1.0.30 is dynamically loaded from the signed
 app bundle under LGPL-2.1-or-later; its license and notice are here and its
 complete pinned source archive is in ../CorrespondingSource/libusb. Normal
 LS-5000 color-roll detection, preview, and capture require no host driver.
-The bundled python-sane binding still needs a compatible system SANE backend
-for its optional plain-scan and software-eject paths.
+The python-sane 2.9.2 binding is built from the exact source and instructions
+in ../CorrespondingSource/python-sane against a private SANE 1.4.0 link SDK.
+The SDK and SANE runtime are not bundled; optional plain-scan and software-
+eject paths still need a compatible system SANE backend.
 LICENSES
+
+# Final runtime-boundary proof before signing: source/rebuild material is
+# visible, but neither the private SDK, its sentinel linkage, nor libsane may
+# appear anywhere executable or loadable in the app.
+runtime_scan_targets=(
+    "$staged_app/Contents/MacOS"
+    "$staged_app/Contents/Frameworks"
+    "$staged_app/Contents/Resources/BridgeRuntime"
+)
+if find "${runtime_scan_targets[@]}" -type f \
+    \( -name 'libsane*.dylib' -o -name 'libsane*.so*' \) -print -quit | grep -q . \
+    || grep -R -a -q -F '__ScanStudio_SANE_Link_SDK' "${runtime_scan_targets[@]}" \
+    || grep -R -a -q -F "$sane_link_sdk" "${runtime_scan_targets[@]}"; then
+    print -u2 "Refusing package: private SANE SDK identity, path, or runtime leaked into executable app content."
+    exit 1
+fi
 
 # Swift links object provenance strings into the executable even in a release
 # build. Remove local symbol/debug tables after the source-path remap and

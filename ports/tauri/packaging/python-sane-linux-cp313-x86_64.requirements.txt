@@ -1,0 +1,4 @@
+# python-sane has no CPython 3.13 wheel. The reviewed sdist is downloaded by
+# exact HTTPS URL, bounded, and verified against this requirement and the
+# shared artifact lock before it is compiled against the bundled interpreter.
+python-sane==2.9.2 --hash=sha256:50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe

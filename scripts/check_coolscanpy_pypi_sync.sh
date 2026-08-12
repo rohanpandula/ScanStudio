@@ -6,7 +6,7 @@
 # debugging confusion the instrumented-refusal work exists to prevent
 # (owner policy, 2026-08-08: "keep them in sync so there's no delta").
 #
-# Mechanics: download the latest published coolscanpy sdist and compare its
+# Mechanics: download the exact authenticated coolscanpy 0.7.1 sdist and compare its
 # src/coolscanpy tree byte-for-byte against this repo's vendored
 # coolscanpy/src/coolscanpy. Version strings are NOT trusted as the primary
 # signal (an unbumped version with changed code is precisely the failure
@@ -49,30 +49,12 @@ KNOWN_VENDORED_DIVERGENCE=(
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-echo "fetching latest published coolscanpy from PyPI..."
-meta="$workdir/meta.json"
-curl --fail --silent --show-error --location \
-  https://pypi.org/pypi/coolscanpy/json > "$meta"
-
-pypi_version="$(python3 -c "import json;print(json.load(open('$meta'))['info']['version'])")"
-sdist_url="$(python3 - "$meta" <<'PY'
-import json, sys
-data = json.load(open(sys.argv[1]))
-for f in data["urls"]:
-    if f["packagetype"] == "sdist":
-        print(f["url"]); break
-else:
-    raise SystemExit("no sdist on the latest PyPI release")
-PY
-)"
-
-curl --fail --silent --show-error --location "$sdist_url" > "$workdir/sdist.tar.gz"
-tar -xzf "$workdir/sdist.tar.gz" -C "$workdir"
-published_src="$(find "$workdir" -type d -path '*/src/coolscanpy' | head -1)"
-if [ -z "$published_src" ]; then
-  echo "::error::coolscanpy PyPI sync gate: sdist layout unexpected (no src/coolscanpy)"
-  exit 1
-fi
+echo "fetching authenticated coolscanpy 0.7.1 source from PyPI..."
+published_root="$(python3 -I -S -B scripts/fetch_pinned_coolscanpy_sdist.py \
+  --destination "$workdir/published")"
+published_src="$published_root/src/coolscanpy"
+test -d "$published_src"
+pypi_version="0.7.1"
 
 printf '%s\n' "${KNOWN_VENDORED_DIVERGENCE[@]}" > "$workdir/exemptions"
 if PUBLISHED_SRC="$published_src" VENDORED_DIR="$VENDORED_DIR" \

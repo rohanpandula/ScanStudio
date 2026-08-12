@@ -1,4 +1,4 @@
-.PHONY: engine app package package-check dmg test run smoke launcher-check parity render-color-candidates render-geometry-candidates render-ice-candidates clean check-cargo check-swift check-tools
+.PHONY: engine app sane-link-sdk package package-check dmg test run smoke launcher-check parity render-color-candidates render-geometry-candidates render-ice-candidates clean check-cargo check-swift check-tools
 
 # Tool paths are discovered from the caller's PATH. Override CARGO or SWIFT
 # explicitly when using a non-standard toolchain installation.
@@ -29,6 +29,13 @@ engine: check-cargo
 
 app: check-swift
 	$(SWIFT) build
+
+# Central entry point for inspecting the source-pinned, build-only SANE SDK.
+# The create-only output is deliberately separate from the app bundle and is
+# removed by `make clean`; package_app.sh uses a private per-run equivalent.
+sane-link-sdk:
+	mkdir -p .build
+	./scripts/build_sane_link_sdk.sh "$(CURDIR)/.build/sane-link-sdk"
 
 package: check-tools
 	./scripts/package_app.sh

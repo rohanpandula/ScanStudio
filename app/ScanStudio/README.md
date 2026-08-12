@@ -106,10 +106,13 @@ The real-device backend speaks the NDJSON contract in
 [`protocol/BRIDGE.md`](protocol/BRIDGE.md) to `scanstudio-bridge`, the
 GPL-3.0-only CoolscanPy helper. `make package` includes that helper, a
 relocatable CPython 3.13 runtime, production Python dependencies (including
-`python-sane`), a signed app-owned libusb built from pinned source for the
-app's macOS 14 deployment target, and visible license/source material inside
-`ScanStudio.app`. It does not include Nikon software or an operating-system
-SANE backend.
+`python-sane` 2.9.2 built from its exact locked sdist), a signed app-owned
+libusb built from pinned source for the app's macOS 14 deployment target, and
+visible license/source material inside `ScanStudio.app`. The python-sane C
+extension is compiled against a private, source-pinned SANE 1.4.0 link SDK;
+the packager proves the SDK-only Mach-O identity before rewriting it to the
+architecture's canonical host `libsane.1.dylib` path. The private SDK and SANE
+runtime are never shipped. The app also does not include Nikon software.
 
 The package launcher resolves a bridge in this order: `SCANSTUDIO_BRIDGE_CMD`,
 the user bridge-command file, the bundled helper, then `PATH`. Set
@@ -142,6 +145,15 @@ software-eject paths; those optional actions need a compatible system SANE
 backend (`brew install sane-backends` on the tested Apple Silicon setup). If
 an unavailable optional path is requested, it fails rather than pretending it
 succeeded; it does not turn a real scanner into the simulator.
+
+Release and CI packaging do not install Homebrew SANE as a build input. Use
+`make sane-link-sdk` only to inspect the create-only private SDK generated from
+the exact sane-backends 1.4.0 archive (SHA-256
+`f99205c903dfe2fb8990f0c531232c9a00ec9c2c66ac7cb0ce50b4af9f407a72`).
+`make package` performs the same source build in private staging, compiles the
+exact python-sane 2.9.2 sdist from the bridge lock, and rejects mismatched
+architecture, macOS 14 minimum, ABI, RPATHs, build paths, extra extensions,
+or accidental SDK/runtime files before signing.
 
 The device bar identifies a connected real device as `real` and the simulator
 as `simulated`. Selecting a device is separate from confirming that film is

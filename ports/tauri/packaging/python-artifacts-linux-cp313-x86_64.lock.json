@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "target": {
+    "implementation": "cp",
+    "pythonVersion": "313",
+    "abi": "cp313",
+    "platform": "manylinux_2_28_x86_64"
+  },
+  "artifacts": [
+    {
+      "name": "setuptools",
+      "version": "83.0.0",
+      "kind": "wheel",
+      "roles": ["build"],
+      "filename": "setuptools-83.0.0-py3-none-any.whl",
+      "size": 1008090,
+      "sha256": "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3"
+    },
+    {
+      "name": "numpy",
+      "version": "2.5.1",
+      "kind": "wheel",
+      "roles": ["runtime"],
+      "filename": "numpy-2.5.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "size": 16661440,
+      "sha256": "9726558e8db4a5bf7929a70ae50f63abda4daf0efe810e3bfbab95976f75fc1a"
+    },
+    {
+      "name": "tifffile",
+      "version": "2026.7.31",
+      "kind": "wheel",
+      "roles": ["runtime"],
+      "filename": "tifffile-2026.7.31-py3-none-any.whl",
+      "size": 271576,
+      "sha256": "81adfa08012be1c478f99b83cda2f529eef8620cfbdf94fc41eef6f1d7b47dc5"
+    },
+    {
+      "name": "imagecodecs",
+      "version": "2026.6.26",
+      "kind": "wheel",
+      "roles": ["runtime"],
+      "filename": "imagecodecs-2026.6.26-cp312-abi3-manylinux_2_28_x86_64.whl",
+      "size": 28855566,
+      "sha256": "6e9e57171ce7cdf884e7d45d25427f77275321a0ddbd26941c5c90b242d2b597"
+    },
+    {
+      "name": "opencv-python-headless",
+      "version": "4.14.0.94",
+      "kind": "wheel",
+      "roles": ["runtime"],
+      "filename": "opencv_python_headless-4.14.0.94-cp37-abi3-manylinux_2_28_x86_64.whl",
+      "size": 61960165,
+      "sha256": "211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527"
+    },
+    {
+      "name": "pyusb",
+      "version": "1.3.1",
+      "kind": "wheel",
+      "roles": ["runtime"],
+      "filename": "pyusb-1.3.1-py3-none-any.whl",
+      "size": 58465,
+      "sha256": "bf9b754557af4717fe80c2b07cc2b923a9151f5c08d17bdb5345dac09d6a0430"
+    },
+    {
+      "name": "Jinja2",
+      "version": "3.1.6",
+      "kind": "wheel",
+      "roles": ["runtime"],
+      "filename": "jinja2-3.1.6-py3-none-any.whl",
+      "size": 134899,
+      "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+    },
+    {
+      "name": "MarkupSafe",
+      "version": "3.0.3",
+      "kind": "wheel",
+      "roles": ["runtime"],
+      "filename": "markupsafe-3.0.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "size": 22980,
+      "sha256": "ccfcd093f13f0f0b7fdd0f198b90053bf7b2f02a3927a30e63f3ccc9df56b676"
+    },
+    {
+      "name": "python-sane",
+      "version": "2.9.2",
+      "kind": "sdist",
+      "roles": ["build", "runtime"],
+      "filename": "python_sane-2.9.2.tar.gz",
+      "size": 22513,
+      "sha256": "50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe"
+    }
+  ]
+}
