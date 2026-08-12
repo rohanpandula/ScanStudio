@@ -132,23 +132,29 @@ public final class FoundationBoundedWebRuntimeCommandRunner: WebRuntimeCommandRu
         let readers = DispatchGroup()
         let processBox = UncheckedProcessBox(process)
         readers.enter()
-        DispatchQueue.global(qos: .utility).async {
+        let stdoutReader = Thread {
+            defer { readers.leave() }
             collector.read(
                 from: stdoutPipe.fileHandleForReading,
                 stream: .standardOutput,
                 process: processBox
             )
-            readers.leave()
         }
+        stdoutReader.name = "ScanStudio command stdout"
+        stdoutReader.qualityOfService = .utility
+        stdoutReader.start()
         readers.enter()
-        DispatchQueue.global(qos: .utility).async {
+        let stderrReader = Thread {
+            defer { readers.leave() }
             collector.read(
                 from: stderrPipe.fileHandleForReading,
                 stream: .standardError,
                 process: processBox
             )
-            readers.leave()
         }
+        stderrReader.name = "ScanStudio command stderr"
+        stderrReader.qualityOfService = .utility
+        stderrReader.start()
 
         do {
             try process.run()
