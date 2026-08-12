@@ -1,0 +1,31 @@
+{
+  "assets": {
+    "arm64": {
+      "archiveBytes": 10931186,
+      "archiveSha256": "f8b0b5b2eda9321265b7483ce7ea167012c32afed73a127e8e18ebe9f1d9dffe",
+      "binarySha256": "7beedfde3266774db2638c41dff1b37f285fb108e3aad540f0c8522fad8c3c40",
+      "bottleTag": "arm64_sequoia",
+      "cellar": "/opt/homebrew/Cellar",
+      "libcryptoSha256": "f61f43a1c01bd670ca6bf4d56ff9d7e1d8409c894dcdc17e6b3586de90df002a",
+      "libsslSha256": "82253dbad50909589cb589ad7308171d8ca0b684f6dbe8476363ddb250c72fae",
+      "url": "https://ghcr.io/v2/homebrew/core/openssl/3/blobs/sha256:f8b0b5b2eda9321265b7483ce7ea167012c32afed73a127e8e18ebe9f1d9dffe"
+    },
+    "x86_64": {
+      "archiveBytes": 10114292,
+      "archiveSha256": "5477285c4ebec45713873ae4002affece39e427c5f1b655c6a3df49c6b90f924",
+      "binarySha256": "4de10df614737f68b592f668773b28758efd305455698448d5fa907f46829fac",
+      "bottleTag": "sequoia",
+      "cellar": "/usr/local/Cellar",
+      "libcryptoSha256": "5c5a9674c101eeb61619e7d7752eda15b79b3e17197437242bf26806873eaa03",
+      "libsslSha256": "364c1ee6ff64027811f49b3c10ea17c4feae2d8343c896a2bc9d68cb2dbe109c",
+      "url": "https://ghcr.io/v2/homebrew/core/openssl/3/blobs/sha256:5477285c4ebec45713873ae4002affece39e427c5f1b655c6a3df49c6b90f924"
+    }
+  },
+  "formulaSha256": "204067e3af016bba4246c64454f8a1a8d56916dd2f6d021b7bf5dcd13166374b",
+  "license": "Apache-2.0",
+  "provider": "homebrew/core",
+  "schemaVersion": 1,
+  "sourceSha256": "243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1",
+  "sourceURL": "https://github.com/openssl/openssl/releases/download/openssl-3.6.3/openssl-3.6.3.tar.gz",
+  "version": "3.6.3"
+}

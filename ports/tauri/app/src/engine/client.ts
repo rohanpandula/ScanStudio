@@ -17,6 +17,8 @@ export type UnlistenFn = () => void;
 const WEB_REQUEST_ENDPOINT = "/api/v1/engine/request";
 const WEB_EVENT_ENDPOINT = "/api/v1/engine/events";
 const WEB_SESSION_READY_EVENT = "scanstudio:web-session-ready";
+export const WEB_HYDRATION_TIMEOUT_MS = 10_000;
+export const WEB_HYDRATION_EVENT_LIMIT = 1_024;
 export const WEB_EVENT_STREAM_STATE_EVENT = "scanstudio:web-event-stream-state";
 export const WEB_CONTROL_LOST_EVENT = "scanstudio:web-control-lost";
 
@@ -50,7 +52,11 @@ function asEngineError(value: unknown, fallback: string): EngineError {
   return { code: "INTERNAL", message: fallback, recoverable: false };
 }
 
-async function webRequest<T>(method: string, params: unknown): Promise<T> {
+async function webRequest<T>(
+  method: string,
+  params: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   const leaseHeaders = controlLeaseHeaders();
   const submittedLeaseToken = leaseHeaders[CONTROL_LEASE_HEADER] ?? null;
   let response: Response;
@@ -60,6 +66,7 @@ async function webRequest<T>(method: string, params: unknown): Promise<T> {
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", ...leaseHeaders },
       body: JSON.stringify({ method, params }),
+      signal,
     });
   } catch (error) {
     throw asEngineError(
@@ -136,6 +143,7 @@ function listenToWebEvents(handler: (payload: unknown) => void): UnlistenFn {
   let stopped = false;
   let retryDelayMs = 500;
   let singletonDevice: unknown = null;
+  let abortActiveHydration: (() => void) | null = null;
 
   const deliver = (payload: unknown): void => {
     handler(payload);
@@ -183,9 +191,31 @@ function listenToWebEvents(handler: (payload: unknown) => void): UnlistenFn {
     const candidate = new WebSocket(webSocketUrl());
     const pendingEvents: unknown[] = [];
     let hydrating = true;
+    let hydrationFailed = false;
+    let hydrationController: AbortController | null = null;
+    let hydrationTimer: number | null = null;
     socket = candidate;
+    const cancelHydration = (): void => {
+      if (hydrationTimer !== null) {
+        window.clearTimeout(hydrationTimer);
+        hydrationTimer = null;
+      }
+      hydrationController?.abort();
+      hydrationController = null;
+      if (abortActiveHydration === cancelHydration) abortActiveHydration = null;
+    };
+    abortActiveHydration = cancelHydration;
+    const failHydration = (message: string, reason: string): void => {
+      if (!hydrating || stopped || socket !== candidate) return;
+      hydrating = false;
+      hydrationFailed = true;
+      pendingEvents.splice(0);
+      cancelHydration();
+      publishWebEventStreamState(false, message);
+      candidate.close(1011, reason);
+    };
     const commitHydration = (snapshot: unknown): void => {
-      if (stopped || socket !== candidate) return;
+      if (!hydrating || stopped || socket !== candidate) return;
       handler(snapshot);
       if (stopped || socket !== candidate) return;
       hydrating = false;
@@ -194,14 +224,28 @@ function listenToWebEvents(handler: (payload: unknown) => void): UnlistenFn {
     };
     candidate.addEventListener("open", () => {
       retryDelayMs = 500;
+      const controller = new AbortController();
+      hydrationController = controller;
+      hydrationTimer = window.setTimeout(
+        () => controller.abort(),
+        WEB_HYDRATION_TIMEOUT_MS,
+      );
       void (async () => {
         try {
-          const listed = await webRequest<{ devices?: unknown }>("scanner.list", {});
+          const listed = await webRequest<{ devices?: unknown }>(
+            "scanner.list",
+            {},
+            controller.signal,
+          );
           if (!Array.isArray(listed.devices) || listed.devices.length !== 1) {
             throw new Error("The scanner inventory could not be restored.");
           }
           singletonDevice = listed.devices[0];
-          const status = await webRequest<unknown>("scanner.status", {});
+          const status = await webRequest<unknown>(
+            "scanner.status",
+            {},
+            controller.signal,
+          );
           if (stopped || socket !== candidate) return;
           commitHydration({
             event: "scanstudio.webEventStream",
@@ -222,11 +266,12 @@ function listenToWebEvents(handler: (payload: unknown) => void): UnlistenFn {
             });
             return;
           }
-          publishWebEventStreamState(
-            false,
+          failHydration(
             "Scanner state could not be restored; reconnecting…",
+            "state reconciliation failed",
           );
-          candidate.close(1011, "state reconciliation failed");
+        } finally {
+          cancelHydration();
         }
       })();
     });
@@ -237,11 +282,21 @@ function listenToWebEvents(handler: (payload: unknown) => void): UnlistenFn {
       } catch {
         payload = event.data;
       }
-      if (hydrating) pendingEvents.push(payload);
-      else deliver(payload);
+      if (hydrationFailed) return;
+      if (hydrating) {
+        if (pendingEvents.length >= WEB_HYDRATION_EVENT_LIMIT) {
+          failHydration(
+            "Scanner event reconciliation overflowed; reconnecting…",
+            "state reconciliation overflow",
+          );
+          return;
+        }
+        pendingEvents.push(payload);
+      } else deliver(payload);
     });
     candidate.addEventListener("close", (event) => {
       if (socket !== candidate) return;
+      cancelHydration();
       socket = null;
       if (stopped) return;
       markDisconnected();
@@ -265,6 +320,7 @@ function listenToWebEvents(handler: (payload: unknown) => void): UnlistenFn {
     stopped = true;
     window.removeEventListener(WEB_SESSION_READY_EVENT, sessionReady);
     if (retryTimer !== null) window.clearTimeout(retryTimer);
+    abortActiveHydration?.();
     socket?.close(1000, "client closed");
     socket = null;
   };

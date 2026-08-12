@@ -14,7 +14,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "${SCANSTUDIO_WEB_PORT:-8787}:8787"
+      - "${SCANSTUDIO_WEB_PUBLISH_HOST:-127.0.0.1}:${SCANSTUDIO_WEB_PORT:-8787}:8787"
     environment:
       - "SCANSTUDIO_WEB_BIND=0.0.0.0"
       - "SCANSTUDIO_WEB_PORT=8787"

@@ -53,7 +53,7 @@ openssl_bin="${OPENSSL_BIN:-}"
     -in "$manifest" \
     -sigfile "$signature" >/dev/null
 
-python3 - "$dmg" "$manifest" "$version" "$arch" <<'PY'
+python3 -I -S - "$dmg" "$manifest" "$version" "$arch" <<'PY'
 from __future__ import annotations
 
 import hashlib

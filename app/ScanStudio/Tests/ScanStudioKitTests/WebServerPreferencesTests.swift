@@ -21,7 +21,7 @@ struct WebServerPreferencesTests {
         #expect(configuration.browserURL.absoluteString == "http://127.0.0.1:8787/")
     }
 
-    @Test("local-network binding advertises only explicit private addresses")
+    @Test("local-network binding selects one deterministic private IPv4 address")
     func localNetworkAddresses() throws {
         let preferences = WebServerPreferences(
             bindScope: .localNetwork,
@@ -32,15 +32,16 @@ struct WebServerPreferencesTests {
         let configuration = try WebServerNetworkResolver.resolve(
             preferences,
             privateLANAddresses: [
-                "192.168.1.20",
+                "192.168.1.100",
                 "8.8.8.8",
                 "fd12:3456::9",
                 "169.254.2.3",
                 "192.168.1.20",
+                "192.168.1.100",
             ]
         )
 
-        #expect(configuration.bindAddress == "0.0.0.0")
+        #expect(configuration.bindAddress == "192.168.1.20")
         #expect(configuration.allowedOrigins == ["http://192.168.1.20:9000"])
         #expect(configuration.advertisedURLs.map(\.absoluteString) == [
             "http://192.168.1.20:9000/",

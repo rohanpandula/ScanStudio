@@ -15,7 +15,7 @@ if [[ ! -d "$root" || -L "$root" || "$(basename "$root")" != 'ScanStudioWebRunti
     exit 66
 fi
 
-python3 - "$root" <<'PY'
+python3 -I -S - "$root" <<'PY'
 from __future__ import annotations
 
 import hashlib

@@ -402,7 +402,7 @@ struct WebServerModelTests {
         await model.setEnabled(true)
 
         let launch = try #require(await process.snapshot().configurations.last)
-        #expect(launch.environment["SCANSTUDIO_WEB_BIND"] == "0.0.0.0")
+        #expect(launch.environment["SCANSTUDIO_WEB_BIND"] == "192.168.50.4")
         #expect(launch.environment["SCANSTUDIO_WEB_PORT"] == "9444")
         #expect(launch.environment["SCANSTUDIO_WEB_AUTH_MODE"] == "trusted-lan-no-login")
         #expect(launch.environment["SCANSTUDIO_WEB_TOKEN"] == nil)

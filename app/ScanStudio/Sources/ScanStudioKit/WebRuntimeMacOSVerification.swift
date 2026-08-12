@@ -550,6 +550,8 @@ public struct SystemWebRuntimeCodeAssessor: WebRuntimeCodeAssessing {
             // Notarization is established on the containing DMG before it is
             // mounted. At launch, strict codesign plus Gatekeeper acceptance
             // of this extracted executable payload is the retained proof.
+            // This transitivity also depends on the launch path re-hashing
+            // the cached tree against the authenticated manifest first.
             notarized: developerIDSigned
         )
     }

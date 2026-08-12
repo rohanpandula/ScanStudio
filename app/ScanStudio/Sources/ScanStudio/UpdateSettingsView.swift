@@ -107,7 +107,7 @@ struct UpdateSettingsView: View {
                     )
                     .foregroundStyle(Color.scanStudioAmber)
 
-                    Text("Every device that can reach this address can control the simulator session. Do not use port forwarding or a reverse proxy: those can make an outside connection look local, which Scan Studio cannot reliably detect.")
+                    Text("Scan Studio listens on one private IPv4 address. Every device that can reach it can control the simulator session. Do not use port forwarding or a reverse proxy: those can make an outside connection look local.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

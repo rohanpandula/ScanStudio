@@ -95,15 +95,16 @@ public enum WebServerNetworkResolver {
             bindAddress = "127.0.0.1"
             advertisedAddresses = [bindAddress]
         case .localNetwork:
-            // Uvicorn's 0.0.0.0 socket is IPv4-only. Do not advertise ULA
-            // addresses that this process did not bind; users can select an
-            // exact ULA through the custom-address option instead.
-            let privateIPv4Addresses = lanAddresses.filter(isIPv4Address)
-            guard !privateIPv4Addresses.isEmpty else {
+            // Bind one exact RFC1918 interface. A wildcard socket would also
+            // expose no-login mode through unrelated public interfaces.
+            let privateIPv4Addresses = lanAddresses
+                .filter(isIPv4Address)
+                .sorted { ipv4HostOrder($0) < ipv4HostOrder($1) }
+            guard let selectedAddress = privateIPv4Addresses.first else {
                 throw WebServerPreferencesError.noPrivateLANInterface
             }
-            bindAddress = "0.0.0.0"
-            advertisedAddresses = privateIPv4Addresses
+            bindAddress = selectedAddress
+            advertisedAddresses = [selectedAddress]
         case .custom:
             let candidate = preferences.customBindAddress
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -219,6 +220,12 @@ public enum WebServerNetworkResolver {
     private static func isIPv4Address(_ value: String) -> Bool {
         var address = in_addr()
         return inet_pton(AF_INET, value, &address) == 1
+    }
+
+    private static func ipv4HostOrder(_ value: String) -> UInt32 {
+        var address = in_addr()
+        guard inet_pton(AF_INET, value, &address) == 1 else { return UInt32.max }
+        return UInt32(bigEndian: address.s_addr)
     }
 
     private static func splitOrigins(_ raw: String) -> [String] {

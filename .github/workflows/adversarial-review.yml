@@ -17,17 +17,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the protected base validator
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 1
           path: validator
+          persist-credentials: false
       - name: Check out the read-only PR merge tree
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           fetch-depth: 0
           path: candidate
+          persist-credentials: false
       - name: Validate with code from the protected base
         env:
           REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}

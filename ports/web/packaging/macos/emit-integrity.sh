@@ -61,7 +61,7 @@ trap 'rm -rf -- "$workdir"' EXIT
 temporary_manifest="$workdir/$stem.json"
 temporary_signature="$temporary_manifest.sig"
 
-python3 - \
+python3 -I -S - \
     "$dmg" "$version" "$arch" "$payload_summary" "$temporary_manifest" <<'PY'
 from __future__ import annotations
 

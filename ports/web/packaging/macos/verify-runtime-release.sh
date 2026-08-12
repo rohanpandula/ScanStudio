@@ -30,7 +30,7 @@ summary="$workdir/payload.json"
 "$script_dir/inspect-runtime-dmg.sh" \
     "$dmg" "$version" "$arch" "$team_id" "$summary"
 
-python3 - "$manifest" "$summary" <<'PY'
+python3 -I -S - "$manifest" "$summary" <<'PY'
 import json
 from pathlib import Path
 import sys

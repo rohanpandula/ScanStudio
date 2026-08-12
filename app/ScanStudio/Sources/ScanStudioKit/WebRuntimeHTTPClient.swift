@@ -5,10 +5,27 @@
 import Foundation
 
 public final class URLSessionWebRuntimeHTTPClient: WebRuntimeHTTPClient, @unchecked Sendable {
-    private let timeout: TimeInterval
+    static let defaultInactivityTimeout: TimeInterval = 60
+    static let defaultResourceTimeout: TimeInterval = 6 * 60 * 60
 
-    public init(timeout: TimeInterval = 60) {
-        self.timeout = timeout
+    private let inactivityTimeout: TimeInterval
+    private let resourceTimeout: TimeInterval
+
+    public init(
+        inactivityTimeout: TimeInterval = 60,
+        resourceTimeout: TimeInterval = 21_600
+    ) {
+        precondition(inactivityTimeout.isFinite && inactivityTimeout > 0)
+        precondition(resourceTimeout.isFinite && resourceTimeout >= inactivityTimeout)
+        self.inactivityTimeout = inactivityTimeout
+        self.resourceTimeout = resourceTimeout
+    }
+
+    public convenience init(timeout: TimeInterval) {
+        self.init(
+            inactivityTimeout: timeout,
+            resourceTimeout: max(Self.defaultResourceTimeout, timeout)
+        )
     }
 
     public func download(
@@ -23,17 +40,10 @@ public final class URLSessionWebRuntimeHTTPClient: WebRuntimeHTTPClient, @unchec
             throw WebRuntimeDistributionError.invalidRequest
         }
 
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        configuration.urlCache = nil
-        configuration.httpCookieStorage = nil
-        configuration.httpCookieAcceptPolicy = .never
-        configuration.httpShouldSetCookies = false
-        configuration.httpMaximumConnectionsPerHost = 1
-        configuration.timeoutIntervalForRequest = timeout
-        configuration.timeoutIntervalForResource = timeout
-        configuration.waitsForConnectivity = false
-
+        let configuration = Self.makeConfiguration(
+            inactivityTimeout: inactivityTimeout,
+            resourceTimeout: resourceTimeout
+        )
         let delegate = WebRuntimeTransferDelegate(
             redirectPolicy: redirectPolicy,
             maximumBytes: maximumBytes
@@ -84,6 +94,25 @@ public final class URLSessionWebRuntimeHTTPClient: WebRuntimeHTTPClient, @unchec
             statusCode: http.statusCode,
             byteCount: byteCount
         )
+    }
+
+    static func makeConfiguration(
+        inactivityTimeout: TimeInterval = defaultInactivityTimeout,
+        resourceTimeout: TimeInterval = defaultResourceTimeout
+    ) -> URLSessionConfiguration {
+        precondition(inactivityTimeout.isFinite && inactivityTimeout > 0)
+        precondition(resourceTimeout.isFinite && resourceTimeout >= inactivityTimeout)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpShouldSetCookies = false
+        configuration.httpMaximumConnectionsPerHost = 1
+        configuration.timeoutIntervalForRequest = inactivityTimeout
+        configuration.timeoutIntervalForResource = resourceTimeout
+        configuration.waitsForConnectivity = false
+        return configuration
     }
 }
 

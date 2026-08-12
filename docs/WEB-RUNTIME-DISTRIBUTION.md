@@ -130,14 +130,29 @@ release is not published. If the opt-in is false, the exact existing release
 set remains unchanged and no runtime asset is advertised. A stable runtime is
 never silently downgraded to ad-hoc signing or an unsigned checksum.
 
+The secret-bearing signer does not execute the transferred launcher or Python
+payload, but its trusted computing base still includes the GitHub runner image,
+the reviewed workflow and packaging scripts, the repository-pinned OpenSSL 3
+executable, and Apple's `security`, `codesign`, `hdiutil`, `xcrun notarytool`,
+`stapler`, and `spctl` tools. Several Apple parsers necessarily consume the
+unsigned job's attacker-influenced Mach-O and UDIF bytes while credentials are
+live. A memory-safety flaw in one of those native parsers could expose signing
+material. This is an accepted residual risk: the fresh-runner boundary,
+authenticate-and-rehash handoff, ephemeral keychain, immediate credential
+cleanup, Apple notarization scan, and post-signature verification reduce it but
+cannot eliminate it without a physically separate signing service.
+
 The runtime job also downloads one exact architecture-specific
 python-build-standalone `20260728` `pgo+lto` full archive. Asset size/SHA-256,
 `PYTHON.json` SHA-256, target triple, exact 3.13.14 interpreter version, and
 every distribution-supplied license file size/SHA-256 are committed in
 `python-build-standalone-lock.json`. Packaging uses that extracted interpreter
-and refuses a different uv-managed Python. OpenSSL is similarly selected by an
-absolute OpenSSL 3 path and must complete a real raw Ed25519 sign/verify probe
-before credentials or release manifests are processed.
+and refuses a different uv-managed Python. OpenSSL comes from one
+content-addressed Homebrew bottle without executing Homebrew: the compressed
+bottle, formula, executable, and linked cryptographic libraries must all match
+the architecture-specific SHA-256 values in the committed release lock before
+the executable is exposed to the workflow. It must then complete a real raw
+Ed25519 sign/verify probe before credentials or release manifests are processed.
 
 The publisher accepts exactly six ordinary platform packages when disabled,
 or those six plus the two three-file runtime sets when enabled. `SHA256SUMS`

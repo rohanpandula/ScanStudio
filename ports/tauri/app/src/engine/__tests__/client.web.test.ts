@@ -5,6 +5,8 @@ import {
   notifyWebSessionReady,
   onEngineEvent,
   WEB_CONTROL_LOST_EVENT,
+  WEB_HYDRATION_EVENT_LIMIT,
+  WEB_HYDRATION_TIMEOUT_MS,
 } from "../client";
 import {
   clearControlLeaseToken,
@@ -15,6 +17,7 @@ import { SessionStore } from "../../session/store/session";
 import type { EngineTransport } from "../../session/wire/codec";
 
 afterEach(() => {
+  vi.useRealTimers();
   clearControlLeaseToken();
   window.sessionStorage.clear();
   vi.unstubAllGlobals();
@@ -405,6 +408,112 @@ describe("browser engine client", () => {
         status: liveStatus,
       },
     });
+    unlisten();
+  });
+
+  it("aborts stalled hydration and closes the socket for reconciliation", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (!signal) throw new Error("hydration must carry an abort signal");
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    class FakeWebSocket {
+      static instance: FakeWebSocket | null = null;
+      listeners = new Map<string, Array<(event: { data?: unknown }) => void>>();
+      close = vi.fn();
+
+      constructor(readonly url: string) {
+        FakeWebSocket.instance = this;
+      }
+
+      addEventListener(name: string, listener: (event: { data?: unknown }) => void): void {
+        const current = this.listeners.get(name) ?? [];
+        current.push(listener);
+        this.listeners.set(name, current);
+      }
+
+      emit(name: string, event: { data?: unknown } = {}): void {
+        for (const listener of this.listeners.get(name) ?? []) listener(event);
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const unlisten = await onEngineEvent(vi.fn());
+    notifyWebSessionReady();
+    FakeWebSocket.instance?.emit("open");
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(WEB_HYDRATION_TIMEOUT_MS);
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    expect(FakeWebSocket.instance?.close).toHaveBeenCalledWith(
+      1011,
+      "state reconciliation failed",
+    );
+    unlisten();
+  });
+
+  it("closes hydration when the pending event buffer reaches its finite cap", async () => {
+    const fetchMock = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    class FakeWebSocket {
+      static instance: FakeWebSocket | null = null;
+      listeners = new Map<string, Array<(event: { data?: unknown }) => void>>();
+      close = vi.fn();
+
+      constructor(readonly url: string) {
+        FakeWebSocket.instance = this;
+      }
+
+      addEventListener(name: string, listener: (event: { data?: unknown }) => void): void {
+        const current = this.listeners.get(name) ?? [];
+        current.push(listener);
+        this.listeners.set(name, current);
+      }
+
+      emit(name: string, event: { data?: unknown } = {}): void {
+        for (const listener of this.listeners.get(name) ?? []) listener(event);
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const handler = vi.fn();
+    const unlisten = await onEngineEvent(handler);
+    notifyWebSessionReady();
+    FakeWebSocket.instance?.emit("open");
+    for (let index = 0; index <= WEB_HYDRATION_EVENT_LIMIT; index += 1) {
+      FakeWebSocket.instance?.emit("message", {
+        data: JSON.stringify({ event: "scanner.status", payload: { index } }),
+      });
+    }
+
+    expect(FakeWebSocket.instance?.close).toHaveBeenCalledWith(
+      1011,
+      "state reconciliation overflow",
+    );
+    expect(handler).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: "scanner.status" }),
+    );
     unlisten();
   });
 

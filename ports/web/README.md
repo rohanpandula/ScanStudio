@@ -146,11 +146,14 @@ The multi-stage image builds the existing Vite application, compiles the existin
 ```sh
 export SCANSTUDIO_WEB_TOKEN="$(openssl rand -hex 32)"
 export SCANSTUDIO_WEB_ALLOWED_ORIGINS="http://your-unraid-host:8787"
+export SCANSTUDIO_WEB_PUBLISH_HOST="192.168.1.20"
 docker compose -f ports/web/compose.yaml up --build
 ```
 
 The Compose default remains token mode and fails gateway startup if its token is
-missing. To opt into the narrower trusted-LAN topology explicitly:
+missing. It also publishes only on `127.0.0.1` unless
+`SCANSTUDIO_WEB_PUBLISH_HOST` is deliberately set to one exact host-interface
+address. To opt into the narrower trusted-LAN topology explicitly:
 
 ```sh
 export SCANSTUDIO_WEB_AUTH_MODE=trusted-lan-no-login
@@ -180,6 +183,7 @@ Do not run Uvicorn with multiple workers or reload mode. Sessions, the controlle
 | --- | --- | --- |
 | `SCANSTUDIO_ENGINE_PATH` | `scanstudio-engine` | Fixed executable path; never evaluated by a shell |
 | `SCANSTUDIO_WEB_BIND` | `127.0.0.1` | Listen address; LAN mode permits only `0.0.0.0`, RFC1918, or IPv6 ULA |
+| `SCANSTUDIO_WEB_PUBLISH_HOST` | `127.0.0.1` | Compose-only host interface to publish; set one exact address for deliberate remote access |
 | `SCANSTUDIO_WEB_PORT` | `8787` | Listen port |
 | `SCANSTUDIO_WEB_AUTH_MODE` | `token` | `token` or explicit `trusted-lan-no-login` socket-peer mode |
 | `SCANSTUDIO_WEB_TOKEN` | unset | Required for every bind in token mode; must be unset in LAN mode |
