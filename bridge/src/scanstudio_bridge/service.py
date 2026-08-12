@@ -25,7 +25,15 @@ from pathlib import Path
 from typing import Callable
 
 from scanstudio_bridge import domain, safety
-from scanstudio_bridge.protocol import BridgeError, ErrorCode, from_wire, hello_result, to_wire
+from scanstudio_bridge.protocol import (
+    BridgeError,
+    ErrorCode,
+    from_wire,
+    hello_result,
+    to_wire,
+    validate_params,
+    validate_request,
+)
 from scanstudio_bridge.transport import FrameRetryExhausted, Transport
 
 BRIDGE_VERSION = importlib.metadata.version("scanstudio-bridge")
@@ -48,6 +56,23 @@ _DEFAULT_SCAN_TIMEOUT_SECONDS = 900.0
 # that production's 900s default costs nothing.
 _WATCHDOG_POLL_FLOOR_SECONDS = 0.01
 _WATCHDOG_POLL_CEILING_SECONDS = 0.5
+
+_METHOD_PARAM_SCHEMAS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "bridge.hello": (("clientName", "protocolVersion"), ()),
+    "bridge.shutdown": ((), ()),
+    "device.list": ((), ()),
+    "device.open": (("deviceId",), ()),
+    "device.status": ((), ()),
+    "device.close": ((), ()),
+    "roll.preview": (("material",), ("slots",)),
+    "roll.approve": (("slot",), ("fingerprint",)),
+    "roll.setSpacingOffset": (("slot", "offsetRows"), ()),
+    "roll.manualFrames": (("rows",), ()),
+    "roll.previewStrip": ((), ()),
+    "scan.start": (("slots", "recipe", "output"), ("jobId",)),
+    "scan.stop": (("jobId",), ()),
+    "device.eject": ((), ()),
+}
 
 
 def _scan_timeout_seconds() -> float:
@@ -151,6 +176,73 @@ def _require_param(params: dict, key: str) -> object:
     return value
 
 
+def _require_plain_int(
+    value: object,
+    name: str,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) is not int:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, f"{name} must be a whole number")
+    if minimum is not None and value < minimum:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, f"{name} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, f"{name} must be at most {maximum}")
+    return value
+
+
+def _require_string(
+    value: object,
+    name: str,
+    *,
+    minimum_length: int = 1,
+    maximum_length: int = 4096,
+) -> str:
+    if type(value) is not str:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, f"{name} must be a string")
+    if not minimum_length <= len(value) <= maximum_length:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"{name} length must be between {minimum_length} and {maximum_length}",
+        )
+    return value
+
+
+def _require_int_list(
+    value: object,
+    name: str,
+    *,
+    minimum_length: int,
+    maximum_length: int,
+    item_minimum: int,
+    item_maximum: int,
+    unique: bool = False,
+) -> list[int]:
+    if type(value) is not list or any(type(item) is not int for item in value):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"{name} must be a list of whole numbers",
+        )
+    if not minimum_length <= len(value) <= maximum_length:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"{name} must contain between {minimum_length} and {maximum_length} items",
+        )
+    result = [
+        _require_plain_int(
+            item,
+            f"{name}[{index}]",
+            minimum=item_minimum,
+            maximum=item_maximum,
+        )
+        for index, item in enumerate(value)
+    ]
+    if unique and len(set(result)) != len(result):
+        raise BridgeError(ErrorCode.INVALID_PARAMS, f"{name} may not contain duplicates")
+    return result
+
+
 # Plan 10-09 (durable per-frame failure reasons): scan.frameFailed's own
 # fixed telemetry fields -- a coolscanpy exception attribute that happens to
 # share one of these names is renamed rather than silently dropped or
@@ -241,6 +333,7 @@ class BridgeService:
         self._device_open = False
         self._preview_material: domain.Material | None = None
         self._last_job: dict | None = None  # {"job_id": str, "terminal": bool, "thread": Thread}
+        self._seen_job_ids: set[str] = set()
         # Set True the instant a `safety.HardwareLane` is actually held by
         # this process (roll.preview/scan.start/device.eject), False the
         # instant it's released -- lets `device.status`'s DeviceStatus.laneHeld
@@ -318,7 +411,16 @@ class BridgeService:
     # -- dispatch -------------------------------------------------------------------
 
     def dispatch(self, request: dict, emit: Callable[[str, dict], None]) -> dict:
+        request = validate_request(request)
         method = request.get("method")
+
+        if method in _METHOD_PARAM_SCHEMAS:
+            required, optional = _METHOD_PARAM_SCHEMAS[method]
+            normalized = dict(request)
+            normalized["params"] = validate_params(
+                request, required=required, optional=optional
+            )
+            request = normalized
 
         reject = reject_before_hello(self._hello_received, method)
         if reject is not None:
@@ -341,7 +443,7 @@ class BridgeService:
         if method == "roll.preview":
             return self._handle_roll_preview(request, emit)
         if method == "roll.approve":
-            params = request.get("params") or {}
+            params = request["params"]
             # Additive (2026-08-08 adversarial review, S1): `fingerprint` is
             # optional on the wire -- omitted entirely by every pre-existing
             # caller, unchanged. When present it must be a string; passed
@@ -349,13 +451,13 @@ class BridgeService:
             # FINGERPRINT_REFUSED if it no longer matches the roll's current
             # state (see coolscanpy_transport.CoolscanPyTransport.approve).
             fingerprint = params.get("fingerprint")
-            if fingerprint is not None and not isinstance(fingerprint, str):
-                raise BridgeError(
-                    ErrorCode.INVALID_PARAMS,
-                    "fingerprint must be a string when present",
+            if fingerprint is not None:
+                fingerprint = _require_string(
+                    fingerprint, "fingerprint", maximum_length=256
                 )
             self._transport.approve(
-                int(_require_param(params, "slot")), fingerprint=fingerprint
+                _require_plain_int(params["slot"], "slot", minimum=1, maximum=40),
+                fingerprint=fingerprint,
             )
             return {}
         if method == "roll.setSpacingOffset":
@@ -371,10 +473,18 @@ class BridgeService:
                     ErrorCode.HARDWARE_LANE_BUSY,
                     "a motion operation is still active; retry after it finishes",
                 )
-            params = request.get("params") or {}
+            params = request["params"]
+            slot = _require_plain_int(params["slot"], "slot", minimum=1, maximum=40)
+            offset_minimum = 0 if slot == 1 else -144
+            offset_rows = _require_plain_int(
+                params["offsetRows"],
+                "offsetRows",
+                minimum=offset_minimum,
+                maximum=144,
+            )
             thumbnail = self._transport.set_spacing_offset(
-                int(_require_param(params, "slot")),
-                int(_require_param(params, "offsetRows")),
+                slot,
+                offset_rows,
             )
             return {"thumbnail": _thumbnail_to_wire(thumbnail)}
         if method == "roll.manualFrames":
@@ -400,38 +510,55 @@ class BridgeService:
     # -- bridge.hello / bridge.shutdown --------------------------------------------
 
     def _handle_hello(self, request: dict) -> dict:
-        params = request.get("params") or {}
-        result = hello_result(params.get("protocolVersion"), BRIDGE_VERSION)
+        params = request["params"]
+        _require_string(params["clientName"], "clientName", maximum_length=128)
+        protocol_version = _require_plain_int(
+            params["protocolVersion"], "protocolVersion", minimum=0, maximum=2**31 - 1
+        )
+        result = hello_result(protocol_version, BRIDGE_VERSION)
         self._hello_received = True
         return result
 
-    def _handle_shutdown(self) -> dict:
+    def _handle_shutdown(self, *, join_timeout: float | None = _JOIN_TIMEOUT_SECONDS) -> dict:
         if self._last_job is not None and not self._last_job["terminal"]:
             self._transport.request_stop()
             thread = self._last_job.get("thread")
             if thread is not None:
-                thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
+                thread.join(timeout=join_timeout)
+            if thread is not None and thread.is_alive():
+                raise BridgeError(
+                    ErrorCode.HARDWARE_LANE_BUSY,
+                    "shutdown not acknowledged: the owned capture worker is still active",
+                )
+            if not self._last_job["terminal"]:
+                raise BridgeError(
+                    ErrorCode.HARDWARE_LANE_BUSY,
+                    "shutdown not acknowledged: the scan job has not published terminal cleanup",
+                )
         if self._device_open:
-            # Best-effort: the job join above is bounded, not guaranteed --
-            # if the worker is still finishing up, close_device() may still
-            # see the lane held and raise HARDWARE_LANE_BUSY. The process is
-            # exiting right after this either way (cli.py), so never let
-            # that raise abort the shutdown response itself.
-            try:
-                self._transport.close_device()
-                self._device_open = False
-                self._preview_material = None
-            except BridgeError:
-                pass
+            self._transport.close_device()
+            self._device_open = False
+            self._preview_material = None
         return {}
+
+    def wait_for_owned_work_before_exit(self) -> None:
+        """EOF/parent-loss cleanup that never abandons a capture worker.
+
+        This may wait indefinitely for a genuinely stuck hardware call. That
+        is intentional: the bridge process and inherited ownership lock stay
+        alive, and a replacement bridge remains fenced off until ownership is
+        actually released.
+        """
+
+        self._handle_shutdown(join_timeout=None)
 
     # -- device.* ---------------------------------------------------------------------
 
     def _handle_device_open(self, request: dict, emit: Callable[[str, dict], None]) -> dict:
         if self._device_open:
             raise BridgeError(ErrorCode.ALREADY_CONNECTED, "a device is already open")
-        params = request.get("params") or {}
-        device_id = _require_param(params, "deviceId")
+        params = request["params"]
+        device_id = _require_string(params["deviceId"], "deviceId", maximum_length=256)
         device = self._transport.open_device(device_id)
         self._device_open = True
         status = self._status_snapshot()
@@ -541,9 +668,26 @@ class BridgeService:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
         safety.require_armed(self._base_dir)
 
-        params = request.get("params") or {}
-        material = domain.Material(_require_param(params, "material"))
+        params = request["params"]
+        material_value = _require_string(params["material"], "material", maximum_length=64)
+        try:
+            material = domain.Material(material_value)
+        except ValueError as exc:
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                f"material has unsupported value {material_value!r}",
+            ) from exc
         slots = params.get("slots")
+        if slots is not None:
+            slots = _require_int_list(
+                slots,
+                "slots",
+                minimum_length=1,
+                maximum_length=40,
+                item_minimum=1,
+                item_maximum=40,
+                unique=True,
+            )
 
         if self._motion_op_active:
             raise BridgeError(
@@ -656,21 +800,26 @@ class BridgeService:
                 ErrorCode.HARDWARE_LANE_BUSY,
                 "a motion operation is still active; retry after it finishes",
             )
-        params = request.get("params") or {}
-        raw_rows = _require_param(params, "rows")
+        params = request["params"]
+        raw_rows = params["rows"]
         # Strict wire check (adversarial review 2026-08-08, F8a): int() would
         # silently truncate JSON floats, explode a string into digits, and
         # turn a non-numeric into an INTERNAL error. The driver's own gates
         # are strict; the wire deserves the same.
-        if not isinstance(raw_rows, list) or not all(
-            isinstance(row, int) and not isinstance(row, bool) for row in raw_rows
-        ):
+        rows = _require_int_list(
+            raw_rows,
+            "rows",
+            minimum_length=2,
+            maximum_length=41,
+            item_minimum=0,
+            item_maximum=2**31 - 1,
+            unique=True,
+        )
+        if any(left >= right for left, right in zip(rows, rows[1:])):
             raise BridgeError(
                 ErrorCode.INVALID_PARAMS,
-                "rows must be a list of whole numbers (the preview row of "
-                "each frame boundary)",
+                "rows must be strictly increasing",
             )
-        rows = list(raw_rows)
         preview_result, thumbnails, snaps, material = self._transport.manual_frames(
             rows
         )
@@ -703,11 +852,39 @@ class BridgeService:
             )
         safety.require_armed(self._base_dir)
 
-        params = request.get("params") or {}
-        slots = [int(s) for s in _require_param(params, "slots")]
-        recipe = from_wire(_require_param(params, "recipe"), domain.CaptureRecipe)
-        output = from_wire(_require_param(params, "output"), domain.OutputSpec)
+        params = request["params"]
+        slots = _require_int_list(
+            params["slots"],
+            "slots",
+            minimum_length=1,
+            maximum_length=40,
+            item_minimum=1,
+            item_maximum=40,
+            unique=True,
+        )
+        recipe = from_wire(params["recipe"], domain.CaptureRecipe)
+        output = from_wire(params["output"], domain.OutputSpec)
         domain.validate_capture_recipe(recipe, self._preview_material)
+
+        requested_job_id = params.get("jobId")
+        if "jobId" not in params:
+            job_id = uuid.uuid4().hex
+        elif (
+            type(requested_job_id) is not str
+            or len(requested_job_id) != 32
+            or any(character not in "0123456789abcdef" for character in requested_job_id)
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "jobId must be a 32-character lowercase hexadecimal operation token",
+            )
+        else:
+            job_id = requested_job_id
+        if job_id in self._seen_job_ids:
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "jobId was already used in this bridge generation",
+            )
 
         if self._motion_op_active:
             raise BridgeError(
@@ -719,7 +896,7 @@ class BridgeService:
         self._lane_held = True
         self._motion_op_active = True
 
-        job_id = uuid.uuid4().hex
+        self._seen_job_ids.add(job_id)
         job_record: dict = {"job_id": job_id, "terminal": False}
         self._last_job = job_record
 
@@ -1265,8 +1442,8 @@ class BridgeService:
         return {"jobId": job_id}
 
     def _handle_scan_stop(self, request: dict) -> dict:
-        params = request.get("params") or {}
-        job_id = _require_param(params, "jobId")
+        params = request["params"]
+        job_id = _require_string(params["jobId"], "jobId", maximum_length=128)
         if self._last_job is None or self._last_job["job_id"] != job_id:
             raise BridgeError(ErrorCode.UNKNOWN_JOB, f"unknown job id: {job_id!r}")
         if self._last_job["terminal"]:

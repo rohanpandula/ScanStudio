@@ -559,7 +559,7 @@ describe("ContactSheet", () => {
     const imageTile = screen.getByTestId("contact-tile-2");
     const img = within(imageTile).getByRole("img") as HTMLImageElement;
     expect(img.src).toBe(
-      "scanstudio-preview://localhost/?path=" + encodeURIComponent("/scans/frames/frame-0002.png"),
+      "scanstudio-preview://localhost/?id=" + encodeURIComponent("/scans/frames/frame-0002.png"),
     );
   });
 

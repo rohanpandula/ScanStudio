@@ -58,6 +58,13 @@ require_file "Windows hardware-session WSL latch helper" \
     "$script_dir/scanstudio-hardware-session-latch.sh"
 require_file "Windows hardware-session NSIS hooks" "$script_dir/installer-hooks.nsh"
 
+COOLSCANPY_IDENTITY_VERIFIER="$repo_root/../../scripts/verify_coolscanpy_source.py"
+require_file "CoolscanPy package identity verifier" "$COOLSCANPY_IDENTITY_VERIFIER"
+COOLSCANPY_VERSION="$(
+    "$HOST_PYTHON" -I -B "$COOLSCANPY_IDENTITY_VERIFIER" \
+        "$COOLSCANPY_SOURCE" --print-version
+)"
+
 # (1) fresh staging root.
 rm -rf "$STAGING_ROOT"
 mkdir -p "$STAGING_ROOT"
@@ -161,10 +168,10 @@ install -m 644 "$repo_root/runbooks/WINDOWS-LIVE-VALIDATION.md" \
     "$STAGING_ROOT/Documentation/WINDOWS-LIVE-VALIDATION.md"
 
 # (5) provenance: records package-time git HEAD SHAs of both GPL sources,
-# version strings matching package_app.sh:180-185.
+# version parsed from the exact source pyproject and lock.
 write_provenance_json "$STAGING_ROOT/provenance.json" \
     scanstudio-bridge "$SCANSTUDIO_BRIDGE_SOURCE" "0.1.0" \
-    coolscanpy "$COOLSCANPY_SOURCE" "0.1.3"
+    coolscanpy "$COOLSCANPY_SOURCE" "$COOLSCANPY_VERSION"
 
 # (6) license texts + README.
 mkdir -p "$STAGING_ROOT/Licenses"
@@ -251,5 +258,11 @@ for root in sys.argv[1:]:
             continue
         path.write_bytes(data.replace(b"/Users/", b"/src/"))
 PYTHON
+
+# Re-run against the post-scrub assembled source bytes and generated
+# provenance.  A one-byte change to any capture component fails packaging.
+"$HOST_PYTHON" -I -B "$COOLSCANPY_IDENTITY_VERIFIER" \
+    "$STAGING_ROOT/CorrespondingSource/coolscanpy" \
+    --provenance "$STAGING_ROOT/provenance.json"
 
 printf 'Windows staging assembled at %s\n' "$STAGING_ROOT"

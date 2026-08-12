@@ -31,10 +31,16 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # Resealed 2026-08-07 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md, Rung 4
     # scan-side wiring): both files gained CaptureBatchRequest/LiveBatchJob's
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
-    "capture_process.py": "6208a95b23bba84ee0903a07a0d583a9840c5332cbdc60f38a4b574a050d24e2",
+    # Resealed 2026-08-11: capture descendants remain in the bridge-owned
+    # process group and inherit its exclusive process-ownership fence.
+    "capture_process.py": "a7a4eb4d09c6c6daf399e4a868375a291cf80f220f45a1c13bc36ebff37e1cc9",
     "worker.py": "d826249919c94b67f76b6a36400374a090ef2c9b2c05138f51913e9576e67650",
     "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
-    "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
+    # Port-specific reseal 2026-08-11: Windows/WSL and Linux use the
+    # intentionally extended host-libusb discovery implementation shipped in
+    # this vendor tree.  The package identity gate re-hashes the assembled
+    # source snapshot, so this cannot silently drift again.
+    "usb_backend.py": "77499a606dc48049521d2fd0359a0405cb55525242843d61165b642c78841208",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
     "packed.py": "856315714e4f7e81f42e1ca93917e4cc0feb03b24915c2ad604302bfdca46f87",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",

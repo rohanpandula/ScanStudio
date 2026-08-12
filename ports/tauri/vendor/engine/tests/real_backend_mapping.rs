@@ -98,6 +98,91 @@ fn drain_events(
     events
 }
 
+#[cfg(unix)]
+#[test]
+fn full_capture_package_symlink_collision_is_refused_before_scan_start() {
+    use std::os::unix::fs::symlink;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let call_log_path = std::env::temp_dir().join(format!(
+        "scanstudio-evidence-premotion-call-log-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::write(&call_log_path, "").expect("create mock bridge call log");
+    let call_log = call_log_path.display().to_string();
+    let backend = Arc::new(
+        RealLs5000::new_with_env(
+            mock_bridge_bin(),
+            GENEROUS_TIMEOUT,
+            &[("MOCK_BRIDGE_CALL_LOG", call_log.as_str())],
+        )
+        .expect("healthy mock bridge"),
+    );
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect before local evidence preflight");
+
+    let root = std::env::temp_dir().join(format!(
+        "scanstudio-evidence-premotion-{}-{nonce}",
+        std::process::id()
+    ));
+    let archive = root.join("Archive");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel.txt");
+    std::fs::write(&sentinel, b"outside unchanged").unwrap();
+    symlink(&outside, archive.join("Capture Evidence")).unwrap();
+
+    let mut output = domain::OutputRecipe::default();
+    output.archive.destination = archive.display().to_string();
+    output.archive.full_capture_package = true;
+    output.positive.enabled = false;
+    output.preview.enabled = false;
+    output.raw_export.enabled = false;
+
+    // Exclude connect/device-open setup calls. Everything after this reset is
+    // attributable to the scan request under test.
+    std::fs::write(&call_log_path, "").expect("reset mock bridge call log");
+    let (tx, _rx) = mpsc::channel();
+    let error = RealLs5000::scan_start(
+        &backend,
+        vec![1],
+        valid_capture_recipe(),
+        domain::ProcessingRecipe::default(),
+        output,
+        std::collections::HashMap::new(),
+        Some(root.clone()),
+        tx,
+    )
+    .expect_err("a planted Capture Evidence symlink must fail before motion dispatch");
+
+    assert_eq!(error.code, ErrorCode::InvalidParams, "{error:?}");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside unchanged");
+    assert_eq!(
+        std::fs::read_to_string(&call_log_path)
+            .unwrap()
+            .lines()
+            .filter(|method| *method == "scan.start")
+            .count(),
+        0,
+        "local evidence authority refusal must send zero scan.start calls"
+    );
+    assert!(
+        std::fs::read_dir(&outside)
+            .unwrap()
+            .all(|entry| entry.unwrap().path() == sentinel),
+        "the planted link target must receive no package or probe writes"
+    );
+
+    let _ = std::fs::remove_file(archive.join("Capture Evidence"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_file(call_log_path);
+}
+
 /// Retries `op` while it returns `ScannerBusy`, up to `deadline`, then
 /// panics with the last error. For asserting that a background drain
 /// EVENTUALLY unblocks an operation: a fixed sleep before the attempt
@@ -510,10 +595,12 @@ fn healthy_preview_timeout_quarantines_successors_until_disconnect_and_reconnect
     let _ = std::fs::remove_file(call_log_path);
 }
 
-/// A session-scoped RPC can restart the bridge while a preview worker is
-/// blocked in the shared event receiver. The old reader must keep ownership
-/// until it has observed that loss, so it cannot consume a replacement
-/// session's untagged preview events.
+/// A session-scoped RPC can time out while a preview worker is blocked in the
+/// shared event receiver. The live but unresponsive bridge may still own a
+/// hardware operation, so it must not be killed or replaced. The old reader
+/// keeps ownership until it observes the loss; reconnect stays failed closed
+/// even after reader detach, and becomes possible only after an independently
+/// proven process exit.
 #[test]
 fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     let call_log_path = std::env::temp_dir().join(format!(
@@ -522,6 +609,12 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     ));
     std::fs::write(&call_log_path, "").expect("create mock bridge call log");
     let call_log_path_string = call_log_path.display().to_string();
+    let exit_trigger_path = std::env::temp_dir().join(format!(
+        "scanstudio-preview-owner-exit-trigger-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&exit_trigger_path);
+    let exit_trigger_path_string = exit_trigger_path.display().to_string();
     let backend = Arc::new(
         RealLs5000::new_with_env(
             mock_bridge_bin(),
@@ -529,6 +622,10 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
             &[
                 ("MOCK_BRIDGE_PREVIEW_DELAY_MS", "2000"),
                 ("MOCK_BRIDGE_HANG_ON_STATUS_WHILE_PREVIEW_PENDING", "1"),
+                (
+                    "MOCK_BRIDGE_EXIT_TRIGGER_ON_HUNG_STATUS",
+                    exit_trigger_path_string.as_str(),
+                ),
                 ("MOCK_BRIDGE_CALL_LOG", call_log_path_string.as_str()),
                 // Adversarial review S3 (2026-08-08): roll_approve now
                 // requires the approved frame to be one the completed
@@ -621,15 +718,43 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     let reconnect_deadline = Instant::now() + Duration::from_secs(3);
     loop {
         match backend.connect(DEVICE_ID, &ConnectOptions::default()) {
-            Ok(_) => break,
             Err(error)
                 if error.code == ErrorCode::ScannerBusy
                     && Instant::now() < reconnect_deadline =>
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            Err(error) if error.code == ErrorCode::NotConnected => break,
+            Ok(_) => panic!(
+                "a live hung bridge may not be replaced merely because its preview reader detached"
+            ),
             Err(error) => panic!(
-                "once the old reader detached, reconnect should not require a separate disconnect: {error:?}"
+                "after reader detach the still-live bridge must fail closed as not connected: {error:?}"
+            ),
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&call_log_path)
+            .expect("read calls while the original bridge still owns the process fence")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["roll.preview", "device.status"],
+        "failed-closed reconnect attempts must not reach the live hung bridge"
+    );
+
+    std::fs::write(&exit_trigger_path, "exit").expect("release the mock bridge owner");
+    let process_exit_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match backend.connect(DEVICE_ID, &ConnectOptions::default()) {
+            Ok(_) => break,
+            Err(error)
+                if error.code == ErrorCode::NotConnected
+                    && Instant::now() < process_exit_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!(
+                "a proven predecessor-process exit should permit an explicit reconnect: {error:?}"
             ),
         }
     }
@@ -750,6 +875,7 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
         "only the valid completed replacement approval may reach the bridge: {bridge_calls:#?}"
     );
     let _ = std::fs::remove_file(call_log_path);
+    let _ = std::fs::remove_file(exit_trigger_path);
 }
 
 /// Forces the session epoch/generation to change after the worker's
@@ -762,7 +888,7 @@ fn terminal_generation_loss_before_finalization_does_not_strand_reader_gate() {
     let backend = Arc::new(
         RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
             .expect("healthy mock bridge")
-            .with_preview_terminal_generation_loss_test_hook(),
+            .with_preview_terminal_session_loss_test_hook(),
     );
     backend
         .connect(DEVICE_ID, &ConnectOptions::default())
@@ -778,11 +904,7 @@ fn terminal_generation_loss_before_finalization_does_not_strand_reader_gate() {
     )
     .expect("preview should be accepted before the terminal loss hook");
 
-    let events = drain_events(
-        &rx,
-        "scanner.thumbnailsComplete",
-        Duration::from_secs(3),
-    );
+    let events = drain_events(&rx, "scanner.thumbnailsComplete", Duration::from_secs(3));
     assert!(
         events.iter().any(|event| {
             event["event"] == "scanner.thumbnailsFailed"
@@ -818,7 +940,7 @@ fn quarantined_terminal_generation_loss_does_not_strand_poison_gate() {
         )
         .expect("healthy delayed mock bridge")
         .with_preview_silence_deadline(Duration::from_millis(20))
-        .with_preview_terminal_generation_loss_test_hook(),
+        .with_preview_terminal_session_loss_test_hook(),
     );
     backend
         .connect(DEVICE_ID, &ConnectOptions::default())
@@ -834,11 +956,7 @@ fn quarantined_terminal_generation_loss_does_not_strand_poison_gate() {
     )
     .expect("preview should be accepted before its watchdog");
 
-    let events = drain_events(
-        &rx,
-        "scanner.thumbnailsComplete",
-        Duration::from_secs(2),
-    );
+    let events = drain_events(&rx, "scanner.thumbnailsComplete", Duration::from_secs(2));
     assert!(events.iter().any(|event| {
         event["event"] == "scanner.thumbnailsFailed"
             && event["payload"]["code"] == "BRIDGE_STREAM_STALLED"
@@ -1005,14 +1123,16 @@ fn scan_start_raw_only_maps_dng_sidecar_recipe_and_preserves_both_bridge_paths()
     let raw_path = receipt["outputs"]["rawNegativePath"]
         .as_str()
         .expect("completed receipt must expose the bridge-written raw path");
+    let canonical_raw_root = std::fs::canonicalize(&raw_root)
+        .expect("published raw destination has a canonical authority path");
     assert!(raw_path.ends_with(".dng"));
-    assert!(std::path::Path::new(raw_path).starts_with(&raw_root));
+    assert!(std::path::Path::new(raw_path).starts_with(&canonical_raw_root));
     assert!(std::path::Path::new(raw_path).is_file());
     let raw_ir_path = receipt["outputs"]["rawNegativeIrPath"]
         .as_str()
         .expect("completed receipt must expose the paired raw IR path");
     assert!(raw_ir_path.ends_with("-ir.tif"));
-    assert!(std::path::Path::new(raw_ir_path).starts_with(&raw_root));
+    assert!(std::path::Path::new(raw_ir_path).starts_with(&canonical_raw_root));
     assert!(std::path::Path::new(raw_ir_path).is_file());
     assert!(receipt["outputs"]["archivePath"].is_null());
 }
@@ -1083,6 +1203,12 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
         .find(|event| event["event"] == "scan.frameCompleted")
         .expect("scan.frameCompleted event must be present");
     let receipt = &frame_completed["payload"]["receipt"];
+    let expected_rgb_path = std::fs::canonicalize(&expected_rgb_path)
+        .expect("published RGB archive has a canonical authority path");
+    let expected_ir_path = std::fs::canonicalize(&expected_ir_path)
+        .expect("published IR archive has a canonical authority path");
+    let expected_meter_path = std::fs::canonicalize(&expected_meter_path)
+        .expect("published meter archive has a canonical authority path");
 
     let rgb_path = receipt["rgbPath"]
         .as_str()
@@ -1125,10 +1251,8 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
         "the receipt must make derivative rerender geometry reproducible: {receipt:#?}"
     );
     let archive_dimensions = image::image_dimensions(rgb_path).unwrap();
-    let positive_dimensions = image::image_dimensions(
-        receipt["outputs"]["positivePath"].as_str().unwrap()
-    )
-    .unwrap();
+    let positive_dimensions =
+        image::image_dimensions(receipt["outputs"]["positivePath"].as_str().unwrap()).unwrap();
     assert_eq!(
         positive_dimensions,
         (archive_dimensions.1, archive_dimensions.0),
@@ -1173,10 +1297,11 @@ fn scan_start_receipt_carries_real_capture_paths_and_hardware_telemetry() {
 #[test]
 fn derivative_only_real_scan_routes_through_private_working_root_and_cleans_after_terminal() {
     let backend = Arc::new(
-        RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
-            .expect("healthy mock bridge"),
+        RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT).expect("healthy mock bridge"),
     );
-    backend.connect(DEVICE_ID, &ConnectOptions::default()).expect("connect");
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect");
 
     let mut output = isolated_output_recipe();
     let user_archive_destination = std::path::PathBuf::from(&output.archive.destination);
@@ -1196,27 +1321,46 @@ fn derivative_only_real_scan_routes_through_private_working_root_and_cleans_afte
     .expect("derivative-only scan dispatches to mock bridge");
 
     let events = drain_events(&rx, "scan.completed", GENEROUS_TIMEOUT);
-    let frame_completed = events.iter()
+    let frame_completed = events
+        .iter()
         .find(|event| event["event"] == "scan.frameCompleted")
         .expect("derivatives complete");
     let receipt = &frame_completed["payload"]["receipt"];
-    let rgb_path = std::path::PathBuf::from(receipt["rgbPath"].as_str().expect("bridge provenance path"));
+    let rgb_path =
+        std::path::PathBuf::from(receipt["rgbPath"].as_str().expect("bridge provenance path"));
+    let private_root = rgb_path
+        .parent()
+        .expect("private capture has a workspace parent");
+    let canonical_temp_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    assert_eq!(
+        private_root.parent(),
+        Some(canonical_temp_root.as_path()),
+        "archive-off bridge capture must use the canonical OS temp root: {receipt:#?}"
+    );
     assert!(
-        rgb_path.starts_with(std::env::temp_dir().join("scanstudio-engine-capture-work")),
-        "archive-off bridge capture must use the private working root, not a user destination: {receipt:#?}"
+        private_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("scanstudio-engine-capture-") && name.len() == 58),
+        "private workspace must have a cryptorandom, non-predictable name: {receipt:#?}"
     );
     assert!(
         !rgb_path.starts_with(&user_archive_destination),
         "private capture must never route to the disabled archive destination"
     );
-    assert!(receipt["outputs"]["archivePath"].is_null(), "temporary capture is not a WrittenOutputs archive path: {receipt:#?}");
+    assert!(
+        receipt["outputs"]["archivePath"].is_null(),
+        "temporary capture is not a WrittenOutputs archive path: {receipt:#?}"
+    );
     assert!(
         !user_archive_destination.exists(),
         "disabled archive must not create the user archive folder"
     );
     for key in ["positivePath", "previewPath"] {
         assert!(
-            receipt["outputs"][key].as_str().is_some_and(|path| std::path::Path::new(path).is_file()),
+            receipt["outputs"][key]
+                .as_str()
+                .is_some_and(|path| std::path::Path::new(path).is_file()),
             "{key} must be retained: {receipt:#?}"
         );
     }
@@ -1224,7 +1368,10 @@ fn derivative_only_real_scan_routes_through_private_working_root_and_cleans_afte
         !rgb_path.exists(),
         "after scan.completed plus successful derivatives, the owned private capture must be cleaned"
     );
-    let terminal = events.iter().find(|event| event["event"] == "scan.completed").unwrap();
+    let terminal = events
+        .iter()
+        .find(|event| event["event"] == "scan.completed")
+        .unwrap();
     let status = terminal["payload"]["summary"]["evidencePackageStatus"]
         .as_str()
         .expect("cleanup status");
@@ -1263,15 +1410,19 @@ fn derivative_only_real_scan_routes_through_private_working_root_and_cleans_afte
 #[test]
 fn mixed_output_overrides_hold_private_capture_when_retained_package_is_incomplete() {
     let backend = Arc::new(
-        RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
-            .expect("healthy mock bridge"),
+        RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT).expect("healthy mock bridge"),
     );
-    backend.connect(DEVICE_ID, &ConnectOptions::default()).expect("connect");
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect");
 
     let output = isolated_output_recipe();
     assert!(output.archive.enabled && output.archive.full_capture_package);
     let archive_destination = std::path::PathBuf::from(&output.archive.destination);
-    let test_root = archive_destination.parent().expect("isolated archive has parent").to_path_buf();
+    let test_root = archive_destination
+        .parent()
+        .expect("isolated archive has parent")
+        .to_path_buf();
     let mut derivative_only = output.clone();
     derivative_only.archive.enabled = false;
     derivative_only.archive.full_capture_package = false;
@@ -1300,14 +1451,20 @@ fn mixed_output_overrides_hold_private_capture_when_retained_package_is_incomple
     let events = drain_events(&rx, "scan.completed", GENEROUS_TIMEOUT);
     let retained = events
         .iter()
-        .find(|event| event["event"] == "scan.frameCompleted" && event["payload"]["frameIndex"] == 1)
+        .find(|event| {
+            event["event"] == "scan.frameCompleted" && event["payload"]["frameIndex"] == 1
+        })
         .expect("retained frame completes");
     let derivative_only = events
         .iter()
-        .find(|event| event["event"] == "scan.frameCompleted" && event["payload"]["frameIndex"] == 2)
+        .find(|event| {
+            event["event"] == "scan.frameCompleted" && event["payload"]["frameIndex"] == 2
+        })
         .expect("derivative-only frame completes");
     assert!(
-        retained["payload"]["receipt"]["outputs"]["archivePath"].as_str().is_some_and(|path| std::path::Path::new(path).is_file()),
+        retained["payload"]["receipt"]["outputs"]["archivePath"]
+            .as_str()
+            .is_some_and(|path| std::path::Path::new(path).is_file()),
         "the retained frame must keep its user master"
     );
     assert!(
@@ -1333,17 +1490,30 @@ fn mixed_output_overrides_hold_private_capture_when_retained_package_is_incomple
         &std::fs::read(&package_manifest).expect("retained frame package manifest"),
     )
     .expect("package manifest JSON");
-    assert_eq!(package["status"], "incomplete", "missing attemptsRoot is not verified package success");
+    assert_eq!(
+        package["status"], "incomplete",
+        "missing attemptsRoot is not verified package success"
+    );
     let packaged_frames = package["frames"].as_array().expect("package frames");
-    assert_eq!(packaged_frames.len(), 1, "only the retained-master frame is eligible");
+    assert_eq!(
+        packaged_frames.len(),
+        1,
+        "only the retained-master frame is eligible"
+    );
     assert_eq!(packaged_frames[0]["frameIndex"], 1);
     assert_ne!(
         packaged_frames[0]["rgb"]["path"].as_str(),
         private_rgb.to_str(),
         "a private derivative-only capture must never be copied into a master package"
     );
-    assert!(private_rgb.is_file(), "an incomplete package cannot authorize deletion of the private capture");
-    let private_root = private_rgb.parent().expect("private capture parent").to_path_buf();
+    assert!(
+        private_rgb.is_file(),
+        "an incomplete package cannot authorize deletion of the private capture"
+    );
+    let private_root = private_rgb
+        .parent()
+        .expect("private capture parent")
+        .to_path_buf();
     let terminal_status = terminal["payload"]["summary"]["evidencePackageStatus"]
         .as_str()
         .expect("evidence package status");
@@ -1353,15 +1523,21 @@ fn mixed_output_overrides_hold_private_capture_when_retained_package_is_incomple
             && terminal_status.contains(private_root.to_str().expect("UTF-8 temp path")),
         "missing attemptsRoot makes the package incomplete and must report the held private path: {terminal:#?}"
     );
-    assert!(private_root.join(".scanstudio-capture-work-owner").is_file());
+    assert!(private_root
+        .join(".scanstudio-capture-work-owner")
+        .is_file());
     let _ = std::fs::remove_dir_all(private_root);
     let _ = std::fs::remove_dir_all(test_root);
 }
 
 #[test]
 fn derivative_only_real_scan_preserves_private_capture_when_derivative_rendering_fails() {
-    let backend = Arc::new(RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT).expect("healthy mock bridge"));
-    backend.connect(DEVICE_ID, &ConnectOptions::default()).expect("connect");
+    let backend = Arc::new(
+        RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT).expect("healthy mock bridge"),
+    );
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect");
     let mut output = isolated_output_recipe();
     output.archive.enabled = false;
     output.archive.full_capture_package = false;
@@ -1371,25 +1547,45 @@ fn derivative_only_real_scan_preserves_private_capture_when_derivative_rendering
     output.positive.color_profile = domain::OutputColorProfile::SRgb;
     let (tx, rx) = mpsc::channel();
     RealLs5000::scan_start(
-        &backend, vec![1], valid_capture_recipe(), domain::ProcessingRecipe::default(),
-        output, std::collections::HashMap::new(), None, tx,
-    ).expect("bridge dispatch succeeds before derivative failure");
+        &backend,
+        vec![1],
+        valid_capture_recipe(),
+        domain::ProcessingRecipe::default(),
+        output,
+        std::collections::HashMap::new(),
+        None,
+        tx,
+    )
+    .expect("bridge dispatch succeeds before derivative failure");
 
     let events = drain_events(&rx, "scan.completed", GENEROUS_TIMEOUT);
-    let failure = events.iter()
+    let failure = events
+        .iter()
         .find(|event| event["event"] == "scan.frameState" && event["payload"]["state"] == "failed")
         .expect("derivative failure must be visible");
-    let message = failure["payload"]["error"]["message"].as_str().expect("failure message");
+    let message = failure["payload"]["error"]["message"]
+        .as_str()
+        .expect("failure message");
     let held_root = message
-        .split("recovery-held at ").nth(1)
+        .split("recovery-held at ")
+        .nth(1)
         .and_then(|tail| tail.split(": derivative rendering failed").next())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| panic!("failure must honestly name the held recovery workspace: {message}"));
-    assert!(held_root.is_dir(), "the only physical capture must be preserved: {message}");
-    assert!(held_root.join(".scanstudio-capture-work-owner").is_file());
-    let terminal = events.iter().find(|event| event["event"] == "scan.completed").unwrap();
+        .unwrap_or_else(|| {
+            panic!("failure must honestly name the held recovery workspace: {message}")
+        });
     assert!(
-        terminal["payload"]["summary"]["evidencePackageStatus"].as_str()
+        held_root.is_dir(),
+        "the only physical capture must be preserved: {message}"
+    );
+    assert!(held_root.join(".scanstudio-capture-work-owner").is_file());
+    let terminal = events
+        .iter()
+        .find(|event| event["event"] == "scan.completed")
+        .unwrap();
+    assert!(
+        terminal["payload"]["summary"]["evidencePackageStatus"]
+            .as_str()
             .is_some_and(|status| status.contains("recovery-held")),
         "terminal status must not claim cleanup after derivative failure: {terminal:#?}"
     );
@@ -1407,26 +1603,45 @@ fn derivative_only_real_scan_preserves_private_capture_without_bridge_terminal_c
         .expect("bridge starts before its scan worker crash")
         .with_scan_silence_deadline(Duration::from_secs(2)),
     );
-    backend.connect(DEVICE_ID, &ConnectOptions::default()).expect("connect");
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect");
     let mut output = isolated_output_recipe();
     output.archive.enabled = false;
     output.archive.full_capture_package = false;
     let (tx, rx) = mpsc::channel();
     RealLs5000::scan_start(
-        &backend, vec![1], valid_capture_recipe(), domain::ProcessingRecipe::default(),
-        output, std::collections::HashMap::new(), None, tx,
-    ).expect("scan starts");
+        &backend,
+        vec![1],
+        valid_capture_recipe(),
+        domain::ProcessingRecipe::default(),
+        output,
+        std::collections::HashMap::new(),
+        None,
+        tx,
+    )
+    .expect("scan starts");
 
     let events = drain_events(&rx, "scan.completed", Duration::from_secs(8));
-    let receipt = &events.iter()
+    let receipt = &events
+        .iter()
         .find(|event| event["event"] == "scan.frameCompleted")
         .expect("the bridge completes the physical frame before crashing")["payload"]["receipt"];
-    let rgb_path = std::path::PathBuf::from(receipt["rgbPath"].as_str().expect("private provenance"));
-    assert!(rgb_path.is_file(), "without a terminal bridge closure the physical capture must remain: {receipt:#?}");
-    let terminal = events.iter().find(|event| event["event"] == "scan.completed").unwrap();
+    let rgb_path =
+        std::path::PathBuf::from(receipt["rgbPath"].as_str().expect("private provenance"));
     assert!(
-        terminal["payload"]["summary"]["evidencePackageStatus"].as_str()
-            .is_some_and(|status| status.contains("recovery-held") && status.contains("without a real bridge scan.completed closure")),
+        rgb_path.is_file(),
+        "without a terminal bridge closure the physical capture must remain: {receipt:#?}"
+    );
+    let terminal = events
+        .iter()
+        .find(|event| event["event"] == "scan.completed")
+        .unwrap();
+    assert!(
+        terminal["payload"]["summary"]["evidencePackageStatus"]
+            .as_str()
+            .is_some_and(|status| status.contains("recovery-held")
+                && status.contains("without a real bridge scan.completed closure")),
         "terminal status must honestly preserve recovery capture: {terminal:#?}"
     );
     let held_root = rgb_path.parent().expect("capture parent").to_path_buf();
@@ -1524,9 +1739,7 @@ fn scan_start_rejects_a_respawned_non_owner_before_dispatching_motion() {
     .expect_err("a replacement child must not inherit motion authority");
     assert_eq!(error.code, ErrorCode::NotConnected);
     assert!(
-        error
-            .message
-            .contains("no longer current before dispatch")
+        error.message.contains("no longer current before dispatch")
             && error.message.contains("motion request was not retried"),
         "the rejection must prove it occurred at the ownership boundary: {error:?}"
     );
@@ -2576,7 +2789,7 @@ fn scan_start_persists_frame_receipts_to_manifest_for_real_hardware() {
         vec![1, 2],
         valid_capture_recipe(),
         domain::ProcessingRecipe::default(),
-        isolated_output_recipe(),
+        project.recipes.clone(),
         std::collections::HashMap::new(),
         Some(project_directory.clone()),
         tx,

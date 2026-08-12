@@ -92,6 +92,20 @@ if [[ ! -f "$bridge_site_packages/sane.py" ]] \
     exit 66
 fi
 
+# Version and sealed capture identity have one source of truth: the exact
+# CoolscanPy pyproject/lock/source tree copied below.  Run the stdlib-only gate
+# before spending time on native builds, then use its parsed version for every
+# generated metadata record.
+coolscanpy_identity_verifier="$package_root/../../scripts/verify_coolscanpy_source.py"
+if [[ ! -f "$coolscanpy_identity_verifier" ]]; then
+    print -u2 "Refusing to package without the CoolscanPy identity verifier: $coolscanpy_identity_verifier"
+    exit 66
+fi
+coolscanpy_version="$(
+    "$bridge_python" -I -B "$coolscanpy_identity_verifier" \
+        "$coolscanpy_source" --print-version
+)"
+
 bridge_runtime_prefix="$($bridge_python -c 'import sys; print(sys.base_prefix)')"
 if [[ ! -x "$bridge_runtime_prefix/bin/python3.13" ]]; then
     print -u2 "Refusing to package a non-relocatable Python runtime: expected '$bridge_runtime_prefix/bin/python3.13'."
@@ -218,11 +232,15 @@ copy_python_runtime_dependencies "$bridge_site_packages" "$staged_app/Contents/R
 mkdir -p "$staged_app/Contents/Resources/BridgeRuntime/site-packages/scanstudio_bridge-0.1.0.dist-info"
 print -r -- $'Metadata-Version: 2.1\nName: scanstudio-bridge\nVersion: 0.1.0\nLicense-Expression: GPL-3.0-only\n' \
     > "$staged_app/Contents/Resources/BridgeRuntime/site-packages/scanstudio_bridge-0.1.0.dist-info/METADATA"
-mkdir -p "$staged_app/Contents/Resources/BridgeRuntime/site-packages/coolscanpy-0.1.3.dist-info"
-print -r -- $'Metadata-Version: 2.1\nName: coolscanpy\nVersion: 0.1.3\nLicense-Expression: GPL-3.0-only\n' \
-    > "$staged_app/Contents/Resources/BridgeRuntime/site-packages/coolscanpy-0.1.3.dist-info/METADATA"
+coolscanpy_dist_info="$staged_app/Contents/Resources/BridgeRuntime/site-packages/coolscanpy-$coolscanpy_version.dist-info"
+mkdir -p "$coolscanpy_dist_info"
+printf 'Metadata-Version: 2.1\nName: coolscanpy\nVersion: %s\nLicense-Expression: GPL-3.0-only\n' \
+    "$coolscanpy_version" > "$coolscanpy_dist_info/METADATA"
 copy_corresponding_source "$bridge_source" "$staged_app/Contents/Resources/CorrespondingSource/scanstudio-bridge"
 copy_corresponding_source "$coolscanpy_source" "$staged_app/Contents/Resources/CorrespondingSource/coolscanpy"
+"$bridge_python" -I -B "$coolscanpy_identity_verifier" \
+    "$staged_app/Contents/Resources/CorrespondingSource/coolscanpy" \
+    --metadata-root "$staged_app/Contents/Resources/BridgeRuntime/site-packages"
 # The capture adapter deliberately launches its scanner worker under
 # `python -I` through a stdlib-only bootstrap.  `-I` correctly rejects a user's
 # `PYTHONPATH` and working directory, but it also means the bridge helper's

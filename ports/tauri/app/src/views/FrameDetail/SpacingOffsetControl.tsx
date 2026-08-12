@@ -115,7 +115,7 @@ export default function SpacingOffsetControl({ frameIndex }: { frameIndex: numbe
         {thumbnail?.imagePath !== undefined ? (
           <img
             className={styles.replacementTile}
-            src={`scanstudio-preview://localhost/?path=${encodeURIComponent(thumbnail.imagePath)}`}
+            src={`scanstudio-preview://localhost/?id=${encodeURIComponent(thumbnail.imagePath)}`}
             alt={`Frame ${frameIndex} replacement tile`}
             data-testid="replacement-tile"
           />

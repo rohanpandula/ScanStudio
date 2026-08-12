@@ -158,13 +158,16 @@ describe("FrameDetailView", () => {
     expect(screen.getByText("Frame 2")).toBeInTheDocument();
     const img = screen.getByTestId("zoom-pan-image") as HTMLImageElement;
     expect(img.src).toBe(
-      "scanstudio-preview://localhost/?path=" +
+      "scanstudio-preview://localhost/?id=" +
         encodeURIComponent("/scans/frames/frame-0002.png"),
     );
     expect(screen.getByTestId("spacing-offset-input")).toBeInTheDocument();
     expect(screen.getByTestId("approval-panel")).toBeInTheDocument();
     expect(screen.getByTestId("approval-needs-badge")).toBeInTheDocument();
     expect(screen.getByText("IR channel saturated")).toBeInTheDocument();
+    expect(
+      fixture.calls.find((call) => call.method === "project.analyzeFrameDefects")?.params,
+    ).toEqual({ frameIndex: 2 });
   });
 
   it("invokes the onClose callback when provided", async () => {

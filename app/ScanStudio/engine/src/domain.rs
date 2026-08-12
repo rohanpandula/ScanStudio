@@ -99,6 +99,34 @@ pub trait ScannerBackend: Send + Sync + Sized {
         overrides: std::collections::HashMap<u32, FrameOverrides>,
         project_directory: Option<std::path::PathBuf>,
         event_tx: std::sync::mpsc::Sender<String>,
+    ) -> Result<String, EngineError> {
+        Self::scan_start_with_output_authorities(
+            backend,
+            frames,
+            recipe,
+            processing,
+            output,
+            overrides,
+            project_directory,
+            None,
+            event_tx,
+        )
+    }
+
+    /// Internal server dispatch variant. `Some` carries the exact authority
+    /// acquired before pathname preflight so the backend cannot silently
+    /// re-bless a project-root replacement between validation and motion.
+    #[doc(hidden)]
+    fn scan_start_with_output_authorities(
+        backend: &std::sync::Arc<Self>,
+        frames: Vec<u32>,
+        recipe: CaptureRecipe,
+        processing: ProcessingRecipe,
+        output: OutputRecipe,
+        overrides: std::collections::HashMap<u32, FrameOverrides>,
+        project_directory: Option<std::path::PathBuf>,
+        output_authorities: Option<crate::render::JobOutputAuthorities>,
+        event_tx: std::sync::mpsc::Sender<String>,
     ) -> Result<String, EngineError>;
 
     fn scan_stop(
@@ -730,6 +758,42 @@ pub struct FrameOverrides {
 /// Where a completed frame's files actually landed. Populated by Plan
 /// 03-02's real file-writing logic; every field is a path this engine
 /// build actually wrote, never a template or a destination directory.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WrittenFileBinding {
+    /// UTF-8 path relative to the engine-selected project output root.
+    /// Metadata writes reconstruct the path from this value and never use
+    /// the legacy absolute receipt path as authority.
+    pub relative_path: String,
+    pub sha256: String,
+    pub byte_length: u64,
+    /// Stable filesystem identity where the platform exposes one (`st_dev`
+    /// on Unix, volume serial on Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<u64>,
+    /// Stable file identity where the platform exposes one (`st_ino` on
+    /// Unix, file index on Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<u64>,
+}
+
+/// Engine-authored capabilities for the only files ExifTool may touch.
+/// These are deliberately separate from the legacy display paths above:
+/// an opened project cannot turn an arbitrary absolute receipt path into
+/// write authority. A missing binding fails closed for metadata writes.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataOutputBindings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<WrittenFileBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_xmp: Option<WrittenFileBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positive: Option<WrittenFileBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<WrittenFileBinding>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WrittenOutputs {
@@ -743,6 +807,12 @@ pub struct WrittenOutputs {
     pub raw_negative_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_negative_ir_path: Option<String>,
+    /// Relative-path, hash, and file-identity bindings minted when the
+    /// engine finishes writing this receipt's outputs. Legacy/untrusted
+    /// receipts without these capabilities remain readable, but cannot
+    /// authorize ExifTool writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_bindings: Option<MetadataOutputBindings>,
     /// Exact presentation transform used for the finished derivatives.
     /// Identity on legacy receipts whose `outputs` object predates this key.
     #[serde(default)]

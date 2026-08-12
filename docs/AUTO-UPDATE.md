@@ -4,19 +4,19 @@
 
 | Path | Status |
 |------|--------|
-| **Path A — custom updater** (shipped mechanism in this repo) | **ACTIVE** |
+| **Path A — custom updater** (shipped mechanism in this repo) | **CHECK-ONLY; INSTALL FAILS CLOSED UNTIL DEVELOPER ID GATE OPENS** |
 | **Path B — Sparkle** | **GATED** on Developer ID; **NOT active** |
 
 ## Why two paths
 
 ScanStudio is ad-hoc signed today (`codesign -dv` → `Signature=adhoc`, no
-TeamIdentifier). Sparkle's real value is silent, auto-verified updates via
-Gatekeeper — and that only works once the app is Developer ID signed and
-**notarized**, both of which are blocked on a Developer ID certificate. Path A
-is a custom updater that delivers verified-update + rollback value at $0 and
-works with the existing ad-hoc signing, so it ships now and Path B waits.
+TeamIdentifier). Neither the custom updater nor Sparkle may install a release
+from that trust state. A checksum supplied by the release server is an
+integrity check, not an independent publisher identity. Path A can check and
+download today, but installation fails closed until the running app and update
+are Developer ID signed, securely timestamped, notarized, and stapled.
 
-## Path A (active) — how it works
+## Path A — how it works and its publisher gate
 
 The shipped pieces are the release pipeline (01-01), version identity (01-02),
 install core (01-03), verified update service (01-04), Settings UI (01-05),
@@ -42,8 +42,25 @@ integration gate (01-06), and host-architecture-aware resolution (Phase 02).
 - **Service (plan 01-04, shipped):**
   `app/ScanStudio/Sources/ScanStudioKit/UpdateService.swift` provides
   `GitHubUpdateChecker` + `UpdateDownloader`, which resolve the pointer/channel,
-  verify the downloaded DMG's SHA-256 before mounting, and code-signature
-  verify (`codesign --verify --deep --strict`) the mounted app before install.
+  and verify the downloaded DMG's SHA-256 before mounting. A scoped read-only
+  mount then requires exactly one `.app` anywhere in the image, and that app
+  must be root-level `ScanStudio.app`; the image always detaches
+  (normal detach followed by a bounded forced-detach fallback).
+- **Independent publisher root (required for installation):** the signed
+  `Info.plist` must contain `ScanStudioUpdateTeamIdentifier` with the real
+  ten-character Apple Team ID. At runtime that stamp must match the running
+  app's Developer ID certificate, exact Security.framework designated
+  requirement, secure timestamp, and stapled notarization ticket. The mounted
+  app, private staging copy, and installed copy must all satisfy the same root.
+  Missing/empty stamps and ad-hoc signatures produce no policy and disable
+  installation; there is no placeholder Team ID and no permissive fallback.
+- **Bundle binding:** before and after staging, the updater requires bundle ID
+  `dev.scanstudio.live`, `CFBundleExecutable=ScanStudioLauncher`, exact
+  `ScanStudioRelease`, a single-architecture `Contents/MacOS/ScanStudio` Mach-O
+  matching the selected host feed entry, and a valid `LSMinimumSystemVersion`
+  from the supported macOS 14+ range that the current host can run. The install
+  core also refuses a candidate that is not newer than the app already at the
+  selected destination.
 - **Architecture-aware resolution (Phase 02, shipped):** the updater resolves
   the newest release for the HOST architecture from the arch-keyed
   `latest.json` (a single `architectures` mapping with a distinct
@@ -71,7 +88,8 @@ imported into your keychain.
    **Why:** without it `codesign` cannot attest authorship, so macOS keeps
    flagging the bundle. **Where:** Apple's certs portal → download → double-click
    to install into `login` keychain; record the **Team ID** (visible via
-   `codesign -dv` on a signed product, e.g. `TEAMID`).
+   `codesign -dv` on a signed product). Stamp that exact value as
+   `ScanStudioUpdateTeamIdentifier`; never use a sample or guessed value.
 2. **Notarization capability** — a channel to submit builds to Apple's
    notary and staple the ticket.
    **Why:** notarization is what turns "first-launch warning" into Gatekeeper
@@ -119,7 +137,8 @@ identity), `release.yml` (emit + upload appcast, notarize).
 
 **Explicitly untouched by Path B:** the update safety boundary (no bridge spawn,
 no scanner motion), the snapshot/swap/rollback core (`UpdateInstaller`), version
-ordering (`UpdateVersion`), and the GitHub Releases distribution surface.
+ordering (`UpdateVersion`), the custom updater's Developer ID publisher gate,
+and the GitHub Releases distribution surface.
 
 ## Explicit non-goals while gated
 

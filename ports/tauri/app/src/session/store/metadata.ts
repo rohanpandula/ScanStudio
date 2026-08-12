@@ -6,7 +6,8 @@
 //
 // Safety note (threat T-07-01): none of these functions ever accepts an
 // ExifTool argument list or command string. applyMetadata sends only
-// frameIndex; the engine rebuilds the argument array entirely server-side
+// frameIndex plus the reviewed preview fingerprint; the engine rebuilds and
+// verifies the argument array entirely server-side
 // (PROTOCOL.md: "applyMetadata always rebuilds its own argument array
 // server-side ... never accepts or executes a client-supplied argument
 // list").
@@ -46,9 +47,13 @@ export async function previewMetadataCommand(
 export async function applyMetadata(
   request: MetadataRequest,
   frameIndex: number,
+  previewFingerprint: string,
 ): Promise<ApplyMetadataResult | null> {
   try {
-    return (await request("project.applyMetadata", { frameIndex })) as ApplyMetadataResult;
+    return (await request("project.applyMetadata", {
+      frameIndex,
+      previewFingerprint,
+    })) as ApplyMetadataResult;
   } catch {
     return null;
   }

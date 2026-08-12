@@ -132,3 +132,34 @@ def test_from_wire_raises_invalid_params_on_missing_required_field() -> None:
     with pytest.raises(BridgeError) as excinfo:
         from_wire(incomplete, CaptureRecipe)
     assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+
+
+@pytest.mark.parametrize("bad_value", [True, "4000", 4000.0, float("nan")])
+def test_from_wire_refuses_coercible_or_nonfinite_integer_fields(bad_value: object) -> None:
+    recipe = {
+        "resolutionDpi": bad_value,
+        "bitDepth": 16,
+        "multisamplePasses": 4,
+        "channels": "rgbi",
+        "autofocus": True,
+        "autoExposure": True,
+    }
+    with pytest.raises(BridgeError) as excinfo:
+        from_wire(recipe, CaptureRecipe)
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+
+
+def test_from_wire_refuses_unknown_fields() -> None:
+    recipe = {
+        "resolutionDpi": 4000,
+        "bitDepth": 16,
+        "multisamplePasses": 4,
+        "channels": "rgbi",
+        "autofocus": True,
+        "autoExposure": True,
+        "futureMotionFlag": True,
+    }
+    with pytest.raises(BridgeError) as excinfo:
+        from_wire(recipe, CaptureRecipe)
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert "unknown" in excinfo.value.message

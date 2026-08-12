@@ -2,9 +2,10 @@
 // Pure Foundation filesystem work: snapshot the current app, stage a
 // source-verified archive, atomically swap it into place, and restore the
 // previous version on demand. No bridge spawn, no device open, no motion
-// latch, no project access, no subprocesses (FileManager is the copy helper,
-// so `ditto` is not needed here).
+// latch, or project access. FileManager is the copy helper (`ditto` is not
+// needed); the shared verifier performs the bounded notarization assessment.
 
+import Darwin
 import Foundation
 
 /// Typed failures for the install core (AUT-04-SNAP, AUT-04-SWAP,
@@ -38,11 +39,20 @@ public struct UpdateArchive: Sendable {
     /// Non-empty release SHA-256 (actual hash verification is 01-04's job,
     /// run before this core ever sees the archive).
     public let checksumSHA256: String
+    /// Architecture selected from the feed for this archive. The install core
+    /// revalidates the copied Mach-O against it before and after publication.
+    public let architecture: HostArchitecture
 
-    public init(version: UpdateVersion, sourceAppPath: URL, checksumSHA256: String) {
+    public init(
+        version: UpdateVersion,
+        sourceAppPath: URL,
+        checksumSHA256: String,
+        architecture: HostArchitecture = HostArchitectureProvider.current()
+    ) {
         self.version = version
         self.sourceAppPath = sourceAppPath
         self.checksumSHA256 = checksumSHA256
+        self.architecture = architecture
     }
 }
 
@@ -60,6 +70,10 @@ public final class UpdateInstaller {
     /// `appDirectory` is not writable (01-08 gap closure). Empty means
     /// "default to the user-writable `~/Applications`".
     private let authorizedDestinations: [URL]
+    /// Same publisher/identity verifier used on the mounted source. Re-running
+    /// it on the private staging copy and final destination closes copy/swap
+    /// mistakes and makes the installer independently fail-closed.
+    private let bundleVerifier: UpdateBundleVerifier
 
     /// The most recent snapshot taken by this instance — the only source of
     /// truth for `availableRollback`. Never cleared after a later successful
@@ -80,10 +94,25 @@ public final class UpdateInstaller {
         ]
     }
 
-    public init(
+    public convenience init(
         appDirectory: URL,
         rollbackDirectory: URL,
-        authorizedDestinations: [URL] = []
+        authorizedDestinations: [URL] = [],
+        publisherTrust: UpdatePublisherTrust? = nil
+    ) throws {
+        try self.init(
+            appDirectory: appDirectory,
+            rollbackDirectory: rollbackDirectory,
+            authorizedDestinations: authorizedDestinations,
+            bundleVerifier: UpdateBundleVerifier(publisherTrust: publisherTrust)
+        )
+    }
+
+    init(
+        appDirectory: URL,
+        rollbackDirectory: URL,
+        authorizedDestinations: [URL] = [],
+        bundleVerifier: UpdateBundleVerifier
     ) throws {
         guard appDirectory.isExistingDirectory, rollbackDirectory.isExistingDirectory else {
             throw UpdateInstallError.badArguments
@@ -91,6 +120,7 @@ public final class UpdateInstaller {
         self.appDirectory = appDirectory
         self.rollbackDirectory = rollbackDirectory
         self.authorizedDestinations = authorizedDestinations
+        self.bundleVerifier = bundleVerifier
     }
 
     /// The last snapshot this instance recorded, if any.
@@ -177,17 +207,60 @@ public final class UpdateInstaller {
         guard !archive.checksumSHA256.isEmpty else {
             throw UpdateInstallError.notVerified
         }
+        // Do not snapshot or mutate a destination until the mounted source has
+        // independently passed the complete publisher/identity gate.
+        try bundleVerifier.validate(
+            appURL: archive.sourceAppPath,
+            expectedVersion: archive.version,
+            expectedArchitecture: archive.architecture
+        )
         // Preflight the destination up front: an unwritable target surfaces a
         // clear `.cannotWriteTarget`, never a misleading `.swapFailed`.
         let destination = try resolveInstallDestination()
-        try snapshotCurrentCore(in: destination)
-        do {
-            let staging = stagingURL(in: destination)
-            if fileManager.fileExists(atPath: staging.path) {
-                try fileManager.removeItem(at: staging)
+        if !fileManager.fileExists(atPath: destination.path) {
+            do {
+                try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+                try Self.syncDirectory(destination.deletingLastPathComponent())
+            } catch {
+                throw UpdateInstallError.cannotWriteTarget
             }
+        }
+        let currentApp = destination.appendingPathComponent("ScanStudio.app", isDirectory: true)
+        if fileManager.fileExists(atPath: currentApp.path) {
+            let currentVersion: UpdateVersion
+            do {
+                currentVersion = try Self.versionOfBundle(at: currentApp)
+            } catch {
+                throw UpdateInstallError.cannotSnapshot
+            }
+            guard currentVersion < archive.version else {
+                throw UpdateDownloadError.versionMismatch
+            }
+        }
+        try snapshotCurrentCore(in: destination)
+        let stagingContainer: URL
+        do {
+            stagingContainer = try makePrivateStagingContainer(in: destination)
+        } catch {
+            throw UpdateInstallError.swapFailed
+        }
+        let staging = stagingContainer.appendingPathComponent("ScanStudio.app", isDirectory: true)
+        defer { try? fileManager.removeItem(at: stagingContainer) }
+        do {
             try fileManager.copyItem(at: archive.sourceAppPath, to: staging)
-            try swapIn(staged: staging, into: destination)
+            try bundleVerifier.validate(
+                appURL: staging,
+                expectedVersion: archive.version,
+                expectedArchitecture: archive.architecture
+            )
+            try swapIn(
+                staged: staging,
+                into: destination,
+                expectedVersion: archive.version,
+                expectedArchitecture: archive.architecture
+            )
+        } catch let error as UpdateDownloadError {
+            throw error
         } catch {
             throw UpdateInstallError.swapFailed
         }
@@ -202,12 +275,21 @@ public final class UpdateInstaller {
             throw UpdateInstallError.rolledBack
         }
         let destination = try resolveInstallDestination()
-        let staging = stagingURL(in: destination)
-        if fileManager.fileExists(atPath: staging.path) {
-            try fileManager.removeItem(at: staging)
-        }
+        let stagingContainer = try makePrivateStagingContainer(in: destination)
+        let staging = stagingContainer.appendingPathComponent("ScanStudio.app", isDirectory: true)
+        defer { try? fileManager.removeItem(at: stagingContainer) }
         try fileManager.copyItem(at: snapshot.url, to: staging)
-        try swapIn(staged: staging, into: destination)
+        try bundleVerifier.validate(
+            appURL: staging,
+            expectedVersion: snapshot.version,
+            expectedArchitecture: HostArchitectureProvider.current()
+        )
+        try swapIn(
+            staged: staging,
+            into: destination,
+            expectedVersion: snapshot.version,
+            expectedArchitecture: HostArchitectureProvider.current()
+        )
         return destination.appendingPathComponent("ScanStudio.app", isDirectory: true)
     }
 
@@ -216,20 +298,43 @@ public final class UpdateInstaller {
     /// Atomic-ish replacement: move the staged bundle into the app slot,
     /// keeping the previous app as `ScanStudio.prev` until the new one is
     /// confirmed present and readable, then drop the backup.
-    private func swapIn(staged: URL, into destination: URL) throws {
+    private func swapIn(
+        staged: URL,
+        into destination: URL,
+        expectedVersion: UpdateVersion,
+        expectedArchitecture: HostArchitecture
+    ) throws {
         let current = destination.appendingPathComponent("ScanStudio.app", isDirectory: true)
-        let backup = destination.appendingPathComponent("ScanStudio.prev", isDirectory: true)
+        let backupName = ".ScanStudio.prev.\(UUID().uuidString)"
+        let backup = destination.appendingPathComponent(backupName, isDirectory: true)
+        let hadCurrent = fileManager.fileExists(atPath: current.path)
 
         do {
-            _ = try fileManager.replaceItemAt(current, withItemAt: staged, backupItemName: "ScanStudio.prev")
+            if hadCurrent {
+                _ = try fileManager.replaceItemAt(
+                    current,
+                    withItemAt: staged,
+                    backupItemName: backupName
+                )
+            } else {
+                try Self.renameExclusive(staged, to: current)
+            }
+            try bundleVerifier.validate(
+                appURL: current,
+                expectedVersion: expectedVersion,
+                expectedArchitecture: expectedArchitecture
+            )
+            try Self.syncDirectory(destination)
         } catch {
-            restoreBackup(backup: backup, current: current)
-            throw UpdateInstallError.swapFailed
-        }
-
-        guard fileManager.fileExists(atPath: current.path),
-              fileManager.isReadableFile(atPath: current.path) else {
-            restoreBackup(backup: backup, current: current)
+            if hadCurrent {
+                restoreBackup(backup: backup, current: current)
+            } else {
+                try? fileManager.removeItem(at: current)
+                try? Self.syncDirectory(destination)
+            }
+            if let validationError = error as? UpdateDownloadError {
+                throw validationError
+            }
             throw UpdateInstallError.swapFailed
         }
 
@@ -243,10 +348,57 @@ public final class UpdateInstaller {
         guard fileManager.fileExists(atPath: backup.path) else { return }
         try? fileManager.removeItem(at: current)
         try? fileManager.moveItem(at: backup, to: current)
+        try? Self.syncDirectory(current.deletingLastPathComponent())
     }
 
-    private func stagingURL(in directory: URL) -> URL {
-        directory.appendingPathComponent(".ScanStudio.new", isDirectory: true)
+    /// Creates a randomized mode-0700 sibling atomically. The copied app stays
+    /// inside this private directory until its final same-volume rename/swap.
+    private func makePrivateStagingContainer(in directory: URL) throws -> URL {
+        for _ in 0..<8 {
+            let container = directory.appendingPathComponent(
+                ".ScanStudio.stage.\(UUID().uuidString)",
+                isDirectory: true
+            )
+            let result = container.path.withCString { Darwin.mkdir($0, 0o700) }
+            if result == 0 { return container }
+            if errno != EEXIST {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+        throw POSIXError(.EEXIST)
+    }
+
+    /// Atomic create-only publication for an empty destination. `RENAME_EXCL`
+    /// prevents a path appearing between validation and rename from being
+    /// overwritten.
+    private static func renameExclusive(_ source: URL, to destination: URL) throws {
+        let result = source.path.withCString { sourcePath in
+            destination.path.withCString { destinationPath in
+                renameatx_np(
+                    AT_FDCWD,
+                    sourcePath,
+                    AT_FDCWD,
+                    destinationPath,
+                    UInt32(RENAME_EXCL)
+                )
+            }
+        }
+        guard result == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    /// Makes the create/replace directory entry durable before reporting
+    /// success. This is intentionally a throwing gate, not best-effort.
+    private static func syncDirectory(_ directory: URL) throws {
+        let descriptor = Darwin.open(directory.path, O_RDONLY)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { Darwin.close(descriptor) }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     // MARK: - Version helpers

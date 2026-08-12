@@ -24,7 +24,7 @@ describe("ZoomPanViewer", () => {
   it("renders the frame image via the Phase 3 scanstudio-preview protocol URL", () => {
     renderViewer();
     expect(imageOf().src).toBe(
-      "scanstudio-preview://localhost/?path=" + encodeURIComponent(IMAGE_PATH),
+      "scanstudio-preview://localhost/?id=" + encodeURIComponent(IMAGE_PATH),
     );
   });
 

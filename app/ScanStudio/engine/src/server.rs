@@ -33,9 +33,68 @@ struct ProjectState {
 }
 
 impl ProjectState {
-    fn set(&mut self, project: domain::ScanProject, directory: std::path::PathBuf) {
-        self.active = Some(project);
+    fn set(
+        &mut self,
+        mut project: domain::ScanProject,
+        directory: std::path::PathBuf,
+    ) -> Result<domain::ScanProject, EngineError> {
+        // Store the physical project directory once. Keeping a symlink or
+        // junction alias here would let a later retarget redirect every
+        // project operation which begins after the current held capability
+        // is dropped.
+        let requested_directory = if directory.is_absolute() {
+            directory.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    EngineError::new(
+                        ErrorCode::ManifestInvalid,
+                        format!("cannot resolve active project directory: {error}"),
+                    )
+                })?
+                .join(&directory)
+        };
+        let directory = std::fs::canonicalize(&requested_directory).map_err(|error| {
+            EngineError::new(
+                ErrorCode::ManifestInvalid,
+                format!(
+                    "cannot anchor active project directory {}: {error}",
+                    directory.display()
+                ),
+            )
+        })?;
+        fn rebase_output_destinations(
+            output: &mut domain::OutputRecipe,
+            requested_root: &std::path::Path,
+            canonical_root: &std::path::Path,
+        ) {
+            for destination in [
+                &mut output.archive.destination,
+                &mut output.positive.destination,
+                &mut output.preview.destination,
+                &mut output.raw_export.destination,
+            ] {
+                let path = std::path::Path::new(destination);
+                let Ok(relative) = path.strip_prefix(requested_root) else {
+                    continue;
+                };
+                if relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                {
+                    *destination = canonical_root.join(relative).display().to_string();
+                }
+            }
+        }
+        rebase_output_destinations(&mut project.recipes, &requested_directory, &directory);
+        for frame in &mut project.frames {
+            if let Some(output) = frame.output_override.as_mut() {
+                rebase_output_destinations(output, &requested_directory, &directory);
+            }
+        }
+        self.active = Some(project.clone());
         self.directory = Some(directory);
+        Ok(project)
     }
 
     /// Refreshes the active manifest from its durable copy. Scan workers
@@ -58,6 +117,31 @@ impl ProjectState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SCAN_RECIPE_PERSIST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_before_scan_recipe_persist_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_SCAN_RECIPE_PERSIST_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_before_scan_recipe_persist_hook() {
+    BEFORE_SCAN_RECIPE_PERSIST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_scan_recipe_persist_hook() {}
 
 /// Which backend currently owns the connection, if any. `Copy` so
 /// `Backends`' read-only dispatch methods (`status`/`load_media`/`eject`/
@@ -196,6 +280,20 @@ impl Backends {
                 ErrorCode::NotConnected,
                 "scanner is not connected",
             )),
+        }
+    }
+
+    /// Reads only engine-owned activity state. This must not call the real
+    /// bridge: a status timeout while the scanner is mid-transaction can
+    /// restart the bridge and violate hardware ownership.
+    fn active_job_id_snapshot(&self) -> Option<String> {
+        match self.active {
+            Some(ActiveDevice::Sim) => self.sim.active_job_id_snapshot(),
+            Some(ActiveDevice::Real) => self
+                .real
+                .as_ref()
+                .and_then(|real| real.active_job_id_snapshot()),
+            None => None,
         }
     }
 
@@ -425,10 +523,11 @@ impl Backends {
         output: domain::OutputRecipe,
         overrides: std::collections::HashMap<u32, domain::FrameOverrides>,
         project_directory: Option<std::path::PathBuf>,
+        output_authorities: crate::render::JobOutputAuthorities,
         event_tx: mpsc::Sender<String>,
     ) -> Result<String, EngineError> {
         match self.active {
-            Some(ActiveDevice::Sim) => SimulatedLs5000::scan_start(
+            Some(ActiveDevice::Sim) => SimulatedLs5000::scan_start_with_output_authorities(
                 &self.sim,
                 frames,
                 recipe,
@@ -436,9 +535,10 @@ impl Backends {
                 output,
                 overrides,
                 project_directory,
+                Some(output_authorities),
                 event_tx,
             ),
-            Some(ActiveDevice::Real) => RealLs5000::scan_start(
+            Some(ActiveDevice::Real) => RealLs5000::scan_start_with_output_authorities(
                 self.real.as_ref().unwrap(),
                 frames,
                 recipe,
@@ -446,6 +546,7 @@ impl Backends {
                 output,
                 overrides,
                 project_directory,
+                Some(output_authorities),
                 event_tx,
             ),
             None => Err(EngineError::new(
@@ -540,6 +641,131 @@ fn validate_output_retention(
             ErrorCode::InvalidParams,
             format!("{label} enables a full capture package without keeping a master TIFF"),
         ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn destination_component_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn destination_component_is_reparse(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// A completed receipt can authorize later metadata writes only beneath the
+/// immutable project root. Refuse custom metadata-capable destinations before
+/// recipe persistence, backend dispatch, or scanner motion instead of
+/// completing a scan whose fresh receipt silently lacks write capabilities.
+/// Raw exports are not ExifTool targets and therefore remain independently
+/// configurable.
+fn validate_metadata_destinations_under_project(
+    project_root: &crate::render::ProjectOutputRootAuthority,
+    output: &domain::OutputRecipe,
+) -> Result<(), EngineError> {
+    // Both paths belong to the root handle captured before this preflight.
+    // Never canonicalize the mutable project pathname again here: doing so
+    // could validate an attacker-installed replacement rather than the root
+    // whose capability will authorize publication.
+    let root_absolute = project_root.requested_path();
+    let canonical_root = project_root.canonical_path();
+
+    let destinations = [
+        (
+            "archive",
+            output.archive.enabled,
+            output.archive.destination.as_str(),
+        ),
+        (
+            "positive",
+            output.positive.enabled,
+            output.positive.destination.as_str(),
+        ),
+        (
+            "preview",
+            output.preview.enabled,
+            output.preview.destination.as_str(),
+        ),
+    ];
+    for (role, enabled, value) in destinations {
+        if !enabled {
+            continue;
+        }
+        let destination = std::path::Path::new(value);
+        if !destination.is_absolute() {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                format!(
+                    "{role} destination must be an absolute folder beneath the active project"
+                ),
+            ));
+        }
+        let relative = destination
+            .strip_prefix(&root_absolute)
+            .or_else(|_| destination.strip_prefix(&canonical_root))
+            .map_err(|_| {
+                EngineError::new(
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "{role} destination is outside the active project's metadata-safe output root: {}",
+                        destination.display()
+                    ),
+                )
+            })?;
+        if relative.components().any(|component| {
+            !matches!(component, std::path::Component::Normal(_))
+        }) {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                format!("{role} destination contains an unsafe path component"),
+            ));
+        }
+
+        let mut current = canonical_root.to_path_buf();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                unreachable!("validated above")
+            };
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        || destination_component_is_reparse(&metadata) =>
+                {
+                    return Err(EngineError::new(
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "{role} destination traverses a linked or reparse-point component: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(EngineError::new(
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "{role} destination component is not a directory: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(EngineError::new(
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "cannot inspect {role} destination {}: {error}",
+                            current.display()
+                        ),
+                    ))
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -852,6 +1078,20 @@ fn handle_request(
             let mut params: protocol::ScanStartParams = parse_params(&request.params)?;
             crate::render::validate_user_output_recipe_paths(&params.output)?;
             params.processing = params.processing.effective();
+            // Capture the project namespace before any filesystem-based
+            // destination validation. This exact capability is retained
+            // through backend publication; later code must not canonicalize
+            // and bless whatever happens to occupy the project pathname.
+            let project_root_authority =
+                crate::render::acquire_project_output_root_authority(
+                    project_state.directory.as_deref(),
+                )?;
+            if let Some(project_root) = project_root_authority.as_ref() {
+                crate::render::normalize_output_recipe_project_aliases(
+                    project_root,
+                    &mut params.output,
+                )?;
+            }
             // Resolve per-frame overrides and enforce exclusion from the
             // engine's own project_state BEFORE anything else -- the
             // override map is never trusted from client-supplied override
@@ -910,9 +1150,31 @@ fn handle_request(
                     }
                 }
             }
-            for override_values in overrides.values() {
-                if let Some(output) = override_values.output.as_ref() {
+            for override_values in overrides.values_mut() {
+                if let Some(output) = override_values.output.as_mut() {
                     crate::render::validate_user_output_recipe_paths(output)?;
+                    if let Some(project_root) = project_root_authority.as_ref() {
+                        crate::render::normalize_output_recipe_project_aliases(
+                            project_root,
+                            output,
+                        )?;
+                    }
+                }
+            }
+            if let Some(project_root) = project_root_authority.as_ref() {
+                validate_metadata_destinations_under_project(project_root, &params.output)?;
+                for (frame_index, override_values) in &overrides {
+                    if let Some(output) = override_values.output.as_ref() {
+                        validate_metadata_destinations_under_project(project_root, output).map_err(
+                            |mut error| {
+                                error.message = format!(
+                                    "frame {frame_index} output override is not metadata-safe: {}",
+                                    error.message
+                                );
+                                error
+                            },
+                        )?;
+                    }
                 }
             }
             // Reject an all-off effective recipe before persistence,
@@ -947,10 +1209,19 @@ fn handle_request(
             // drifting further from it.
             if let Some(project) = project_state.active.as_mut() {
                 project.recipes = params.output.clone();
-                let directory = project_state.directory.as_ref().expect(
-                    "directory is always Some whenever active is Some — ProjectState::set sets both together",
+                let project_root = project_root_authority.as_ref().expect(
+                    "a project-root authority exists whenever project state is active",
                 );
-                match crate::manifest::persist_project_update(directory, project) {
+                // This verification is the pre-motion refusal boundary. The
+                // persistence API below also uses only the held handle, so a
+                // later namespace race can never redirect manifest bytes.
+                run_before_scan_recipe_persist_hook();
+                project_root.verify_namespace()?;
+                match crate::manifest::persist_project_update_at(
+                    project_root.directory_handle(),
+                    project_root.canonical_path(),
+                    project,
+                ) {
                     Ok(merged) => project_state.active = Some(merged),
                     Err(err) => {
                         eprintln!("scanstudio-engine: failed to persist recipes to manifest: {err}")
@@ -1017,25 +1288,83 @@ fn handle_request(
             // per-frame names across every enabled output before any
             // preflight can permit hardware motion; manifests retain the
             // editable raw template persisted above.
+            if let Some(project_root) = project_root_authority.as_ref() {
+                project_root.verify_namespace()?;
+            }
             crate::render::reserve_auto_sequence_filenames(
+                project_root_authority.as_ref(),
                 &params.frames,
                 &params.recipe,
                 &params.processing,
                 &effective_output,
                 &mut overrides,
             )?;
-            // Reject the complete batch's physical target graph before the
-            // backend receives a job: all slots, enabled derivatives, and
-            // possible bridge IR/meter sidecars participate in one
-            // collision set. No simulator write, bridge request, progress
-            // event, or hardware motion can precede this check.
-            crate::render::validate_batch_output_paths(
+            if let Some(project_root) = project_root_authority.as_ref() {
+                project_root.verify_namespace()?;
+            }
+            // Real hardware captures one batch-wide channel recipe. Capture
+            // overrides remain project provenance there, but do not alter
+            // which bridge artifacts will exist. Keep processing/output
+            // overrides while acquiring exactly the destinations the active
+            // backend can actually publish.
+            let mut authority_overrides = overrides.clone();
+            let authority_recipe = match backends.active {
+                Some(ActiveDevice::Real) => {
+                    // The real bridge receives one batch-wide capture recipe;
+                    // per-frame capture overrides are provenance only.
+                    for values in authority_overrides.values_mut() {
+                        values.capture = None;
+                    }
+                    params
+                        .recipe
+                        .effective_for_process(params.processing.film_process)
+                }
+                Some(ActiveDevice::Sim) => {
+                    // Simulator capture overrides are effective per frame.
+                    // Normalize each one before the authority graph decides
+                    // whether an IR sidecar will be published.
+                    for values in authority_overrides.values_mut() {
+                        let film_process = values
+                            .processing
+                            .as_ref()
+                            .unwrap_or(&params.processing)
+                            .effective()
+                            .film_process;
+                        if let Some(capture) = values.capture.as_mut() {
+                            *capture = capture.effective_for_process(film_process);
+                        }
+                    }
+                    params
+                        .recipe
+                        .effective_for_process(params.processing.film_process)
+                }
+                None => {
+                    return Err(EngineError::new(
+                        ErrorCode::NotConnected,
+                        "scanner is not connected",
+                    ))
+                }
+            };
+            // Acquire and retain the project/output capability before the
+            // pathname preflight below. The same held handles move into the
+            // backend worker, so replacing the project root after this point
+            // can only cause a typed refusal; it can never redirect a write.
+            let output_authorities =
+                crate::render::acquire_job_output_authorities_with_project_root(
+                project_root_authority.as_ref(),
                 &params.frames,
-                &params.recipe,
-                &params.processing,
+                &authority_recipe,
                 &effective_output,
-                &overrides,
+                &authority_overrides,
             )?;
+            // The held graph acquisition above performs the decisive
+            // physical dir-identity+leaf collision check and exact
+            // handle-relative create-only vacancy check. Do not follow it
+            // with the legacy pathname validator: re-resolving display paths
+            // here would reintroduce a post-authority namespace race.
+            if let Some(project_root) = project_root_authority.as_ref() {
+                project_root.verify_namespace()?;
+            }
             let job_id = backends.scan_start(
                 params.frames,
                 params.recipe,
@@ -1043,6 +1372,7 @@ fn handle_request(
                 effective_output,
                 overrides,
                 project_state.directory.clone(),
+                output_authorities,
                 tx.clone(),
             )?;
             to_json(&protocol::ScanStartResult { job_id })
@@ -1079,7 +1409,11 @@ fn handle_request(
                 params.film_process,
                 params.directory.as_deref().map(std::path::Path::new),
             )?;
-            project_state.set(project.clone(), directory.clone());
+            let project = project_state.set(project, directory)?;
+            let directory = project_state
+                .directory
+                .as_ref()
+                .expect("set stores a canonical project directory");
             to_json(&protocol::ProjectCreateResult {
                 project,
                 directory: directory.display().to_string(),
@@ -1097,10 +1431,19 @@ fn handle_request(
                     validate_derivative_transform(alignment.derivative_transform)?;
                 }
             }
-            project_state.set(project.clone(), std::path::PathBuf::from(&params.directory));
+            let project = project_state.set(
+                project,
+                std::path::PathBuf::from(&params.directory),
+            )?;
+            let directory = project_state
+                .directory
+                .as_ref()
+                .expect("set stores a canonical project directory")
+                .display()
+                .to_string();
             to_json(&protocol::ProjectOpenResult {
                 project,
-                directory: params.directory,
+                directory,
             })
         }
         "project.list" => {
@@ -1230,14 +1573,40 @@ fn handle_request(
                         ),
                     )
                 })?;
+            // Recipe authority stays inside the project boundary. Prefer a
+            // current per-frame override, then the latest receipt's actual
+            // capture settings, and use deterministic project-material
+            // defaults only for an as-yet unscanned frame. The renderer is
+            // deliberately not allowed to nominate analysis settings.
+            let latest_receipt = frame.receipts.last();
+            let receipt_capture = latest_receipt.map(|receipt| domain::CaptureRecipe {
+                resolution_dpi: receipt.resolution_dpi,
+                bit_depth: receipt.bit_depth,
+                multisample_passes: receipt.passes,
+                channels: match receipt.channels.as_str() {
+                    "rgb" => domain::Channels::Rgb,
+                    "rgbi" => domain::Channels::Rgbi,
+                    _ => domain::CaptureRecipe::default().channels,
+                },
+            });
+            let mut effective_processing = frame
+                .processing_override
+                .clone()
+                .or_else(|| latest_receipt.and_then(|receipt| receipt.processing.clone()))
+                .unwrap_or_else(|| domain::ProcessingRecipe {
+                    film_process: project.film_process,
+                    ..domain::ProcessingRecipe::default()
+                });
+            // The project's material is authoritative even for a legacy
+            // receipt carrying a stale/missing processing recipe.
+            effective_processing.film_process = project.film_process;
+            effective_processing = effective_processing.effective();
             let effective_capture = frame
                 .capture_override
                 .clone()
-                .unwrap_or_else(|| params.capture.clone());
-            let effective_processing = frame
-                .processing_override
-                .clone()
-                .unwrap_or_else(|| params.processing.clone());
+                .or(receipt_capture)
+                .unwrap_or_default()
+                .effective_for_process(effective_processing.film_process);
 
             // `simulated` and `digital_ice_enabled` are deliberately
             // independent, orthogonal signals. A real-capture-backed frame
@@ -1306,12 +1675,15 @@ fn handle_request(
             } else {
                 None
             };
+            let digital_ice_enabled = effective_processing.digital_ice_enabled;
 
             to_json(&protocol::AnalyzeFrameDefectsResult {
                 frame_index: params.frame_index,
+                capture: effective_capture,
+                processing: effective_processing,
                 defects,
                 simulated,
-                digital_ice_enabled: effective_processing.digital_ice_enabled,
+                digital_ice_enabled,
                 transport_smear_flagged,
                 transport_smear_reason,
             })
@@ -1320,35 +1692,20 @@ fn handle_request(
         "project.previewMetadataCommand" => {
             let params: protocol::PreviewMetadataCommandParams = parse_params(&request.params)?;
             project_state.refresh_from_disk()?;
+            let output_root = project_state.directory.clone().ok_or_else(|| {
+                EngineError::new(
+                    ErrorCode::ProjectNotFound,
+                    "the active project has no immutable output root",
+                )
+            })?;
             let project = project_state.active.as_ref().ok_or_else(|| {
                 EngineError::new(ErrorCode::ProjectNotFound, "no project is currently open")
             })?;
-            let frame = project
-                .frames
-                .iter()
-                .find(|f| f.index == params.frame_index)
-                .ok_or_else(|| {
-                    EngineError::new(
-                        ErrorCode::InvalidParams,
-                        format!(
-                            "frame index {} does not exist in this project",
-                            params.frame_index
-                        ),
-                    )
-                })?;
 
             let metadata =
                 crate::exiftool::resolve_effective_metadata(project, params.frame_index)?;
-            let targets = crate::exiftool::resolve_targets(project, params.frame_index)?;
-            let archive_path = frame
-                .receipts
-                .last()
-                .and_then(|r| r.outputs.as_ref())
-                .and_then(|o| o.archive_path.as_ref())
-                .map(std::path::PathBuf::from);
-            if let Some(archive_path) = &archive_path {
-                crate::exiftool::assert_no_archive_target(&targets, archive_path)?;
-            }
+            let targets =
+                crate::exiftool::resolve_targets(project, params.frame_index, &output_root)?;
 
             let mut arguments = crate::exiftool::build_exiftool_arguments(&metadata);
             let target_strings: Vec<String> =
@@ -1361,33 +1718,40 @@ fn handle_request(
                 arguments.extend(target_strings.iter().cloned());
                 detection.available
             };
+            let fingerprint =
+                crate::exiftool::metadata_approval_fingerprint(&arguments, &detection);
 
             to_json(&protocol::PreviewMetadataCommandResult {
                 available,
                 exiftool_path: detection.path,
                 targets: target_strings,
                 arguments,
+                fingerprint,
             })
         }
         "project.applyMetadata" => {
             let params: protocol::ApplyMetadataParams = parse_params(&request.params)?;
             project_state.refresh_from_disk()?;
+            let output_root = project_state.directory.clone().ok_or_else(|| {
+                EngineError::new(
+                    ErrorCode::ProjectNotFound,
+                    "the active project has no immutable output root",
+                )
+            })?;
             let project = project_state.active.as_ref().ok_or_else(|| {
                 EngineError::new(ErrorCode::ProjectNotFound, "no project is currently open")
             })?;
-            let frame = project
-                .frames
-                .iter()
-                .find(|f| f.index == params.frame_index)
-                .ok_or_else(|| {
-                    EngineError::new(
-                        ErrorCode::InvalidParams,
-                        format!(
-                            "frame index {} does not exist in this project",
-                            params.frame_index
-                        ),
-                    )
-                })?;
+            // The dispatcher is sequential, so after this pure in-process
+            // check no new scan can start until Apply returns. Never issue a
+            // real `device.status` here: its timeout path could restart the
+            // bridge while a worker is mid-USB transaction.
+            if backends.active_job_id_snapshot().is_some() {
+                return Err(EngineError::new(
+                    ErrorCode::ScannerBusy,
+                    "metadata cannot be applied while a scan is active",
+                )
+                .with_recoverable(true));
+            }
 
             // Never trust a client-supplied argument array (04-02's own
             // "override map built from project_state alone" precedent) —
@@ -1395,16 +1759,8 @@ fn handle_request(
             // the active project's own resolved metadata and receipts.
             let metadata =
                 crate::exiftool::resolve_effective_metadata(project, params.frame_index)?;
-            let targets = crate::exiftool::resolve_targets(project, params.frame_index)?;
-            let archive_path = frame
-                .receipts
-                .last()
-                .and_then(|r| r.outputs.as_ref())
-                .and_then(|o| o.archive_path.as_ref())
-                .map(std::path::PathBuf::from);
-            if let Some(archive_path) = &archive_path {
-                crate::exiftool::assert_no_archive_target(&targets, archive_path)?;
-            }
+            let targets =
+                crate::exiftool::resolve_targets(project, params.frame_index, &output_root)?;
 
             if targets.is_empty() {
                 return Err(EngineError::new(
@@ -1418,8 +1774,27 @@ fn handle_request(
 
             let target_strings: Vec<String> =
                 targets.iter().map(|t| t.display().to_string()).collect();
-            let mut arguments = crate::exiftool::build_exiftool_arguments(&metadata);
-            if arguments.is_empty() {
+            let metadata_arguments = crate::exiftool::build_exiftool_arguments(&metadata);
+            let metadata_is_empty = metadata_arguments.is_empty();
+            // This is the logical, operator-reviewed command. Execution uses
+            // engine-private staged copies and never hands these authoritative
+            // project paths to ExifTool, but the approval token remains bound
+            // to the exact arguments and targets displayed in Preview.
+            let mut arguments = metadata_arguments.clone();
+            if !metadata_is_empty {
+                arguments.push("-overwrite_original".to_string());
+                arguments.extend(target_strings.iter().cloned());
+            }
+            let detection = crate::exiftool::detect_exiftool();
+            let fingerprint =
+                crate::exiftool::metadata_approval_fingerprint(&arguments, &detection);
+            if fingerprint != params.preview_fingerprint {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "metadata or output targets changed after preview — preview the command again before applying",
+                ));
+            }
+            if metadata_is_empty {
                 return to_json(&protocol::ApplyMetadataResult {
                     success: true,
                     exit_code: 0,
@@ -1427,10 +1802,11 @@ fn handle_request(
                         .to_string(),
                     stderr: String::new(),
                     targets: target_strings,
+                    arguments,
+                    fingerprint,
                 });
             }
 
-            let detection = crate::exiftool::detect_exiftool();
             if !detection.available {
                 return Err(EngineError::new(
                     ErrorCode::InvalidParams,
@@ -1438,21 +1814,43 @@ fn handle_request(
                 ));
             }
 
-            arguments.push("-overwrite_original".to_string());
-            arguments.extend(target_strings.iter().cloned());
-
-            let exiftool_path = detection
-                .path
-                .expect("detection.available implies a resolved path");
-            let output = std::process::Command::new(&exiftool_path)
-                .args(&arguments)
-                .output()
-                .map_err(|err| {
+            let expected_receipt = project
+                .frames
+                .iter()
+                .find(|frame| frame.index == params.frame_index)
+                .and_then(|frame| frame.receipts.last())
+                .cloned()
+                .ok_or_else(|| {
                     EngineError::new(
-                        ErrorCode::Internal,
-                        format!("failed to spawn exiftool: {err}"),
+                        ErrorCode::InvalidParams,
+                        format!("frame {} has no scan receipt", params.frame_index),
                     )
                 })?;
+            let execution = crate::exiftool::execute_and_persist_metadata_transaction(
+                &detection,
+                &metadata_arguments,
+                &output_root,
+                params.frame_index,
+                &expected_receipt,
+            )?;
+            let output = execution.output;
+
+            if output.status.success() {
+                if execution.bindings.is_none() {
+                    return Err(EngineError::new(
+                        ErrorCode::Internal,
+                        "ExifTool succeeded without returning published file identities",
+                    )
+                    .with_recoverable(true));
+                }
+                project_state.active = Some(execution.project.ok_or_else(|| {
+                    EngineError::new(
+                        ErrorCode::Internal,
+                        "ExifTool succeeded without durably committed receipt authority",
+                    )
+                    .with_recoverable(true)
+                })?);
+            }
 
             to_json(&protocol::ApplyMetadataResult {
                 success: output.status.success(),
@@ -1460,6 +1858,8 @@ fn handle_request(
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                 targets: target_strings,
+                arguments,
+                fingerprint,
             })
         }
         other => Err(EngineError::new(
@@ -2547,6 +2947,102 @@ mod tests {
     }
 
     #[test]
+    fn analyze_frame_defects_uses_project_material_and_frame_recipe_overrides() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let directory = temp_test_dir("analyze-frame-defects-effective-recipe");
+
+        let create = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "B&W effective recipe",
+                "carrier": "mounted",
+                "frameCount": 1,
+                "filmProcess": "bwNegative",
+                "directory": directory.display().to_string(),
+            }),
+        };
+        handle_request(&mut backends, &tx, &create, &mut project_state)
+            .expect("project.create");
+
+        let capture_override = Request {
+            id: 2,
+            method: "project.setFrameCaptureOverride".into(),
+            params: serde_json::json!({
+                "frameIndex": 1,
+                "capture": {
+                    "resolutionDpi": 2400,
+                    "bitDepth": 8,
+                    "multisamplePasses": 4,
+                    "channels": "rgbi"
+                }
+            }),
+        };
+        handle_request(
+            &mut backends,
+            &tx,
+            &capture_override,
+            &mut project_state,
+        )
+        .expect("capture override");
+
+        let processing_override = Request {
+            id: 3,
+            method: "project.setFrameProcessingOverride".into(),
+            params: serde_json::json!({
+                "frameIndex": 1,
+                "processing": {
+                    "filmProcess": "bwNegative",
+                    "autofocusEachFrame": false,
+                    "autoExposureEachFrame": false,
+                    "digitalIceEnabled": true,
+                    "digitalIceMode": "hybrid",
+                    "softwareDustRemovalBw": true
+                }
+            }),
+        };
+        handle_request(
+            &mut backends,
+            &tx,
+            &processing_override,
+            &mut project_state,
+        )
+        .expect("processing override");
+
+        let analyze = Request {
+            id: 4,
+            method: "project.analyzeFrameDefects".into(),
+            // Legacy/untrusted client recipe fields are ignored. Project
+            // state and overrides remain the sole recipe authority.
+            params: serde_json::json!({
+                "frameIndex": 1,
+                "capture": { "resolutionDpi": 4000, "channels": "rgbi" },
+                "processing": { "filmProcess": "positive", "digitalIceEnabled": true }
+            }),
+        };
+        let result = handle_request(&mut backends, &tx, &analyze, &mut project_state)
+            .expect("project.analyzeFrameDefects");
+
+        assert_eq!(result["capture"]["resolutionDpi"], 2400);
+        assert_eq!(result["capture"]["bitDepth"], 8);
+        assert_eq!(result["capture"]["multisamplePasses"], 4);
+        assert_eq!(result["capture"]["channels"], "rgb");
+        assert_eq!(result["processing"]["filmProcess"], "bwNegative");
+        assert_eq!(result["processing"]["digitalIceEnabled"], false);
+        assert_eq!(result["processing"]["softwareDustRemovalBw"], true);
+        assert_eq!(result["digitalIceEnabled"], false);
+        assert!(result["defects"].as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn analyze_frame_defects_rejects_an_out_of_range_frame_index() {
         let mut backends = Backends {
             sim: Arc::new(SimulatedLs5000::new()),
@@ -3449,7 +3945,12 @@ mod tests {
         handle_request(&mut backends, &tx, &create_request, &mut project_state)
             .expect("project.create");
 
-        let (output_recipe, _output_dir) = isolated_output_recipe("scan-start-receipt-loss");
+        let output_recipe = project_state
+            .active
+            .as_ref()
+            .expect("project is active")
+            .recipes
+            .clone();
         let scan_start_request = |id: u64, frame_index: u32| Request {
             id,
             method: "scan.start".into(),
@@ -3575,23 +4076,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Isolated per-test output destination (mirrors `sim.rs`'s own private
-    /// `isolated_output_recipe` test helper) so a real `scan.start` in this
-    /// file's tests never collides with another test's archive write —
-    /// `ArchiveRecipe` writes are create-only (`ARCHIVE_COLLISION` on a
-    /// naming/destination collision).
-    fn isolated_output_recipe(label: &str) -> (domain::OutputRecipe, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "scanstudio-server-test-{label}-{}",
-            crate::manifest::generate_project_id()
-        ));
-        let mut recipe = domain::OutputRecipe::default();
-        recipe.archive.destination = dir.join("Archive").display().to_string();
-        recipe.positive.destination = dir.join("Positive").display().to_string();
-        recipe.preview.destination = dir.join("Preview").display().to_string();
-        (recipe, dir)
-    }
-
     #[test]
     fn scan_start_rejects_all_outputs_off_before_backend_dispatch() {
         let mut backends = Backends {
@@ -3622,6 +4106,237 @@ mod tests {
     }
 
     #[test]
+    fn scan_start_rejects_external_metadata_destinations_before_recipe_persistence() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let project_directory = temp_test_dir("metadata-root-preflight-project");
+        let external_directory = temp_test_dir("metadata-root-preflight-external");
+        let create_request = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Metadata Root Preflight",
+                "carrier": "strip6",
+                "frameCount": 1,
+                "filmProcess": "positive",
+                "directory": project_directory.display().to_string(),
+            }),
+        };
+        handle_request(&mut backends, &tx, &create_request, &mut project_state)
+            .expect("project.create");
+        let active_recipe = project_state
+            .active
+            .as_ref()
+            .expect("project is active")
+            .recipes
+            .clone();
+        // `ProjectState::set` intentionally normalizes the active recipe to
+        // the physical project root. Snapshot the durable recipe separately:
+        // this assertion is about proving the rejected scan did not persist
+        // anything, not about lexical `/var` versus `/private/var` aliases.
+        let original_durable_recipe = crate::manifest::read_manifest(&project_directory)
+            .expect("manifest is readable before scan preflight")
+            .recipes;
+        let mut external = active_recipe;
+        external.archive.destination = external_directory.display().to_string();
+        external.positive.enabled = false;
+        external.preview.enabled = false;
+        let request = Request {
+            id: 2,
+            method: "scan.start".into(),
+            params: serde_json::json!({
+                "frames": [1],
+                "recipe": { "resolutionDpi": 200 },
+                "output": external,
+            }),
+        };
+        let error = handle_request(&mut backends, &tx, &request, &mut project_state)
+            .expect_err("external metadata destination must fail closed");
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("outside"), "{error}");
+        assert_eq!(
+            crate::manifest::read_manifest(&project_directory)
+                .expect("manifest remains readable")
+                .recipes,
+            original_durable_recipe,
+            "unsafe client recipe must not be persisted before refusal"
+        );
+
+        let _ = std::fs::remove_dir_all(&project_directory);
+        let _ = std::fs::remove_dir_all(&external_directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_destination_preflight_rejects_symlinked_components() {
+        let project_directory = temp_test_dir("metadata-root-symlink-project");
+        let external_directory = temp_test_dir("metadata-root-symlink-external");
+        std::fs::create_dir_all(&project_directory).expect("create project root");
+        std::fs::create_dir_all(&external_directory).expect("create external root");
+        std::os::unix::fs::symlink(
+            &external_directory,
+            project_directory.join("Linked Archive"),
+        )
+        .expect("create destination symlink");
+        let mut output = domain::OutputRecipe::default();
+        output.archive.destination = project_directory
+            .join("Linked Archive")
+            .display()
+            .to_string();
+        output.positive.enabled = false;
+        output.preview.enabled = false;
+        let project_root = crate::render::acquire_project_output_root_authority(Some(
+            &project_directory,
+        ))
+        .unwrap()
+        .unwrap();
+        let error = validate_metadata_destinations_under_project(&project_root, &output)
+            .expect_err("linked destination must fail closed");
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("linked"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&project_directory);
+        let _ = std::fs::remove_dir_all(&external_directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_start_root_swap_before_recipe_persistence_never_touches_replacement_manifest() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let project_directory = temp_test_dir("scan-root-swap-project");
+        let displaced = project_directory.with_extension("held-project");
+        let outside = temp_test_dir("scan-root-swap-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_manifest = outside.join("manifest.json");
+        std::fs::write(&outside_manifest, b"outside sentinel manifest").unwrap();
+
+        let create_request = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Root Swap Test",
+                "carrier": "mounted",
+                "frameCount": 1,
+                "filmProcess": "positive",
+                "directory": project_directory.display().to_string(),
+            }),
+        };
+        handle_request(&mut backends, &tx, &create_request, &mut project_state)
+            .expect("project.create");
+        let held_manifest_before = std::fs::read(project_directory.join("manifest.json")).unwrap();
+        let output = project_state.active.as_ref().unwrap().recipes.clone();
+
+        let hook_project = project_directory.clone();
+        let hook_displaced = displaced.clone();
+        let hook_outside = outside.clone();
+        set_before_scan_recipe_persist_hook(move || {
+            std::fs::rename(&hook_project, &hook_displaced).unwrap();
+            std::os::unix::fs::symlink(&hook_outside, &hook_project).unwrap();
+        });
+        let scan_request = Request {
+            id: 2,
+            method: "scan.start".into(),
+            params: serde_json::json!({
+                "frames": [1],
+                "recipe": { "resolutionDpi": 200 },
+                "processing": {},
+                "output": output,
+            }),
+        };
+        let error = handle_request(&mut backends, &tx, &scan_request, &mut project_state)
+            .expect_err("replaced project namespace must be refused before backend dispatch");
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.message.contains("project-root"), "{error}");
+        assert_eq!(
+            std::fs::read(&outside_manifest).unwrap(),
+            b"outside sentinel manifest"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("manifest.json")).unwrap(),
+            held_manifest_before,
+            "the pre-persistence refusal must leave the held manifest unchanged"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            1,
+            "no lock, temp, or manifest entry may be created in the replacement"
+        );
+
+        let _ = std::fs::remove_file(&project_directory);
+        let _ = std::fs::remove_dir_all(&displaced);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_project_through_alias_normalizes_future_writes_to_physical_root() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let physical_parent = temp_test_dir("canonical-project-physical-parent");
+        let physical = physical_parent.join("project");
+        let alias_parent = temp_test_dir("canonical-project-alias-parent");
+        let alias = alias_parent.join("project");
+        let outside_parent = temp_test_dir("canonical-project-outside-parent");
+        let outside = outside_parent.join("project");
+        let (_project, _) = crate::manifest::create_project(
+            "Canonical Project",
+            domain::MediaCarrier::Mounted,
+            1,
+            domain::FilmProcess::Positive,
+            Some(&physical),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside unchanged").unwrap();
+        std::os::unix::fs::symlink(&physical_parent, &alias_parent).unwrap();
+
+        let open = Request {
+            id: 1,
+            method: "project.open".into(),
+            params: serde_json::json!({ "directory": alias.display().to_string() }),
+        };
+        handle_request(&mut backends, &tx, &open, &mut project_state).unwrap();
+        assert_eq!(
+            project_state.directory.as_deref(),
+            Some(std::fs::canonicalize(&physical).unwrap().as_path())
+        );
+
+        std::fs::remove_file(&alias_parent).unwrap();
+        std::os::unix::fs::symlink(&outside_parent, &alias_parent).unwrap();
+        let update = Request {
+            id: 2,
+            method: "project.setRollMetadata".into(),
+            params: serde_json::json!({ "metadata": { "camera": "Nikon F3" } }),
+        };
+        handle_request(&mut backends, &tx, &update, &mut project_state)
+            .expect("canonical active root remains authoritative");
+        let persisted = crate::manifest::read_manifest(&physical).unwrap();
+        assert_eq!(persisted.roll_metadata.camera.as_deref(), Some("Nikon F3"));
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside unchanged");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+
+        let _ = std::fs::remove_file(&alias_parent);
+        let _ = std::fs::remove_dir_all(&physical_parent);
+        let _ = std::fs::remove_dir_all(&outside_parent);
+    }
+
+    #[test]
     fn scan_start_rejects_an_all_off_effective_per_frame_override_before_backend_dispatch() {
         let mut backends = Backends {
             sim: Arc::new(SimulatedLs5000::new()),
@@ -3639,7 +4354,9 @@ mod tests {
         )
         .expect("create test project");
         let mut project_state = ProjectState::default();
-        project_state.set(project, project_directory);
+        project_state
+            .set(project, project_directory)
+            .expect("set active project");
         let mut all_off = domain::OutputRecipe::default();
         all_off.archive.enabled = false;
         all_off.archive.full_capture_package = false;
@@ -3651,6 +4368,12 @@ mod tests {
             .expect("project active")
             .frames[0]
             .output_override = Some(all_off);
+        let project_local_output = project_state
+            .active
+            .as_ref()
+            .expect("project active")
+            .recipes
+            .clone();
 
         let request = Request {
             id: 1,
@@ -3658,7 +4381,7 @@ mod tests {
             params: serde_json::json!({
                 "frames": [1],
                 "recipe": {"resolutionDpi": 200},
-                "output": domain::OutputRecipe::default(),
+                "output": project_local_output,
             }),
         };
         let error = handle_request(&mut backends, &tx, &request, &mut project_state).expect_err(
@@ -3756,7 +4479,12 @@ mod tests {
         // timers, never the real disk I/O/image-encoding cost of writing
         // full-resolution derivatives, and this test only needs the
         // archive path (always written) to exist.
-        let (mut output_recipe, output_dir) = isolated_output_recipe("preview-metadata-command");
+        let mut output_recipe = project_state
+            .active
+            .as_ref()
+            .expect("project is active")
+            .recipes
+            .clone();
         output_recipe.positive.enabled = false;
         output_recipe.preview.enabled = false;
         let scan_request = Request {
@@ -3825,10 +4553,56 @@ mod tests {
         assert_eq!(preview_result["available"], true);
         assert_eq!(preview_result["arguments"], serde_json::json!([]));
 
-        let apply_request = Request {
+        // Mutating metadata after preview must invalidate that approval
+        // fingerprint before any ExifTool detection/execution is attempted.
+        let set_metadata = Request {
             id: 6,
+            method: "project.setRollMetadata".into(),
+            params: serde_json::json!({
+                "metadata": { "camera": "Nikon F6", "keywords": [] }
+            }),
+        };
+        handle_request(&mut backends, &tx, &set_metadata, &mut project_state)
+            .expect("set metadata after preview");
+        let stale_apply = Request {
+            id: 7,
             method: "project.applyMetadata".into(),
-            params: serde_json::json!({ "frameIndex": 1 }),
+            params: serde_json::json!({
+                "frameIndex": 1,
+                "previewFingerprint": preview_result["fingerprint"].clone()
+            }),
+        };
+        let stale_error =
+            handle_request(&mut backends, &tx, &stale_apply, &mut project_state).unwrap_err();
+        assert_eq!(stale_error.code, ErrorCode::InvalidParams);
+        assert!(stale_error.message.contains("changed after preview"));
+
+        let clear_metadata = Request {
+            id: 8,
+            method: "project.setRollMetadata".into(),
+            params: serde_json::json!({ "metadata": { "keywords": [] } }),
+        };
+        handle_request(&mut backends, &tx, &clear_metadata, &mut project_state)
+            .expect("restore empty metadata");
+        let fresh_preview = handle_request(
+            &mut backends,
+            &tx,
+            &Request {
+                id: 9,
+                method: "project.previewMetadataCommand".into(),
+                params: serde_json::json!({ "frameIndex": 1 }),
+            },
+            &mut project_state,
+        )
+        .expect("fresh metadata preview");
+
+        let apply_request = Request {
+            id: 10,
+            method: "project.applyMetadata".into(),
+            params: serde_json::json!({
+                "frameIndex": 1,
+                "previewFingerprint": fresh_preview["fingerprint"].clone()
+            }),
         };
         let apply_result = handle_request(&mut backends, &tx, &apply_request, &mut project_state)
             .expect("project.applyMetadata immediately after scan");
@@ -3837,9 +4611,10 @@ mod tests {
         assert!(apply_result["stdout"]
             .as_str()
             .is_some_and(|text| text.contains("left unchanged")));
+        assert_eq!(apply_result["fingerprint"], fresh_preview["fingerprint"]);
+        assert_eq!(apply_result["arguments"], fresh_preview["arguments"]);
 
         let _ = std::fs::remove_dir_all(&directory);
-        let _ = std::fs::remove_dir_all(&output_dir);
     }
 
     #[test]
@@ -3873,7 +4648,7 @@ mod tests {
         let apply_request = Request {
             id: 2,
             method: "project.applyMetadata".into(),
-            params: serde_json::json!({ "frameIndex": 1 }),
+            params: serde_json::json!({ "frameIndex": 1, "previewFingerprint": "unused" }),
         };
         let err =
             handle_request(&mut backends, &tx, &apply_request, &mut project_state).unwrap_err();

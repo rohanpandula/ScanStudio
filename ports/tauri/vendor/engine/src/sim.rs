@@ -371,6 +371,14 @@ impl SimulatedLs5000 {
         self.device.clone()
     }
 
+    /// Pure in-process activity snapshot used by metadata publication. It
+    /// must never issue a device/status request merely to decide whether a
+    /// background scan worker can still append a receipt.
+    pub fn active_job_id_snapshot(&self) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        status_snapshot(&state).active_job_id
+    }
+
     /// Marks the job's currently-active frame to be abandoned rather than
     /// completed, without stopping the rest of the batch — unlike
     /// `scan_stop`, the job continues to its next frame once the active
@@ -822,7 +830,7 @@ impl ScannerBackend for SimulatedLs5000 {
         Ok(accepted_frames)
     }
 
-    fn scan_start(
+    fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
         recipe: CaptureRecipe,
@@ -830,9 +838,10 @@ impl ScannerBackend for SimulatedLs5000 {
         output: OutputRecipe,
         overrides: std::collections::HashMap<u32, FrameOverrides>,
         project_directory: Option<std::path::PathBuf>,
+        output_authorities: Option<crate::render::JobOutputAuthorities>,
         event_tx: mpsc::Sender<String>,
     ) -> Result<String, EngineError> {
-        let (job_id, time_scale, fault_injection) = {
+        let (job_id, time_scale, fault_injection, output_authorities) = {
             let mut state = backend.state.lock().unwrap();
             if !state.connected {
                 return Err(EngineError::new(
@@ -892,6 +901,22 @@ impl ScannerBackend for SimulatedLs5000 {
                 ));
             }
 
+            // Acquire and retain the actual destination-directory
+            // capabilities before this job becomes active. Path validation
+            // performed by server.rs is intentionally not publication
+            // authority: every later archive/positive/preview write is
+            // relative to these held, no-follow handles.
+            let output_authorities = match output_authorities {
+                Some(authorities) => authorities,
+                None => crate::render::acquire_job_output_authorities(
+                    project_directory.as_deref(),
+                    &frames,
+                    &recipe,
+                    &output,
+                    &overrides,
+                )?,
+            };
+
             state.job_seq += 1;
             let job_id = format!("job-{}", state.job_seq);
             state.job_slot = Some(JobRecord {
@@ -906,7 +931,12 @@ impl ScannerBackend for SimulatedLs5000 {
                     .collect(),
             });
             state.transport = Transport::Busy;
-            (job_id, state.time_scale, state.fault_injection.clone())
+            (
+                job_id,
+                state.time_scale,
+                state.fault_injection.clone(),
+                output_authorities,
+            )
         };
 
         let backend_for_thread = Arc::clone(backend);
@@ -920,7 +950,7 @@ impl ScannerBackend for SimulatedLs5000 {
                 processing,
                 output,
                 overrides,
-                project_directory,
+                output_authorities,
                 time_scale,
                 fault_injection,
                 event_tx,
@@ -1120,10 +1150,21 @@ fn build_receipt(
     output: &OutputRecipe,
     device_id: &str,
     written: &crate::render::WrittenPaths,
-) -> ScanReceipt {
+    project_root: Option<&crate::render::ProjectOutputRootAuthority>,
+) -> Result<ScanReceipt, crate::domain::EngineError> {
     let now = now_unix_secs();
     let started_at_secs = now - (duration_ms as i64 / 1000).max(0);
-    ScanReceipt {
+    let metadata_bindings = project_root
+        .map(|root| {
+            crate::exiftool::bind_metadata_output_publications_at(
+                root.directory_handle(),
+                root.requested_path(),
+                root.canonical_path(),
+                &written.metadata_publications,
+            )
+        })
+        .transpose()?;
+    Ok(ScanReceipt {
         exposure_authority: None,
         auto_crop: written.auto_crop.clone(),
         job_id: job_id.to_string(),
@@ -1161,6 +1202,7 @@ fn build_receipt(
                 .raw_negative_ir_path
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            metadata_bindings,
             derivative_transform: written.derivative_transform,
         }),
         // Bridge-only concepts — the simulator has no bridge subprocess to
@@ -1171,7 +1213,7 @@ fn build_receipt(
         meter_rgbi_path: None,
         hardware_telemetry: None,
         nikonlook: written.nikonlook.clone(),
-    }
+    })
 }
 
 enum AttemptOutcome {
@@ -1282,7 +1324,7 @@ fn run_scan_job(
     processing: ProcessingRecipe,
     output: OutputRecipe,
     overrides: HashMap<u32, FrameOverrides>,
-    project_directory: Option<std::path::PathBuf>,
+    output_authorities: crate::render::JobOutputAuthorities,
     time_scale: f64,
     fault_injection: FaultInjection,
     event_tx: mpsc::Sender<String>,
@@ -1531,7 +1573,7 @@ fn run_scan_job(
                     .get(&frame_index)
                     .and_then(|o| o.alignment.as_ref());
 
-                match crate::render::render_and_write_frame_with_processing(
+                match crate::render::render_and_write_frame_with_processing_authorized(
                     &device_id,
                     frame_index,
                     &effective_processing,
@@ -1543,21 +1585,53 @@ fn run_scan_job(
                     &effective_output,
                     Some(detected_boundary),
                     effective_alignment,
-                ) {
-                    Ok(written) => {
+                    match output_authorities.frame(frame_index) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            let _ = set_frame_state(
+                                &backend,
+                                &job_id,
+                                frame_index,
+                                FrameState::Failed,
+                            );
+                            emit(
+                                &event_tx,
+                                "scan.frameState",
+                                FrameStatePayload {
+                                    job_id: job_id.clone(),
+                                    frame_index,
+                                    state: FrameState::Failed,
+                                    attempt,
+                                    error: Some(ErrorPayload::from(&error)),
+                                },
+                            );
+                            summary.failed.push(frame_index);
+                            continue 'frames;
+                        }
+                    },
+                )
+                .and_then(|written| {
+                    // A receipt is successful only when every metadata-
+                    // capable publication still matches the held descriptor
+                    // produced by the writer.  Binding refusal follows this
+                    // same typed frame-failure path as an encode/publication
+                    // refusal and is never silently dropped.
+                    build_receipt(
+                        &job_id,
+                        frame_index,
+                        frame_total_ms,
+                        &effective_recipe,
+                        &effective_processing,
+                        &effective_output,
+                        &device_id,
+                        &written,
+                        output_authorities.project_root(),
+                    )
+                }) {
+                    Ok(receipt) => {
                         // Load-bearing honesty guarantee: the receipt must show
                         // what was ACTUALLY used for this frame, not the
                         // job-wide request.
-                        let receipt = build_receipt(
-                            &job_id,
-                            frame_index,
-                            frame_total_ms,
-                            &effective_recipe,
-                            &effective_processing,
-                            &effective_output,
-                            &device_id,
-                            &written,
-                        );
                         // A receipt persistence failure here does not mean
                         // the frame failed -- the master (and any
                         // derivatives) are already durably written to disk,
@@ -1575,9 +1649,10 @@ fn run_scan_job(
                         // BEFORE that emit rather than after: the event has
                         // to carry the outcome it describes, not a second
                         // event nobody asked for.
-                        let manifest_persist_error = match &project_directory {
-                            Some(directory) => crate::manifest::persist_frame_receipt(
-                                directory,
+                        let manifest_persist_error = match output_authorities.project_root() {
+                            Some(project_root) => crate::manifest::persist_frame_receipt_at(
+                                project_root.directory_handle(),
+                                project_root.canonical_path(),
                                 frame_index,
                                 &receipt,
                             )
@@ -1781,6 +1856,7 @@ mod tests {
             preview_path: None,
             raw_negative_path: Some(std::path::PathBuf::from("/tmp/negative.dng")),
             raw_negative_ir_path: Some(std::path::PathBuf::from("/tmp/negative-ir.tif")),
+            metadata_publications: crate::render::MetadataPublicationProofs::default(),
             nikonlook: Some(provenance.clone()),
             auto_crop: None,
             derivative_transform: crate::domain::DerivativeTransform::default(),
@@ -1795,7 +1871,9 @@ mod tests {
             &output,
             DEVICE_ID,
             &written,
-        );
+            None,
+        )
+        .unwrap();
         assert_eq!(receipt.nikonlook, Some(provenance));
         let outputs = receipt.outputs.as_ref().expect("simulated receipt has outputs");
         assert_eq!(outputs.raw_negative_path.as_deref(), Some("/tmp/negative.dng"));
@@ -1820,8 +1898,63 @@ mod tests {
             &output,
             DEVICE_ID,
             &written_none,
-        );
+            None,
+        )
+        .unwrap();
         assert_eq!(receipt_none.nikonlook, None);
+    }
+
+    #[test]
+    fn build_receipt_fails_closed_when_a_rendered_output_is_replaced() {
+        let (mut output, root) = isolated_output_recipe("binding-replacement");
+        output.archive.enabled = false;
+        output.preview.enabled = false;
+        output.raw_export.enabled = false;
+        output.positive.enabled = true;
+        output.positive.filename_template = "positive.tif".to_string();
+        output.positive.file_format = crate::domain::OutputFileFormat::Tiff;
+        let processing = ProcessingRecipe {
+            film_process: FilmProcess::Positive,
+            ..ProcessingRecipe::default()
+        };
+        let recipe = CaptureRecipe::default();
+        std::fs::create_dir_all(&root).unwrap();
+        let project_root = crate::render::acquire_project_output_root_authority(Some(&root))
+            .unwrap()
+            .unwrap();
+        let written = crate::render::render_and_write_frame_with_processing(
+            DEVICE_ID,
+            1,
+            &processing,
+            8,
+            6,
+            recipe.bit_depth,
+            recipe.resolution_dpi,
+            false,
+            &output,
+            None,
+            None,
+        )
+        .unwrap();
+        let positive = written.positive_path.as_ref().unwrap();
+        std::fs::rename(positive, root.join("engine-positive.tif")).unwrap();
+        std::fs::write(positive, b"unrelated replacement").unwrap();
+
+        let error = build_receipt(
+            "job-binding-replacement",
+            1,
+            1000,
+            &recipe,
+            &processing,
+            &output,
+            DEVICE_ID,
+            &written,
+            Some(&project_root),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        assert!(error.recoverable());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2409,7 +2542,10 @@ mod tests {
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Strip6).expect("load media");
 
-        let (mut output, output_dir) = isolated_output_recipe("resume-persistence");
+        let mut output = OutputRecipe::default();
+        output.archive.destination = project_dir.join("Archive").display().to_string();
+        output.positive.destination = project_dir.join("Positive").display().to_string();
+        output.preview.destination = project_dir.join("Preview").display().to_string();
         output.positive.enabled = false;
         output.preview.enabled = false;
 
@@ -2453,7 +2589,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&project_dir);
-        let _ = std::fs::remove_dir_all(&output_dir);
     }
 
     /// A master without provenance must not be silent (mirrors
@@ -2485,8 +2620,10 @@ mod tests {
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Mounted).expect("load media");
 
-        let (output, output_dir) =
-            isolated_output_recipe("persist-failure-surfaces-on-frame-state");
+        let mut output = OutputRecipe::default();
+        output.archive.destination = project_dir.join("Archive").display().to_string();
+        output.positive.destination = project_dir.join("Positive").display().to_string();
+        output.preview.destination = project_dir.join("Preview").display().to_string();
 
         let (tx, rx) = mpsc::channel();
         SimulatedLs5000::scan_start(
@@ -2548,7 +2685,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&project_dir);
-        let _ = std::fs::remove_dir_all(&output_dir);
     }
 
     // -- roll.previewStrip / roll.manualFrames sim parity (Rung 4) ---------

@@ -135,7 +135,7 @@ export default function ZoomPanViewer({
           >
             <img
               className={styles.previewImage}
-              src={`scanstudio-preview://localhost/?path=${encodeURIComponent(imagePath)}`}
+              src={`scanstudio-preview://localhost/?id=${encodeURIComponent(imagePath)}`}
               alt={alt ?? "Frame preview"}
               draggable={false}
               data-testid="zoom-pan-image"

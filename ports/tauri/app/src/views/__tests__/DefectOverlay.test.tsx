@@ -10,6 +10,15 @@ afterEach(cleanup);
 function result(overrides: Partial<AnalyzeFrameDefectsResult> = {}): AnalyzeFrameDefectsResult {
   return {
     frameIndex: 3,
+    capture: { resolutionDpi: 4000, bitDepth: 16, multisamplePasses: 1, channels: "rgbi" },
+    processing: {
+      filmProcess: "positive",
+      autofocusEachFrame: true,
+      autoExposureEachFrame: true,
+      digitalIceEnabled: true,
+      digitalIceMode: "legacy",
+      softwareDustRemovalBw: false,
+    },
     defects: [],
     simulated: true,
     digitalIceEnabled: true,

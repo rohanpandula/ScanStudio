@@ -239,6 +239,42 @@ printf '%s\n' '=== Installing scanstudio-bridge from shipped corresponding sourc
 "$python_bin" -I -c \
     'import coolscanpy, sane, scanstudio_bridge; print("bridge imports: OK")'
 
+# Execute the same fail-closed capture preflight under the exact installed
+# isolated interpreter/import path the worker uses.  Bind runtime metadata to
+# both the shipped pyproject and the package provenance before publishing the
+# wrapper or declaring installation complete.
+"$python_bin" -I -B - \
+    "$install_sources/coolscanpy/pyproject.toml" \
+    "$BUNDLE_DIR/provenance.json" <<'PYTHON'
+from importlib.metadata import version
+import json
+from pathlib import Path
+import sys
+import tomllib
+
+import coolscanpy
+from coolscanpy.protocol.ls5000_single_pass.bundle import (
+    CAPTURE_BUNDLE_SHA256,
+    verify_capture_bundle,
+)
+
+with Path(sys.argv[1]).open("rb") as handle:
+    project_version = tomllib.load(handle)["project"]["version"]
+provenance_version = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))[
+    "sources"
+]["coolscanpy"]["version"]
+if not (
+    coolscanpy.__version__
+    == version("coolscanpy")
+    == project_version
+    == provenance_version
+):
+    raise SystemExit("CoolscanPy runtime/package/provenance versions disagree")
+if verify_capture_bundle(require_python_sources=True) != CAPTURE_BUNDLE_SHA256:
+    raise SystemExit("CoolscanPy capture-bundle identity changed after installation")
+print("capture worker package preflight: OK")
+PYTHON
+
 # `wsl.exe -e scanstudio-bridge` does not run a login shell, so relying on
 # ~/.local/bin would be fragile. Install one tiny global wrapper whose target
 # remains the per-user, bundle-owned runtime. The wrapper never arms motion.

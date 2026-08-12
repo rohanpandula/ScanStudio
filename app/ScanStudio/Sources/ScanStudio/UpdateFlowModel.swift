@@ -233,22 +233,29 @@ final class UpdateFlowModel {
             let temporaryDirectory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ScanStudio Updates", isDirectory: true)
             let dmgURL = try await downloader.download(candidate, to: temporaryDirectory)
-            let appURL = try downloader.mountAndLocateApp(dmgURL)
-            try downloader.verifyCodeSignature(at: appURL)
-            let archive = UpdateArchive(
-                version: candidate.version,
-                sourceAppPath: appURL,
-                checksumSHA256: candidate.sha256
-            )
-            // Preflight the destination so an unwritable target resolves to a
-            // user-writable location (or a clear typed error) — never a
-            // misleading bare `.swapFailed`. The installer re-resolves the same
-            // destination internally, so the surfaced path matches the swap.
-            let destination = try installer.installDestination
-            pendingInstallDestination = destination.path
-            try installer.install(archive)
+            let architecture = HostArchitectureProvider.current()
+            let installedAppURL = try downloader.withVerifiedMountedApp(
+                dmgURL,
+                candidate: candidate,
+                architecture: architecture
+            ) { appURL in
+                let archive = UpdateArchive(
+                    version: candidate.version,
+                    sourceAppPath: appURL,
+                    checksumSHA256: candidate.sha256,
+                    architecture: architecture
+                )
+                // Preflight the destination so an unwritable target resolves to
+                // a user-writable location (or a clear typed error). Installer
+                // revalidates the mounted source, private staging copy, and
+                // installed destination before this scoped mount detaches.
+                let destination = try installer.installDestination
+                pendingInstallDestination = destination.path
+                try installer.install(archive)
+                return destination.appendingPathComponent("ScanStudio.app", isDirectory: true)
+            }
             installProgress = 1
-            pendingInstallURL = appURL
+            pendingInstallURL = installedAppURL
         } catch {
             installProgress = nil
             pendingInstallURL = nil
@@ -281,10 +288,30 @@ final class UpdateFlowModel {
             return "The update could not be downloaded. Check your connection and try again."
         case UpdateDownloadError.checksumMismatch:
             return "The downloaded update did not match its checksum and was discarded."
+        case UpdateDownloadError.checksumReadFailed:
+            return "The downloaded update could not be read completely and was discarded."
         case UpdateDownloadError.mountFailed:
             return "The update disk image could not be opened."
+        case UpdateDownloadError.detachFailed:
+            return "The update disk image could not be closed safely. Restart the Mac before trying again."
+        case UpdateDownloadError.publisherTrustNotConfigured:
+            return "Automatic updates are disabled until this app has an authorized Developer ID publisher."
         case UpdateDownloadError.signatureInvalid:
             return "The downloaded update failed its code-signature check."
+        case UpdateDownloadError.publisherUnauthorized:
+            return "The downloaded update was not signed by the authorized Scan Studio publisher."
+        case UpdateDownloadError.notarizationMissing:
+            return "The downloaded update was not securely timestamped and notarized."
+        case UpdateDownloadError.bundleIdentityMismatch:
+            return "The update did not contain the expected Scan Studio application."
+        case UpdateDownloadError.versionMismatch:
+            return "The update application version did not match the selected release."
+        case UpdateDownloadError.architectureMismatch:
+            return "The update was not built for this Mac's architecture."
+        case UpdateDownloadError.operatingSystemUnsupported:
+            return "The update is not compatible with this version of macOS."
+        case UpdateDownloadError.bundleReadFailed:
+            return "The update application could not be read completely."
         case UpdateDownloadError.invalidArchive:
             return "The update is not a supported disk image."
         case UpdateDownloadError.notAnApp:
@@ -316,7 +343,8 @@ final class UpdateFlowModel {
 /// Immutable, stateless way to carry the 01-04 `UpdateDownloader` across
 /// isolation boundaries without a `sending` diagnostic: the downloader is a
 /// public final class (so not implicitly `Sendable`) that holds only a
-/// `URLSessionProtocol`, and this box forwards its three methods unchanged.
+/// `URLSessionProtocol` plus immutable verification helpers, and this box
+/// forwards its methods unchanged.
 private struct UpdateDownloaderBox: @unchecked Sendable {
     let downloader: UpdateDownloader
 
@@ -324,11 +352,17 @@ private struct UpdateDownloaderBox: @unchecked Sendable {
         try await downloader.download(candidate, to: directory)
     }
 
-    func mountAndLocateApp(_ dmgURL: URL) throws -> URL {
-        try downloader.mountAndLocateApp(dmgURL)
-    }
-
-    func verifyCodeSignature(at appURL: URL) throws {
-        try downloader.verifyCodeSignature(at: appURL)
+    func withVerifiedMountedApp<T>(
+        _ dmgURL: URL,
+        candidate: UpdateCandidate,
+        architecture: HostArchitecture,
+        _ body: (URL) throws -> T
+    ) throws -> T {
+        try downloader.withVerifiedMountedApp(
+            dmgURL,
+            candidate: candidate,
+            architecture: architecture,
+            body
+        )
     }
 }

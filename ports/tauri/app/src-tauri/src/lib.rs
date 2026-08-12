@@ -106,6 +106,7 @@ fn telemetry_lines() -> Option<Vec<String>> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .manage(preview::PreviewAccess::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
@@ -116,7 +117,7 @@ pub fn run() {
             wsl_run_checks,
             wsl_max_read_report,
             wsl_write_mode_report,
-            diagnostics::write_diagnostic_bundle,
+            diagnostics::save_diagnostic_bundle,
             diagnostics::read_preview_raster
         ])
         .setup(|app| engine::setup(app))

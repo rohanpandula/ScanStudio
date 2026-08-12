@@ -84,6 +84,18 @@ base_dir="$workdir/isolated bridge base"
 output="$workdir/bridge.ndjson"
 bridge="$relocated_app/Contents/MacOS/scanstudio-bridge"
 engine="$relocated_app/Contents/MacOS/scanstudio-engine"
+runtime_python="$relocated_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"
+coolscanpy_pyproject="$relocated_app/Contents/Resources/CorrespondingSource/coolscanpy/pyproject.toml"
+coolscanpy_version="$(
+    "$runtime_python" -I -B - "$coolscanpy_pyproject" <<'PYTHON'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    print(tomllib.load(handle)["project"]["version"])
+PYTHON
+)"
+coolscanpy_version_regex="${coolscanpy_version//./\\.}"
 poison_root="$workdir/hostile Python cwd"
 poison_marker="$workdir/poison-imported"
 mkdir -p "$poison_root/scanstudio_bridge"
@@ -178,9 +190,9 @@ if [[ -e "$base_dir/hw-motion-armed" ]]; then
 fi
 telemetry_file="$(find "$base_dir/hw-telemetry" -type f -name '*.jsonl' -print -quit)"
 if [[ -z "$telemetry_file" ]] \
-    || ! grep -Eq '"version"[[:space:]]*:[[:space:]]*"0\.1\.3"' "$telemetry_file" \
+    || ! grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"$coolscanpy_version_regex\"" "$telemetry_file" \
     || ! grep -Eq '"head_sha"[[:space:]]*:[[:space:]]*null' "$telemetry_file"; then
-    print -u2 "packaged bridge check failed: provenance did not report sealed CoolscanPy 0.1.3 with no borrowed checkout SHA"
+    print -u2 "packaged bridge check failed: provenance did not report sealed CoolscanPy $coolscanpy_version with no borrowed checkout SHA"
     [[ -n "$telemetry_file" ]] && cat "$telemetry_file" >&2
     exit 1
 fi
@@ -196,7 +208,6 @@ fi
 # operation. This proves the worker sees only the bundled CoolscanPy source
 # and curated dependencies, not a developer environment, user PYTHONPATH, or
 # the hostile current directory above.
-runtime_python="$relocated_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"
 resolved_libusb="$(
     cd "$poison_root"
     env -i HOME="$workdir/worker-home" PATH="/usr/bin:/bin" \
@@ -224,6 +235,36 @@ if [[ "$worker_package" != "$expected_worker_package" ]]; then
     print -u2 "packaged bridge check failed: isolated worker did not import the bundled CoolscanPy source"
     print -u2 "expected: $expected_worker_package"
     print -u2 "actual:   $worker_package"
+    exit 1
+fi
+# Exercise the same fail-closed identity gate the source-based capture worker
+# runs before scanner access.  Bind runtime metadata and corresponding-source
+# pyproject to the same version while verifying every sealed source/resource
+# byte from the exact relocated package.
+if ! "$runtime_python" -I -B - "$coolscanpy_pyproject" <<'PYTHON'
+from importlib.metadata import version
+from pathlib import Path
+import sys
+import tomllib
+
+import coolscanpy
+from coolscanpy.protocol.ls5000_single_pass.bundle import (
+    CAPTURE_BUNDLE_SHA256,
+    verify_capture_bundle,
+)
+
+with Path(sys.argv[1]).open("rb") as handle:
+    project_version = tomllib.load(handle)["project"]["version"]
+metadata_version = version("coolscanpy")
+if coolscanpy.__version__ != project_version or metadata_version != project_version:
+    raise SystemExit(
+        "CoolscanPy runtime, dist-info, and corresponding-source versions disagree"
+    )
+if verify_capture_bundle(require_python_sources=True) != CAPTURE_BUNDLE_SHA256:
+    raise SystemExit("CoolscanPy capture-bundle identity changed")
+PYTHON
+then
+    print -u2 "packaged bridge check failed: CoolscanPy version or capture identity disagrees"
     exit 1
 fi
 # Use the exact bootstrap command shape with the real worker and --help.

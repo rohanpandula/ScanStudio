@@ -21,6 +21,8 @@ serde = { version = "1", features = ["derive"] }
 # A receipt is supposed to be an exact record.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
+getrandom = "0.4"
+libc = "0.2"
 # Direct dependencies already present in Cargo.lock through `image`. `tiff`
 # exposes derivative ICC/resolution tags; `moxcms` generates and validates a
 # ScanStudio-authored profile compatible with the Adobe RGB (1998) color space.

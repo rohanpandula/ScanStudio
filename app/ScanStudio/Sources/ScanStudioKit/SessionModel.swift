@@ -404,6 +404,27 @@ public final class SessionModel {
         let connectionEpoch: UInt64
     }
 
+    /// One-shot authority to apply exactly the command the user most
+    /// recently previewed. Keeping the displayed argument/target vectors
+    /// beside the engine-minted fingerprint prevents UI state from being
+    /// rebound to a fingerprint from another frame or preview response.
+    private struct MetadataPreviewAuthorization {
+        let frameIndex: Int
+        let fingerprint: String
+        let arguments: [String]
+        let targets: [String]
+
+        func matches(
+            frameIndex: Int,
+            preview: PreviewMetadataCommandResult
+        ) -> Bool {
+            self.frameIndex == frameIndex
+                && fingerprint == preview.fingerprint
+                && arguments == preview.arguments
+                && targets == preview.targets
+        }
+    }
+
     /// Binds the UI-visible manual-review request to the exact completed
     /// preview and connection that produced it.
     private struct PendingManualReviewScanAuthorization {
@@ -807,6 +828,12 @@ public final class SessionModel {
     /// `frameDefects`) would be needless; callers clear/replace this
     /// between frames.
     public private(set) var metadataPreview: PreviewMetadataCommandResult?
+    private var metadataPreviewAuthorization: MetadataPreviewAuthorization?
+    /// Monotonic ownership token for in-flight preview requests. A metadata
+    /// or target mutation can revoke a preview even while its response is in
+    /// flight, preventing that late response from resurrecting stale state.
+    private var metadataPreviewGeneration: UInt64 = 0
+    private var pendingMetadataPreviewFrameIndex: Int?
 
     /// The engine's authoritative resume set from the last
     /// `project.pendingFrames` round trip.
@@ -2564,6 +2591,9 @@ public final class SessionModel {
     /// Sets or clears one frame's independent output override (archive/
     /// positive/preview).
     public func setFrameOutputOverride(_ frameIndex: Int, to output: OutputRecipe?) async {
+        // The request may have committed even if its response is lost, so
+        // revoke a matching preview before crossing the engine boundary.
+        invalidateMetadataPreviewAuthorization(for: frameIndex)
         lastErrorMessage = nil
         do {
             let params = SetFrameOutputOverrideParams(frameIndex: frameIndex, output: output)
@@ -2577,6 +2607,10 @@ public final class SessionModel {
     /// Sets the roll-wide default metadata every frame without its own
     /// override inherits.
     public func setRollMetadata(_ metadata: MetadataSet) async {
+        // Roll metadata can change the effective ExifTool arguments for any
+        // frame. Invalidate before awaiting so timeout/response loss cannot
+        // leave an apparently reusable preview behind.
+        invalidateMetadataPreviewAuthorization()
         lastErrorMessage = nil
         do {
             let params = SetRollMetadataParams(metadata: metadata)
@@ -2590,6 +2624,7 @@ public final class SessionModel {
     /// Sets (`metadata` populated) or clears (`metadata: nil`, reverting to
     /// roll-wide inheritance) one frame's independent metadata override.
     public func setFrameMetadataOverride(_ frameIndex: Int, to metadata: MetadataSet?) async {
+        invalidateMetadataPreviewAuthorization(for: frameIndex)
         lastErrorMessage = nil
         do {
             let params = SetFrameMetadataOverrideParams(frameIndex: frameIndex, metadata: metadata)
@@ -2633,12 +2668,35 @@ public final class SessionModel {
     /// Fetches a dry-run preview of the ExifTool invocation
     /// `applyMetadata(_:)` would actually run for this frame.
     public func previewMetadataCommand(_ frameIndex: Int) async {
+        // A failed refresh must never fall back to an older authorization.
+        invalidateMetadataPreviewAuthorization()
+        let requestGeneration = metadataPreviewGeneration
+        pendingMetadataPreviewFrameIndex = frameIndex
         lastErrorMessage = nil
         do {
             let params = PreviewMetadataCommandParams(frameIndex: frameIndex)
             let result: PreviewMetadataCommandResult = try await engineClient.request("project.previewMetadataCommand", params: params)
+            guard metadataPreviewGeneration == requestGeneration else {
+                return
+            }
+            pendingMetadataPreviewFrameIndex = nil
+            guard !result.fingerprint.isEmpty else {
+                lastErrorMessage =
+                    "The engine returned a metadata preview without an authorization fingerprint. Preview again before applying."
+                return
+            }
             metadataPreview = result
+            metadataPreviewAuthorization = MetadataPreviewAuthorization(
+                frameIndex: frameIndex,
+                fingerprint: result.fingerprint,
+                arguments: result.arguments,
+                targets: result.targets
+            )
         } catch {
+            guard metadataPreviewGeneration == requestGeneration else {
+                return
+            }
+            pendingMetadataPreviewFrameIndex = nil
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -2650,9 +2708,35 @@ public final class SessionModel {
     /// `lastErrorMessage` set, same as every other action here).
     public func applyMetadata(_ frameIndex: Int) async -> ApplyMetadataResult? {
         lastErrorMessage = nil
+        guard let preview = metadataPreview,
+              let authorization = metadataPreviewAuthorization,
+              authorization.matches(frameIndex: frameIndex, preview: preview),
+              !authorization.fingerprint.isEmpty
+        else {
+            invalidateMetadataPreviewAuthorization()
+            lastErrorMessage =
+                "Preview the metadata command for this frame again before applying it. The prior preview is missing or stale."
+            return nil
+        }
+
+        // Consume before awaiting. Two overlapping Apply actions can never
+        // reuse one preview authorization, even though @MainActor methods are
+        // re-entrant across the engine request.
+        invalidateMetadataPreviewAuthorization()
         do {
-            let params = ApplyMetadataParams(frameIndex: frameIndex)
+            let params = ApplyMetadataParams(
+                frameIndex: frameIndex,
+                previewFingerprint: authorization.fingerprint
+            )
             let result: ApplyMetadataResult = try await engineClient.request("project.applyMetadata", params: params)
+            guard result.fingerprint == authorization.fingerprint,
+                  result.arguments == authorization.arguments,
+                  result.targets == authorization.targets
+            else {
+                lastErrorMessage =
+                    "The metadata command reported by the engine no longer matches the preview. Nothing is being reported as applied; preview again and retry."
+                return nil
+            }
             return result
         } catch {
             lastErrorMessage = Self.describe(error)
@@ -2754,6 +2838,22 @@ public final class SessionModel {
         digitalIceEnabled = false
     }
 
+    /// Revokes the current one-shot metadata preview. Frame-scoped callers
+    /// preserve a preview for a different frame; project-wide callers clear
+    /// it unconditionally.
+    private func invalidateMetadataPreviewAuthorization(for frameIndex: Int? = nil) {
+        if let frameIndex,
+           metadataPreviewAuthorization?.frameIndex != frameIndex,
+           pendingMetadataPreviewFrameIndex != frameIndex
+        {
+            return
+        }
+        metadataPreviewGeneration &+= 1
+        pendingMetadataPreviewFrameIndex = nil
+        metadataPreviewAuthorization = nil
+        metadataPreview = nil
+    }
+
     /// Clears state whose meaning belongs to the previously active project.
     ///
     /// Preview imagery and unsaved frame-alignment drafts deliberately remain:
@@ -2773,7 +2873,7 @@ public final class SessionModel {
         pendingFrames = []
         completedFrameCount = 0
         durableCompletedFrameIndices.removeAll()
-        metadataPreview = nil
+        invalidateMetadataPreviewAuthorization()
         frameDefects.removeAll()
         selectedFrameIndices.removeAll()
         selectionAnchorFrameIndex = nil
@@ -4137,6 +4237,10 @@ public final class SessionModel {
 
     private func applyReceipt(_ payload: FrameCompletedPayload, source: EngineEvent) {
         guard eventIsRelevant(payload.jobId, source: source), !receipts.contains(where: { $0.id == payload.receipt.id }) else { return }
+        // A replacement scan can resolve a different set of derivative
+        // targets for this frame. Never carry its old ExifTool preview across
+        // the new receipt.
+        invalidateMetadataPreviewAuthorization(for: payload.frameIndex)
         receipts.append(payload.receipt)
         durableCompletedFrameIndices.insert(payload.frameIndex)
         frameStates[payload.frameIndex] = .completed

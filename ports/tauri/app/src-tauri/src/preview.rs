@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::RandomState, HashMap, VecDeque};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -18,6 +19,116 @@ type CacheKey = (PathBuf, SystemTime);
 const MAX_PIXELS: u64 = 24_000_000;
 // Total retained encoded-PNG budget; the LRU entry count stays a secondary cap.
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+// A session can produce replacement thumbnails while alignment is edited.
+// Keep a generous but finite set so an engine cannot grow renderer-visible
+// preview authority without bound.
+const MAX_ISSUED_PREVIEWS: usize = 4096;
+
+/// Session-local capability table for preview rasters. The engine is the
+/// only issuer: before an engine response/event reaches the renderer, every
+/// `imagePath` is replaced with an opaque identifier backed by this table.
+/// Renderer IPC can therefore present an identifier it received, but cannot
+/// turn an arbitrary home-directory path into a read request.
+pub struct PreviewAccess {
+    inner: Mutex<PreviewAccessInner>,
+}
+
+struct PreviewAccessInner {
+    paths_by_id: HashMap<String, String>,
+    ids_by_path: HashMap<String, String>,
+    order: VecDeque<String>,
+    next_id: u64,
+    hash_a: RandomState,
+    hash_b: RandomState,
+}
+
+impl Default for PreviewAccess {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(PreviewAccessInner {
+                paths_by_id: HashMap::new(),
+                ids_by_path: HashMap::new(),
+                order: VecDeque::new(),
+                next_id: 0,
+                // RandomState seeds each app session from the platform RNG.
+                // Two independently keyed hashes give a 128-bit opaque ID
+                // without adding another dependency to the desktop shell.
+                hash_a: RandomState::new(),
+                hash_b: RandomState::new(),
+            }),
+        }
+    }
+}
+
+impl PreviewAccess {
+    fn keyed_hash<T: Hash>(state: &RandomState, value: &T) -> u64 {
+        let mut hasher = state.build_hasher();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Issue (or reuse) an opaque identifier for an engine-originated path.
+    pub fn issue(&self, path: &str) -> String {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(existing) = inner.ids_by_path.get(path) {
+            return existing.clone();
+        }
+        inner.next_id = inner.next_id.wrapping_add(1);
+        let input = (inner.next_id, path);
+        let first = Self::keyed_hash(&inner.hash_a, &input);
+        let second = Self::keyed_hash(&inner.hash_b, &input);
+        // Retain only a harmless, recognized extension so diagnostic bundles
+        // can preserve the raster format without revealing its local path.
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .filter(|value| matches!(value.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg"))
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default();
+        let id = format!("{first:016x}{second:016x}{extension}");
+        inner.paths_by_id.insert(id.clone(), path.to_string());
+        inner.ids_by_path.insert(path.to_string(), id.clone());
+        inner.order.push_back(id.clone());
+        while inner.order.len() > MAX_ISSUED_PREVIEWS {
+            if let Some(expired_id) = inner.order.pop_front() {
+                if let Some(expired_path) = inner.paths_by_id.remove(&expired_id) {
+                    inner.ids_by_path.remove(&expired_path);
+                }
+            }
+        }
+        id
+    }
+
+    /// Resolve only an identifier minted by `issue` in this app session.
+    pub fn resolve(&self, id: &str) -> Option<String> {
+        self.inner.lock().unwrap().paths_by_id.get(id).cloned()
+    }
+}
+
+/// Rewrite engine-owned image paths before they cross into the webview.
+/// Recursion covers both direct command results and nested event payloads.
+pub(crate) fn replace_engine_image_paths(value: &mut serde_json::Value, access: &PreviewAccess) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, child) in fields {
+                if key == "imagePath" {
+                    if let Some(path) = child.as_str() {
+                        *child = serde_json::Value::String(access.issue(path));
+                    }
+                } else {
+                    replace_engine_image_paths(child, access);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_engine_image_paths(item, access);
+            }
+        }
+        _ => {}
+    }
+}
 
 struct PreviewCache {
     entries: LruCache<CacheKey, Vec<u8>>,
@@ -60,6 +171,7 @@ fn text_response(status: u16, body: &str) -> Response<Vec<u8>> {
 }
 
 pub fn handle_request(ctx: UriSchemeContext<'_, Wry>, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    let access = ctx.app_handle().state::<PreviewAccess>();
     let home = match ctx.app_handle().path().home_dir() {
         Ok(h) => h,
         Err(_) => return text_response(500, "could not resolve home directory"),
@@ -69,16 +181,20 @@ pub fn handle_request(ctx: UriSchemeContext<'_, Wry>, request: Request<Vec<u8>>)
             Ok(path) => path,
             Err(_) => return text_response(500, "could not resolve pinned WSL preview share"),
         };
-        handle_with_windows_wsl_share(home, &share, &request)
+        handle_with_windows_wsl_share(home, &share, &access, &request)
     } else {
-        handle_with_home(home, &request)
+        handle_with_home(home, &access, &request)
     }
 }
 
 /// Tauri-independent core so unit tests can call it without constructing a
 /// UriSchemeContext (see plan's Task 2).
-pub fn handle_with_home(home: PathBuf, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
-    handle_with_roots(home, None, request)
+pub fn handle_with_home(
+    home: PathBuf,
+    access: &PreviewAccess,
+    request: &Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
+    handle_with_roots(home, None, access, request)
 }
 
 /// Windows core with an injectable root for the pinned WSL distro share.
@@ -89,9 +205,10 @@ pub fn handle_with_home(home: PathBuf, request: &Request<Vec<u8>>) -> Response<V
 pub fn handle_with_windows_wsl_share(
     home: PathBuf,
     distro_share_root: &Path,
+    access: &PreviewAccess,
     request: &Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
-    handle_with_roots(home, Some(distro_share_root), request)
+    handle_with_roots(home, Some(distro_share_root), access, request)
 }
 
 fn canonical_path_in_scope(requested: &Path, allowed_root: &Path) -> Result<PathBuf, u16> {
@@ -106,18 +223,22 @@ fn canonical_path_in_scope(requested: &Path, allowed_root: &Path) -> Result<Path
 fn handle_with_roots(
     home: PathBuf,
     windows_wsl_share: Option<&Path>,
+    access: &PreviewAccess,
     request: &Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
     let query = request.uri().query().unwrap_or("");
     let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect();
-    let Some(raw_path) = params.get("path") else {
-        return text_response(400, "missing required 'path' query parameter");
+    let Some(preview_id) = params.get("id") else {
+        return text_response(400, "missing required 'id' query parameter");
+    };
+    let Some(raw_path) = access.resolve(preview_id) else {
+        return text_response(403, "preview identifier was not issued by the engine");
     };
 
     let canonical = if let Some(share) = windows_wsl_share.filter(|_| raw_path.starts_with('/')) {
-        let (preview_root, requested) = match wsl_preview_paths_in_share(raw_path, share) {
+        let (preview_root, requested) = match wsl_preview_paths_in_share(&raw_path, share) {
             Ok(paths) => paths,
             Err(_) => return text_response(403, "path outside allowed WSL preview scope"),
         };
@@ -127,7 +248,7 @@ fn handle_with_roots(
             Err(_) => return text_response(404, "path not found or inaccessible"),
         }
     } else {
-        let requested = PathBuf::from(raw_path);
+        let requested = PathBuf::from(&raw_path);
         match canonical_path_in_scope(&requested, &home) {
             Ok(path) => path,
             Err(403) => return text_response(403, "path outside allowed scope"),
@@ -217,11 +338,15 @@ mod tests {
         (dir.clone(), FixtureGuard { dir })
     }
 
-    fn request_for_path(path: &std::path::Path) -> Request<Vec<u8>> {
+    fn request_for_id(id: &str) -> Request<Vec<u8>> {
         let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("path", &path.to_string_lossy());
+        query.append_pair("id", id);
         let uri = format!("scanstudio-preview://localhost/?{}", query.finish());
         Request::builder().uri(uri).body(Vec::new()).unwrap()
+    }
+
+    fn authorized_request(access: &PreviewAccess, path: &std::path::Path) -> Request<Vec<u8>> {
+        request_for_id(&access.issue(&path.to_string_lossy()))
     }
 
     #[test]
@@ -237,7 +362,8 @@ mod tests {
         let tif_path = dir.join("fixture8.tif");
         img.save(&tif_path).expect("save 8-bit tiff fixture");
 
-        let response = handle_with_home(home_dir(), &request_for_path(&tif_path));
+        let access = PreviewAccess::default();
+        let response = handle_with_home(home_dir(), &access, &authorized_request(&access, &tif_path));
 
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers().get("Content-Type").unwrap(), "image/png");
@@ -261,7 +387,8 @@ mod tests {
         let tif_path = dir.join("fixture16.tif");
         img.save(&tif_path).expect("save 16-bit tiff fixture");
 
-        let response = handle_with_home(home_dir(), &request_for_path(&tif_path));
+        let access = PreviewAccess::default();
+        let response = handle_with_home(home_dir(), &access, &authorized_request(&access, &tif_path));
 
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers().get("Content-Type").unwrap(), "image/png");
@@ -298,9 +425,10 @@ mod tests {
             eprintln!("skipping 403 fixture: cannot write {outside:?}");
             return;
         }
-        let request = request_for_path(&outside);
+        let access = PreviewAccess::default();
+        let request = authorized_request(&access, &outside);
 
-        let response = handle_with_home(home, &request);
+        let response = handle_with_home(home, &access, &request);
 
         assert_eq!(response.status(), 403);
         let _ = std::fs::remove_file(&outside);
@@ -311,7 +439,8 @@ mod tests {
         let (dir, _guard) = setup_fixture("missing");
         let missing = dir.join("never-created.tif");
 
-        let response = handle_with_home(home_dir(), &request_for_path(&missing));
+        let access = PreviewAccess::default();
+        let response = handle_with_home(home_dir(), &access, &authorized_request(&access, &missing));
 
         assert_eq!(response.status(), 404);
     }
@@ -345,7 +474,8 @@ mod tests {
         let tif_path = dir.join("huge.tif");
         std::fs::write(&tif_path, &tiff).expect("write crafted tiff header");
 
-        let response = handle_with_home(home_dir(), &request_for_path(&tif_path));
+        let access = PreviewAccess::default();
+        let response = handle_with_home(home_dir(), &access, &authorized_request(&access, &tif_path));
 
         assert_eq!(response.status(), 413);
     }
@@ -391,12 +521,56 @@ mod tests {
         let tif_path = dir.join("cache.tif");
         img.save(&tif_path).expect("save cache fixture");
 
-        let request = request_for_path(&tif_path);
-        let first = handle_with_home(home_dir(), &request);
-        let second = handle_with_home(home_dir(), &request);
+        let access = PreviewAccess::default();
+        let request = authorized_request(&access, &tif_path);
+        let first = handle_with_home(home_dir(), &access, &request);
+        let second = handle_with_home(home_dir(), &access, &request);
 
         assert_eq!(first.status(), 200);
         assert_eq!(second.status(), 200);
         assert_eq!(first.body(), second.body());
+    }
+
+    #[test]
+    fn arbitrary_home_image_without_an_engine_identifier_is_refused() {
+        let (dir, _guard) = setup_fixture("unissued");
+        let image_path = dir.join("private.png");
+        image::RgbImage::new(2, 2)
+            .save(&image_path)
+            .expect("save arbitrary home image");
+        let access = PreviewAccess::default();
+
+        // Supplying the local path where an opaque identifier is required
+        // must not recover or decode the file, even though it is under HOME.
+        let response = handle_with_home(
+            home_dir(),
+            &access,
+            &request_for_id(&image_path.to_string_lossy()),
+        );
+
+        assert_eq!(response.status(), 403);
+        assert_eq!(
+            response.body(),
+            b"preview identifier was not issued by the engine"
+        );
+    }
+
+    #[test]
+    fn engine_paths_are_replaced_with_opaque_identifiers() {
+        let access = PreviewAccess::default();
+        let raw = "/Users/example/.scanstudio/previews/session/frame-0001.tif";
+        let mut message = serde_json::json!({
+            "event": "scanner.thumbnail",
+            "payload": { "thumbnail": { "imagePath": raw } }
+        });
+
+        replace_engine_image_paths(&mut message, &access);
+
+        let id = message["payload"]["thumbnail"]["imagePath"]
+            .as_str()
+            .expect("opaque image identifier");
+        assert_ne!(id, raw);
+        assert!(!id.contains("Users"));
+        assert_eq!(access.resolve(id).as_deref(), Some(raw));
     }
 }

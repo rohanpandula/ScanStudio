@@ -630,22 +630,21 @@ pub struct PendingFramesResult {
 // the manifest.
 // ---------------------------------------------------------------------
 
-/// Neither `capture` nor `processing` gets `#[serde(default)]` — mirrors
-/// `ScanStartParams.frames`/`.recipe`'s own required-ness (this method's
-/// caller always resolves and supplies both), not `ScanStartParams
-/// .processing`/`.output`'s defaulted convention.
+/// Only frame identity is accepted from the client. Effective recipes are
+/// derived from the active project, frame overrides, and latest receipt in
+/// the server so a renderer cannot analyze settings unrelated to the frame.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzeFrameDefectsParams {
     pub frame_index: u32,
-    pub capture: domain::CaptureRecipe,
-    pub processing: domain::ProcessingRecipe,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzeFrameDefectsResult {
     pub frame_index: u32,
+    pub capture: domain::CaptureRecipe,
+    pub processing: domain::ProcessingRecipe,
     pub defects: Vec<domain::DefectInstance>,
     pub simulated: bool,
     /// Echoes the resolved `processing.digitalIceEnabled` so an empty
@@ -686,12 +685,14 @@ pub struct PreviewMetadataCommandResult {
     pub exiftool_path: Option<String>,
     pub targets: Vec<String>,
     pub arguments: Vec<String>,
+    pub fingerprint: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyMetadataParams {
     pub frame_index: u32,
+    pub preview_fingerprint: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -702,6 +703,8 @@ pub struct ApplyMetadataResult {
     pub stdout: String,
     pub stderr: String,
     pub targets: Vec<String>,
+    pub arguments: Vec<String>,
+    pub fingerprint: String,
 }
 
 // ---------------------------------------------------------------------

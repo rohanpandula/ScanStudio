@@ -267,13 +267,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             at: rollbackDirectory,
             withIntermediateDirectories: true
         )
+        // Independent publisher root: nil for today's ad-hoc/unstamped build,
+        // which deliberately leaves installation disabled. Once a real Team ID
+        // is stamped into the signed Info.plist, this factory also requires the
+        // running app's matching Developer ID designated requirement, secure
+        // timestamp, and stapled notarization ticket.
+        let publisherTrust = UpdatePublisherTrust.currentApplication()
         let installer = try! UpdateInstaller(
             appDirectory: URL(fileURLWithPath: "/Applications", isDirectory: true),
-            rollbackDirectory: rollbackDirectory
+            rollbackDirectory: rollbackDirectory,
+            publisherTrust: publisherTrust
         )
         return UpdateFlowModel(
             checker: GitHubUpdateChecker(pointerURL: Self.updatePointerURL),
-            downloader: UpdateDownloader(),
+            downloader: UpdateDownloader(publisherTrust: publisherTrust),
             installer: installer,
             installedVersion: Self.installedUpdateVersion(),
             channelDefaultsKey: "ScanStudio.updateChannel",

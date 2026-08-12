@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -153,6 +155,41 @@ def test_hardware_lane_works_as_a_context_manager_and_releases_on_exit(
 ) -> None:
     with safety.HardwareLane(tmp_path):
         pass
+
+
+# -- BridgeProcessOwnership --------------------------------------------------
+
+
+def test_bridge_process_ownership_refuses_a_second_live_bridge(tmp_path: Path) -> None:
+    first = safety.BridgeProcessOwnership(tmp_path).acquire()
+    try:
+        with pytest.raises(BridgeError) as excinfo:
+            safety.BridgeProcessOwnership(tmp_path).acquire()
+        assert excinfo.value.code == ErrorCode.HARDWARE_LANE_BUSY
+    finally:
+        first.close()
+
+    replacement = safety.BridgeProcessOwnership(tmp_path).acquire()
+    replacement.close()
+
+
+def test_surviving_worker_keeps_replacement_bridge_fenced(tmp_path: Path) -> None:
+    owner = safety.BridgeProcessOwnership(tmp_path).acquire()
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        pass_fds=(owner.fd,),
+    )
+    owner.close()
+    try:
+        with pytest.raises(BridgeError) as excinfo:
+            safety.BridgeProcessOwnership(tmp_path).acquire()
+        assert excinfo.value.code == ErrorCode.HARDWARE_LANE_BUSY
+    finally:
+        worker.terminate()
+        worker.wait(timeout=5)
+
+    replacement = safety.BridgeProcessOwnership(tmp_path).acquire()
+    replacement.close()
     # Released -- a fresh lane over the same base_dir can be acquired again.
     with safety.HardwareLane(tmp_path):
         pass

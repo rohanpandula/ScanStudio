@@ -75,6 +75,7 @@ const PREVIEW: PreviewMetadataCommandResult = {
   exiftoolPath: "/usr/bin/exiftool",
   targets: ["/out/IMG_0001.tiff"],
   arguments: ["-CameraModel=Nikon F6", "-overwrite_original", "/out/IMG_0001.tiff"],
+  fingerprint: "metadata-preview-fingerprint",
 };
 
 const APPLY: ApplyMetadataResult = {
@@ -83,6 +84,8 @@ const APPLY: ApplyMetadataResult = {
   stdout: "    1 image files updated",
   stderr: "",
   targets: ["/out/IMG_0001.tiff"],
+  arguments: PREVIEW.arguments,
+  fingerprint: PREVIEW.fingerprint,
 };
 
 interface Call {
@@ -161,11 +164,16 @@ describe("detectExifTool / previewMetadataCommand / applyMetadata delegation", (
     ]);
   });
 
-  it("applyMetadata sends only frameIndex (never an argument list) and returns the result", async () => {
+  it("applyMetadata sends frameIndex plus the reviewed fingerprint, never arguments", async () => {
     const { store, calls } = fixture(() => ({ result: APPLY }));
-    await expect(store.applyMetadata(1)).resolves.toEqual(APPLY);
-    expect(calls).toEqual([{ method: "project.applyMetadata", params: { frameIndex: 1 } }]);
-    expect(Object.keys(calls[0].params)).toEqual(["frameIndex"]);
+    await expect(store.applyMetadata(1, PREVIEW.fingerprint)).resolves.toEqual(APPLY);
+    expect(calls).toEqual([
+      {
+        method: "project.applyMetadata",
+        params: { frameIndex: 1, previewFingerprint: PREVIEW.fingerprint },
+      },
+    ]);
+    expect(Object.keys(calls[0].params)).toEqual(["frameIndex", "previewFingerprint"]);
   });
 
   it("applyMetadata returns null (never throws) when the wire call rejects", async () => {
@@ -174,6 +182,6 @@ describe("detectExifTool / previewMetadataCommand / applyMetadata delegation", (
       onRequest: () => ({ error: reject }),
     });
     const store = new SessionStore(handle.transport);
-    await expect(store.applyMetadata(1)).resolves.toBeNull();
+    await expect(store.applyMetadata(1, PREVIEW.fingerprint)).resolves.toBeNull();
   });
 });

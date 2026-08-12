@@ -11,19 +11,20 @@
 //! multi-field write routes through, with a fail-closed guard on the
 //! underlying write itself as a structural backstop.
 //!
-//! No new crates: `SystemTime`/`std::env` for ids and default paths
-//! (matching `sim.rs`'s dependency-free approach), and plain
-//! `std::fs`/`std::path` for everything else.
+//! `getrandom` supplies unpredictable temporary names; `create_new`, file
+//! sync, rename, and parent-directory sync provide the filesystem safety
+//! and durability barriers.
 
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{
-    ArchiveRecipe, EngineError, FilmProcess, MediaCarrier, MetadataSet, OutputRecipe,
-    PositiveRecipe, PreviewRecipe, ProjectFrame, ProjectSummary, ScanProject,
+    ArchiveRecipe, EngineError, FilmProcess, MediaCarrier, MetadataOutputBindings, MetadataSet,
+    OutputRecipe, PositiveRecipe, PreviewRecipe, ProjectFrame, ProjectSummary, ScanProject,
+    ScanReceipt,
 };
 use crate::protocol::ErrorCode;
 
@@ -41,7 +42,9 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
-const MANIFEST_TMP_FILE_NAME: &str = ".manifest.json.tmp";
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(any(windows, test))]
+const MANIFEST_LOCK_FILE_NAME: &str = ".scanstudio-manifest.lock";
 
 // ---------------------------------------------------------------------
 // Paths, ids, slugs
@@ -101,6 +104,20 @@ fn io_err_to_internal(err: io::Error) -> EngineError {
     EngineError::new(ErrorCode::Internal, format!("manifest I/O error: {err}"))
 }
 
+fn read_bounded_bytes(reader: &mut impl Read, maximum: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest grew beyond its fixed read bound",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// The one process-wide gate a manifest read-modify-write cycle must hold
 /// for its *full* extent, not just its final write. `write_manifest_
 /// atomically`'s rename is atomic per call, but "read the current file,
@@ -109,15 +126,10 @@ fn io_err_to_internal(err: io::Error) -> EngineError {
 /// another thread's own write can land and then be silently discarded the
 /// moment the first thread's write lands on top of it (PERSIST-02: this is
 /// how a scan's completed-frame receipt used to get destroyed by the very
-/// next scan's own best-effort recipe save). Exactly two threads ever write
-/// a given project's manifest in this process — the server's single
-/// request-dispatch thread and a scan job's worker thread (via
-/// `persist_frame_receipt`) — so a plain `Mutex` scoped to this process is
-/// sufficient; there is no other process ever writing this file.
-/// `persist_project_update` and `persist_frame_receipt` are the only two
-/// functions that acquire it; `write_manifest_atomically` deliberately does
-/// not, so those two can call it while already holding the lock without
-/// deadlocking on themselves.
+/// next scan's own best-effort recipe save). The process mutex establishes a
+/// single lock order for local threads; every public manifest path then also
+/// acquires the stable project-scoped OS lock below so two ScanStudio
+/// processes cannot interleave read-modify-write cycles.
 static MANIFEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Acquires `MANIFEST_LOCK`, recovering from poisoning rather than
@@ -132,6 +144,270 @@ fn manifest_lock() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+/// Stable project-scoped lock shared by every manifest read-modify-write and
+/// by the longer metadata file+receipt transaction. Unix locks the held
+/// project-directory inode itself. Windows locks a dedicated regular file
+/// whose handle denies delete sharing. Locking `manifest.json` itself would
+/// become useless as soon as an atomic commit replaces that inode.
+pub(crate) struct ManifestTransactionGuard {
+    _process: std::sync::MutexGuard<'static, ()>,
+    pub(crate) directory: File,
+    lock_file: File,
+}
+
+impl Drop for ManifestTransactionGuard {
+    fn drop(&mut self) {
+        unlock_file(&self.lock_file);
+    }
+}
+
+pub(crate) fn lock_manifest_transaction(
+    directory: &Path,
+) -> Result<ManifestTransactionGuard, EngineError> {
+    let process = manifest_lock();
+    let directory_handle = crate::exiftool::metadata_publish_sys::open_directory(directory)
+        .map_err(io_err_to_internal)?;
+    let guard = lock_manifest_transaction_inner(process, directory_handle)?;
+    crate::exiftool::verify_directory_path_authority(
+        directory,
+        &guard.directory,
+        "project manifest root",
+    )?;
+    Ok(guard)
+}
+
+/// Acquires the project manifest transaction lock relative to an existing
+/// directory capability. This is the persistence boundary used by a scan
+/// whose project root was approved before capture: it must not reopen or
+/// canonicalize the mutable display pathname after scanner motion.
+pub(crate) fn lock_manifest_transaction_at(
+    directory: &File,
+) -> Result<ManifestTransactionGuard, EngineError> {
+    let process = manifest_lock();
+    let directory_handle = directory.try_clone().map_err(io_err_to_internal)?;
+    let metadata = directory_handle.metadata().map_err(io_err_to_internal)?;
+    if !metadata.is_dir() || directory_entry_is_reparse_point(&metadata) {
+        return Err(EngineError::new(
+            ErrorCode::ManifestInvalid,
+            "refusing a non-directory or reparse-point project manifest capability",
+        ));
+    }
+    lock_manifest_transaction_inner(process, directory_handle)
+}
+
+fn lock_manifest_transaction_inner(
+    process: std::sync::MutexGuard<'static, ()>,
+    directory_handle: File,
+) -> Result<ManifestTransactionGuard, EngineError> {
+    // Unix directory inodes cannot be unlinked while non-empty and, unlike a
+    // conventional lock-file name, cannot be replaced without also changing
+    // the already-held project authority. Lock that stable inode directly so
+    // an attacker cannot unlink/recreate a nominal lock leaf and split two
+    // processes across different locks.
+    #[cfg(unix)]
+    let lock_file = directory_handle.try_clone().map_err(io_err_to_internal)?;
+
+    // Windows byte-range locking is retained on a dedicated regular file,
+    // but its held handle explicitly denies delete sharing. The lock name
+    // therefore cannot be renamed/unlinked and replaced while this guard is
+    // alive.
+    #[cfg(windows)]
+    let lock_file = {
+        let lock_name = std::ffi::OsStr::new(MANIFEST_LOCK_FILE_NAME);
+        match crate::exiftool::metadata_publish_sys::open_manifest_lock(
+            &directory_handle,
+            lock_name,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match crate::exiftool::metadata_publish_sys::create_manifest_lock(
+                    &directory_handle,
+                    lock_name,
+                ) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        crate::exiftool::metadata_publish_sys::open_manifest_lock(
+                            &directory_handle,
+                            lock_name,
+                        )
+                        .map_err(io_err_to_internal)?
+                    }
+                    Err(error) => return Err(io_err_to_internal(error)),
+                }
+            }
+            Err(error) => return Err(io_err_to_internal(error)),
+        }
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    return Err(io_err_to_internal(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "manifest locking is unsupported on this platform",
+    )));
+
+    let metadata = lock_file.metadata().map_err(io_err_to_internal)?;
+    #[cfg(unix)]
+    let unsafe_lock = !metadata.is_dir();
+    #[cfg(windows)]
+    let unsafe_lock = !metadata.is_file() || lock_entry_is_unsafe(&lock_file, &metadata);
+    if unsafe_lock {
+        return Err(EngineError::new(
+            ErrorCode::ManifestInvalid,
+            "refusing an unsafe project manifest lock authority",
+        ));
+    }
+    lock_file_exclusive(&lock_file)?;
+    Ok(ManifestTransactionGuard {
+        _process: process,
+        directory: directory_handle,
+        lock_file,
+    })
+}
+
+#[cfg(windows)]
+fn directory_entry_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn directory_entry_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn lock_entry_is_unsafe(file: &File, metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || crate::exiftool::held_file_identity(file, metadata)
+            .map(|(_, _, links)| links != 1)
+            .unwrap_or(true)
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File) -> Result<(), EngineError> {
+    use std::os::fd::AsRawFd as _;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            ErrorCode::ScannerBusy,
+            format!(
+                "another ScanStudio process is updating this project: {}",
+                io::Error::last_os_error()
+            ),
+        )
+        .with_recoverable(true))
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) {
+    use std::os::fd::AsRawFd as _;
+    unsafe {
+        let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct LockOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+fn lock_file_exclusive(file: &File) -> Result<(), EngineError> {
+    use std::os::windows::io::AsRawHandle as _;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LockFileEx(
+            file: *mut std::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            low: u32,
+            high: u32,
+            overlapped: *mut LockOverlapped,
+        ) -> i32;
+    }
+    let mut overlapped = LockOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        event: std::ptr::null_mut(),
+    };
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            0x3,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &raw mut overlapped,
+        )
+    };
+    if result == 0 {
+        Err(EngineError::new(
+            ErrorCode::ScannerBusy,
+            format!(
+                "another ScanStudio process is updating this project: {}",
+                io::Error::last_os_error()
+            ),
+        )
+        .with_recoverable(true))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) {
+    use std::os::windows::io::AsRawHandle as _;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn UnlockFileEx(
+            file: *mut std::ffi::c_void,
+            reserved: u32,
+            low: u32,
+            high: u32,
+            overlapped: *mut LockOverlapped,
+        ) -> i32;
+    }
+    let mut overlapped = LockOverlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        event: std::ptr::null_mut(),
+    };
+    unsafe {
+        let _ = UnlockFileEx(
+            file.as_raw_handle(),
+            0,
+            u32::MAX,
+            u32::MAX,
+            &raw mut overlapped,
+        );
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_file_exclusive(_file: &File) -> Result<(), EngineError> {
+    Err(io_err_to_internal(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "manifest locking unsupported",
+    )))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_file(_file: &File) {}
 
 /// Writes `project` to `directory/manifest.json`, atomically: serialize to
 /// a sibling temp file inside the same directory, then `fs::rename` it
@@ -164,7 +440,34 @@ pub fn write_manifest_atomically(
     directory: &Path,
     project: &ScanProject,
 ) -> Result<(), EngineError> {
-    match read_manifest(directory) {
+    fs::create_dir_all(directory).map_err(io_err_to_internal)?;
+    let guard = lock_manifest_transaction(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(directory, &guard.directory)?;
+    write_manifest_atomically_locked(&guard.directory, directory, project)
+}
+
+fn write_manifest_atomically_locked(
+    directory_handle: &File,
+    display_directory: &Path,
+    project: &ScanProject,
+) -> Result<(), EngineError> {
+    crate::exiftool::verify_directory_path_authority(
+        display_directory,
+        directory_handle,
+        "project manifest root",
+    )?;
+    write_manifest_atomically_at_locked(directory_handle, display_directory, project)
+}
+
+/// Capability-anchored form of the receipt-preserving manifest write. The
+/// display path is diagnostics only: all reads, temporary creation, rename,
+/// and durability barriers are relative to `directory_handle`.
+fn write_manifest_atomically_at_locked(
+    directory_handle: &File,
+    display_directory: &Path,
+    project: &ScanProject,
+) -> Result<(), EngineError> {
+    match read_manifest_from_directory_handle(directory_handle, display_directory) {
         Ok(on_disk) => {
             for on_disk_frame in &on_disk.frames {
                 let incoming_receipts = project
@@ -182,7 +485,7 @@ pub fn write_manifest_atomically(
                         ErrorCode::ManifestInvalid,
                         format!(
                             "refusing to write manifest at {}: frame {} would lose its on-disk receipt from job {} (started {}) — this write was not derived from the manifest currently on disk; read, merge, and retry through persist_project_update instead of overwriting",
-                            directory.display(),
+                            display_directory.display(),
                             on_disk_frame.index,
                             lost.job_id,
                             lost.started_at,
@@ -197,12 +500,12 @@ pub fn write_manifest_atomically(
                 ErrorCode::ManifestInvalid,
                 format!(
                     "refusing to write manifest at {}: the existing manifest cannot be read ({err}) — manual recovery is needed before this project can be written to again",
-                    directory.display(),
+                    display_directory.display(),
                 ),
             ));
         }
     }
-    write_manifest_bytes(directory, project)
+    write_manifest_bytes_locked(directory_handle, project)
 }
 
 /// The actual bytes-to-disk half of `write_manifest_atomically`, split out
@@ -210,23 +513,92 @@ pub fn write_manifest_atomically(
 /// once it has decided the write is safe. Never call this directly outside
 /// that guard — it is the one thing `write_manifest_atomically` exists to
 /// wrap.
-fn write_manifest_bytes(directory: &Path, project: &ScanProject) -> Result<(), EngineError> {
-    fs::create_dir_all(directory).map_err(io_err_to_internal)?;
-
+fn write_manifest_bytes_locked(
+    directory_handle: &File,
+    project: &ScanProject,
+) -> Result<(), EngineError> {
     let json = serde_json::to_string_pretty(project).map_err(|err| {
         EngineError::new(
             ErrorCode::Internal,
             format!("failed to serialize manifest: {err}"),
         )
     })?;
+    ensure_manifest_write_size(json.len() as u64, MAX_MANIFEST_BYTES)?;
 
-    let tmp_path = directory.join(MANIFEST_TMP_FILE_NAME);
-    fs::write(&tmp_path, json).map_err(io_err_to_internal)?;
+    let (tmp_name, mut tmp_file) = create_manifest_temp_file(directory_handle)?;
+    let write_result = (|| {
+        tmp_file
+            .write_all(json.as_bytes())
+            .map_err(io_err_to_internal)?;
+        tmp_file.sync_all().map_err(io_err_to_internal)?;
+        drop(tmp_file);
+        crate::exiftool::metadata_publish_sys::rename_replace(
+            directory_handle,
+            &tmp_name,
+            directory_handle,
+            std::ffi::OsStr::new(MANIFEST_FILE_NAME),
+        )
+        .map_err(io_err_to_internal)?;
+        #[cfg(test)]
+        if crate::exiftool::metadata_transaction_failpoint_is(375) {
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                "simulated manifest directory-sync failure after atomic rename",
+            )
+            .with_recoverable(true));
+        }
+        crate::exiftool::metadata_publish_sys::sync_directory(directory_handle)
+            .map_err(io_err_to_internal)
+    })();
 
-    let final_path = directory.join(MANIFEST_FILE_NAME);
-    fs::rename(&tmp_path, &final_path).map_err(io_err_to_internal)?;
+    if write_result.is_err() {
+        let _ = crate::exiftool::metadata_publish_sys::unlink(directory_handle, &tmp_name);
+    }
+    write_result
+}
 
+fn ensure_manifest_write_size(length: u64, maximum: u64) -> Result<(), EngineError> {
+    if length > maximum {
+        return Err(EngineError::new(
+            ErrorCode::ManifestInvalid,
+            format!(
+                "serialized manifest is {length} bytes, exceeding the {maximum}-byte authority limit"
+            ),
+        ));
+    }
     Ok(())
+}
+
+/// Creates a same-directory temporary file without ever following an
+/// attacker-controlled path. The random name prevents a predictable-path
+/// collision, while `create_new(true)` is the atomic backstop: even if an
+/// entry with the generated name already exists (including a symlink), the
+/// open fails rather than truncating or following it.
+fn create_manifest_temp_file(directory: &File) -> Result<(std::ffi::OsString, File), EngineError> {
+    for _ in 0..16 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|err| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!("failed to obtain randomness for manifest temp file: {err}"),
+            )
+        })?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let name = std::ffi::OsString::from(format!(".manifest.json.{suffix}.tmp"));
+        match crate::exiftool::metadata_publish_sys::create_new_regular(directory, &name) {
+            Ok(file) => return Ok((name, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(io_err_to_internal(err)),
+        }
+    }
+
+    Err(EngineError::new(
+        ErrorCode::Internal,
+        "failed to allocate a unique manifest temp file after 16 attempts",
+    ))
 }
 
 /// Reads and validates `directory/manifest.json`. A missing directory or a
@@ -237,25 +609,108 @@ fn write_manifest_bytes(directory: &Path, project: &ScanProject) -> Result<(), E
 /// manifest exists but cannot be trusted, and is never partially trusted
 /// or silently coerced.
 pub fn read_manifest(directory: &Path) -> Result<ScanProject, EngineError> {
-    let path = directory.join(MANIFEST_FILE_NAME);
-    let contents = fs::read_to_string(&path).map_err(|err| {
+    // A metadata commit spans several filesystem objects. Resolve any
+    // durable transaction record before treating receipt bindings as
+    // authority; callers must never observe an old manifest beside newly
+    // published files (or vice versa) after a crash.
+    if !directory.is_dir() {
+        return read_manifest_unrecovered(directory);
+    }
+    let guard = lock_manifest_transaction(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(directory, &guard.directory)?;
+    read_manifest_from_directory_handle(&guard.directory, directory)
+}
+
+/// Raw manifest read used only by metadata-transaction recovery/commit while
+/// it already owns the metadata transaction lock. Calling the recovering
+/// public reader from those paths would recursively try to recover the very
+/// journal they are resolving.
+pub(crate) fn read_manifest_unrecovered(directory: &Path) -> Result<ScanProject, EngineError> {
+    let handle =
+        crate::exiftool::metadata_publish_sys::open_directory(directory).map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                EngineError::new(
+                    ErrorCode::ProjectNotFound,
+                    format!("no project found at {}", directory.display()),
+                )
+            } else {
+                EngineError::new(
+                    ErrorCode::ManifestInvalid,
+                    format!("failed to open project at {}: {err}", directory.display()),
+                )
+            }
+        })?;
+    read_manifest_from_directory_handle(&handle, directory)
+}
+
+pub(crate) fn read_manifest_from_directory_handle(
+    directory_handle: &File,
+    display_directory: &Path,
+) -> Result<ScanProject, EngineError> {
+    let mut file = crate::exiftool::metadata_publish_sys::open_regular(
+        directory_handle,
+        std::ffi::OsStr::new(MANIFEST_FILE_NAME),
+    )
+    .map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             EngineError::new(
                 ErrorCode::ProjectNotFound,
-                format!("no project found at {}", directory.display()),
+                format!("no project found at {}", display_directory.display()),
             )
         } else {
             EngineError::new(
                 ErrorCode::ManifestInvalid,
-                format!("failed to read manifest at {}: {err}", directory.display()),
+                format!(
+                    "failed to open manifest at {}: {err}",
+                    display_directory.display()
+                ),
             )
         }
+    })?;
+    let metadata = file.metadata().map_err(io_err_to_internal)?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(EngineError::new(
+            ErrorCode::ManifestInvalid,
+            "manifest is not a bounded regular file",
+        ));
+    }
+    let identity_before = crate::exiftool::held_file_identity(&file, &metadata);
+    let bytes = read_bounded_bytes(&mut file, MAX_MANIFEST_BYTES).map_err(|err| {
+        EngineError::new(
+            ErrorCode::ManifestInvalid,
+            format!(
+                "failed to read manifest at {}: {err}",
+                display_directory.display()
+            ),
+        )
+    })?;
+    let after = file.metadata().map_err(io_err_to_internal)?;
+    if crate::exiftool::held_file_identity(&file, &after) != identity_before
+        || after.len() != metadata.len()
+        || bytes.len() as u64 != metadata.len()
+    {
+        return Err(EngineError::new(
+            ErrorCode::ManifestInvalid,
+            "manifest identity or length changed while it was being read",
+        ));
+    }
+    let contents = String::from_utf8(bytes).map_err(|err| {
+        EngineError::new(
+            ErrorCode::ManifestInvalid,
+            format!(
+                "manifest at {} is not valid UTF-8: {err}",
+                display_directory.display()
+            ),
+        )
     })?;
 
     let project: ScanProject = serde_json::from_str(&contents).map_err(|err| {
         EngineError::new(
             ErrorCode::ManifestInvalid,
-            format!("failed to parse manifest at {}: {err}", directory.display()),
+            format!(
+                "failed to parse manifest at {}: {err}",
+                display_directory.display()
+            ),
         )
     })?;
 
@@ -267,7 +722,7 @@ pub fn read_manifest(directory: &Path) -> Result<ScanProject, EngineError> {
             format!(
                 "unsupported manifest schemaVersion {} at {} (supported range {MIN_SUPPORTED_SCHEMA_VERSION}..={CURRENT_SCHEMA_VERSION})",
                 project.schema_version,
-                directory.display()
+                display_directory.display()
             ),
         ));
     }
@@ -442,13 +897,15 @@ fn migrate_temp_destinations(
         changed = true;
     }
     if missing_raw_export {
-        project.recipes.raw_export.destination = directory.join("Raw Negative").display().to_string();
+        project.recipes.raw_export.destination =
+            directory.join("Raw Negative").display().to_string();
         changed = true;
     }
     for frame in &mut project.frames {
         if frame_overrides_missing_raw_export.contains(&frame.index) {
             if let Some(output) = frame.output_override.as_mut() {
-                output.raw_export.destination = directory.join("Raw Negative").display().to_string();
+                output.raw_export.destination =
+                    directory.join("Raw Negative").display().to_string();
                 changed = true;
             }
         }
@@ -463,13 +920,19 @@ fn legacy_raw_export_presence(
     let contents = fs::read_to_string(&path).map_err(|error| {
         EngineError::new(
             ErrorCode::ManifestInvalid,
-            format!("failed to read manifest at {}: {error}", directory.display()),
+            format!(
+                "failed to read manifest at {}: {error}",
+                directory.display()
+            ),
         )
     })?;
     let value: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
         EngineError::new(
             ErrorCode::ManifestInvalid,
-            format!("failed to parse manifest at {}: {error}", directory.display()),
+            format!(
+                "failed to parse manifest at {}: {error}",
+                directory.display()
+            ),
         )
     })?;
     let missing_project_raw = value
@@ -484,7 +947,12 @@ fn legacy_raw_export_presence(
         .filter_map(|frame| {
             let output = frame.get("outputOverride")?.as_object()?;
             (!output.contains_key("rawExport"))
-                .then(|| frame.get("index")?.as_u64().and_then(|index| u32::try_from(index).ok()))
+                .then(|| {
+                    frame
+                        .get("index")?
+                        .as_u64()
+                        .and_then(|index| u32::try_from(index).ok())
+                })
                 .flatten()
         })
         .collect();
@@ -609,14 +1077,106 @@ pub fn persist_project_update(
     directory: &Path,
     incoming: &ScanProject,
 ) -> Result<ScanProject, EngineError> {
-    let _guard = manifest_lock();
-    let merged = match read_manifest(directory) {
+    fs::create_dir_all(directory).map_err(io_err_to_internal)?;
+    let guard = lock_manifest_transaction(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(directory, &guard.directory)?;
+    let merged = match read_manifest_from_directory_handle(&guard.directory, directory) {
         Ok(on_disk) => merge_receipts(on_disk, incoming.clone()),
         Err(err) if err.code == ErrorCode::ProjectNotFound => incoming.clone(),
         Err(err) => return Err(err),
     };
-    write_manifest_atomically(directory, &merged)?;
+    write_manifest_atomically_locked(&guard.directory, directory, &merged)?;
     Ok(merged)
+}
+
+/// Receipt-preserving project update rooted in a directory capability that
+/// the caller acquired before capture. `display_directory` is used only in
+/// error messages; replacing or redirecting that pathname cannot redirect
+/// the lock, recovery scan, manifest read, or atomic manifest publication.
+pub(crate) fn persist_project_update_at(
+    directory: &File,
+    display_directory: &Path,
+    incoming: &ScanProject,
+) -> Result<ScanProject, EngineError> {
+    let guard = lock_manifest_transaction_at(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(
+        display_directory,
+        &guard.directory,
+    )?;
+    let merged = match read_manifest_from_directory_handle(&guard.directory, display_directory) {
+        Ok(on_disk) => merge_receipts(on_disk, incoming.clone()),
+        Err(err) if err.code == ErrorCode::ProjectNotFound => incoming.clone(),
+        Err(err) => return Err(err),
+    };
+    write_manifest_atomically_at_locked(&guard.directory, display_directory, &merged)?;
+    Ok(merged)
+}
+
+/// Replaces only the latest receipt's metadata-write capabilities under the
+/// same lock used by scan-worker receipt appends. The exact expected receipt
+/// must still be latest; if a scan completed while ExifTool was working, this
+/// fails rather than appending a mutated duplicate or moving an older receipt
+/// behind the newer capture. `write_manifest_bytes` is intentional here: the
+/// normal append-preservation guard compares whole receipt values and would
+/// misclassify this identity-preserving field update as receipt loss.
+#[cfg(test)]
+pub(crate) fn persist_latest_receipt_metadata_bindings(
+    directory: &Path,
+    frame_index: u32,
+    expected: &ScanReceipt,
+    bindings: MetadataOutputBindings,
+) -> Result<ScanProject, EngineError> {
+    let guard = lock_manifest_transaction(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(directory, &guard.directory)?;
+    persist_latest_receipt_metadata_bindings_locked(
+        &guard.directory,
+        directory,
+        frame_index,
+        expected,
+        bindings,
+    )
+}
+
+pub(crate) fn persist_latest_receipt_metadata_bindings_locked(
+    directory_handle: &File,
+    display_directory: &Path,
+    frame_index: u32,
+    expected: &ScanReceipt,
+    bindings: MetadataOutputBindings,
+) -> Result<ScanProject, EngineError> {
+    let mut project = read_manifest_from_directory_handle(directory_handle, display_directory)?;
+    let frame = project
+        .frames
+        .iter_mut()
+        .find(|frame| frame.index == frame_index)
+        .ok_or_else(|| {
+            EngineError::new(
+                ErrorCode::InvalidParams,
+                format!("frame index {frame_index} does not exist in this project"),
+            )
+        })?;
+    let latest = frame.receipts.last_mut().ok_or_else(|| {
+        EngineError::new(
+            ErrorCode::InvalidParams,
+            format!("frame {frame_index} has no receipt to update"),
+        )
+    })?;
+    if latest != expected {
+        return Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            "the frame receipt changed while metadata was being applied; preview again",
+        )
+        .with_recoverable(true));
+    }
+    let outputs = latest.outputs.as_mut().ok_or_else(|| {
+        EngineError::new(
+            ErrorCode::InvalidParams,
+            "the latest frame receipt has no written outputs",
+        )
+    })?;
+    outputs.metadata_bindings = Some(bindings);
+    write_manifest_bytes_locked(directory_handle, &project)?;
+    Ok(project)
 }
 
 /// Per frame, `on_disk`'s receipts survive ahead of `into`'s own: any of
@@ -665,13 +1225,36 @@ pub fn persist_frame_receipt(
     frame_index: u32,
     receipt: &crate::domain::ScanReceipt,
 ) -> Result<(), EngineError> {
-    let _guard = manifest_lock();
-    let mut project = read_manifest(directory)?;
+    let guard = lock_manifest_transaction(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(directory, &guard.directory)?;
+    let mut project = read_manifest_from_directory_handle(&guard.directory, directory)?;
     mutate_frame(&mut project, frame_index, |f| {
         f.receipts.push(receipt.clone())
     })?;
-    write_manifest_atomically(directory, &project)?;
+    write_manifest_atomically_locked(&guard.directory, directory, &project)?;
     Ok(())
+}
+
+/// Appends a receipt beneath an already-held project directory capability.
+/// This is the scan-worker counterpart to `persist_project_update_at`: it
+/// shares the same process/OS lock and recovery ordering but never reopens
+/// the mutable project pathname after the job has begun.
+pub(crate) fn persist_frame_receipt_at(
+    directory: &File,
+    display_directory: &Path,
+    frame_index: u32,
+    receipt: &crate::domain::ScanReceipt,
+) -> Result<(), EngineError> {
+    let guard = lock_manifest_transaction_at(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(
+        display_directory,
+        &guard.directory,
+    )?;
+    let mut project = read_manifest_from_directory_handle(&guard.directory, display_directory)?;
+    mutate_frame(&mut project, frame_index, |frame| {
+        frame.receipts.push(receipt.clone())
+    })?;
+    write_manifest_atomically_at_locked(&guard.directory, display_directory, &project)
 }
 
 /// Pure, disk-free derivation of the resume set: every frame that is not
@@ -713,6 +1296,94 @@ mod tests {
 
     fn cleanup(dir: &Path) {
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounded_manifest_reader_rejects_one_byte_beyond_limit() {
+        let mut exact = std::io::Cursor::new(b"1234".to_vec());
+        assert_eq!(read_bounded_bytes(&mut exact, 4).unwrap(), b"1234");
+        let mut oversized = std::io::Cursor::new(b"12345".to_vec());
+        let error = read_bounded_bytes(&mut oversized, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn manifest_writer_enforces_the_same_inclusive_size_boundary_as_reader() {
+        ensure_manifest_write_size(4, 4).expect("the exact authority limit is writable");
+        let error = ensure_manifest_write_size(5, 4)
+            .expect_err("one byte beyond the authority limit must be rejected before rename");
+        assert_eq!(error.code, ErrorCode::ManifestInvalid);
+    }
+
+    const MANIFEST_LOCK_CHILD_DIRECTORY: &str = "SCANSTUDIO_TEST_MANIFEST_LOCK_CHILD_DIRECTORY";
+
+    #[test]
+    fn manifest_lock_child_probe() {
+        let Ok(directory) = std::env::var(MANIFEST_LOCK_CHILD_DIRECTORY) else {
+            return;
+        };
+        let handle = crate::exiftool::metadata_publish_sys::open_directory(Path::new(&directory))
+            .expect("child opens project directory independently");
+        match lock_manifest_transaction_at(&handle) {
+            Ok(_) => panic!("child process split onto a replacement manifest lock"),
+            Err(error) => assert_eq!(error.code, ErrorCode::ScannerBusy),
+        }
+    }
+
+    #[test]
+    fn manifest_lock_name_replacement_cannot_split_cross_process_serialization() {
+        let directory = temp_project_dir();
+        let (_project, _) = create_project(
+            "Stable Manifest Lock",
+            MediaCarrier::Mounted,
+            1,
+            FilmProcess::Positive,
+            Some(&directory),
+        )
+        .unwrap();
+        let directory_handle =
+            crate::exiftool::metadata_publish_sys::open_directory(&directory).unwrap();
+        let guard = lock_manifest_transaction_at(&directory_handle).unwrap();
+        let nominal_lock = directory.join(MANIFEST_LOCK_FILE_NAME);
+
+        #[cfg(unix)]
+        {
+            // The nominal leaf is deliberately irrelevant on Unix. Prove an
+            // attacker can replace it while the directory-inode lock remains
+            // authoritative for another process.
+            std::fs::write(&nominal_lock, b"first inode").unwrap();
+            std::fs::remove_file(&nominal_lock).unwrap();
+            std::fs::write(&nominal_lock, b"replacement inode").unwrap();
+        }
+        #[cfg(windows)]
+        {
+            assert!(nominal_lock.exists());
+            assert!(
+                std::fs::remove_file(&nominal_lock).is_err(),
+                "held Windows lock handle must deny delete sharing"
+            );
+            assert!(
+                std::fs::rename(&nominal_lock, directory.join("replacement.lock")).is_err(),
+                "held Windows lock handle must deny rename sharing"
+            );
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("manifest::tests::manifest_lock_child_probe")
+            .arg("--nocapture")
+            .env(MANIFEST_LOCK_CHILD_DIRECTORY, &directory)
+            .output()
+            .expect("spawn independent manifest-lock probe");
+        assert!(
+            output.status.success(),
+            "child lock probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        drop(guard);
+        cleanup(&directory);
     }
 
     #[test]
@@ -1403,6 +2074,42 @@ mod tests {
         }
     }
 
+    fn sample_receipt_with_outputs(job_id: &str, frame_index: u32) -> ScanReceipt {
+        ScanReceipt {
+            outputs: Some(crate::domain::WrittenOutputs {
+                archive_path: Some(format!("/display-only/{job_id}.tiff")),
+                positive_path: Some(format!("/display-only/{job_id}.jpg")),
+                preview_path: None,
+                raw_negative_path: None,
+                raw_negative_ir_path: None,
+                metadata_bindings: None,
+                derivative_transform: crate::domain::DerivativeTransform::default(),
+            }),
+            ..sample_receipt(job_id, frame_index)
+        }
+    }
+
+    fn sample_metadata_bindings() -> MetadataOutputBindings {
+        MetadataOutputBindings {
+            archive: Some(crate::domain::WrittenFileBinding {
+                relative_path: "Archive/frame-0001.tiff".into(),
+                sha256: "a".repeat(64),
+                byte_length: 4_096,
+                volume_id: Some(7),
+                file_id: Some(11),
+            }),
+            archive_xmp: None,
+            positive: Some(crate::domain::WrittenFileBinding {
+                relative_path: "Positive/frame-0001.jpg".into(),
+                sha256: "b".repeat(64),
+                byte_length: 2_048,
+                volume_id: Some(7),
+                file_id: Some(12),
+            }),
+            preview: None,
+        }
+    }
+
     #[test]
     fn persist_frame_receipt_round_trips_through_read_manifest() {
         let dir = temp_project_dir();
@@ -1424,6 +2131,50 @@ mod tests {
         assert!(read_back.frames[1].receipts.is_empty());
 
         cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_root_receipt_append_ignores_replacement_namespace_and_sentinel() {
+        let dir = temp_project_dir();
+        create_project(
+            "Held Receipt Project",
+            MediaCarrier::Strip6,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create original project");
+        let held = crate::exiftool::metadata_publish_sys::open_directory(&dir)
+            .expect("hold original project root");
+        let displaced = dir.with_extension("held-receipt-root");
+        fs::rename(&dir, &displaced).expect("move held project namespace");
+
+        let (replacement, _) = create_project(
+            "Attacker Replacement",
+            MediaCarrier::Strip6,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create replacement project");
+        let sentinel = dir.join("outside-sentinel.txt");
+        fs::write(&sentinel, b"do not touch").expect("write replacement sentinel");
+        fs::create_dir(dir.join(".scanstudio-metadata-attacker.attempt"))
+            .expect("plant replacement-only recovery candidate");
+
+        let receipt = sample_receipt("held-root-job", 1);
+        persist_frame_receipt_at(&held, &dir, 1, &receipt)
+            .expect("append through held root despite display replacement");
+
+        let original_after = read_manifest(&displaced).expect("read held original project");
+        assert_eq!(original_after.frames[0].receipts, vec![receipt]);
+        let replacement_after = read_manifest(&dir).expect("read replacement project");
+        assert_eq!(replacement_after, replacement);
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"do not touch");
+
+        cleanup(&dir);
+        cleanup(&displaced);
     }
 
     #[test]
@@ -1484,6 +2235,129 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[test]
+    fn persist_latest_receipt_metadata_bindings_replaces_only_the_latest_receipt_bindings() {
+        let dir = temp_project_dir();
+        create_project(
+            "Metadata Binding Persistence",
+            MediaCarrier::Strip6,
+            2,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create_project should succeed");
+
+        let older = sample_receipt_with_outputs("job-older", 1);
+        let latest = sample_receipt_with_outputs("job-latest", 1);
+        persist_frame_receipt(&dir, 1, &older).expect("persist older receipt");
+        persist_frame_receipt(&dir, 1, &latest).expect("persist latest receipt");
+
+        let before = read_manifest(&dir).expect("read manifest before binding update");
+        let before_latest_bytes = serde_json::to_vec(
+            &serde_json::to_value(&before.frames[0].receipts[1])
+                .expect("normalize latest receipt before update"),
+        )
+        .expect("serialize latest receipt before update");
+        let bindings = sample_metadata_bindings();
+
+        let updated = persist_latest_receipt_metadata_bindings(&dir, 1, &latest, bindings.clone())
+            .expect("latest receipt binding update should succeed");
+        let on_disk = read_manifest(&dir).expect("read manifest after binding update");
+
+        assert_eq!(updated, on_disk, "returned state must match durable state");
+        assert_eq!(on_disk.frames[0].receipts.len(), 2);
+        assert_eq!(
+            on_disk.frames[0].receipts[0], older,
+            "an older receipt must neither move nor change"
+        );
+        assert_eq!(
+            on_disk.frames[0]
+                .receipts
+                .iter()
+                .map(|receipt| receipt.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job-older", "job-latest"],
+            "updating capabilities must not append or reorder receipts"
+        );
+
+        let mut expected_after = latest.clone();
+        expected_after
+            .outputs
+            .as_mut()
+            .expect("fixture has outputs")
+            .metadata_bindings = Some(bindings);
+        assert_eq!(on_disk.frames[0].receipts[1], expected_after);
+
+        let mut after_without_new_binding = serde_json::to_value(&on_disk.frames[0].receipts[1])
+            .expect("serialize latest receipt after update");
+        after_without_new_binding["outputs"]
+            .as_object_mut()
+            .expect("outputs is an object")
+            .remove("metadataBindings");
+        assert_eq!(
+            serde_json::to_vec(&after_without_new_binding).expect("serialize normalized receipt"),
+            before_latest_bytes,
+            "every serialized receipt byte outside metadataBindings must remain unchanged"
+        );
+
+        let mut expected_project = before;
+        expected_project.frames[0].receipts[1] = expected_after;
+        assert_eq!(
+            on_disk, expected_project,
+            "no manifest field outside the selected receipt binding may change"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn persist_latest_receipt_metadata_bindings_refuses_a_stale_expected_receipt_without_writing() {
+        let dir = temp_project_dir();
+        create_project(
+            "Stale Metadata Binding Persistence",
+            MediaCarrier::Strip6,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create_project should succeed");
+
+        let expected = sample_receipt_with_outputs("job-being-tagged", 1);
+        persist_frame_receipt(&dir, 1, &expected).expect("persist expected receipt");
+
+        // Model a scan completing after ExifTool captured `expected` but
+        // before it tried to ratify the updated binding in the manifest.
+        let newer = sample_receipt_with_outputs("job-completed-concurrently", 1);
+        persist_frame_receipt(&dir, 1, &newer).expect("persist concurrent newer receipt");
+        let manifest_path = dir.join(MANIFEST_FILE_NAME);
+        let bytes_before = fs::read(&manifest_path).expect("read manifest bytes before refusal");
+
+        let err = persist_latest_receipt_metadata_bindings(
+            &dir,
+            1,
+            &expected,
+            sample_metadata_bindings(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.recoverable());
+        assert!(err.message.contains("changed"));
+
+        let bytes_after = fs::read(&manifest_path).expect("read manifest bytes after refusal");
+        assert_eq!(
+            bytes_after, bytes_before,
+            "a stale update must leave the manifest byte-for-byte unchanged"
+        );
+        let on_disk = read_manifest(&dir).expect("read manifest after refusal");
+        assert_eq!(
+            on_disk.frames[0].receipts,
+            vec![expected, newer],
+            "the append-only receipt order must survive the refusal"
+        );
+
+        cleanup(&dir);
+    }
+
     /// PERSIST-02 core fix: a caller's stale in-memory `incoming` (no
     /// receipts, exactly like `project_state.active` right after
     /// `project.create`) must never blow away a receipt `persist_frame_
@@ -1523,6 +2397,55 @@ mod tests {
         assert_eq!(on_disk.recipes.archive.filename_template, "Renamed_####");
 
         cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_root_project_merge_ignores_replacement_namespace_and_sentinel() {
+        let dir = temp_project_dir();
+        let (project, _) = create_project(
+            "Held Recipe Project",
+            MediaCarrier::Strip6,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create original project");
+        let held = crate::exiftool::metadata_publish_sys::open_directory(&dir)
+            .expect("hold original project root");
+        let displaced = dir.with_extension("held-recipe-root");
+        fs::rename(&dir, &displaced).expect("move held project namespace");
+
+        let (replacement, _) = create_project(
+            "Attacker Replacement",
+            MediaCarrier::Strip6,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create replacement project");
+        let sentinel = dir.join("outside-sentinel.txt");
+        fs::write(&sentinel, b"do not touch").expect("write replacement sentinel");
+        fs::create_dir(dir.join(".scanstudio-metadata-attacker.attempt"))
+            .expect("plant replacement-only recovery candidate");
+
+        let mut incoming = project;
+        incoming.recipes.archive.filename_template = "Held_####".into();
+        let merged = persist_project_update_at(&held, &dir, &incoming)
+            .expect("merge through held root despite display replacement");
+        assert_eq!(merged.recipes.archive.filename_template, "Held_####");
+
+        let original_after = read_manifest(&displaced).expect("read held original project");
+        assert_eq!(
+            original_after.recipes.archive.filename_template,
+            "Held_####"
+        );
+        let replacement_after = read_manifest(&dir).expect("read replacement project");
+        assert_eq!(replacement_after, replacement);
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"do not touch");
+
+        cleanup(&dir);
+        cleanup(&displaced);
     }
 
     /// Every field besides receipts is `incoming`'s to decide — merging
@@ -1626,6 +2549,47 @@ mod tests {
         let project = n_frame_project_for_mutate_frame_tests(1);
         write_manifest_atomically(&dir, &project).expect("first write to a fresh directory");
         assert_eq!(read_manifest(&dir).expect("read back manifest"), project);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn write_manifest_atomically_never_reuses_the_legacy_predictable_temp_path() {
+        let dir = temp_project_dir();
+        fs::create_dir_all(&dir).expect("create project directory");
+        let legacy_temp = dir.join(".manifest.json.tmp");
+        fs::write(&legacy_temp, b"do not overwrite").expect("plant legacy temp sentinel");
+
+        let project = n_frame_project_for_mutate_frame_tests(1);
+        write_manifest_atomically(&dir, &project).expect("write manifest");
+
+        assert_eq!(
+            fs::read(&legacy_temp).expect("read legacy temp sentinel"),
+            b"do not overwrite"
+        );
+        assert_eq!(read_manifest(&dir).expect("read manifest"), project);
+        cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_manifest_atomically_does_not_follow_a_legacy_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_project_dir();
+        fs::create_dir_all(&dir).expect("create project directory");
+        let sentinel = dir.join("sentinel.txt");
+        fs::write(&sentinel, b"untouched").expect("write sentinel");
+        let legacy_temp = dir.join(".manifest.json.tmp");
+        symlink(&sentinel, &legacy_temp).expect("plant legacy temp symlink");
+
+        let project = n_frame_project_for_mutate_frame_tests(1);
+        write_manifest_atomically(&dir, &project).expect("write manifest");
+
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"untouched");
+        assert!(fs::symlink_metadata(&legacy_temp)
+            .expect("legacy symlink remains")
+            .file_type()
+            .is_symlink());
         cleanup(&dir);
     }
 

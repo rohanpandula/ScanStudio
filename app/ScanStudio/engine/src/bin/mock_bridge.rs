@@ -130,6 +130,17 @@ fn main() {
         std::env::var("MOCK_BRIDGE_HANG_ON_STATUS_WHILE_PREVIEW_PENDING")
             .map(|v| !v.is_empty())
             .unwrap_or(false);
+    // Optional deterministic ownership-exit trigger for the preview/status
+    // hang seam above. When a hung status request is observed, a watcher exits
+    // this mock process only after the named file exists. This lets an
+    // integration test prove the engine refuses to replace a still-live owner,
+    // then independently prove that reconnect becomes possible after the OS
+    // observes that owner exit. The production bridge has no equivalent knob.
+    let exit_trigger_on_hung_status =
+        std::env::var("MOCK_BRIDGE_EXIT_TRIGGER_ON_HUNG_STATUS")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
     // Unset -> Some(true) (film present, the common case); "false" ->
     // Some(false); "null" -> None (no presence sensor wired) — lets tests
     // exercise all three DeviceStatus.filmPresent states with zero
@@ -376,6 +387,14 @@ fn main() {
                 || (hang_status_while_preview_pending
                     && !state.preview_established.load(Ordering::Acquire)))
         {
+            if let Some(trigger_path) = exit_trigger_on_hung_status.clone() {
+                thread::spawn(move || loop {
+                    if trigger_path.exists() {
+                        std::process::exit(1);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                });
+            }
             continue;
         }
 
@@ -679,7 +698,9 @@ fn handle_request(
             }
             let params: BridgeScanStartParams = parse_params(&request.params)?;
             state.job_counter += 1;
-            let job_id = format!("mock-job-{}", state.job_counter);
+            let job_id = params
+                .job_id
+                .unwrap_or_else(|| format!("mock-job-{}", state.job_counter));
             // MOCK_BRIDGE_HANG_ON_SCAN: accept the job normally (it is a
             // real, well-formed acceptance — the bridge is not refusing or
             // crashing) but never spawn the worker that would emit

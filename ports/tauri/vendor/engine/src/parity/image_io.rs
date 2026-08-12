@@ -38,7 +38,20 @@ pub struct NormalizedMask {
 /// Reads a 16-bit, 3-sample RGB TIFF (or any format the `image` crate can
 /// decode and upconvert to 16-bit RGB).
 pub fn read_rgb16(path: &Path) -> Result<Rgb16Image, ParityError> {
-    let decoded = image::open(path)?.into_rgb16();
+    rgb16_from_dynamic(image::open(path)?)
+}
+
+/// Reads the bridge archive through an already-open identity-checked file
+/// descriptor.  The explicit TIFF format avoids reopening an attacker-
+/// replaceable pathname merely to infer the decoder.
+pub fn read_rgb16_file(file: std::fs::File) -> Result<Rgb16Image, ParityError> {
+    let reader = std::io::BufReader::new(file);
+    let decoded = image::ImageReader::with_format(reader, image::ImageFormat::Tiff).decode()?;
+    rgb16_from_dynamic(decoded)
+}
+
+fn rgb16_from_dynamic(decoded: image::DynamicImage) -> Result<Rgb16Image, ParityError> {
+    let decoded = decoded.into_rgb16();
     let width = decoded.width();
     let height = decoded.height();
     let raw = decoded.into_raw();

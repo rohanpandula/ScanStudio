@@ -90,6 +90,7 @@ export default function PartialDateEditor({ value, onChange }: PartialDateEditor
     const year = currentYearOf(value);
     setDraftYear(year === null ? "" : String(year));
     setDraftMonth(currentMonthOf(value) ?? 1);
+    setPendingPrecision(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [valueKey]);
 
@@ -101,12 +102,16 @@ export default function PartialDateEditor({ value, onChange }: PartialDateEditor
         break;
       case "month": {
         const year = currentYearOf(value);
-        if (year !== null) {
-          // A known year (from any precision) is carried straight over,
-          // never re-guessed; month only defaults to January when unknown.
+        const month = currentMonthOf(value);
+        if (year !== null && month !== null) {
+          // Both known components may be carried over without increasing
+          // precision or inventing metadata.
           setPendingPrecision(null);
-          onChange({ kind: "monthOnly", year, month: currentMonthOf(value) ?? 1 });
+          onChange({ kind: "monthOnly", year, month });
         } else {
+          if (year !== null) setDraftYear(String(year));
+          // The select must display an option, but its January draft is not
+          // authoritative until the operator deliberately changes it.
           setPendingPrecision("month");
         }
         break;

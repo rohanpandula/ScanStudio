@@ -51,6 +51,18 @@ if ($LASTEXITCODE -ne 0) {
     $failures += 1
 }
 
+$identityVerifier = Join-Path $PSScriptRoot '..\..\..\..\scripts\verify_coolscanpy_source.py'
+$coolscanpySource = Join-Path $Root 'CorrespondingSource\coolscanpy'
+$provenancePath = Join-Path $Root 'provenance.json'
+& python -I -B $identityVerifier $coolscanpySource --provenance $provenancePath
+if ($LASTEXITCODE -eq 0) {
+    Write-Host 'PASS  exact CoolscanPy source/version/capture identity'
+}
+else {
+    Write-Host 'FAIL  exact CoolscanPy source/version/capture identity' -ForegroundColor Red
+    $failures += 1
+}
+
 # 3) pinned offline requirements and local-source installer semantics.
 $requirementsPath = Join-Path $Root 'wsl-requirements.txt'
 $requirementsText = if (Test-Path $requirementsPath -PathType Leaf) {

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import types
 import typing
 from dataclasses import dataclass
@@ -99,7 +100,19 @@ def from_wire(data: dict, cls: type) -> object:
     """Inverse of `to_wire` for one dataclass type: camelCase JSON keys ->
     snake_case constructor kwargs, recursing per `cls`'s type annotations.
     A missing required field raises `BridgeError(INVALID_PARAMS)`."""
+    if type(data) is not dict:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"{cls.__name__} must be a JSON object",
+        )
     hints = typing.get_type_hints(cls)
+    known_keys = {to_camel_case(field.name) for field in dataclasses.fields(cls)}
+    unknown_keys = sorted(set(data) - known_keys)
+    if unknown_keys:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"unknown {cls.__name__} field(s): {', '.join(unknown_keys)}",
+        )
     kwargs: dict[str, object] = {}
     for field in dataclasses.fields(cls):
         wire_key = to_camel_case(field.name)
@@ -113,46 +126,153 @@ def from_wire(data: dict, cls: type) -> object:
             raise BridgeError(
                 ErrorCode.INVALID_PARAMS, f"missing required field: {wire_key}"
             )
-        kwargs[field.name] = _decode_value(data[wire_key], hints[field.name])
+        kwargs[field.name] = _decode_value(
+            data[wire_key], hints[field.name], f"{cls.__name__}.{wire_key}"
+        )
     return cls(**kwargs)
 
 
-def _decode_value(value: object, type_: object) -> object:
+def _decode_value(value: object, type_: object, path: str) -> object:
     origin = typing.get_origin(type_)
 
     if origin is typing.Union or origin is types.UnionType:
-        members = [arg for arg in typing.get_args(type_) if arg is not type(None)]
+        union_args = typing.get_args(type_)
+        members = [arg for arg in union_args if arg is not type(None)]
         if value is None:
-            return None
+            if type(None) in union_args:
+                return None
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} may not be null")
         if len(members) == 1:
-            return _decode_value(value, members[0])
+            return _decode_value(value, members[0], path)
         return value  # opaque multi-member union: pass through unchanged
 
     if value is None:
-        return None
+        raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} may not be null")
 
     if isinstance(type_, type) and dataclasses.is_dataclass(type_):
         return from_wire(value, type_)
 
     if isinstance(type_, type) and issubclass(type_, Enum):
-        return type_(value)
+        try:
+            return type_(value)
+        except (TypeError, ValueError) as exc:
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                f"{path} has unsupported value {value!r}",
+            ) from exc
 
     if origin is tuple:
+        if type(value) is not list:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} must be a JSON array")
         args = typing.get_args(type_)
         if len(args) == 2 and args[1] is Ellipsis:
-            return tuple(_decode_value(item, args[0]) for item in value)
-        return tuple(_decode_value(item, arg) for item, arg in zip(value, args))
+            return tuple(
+                _decode_value(item, args[0], f"{path}[{index}]")
+                for index, item in enumerate(value)
+            )
+        if len(value) != len(args):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                f"{path} must contain exactly {len(args)} items",
+            )
+        return tuple(
+            _decode_value(item, arg, f"{path}[{index}]")
+            for index, (item, arg) in enumerate(zip(value, args))
+        )
 
     if origin is list:
+        if type(value) is not list:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} must be a JSON array")
         (element_type,) = typing.get_args(type_) or (object,)
-        return [_decode_value(item, element_type) for item in value]
+        return [
+            _decode_value(item, element_type, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
 
     if origin is dict:
+        if type(value) is not dict:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} must be a JSON object")
         _, value_type = typing.get_args(type_) or (str, object)
-        return {key: _decode_value(item, value_type) for key, item in value.items()}
+        if any(type(key) is not str for key in value):
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} keys must be strings")
+        return {
+            key: _decode_value(item, value_type, f"{path}.{key}")
+            for key, item in value.items()
+        }
+
+    if type_ is bool:
+        if type(value) is not bool:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} must be a boolean")
+        return value
+    if type_ is int:
+        if type(value) is not int:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} must be a whole number")
+        return value
+    if type_ is float:
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} must be a finite number")
+        return float(value)
+    if type_ is str:
+        if type(value) is not str:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"{path} must be a string")
+        return value
 
     # Primitive (str/int/float/bool) or intentionally opaque (e.g. `object`).
     return value
+
+
+def validate_request(request: object) -> dict:
+    """Validate the common request envelope without coercion."""
+
+    if type(request) is not dict:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, "request must be a JSON object")
+    unknown = sorted(set(request) - {"id", "method", "params"})
+    if unknown:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"unknown request field(s): {', '.join(unknown)}",
+        )
+    if (
+        "id" not in request
+        or type(request["id"]) is not int
+        or not 0 <= request["id"] <= 2**64 - 1
+    ):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "id must be a whole number between 0 and 18446744073709551615",
+        )
+    if type(request.get("method")) is not str or not request["method"]:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, "method must be a non-empty string")
+    if "params" in request and type(request["params"]) is not dict:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, "params must be a JSON object")
+    return request
+
+
+def validate_params(
+    request: dict,
+    *,
+    required: tuple[str, ...] = (),
+    optional: tuple[str, ...] = (),
+) -> dict:
+    """Validate one method's exact parameter-key schema."""
+
+    params = request.get("params", {})
+    if type(params) is not dict:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, "params must be a JSON object")
+    allowed = set(required) | set(optional)
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"unknown parameter(s) for {request['method']}: {', '.join(unknown)}",
+        )
+    missing = [name for name in required if name not in params]
+    if missing:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            f"missing required parameter(s) for {request['method']}: {', '.join(missing)}",
+        )
+    return params
 
 
 def read_request(line: str) -> dict:

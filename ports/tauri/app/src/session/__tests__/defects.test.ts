@@ -6,24 +6,8 @@
 import { describe, expect, it } from "vitest";
 import { analyzeFrameDefects, type DefectRequest } from "../store/defects";
 
-const CAPTURE = {
-  resolutionDpi: 4000,
-  bitDepth: 16 as const,
-  multisamplePasses: 1 as const,
-  channels: "rgbi" as const,
-};
-
-const PROCESSING = {
-  filmProcess: "positive" as const,
-  autofocusEachFrame: false,
-  autoExposureEachFrame: false,
-  digitalIceEnabled: true,
-  digitalIceMode: "hybrid" as const,
-  softwareDustRemovalBw: false,
-};
-
 describe("analyzeFrameDefects wrapper", () => {
-  it("calls project.analyzeFrameDefects with frameIndex + resolved recipes", async () => {
+  it("sends only frameIndex so the engine resolves recipes authoritatively", async () => {
     const calls: Array<{ method: string; params: unknown }> = [];
     const request: DefectRequest = async (method, params) => {
       calls.push({ method, params });
@@ -36,9 +20,9 @@ describe("analyzeFrameDefects wrapper", () => {
         transportSmearReason: null,
       };
     };
-    const result = await analyzeFrameDefects(request, 3, CAPTURE, PROCESSING);
+    const result = await analyzeFrameDefects(request, 3);
     expect(calls[0].method).toBe("project.analyzeFrameDefects");
-    expect(calls[0].params).toEqual({ frameIndex: 3, capture: CAPTURE, processing: PROCESSING });
+    expect(calls[0].params).toEqual({ frameIndex: 3 });
     expect(result.frameIndex).toBe(3);
     expect(result.simulated).toBe(true);
   });
@@ -46,6 +30,15 @@ describe("analyzeFrameDefects wrapper", () => {
   it("returns the engine response unchanged, including an honest simulated flag", async () => {
     const request: DefectRequest = async () => ({
       frameIndex: 1,
+      capture: { resolutionDpi: 2000, bitDepth: 16, multisamplePasses: 4, channels: "rgb" },
+      processing: {
+        filmProcess: "bwNegative",
+        autofocusEachFrame: true,
+        autoExposureEachFrame: false,
+        digitalIceEnabled: false,
+        digitalIceMode: "legacy",
+        softwareDustRemovalBw: true,
+      },
       defects: [
         {
           id: 1,
@@ -62,12 +55,21 @@ describe("analyzeFrameDefects wrapper", () => {
       transportSmearFlagged: true,
       transportSmearReason: "smear detected on transport",
     });
-    const result = await analyzeFrameDefects(request, 1, CAPTURE, PROCESSING);
+    const result = await analyzeFrameDefects(request, 1);
     // The response is passed through untouched -- the overlay reads
     // classification/simulated straight off it, never recomputing a
     // threshold or masking the flag.
     expect(result).toEqual({
       frameIndex: 1,
+      capture: { resolutionDpi: 2000, bitDepth: 16, multisamplePasses: 4, channels: "rgb" },
+      processing: {
+        filmProcess: "bwNegative",
+        autofocusEachFrame: true,
+        autoExposureEachFrame: false,
+        digitalIceEnabled: false,
+        digitalIceMode: "legacy",
+        softwareDustRemovalBw: true,
+      },
       defects: [
         {
           id: 1,

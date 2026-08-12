@@ -41,6 +41,7 @@ const PREVIEW_EMPTY: PreviewMetadataCommandResult = {
   exiftoolPath: "/usr/bin/exiftool",
   targets: [],
   arguments: ["-CameraModel=Nikon F6"],
+  fingerprint: "preview-empty-fingerprint",
 };
 
 const PREVIEW_TARGETS: PreviewMetadataCommandResult = {
@@ -52,6 +53,7 @@ const PREVIEW_TARGETS: PreviewMetadataCommandResult = {
     "-overwrite_original",
     "/out/IMG_0001.tiff",
   ],
+  fingerprint: "preview-targets-fingerprint",
 };
 
 const APPLY_RESULT: ApplyMetadataResult = {
@@ -60,6 +62,8 @@ const APPLY_RESULT: ApplyMetadataResult = {
   stdout: "Warning: no file matching /out/IMG_0001.tiff",
   stderr: "Error: nothing to do",
   targets: ["/out/IMG_0001.tiff"],
+  arguments: PREVIEW_TARGETS.arguments,
+  fingerprint: PREVIEW_TARGETS.fingerprint,
 };
 
 async function fixture(): Promise<SessionStore> {
@@ -158,6 +162,34 @@ describe("FrameMetadataOverride", () => {
     expect(screen.getByTestId("override-metadata-toggle")).toBeChecked();
     await user.click(screen.getByTestId("override-metadata-toggle"));
     expect(onSetOverride).toHaveBeenCalledWith(null);
+  });
+
+  it("invalidates a reviewed command after metadata changes until a fresh preview arrives", async () => {
+    await fixture();
+    const onSetOverride = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(
+      renderOverride({
+        override: { camera: "Nikon F6", keywords: [] },
+        metadataPreview: PREVIEW_TARGETS,
+        onSetOverride,
+      }),
+    );
+    expect(screen.getByTestId("apply-metadata")).toBeEnabled();
+
+    await user.click(screen.getByTestId("clear-metadata-override"));
+
+    expect(onSetOverride).toHaveBeenCalledWith(null);
+    expect(screen.getByTestId("apply-metadata")).toBeDisabled();
+    expect(screen.queryByTestId("exiftool-arguments")).toBeNull();
+
+    rerender(
+      renderOverride({
+        metadataPreview: { ...PREVIEW_TARGETS },
+        onSetOverride,
+      }),
+    );
+    await waitFor(() => expect(screen.getByTestId("apply-metadata")).toBeEnabled());
   });
 
   it("shows effective metadata read-only when no override is set", async () => {

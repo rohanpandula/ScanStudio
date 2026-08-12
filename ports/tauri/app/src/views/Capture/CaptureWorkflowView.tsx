@@ -16,6 +16,10 @@ let cachedStore: unknown = null;
 let cachedSnapshot: Readonly<SessionState> | null = null;
 
 function stableSubscribe(listener: () => void): () => void {
+  // This view may be unmounted while Windows setup is visible. Discard a
+  // snapshot retained from the prior mount so React's post-subscribe check
+  // observes a job that became active while the view was away.
+  cachedSnapshot = null;
   const unsubscribe = sessionStore.subscribe(() => {
     cachedSnapshot = null;
     listener();

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSyncExternalStore } from "react";
 import AppShell from "./shell/AppShell";
 import ContactSheet from "./views/ContactSheet";
@@ -45,8 +45,34 @@ function isWindows(): boolean {
 function App() {
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const [workspace, setWorkspace] = useState<Workspace>({ kind: "contact" });
+  const [workspaceBeforeSetup, setWorkspaceBeforeSetup] = useState<Workspace | null>(null);
   const selectedFrames = state.selectedFrameIndices;
   const windows = isWindows();
+  const hardwareJobActive =
+    state.connection.device?.kind === "real" &&
+    state.jobState !== null &&
+    !["completed", "stopped", "failed"].includes(state.jobState);
+
+  useEffect(() => {
+    // A job may become active while setup is already visible (for example,
+    // after a delayed scan.start response). Immediately restore the workspace
+    // that owns Stop instead of leaving hardware controls behind setup.
+    if (hardwareJobActive && workspace.kind === "windows-setup") {
+      setWorkspace(workspaceBeforeSetup ?? { kind: "contact" });
+      setWorkspaceBeforeSetup(null);
+    }
+  }, [hardwareJobActive, workspace.kind, workspaceBeforeSetup]);
+
+  const toggleWindowsSetup = (): void => {
+    if (workspace.kind === "windows-setup") {
+      setWorkspace(workspaceBeforeSetup ?? { kind: "contact" });
+      setWorkspaceBeforeSetup(null);
+      return;
+    }
+    if (hardwareJobActive) return;
+    setWorkspaceBeforeSetup(workspace);
+    setWorkspace({ kind: "windows-setup" });
+  };
 
   return (
     <AppShell
@@ -92,13 +118,9 @@ function App() {
               type="button"
               className={styles.windowsSetupButton}
               data-testid="windows-setup-action"
-              onClick={() =>
-                setWorkspace((current) =>
-                  current.kind === "windows-setup"
-                    ? { kind: "contact" }
-                    : { kind: "windows-setup" },
-                )
-              }
+              disabled={hardwareJobActive}
+              title={hardwareJobActive ? "Stop controls stay visible while real hardware is scanning" : undefined}
+              onClick={toggleWindowsSetup}
             >
               {workspace.kind === "windows-setup" ? "Back to film" : "Check Windows setup"}
             </button>

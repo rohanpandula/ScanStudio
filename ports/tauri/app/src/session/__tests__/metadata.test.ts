@@ -34,6 +34,7 @@ const PREVIEW: PreviewMetadataCommandResult = {
   exiftoolPath: "/usr/bin/exiftool",
   targets: ["/out/IMG_0001.tiff"],
   arguments: ["-CameraModel=Test", "-overwrite_original", "/out/IMG_0001.tiff"],
+  fingerprint: "metadata-preview-fingerprint",
 };
 
 const APPLY: ApplyMetadataResult = {
@@ -42,6 +43,8 @@ const APPLY: ApplyMetadataResult = {
   stdout: "    1 image files updated",
   stderr: "",
   targets: ["/out/IMG_0001.tiff"],
+  arguments: PREVIEW.arguments,
+  fingerprint: PREVIEW.fingerprint,
 };
 
 const PROJECT: ScanProject = {
@@ -139,18 +142,25 @@ describe("previewMetadataCommand", () => {
 });
 
 describe("applyMetadata", () => {
-  it("calls project.applyMetadata with only frameIndex (never an argument list) and returns the result", async () => {
+  it("sends the reviewed fingerprint but never a client argument list", async () => {
     const { request, calls } = capturingRequest(APPLY);
-    await expect(applyMetadata(request, 1)).resolves.toEqual(APPLY);
-    expect(calls).toEqual([{ method: "project.applyMetadata", params: { frameIndex: 1 } }]);
-    // Safety property (T-07-01): the only param ever sent is frameIndex.
-    expect(Object.keys(calls[0].params as Record<string, unknown>)).toEqual(["frameIndex"]);
+    await expect(applyMetadata(request, 1, PREVIEW.fingerprint)).resolves.toEqual(APPLY);
+    expect(calls).toEqual([
+      {
+        method: "project.applyMetadata",
+        params: { frameIndex: 1, previewFingerprint: PREVIEW.fingerprint },
+      },
+    ]);
+    expect(Object.keys(calls[0].params as Record<string, unknown>)).toEqual([
+      "frameIndex",
+      "previewFingerprint",
+    ]);
   });
 
   it("returns null (never throws) when the request rejects", async () => {
     const request = (): Promise<unknown> =>
       Promise.reject({ code: "INVALID_PARAMS", message: "no scanned outputs yet", recoverable: false });
-    await expect(applyMetadata(request, 1)).resolves.toBeNull();
+    await expect(applyMetadata(request, 1, PREVIEW.fingerprint)).resolves.toBeNull();
   });
 });
 

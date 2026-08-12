@@ -98,6 +98,9 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
   // immediate is not real-hardware-safe; the connected backend exposes it
   // only when simulated).
   const supportsImmediateStop = state.connection.device?.kind === "simulated";
+  const mediaLoaded = state.connection.connected && state.connection.status?.mediaLoaded === true;
+  const [ejectPending, setEjectPending] = useState(false);
+  const [ejectResult, setEjectResult] = useState<"succeeded" | EngineError | null>(null);
 
   // Cumulative event ticker built from store state changes: every frame-state
   // transition and every failing error produce an entry, capped at the 200
@@ -148,6 +151,25 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
   const loadPending = async (): Promise<void> => {
     const pending = await sessionStore.pendingFrames();
     if (onResume !== undefined) onResume(pending);
+  };
+
+  const eject = async (): Promise<void> => {
+    if (ejectPending) return;
+    setEjectPending(true);
+    setEjectResult(null);
+    try {
+      await sessionStore.eject();
+      setEjectResult("succeeded");
+    } catch (reason) {
+      const error = reason as Partial<EngineError>;
+      setEjectResult({
+        code: typeof error.code === "string" ? error.code : "INTERNAL",
+        message: typeof error.message === "string" ? error.message : "eject failed",
+        recoverable: error.recoverable === true,
+      });
+    } finally {
+      setEjectPending(false);
+    }
   };
 
   return (
@@ -208,10 +230,21 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
           type="button"
           className={styles.controlButton}
           data-testid="eject-control"
-          disabled={jobActive}
+          disabled={jobActive || ejectPending || !mediaLoaded}
+          onClick={() => void eject()}
         >
-          Eject
+          {ejectPending ? "Ejecting…" : "Eject"}
         </button>
+        {ejectResult === "succeeded" && (
+          <p className={styles.hint} data-testid="eject-success">
+            Eject completed.
+          </p>
+        )}
+        {ejectResult !== null && ejectResult !== "succeeded" && (
+          <p className={styles.frameError} data-testid="eject-error">
+            {ejectResult.code} — {ejectResult.message}
+          </p>
+        )}
         <button
           type="button"
           className={styles.controlButton}

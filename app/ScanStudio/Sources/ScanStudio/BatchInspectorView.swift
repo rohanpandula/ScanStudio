@@ -1787,15 +1787,14 @@ struct PartialDateEditor: View {
                     pendingPrecision = nil
                     date = .unknown
                 case .month:
-                    // A year already known (even from a lesser- or
-                    // greater-precision existing value) is carried straight
-                    // over — never re-guessed, never dropped — with month
-                    // defaulting to January only when no month is already
-                    // known either. No year known at all: defer (below)
-                    // rather than inventing one.
-                    if let year = currentYear {
+                    // Carry both known components, but never promote a
+                    // year-only value by treating the picker's required
+                    // January display value as operator-supplied metadata.
+                    if let committed = PartialDatePrecisionPolicy
+                        .monthCommitWhenSelectingPrecision(from: date)
+                    {
                         pendingPrecision = nil
-                        date = .monthOnly(year: year, month: currentMonth ?? 1)
+                        date = committed
                     } else {
                         pendingPrecision = .month
                         resyncDrafts()

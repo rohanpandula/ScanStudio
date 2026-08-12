@@ -72,6 +72,24 @@ public enum ManualFramePlacementValidation {
         Array(Set(rows)).sorted()
     }
 
+    /// Replaces the boundary currently owned by an in-flight drag. The view
+    /// passes the previous callback's destination as `currentRow`, never the
+    /// gesture's original anchor, so repeated callbacks move one line rather
+    /// than accumulating ghost boundaries. A collision is a no-op and never
+    /// silently reduces the boundary count.
+    public static func movingBoundary(
+        in rows: [Int],
+        currentRow: Int,
+        to destinationRow: Int
+    ) -> [Int] {
+        let normalized = normalize(rows)
+        guard normalized.contains(currentRow) else { return normalized }
+        guard destinationRow == currentRow || !normalized.contains(destinationRow) else {
+            return normalized
+        }
+        return normalize(normalized.map { $0 == currentRow ? destinationRow : $0 })
+    }
+
     /// A plain-English reason `rows` cannot be submitted yet, or `nil` when
     /// they are ready to send. Checks gate order mirrors the server's own
     /// (structure, then frame count, then per-frame height) so a

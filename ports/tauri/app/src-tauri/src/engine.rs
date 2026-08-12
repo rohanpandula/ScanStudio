@@ -173,6 +173,26 @@ pub fn dispatch_line(line: &str, pending: &PendingMap, on_event: &dyn Fn(Value))
         Ok(v) => v,
         Err(_) => return, // ignore malformed / non-protocol stdout noise
     };
+    dispatch_value(parsed, pending, on_event);
+}
+
+/// Production dispatcher: strips local filesystem paths out of every engine
+/// `imagePath` before routing a result/event into the renderer-facing store.
+fn dispatch_line_with_preview_access(
+    line: &str,
+    pending: &PendingMap,
+    access: &crate::preview::PreviewAccess,
+    on_event: &dyn Fn(Value),
+) {
+    let mut parsed: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    crate::preview::replace_engine_image_paths(&mut parsed, access);
+    dispatch_value(parsed, pending, on_event);
+}
+
+fn dispatch_value(parsed: Value, pending: &PendingMap, on_event: &dyn Fn(Value)) {
     if let Some(id) = parsed.get("id").and_then(|v| v.as_u64()) {
         let sender = pending.lock().unwrap().remove(&id);
         if let Some(sender) = sender {
@@ -264,6 +284,12 @@ pub fn spawn_engine<R: Runtime>(
     app: &AppHandle<R>,
     command: Command,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Production registers this on the builder before the URI protocol is
+    // available. Windowless integration tests call spawn_engine directly,
+    // so give them the same state without requiring test-only setup code.
+    if app.try_state::<crate::preview::PreviewAccess>().is_none() {
+        app.manage(crate::preview::PreviewAccess::default());
+    }
     let (mut rx, child) = command.spawn()?;
     let (handshake_tx, _handshake_rx) = watch::channel(HandshakeState::Pending);
     app.manage(EngineHandle {
@@ -279,10 +305,16 @@ pub fn spawn_engine<R: Runtime>(
                 CommandEvent::Stdout(line_bytes) => {
                     let line = String::from_utf8_lossy(&line_bytes).to_string();
                     let state = app_handle.state::<EngineHandle>();
+                    let preview_access = app_handle.state::<crate::preview::PreviewAccess>();
                     let handle_for_emit = app_handle.clone();
-                    dispatch_line(&line, &state.pending, &|payload| {
-                        let _ = handle_for_emit.emit("engine://event", payload);
-                    });
+                    dispatch_line_with_preview_access(
+                        &line,
+                        &state.pending,
+                        &preview_access,
+                        &|payload| {
+                            let _ = handle_for_emit.emit("engine://event", payload);
+                        },
+                    );
                 }
                 CommandEvent::Stderr(bytes) => {
                     eprintln!("[engine stderr] {}", String::from_utf8_lossy(&bytes));

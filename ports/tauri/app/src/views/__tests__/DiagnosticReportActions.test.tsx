@@ -19,12 +19,9 @@ import DiagnosticReportActions from "../DiagnosticReportActions";
 const sessionMocks = vi.hoisted(() => ({ diagnosticTimeline: null as unknown }));
 vi.mock("../../session", () => sessionMocks);
 
-const dialogMocks = vi.hoisted(() => ({ save: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => dialogMocks);
-
 const bundleIOMocks = vi.hoisted(() => ({
   readPreviewRasterBytes: vi.fn(),
-  writeDiagnosticBundleFile: vi.fn(),
+  saveDiagnosticBundleFile: vi.fn(),
 }));
 vi.mock("../../session/diagnosticBundleIO", () => bundleIOMocks);
 
@@ -82,9 +79,8 @@ function baseProps() {
 }
 
 beforeEach(() => {
-  dialogMocks.save.mockReset();
   bundleIOMocks.readPreviewRasterBytes.mockReset();
-  bundleIOMocks.writeDiagnosticBundleFile.mockReset();
+  bundleIOMocks.saveDiagnosticBundleFile.mockReset();
   clipboardMocks.writeText.mockReset();
   hostEnvironmentMocks.getScanStudioVersion.mockReset();
   hostEnvironmentMocks.describeOperatingSystem.mockReset();
@@ -183,21 +179,21 @@ describe("DiagnosticReportActions", () => {
     expect(text).toContain("- wsl-status: Ok -- WSL2 with Ubuntu-24.04 default");
   });
 
-  it("saves a diagnostic bundle zip to the chosen path and skips writing when the dialog is cancelled", async () => {
+  it("saves through the native one-use dialog command and handles cancellation", async () => {
     bundleIOMocks.readPreviewRasterBytes.mockResolvedValue(null);
-    dialogMocks.save.mockResolvedValueOnce(null);
+    bundleIOMocks.saveDiagnosticBundleFile.mockResolvedValueOnce(false);
     render(<DiagnosticReportActions {...baseProps()} error={NOT_CONNECTED_ERROR} />);
 
     fireEvent.click(screen.getByTestId("save-diagnostic-bundle"));
-    await waitFor(() => expect(dialogMocks.save).toHaveBeenCalled());
-    expect(bundleIOMocks.writeDiagnosticBundleFile).not.toHaveBeenCalled();
+    await waitFor(() => expect(bundleIOMocks.saveDiagnosticBundleFile).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("save-diagnostic-bundle")).not.toHaveTextContent("Saved");
 
-    dialogMocks.save.mockResolvedValueOnce("/chosen/ScanStudio-Diagnostics.zip");
+    bundleIOMocks.saveDiagnosticBundleFile.mockResolvedValueOnce(true);
     fireEvent.click(screen.getByTestId("save-diagnostic-bundle"));
-    await waitFor(() => expect(bundleIOMocks.writeDiagnosticBundleFile).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(bundleIOMocks.saveDiagnosticBundleFile).toHaveBeenCalledTimes(2));
 
-    const [path, bytes] = bundleIOMocks.writeDiagnosticBundleFile.mock.calls[0] as [string, Uint8Array];
-    expect(path).toBe("/chosen/ScanStudio-Diagnostics.zip");
+    const [suggestedName, bytes] = bundleIOMocks.saveDiagnosticBundleFile.mock.calls[1] as [string, Uint8Array];
+    expect(suggestedName).toMatch(/^ScanStudio-Diagnostics-.*\.zip$/);
     // A stored-zip local file header signature ("PK\x03\x04") -- proves a
     // real archive was assembled and handed to the writer, not empty bytes.
     expect(Array.from(bytes.slice(0, 4))).toEqual([0x50, 0x4b, 0x03, 0x04]);

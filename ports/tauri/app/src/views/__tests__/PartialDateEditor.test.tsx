@@ -64,12 +64,16 @@ describe("PartialDateEditor", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("carries a known year when switching to Month from an existing year-only value", async () => {
+  it("does not fabricate January when switching a year-only value to Month", async () => {
     const onChange = vi.fn();
     renderEditor({ kind: "yearOnly", year: 1985 }, onChange);
     const user = userEvent.setup();
     await user.click(screen.getByTestId("date-precision-month"));
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("date-year-input")).toHaveValue("1985");
+
+    await user.selectOptions(screen.getByTestId("date-month-select"), "6");
     expect(onChange).toHaveBeenCalledTimes(1);
-    expect(onChange.mock.calls[0][0]).toEqual({ kind: "monthOnly", year: 1985, month: 1 });
+    expect(onChange.mock.calls[0][0]).toEqual({ kind: "monthOnly", year: 1985, month: 6 });
   });
 });
