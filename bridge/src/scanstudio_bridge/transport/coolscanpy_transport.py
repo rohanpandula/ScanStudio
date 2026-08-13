@@ -1565,14 +1565,11 @@ class CoolscanPyTransport:
     def eject(self) -> bool:
         if self._device is None:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
-        # Route through the open Roll when one exists. On the pinned
-        # coolscanpy `Roll.eject()` is a plain passthrough to
-        # `Device.eject()`, so behavior is identical today -- but the
-        # vendor-traced held-session eject (RESERVE_UNIT before the eject
-        # CDB, proven live 2026-07-20 from a normal post-traversal state)
-        # lands on `Roll` first (see coolscanpy's capture branch), so this
-        # routing picks it up with zero bridge changes the day the pin
-        # advances. The callable guard keeps duck-typed Roll doubles
+        # Route through the open Roll when one exists: on the current pin
+        # `Roll.eject()` replays the vendor-traced held-session eject
+        # sequence (RESERVE_UNIT before the eject CDB, proven live
+        # 2026-07-20), which is only valid while a preview's reservation
+        # is still held. The callable guard keeps duck-typed Roll doubles
         # without an eject method on the device route instead of dying
         # with an AttributeError.
         roll = self._roll
@@ -1580,11 +1577,16 @@ class CoolscanPyTransport:
             target = roll
         else:
             target = self._device
-        # Future-pin exception (capture branch): Roll.eject() with no held
-        # reservation raises EjectNotAvailable, which is NOT an EjectFailed
-        # subclass. Resolved per call so the editable pin advancing is
-        # picked up without a bridge restart ordering hazard; the empty
-        # tuple makes the except clause match nothing on today's pin.
+        # True whenever the eject that produced `ejected` ran through the
+        # vendor Device route (directly, or as the fallback below) -- that
+        # route reports acceptance, not actuation, so its success must be
+        # confirmed before it is reported (see _require_vendor_eject_confirmed).
+        vendor_route = target is self._device
+        # Roll.eject() with no held reservation raises EjectNotAvailable,
+        # which is NOT an EjectFailed subclass. Exported by the pinned
+        # coolscanpy since 2026-08-07; still resolved per call so a pin
+        # without the symbol degrades to an empty tuple (matching nothing)
+        # instead of an AttributeError at import order.
         eject_not_available: tuple[type[BaseException], ...] = tuple(
             cls
             for cls in (getattr(coolscanpy, "EjectNotAvailable", None),)
@@ -1609,7 +1611,42 @@ class CoolscanPyTransport:
         except coolscanpy.EjectFailed as exc:
             raise BridgeError(ErrorCode.EJECT_FAILED, str(exc)) from exc
         except eject_not_available as exc:
-            raise BridgeError(ErrorCode.EJECT_FAILED, str(exc)) from exc
+            if target is not roll:
+                # Defensive, should be unreachable: EjectNotAvailable is
+                # raised only by Roll.eject(), never by Device.eject().
+                raise BridgeError(ErrorCode.EJECT_FAILED, str(exc)) from exc
+            # A failed preview's fail-closed teardown already released the
+            # held reservation (coolscanpy 0.2.0), so Roll.eject() refuses
+            # here WITHOUT having sent any command -- the film is still
+            # physically inside (field reports #16 #68 #76: power cycle was
+            # the only way out). No eject has been attempted yet, so fall
+            # back to the capability-gated vendor eject on Device before
+            # giving up. Every fallback outcome keeps the direct device
+            # route's typed mapping, and success below still requires a
+            # confirmed ejected=True -- the fallback adds a second attempt,
+            # never a weaker acceptance.
+            vendor_route = True
+            try:
+                ejected = bool(self._device.eject())
+            except ImportError as fallback_exc:
+                raise BridgeError(
+                    ErrorCode.EJECT_FAILED,
+                    "real eject requires the coolscanpy[scanner] extra and SANE installed -- see README",
+                ) from fallback_exc
+            except coolscanpy.DeviceBusy as fallback_exc:
+                raise BridgeError(
+                    ErrorCode.DEVICE_BUSY, str(fallback_exc)
+                ) from fallback_exc
+            except coolscanpy.FeederParked as fallback_exc:
+                raise BridgeError(
+                    ErrorCode.FEEDER_PARKED, str(fallback_exc)
+                ) from fallback_exc
+            except coolscanpy.EjectFailed as fallback_exc:
+                raise BridgeError(
+                    ErrorCode.EJECT_FAILED, str(fallback_exc)
+                ) from fallback_exc
+        if ejected and vendor_route:
+            self._require_vendor_eject_confirmed()
         if not ejected:
             # A capability-gated no-op is NOT an eject: the film is still
             # inside the feeder. Returning success here would be exactly
@@ -1621,12 +1658,53 @@ class CoolscanPyTransport:
             )
         # The strip is out: the roll session and preview no longer
         # describe loaded film. Close-first ordering on purpose -- if
-        # close() raises (surfaced as INTERNAL by service.py's boundary),
-        # `self._roll` stays set so `device.close` can still close
-        # Roll-then-Device in the order coolscanpy requires.
+        # close() raises, `self._roll` stays set so `device.close` can
+        # still close Roll-then-Device in the order coolscanpy requires.
+        # The failure is raised typed as INTERNAL with a message that says
+        # the film IS out: letting it reach service.py's generic eject
+        # boundary would report "eject failed" for a completed eject.
         if self._roll is not None:
-            self._roll.close()
+            try:
+                self._roll.close()
+            except Exception as exc:
+                raise BridgeError(
+                    ErrorCode.INTERNAL,
+                    "the film was ejected, but closing the roll session "
+                    f"afterwards failed ({type(exc).__name__}: {exc}); "
+                    "disconnect and reconnect before the next preview",
+                ) from exc
             self._roll = None
         self._material = None
         self._preview_established = False
         return True
+
+    def _require_vendor_eject_confirmed(self) -> None:
+        # The vendor eject reports acceptance, not actuation: the LS-5000
+        # can accept the eject CDB with clean sense and never move
+        # (INCIDENT-20260719-eject-from-park, reconfirmed 2026-07-24 from
+        # the 022b4b wedge). The Roll route confirms actuation through the
+        # worker journal; the Device route must confirm through the
+        # motion-free film-presence probe before any success is reported.
+        # The probe's None means "could not determine" -- per its own
+        # contract it must never be read as film-absent -- so anything
+        # short of a definite False fails closed.
+        probe = getattr(self._device, "film_present", None)
+        present: bool | None = None
+        if callable(probe):
+            try:
+                present = probe()
+            except Exception:
+                present = None
+        if present is True:
+            raise BridgeError(
+                ErrorCode.FEEDER_PARKED,
+                "the vendor eject was accepted but the film is still "
+                "present; the transport did not actuate -- a power cycle "
+                "is the only demonstrated recovery",
+            )
+        if present is not False:
+            raise BridgeError(
+                ErrorCode.EJECT_FAILED,
+                "the vendor eject was accepted but film presence could "
+                "not be confirmed clear; treat the film as still loaded",
+            )

@@ -592,6 +592,38 @@ def test_device_eject_bridge_error_from_transport_records_error_telemetry(
     assert "power cycle" in error_entry["message"]
 
 
+def test_device_eject_unmapped_transport_exception_is_eject_failed_not_internal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transport/driver exception outside the transport's mapped ladder
+    must reach the wire as a typed EJECT_FAILED with a code+message
+    telemetry line -- not fall through to cli.py's catch-all INTERNAL,
+    which is how the #16/#68/#76 eject failures shipped undiagnosable."""
+
+    class _ExplodingTransport(_StubTransport):
+        def eject(self) -> bool:
+            raise RuntimeError("capture worker reaped mid-eject")
+
+    svc = _opened_service(tmp_path, _ExplodingTransport())
+    _arm(monkeypatch, tmp_path)
+    emit = _RecordingEmit()
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch({"id": 2, "method": "device.eject"}, emit)
+
+    assert excinfo.value.code == ErrorCode.EJECT_FAILED
+    assert "RuntimeError" in str(excinfo.value)
+    assert "capture worker reaped mid-eject" in str(excinfo.value)
+    assert not emit.has("device.status")
+    error_entry = next(
+        e
+        for e in _telemetry_entries(tmp_path)
+        if e["method"] == "device.eject" and e["outcome"] == "error"
+    )
+    assert error_entry["code"] == ErrorCode.EJECT_FAILED.value
+    assert "RuntimeError" in error_entry["message"]
+
+
 def test_device_eject_success_clears_preview_material_so_scan_start_is_no_preview(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
