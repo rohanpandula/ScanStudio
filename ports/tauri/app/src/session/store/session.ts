@@ -619,7 +619,14 @@ export function validateRecipe(
       message: `bitDepth must be 8 or 16 (got ${capture.bitDepth})`,
     };
   }
-  const multisampleOptions = ctx.supportedMultisamplePasses ?? VALID_MULTISAMPLE_PASSES;
+  // Intersect, never replace: the device's advertised set narrows the
+  // protocol invariant {1,2,4,8,16}, but a device advertising a value
+  // outside it must not widen what this validator accepts.
+  const multisampleOptions = ctx.supportedMultisamplePasses
+    ? ctx.supportedMultisamplePasses.filter((passes) =>
+        VALID_MULTISAMPLE_PASSES.includes(passes),
+      )
+    : VALID_MULTISAMPLE_PASSES;
   if (!multisampleOptions.includes(capture.multisamplePasses)) {
     return {
       valid: false,

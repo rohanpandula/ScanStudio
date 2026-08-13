@@ -195,6 +195,25 @@ describe("SessionStore recipe mirroring (pure helpers)", () => {
     ).toEqual({ valid: true });
   });
 
+  it("intersects the device's set with the protocol invariant instead of replacing it", () => {
+    // A device advertising a value outside {1,2,4,8,16} narrows nothing
+    // for that value: 3 stays invalid even when the wire claims it, and a
+    // protocol-valid value outside the (filtered) device set stays
+    // rejected on the device bound.
+    expectInvalid(
+      { capture: { ...VALID_CAPTURE, multisamplePasses: 3 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      { requestedFrames: [1], supportedMultisamplePasses: [3, 4] },
+      "capture.multisamplePasses",
+      /must be one of 4/,
+    );
+    expect(
+      validateRecipe(
+        { capture: { ...VALID_CAPTURE, multisamplePasses: 4 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+        { requestedFrames: [1], supportedMultisamplePasses: [3, 4] },
+      ),
+    ).toEqual({ valid: true });
+  });
+
   it("forces channels to rgb and digitalIceEnabled to false for bwNegative", () => {
     const effective = resolveEffectiveProcessing({
       ...VALID_PROCESSING,
