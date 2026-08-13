@@ -101,6 +101,25 @@ from scanstudio_bridge.transport.output_reservation import (
 # startup.
 _GIT_HEAD_SHA_TIMEOUT_SECONDS = 5.0
 
+# LV-2 (2026-08-13 live validation, shortstrip-lab/live-attempts/
+# 20260813-beta8-linux-validation/RESULT.md +
+# vm-logs/eject-nopreview-194010.log): on a real LS-5000, a genuinely
+# successful vendor eject's confirmation probe (Device.film_present(), see
+# _require_vendor_eject_confirmed) can land inside the scanner's
+# post-motion UNIT ATTENTION drain (sense 063f04/062800 before it settles
+# to 023a00) and read back an indeterminate None -- not because the film
+# is still loaded, but because the drain hasn't cleared yet. Motion-free
+# probes ~15-20s later returned a definitive film_present=False. These two
+# constants bound how long _require_vendor_eject_confirmed retries a None
+# verdict before it gives up and fails closed: the total settle window,
+# and the pause between successive probes within it. Today's drain
+# settled well inside the total (RESULT.md's own estimate is ~10s of
+# draining attentions). A definite True or False verdict at ANY attempt
+# still resolves immediately -- these constants only bound how long an
+# INDETERMINATE probe is retried.
+_VENDOR_EJECT_CONFIRM_SETTLE_SECONDS = 15.0
+_VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS = 1.0
+
 _DEVICE_VENDOR = "Nikon"
 _DEVICE_MODEL = "SUPER COOLSCAN 5000 ED"
 
@@ -1688,23 +1707,48 @@ class CoolscanPyTransport:
         # The probe's None means "could not determine" -- per its own
         # contract it must never be read as film-absent -- so anything
         # short of a definite False fails closed.
+        #
+        # LV-2 (see _VENDOR_EJECT_CONFIRM_SETTLE_SECONDS above for the full
+        # evidence citation): a None straight after the eject call returns
+        # can just be the scanner's post-motion UNIT ATTENTION drain, not a
+        # failed eject. Retry a None verdict with short sleeps up to the
+        # bounded settle window below before giving up. A definite verdict
+        # at any attempt -- True or False -- resolves immediately and is
+        # never retried further: False confirms the eject (below); True is
+        # the accepted-without-progress wedge
+        # (INCIDENT-20260719-eject-from-park) reaching its own typed
+        # outcome, not a draining attention, and burning the rest of the
+        # settle window on a park that will never clear on its own would
+        # only delay reporting it -- this exact shape fired live on the
+        # MA-21 today (vm-logs/ma21-201040.log) and must keep surfacing
+        # FEEDER_PARKED without delay. This method holds no lock of its
+        # own; the caller's HardwareLane (service.py's device.eject
+        # handler) does not gate device.status, so sleeping here never
+        # blocks a status poll.
         probe = getattr(self._device, "film_present", None)
+        probe_callable = callable(probe)
+        deadline = time.monotonic() + _VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
         present: bool | None = None
-        if callable(probe):
-            try:
-                present = probe()
-            except Exception:
-                present = None
-        if present is True:
-            raise BridgeError(
-                ErrorCode.FEEDER_PARKED,
-                "the vendor eject was accepted but the film is still "
-                "present; the transport did not actuate -- a power cycle "
-                "is the only demonstrated recovery",
-            )
-        if present is not False:
-            raise BridgeError(
-                ErrorCode.EJECT_FAILED,
-                "the vendor eject was accepted but film presence could "
-                "not be confirmed clear; treat the film as still loaded",
-            )
+        while True:
+            if probe_callable:
+                try:
+                    present = probe()
+                except Exception:
+                    present = None
+            if present is True:
+                raise BridgeError(
+                    ErrorCode.FEEDER_PARKED,
+                    "the vendor eject was accepted but the film is still "
+                    "present; the transport did not actuate -- a power cycle "
+                    "is the only demonstrated recovery",
+                )
+            if present is False:
+                return
+            if not probe_callable or time.monotonic() >= deadline:
+                break
+            time.sleep(_VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS)
+        raise BridgeError(
+            ErrorCode.EJECT_FAILED,
+            "the vendor eject was accepted but film presence could "
+            "not be confirmed clear; treat the film as still loaded",
+        )

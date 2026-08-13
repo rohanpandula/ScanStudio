@@ -205,7 +205,28 @@ class _FakeDevice:
         # (undetermined) mirrors the pre-probe default; vendor-route eject
         # success tests set False (confirmed-out) explicitly, and the
         # accepted-without-progress / unconfirmable shapes set True/None.
+        #
+        # LV-2 settle-window coverage: this also accepts a `list` of
+        # per-call values (each element a bool/None verdict, or an
+        # exception instance to raise for that call), exercising
+        # _require_vendor_eject_confirmed's retry loop one scripted probe
+        # at a time -- e.g. `[None, None, False]` for "settles clear after
+        # two indeterminate reads" or `[None, True]` for "settles into the
+        # accepted-without-progress wedge". While more than one element
+        # remains, each call POPS the next one; once only one element is
+        # left (including a plain single-item list), that element is
+        # returned/raised on every further call instead of raising
+        # IndexError -- a test scripting the exhausted-retries shape can
+        # therefore just write a bare scalar (or a one-item list) for
+        # "returns None forever" without having to predict the fix's exact
+        # retry count. A bare (non-list) value keeps its original meaning
+        # unchanged: return/raise that one value on every call.
         self.film_present_result: object = None
+        # Counts every film_present() call, list-scripted or scalar --
+        # lets a test assert exactly how many times the settle loop probed
+        # (e.g. ==1 for an immediate definite verdict, >1 for a settle
+        # retry) without inferring it indirectly from elapsed fake time.
+        self.film_present_calls = 0
         self.closed = False
         self.capabilities = _fake_capabilities()
         # Plan 10-09 (attempts-root persistence): records exactly what
@@ -225,9 +246,15 @@ class _FakeDevice:
         return self.eject_effect
 
     def film_present(self) -> bool | None:
-        if isinstance(self.film_present_result, BaseException):
-            raise self.film_present_result
-        return self.film_present_result
+        self.film_present_calls += 1
+        result = self.film_present_result
+        if isinstance(result, list):
+            value = result.pop(0) if len(result) > 1 else (result[0] if result else None)
+        else:
+            value = result
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
     def close(self) -> None:
         self.closed = True
@@ -3287,13 +3314,48 @@ def test_eject_fallback_device_busy_maps_typed(
     assert roll.closed is False
 
 
+class _FakeEjectConfirmClock:
+    """Deterministic stand-in for `time.monotonic`/`time.sleep`, patched in
+    via `_patch_eject_confirm_clock` the same way this file's git-provenance
+    tests below patch `coolscanpy_transport_module.subprocess.run`: the
+    real `time` module's own `monotonic`/`sleep` attributes are replaced
+    for the duration of one test (monkeypatch restores them afterward).
+    `sleep()` advances `monotonic()` by the exact requested amount instead
+    of actually blocking, so `_require_vendor_eject_confirmed`'s full
+    `_VENDOR_EJECT_CONFIRM_SETTLE_SECONDS` bound (LV-2) can be exercised
+    without a test taking anywhere near that long in real wall time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleep_calls: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleep_calls.append(seconds)
+        self.now += seconds
+
+
+def _patch_eject_confirm_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _FakeEjectConfirmClock:
+    clock = _FakeEjectConfirmClock()
+    monkeypatch.setattr(coolscanpy_transport_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(coolscanpy_transport_module.time, "sleep", clock.sleep)
+    return clock
+
+
 def test_vendor_eject_still_present_after_accept_is_feeder_parked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The vendor eject reports acceptance, not actuation
     (INCIDENT-20260719-eject-from-park): a clean scanimage exit with film
     still present is the accepted-without-progress wedge and must surface
-    as FEEDER_PARKED, never as success."""
+    as FEEDER_PARKED, never as success -- immediately, on the very first
+    probe, spending none of LV-2's settle window: that window is for a
+    genuinely INDETERMINATE None, never for waiting out a definite True."""
+    clock = _patch_eject_confirm_clock(monkeypatch)
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
     device.eject_effect = True
     device.film_present_result = True
@@ -3303,14 +3365,70 @@ def test_vendor_eject_still_present_after_accept_is_feeder_parked(
 
     assert excinfo.value.code == ErrorCode.FEEDER_PARKED
     assert "still present" in str(excinfo.value)
+    assert device.film_present_calls == 1
+    assert clock.sleep_calls == []
+
+
+def test_vendor_eject_present_during_settle_window_is_feeder_parked_without_further_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live MA-21 shape, unchanged by LV-2's fix (2026-08-13,
+    vm-logs/ma21-201040.log): the first probe lands in the settle window as
+    an indeterminate None (the same post-motion drain LV-2 is about), one
+    settle-retry sleep fires, and the SECOND probe returns a definite True
+    -- the accepted-without-progress wedge, not a drain. That definite
+    verdict must still resolve immediately, without spending the rest of
+    the settle window on a park that will never clear on its own."""
+    clock = _patch_eject_confirm_clock(monkeypatch)
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    device.eject_effect = True
+    device.film_present_result = [None, True]
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.eject()
+
+    assert excinfo.value.code == ErrorCode.FEEDER_PARKED
+    assert "still present" in str(excinfo.value)
+    assert device.film_present_calls == 2
+    assert clock.sleep_calls == [
+        coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS
+    ]
+    assert clock.now < coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
+
+
+def test_vendor_eject_confirms_clear_after_settle_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LV-2's actual fix, direct coverage (2026-08-13,
+    shortstrip-lab/live-attempts/20260813-beta8-linux-validation/RESULT.md
+    + vm-logs/eject-nopreview-194010.log): two indeterminate probes (the
+    post-motion UNIT ATTENTION drain) followed by a definite False must
+    confirm the eject as a SUCCESS -- the exact shape that used to fail
+    closed with EJECT_FAILED from a single immediate probe."""
+    clock = _patch_eject_confirm_clock(monkeypatch)
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    device.eject_effect = True
+    device.film_present_result = [None, None, False]
+
+    assert transport.eject() is True
+
+    assert device.film_present_calls == 3
+    assert clock.sleep_calls == [
+        coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS
+    ] * 2
+    assert clock.now < coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
 
 
 def test_vendor_eject_unconfirmable_presence_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """film_present() -> None means undetermined -- per its contract it
-    must never be read as film-absent, so an unconfirmable vendor eject
-    fails closed as EJECT_FAILED."""
+    must never be read as film-absent. LV-2 gives a persistently
+    indeterminate probe a bounded settle-and-retry window
+    (_VENDOR_EJECT_CONFIRM_SETTLE_SECONDS) before this still fails closed
+    as EJECT_FAILED, exactly as it did before that window existed -- only
+    the timing changed, not the verdict for a probe that never resolves."""
+    clock = _patch_eject_confirm_clock(monkeypatch)
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
     device.eject_effect = True
     device.film_present_result = None
@@ -3320,6 +3438,13 @@ def test_vendor_eject_unconfirmable_presence_fails_closed(
 
     assert excinfo.value.code == ErrorCode.EJECT_FAILED
     assert "could not be confirmed" in str(excinfo.value)
+    # Proves the settle window actually ran to its bound instead of
+    # failing closed on the first indeterminate read: one more probe than
+    # sleep (the final probe that hits the deadline does not sleep again),
+    # and the fake clock advanced to at least the settle bound.
+    assert device.film_present_calls == len(clock.sleep_calls) + 1
+    assert device.film_present_calls > 1
+    assert clock.now >= coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
 
 
 def test_eject_roll_close_failure_reports_film_out_not_eject_failed(
