@@ -59,6 +59,31 @@ else
     failures=$((failures + 1))
 fi
 
+# The offline wheelhouse must contain every pinned requirement, and its
+# installer must preserve the local-project ordering and fail-closed flags.
+# This offline, hash-only lock check must run before
+# verify_installed_capture_runtime below: that helper pip-installs and
+# imports these same wheels, so the lock check has to gate the install
+# instead of merely auditing it afterward.
+requirements="$root/wsl-requirements.txt"
+artifact_verifier="$repo_root/packaging/verify_python_artifact_lock.py"
+artifact_lock="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.lock.json"
+artifact_sha256="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.sha256"
+wheel_requirements="$repo_root/packaging/python-wheels-linux-cp313-x86_64.requirements.txt"
+sane_requirements="$repo_root/packaging/python-sane-linux-cp313-x86_64.requirements.txt"
+if "$HOST_PYTHON" -I -B "$artifact_verifier" \
+    --lock "$artifact_lock" \
+    --wheel-requirements "$wheel_requirements" \
+    --sdist-requirements "$sane_requirements" \
+    --combined-requirements "$requirements" \
+    --sha256sums "$artifact_sha256" \
+    --directory "$root/Wheelhouse" --allow-ledger; then
+    printf 'PASS  exact locked WSL Python artifact set\n'
+else
+    printf 'FAIL  exact locked WSL Python artifact set\n' >&2
+    failures=$((failures + 1))
+fi
+
 # On the Linux x86_64 resource-builder, install the exact staged source and
 # staged wheels into the exact staged CPython archive, then run the worker's
 # isolated import and capture-bundle preflight.  This is the WSL runtime shape
@@ -140,26 +165,6 @@ else
     printf 'SKIP  installed WSL capture-worker preflight (requires Linux x86_64 host)\n'
 fi
 
-# The offline wheelhouse must contain every pinned requirement, and its
-# installer must preserve the local-project ordering and fail-closed flags.
-requirements="$root/wsl-requirements.txt"
-artifact_verifier="$repo_root/packaging/verify_python_artifact_lock.py"
-artifact_lock="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.lock.json"
-artifact_sha256="$repo_root/packaging/python-artifacts-linux-cp313-x86_64.sha256"
-wheel_requirements="$repo_root/packaging/python-wheels-linux-cp313-x86_64.requirements.txt"
-sane_requirements="$repo_root/packaging/python-sane-linux-cp313-x86_64.requirements.txt"
-if "$HOST_PYTHON" -I -B "$artifact_verifier" \
-    --lock "$artifact_lock" \
-    --wheel-requirements "$wheel_requirements" \
-    --sdist-requirements "$sane_requirements" \
-    --combined-requirements "$requirements" \
-    --sha256sums "$artifact_sha256" \
-    --directory "$root/Wheelhouse" --allow-ledger; then
-    printf 'PASS  exact locked WSL Python artifact set\n'
-else
-    printf 'FAIL  exact locked WSL Python artifact set\n' >&2
-    failures=$((failures + 1))
-fi
 for requirement in \
     'setuptools==83.0.0' \
     'numpy==2.5.1' \
