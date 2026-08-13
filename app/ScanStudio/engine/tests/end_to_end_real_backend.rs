@@ -1715,6 +1715,27 @@ fn real_device_listed_and_connectable_when_bridge_cmd_set() {
         "exactly one listed device must have kind \"real\": {devices:?}"
     );
     assert_eq!(real_devices[0]["deviceId"], json!("bridge-ls5000-0"));
+    // The exact wire key WireProtocol.swift's DeviceInfo already decodes
+    // (added ahead of the engine actually sending it) and the TS wire
+    // client's DeviceInfo interface expects, carrying mock_bridge's fixed
+    // Capabilities.supportedMultisamplePasses verbatim through
+    // derive_supported_multisample_passes -- a real, over-the-wire,
+    // black-box proof of the key name, not just an in-process Rust struct
+    // assertion.
+    assert_eq!(
+        real_devices[0]["supportedMultisamplePasses"],
+        json!([4]),
+        "real device's scanner.list entry must forward the bridge's supported multisample passes: {devices:?}"
+    );
+    let sim_devices: Vec<&Value> = devices
+        .iter()
+        .filter(|device| device["kind"] == json!("simulated"))
+        .collect();
+    assert_eq!(sim_devices.len(), 1, "expected exactly one simulated device: {devices:?}");
+    assert!(
+        sim_devices[0].get("supportedMultisamplePasses").is_none(),
+        "the simulator has no bridge-sourced capability list and must omit the key entirely, not null: {devices:?}"
+    );
 
     send(
         &mut stdin,

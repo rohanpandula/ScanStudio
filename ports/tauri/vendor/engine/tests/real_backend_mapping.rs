@@ -319,6 +319,25 @@ fn unsupported_bridge_device_is_listed_but_never_connectable() {
     assert_eq!(err.code, ErrorCode::NotSupported);
 }
 
+/// `device_info()` (which `scanner.list`/`scanner.connect` both build their
+/// `DeviceInfo` response from) now forwards the exact device-sourced set
+/// `scan_start`'s own gate validates against
+/// (`scan_start_rejects_multisample_passes_other_than_device_supported`
+/// above), instead of leaving the client to guess or hardcode it. Available
+/// independent of connection state, matching `device_info()`'s own doc
+/// comment.
+#[test]
+fn device_info_forwards_the_bridges_supported_multisample_passes() {
+    let backend = RealLs5000::new(mock_bridge_bin(), GENEROUS_TIMEOUT)
+        .expect("RealLs5000::new should succeed against a healthy mock bridge");
+
+    assert_eq!(
+        backend.device_info().supported_multisample_passes,
+        Some(vec![4]),
+        "must forward mock_bridge's fixed_device_info() Capabilities.supportedMultisamplePasses verbatim"
+    );
+}
+
 const UNSUPPORTED_DEVICE_ID: &str = "bridge-ls50-0";
 
 #[test]

@@ -2615,6 +2615,14 @@ impl RealLs5000 {
             firmware: self.firmware_label.clone(),
             connection: "USB (bridge)".to_string(),
             supported: self.supported,
+            // The same device-sourced set scan_start's own INVALID_PARAMS
+            // gate already validates multisamplePasses against (see the
+            // "multisamplePasses must be one of {:?} for this device"
+            // check below) -- always Some for a real backend, since
+            // derive_supported_multisample_passes always returns a
+            // concrete (if degenerate) Vec from the bridge's own
+            // Capabilities, never absent data.
+            supported_multisample_passes: Some(self.supported_multisample_passes.clone()),
         }
     }
 
