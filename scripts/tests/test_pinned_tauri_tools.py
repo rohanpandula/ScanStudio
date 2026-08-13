@@ -256,10 +256,11 @@ class ToolTreeTests(unittest.TestCase):
             tool = Path(temporary_directory).resolve() / "tool"
             tool.write_bytes(payload)
             with mock.patch.object(INSTALLER.os, "fstat", side_effect=synthetic_fstat):
-                self.assertEqual(
-                    INSTALLER.hash_regular_file(tool, expected_size=len(payload)),
-                    sha256(payload),
+                digest, mode = INSTALLER.hash_regular_file(
+                    tool, expected_size=len(payload)
                 )
+                self.assertEqual(digest, sha256(payload))
+                self.assertEqual(mode, stat.S_IMODE(tool.stat().st_mode))
 
     def test_held_hash_rejects_content_changed_between_reads(self) -> None:
         payload = b"stable pinned bytes"
