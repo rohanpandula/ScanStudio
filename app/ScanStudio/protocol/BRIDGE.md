@@ -95,6 +95,8 @@ Records manual-review approval for one slot. Not motion-capable — no transport
 - Omitted (or `false`) is unchanged pre-existing behavior in every respect.
 - The mock transport refuses `attended` with `INVALID_PARAMS`: it has no lattice-confidence detector, so it has no roll for an attended acceptance to rescue.
 
+A coolscanpy build predating attended binding has no such parameter. The bridge passes the keyword only when the operator opted in, so ordinary approvals keep working against an older driver; an attended approval against one is refused with `INVALID_PARAMS` naming the missing capability, rather than surfacing as an unmapped `INTERNAL`.
+
 Each acceptance is recorded in the capture journal under `live_frame_selection.attended_roll_binding`, so an evidence audit can tell which mode bound a frame.
 
 ### `roll.setSpacingOffset`
@@ -143,6 +145,8 @@ Returns `HARDWARE_LANE_BUSY` while a scan job holds the lane — mirrors PROTOCO
 
 - `EJECT_FAILED` — the eject could not run or the transport reported not-ejected. On the current CoolscanPy pin a real eject needs the `[scanner]` extra plus SANE in the bridge's own environment, so on a rig without them every real `device.eject` is this error, with the message naming the missing dependency.
 - `FEEDER_PARKED` — the typed stalled outcome: the driver's traced eject reported accepted-without-confirmed-clear (CoolscanPy `FeederParked`). The film state is unknown-but-likely-inside, the session is left untouched, and a power cycle is the only demonstrated recovery. A client must NEVER auto-retry this (or any) eject outcome — retry decisions belong to the operator at the machine.
+
+**Caller-side deadline (2026-08-13).** This is the one synchronous bridge method whose duration is mechanical rather than computational — a roll rewind measured at 57 s on a full 36-exposure roll from a normal post-traversal position (`shortstrip-lab/INCIDENT-20260719-eject-from-park.md`) — so the engine bounds it with its own `device.eject` deadline (300 s, `SCANSTUDIO_EJECT_DEADLINE_SECS`) instead of the generic 10 s bridge request timeout every other method uses. That value is chosen to strictly dominate the bridge's own bounded eject work (eject CDB + EXECUTE + the post-eject sense-chain wait, 180 s worst case on the current pin, before the presence-confirmation gate), so the bridge always gets to deliver its typed verdict here rather than having a caller time out underneath it. A bridge change that could make `device.eject` block longer than that ceiling must raise the ceiling in the same change. Discovered live: the previous 10 s bound made the engine report `NOT_CONNECTED` and drop the session while a real roll was still ejecting, twice (`shortstrip-lab/live-attempts/20260813-beta8-linux-validation/`, LV-1).
 
 The bridge executes the eject against the open roll session when one exists (this is where CoolscanPy's vendor-traced `RESERVE_UNIT`-guarded held-session eject lands once the pin carries it — proven live 2026-07-20 from a normal post-traversal state), falling back to the device-level eject otherwise. Operationally, eject is only known-good from a normal post-traversal state; from a short-strip end-stop park or a wedged transport the eject can be accepted-but-inert with no probe able to distinguish that in advance (same incident file).
 
