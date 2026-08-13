@@ -776,34 +776,22 @@ $buildConfig = Join-Path ([System.IO.Path]::GetTempPath()) ("scanstudio-tauri-ve
 # files must say the real version before the build starts, not just the
 # CLI's --config merge above. Cargo.toml and package.json are stamped too so
 # `cargo metadata`, the cargo-about notice generator, and npm tooling agree
-# with the shipped binary instead of showing a frozen "0.3.0".
-function Set-StampedVersionField {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Pattern,
-        [Parameter(Mandatory = $true)][string]$Version
-    )
-    $content = Get-Content -LiteralPath $Path -Raw
-    $fieldMatches = [regex]::Matches($content, $Pattern)
-    if ($fieldMatches.Count -ne 1) {
-        throw "Expected exactly one version field in $Path, found $($fieldMatches.Count)"
-    }
-    $group = $fieldMatches[0].Groups[1]
-    $updated = $content.Substring(0, $group.Index) + $Version + $content.Substring($group.Index + $group.Length)
-    Set-Content -LiteralPath $Path -Value $updated -NoNewline -Encoding utf8NoBOM
+# with the shipped binary instead of showing a frozen "0.3.0". Shared with
+# linux/build-and-verify.sh via stamp_release_version.py: python is already
+# an unconditional dependency of this job and of this script (see
+# Invoke-PinnedTauriToolCheck below), so both packaging lanes apply the
+# exact same fail-closed regex contract instead of maintaining two copies of
+# it in two languages.
+$stampReleaseVersion = Join-Path $portRoot 'packaging\stamp_release_version.py'
+& python -I -S -B $stampReleaseVersion `
+    (Join-Path $appRoot 'src-tauri\tauri.conf.json') `
+    (Join-Path $appRoot 'package.json') `
+    (Join-Path $appRoot 'src-tauri\Cargo.toml') `
+    (Join-Path $appRoot 'src-tauri\Cargo.lock') `
+    $Version
+if ($LASTEXITCODE -ne 0) {
+    throw "stamp_release_version.py failed with exit code $LASTEXITCODE"
 }
-
-$jsonVersionPattern = '"version":\s*"([^"]*)"'
-Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\tauri.conf.json') -Pattern $jsonVersionPattern -Version $Version
-Set-StampedVersionField -Path (Join-Path $appRoot 'package.json') -Pattern $jsonVersionPattern -Version $Version
-Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.toml') -Pattern '(?m)^version = "([^"]*)"' -Version $Version
-# Cargo.lock records this workspace member's own version in its [[package]]
-# block; --locked (the supply-chain gate the pinned toolchain work added)
-# refuses to silently regenerate a lockfile that has drifted from
-# Cargo.toml, so the stamp must apply here too or cargo refuses to run at
-# all before any build step -- exactly what happened once Cargo.toml alone
-# was stamped.
-Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.lock') -Pattern '(?m)^name = "scanstudio-app"\r?\nversion = "([^"]*)"' -Version $Version
 
 $pinnedToolHandles = [Collections.Generic.List[System.IO.FileStream]]::new()
 $heldMakensisSha256 = ''
