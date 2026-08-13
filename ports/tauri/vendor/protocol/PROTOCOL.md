@@ -158,7 +158,8 @@ The engine's project-mutating handlers (`project.setFrameExcluded`, `project.set
 
 ```
 DeviceInfo      {deviceId: "sim-ls5000-0", model: "SUPER COOLSCAN 5000 ED",
-                 kind: "simulated", firmware: "1.03-sim", connection: "USB (simulated)"}
+                 kind: "simulated", firmware: "1.03-sim", connection: "USB (simulated)",
+                 supported: bool, supportedMultisamplePasses?: [u32]}
 ScannerStatus   {connected: bool, adapter: string|null,      // simulator: "SA-30 (simulated)" | "SA-21 (simulated)" | "MA-21 (simulated)"; real: "SA-30" | "SA-21" | "MA-21"
                  mediaLoaded: bool, carrier: "roll36"|"strip6"|"mounted"|null,
                  frameCount: u32|null, lamp: "off"|"warming"|"stable",
