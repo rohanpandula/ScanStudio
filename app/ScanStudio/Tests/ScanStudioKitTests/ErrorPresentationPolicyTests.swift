@@ -498,6 +498,10 @@ struct ErrorPresentationPolicyTests {
         let rawMessage = "REFEED_REQUIRED: preview could not establish a usable roll session"
         let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
         #expect(presentation.probableCause == nil)
+        // Issue #16: a preview that returns REFEED_REQUIRED with low
+        // confidence but no Rung-3 diagnosis is the common case, not the
+        // exception -- manual placement must still be reachable here.
+        #expect(presentation.canPlaceFramesManually)
     }
 
     @Test("a completely unrelated error never fabricates a probableCause")
@@ -506,6 +510,7 @@ struct ErrorPresentationPolicyTests {
             lastErrorMessage: "NOT_CONNECTED: scanner is not connected"
         )
         #expect(presentation.probableCause == nil)
+        #expect(!presentation.canPlaceFramesManually)
     }
 
     /// S8 (adversarial review round 2, 2026-08-08): extraction must be
@@ -525,5 +530,84 @@ struct ErrorPresentationPolicyTests {
         #expect(presentation.probableCause == nil)
         #expect(presentation.title != "Film shifted—refeed required")
         #expect(presentation.title != "Film needs to be reloaded")
+        #expect(!presentation.canPlaceFramesManually)
+    }
+
+    // MARK: - canPlaceFramesManually (issue #16)
+
+    @Test("every REFEED_REQUIRED-classified refusal offers manual placement, with or without a probable cause")
+    func canPlaceFramesManuallyCoversEveryReclassifiedRefeed() {
+        let messages = [
+            // Plain known-code REFEED_REQUIRED (noProbableCauseWhenAbsent
+            // covers this one too; repeated here alongside its siblings for
+            // one place that documents the full REFEED_REQUIRED family).
+            "REFEED_REQUIRED: the transport index no longer matches",
+            // leadingFrameClippedCopy's reclassification.
+            "REFEED_REQUIRED: the first frame begins 17 preview rows before "
+                + "the captured preview area (88.1% remains); refeed the film slightly deeper "
+                + "and acquire a fresh preview. ScanStudio did not expose the cropped frame for scanning",
+            // filmTransportSlipCopy's reclassification -- raw code is
+            // INTERNAL, not REFEED_REQUIRED, and still qualifies.
+            "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): SynchronizedProtocolError: "
+                + "command 124: sense 045300 not in accepted ['000000']",
+        ]
+        for rawMessage in messages {
+            let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+            #expect(presentation.canPlaceFramesManually, "expected true for: \(rawMessage)")
+        }
+    }
+
+    @Test("codes that never resolve to REFEED_REQUIRED never offer manual placement")
+    func canPlaceFramesManuallyFalseForOtherCodes() {
+        let messages = [
+            "NOT_CONNECTED: scanner is not connected",
+            "FEEDER_PARKED: transport parked at end-stop",
+            "INVALID_PARAMS: frame selection was empty",
+            "BRIDGE_TIMEOUT: no terminal event arrived",
+        ]
+        for rawMessage in messages {
+            let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+            #expect(!presentation.canPlaceFramesManually, "expected false for: \(rawMessage)")
+        }
+    }
+
+    // MARK: - Unattended-binding confidence refusal (issue #76/#24)
+
+    @Test("the unattended-binding confidence gate gets calm, factual copy of its own")
+    func unattendedBindingConfidenceCopy() {
+        let rawMessage = "ROLL_MISMATCH: roll boundary lattice confidence is 'low'; "
+            + "unattended frame binding requires 'high'"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "This roll previewed with low confidence")
+        #expect(
+            presentation.guidance
+                == "This roll previewed below the confidence the unattended scanner binding requires. Refeeding the strip or previewing it again may raise that confidence. A future release is expected to widen what the detector accepts here."
+        )
+        #expect(presentation.technicalDetails == rawMessage)
+        // Deliberately its own code, distinct from REFEED_REQUIRED: this is
+        // a scan-time capture refusal, not a preview failure, and no
+        // manual-placement raster is guaranteed to exist for it.
+        #expect(!presentation.canPlaceFramesManually)
+    }
+
+    @Test("the unattended-binding phrase is recognized regardless of how the engine wraps the code")
+    func unattendedBindingConfidenceCopyMatchesWrappedForm() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): roll boundary lattice "
+            + "confidence is 'low'; unattended frame binding requires 'high'"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "This roll previewed with low confidence")
+    }
+
+    @Test("an ordinary roll mismatch without the confidence phrase keeps its own fallback")
+    func rollMismatchWithoutConfidencePhraseUsesFallback() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): calibration signature changed"
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title != "This roll previewed with low confidence")
+        #expect(presentation.title == "ScanStudio could not complete that action")
     }
 }

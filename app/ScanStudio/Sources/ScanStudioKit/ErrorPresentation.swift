@@ -78,21 +78,31 @@ public struct ErrorPresentation: Equatable, Sendable {
     /// never the surrounding diagnostic prose. `nil` for the common case
     /// (most errors, including most REFEED_REQUIREDs, carry no Rung-3
     /// diagnosis). When present, the workspace error card shows it
-    /// prominently and offers "Place frames manually" alongside it.
+    /// prominently alongside "Place frames manually".
     public let probableCause: String?
+    /// True whenever this refusal classifies as `REFEED_REQUIRED` -- Rung 4
+    /// of the feeding UX ladder's manual-placement recovery is reachable for
+    /// every REFEED_REQUIRED, not only the minority that also carry a
+    /// Rung-3 `probableCause` (issue #16: a preview that returns with low
+    /// confidence but no diagnosis sentence still needs "Place frames
+    /// manually" offered). Drives the workspace error card's button on its
+    /// own; the diagnosis sentence next to it stays gated on `probableCause`.
+    public let canPlaceFramesManually: Bool
 
     public init(
         title: String,
         guidance: String,
         technicalDetails: String,
         issueURL: URL,
-        probableCause: String? = nil
+        probableCause: String? = nil,
+        canPlaceFramesManually: Bool = false
     ) {
         self.title = title
         self.guidance = guidance
         self.technicalDetails = technicalDetails
         self.issueURL = issueURL
         self.probableCause = probableCause
+        self.canPlaceFramesManually = canPlaceFramesManually
     }
 }
 
@@ -198,6 +208,7 @@ public enum ErrorPresentationPolicy {
         let copy = leadingFrameClippedCopy(in: lastErrorMessage)
             ?? filmFeedInterruptedCopy(in: lastErrorMessage)
             ?? filmTransportSlipCopy(in: lastErrorMessage)
+            ?? unattendedBindingConfidenceCopy(in: lastErrorMessage)
             ?? previewReadinessTimeoutCopy(in: lastErrorMessage)
             ?? knownCopy.first { containsCode($0.code, in: normalizedMessage) }
             ?? Copy(
@@ -223,13 +234,15 @@ public enum ErrorPresentationPolicy {
             // REFEED_REQUIRED -- never merely because the raw text happens
             // to contain a probable_cause-shaped fragment. An INTERNAL (or
             // any other) error carrying an embedded, coincidental, or
-            // adversarial-looking fragment must never surface a sentence or
-            // the "Place frames manually" action; `copy.code` is this
-            // policy's own already-computed classification, not a second,
-            // independent guess.
+            // adversarial-looking fragment must never surface a sentence.
+            // `copy.code` is this policy's own already-computed
+            // classification, not a second, independent guess --
+            // `canPlaceFramesManually` below reuses the exact same gate, so
+            // an unclassified error cannot offer manual placement either.
             probableCause: copy.code == "REFEED_REQUIRED"
                 ? ProbableCauseExtractor.extract(from: lastErrorMessage)
-                : nil
+                : nil,
+            canPlaceFramesManually: copy.code == "REFEED_REQUIRED"
         )
     }
 
@@ -279,6 +292,31 @@ public enum ErrorPresentationPolicy {
             guidance: "The scanner lost the film’s position. Remove and firmly reinsert "
                 + "the strip, then acquire a fresh preview. Do not retry Capture with "
                 + "the current preview."
+        )
+    }
+
+    /// The bridge's unattended-binding confidence gate (coolscanpy
+    /// `ls5000_single_pass/worker.py`): every frame in the batch refuses
+    /// before any motion because the roll's boundary-detection confidence
+    /// measured below what unattended scanning requires. Matched on this
+    /// phrase alone, not a `ROLL_MISMATCH` code prefix -- the engine wraps
+    /// the same wording differently depending on whether it surfaces from a
+    /// synchronous refusal or a per-frame scan failure, but the phrase
+    /// itself is unique to this one gate.
+    private static func unattendedBindingConfidenceCopy(in message: String) -> Copy? {
+        guard message.range(
+            of: "unattended frame binding requires",
+            options: .caseInsensitive
+        ) != nil else {
+            return nil
+        }
+        return Copy(
+            code: "ROLL_MISMATCH",
+            title: "This roll previewed with low confidence",
+            guidance: "This roll previewed below the confidence the unattended scanner "
+                + "binding requires. Refeeding the strip or previewing it again may raise "
+                + "that confidence. A future release is expected to widen what the "
+                + "detector accepts here."
         )
     }
 

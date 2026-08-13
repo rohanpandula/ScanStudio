@@ -111,6 +111,7 @@ struct ScanPanelView: View {
                 )
                 .font(.system(size: 11))
                 .foregroundStyle(summary.stopped ? Color.scanStudioAmber : (summary.failed.isEmpty ? Color.scanStudioCyan : Color.scanStudioRed))
+                .help(batchSummaryHelp(summary))
             }
 
             Spacer()
@@ -307,6 +308,29 @@ struct ScanPanelView: View {
             return "Paused · \(sessionModel.selectedFrameCount) remaining"
         }
         return "Last batch: \(summary.completed.count) completed"
+    }
+
+    /// Issue #76/#24: "Last batch: 0 completed" alone hid the driver's own
+    /// refusal reason (e.g. the unattended-binding confidence gate failing
+    /// every frame before any capture). This footer label has no room for a
+    /// second line, so the reason surfaces as a tooltip instead --
+    /// `BatchInspectorView.batchResultSummary` shows the same reason inline
+    /// for the fuller Batch inspector. The reason is appended after the
+    /// visible label text, never substituted for it: a reason no curated
+    /// matcher recognizes still gets its generic guidance, and the count
+    /// stays visible either way.
+    private func batchSummaryHelp(_ summary: ScanSummary) -> String {
+        guard summary.completed.isEmpty,
+              let error = summary.failed.lazy.compactMap({ sessionModel.frameErrors[$0] }).first(where: {
+                  $0.code != FrameFailureLabel.manualReviewCode
+              })
+        else {
+            return batchSummary(summary)
+        }
+        let guidance = ErrorPresentationPolicy.make(
+            lastErrorMessage: "\(error.code): \(error.message)"
+        ).guidance
+        return "\(batchSummary(summary)) — \(guidance)"
     }
 
     private var skipFrameHelpText: String {

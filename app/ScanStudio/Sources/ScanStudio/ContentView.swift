@@ -404,6 +404,15 @@ private struct WorkspaceErrorBanner: View {
         sessionModel.manualPlacementStripState == .loading
     }
 
+    /// Rung 4 is reachable whenever this refusal classifies as
+    /// `REFEED_REQUIRED` (`ErrorPresentation.canPlaceFramesManually`) and
+    /// the session is still in the "current physical registration cannot be
+    /// trusted" state `beginManualFramePlacement()` depends on -- the same
+    /// `refeedRequired` flag that gates `DeviceBarView`'s Eject affordance.
+    private var showsManualPlacementAction: Bool {
+        presentation.canPlaceFramesManually && sessionModel.refeedRequired
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
@@ -441,47 +450,61 @@ private struct WorkspaceErrorBanner: View {
                 }
 
                 // Rung 3 + Rung 4 of the feeding UX ladder
-                // (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): when the
-                // engine attached a plain-English diagnosis to this
-                // refusal, show it prominently -- never the raw JSON it
-                // was extracted from (`ProbableCauseExtractor`) -- and
-                // offer the manual-placement recovery path right beside
-                // it.
-                if let probableCause = presentation.probableCause {
+                // (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the
+                // manual-placement action is offered for every
+                // REFEED_REQUIRED this session can actually recover from
+                // (`showsManualPlacementAction`), not only the minority
+                // that also carry a Rung-3 diagnosis (issue #16). When the
+                // engine attached that plain-English diagnosis, show it
+                // prominently -- never the raw JSON it was extracted from
+                // (`ProbableCauseExtractor`) -- right above the button.
+                // The two are independent: the sentence renders on its own
+                // when `refeedRequired` has since cleared (a disconnect
+                // composes NOT_CONNECTED over the old message), and the
+                // button renders without a sentence for undiagnosed
+                // refeeds.
+                if showsManualPlacementAction || presentation.probableCause != nil {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(probableCause)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(Color.scanStudioPrimaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
-
-                        Button {
-                            Task {
-                                await sessionModel.beginManualFramePlacement()
-                            }
-                        } label: {
-                            if isLoadingManualPlacement {
-                                HStack(spacing: 6) {
-                                    ProgressView().controlSize(.small)
-                                    Text("Loading Film Strip…")
-                                }
-                            } else {
-                                Label(
-                                    "Place frames manually",
-                                    systemImage: "rectangle.and.hand.point.up.left"
-                                )
-                            }
+                        if let probableCause = presentation.probableCause {
+                            Text(probableCause)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(Color.scanStudioPrimaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
                         }
-                        .buttonStyle(.bordered)
-                        .tint(.scanStudioAmber)
-                        .font(.system(size: 11, weight: .medium))
-                        .disabled(isLoadingManualPlacement)
-                        .help("Draw your own frame boundaries on the captured film strip")
+
+                        if showsManualPlacementAction {
+                            Button {
+                                Task {
+                                    await sessionModel.beginManualFramePlacement()
+                                }
+                            } label: {
+                                if isLoadingManualPlacement {
+                                    HStack(spacing: 6) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Loading Film Strip…")
+                                    }
+                                } else {
+                                    Label(
+                                        "Place frames manually",
+                                        systemImage: "rectangle.and.hand.point.up.left"
+                                    )
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.scanStudioAmber)
+                            .font(.system(size: 11, weight: .medium))
+                            .disabled(isLoadingManualPlacement)
+                            .help("Draw your own frame boundaries on the captured film strip")
+                        }
                     }
                     .padding(10)
                     .background(Color.scanStudioRaised, in: RoundedRectangle(cornerRadius: 6))
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Probable cause: \(probableCause)")
+                    .accessibilityLabel(
+                        presentation.probableCause.map { "Probable cause: \($0)" }
+                            ?? "Manual frame placement is available"
+                    )
                 }
 
                 HStack(spacing: 12) {

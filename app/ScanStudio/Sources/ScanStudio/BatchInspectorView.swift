@@ -565,6 +565,18 @@ struct BatchInspectorView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 4)
                 }
+                // Issue #76/#24: a whole-batch refusal (e.g. the unattended
+                // binding confidence gate) can fail every frame for the same
+                // one reason before any capture is attempted, leaving
+                // "Completed: 0" with nothing explaining why. Smallest
+                // honest surfacing of that reason, not a redesign.
+                if let batchFailureReason {
+                    Label(batchFailureReason.guidance, systemImage: "info.circle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.scanStudioSecondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 4)
+                }
             }
         }
     }
@@ -579,6 +591,24 @@ struct BatchInspectorView: View {
         (sessionModel.scanSummary?.failed ?? []).filter {
             sessionModel.frameErrors[$0]?.code != FrameFailureLabel.manualReviewCode
         }
+    }
+
+    /// The scanner's own explanation for a batch that finished without
+    /// completing a single frame -- distinct from `needsReviewFrames`/
+    /// `failedFrames` (which list WHICH frames failed): a whole-batch
+    /// refusal fails every frame for the same one reason before any capture
+    /// is attempted. `nil` whenever the batch completed at least one frame,
+    /// or no failed frame carries a real (non-review) error detail.
+    private var batchFailureReason: ErrorPresentation? {
+        guard let summary = sessionModel.scanSummary, summary.completed.isEmpty else {
+            return nil
+        }
+        guard let error = summary.failed.lazy.compactMap({ sessionModel.frameErrors[$0] }).first(where: {
+            $0.code != FrameFailureLabel.manualReviewCode
+        }) else {
+            return nil
+        }
+        return ErrorPresentationPolicy.make(lastErrorMessage: "\(error.code): \(error.message)")
     }
 
     private func frameList(_ frames: [Int]) -> String {

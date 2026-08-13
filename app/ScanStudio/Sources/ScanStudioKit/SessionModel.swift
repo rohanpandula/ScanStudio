@@ -4548,6 +4548,8 @@ public final class SessionModel {
             "filmPresent": status.filmPresent.map(String.init) ?? "unknown",
             "mediaLoaded": String(status.mediaLoaded),
             "transport": status.transport,
+            "adapter": status.adapter ?? "unknown",
+            "carrier": status.carrier ?? "unknown",
         ]
     }
 
