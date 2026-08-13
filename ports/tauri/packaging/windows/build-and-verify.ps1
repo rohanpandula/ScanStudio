@@ -767,6 +767,37 @@ Invoke-HardwareSessionLauncherBlackBox -Root $PSScriptRoot
 
 $buildConfig = Join-Path ([System.IO.Path]::GetTempPath()) ("scanstudio-tauri-version-" + [guid]::NewGuid().ToString('N') + '.json')
 @{ version = $Version } | ConvertTo-Json -Compress | Set-Content -LiteralPath $buildConfig -Encoding utf8NoBOM -NoNewline
+
+# Stamp the release version into the Tauri app's own version fields before
+# any build step runs. tauri::generate_context!() embeds tauri.conf.json's
+# "version" at `cargo build` time -- that's what @tauri-apps/api's
+# getVersion() returns and what the NSIS installer resolves for its
+# installed "DisplayVersion" (Programs and Features) -- so the checked-in
+# files must say the real version before the build starts, not just the
+# CLI's --config merge above. Cargo.toml and package.json are stamped too so
+# `cargo metadata`, the cargo-about notice generator, and npm tooling agree
+# with the shipped binary instead of showing a frozen "0.3.0".
+function Set-StampedVersionField {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [Parameter(Mandatory = $true)][string]$Version
+    )
+    $content = Get-Content -LiteralPath $Path -Raw
+    $fieldMatches = [regex]::Matches($content, $Pattern)
+    if ($fieldMatches.Count -ne 1) {
+        throw "Expected exactly one version field in $Path, found $($fieldMatches.Count)"
+    }
+    $group = $fieldMatches[0].Groups[1]
+    $updated = $content.Substring(0, $group.Index) + $Version + $content.Substring($group.Index + $group.Length)
+    Set-Content -LiteralPath $Path -Value $updated -NoNewline -Encoding utf8NoBOM
+}
+
+$jsonVersionPattern = '"version":\s*"([^"]*)"'
+Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\tauri.conf.json') -Pattern $jsonVersionPattern -Version $Version
+Set-StampedVersionField -Path (Join-Path $appRoot 'package.json') -Pattern $jsonVersionPattern -Version $Version
+Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.toml') -Pattern '(?m)^version = "([^"]*)"' -Version $Version
+
 $pinnedToolHandles = [Collections.Generic.List[System.IO.FileStream]]::new()
 $heldMakensisSha256 = ''
 

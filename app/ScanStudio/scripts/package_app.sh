@@ -205,7 +205,7 @@ install -m 755 "$package_root/packaging/ScanStudioBridge" "$staged_app/Contents/
 install -m 644 "$package_root/packaging/Info.plist" "$staged_app/Contents/Info.plist"
 
 # Stamp the exact release version from the build environment, so the running
-# app can report "I am 0.3.0-alpha.N". Best-effort: dev builds without
+# app can report "I am 0.7.0-beta.N". Best-effort: dev builds without
 # SCANSTUDIO_RELEASE_VERSION keep the empty default.
 if [[ -n "${SCANSTUDIO_RELEASE_VERSION:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Set :ScanStudioRelease '$SCANSTUDIO_RELEASE_VERSION'" \
