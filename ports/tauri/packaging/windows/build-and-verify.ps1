@@ -797,6 +797,13 @@ $jsonVersionPattern = '"version":\s*"([^"]*)"'
 Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\tauri.conf.json') -Pattern $jsonVersionPattern -Version $Version
 Set-StampedVersionField -Path (Join-Path $appRoot 'package.json') -Pattern $jsonVersionPattern -Version $Version
 Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.toml') -Pattern '(?m)^version = "([^"]*)"' -Version $Version
+# Cargo.lock records this workspace member's own version in its [[package]]
+# block; --locked (the supply-chain gate the pinned toolchain work added)
+# refuses to silently regenerate a lockfile that has drifted from
+# Cargo.toml, so the stamp must apply here too or cargo refuses to run at
+# all before any build step -- exactly what happened once Cargo.toml alone
+# was stamped.
+Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.lock') -Pattern '(?m)^name = "scanstudio-app"\nversion = "([^"]*)"' -Version $Version
 
 $pinnedToolHandles = [Collections.Generic.List[System.IO.FileStream]]::new()
 $heldMakensisSha256 = ''

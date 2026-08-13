@@ -38,11 +38,12 @@ python3 -I -S -B - \
     "$app_root/src-tauri/tauri.conf.json" \
     "$app_root/package.json" \
     "$app_root/src-tauri/Cargo.toml" \
+    "$app_root/src-tauri/Cargo.lock" \
     "$version" <<'PY'
 import re
 import sys
 
-tauri_conf_path, package_json_path, cargo_toml_path, release_version = sys.argv[1:5]
+tauri_conf_path, package_json_path, cargo_toml_path, cargo_lock_path, release_version = sys.argv[1:6]
 
 
 def stamp(path, pattern):
@@ -60,6 +61,13 @@ json_version_pattern = r'"version":\s*"([^"]*)"'
 stamp(tauri_conf_path, json_version_pattern)
 stamp(package_json_path, json_version_pattern)
 stamp(cargo_toml_path, r'(?m)^version = "([^"]*)"')
+# Cargo.lock records this workspace member's own version in its
+# [[package]] block; --locked (the supply-chain gate the pinned toolchain
+# work added) refuses to silently regenerate a lockfile that has drifted
+# from Cargo.toml, so the stamp must apply here too or cargo/rustc refuse
+# to run at all before any build step -- exactly what happened once
+# Cargo.toml alone was stamped.
+stamp(cargo_lock_path, r'(?m)^name = "scanstudio-app"\nversion = "([^"]*)"')
 PY
 
 mkdir -p "$output_dir"
