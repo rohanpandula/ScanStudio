@@ -5379,9 +5379,25 @@ fn scan_silence_deadline_from_env() -> Duration {
 /// expire before the bridge could answer anything and turn every eject
 /// into an unconfirmed-film-state teardown.
 fn eject_call_deadline_from_env() -> Duration {
-    std::env::var("SCANSTUDIO_EJECT_DEADLINE_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    parse_eject_call_deadline(
+        std::env::var("SCANSTUDIO_EJECT_DEADLINE_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The parsing half of `eject_call_deadline_from_env`, split out so it can
+/// be unit-tested exhaustively without `set_var` — which is process-global
+/// and would leak into every concurrently-running test in the same binary,
+/// the exact hazard both deadline knobs' doc comments warn about.
+///
+/// Deliberately NOT capped at an upper bound: the sibling
+/// `scan_silence_deadline_from_env` accepts any value, and giving two
+/// adjacent operator-facing knobs different validation semantics is worse
+/// than sharing one permissive rule. If a ceiling is ever wanted, both
+/// should get it in the same change.
+fn parse_eject_call_deadline(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
         .unwrap_or(EJECT_CALL_DEADLINE)
@@ -7819,6 +7835,62 @@ mod tests {
             engine_receipt: json!({"frameIndex": frame_index}),
             attempts_root: None,
         }
+    }
+
+    /// `SCANSTUDIO_EJECT_DEADLINE_SECS` is the operator's escape hatch for
+    /// an eject slower than the shipped ceiling, so every way it can be
+    /// wrong must land on the safe default rather than on a bound too short
+    /// to let the bridge answer.
+    #[test]
+    fn eject_call_deadline_env_parsing_falls_back_on_everything_but_a_positive_whole_number() {
+        assert_eq!(
+            parse_eject_call_deadline(None),
+            EJECT_CALL_DEADLINE,
+            "unset must keep the shipped 300s ceiling"
+        );
+        assert_eq!(EJECT_CALL_DEADLINE, Duration::from_secs(300));
+
+        // Zero parses fine but would expire before the bridge could answer
+        // anything, turning every eject into an unconfirmed-film-state
+        // teardown — rejected on purpose, not by accident of parsing.
+        // The last entry is u64::MAX + 1: an overflowing value must fall
+        // back like any other unparseable one, never wrap.
+        for rejected in [
+            "0",
+            " 0 ",
+            "-5",
+            "12.5",
+            "45s",
+            "abc",
+            "",
+            "   ",
+            "1e3",
+            "+",
+            "0x10",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_eject_call_deadline(Some(rejected)),
+                EJECT_CALL_DEADLINE,
+                "{rejected:?} is not a positive whole number of seconds and must fall back"
+            );
+        }
+
+        assert_eq!(
+            parse_eject_call_deadline(Some("45")),
+            Duration::from_secs(45),
+            "a valid value must be honored even when it shortens the deadline"
+        );
+        assert_eq!(
+            parse_eject_call_deadline(Some("  600\n")),
+            Duration::from_secs(600),
+            "surrounding whitespace must be tolerated, matching the trim in the parser"
+        );
+        assert_eq!(
+            parse_eject_call_deadline(Some("1")),
+            Duration::from_secs(1),
+            "the smallest accepted value is 1s — the boundary immediately above the rejected 0"
+        );
     }
 
     #[test]

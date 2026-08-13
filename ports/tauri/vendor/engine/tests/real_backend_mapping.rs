@@ -1987,13 +1987,30 @@ fn a_roll_length_eject_outlives_the_generic_request_timeout_and_keeps_its_sessio
 /// one thing the generic transport-failure text could never say: the film
 /// state is unknown, not failed, because the rewind outlives whoever was
 /// listening.
+///
+/// The three timings are chosen so this test can only pass if the eject
+/// deadline is genuinely the bound in force, and are load-bearing:
+///
+/// ```text
+///   eject deadline   500ms  <  mock eject delay  1500ms  <  generic  3s
+/// ```
+///
+/// The mock delay sits STRICTLY BETWEEN the two candidate bounds. Wire the
+/// eject to the generic timeout instead (`deadline: None` in
+/// `RealLs5000::eject`) and the mock answers at 1500ms — comfortably inside
+/// the 3s generic bound — so the eject SUCCEEDS and `expect_err` below
+/// fails the test. An earlier revision used a 4000ms delay, which exceeded
+/// both bounds and so passed under either wiring; the reviewer's mutation
+/// caught that. The elapsed assertion is the second, independent guard on
+/// the same property: it fails on timing alone if the bound in force is
+/// ever the 3s one.
 #[test]
 fn an_eject_past_its_own_deadline_still_fails_closed_and_names_the_unknown_film_state() {
     let backend = Arc::new(
         RealLs5000::new_with_env(
             mock_bridge_bin(),
             GENEROUS_TIMEOUT,
-            &[("MOCK_BRIDGE_EJECT_DELAY_MS", "4000")],
+            &[("MOCK_BRIDGE_EJECT_DELAY_MS", "1500")],
         )
         .expect("the eject delay must not affect bridge.hello/device.list")
         .with_eject_call_deadline(Duration::from_millis(500)),
@@ -2002,9 +2019,16 @@ fn an_eject_past_its_own_deadline_still_fails_closed_and_names_the_unknown_film_
         .connect(DEVICE_ID, &ConnectOptions::default())
         .expect("connect should succeed");
 
+    let started = Instant::now();
     let error = backend
         .eject()
         .expect_err("an eject past its own deadline must never be reported as a success");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 500ms eject deadline must be the bound that fired, not the 3s generic request \
+         timeout — a fallback to the generic bound would take ~3s: took {:?}",
+        started.elapsed()
+    );
     assert_eq!(
         error.code,
         ErrorCode::NotConnected,
@@ -2033,9 +2057,9 @@ fn an_eject_past_its_own_deadline_still_fails_closed_and_names_the_unknown_film_
         "the timeout must name the physical caveat the generic transport text cannot: {error:?}"
     );
 
-    // Proves the deadline is genuinely eject-scoped rather than a widened
-    // client-wide timeout: this backend's generic request timeout is 3s,
-    // and the 500ms eject deadline fired well inside it.
+    // An expired eject deadline quarantines the bridge exactly like any
+    // other transport loss, so every later call keeps failing closed until
+    // an explicit reconnect.
     let follow_up = backend
         .status()
         .expect_err("a quarantined bridge must keep failing closed after the lost eject");
