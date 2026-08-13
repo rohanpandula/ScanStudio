@@ -4509,6 +4509,8 @@ fn map_bridge_error_code_str(code: &str) -> ErrorCode {
         "FILM_FEED_INTERRUPTED" => ErrorCode::FilmFeedInterrupted,
         "HW_MOTION_NOT_ARMED" => ErrorCode::HwMotionNotArmed,
         "UNKNOWN_JOB" => ErrorCode::UnknownJob,
+        "EJECT_FAILED" => ErrorCode::EjectFailed,
+        "FEEDER_PARKED" => ErrorCode::FeederParked,
         _ => ErrorCode::Internal,
     }
 }

@@ -201,6 +201,11 @@ class _FakeDevice:
     def __init__(self, roll: _FakeRoll | None = None) -> None:
         self._roll = roll
         self.eject_effect: object = True
+        # The vendor-eject confirmation probe (Device.film_present): None
+        # (undetermined) mirrors the pre-probe default; vendor-route eject
+        # success tests set False (confirmed-out) explicitly, and the
+        # accepted-without-progress / unconfirmable shapes set True/None.
+        self.film_present_result: object = None
         self.closed = False
         self.capabilities = _fake_capabilities()
         # Plan 10-09 (attempts-root persistence): records exactly what
@@ -218,6 +223,11 @@ class _FakeDevice:
         if isinstance(self.eject_effect, BaseException):
             raise self.eject_effect
         return self.eject_effect
+
+    def film_present(self) -> bool | None:
+        if isinstance(self.film_present_result, BaseException):
+            raise self.film_present_result
+        return self.film_present_result
 
     def close(self) -> None:
         self.closed = True
@@ -3091,6 +3101,7 @@ def test_eject_raises_eject_failed_on_coolscanpy_eject_failed(
 def test_eject_returns_true_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
     device.eject_effect = True
+    device.film_present_result = False
     assert transport.eject() is True
 
 
@@ -3156,6 +3167,7 @@ def test_eject_falls_back_to_device_when_roll_lacks_eject(
     roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
     transport, device = _opened_transport(monkeypatch, roll)
     device.eject_effect = True
+    device.film_present_result = False
     transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
 
     assert transport.eject() is True
@@ -3187,30 +3199,182 @@ def test_eject_maps_feeder_parked_stall_and_preserves_session_state(
     assert transport.status().preview_established is True
 
 
-def test_eject_maps_future_pin_eject_not_available_to_eject_failed(
+def test_eject_not_available_falls_back_to_device_eject(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The capture branch's Roll.eject() raises EjectNotAvailable (not an
-    EjectFailed subclass) when no held reservation exists. The pinned
-    coolscanpy does not export it yet; the transport resolves it by name at
-    call time so the mapping is already correct the day the pin advances."""
-
-    class _EjectNotAvailable(Exception):
-        pass
-
-    monkeypatch.setattr(coolscanpy, "EjectNotAvailable", _EjectNotAvailable, raising=False)
+    """Roll.eject() with no held reservation (the state every failed
+    preview's fail-closed teardown leaves behind) raises the REAL exported
+    coolscanpy.EjectNotAvailable without sending any command -- so the
+    transport must try the capability-gated vendor eject on Device instead
+    of refusing outright (#16 #68 #76: the refusal used to strand the film
+    until a power cycle). Uses the real exception class on purpose: the
+    old fake-substitute version of this test could not catch a
+    class-identity regression."""
     roll = _EjectRecordingRoll(thumbnails=[_fake_thumbnail(1)])
-    roll.eject_effect = _EjectNotAvailable(
+    roll.eject_effect = coolscanpy.EjectNotAvailable(
         "no held reservation to eject: call preview() first"
     )
-    transport, _device = _opened_transport(monkeypatch, roll)
+    transport, device = _opened_transport(monkeypatch, roll)
+    device.eject_effect = True
+    device.film_present_result = False
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    assert transport.eject() is True
+
+    assert roll.eject_calls == 1
+    assert roll.closed is True
+    assert transport.status().preview_established is False
+
+
+def test_eject_fallback_failure_stays_typed_and_preserves_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the Device fallback also fails, the error stays the typed
+    EJECT_FAILED of the direct device route -- and the roll session is
+    preserved exactly as the FeederParked case preserves it, because the
+    film did not come out."""
+    roll = _EjectRecordingRoll(thumbnails=[_fake_thumbnail(1)])
+    roll.eject_effect = coolscanpy.EjectNotAvailable("no held reservation to eject")
+    transport, device = _opened_transport(monkeypatch, roll)
+    device.eject_effect = coolscanpy.EjectFailed("vendor eject command failed")
     transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
 
     with pytest.raises(BridgeError) as excinfo:
         transport.eject()
 
     assert excinfo.value.code == ErrorCode.EJECT_FAILED
-    assert "no held reservation" in str(excinfo.value)
+    assert "vendor eject command failed" in str(excinfo.value)
+    assert roll.closed is False
+    assert transport.status().preview_established is True
+
+
+def test_eject_fallback_feeder_parked_maps_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked transport reported by the fallback vendor eject keeps the
+    FEEDER_PARKED taxonomy (never a silent success, never a retry)."""
+    roll = _EjectRecordingRoll(thumbnails=[_fake_thumbnail(1)])
+    roll.eject_effect = coolscanpy.EjectNotAvailable("no held reservation to eject")
+    transport, device = _opened_transport(monkeypatch, roll)
+    device.eject_effect = coolscanpy.FeederParked(
+        "eject accepted without confirmed clear; power cycle required"
+    )
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.eject()
+
+    assert excinfo.value.code == ErrorCode.FEEDER_PARKED
+    assert roll.closed is False
+
+
+def test_eject_fallback_device_busy_maps_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeviceBusy from the fallback vendor eject is a retry-later state,
+    not an eject failure -- it must keep its own taxonomy instead of
+    collapsing into EJECT_FAILED."""
+    roll = _EjectRecordingRoll(thumbnails=[_fake_thumbnail(1)])
+    roll.eject_effect = coolscanpy.EjectNotAvailable("no held reservation to eject")
+    transport, device = _opened_transport(monkeypatch, roll)
+    device.eject_effect = coolscanpy.DeviceBusy("io lock is held")
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.eject()
+
+    assert excinfo.value.code == ErrorCode.DEVICE_BUSY
+    assert roll.closed is False
+
+
+def test_vendor_eject_still_present_after_accept_is_feeder_parked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The vendor eject reports acceptance, not actuation
+    (INCIDENT-20260719-eject-from-park): a clean scanimage exit with film
+    still present is the accepted-without-progress wedge and must surface
+    as FEEDER_PARKED, never as success."""
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    device.eject_effect = True
+    device.film_present_result = True
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.eject()
+
+    assert excinfo.value.code == ErrorCode.FEEDER_PARKED
+    assert "still present" in str(excinfo.value)
+
+
+def test_vendor_eject_unconfirmable_presence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """film_present() -> None means undetermined -- per its contract it
+    must never be read as film-absent, so an unconfirmable vendor eject
+    fails closed as EJECT_FAILED."""
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    device.eject_effect = True
+    device.film_present_result = None
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.eject()
+
+    assert excinfo.value.code == ErrorCode.EJECT_FAILED
+    assert "could not be confirmed" in str(excinfo.value)
+
+
+def test_eject_roll_close_failure_reports_film_out_not_eject_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-eject Roll.close() failure happens AFTER the film is
+    physically out: it must surface as INTERNAL with a message saying so,
+    never as an eject failure -- and `_roll` stays set so device.close can
+    still run the Roll-then-Device teardown order."""
+
+    class _CloseFailingRoll(_EjectRecordingRoll):
+        def close(self) -> None:
+            raise RuntimeError("batch worker still reporting")
+
+    roll = _CloseFailingRoll(thumbnails=[_fake_thumbnail(1)])
+    roll.eject_effect = True
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.eject()
+
+    assert excinfo.value.code == ErrorCode.INTERNAL
+    assert "the film was ejected" in str(excinfo.value)
+    assert roll.closed is False
+
+
+def test_eject_after_failed_preview_ejects_via_device_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end regression for the #16/#68/#76 shape: preview fails, the
+    operator clicks Eject, and the film must come out through the Device
+    fallback instead of the guaranteed EjectNotAvailable refusal."""
+
+    class _RefusedPreviewRoll(_EjectRecordingRoll):
+        def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
+            raise coolscanpy.RefeedRequired(
+                "preview could not establish a usable roll session"
+            )
+
+    roll = _RefusedPreviewRoll(thumbnails=[_fake_thumbnail(1)])
+    roll.eject_effect = coolscanpy.EjectNotAvailable(
+        "no held reservation to eject: call preview() first"
+    )
+    transport, device = _opened_transport(monkeypatch, roll)
+    device.eject_effect = True
+    device.film_present_result = False
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    assert excinfo.value.code == ErrorCode.REFEED_REQUIRED
+
+    assert transport.eject() is True
+    assert roll.eject_calls == 1
+    assert roll.closed is True
 
 
 # -- coolscanpy_provenance (Plan 10-09) ---------------------------------------------

@@ -116,6 +116,14 @@ pub enum ErrorCode {
     /// A recognized-but-unsupported Nikon model (Lane D, #14): discovery
     /// lists it by name, but connect is refused. Fail-closed.
     NotSupported,
+    /// The bridge's eject could not run or could not confirm the film
+    /// left the transport. Previously flattened to `Internal`, which made
+    /// the #16/#68/#76 eject failures undiagnosable client-side.
+    EjectFailed,
+    /// The driver's typed accepted-without-progress eject outcome
+    /// (INCIDENT-20260719-eject-from-park): the transport never actuated
+    /// and a power cycle is the only demonstrated recovery.
+    FeederParked,
 }
 
 // ---------------------------------------------------------------------
@@ -858,6 +866,8 @@ mod tests {
             (ErrorCode::ManualReviewRequired, "MANUAL_REVIEW_REQUIRED"),
             (ErrorCode::HwMotionNotArmed, "HW_MOTION_NOT_ARMED"),
             (ErrorCode::NotSupported, "NOT_SUPPORTED"),
+            (ErrorCode::EjectFailed, "EJECT_FAILED"),
+            (ErrorCode::FeederParked, "FEEDER_PARKED"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
             let decoded: ErrorCode = serde_json::from_value(json!(wire)).unwrap();

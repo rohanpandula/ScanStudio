@@ -623,6 +623,26 @@ class BridgeService:
                     "device.eject", "error", code=exc.code.value, message=str(exc)
                 )
                 raise
+            except Exception as exc:
+                # Wire-contract boundary: BRIDGE.md documents EJECT_FAILED
+                # as "the eject could not run", which is true for any
+                # unmapped transport/driver exception. Left alone these
+                # fall through to cli.py's catch-all and reach the client
+                # as a bare INTERNAL with no telemetry line -- the shape
+                # that made the #16/#68/#76 field reports undiagnosable.
+                # The original type rides in the message so a driver
+                # defect still reads as one.
+                message = (
+                    f"eject failed before completion "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                self._telemetry.record(
+                    "device.eject",
+                    "error",
+                    code=ErrorCode.EJECT_FAILED.value,
+                    message=message,
+                )
+                raise BridgeError(ErrorCode.EJECT_FAILED, message) from exc
             finally:
                 self._lane_held = False
         if not ejected:
