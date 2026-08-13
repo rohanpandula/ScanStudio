@@ -31,11 +31,11 @@ Both preconditions apply before any live step below.
 
 ## [a] VM and USB Passthrough Setup
 
-- Reuse the same Unraid VM + USB-controller-passthrough pattern already used
-  for the owner's existing scanner-attached VM(s) on the same host: pass the
-  LS-5000's USB controller/device through to the Ubuntu VM via Unraid's VM
-  Manager USB/PCI passthrough settings.
-- Exact menu labels vary by Unraid version, so mirror your existing
+- Reuse the same hypervisor VM + USB-controller-passthrough pattern already
+  used for the owner's existing scanner-attached VM(s) on the same host: pass
+  the LS-5000's USB controller/device through to the Ubuntu VM via the
+  hypervisor's VM management USB/PCI passthrough settings.
+- Exact menu labels vary by hypervisor version, so mirror your existing
   passthrough setup rather than following a fixed click path invented here.
 - Once passthrough is active, the Ubuntu VM must see the device at VID:PID
   `04b0:4002`; that visibility is confirmed by the probe in section [b], not
