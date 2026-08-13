@@ -74,6 +74,7 @@ class _FakeRoll:
         self._scan_results = {slot: list(outcomes) for slot, outcomes in (scan_results or {}).items()}
         self.scan_many_calls: list[tuple[int, ...]] = []
         self.approve_calls: list[int] = []
+        self.attended_approve_calls: list[tuple[int, bool]] = []
         self.spacing_offset_calls: list[tuple[int, int]] = []
         self.safe_stop_calls = 0
         self.closed = False
@@ -128,8 +129,13 @@ class _FakeRoll:
     def slot_count(self) -> int:
         return len(self._thumbnails)
 
-    def approve(self, slot: int) -> None:
+    def approve(self, slot: int, *, attended: bool = False) -> None:
+        # Mirrors coolscanpy.Roll.approve's own signature (feed-detector
+        # round; attended binding). Recorded as a (slot, attended) pair so a
+        # test can prove the operator's intent reached the driver, while the
+        # pre-existing `approve_calls` slot list stays exactly as it was.
         self.approve_calls.append(slot)
+        self.attended_approve_calls.append((slot, attended))
 
     def set_spacing_offset(
         self, slot: int, offset_rows: int
@@ -1627,6 +1633,54 @@ def test_approve_with_no_fingerprint_keeps_pre_existing_behavior(
     transport.approve(1)
 
     assert roll.approve_calls == [1]
+    assert roll.attended_approve_calls == [(1, False)]
+
+
+# ---------------------------------------------------------------------------
+# Attended binding (feed-detector round; ScanStudio #24/#16/#42)
+# ---------------------------------------------------------------------------
+
+
+def test_attended_approval_reaches_the_driver_as_an_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator's intent must arrive at coolscanpy as `attended=True`.
+    The bridge never decides eligibility itself -- Roll.approve is the
+    authority on which roll shapes may bind below 'high'."""
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)], fingerprint_sha256="c" * 64)
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    transport.approve(1, attended=True)
+
+    assert roll.attended_approve_calls == [(1, True)]
+
+
+def test_attended_approval_refused_by_the_driver_maps_to_invalid_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """coolscanpy refuses `attended` on any roll that is not an
+    automatically detected medium-confidence one. That refusal must surface
+    as a typed INVALID_PARAMS, not an unhandled fault."""
+
+    class _RefusingRoll(_FakeRoll):
+        def approve(self, slot: int, *, attended: bool = False) -> None:
+            if attended:
+                raise ValueError(
+                    "attended roll binding requires an automatically detected "
+                    "medium-confidence roll; this session is 'high'"
+                )
+            super().approve(slot, attended=attended)
+
+    roll = _RefusingRoll(thumbnails=[_fake_thumbnail(1)], fingerprint_sha256="c" * 64)
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.approve(1, attended=True)
+
+    assert excinfo.value.code is ErrorCode.INVALID_PARAMS
+    assert "attended roll binding requires" in str(excinfo.value)
 
 
 def test_manual_frames_refuses_when_current_attempt_has_no_recorded_evidence(

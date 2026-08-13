@@ -100,6 +100,71 @@ describe("SessionStore approval binding (scripted transport)", () => {
     expect(store.getState().approvedFrames[opId]).toContain(1);
   });
 
+  // Attended binding (feed-detector round; ScanStudio #24/#16/#42).
+
+  it("an ordinary approval never puts attended on the wire", async () => {
+    const { store, handle, calls } = scriptedStore();
+
+    await store.acquireThumbnails();
+    const opId = calls[0].params.operationId as string;
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 1, operationId: opId },
+    });
+
+    await store.approveFrame(1);
+    const approve = calls.find((call) => call.method === "roll.approve");
+    expect(approve?.params).toEqual({ frameIndex: 1, operationId: opId });
+    expect(approve?.params).not.toHaveProperty("attended");
+  });
+
+  it("an attended approval opts in explicitly on the wire", async () => {
+    const { store, handle, calls } = scriptedStore();
+
+    await store.acquireThumbnails();
+    const opId = calls[0].params.operationId as string;
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 1, operationId: opId },
+    });
+
+    await store.approveFrame(1, { attended: true });
+    expect(calls).toContainEqual({
+      method: "roll.approve",
+      params: { frameIndex: 1, operationId: opId, attended: true },
+    });
+    expect(store.getState().approvedFrames[opId]).toContain(1);
+  });
+
+  it("approveEveryFrameAttended approves the whole batch and refuses an empty one", async () => {
+    const { store, handle, calls } = scriptedStore();
+
+    await store.acquireThumbnails();
+    const opId = calls[0].params.operationId as string;
+    handle.emitEvent({
+      event: "scanner.thumbnailsComplete",
+      payload: { count: 1, operationId: opId },
+    });
+
+    await store.approveEveryFrameAttended([1, 2, 3]);
+    const approvals = calls.filter((call) => call.method === "roll.approve");
+    expect(approvals).toHaveLength(3);
+    for (const approval of approvals) {
+      expect(approval.params.attended).toBe(true);
+      expect(approval.params.operationId).toBe(opId);
+    }
+    expect(store.getState().approvedFrames[opId]).toEqual([1, 2, 3]);
+
+    let caught: unknown;
+    try {
+      await store.approveEveryFrameAttended([]);
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as EngineError).code).toBe("INVALID_PARAMS");
+    expect(calls.filter((call) => call.method === "roll.approve")).toHaveLength(3);
+  });
+
   it("starting a new preview clears a prior completed token immediately", async () => {
     const { store, handle, calls } = scriptedStore();
 

@@ -53,7 +53,7 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | `device.status` | `{}` | `DeviceStatus` | `NOT_CONNECTED` |
 | `device.close` | `{}` | `{}` | `NOT_CONNECTED`, `HARDWARE_LANE_BUSY` |
 | `roll.preview` | `{material: "colorNegative"\|"blackAndWhiteNegative", slots?: [number]}` | `{accepted: true}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`; via `roll.previewError`: `FEEDER_PARKED`, `ADAPTER_UNSUPPORTED`, `REFEED_REQUIRED`, `DEVICE_BUSY`, `ROLL_MISMATCH` |
-| `roll.approve` | `{slot: number}` | `{}` | `NOT_CONNECTED`, `NO_PREVIEW` |
+| `roll.approve` | `{slot: number, fingerprint?: string, attended?: boolean}` | `{}` | `NOT_CONNECTED`, `NO_PREVIEW`, `INVALID_PARAMS`, `FINGERPRINT_REFUSED` |
 | `roll.setSpacingOffset` | `{slot: number, offsetRows: number}` | `{thumbnail: Thumbnail}` | `NOT_CONNECTED`, `NO_PREVIEW`, `INVALID_PARAMS` |
 | `roll.manualFrames` | `{rows: [number]}` | `{count: number, fingerprint: string, thumbnails: [Thumbnail], snaps: [BoundarySnap]}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `METER_UNUSABLE` |
 | `roll.previewStrip` | `{}` | `PreviewStrip` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `METER_UNUSABLE` |
@@ -82,6 +82,20 @@ Returns `HARDWARE_LANE_BUSY` while a job holds the lane — the safety rule hold
 ### `roll.approve`
 
 Records manual-review approval for one slot. Not motion-capable — no transport movement, no latch check. Required before scanning any slot whose last `roll.thumbnail` event had `needsApproval: true`; omitting it surfaces as `MANUAL_REVIEW_REQUIRED` when that slot's turn in `scan.start` comes up.
+
+`fingerprint`, when present, is the Roll fingerprint the approval was minted against; a value that no longer matches the roll's current fingerprint is refused with `FINGERPRINT_REFUSED` before any approval is recorded.
+
+#### `attended` (additive, 2026-08-13 — feed-detector round)
+
+`attended: true` records an operator-**attended** acceptance instead of a per-slot manual review, and is what lets a roll be scanned when its boundary-lattice confidence is below what unattended frame binding requires (issues #24, #16, #42 — "previews fine but will not scan").
+
+- It may approve a slot the detector never flagged. That is the point: on a roll the detector could not fully corroborate, the frames an operator has to vouch for are precisely the ones nothing flagged.
+- It is **all-or-nothing per batch.** The driver binds such a roll only when *every* slot in the subsequent `scan.start` carries an attended approval. A partially attended batch refuses exactly as an unapproved one does.
+- Eligibility is the driver's decision, not the bridge's. CoolscanPy accepts `attended` only for an automatically detected roll at `medium` lattice confidence; a `high` roll needs no rescue, a `low` roll has no anchored lattice to vouch for, and a manual placement binds through its own path. Every other case is refused with `INVALID_PARAMS` carrying the driver's own message.
+- Omitted (or `false`) is unchanged pre-existing behavior in every respect.
+- The mock transport refuses `attended` with `INVALID_PARAMS`: it has no lattice-confidence detector, so it has no roll for an attended acceptance to rescue.
+
+Each acceptance is recorded in the capture journal under `live_frame_selection.attended_roll_binding`, so an evidence audit can tell which mode bound a frame.
 
 ### `roll.setSpacingOffset`
 

@@ -919,7 +919,13 @@ class CoolscanPyTransport:
         self._preview_established = True
         return domain.PreviewResult(count=len(thumbnails), fingerprint=self._roll.fingerprint.sha256)
 
-    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
+    def approve(
+        self,
+        slot: int,
+        *,
+        fingerprint: str | None = None,
+        attended: bool = False,
+    ) -> None:
         if self._device is None:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
         if not self._preview_established:
@@ -948,8 +954,16 @@ class CoolscanPyTransport:
                 "that no longer matches the roll's current state; acquire a "
                 "fresh preview or placement and approve again",
             )
+        # Attended binding (feed-detector round; ScanStudio #24/#16/#42).
+        # coolscanpy owns the authority here: Roll.approve(attended=True)
+        # refuses with ValueError unless this roll is an automatically
+        # detected medium-confidence session, which is the only shape the
+        # scan-time gate will bind below "high". The bridge does not
+        # second-guess that -- it forwards the operator's intent and maps
+        # the refusal, exactly as it already does for "slot does not
+        # require manual review".
         try:
-            self._roll.approve(slot)
+            self._roll.approve(slot, attended=attended)
         except ValueError as exc:
             raise BridgeError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
 

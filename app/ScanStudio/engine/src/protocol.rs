@@ -301,6 +301,21 @@ pub struct RollApproveParams {
     /// review warning the user is acknowledging. Unlike preview's optional
     /// token, approval has no safe legacy fallback.
     pub operation_id: String,
+    /// Attended binding (feed-detector round; ScanStudio #24/#16/#42).
+    /// `false` (the default, and every pre-existing client) is unchanged
+    /// behavior: only a frame the completed preview flagged
+    /// `needsApproval` may be approved. `true` means the operator is
+    /// accepting a frame of a roll whose lattice confidence is too low to
+    /// bind unattended, so the frame need not be individually flagged --
+    /// but every frame of the batch must then be approved this way, and
+    /// the driver still refuses any roll shape other than an automatically
+    /// detected medium-confidence one.
+    ///
+    /// Omitted from the wire entirely when false (`skip_serializing_if`),
+    /// so a client that predates this field, and every request that does
+    /// not opt in, produces byte-identical params to before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attended: bool,
 }
 
 /// `roll.approve` intentionally returns no payload. Approval is a
@@ -880,6 +895,7 @@ mod tests {
         let params = RollApproveParams {
             frame_index: 7,
             operation_id: "completed-preview-7".to_string(),
+            attended: false,
         };
         assert_eq!(
             serde_json::to_value(&params).unwrap(),

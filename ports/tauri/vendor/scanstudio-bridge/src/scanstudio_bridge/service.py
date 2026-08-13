@@ -74,7 +74,7 @@ _METHOD_PARAM_SCHEMAS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "device.status": ((), ()),
     "device.close": ((), ()),
     "roll.preview": (("material",), ("slots",)),
-    "roll.approve": (("slot",), ("fingerprint",)),
+    "roll.approve": (("slot",), ("fingerprint", "attended")),
     "roll.setSpacingOffset": (("slot", "offsetRows"), ()),
     "roll.manualFrames": (("rows",), ()),
     "roll.previewStrip": ((), ()),
@@ -215,6 +215,12 @@ def _require_string(
             ErrorCode.INVALID_PARAMS,
             f"{name} length must be between {minimum_length} and {maximum_length}",
         )
+    return value
+
+
+def _require_bool(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise BridgeError(ErrorCode.INVALID_PARAMS, f"{name} must be true or false")
     return value
 
 
@@ -464,9 +470,19 @@ class BridgeService:
                 fingerprint = _require_string(
                     fingerprint, "fingerprint", maximum_length=256
                 )
+            # Attended binding (feed-detector round; ScanStudio #24/#16/#42):
+            # optional on the wire and omitted by every pre-existing caller,
+            # so the default is byte-identical to today's behavior. When
+            # true, the operator is accepting one frame of an automatically
+            # detected medium-confidence roll so the roll can be scanned
+            # with them watching -- coolscanpy refuses it on any other roll
+            # shape (INVALID_PARAMS).
+            attended = params.get("attended")
+            attended = False if attended is None else _require_bool(attended, "attended")
             self._transport.approve(
                 _require_plain_int(params["slot"], "slot", minimum=1, maximum=40),
                 fingerprint=fingerprint,
+                attended=attended,
             )
             return {}
         if method == "roll.setSpacingOffset":

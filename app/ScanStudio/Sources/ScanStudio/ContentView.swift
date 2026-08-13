@@ -413,6 +413,20 @@ private struct WorkspaceErrorBanner: View {
         presentation.canPlaceFramesManually && sessionModel.refeedRequired
     }
 
+    /// Attended binding (feed-detector round; issues #24/#16/#42). Offered
+    /// only when the policy classified this refusal as the rescuable
+    /// (medium) confidence gate AND there are frames selected to approve --
+    /// the action approves every selected frame and re-scans, so with an
+    /// empty selection it would have nothing to authorize.
+    private var showsApproveEveryFrameAction: Bool {
+        presentation.canApproveEveryFrameAndScan
+            && !sessionModel.selectedFrames.isEmpty
+    }
+
+    private var isApprovingEveryFrame: Bool {
+        sessionModel.approvingFrameIndex != nil
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
@@ -463,7 +477,10 @@ private struct WorkspaceErrorBanner: View {
                 // composes NOT_CONNECTED over the old message), and the
                 // button renders without a sentence for undiagnosed
                 // refeeds.
-                if showsManualPlacementAction || presentation.probableCause != nil {
+                if showsManualPlacementAction
+                    || showsApproveEveryFrameAction
+                    || presentation.probableCause != nil
+                {
                     VStack(alignment: .leading, spacing: 8) {
                         if let probableCause = presentation.probableCause {
                             Text(probableCause)
@@ -497,13 +514,49 @@ private struct WorkspaceErrorBanner: View {
                             .disabled(isLoadingManualPlacement)
                             .help("Draw your own frame boundaries on the captured film strip")
                         }
+
+                        // Attended binding (feed-detector round; issues
+                        // #24/#16/#42). The operator is standing at the
+                        // scanner looking at correct thumbnails the
+                        // detector could not fully corroborate. This
+                        // approves every selected frame against the exact
+                        // preview they reviewed and re-issues the scan.
+                        if showsApproveEveryFrameAction {
+                            Button {
+                                Task {
+                                    await sessionModel.approveEveryFrameAndScan()
+                                }
+                            } label: {
+                                if isApprovingEveryFrame {
+                                    HStack(spacing: 6) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Approving Frames…")
+                                    }
+                                } else {
+                                    Label(
+                                        "Approve every frame and scan",
+                                        systemImage: "checkmark.seal"
+                                    )
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.scanStudioAmber)
+                            .font(.system(size: 11, weight: .medium))
+                            .disabled(isApprovingEveryFrame)
+                            .help(
+                                "Confirm the previewed framing yourself and scan the "
+                                + "selected frames with you supervising"
+                            )
+                        }
                     }
                     .padding(10)
                     .background(Color.scanStudioRaised, in: RoundedRectangle(cornerRadius: 6))
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(
                         presentation.probableCause.map { "Probable cause: \($0)" }
-                            ?? "Manual frame placement is available"
+                            ?? (showsApproveEveryFrameAction
+                                ? "Approving every frame yourself is available"
+                                : "Manual frame placement is available")
                     )
                 }
 

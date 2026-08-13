@@ -56,7 +56,7 @@ Errors: `NOT_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `INVALID_PARAMS` (active-pr
 
 ### `roll.approve`
 
-`{frameIndex: u32, operationId: string}` → `{}`. Explicitly records the
+`{frameIndex: u32, operationId: string, attended?: bool}` → `{}`. Explicitly records the
 operator's approval for a single frame that the active **real-device** preview
 marked as requiring manual review. `operationId` is required, nonempty, and
 must exactly equal the token from the most recent successfully completed real
@@ -71,10 +71,27 @@ preview, scan, eject, check the motion latch, or refresh device status. It is
 scoped to the currently open bridge device session and is never retried after
 that session is lost.
 
+`attended` (additive, 2026-08-13 — feed-detector round; issues #24, #16, #42)
+defaults to `false` and is omitted from the wire entirely when false, so an
+ordinary approval is byte-identical to before this field existed. `true`
+records an operator-**attended** acceptance: the operator is authorizing a
+frame of a roll whose boundary-lattice confidence is below what unattended
+scanning requires, having checked the previewed framing themselves.
+
+An attended approval relaxes exactly one local check — the frame no longer has
+to be one the completed preview flagged `needsApproval`. It must still be a
+frame that exact completed preview actually returned; an index the preview
+never produced is refused with `INVALID_PARAMS` either way. Whether the roll is
+eligible at all remains the driver's decision (see BRIDGE.md `roll.approve`),
+and attended binding is all-or-nothing: the client must send an attended
+`roll.approve` for **every** frame of the subsequent `scan.start`, then send
+that original complete frame list in one request.
+
 The simulator has no manual-review gate and refuses this method with
-`INVALID_PARAMS`. Errors: `NOT_CONNECTED`, `INVALID_PARAMS`, `INTERNAL` (for
-a bridge refusal after a valid locally-bound approval; the bridge's specific
-diagnostic remains in the message).
+`INVALID_PARAMS`; it likewise has no lattice-confidence detector and refuses
+`attended: true` outright. Errors: `NOT_CONNECTED`, `INVALID_PARAMS`,
+`INTERNAL` (for a bridge refusal after a valid locally-bound approval; the
+bridge's specific diagnostic remains in the message).
 
 ### `roll.setSpacingOffset`
 
@@ -258,7 +275,7 @@ ApplyMetadataResult {success: bool, exitCode: i32, stdout: string, stderr: strin
 
 `PartialDate` never invents precision it wasn't given — `monthOnly`/`yearOnly` carry no day/month value at all rather than a placeholder like `01`; `unknown` carries no date value whatsoever. `MetadataSet.process` is independent of `ScanProject.filmProcess` and is never auto-synced with it.
 
-`Thumbnail`'s `brightness`/`tint` and `imagePath` are mutually exclusive: exactly one of the `{brightness, tint}` pair or `imagePath` is populated per instance, never both, never neither. The simulator populates `brightness`/`tint` and omits the real transport fields. A real backend populates `imagePath` (BRIDGE.md's bridge-written, Nikon-render-oriented preview tile), `boundaryRows`, `spacingOffset`, `needsApproval`, and `warnings`, while omitting `brightness`/`tint` rather than fabricating them. `spacingOffset` is the bridge-confirmed value active in this exact preview session; a project manifest value alone is not equivalent. Before sending `scan.start`, clients must inspect every requested frame's current completed-preview thumbnail. If any has `needsApproval: true`, the client must obtain explicit operator confirmation, send `roll.approve` for every such frame with that preview's exact `operationId`, and only then send the original complete frame list in one `scan.start`. Starting an unapproved subset and retrying the omitted frame as a second job is not equivalent: it loses the one-traversal transport assumption.
+`Thumbnail`'s `brightness`/`tint` and `imagePath` are mutually exclusive: exactly one of the `{brightness, tint}` pair or `imagePath` is populated per instance, never both, never neither. The simulator populates `brightness`/`tint` and omits the real transport fields. A real backend populates `imagePath` (BRIDGE.md's bridge-written, Nikon-render-oriented preview tile), `boundaryRows`, `spacingOffset`, `needsApproval`, and `warnings`, while omitting `brightness`/`tint` rather than fabricating them. `spacingOffset` is the bridge-confirmed value active in this exact preview session; a project manifest value alone is not equivalent. Before sending `scan.start`, clients must inspect every requested frame's current completed-preview thumbnail. If any has `needsApproval: true`, the client must obtain explicit operator confirmation, send `roll.approve` for every such frame with that preview's exact `operationId`, and only then send the original complete frame list in one `scan.start`. Starting an unapproved subset and retrying the omitted frame as a second job is not equivalent: it loses the one-traversal transport assumption. Separately, when `scan.start` is refused because the roll's boundary-lattice confidence is below what unattended binding requires, a client may offer the operator an attended retry: send `roll.approve` with `attended: true` for *every* frame of the batch under that same `operationId`, then resend the original complete frame list. This is only offered for the `medium` confidence the driver can bind; a `low`-confidence refusal is not rescuable this way and needs a refeed.
 
 `ScannerStatus.filmPresent` mirrors BRIDGE.md's `DeviceStatus.filmPresent` for a real backend — a live, no-motion film-presence read. `true` means the scanner reports film gripped, `false` is the verified MEDIUM NOT PRESENT response, and `null` means no trustworthy verdict was available; `null` is never absence. A verified `false` also invalidates any preview-derived `mediaLoaded`/`frameCount` claim, so the emitted status carries `mediaLoaded: false` and `frameCount: null`; this cannot discard project receipts or the unfinished resume set. Presence is not motion readiness because an end-stop-parked strip can still report `true`. The simulator always omits this field (it has no bridge to source it from).
 

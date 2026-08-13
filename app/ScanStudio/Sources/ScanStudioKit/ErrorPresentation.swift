@@ -88,6 +88,14 @@ public struct ErrorPresentation: Equatable, Sendable {
     /// manually" offered). Drives the workspace error card's button on its
     /// own; the diagnosis sentence next to it stays gated on `probableCause`.
     public let canPlaceFramesManually: Bool
+    /// True when this refusal is the scan-time roll-confidence gate and the
+    /// operator can clear it by accepting every frame themselves (attended
+    /// binding; feed-detector round, issues #24/#16/#42). The workspace
+    /// error card turns this into an "Approve every frame and scan" button,
+    /// which approves each requested frame against the current preview and
+    /// re-issues the scan. False for every other refusal, including the
+    /// `low`-confidence one attendance cannot rescue.
+    public let canApproveEveryFrameAndScan: Bool
 
     public init(
         title: String,
@@ -95,7 +103,8 @@ public struct ErrorPresentation: Equatable, Sendable {
         technicalDetails: String,
         issueURL: URL,
         probableCause: String? = nil,
-        canPlaceFramesManually: Bool = false
+        canPlaceFramesManually: Bool = false,
+        canApproveEveryFrameAndScan: Bool = false
     ) {
         self.title = title
         self.guidance = guidance
@@ -103,6 +112,7 @@ public struct ErrorPresentation: Equatable, Sendable {
         self.issueURL = issueURL
         self.probableCause = probableCause
         self.canPlaceFramesManually = canPlaceFramesManually
+        self.canApproveEveryFrameAndScan = canApproveEveryFrameAndScan
     }
 }
 
@@ -242,8 +252,32 @@ public enum ErrorPresentationPolicy {
             probableCause: copy.code == "REFEED_REQUIRED"
                 ? ProbableCauseExtractor.extract(from: lastErrorMessage)
                 : nil,
-            canPlaceFramesManually: copy.code == "REFEED_REQUIRED"
+            canPlaceFramesManually: copy.code == "REFEED_REQUIRED",
+            // Attended binding (feed-detector round; issues #24/#16/#42).
+            // Offered only for the confidence gate this policy itself
+            // classified, and only when the roll is rescuable: the driver
+            // binds an operator-approved roll at 'medium' but never at
+            // 'low', so offering the button on a 'low' refusal would
+            // promise a recovery that is guaranteed to refuse again.
+            canApproveEveryFrameAndScan: isAttendedRescuableConfidenceRefusal(
+                in: lastErrorMessage
+            )
         )
+    }
+
+    /// The scan-time roll-confidence refusal, restricted to the confidence
+    /// an operator's own approval can actually bind.
+    static func isAttendedRescuableConfidenceRefusal(in message: String) -> Bool {
+        guard
+            message.range(
+                of: "unattended frame binding requires",
+                options: .caseInsensitive
+            ) != nil
+        else { return false }
+        return message.range(
+            of: "confidence is 'medium'",
+            options: .caseInsensitive
+        ) != nil
     }
 
     private static func leadingFrameClippedCopy(in message: String) -> Copy? {
@@ -310,13 +344,30 @@ public enum ErrorPresentationPolicy {
         ) != nil else {
             return nil
         }
+        // Attended binding (feed-detector round; issues #24/#16/#42) split
+        // this one refusal into two honestly different situations. At
+        // 'medium' the detector DID find the frame lattice but could not
+        // corroborate it well enough to cut film unsupervised, so an
+        // operator who checks the frames themselves can authorize the scan.
+        // At 'low' it never anchored a lattice at all, and no amount of
+        // approving thumbnails changes that -- refeeding is the only real
+        // advice, so that copy must not promise a button.
+        if isAttendedRescuableConfidenceRefusal(in: message) {
+            return Copy(
+                code: "ROLL_MISMATCH",
+                title: "This roll needs you to confirm the frames",
+                guidance: "ScanStudio found the frame edges on this roll but is not "
+                    + "confident enough to cut film unsupervised. Check that the preview "
+                    + "thumbnails are framed correctly, then approve every frame and scan "
+                    + "-- or refeed the strip and preview again to try for a cleaner read."
+            )
+        }
         return Copy(
             code: "ROLL_MISMATCH",
             title: "This roll previewed with low confidence",
             guidance: "This roll previewed below the confidence the unattended scanner "
                 + "binding requires. Refeeding the strip or previewing it again may raise "
-                + "that confidence. A future release is expected to widen what the "
-                + "detector accepts here."
+                + "that confidence."
         )
     }
 
