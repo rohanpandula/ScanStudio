@@ -208,6 +208,7 @@ public enum ErrorPresentationPolicy {
         let copy = leadingFrameClippedCopy(in: lastErrorMessage)
             ?? filmFeedInterruptedCopy(in: lastErrorMessage)
             ?? filmTransportSlipCopy(in: lastErrorMessage)
+            ?? unattendedBindingConfidenceCopy(in: lastErrorMessage)
             ?? previewReadinessTimeoutCopy(in: lastErrorMessage)
             ?? knownCopy.first { containsCode($0.code, in: normalizedMessage) }
             ?? Copy(
@@ -291,6 +292,31 @@ public enum ErrorPresentationPolicy {
             guidance: "The scanner lost the film’s position. Remove and firmly reinsert "
                 + "the strip, then acquire a fresh preview. Do not retry Capture with "
                 + "the current preview."
+        )
+    }
+
+    /// The bridge's unattended-binding confidence gate (coolscanpy
+    /// `ls5000_single_pass/worker.py`): every frame in the batch refuses
+    /// before any motion because the roll's boundary-detection confidence
+    /// measured below what unattended scanning requires. Matched on this
+    /// phrase alone, not a `ROLL_MISMATCH` code prefix -- the engine wraps
+    /// the same wording differently depending on whether it surfaces from a
+    /// synchronous refusal or a per-frame scan failure, but the phrase
+    /// itself is unique to this one gate.
+    private static func unattendedBindingConfidenceCopy(in message: String) -> Copy? {
+        guard message.range(
+            of: "unattended frame binding requires",
+            options: .caseInsensitive
+        ) != nil else {
+            return nil
+        }
+        return Copy(
+            code: "ROLL_MISMATCH",
+            title: "This roll previewed with low confidence",
+            guidance: "This roll previewed below the confidence the unattended scanner "
+                + "binding requires. Refeeding the strip or previewing it again may raise "
+                + "that confidence. A future release is expected to widen what the "
+                + "detector accepts here."
         )
     }
 

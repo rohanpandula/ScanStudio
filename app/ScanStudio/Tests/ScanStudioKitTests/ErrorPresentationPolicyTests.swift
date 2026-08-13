@@ -570,4 +570,44 @@ struct ErrorPresentationPolicyTests {
             #expect(!presentation.canPlaceFramesManually, "expected false for: \(rawMessage)")
         }
     }
+
+    // MARK: - Unattended-binding confidence refusal (issue #76/#24)
+
+    @Test("the unattended-binding confidence gate gets calm, factual copy of its own")
+    func unattendedBindingConfidenceCopy() {
+        let rawMessage = "ROLL_MISMATCH: roll boundary lattice confidence is 'low'; "
+            + "unattended frame binding requires 'high'"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "This roll previewed with low confidence")
+        #expect(
+            presentation.guidance
+                == "This roll previewed below the confidence the unattended scanner binding requires. Refeeding the strip or previewing it again may raise that confidence. A future release is expected to widen what the detector accepts here."
+        )
+        #expect(presentation.technicalDetails == rawMessage)
+        // Deliberately its own code, distinct from REFEED_REQUIRED: this is
+        // a scan-time capture refusal, not a preview failure, and no
+        // manual-placement raster is guaranteed to exist for it.
+        #expect(!presentation.canPlaceFramesManually)
+    }
+
+    @Test("the unattended-binding phrase is recognized regardless of how the engine wraps the code")
+    func unattendedBindingConfidenceCopyMatchesWrappedForm() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): roll boundary lattice "
+            + "confidence is 'low'; unattended frame binding requires 'high'"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "This roll previewed with low confidence")
+    }
+
+    @Test("an ordinary roll mismatch without the confidence phrase keeps its own fallback")
+    func rollMismatchWithoutConfidencePhraseUsesFallback() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): calibration signature changed"
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title != "This roll previewed with low confidence")
+        #expect(presentation.title == "ScanStudio could not complete that action")
+    }
 }
