@@ -300,7 +300,7 @@ require_directory_parent="${binding_destination:h}"
 [[ -d "$bridge_source" && ! -L "$bridge_source" ]] \
     || die "bridge source is missing, not a directory, or a symlink: $bridge_source"
 require_regular_file "bridge lockfile" "$bridge_source/uv.lock"
-[[ -x "$bridge_python" && ! -L "$bridge_python" || -x "$bridge_python" ]] \
+[[ -x "$bridge_python" && ! -L "$bridge_python" ]] \
     || die "bridge Python is not executable: $bridge_python"
 
 "$bridge_python" -I -B - "$bridge_source/uv.lock" <<'PYTHON'
