@@ -175,6 +175,31 @@ jobs:
         run: |
           python3 -I -S -B scripts/install_pinned_cargo_about.py \
             --install-root "$RUNNER_TEMP/scanstudio-cargo-about"
+      - name: Resolve release version from the tag
+        # Same derivation as the `linux` job (and the `windows` job's pwsh
+        # equivalent): the workflow only runs on `v*` tag pushes, so
+        # stripping the leading "v" from GITHUB_REF_NAME is authoritative.
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Stamp the release version before assembling Windows resources
+        # Must run BEFORE assemble-staging.sh: assemble-staging.sh byte-copies
+        # src-tauri/Cargo.lock into Licenses/Rust-App-Cargo.lock and
+        # package.json/package-lock.json into Licenses/npm-production/ from
+        # this checkout. This job's staged tree is restored unchanged into
+        # the later `windows` job (which stamps only ITS OWN fresh checkout,
+        # not the resource tree it receives as an artifact), so an unstamped
+        # checkout here means every shipped Windows installer and portable
+        # zip carries a Rust-App-Cargo.lock that still says the checked-in
+        # placeholder "0.3.0" -- mirrors the linux job, which stamps (see
+        # linux/build-and-verify.sh) before calling its own assemble-staging.sh
+        # in the same job.
+        working-directory: ports/tauri
+        run: |
+          python3 -I -S -B packaging/stamp_release_version.py \
+            app/src-tauri/tauri.conf.json \
+            app/package.json \
+            app/src-tauri/Cargo.toml \
+            app/src-tauri/Cargo.lock \
+            "$RELEASE_VERSION"
       - name: Assemble and verify the WSL2 resource bundle
         working-directory: ports/tauri
         env:

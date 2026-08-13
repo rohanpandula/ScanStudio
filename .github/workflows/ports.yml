@@ -47,6 +47,22 @@ jobs:
         run: |
           python3 -I -S -B scripts/install_pinned_cargo_about.py \
             --install-root "$RUNNER_TEMP/scanstudio-cargo-about"
+      - name: Stamp the CI version before assembling Windows resources
+        # Must run BEFORE assemble-staging.sh, which byte-copies Cargo.lock
+        # and package.json/package-lock.json into the staged Licenses/ tree
+        # from this checkout. Uses the exact same "0.3.0-ci.<run_number>"
+        # version the `windows` job below already passes to
+        # build-and-verify.ps1, so the staged license snapshot and the built
+        # binary's self-reported version agree (mirrors the release.yml fix
+        # for this same job).
+        working-directory: ports/tauri
+        run: |
+          python3 -I -S -B packaging/stamp_release_version.py \
+            app/src-tauri/tauri.conf.json \
+            app/package.json \
+            app/src-tauri/Cargo.toml \
+            app/src-tauri/Cargo.lock \
+            "0.3.0-ci.${{ github.run_number }}"
       - name: Assemble and verify the WSL2 resource bundle
         working-directory: ports/tauri
         env:

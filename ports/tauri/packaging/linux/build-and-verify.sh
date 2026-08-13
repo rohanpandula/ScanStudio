@@ -34,41 +34,14 @@ printf '{"version":"%s"}\n' "$version" > "$build_config"
 # just the CLI's --config merge above. Cargo.toml and package.json are
 # stamped too so `cargo metadata`, the cargo-about notice generator, and npm
 # tooling agree with the shipped binary instead of showing a frozen "0.3.0".
-python3 -I -S -B - \
+# Shared with windows/build-and-verify.ps1 via stamp_release_version.py so
+# both packaging lanes apply the exact same fail-closed regex contract.
+python3 -I -S -B "$port_root/packaging/stamp_release_version.py" \
     "$app_root/src-tauri/tauri.conf.json" \
     "$app_root/package.json" \
     "$app_root/src-tauri/Cargo.toml" \
     "$app_root/src-tauri/Cargo.lock" \
-    "$version" <<'PY'
-import re
-import sys
-
-tauri_conf_path, package_json_path, cargo_toml_path, cargo_lock_path, release_version = sys.argv[1:6]
-
-
-def stamp(path, pattern):
-    with open(path, "r", encoding="utf-8") as handle:
-        content = handle.read()
-    found = list(re.finditer(pattern, content, flags=re.MULTILINE))
-    if len(found) != 1:
-        sys.exit(f"expected exactly one version field in {path}, found {len(found)}")
-    start, end = found[0].span(1)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(content[:start] + release_version + content[end:])
-
-
-json_version_pattern = r'"version":\s*"([^"]*)"'
-stamp(tauri_conf_path, json_version_pattern)
-stamp(package_json_path, json_version_pattern)
-stamp(cargo_toml_path, r'(?m)^version = "([^"]*)"')
-# Cargo.lock records this workspace member's own version in its
-# [[package]] block; --locked (the supply-chain gate the pinned toolchain
-# work added) refuses to silently regenerate a lockfile that has drifted
-# from Cargo.toml, so the stamp must apply here too or cargo/rustc refuse
-# to run at all before any build step -- exactly what happened once
-# Cargo.toml alone was stamped.
-stamp(cargo_lock_path, r'(?m)^name = "scanstudio-app"\r?\nversion = "([^"]*)"')
-PY
+    "$version"
 
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
