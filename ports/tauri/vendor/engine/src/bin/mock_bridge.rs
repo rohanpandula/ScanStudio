@@ -306,6 +306,16 @@ fn main() {
     let scan_upfront_burst = std::env::var("MOCK_BRIDGE_SCAN_UPFRONT_BURST")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
+    // LV-1 (2026-08-13 live validation): a roll eject is a mechanical
+    // rewind that keeps running long after the command is accepted — 57s
+    // measured on a full 36-exposure roll — so `device.eject` is the one
+    // synchronous bridge call that legitimately outlives a control-plane
+    // request timeout. This delay reproduces that shape deterministically:
+    // the handler blocks, answers normally afterwards, and moves nothing.
+    let eject_delay_ms: u64 = std::env::var("MOCK_BRIDGE_EJECT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
     let call_log_path = std::env::var_os("MOCK_BRIDGE_CALL_LOG").map(PathBuf::from);
     // Rung 4 validation-passthrough seam: when set, `roll.manualFrames`
     // refuses every request with this exact `INVALID_PARAMS` message,
@@ -438,6 +448,7 @@ fn main() {
             inter_frame_delay_extra_ms,
             scan_upfront_burst,
             manual_frames_error.clone(),
+            eject_delay_ms,
         ) {
             Ok(result) => {
                 if request.method == "bridge.hello" {
@@ -457,7 +468,6 @@ fn main() {
     let _ = writer.join();
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Lane C mock: exactly one designated slot reports `partial: true` so
 /// integration tests can assert the field survives the engine unmangled;
 /// every other slot omits it, like a real bridge on a fully-inside frame.
@@ -469,6 +479,11 @@ fn mock_partial_for(slot: u32) -> Option<bool> {
     (slot == MOCK_PARTIAL_SLOT).then_some(true)
 }
 
+// Every parameter here is one independent mock failure-injection seam,
+// each read once from the environment in `main` and threaded through. The
+// allow was previously attached to `MOCK_PARTIAL_SLOT` above rather than to
+// this function, so it never actually silenced anything.
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     tx: &mpsc::Sender<String>,
     request: &BridgeRequest,
@@ -492,6 +507,7 @@ fn handle_request(
     inter_frame_delay_extra_ms: u64,
     scan_upfront_burst: bool,
     manual_frames_error: Option<String>,
+    eject_delay_ms: u64,
 ) -> Result<serde_json::Value, (BridgeErrorCode, String)> {
     match request.method.as_str() {
         "bridge.hello" => {
@@ -742,6 +758,12 @@ fn handle_request(
         }
         "device.eject" => {
             require_open(state)?;
+            // Blocking on the request thread on purpose: a real bridge's
+            // `device.eject` is synchronous, so this is exactly what the
+            // engine's transport sees while a roll rewinds.
+            if eject_delay_ms > 0 {
+                thread::sleep(Duration::from_millis(eject_delay_ms));
+            }
             state.preview_established.store(false, Ordering::Release);
             state.preview_slot_count.store(0, Ordering::Release);
             let status = current_status(state, false);

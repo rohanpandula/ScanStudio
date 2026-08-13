@@ -1914,6 +1914,134 @@ fn scan_silence_past_deadline_reports_honest_failure_without_touching_the_bridge
     );
 }
 
+/// LV-1 regression (live 2026-08-13 on a real LS-5000 + SA-30, reproduced
+/// twice — `shortstrip-lab/live-attempts/20260813-beta8-linux-validation/`,
+/// `vm-logs/preview-eject-192702.log` and `vm-logs/ma21-194452.log`): a roll
+/// eject from a deep post-traversal position is a mechanical rewind that
+/// outlived the engine's generic 10s bridge request timeout. The engine
+/// declared the bridge unhealthy, tore down session ownership, and answered
+/// `NOT_CONNECTED` — while the eject completed physically ~20s later and a
+/// motion-free probe confirmed the film out. The operator saw a hard error
+/// as their roll popped out, and post-eject status confirmation became
+/// impossible.
+///
+/// `MOCK_BRIDGE_EJECT_DELAY_MS` blocks `device.eject` in the bridge child
+/// for longer than the generic request timeout this backend is built with,
+/// then answers normally — the exact live shape. The eject must now
+/// succeed, and the session must survive it well enough to answer the
+/// follow-up `device.status` an operator needs.
+#[test]
+fn a_roll_length_eject_outlives_the_generic_request_timeout_and_keeps_its_session() {
+    let backend = Arc::new(
+        RealLs5000::new_with_env(
+            mock_bridge_bin(),
+            GENEROUS_TIMEOUT,
+            &[("MOCK_BRIDGE_EJECT_DELAY_MS", "4500")],
+        )
+        .expect("the eject delay must not affect bridge.hello/device.list"),
+    );
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect should succeed — device.open is unaffected by the eject delay");
+
+    // 4500ms is deliberately above GENEROUS_TIMEOUT (3s): before this fix
+    // every bridge call, eject included, was bounded by that one timeout,
+    // so this is the call that used to fail. The eject deadline is left at
+    // its production default here on purpose — proving the shipped value
+    // covers a call this long, not just whatever a test dialled in.
+    let started = Instant::now();
+    let status = backend
+        .eject()
+        .expect("an eject slower than the generic request timeout must still be awaited");
+    assert!(
+        started.elapsed() >= Duration::from_millis(4500),
+        "the engine must have actually waited out the mechanical delay, not short-circuited it"
+    );
+    assert!(
+        status.connected,
+        "a completed eject leaves the session open: {status:#?}"
+    );
+    assert!(
+        !status.media_loaded,
+        "the bridge reported the film out, so the post-eject status must say so: {status:#?}"
+    );
+
+    // The operator-facing half of LV-1: post-eject status confirmation was
+    // impossible once the session was torn down. Same live process, so
+    // connected:true here also proves the bridge was never quarantined.
+    let confirmation = backend
+        .status()
+        .expect("post-eject status confirmation must be possible again");
+    assert!(
+        confirmation.connected,
+        "the bridge must still be the same live, unquarantined instance: {confirmation:#?}"
+    );
+}
+
+/// The other half of LV-1's fix: widening the eject deadline must not have
+/// weakened what happens when it genuinely expires. With the deadline
+/// driven below the mock's eject delay, the pre-existing fail-closed
+/// behaviour must be intact — no invented success, the bridge quarantined,
+/// session ownership torn down, and no retry of any kind
+/// (INCIDENT-20260719) — plus the new eject-specific guidance, which is the
+/// one thing the generic transport-failure text could never say: the film
+/// state is unknown, not failed, because the rewind outlives whoever was
+/// listening.
+#[test]
+fn an_eject_past_its_own_deadline_still_fails_closed_and_names_the_unknown_film_state() {
+    let backend = Arc::new(
+        RealLs5000::new_with_env(
+            mock_bridge_bin(),
+            GENEROUS_TIMEOUT,
+            &[("MOCK_BRIDGE_EJECT_DELAY_MS", "4000")],
+        )
+        .expect("the eject delay must not affect bridge.hello/device.list")
+        .with_eject_call_deadline(Duration::from_millis(500)),
+    );
+    backend
+        .connect(DEVICE_ID, &ConnectOptions::default())
+        .expect("connect should succeed");
+
+    let error = backend
+        .eject()
+        .expect_err("an eject past its own deadline must never be reported as a success");
+    assert_eq!(
+        error.code,
+        ErrorCode::NotConnected,
+        "a genuinely unanswered eject is still a connection loss: {error:?}"
+    );
+    assert!(
+        error.message.contains("bridge call timed out")
+            && error
+                .message
+                .contains("bridge session ownership was lost during session-scoped device.eject")
+            && error
+                .message
+                .contains("no automatic open or motion retry was attempted"),
+        "the pre-existing fail-closed teardown must be preserved verbatim: {error:?}"
+    );
+    assert!(
+        error
+            .message
+            .contains("the eject may still be completing mechanically")
+            && error
+                .message
+                .contains("the film state is unknown, not failed")
+            && error
+                .message
+                .contains("never re-issue motion on an unconfirmed eject"),
+        "the timeout must name the physical caveat the generic transport text cannot: {error:?}"
+    );
+
+    // Proves the deadline is genuinely eject-scoped rather than a widened
+    // client-wide timeout: this backend's generic request timeout is 3s,
+    // and the 500ms eject deadline fired well inside it.
+    let follow_up = backend
+        .status()
+        .expect_err("a quarantined bridge must keep failing closed after the lost eject");
+    assert_eq!(follow_up.code, ErrorCode::NotConnected);
+}
+
 #[test]
 fn scan_stop_always_reports_after_current_frame_mode() {
     let backend = Arc::new(
