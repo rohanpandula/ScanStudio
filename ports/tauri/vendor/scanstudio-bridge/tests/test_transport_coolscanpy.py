@@ -36,6 +36,14 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
 )
 from coolscanpy.protocol.ls5000_single_pass.plan import CANONICAL_PLAN_SHA256
 from coolscanpy.roll.preview_session import _preview_binding_contract
+# LV-2 settle-window realism (2026-08-13 adversarial review of PR #88,
+# P2-3): the real inner cost a `None` verdict from `Device.film_present()`
+# can carry -- see coolscanpy_transport_module's own settle-window
+# rationale comment. Imported by name, not hand-copied as a bare literal,
+# so this test file cannot silently drift from coolscanpy's own constant.
+from coolscanpy.transport.adapter_status import (
+    _SETTLE_DEADLINE_SECONDS as _COOLSCANPY_INNER_PROBE_SETTLE_SECONDS,
+)
 
 from scanstudio_bridge import domain, safety, service
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
@@ -227,6 +235,11 @@ class _FakeDevice:
         # (e.g. ==1 for an immediate definite verdict, >1 for a settle
         # retry) without inferring it indirectly from elapsed fake time.
         self.film_present_calls = 0
+        # P2-3 (2026-08-13 adversarial review of PR #88): a `_FakeEjectConfirmClock`
+        # a test wants charged with the real inner probe cost -- see
+        # film_present() below. `None` (the default) means "free", matching
+        # every OTHER test in this file that never touches this attribute.
+        self.film_present_settle_clock: "_FakeEjectConfirmClock | None" = None
         self.closed = False
         self.capabilities = _fake_capabilities()
         # Plan 10-09 (attempts-root persistence): records exactly what
@@ -252,6 +265,21 @@ class _FakeDevice:
             value = result.pop(0) if len(result) > 1 else (result[0] if result else None)
         else:
             value = result
+        # P2-3: a None verdict from the REAL Device.film_present() is never
+        # free -- coolscanpy's own probe_adapter_status() already drains
+        # the same startup unit-attention senses internally for up to
+        # _COOLSCANPY_INNER_PROBE_SETTLE_SECONDS before it gives up and
+        # returns None (see that import's own comment above). Charge that
+        # cost to the SAME fake clock the outer settle-and-retry loop
+        # reads, via `.advance()` (not `.sleep()` -- see
+        # _FakeEjectConfirmClock's own docstring for why those stay
+        # separate), so a test's accounting reflects the true multi-probe/
+        # multi-second shape instead of getting free (zero-cost) probes. A
+        # definite True/False costs nothing, exactly like the real probe:
+        # the first TEST UNIT READY reply was already conclusive, so no
+        # internal drain was needed.
+        if value is None and self.film_present_settle_clock is not None:
+            self.film_present_settle_clock.advance(_COOLSCANPY_INNER_PROBE_SETTLE_SECONDS)
         if isinstance(value, BaseException):
             raise value
         return value
@@ -3315,15 +3343,24 @@ def test_eject_fallback_device_busy_maps_typed(
 
 
 class _FakeEjectConfirmClock:
-    """Deterministic stand-in for `time.monotonic`/`time.sleep`, patched in
-    via `_patch_eject_confirm_clock` the same way this file's git-provenance
-    tests below patch `coolscanpy_transport_module.subprocess.run`: the
-    real `time` module's own `monotonic`/`sleep` attributes are replaced
-    for the duration of one test (monkeypatch restores them afterward).
-    `sleep()` advances `monotonic()` by the exact requested amount instead
-    of actually blocking, so `_require_vendor_eject_confirmed`'s full
-    `_VENDOR_EJECT_CONFIRM_SETTLE_SECONDS` bound (LV-2) can be exercised
-    without a test taking anywhere near that long in real wall time."""
+    """Deterministic stand-in for `_require_vendor_eject_confirmed`'s own
+    `_monotonic`/`_sleep` module-level indirection points (2026-08-13
+    adversarial review of PR #88, P2-5) -- patched in via
+    `_patch_eject_confirm_clock`, which swaps THOSE two names
+    (`coolscanpy_transport_module._monotonic` / `._sleep`), never the real
+    stdlib `time` module: mutating the actual `time.sleep`/`time.monotonic`
+    for a test's duration would be process-visible to any other live
+    thread in the same test run (e.g. a scan soft-timeout watchdog), not
+    just this one call.
+
+    `sleep()` is what the code under test actually calls (via the patched
+    `_sleep` name): it advances `now` AND is recorded in `sleep_calls`, a
+    pure record of the settle loop's own outer-poll sleeps. `advance()` is
+    a separate, unrecorded way to move `now` forward, used by
+    `_FakeDevice.film_present()` (P2-3) to charge its own simulated inner
+    probe cost onto this SAME clock without polluting `sleep_calls` --
+    keeping that list an honest record of only the production retry loop's
+    own behavior."""
 
     def __init__(self) -> None:
         self.now = 0.0
@@ -3336,13 +3373,23 @@ class _FakeEjectConfirmClock:
         self.sleep_calls.append(seconds)
         self.now += seconds
 
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
 
 def _patch_eject_confirm_clock(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, device: "_FakeDevice"
 ) -> _FakeEjectConfirmClock:
+    """Patches both halves of LV-2's settle-window determinism in one call:
+    `coolscanpy_transport_module`'s own `_monotonic`/`_sleep` indirection
+    points (P2-5), and wires `device.film_present_settle_clock` (P2-3) so
+    an indeterminate probe charges its simulated inner cost onto the same
+    clock the retry loop reads. Takes `device` rather than returning
+    something each caller must remember to wire up itself."""
     clock = _FakeEjectConfirmClock()
-    monkeypatch.setattr(coolscanpy_transport_module.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(coolscanpy_transport_module.time, "sleep", clock.sleep)
+    monkeypatch.setattr(coolscanpy_transport_module, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(coolscanpy_transport_module, "_sleep", clock.sleep)
+    device.film_present_settle_clock = clock
     return clock
 
 
@@ -3354,9 +3401,17 @@ def test_vendor_eject_still_present_after_accept_is_feeder_parked(
     still present is the accepted-without-progress wedge and must surface
     as FEEDER_PARKED, never as success -- immediately, on the very first
     probe, spending none of LV-2's settle window: that window is for a
-    genuinely INDETERMINATE None, never for waiting out a definite True."""
-    clock = _patch_eject_confirm_clock(monkeypatch)
+    genuinely INDETERMINATE None, never for waiting out a definite True.
+
+    This IS the live MA-21 shape (2026-08-13 adversarial review of PR #88,
+    P2-2, correcting the earlier mislabeled synthetic test below):
+    vm-logs/ma21-201040.log shows a single FEEDER_PARKED with no preceding
+    retry. The MA-21's eject was accepted-but-inert -- no transport motion
+    occurred at all -- so no post-motion UNIT ATTENTION was ever posted for
+    a probe to drain; the very first TEST UNIT READY reply was already a
+    definite True, with no preceding None."""
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    clock = _patch_eject_confirm_clock(monkeypatch, device)
     device.eject_effect = True
     device.film_present_result = True
 
@@ -3367,20 +3422,23 @@ def test_vendor_eject_still_present_after_accept_is_feeder_parked(
     assert "still present" in str(excinfo.value)
     assert device.film_present_calls == 1
     assert clock.sleep_calls == []
+    assert clock.now == 0.0
 
 
 def test_vendor_eject_present_during_settle_window_is_feeder_parked_without_further_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The live MA-21 shape, unchanged by LV-2's fix (2026-08-13,
-    vm-logs/ma21-201040.log): the first probe lands in the settle window as
-    an indeterminate None (the same post-motion drain LV-2 is about), one
-    settle-retry sleep fires, and the SECOND probe returns a definite True
-    -- the accepted-without-progress wedge, not a drain. That definite
-    verdict must still resolve immediately, without spending the rest of
-    the settle window on a park that will never clear on its own."""
-    clock = _patch_eject_confirm_clock(monkeypatch)
+    """SYNTHETIC coverage, NOT the literal live MA-21 log shape (2026-08-13
+    adversarial review of PR #88, P2-2 -- see the adjacent immediate-True
+    test above for that one): defensive coverage for a stall that first
+    reads as an indeterminate settling probe (one settle-retry sleep fires,
+    after the real inner probe cost -- P2-3) before a SECOND probe resolves
+    to a definite True -- the accepted-without-progress wedge, not a drain.
+    Proves the "True is final, never retried further" rule holds even when
+    it is the settle window's own retry path that surfaces the True, not
+    just an immediate first read."""
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    clock = _patch_eject_confirm_clock(monkeypatch, device)
     device.eject_effect = True
     device.film_present_result = [None, True]
 
@@ -3393,6 +3451,13 @@ def test_vendor_eject_present_during_settle_window_is_feeder_parked_without_furt
     assert clock.sleep_calls == [
         coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS
     ]
+    # P2-3: the first (None) call charges the real inner-probe cost too --
+    # accounting now reflects ~11s of simulated wall time (10s inner + 1s
+    # outer poll), not the old free-probe ~1s.
+    assert clock.now == pytest.approx(
+        _COOLSCANPY_INNER_PROBE_SETTLE_SECONDS
+        + coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS
+    )
     assert clock.now < coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
 
 
@@ -3402,11 +3467,12 @@ def test_vendor_eject_confirms_clear_after_settle_retry(
     """LV-2's actual fix, direct coverage (2026-08-13,
     shortstrip-lab/live-attempts/20260813-beta8-linux-validation/RESULT.md
     + vm-logs/eject-nopreview-194010.log): two indeterminate probes (the
-    post-motion UNIT ATTENTION drain) followed by a definite False must
-    confirm the eject as a SUCCESS -- the exact shape that used to fail
-    closed with EJECT_FAILED from a single immediate probe."""
-    clock = _patch_eject_confirm_clock(monkeypatch)
+    post-motion UNIT ATTENTION drain, each carrying its own real inner
+    settle cost -- P2-3) followed by a definite False must confirm the
+    eject as a SUCCESS -- the exact shape that used to fail closed with
+    EJECT_FAILED from a single immediate probe."""
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    clock = _patch_eject_confirm_clock(monkeypatch, device)
     device.eject_effect = True
     device.film_present_result = [None, None, False]
 
@@ -3416,6 +3482,13 @@ def test_vendor_eject_confirms_clear_after_settle_retry(
     assert clock.sleep_calls == [
         coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS
     ] * 2
+    # ~22s of simulated wall time (2x10s inner + 2x1s outer), comfortably
+    # inside the 40s bound -- this is the "settles well inside the window"
+    # shape RESULT.md's own evidence describes.
+    assert clock.now == pytest.approx(
+        2 * _COOLSCANPY_INNER_PROBE_SETTLE_SECONDS
+        + 2 * coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS
+    )
     assert clock.now < coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
 
 
@@ -3427,9 +3500,14 @@ def test_vendor_eject_unconfirmable_presence_fails_closed(
     indeterminate probe a bounded settle-and-retry window
     (_VENDOR_EJECT_CONFIRM_SETTLE_SECONDS) before this still fails closed
     as EJECT_FAILED, exactly as it did before that window existed -- only
-    the timing changed, not the verdict for a probe that never resolves."""
-    clock = _patch_eject_confirm_clock(monkeypatch)
+    the timing changed, not the verdict for a probe that never resolves.
+
+    P2-3 (2026-08-13 adversarial review of PR #88): each probe now charges
+    its own real inner settle cost too, so this reflects the true
+    ~4-probe/~40s accounting the fix actually produces, not the old
+    free-probe count."""
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    clock = _patch_eject_confirm_clock(monkeypatch, device)
     device.eject_effect = True
     device.film_present_result = None
 
@@ -3440,11 +3518,17 @@ def test_vendor_eject_unconfirmable_presence_fails_closed(
     assert "could not be confirmed" in str(excinfo.value)
     # Proves the settle window actually ran to its bound instead of
     # failing closed on the first indeterminate read: one more probe than
-    # sleep (the final probe that hits the deadline does not sleep again),
-    # and the fake clock advanced to at least the settle bound.
+    # outer sleep (the final probe that hits the deadline does not sleep
+    # again), and the fake clock advanced to at least the settle bound.
     assert device.film_present_calls == len(clock.sleep_calls) + 1
     assert device.film_present_calls > 1
     assert clock.now >= coolscanpy_transport_module._VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
+    # With each probe costing ~10s (P2-3) and the outer bound at 40s, the
+    # window should exhaust in roughly four probes, not the sixteen
+    # free-probe calls the old (unrealistic) fake produced -- a loose
+    # upper bound that stays true across small constant tuning rather than
+    # hardcoding an exact count.
+    assert device.film_present_calls <= 6
 
 
 def test_eject_roll_close_failure_reports_film_out_not_eject_failed(
