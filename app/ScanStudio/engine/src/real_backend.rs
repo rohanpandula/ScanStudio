@@ -48,6 +48,49 @@ const EVENT_STREAM_OWNERSHIP_RECHECK: Duration = Duration::from_millis(100);
 /// bridge process is therefore normal during preview/scan; only a dead
 /// bridge or this hard deadline ends the wait.
 const STREAM_SILENCE_DEADLINE: Duration = Duration::from_secs(600);
+/// Bridge-call deadline for `device.eject` ALONE. Every other bridge call
+/// keeps the client's generic `request_timeout` (10s in `server.rs`), which
+/// is sized for control-plane round trips, not for mechanics.
+///
+/// `device.eject` is the one synchronous bridge call whose duration is a
+/// physical rewind rather than a computation: `roll.preview`/`scan.start`
+/// are accept-then-event, so their transport time lands on the event
+/// stream's own `STREAM_SILENCE_DEADLINE` instead. Measured evidence:
+///
+/// * a verified-good eject of a full 36-exposure roll from a normal
+///   post-traversal position reached the terminal medium-clear sense at
+///   **t+57s**, first motion at t+24s
+///   (`shortstrip-lab/INCIDENT-20260719-eject-from-park.md`);
+/// * live 2026-08-13 on a real LS-5000 + SA-30 (30 frames remaining), the
+///   engine's generic 10s timeout lapsed while the film was still moving —
+///   twice — and a motion-free probe confirmed the film out ~20s later
+///   (`shortstrip-lab/live-attempts/20260813-beta8-linux-validation/`,
+///   finding LV-1). Strips never showed this: they rewind in seconds.
+///
+/// The sizing rule is NOT "measured worst case plus slack" — it is that
+/// this deadline must strictly DOMINATE the bridge's own bounded eject
+/// work, so the bridge always gets to deliver its typed verdict
+/// (`EJECT_FAILED`, `FEEDER_PARKED`, or a confirmed success) instead of the
+/// engine inventing a transport failure underneath it. The driver's own
+/// bound on the held-session route is the eject CDB (30s) plus its
+/// companion EXECUTE (30s) plus the post-eject sense-chain wait
+/// (`EJECT_COMPLETION_DEADLINE_SECONDS` = 120s) — 180s in the worst case,
+/// before the bridge's own presence-confirmation gate. 300s clears that
+/// with margin and is still ~4.7x the ~63s a full forty-frame rewind
+/// implies by scaling the measured 36-frame figure.
+///
+/// This is a backstop for a bridge that has genuinely stopped answering,
+/// never a competitor to the driver's own wait: when it does fire, the
+/// existing quarantine and session-ownership teardown are preserved
+/// unchanged (see `eject`).
+const EJECT_CALL_DEADLINE: Duration = Duration::from_secs(300);
+/// Appended to the session-ownership-lost detail when a `device.eject`
+/// request crossed a broken bridge boundary. The physical fact an operator
+/// needs is the one the generic transport-failure text cannot carry: the
+/// scanner keeps rewinding whether or not anything is still listening, so
+/// an unanswered eject is an UNKNOWN film state, never a failed one.
+/// INCIDENT-20260719 still forbids any automatic motion retry.
+const EJECT_TRANSPORT_FAILURE_GUIDANCE: &str = "the eject may still be completing mechanically — a roll rewind runs long past the command that started it, and this engine never saw a confirmed result either way, so the film state is unknown, not failed; reconnect and read status before touching the transport, and never re-issue motion on an unconfirmed eject";
 /// Hard allocation bound for one bridge NDJSON record. Receipts contain only
 /// control data and paths; accepting an unbounded stdout line would let a
 /// malformed or compromised bridge exhaust engine memory before any evidence
@@ -453,6 +496,22 @@ impl BridgeClient {
         self.call_with_timeout(method, params, self.request_timeout)
     }
 
+    /// Like [`call`](Self::call), but bounded by an explicit `deadline`
+    /// instead of the client's generic `request_timeout`. Reserved for the
+    /// few methods whose duration is a known physical bound rather than a
+    /// control-plane round trip — today only `device.eject` (see
+    /// [`EJECT_CALL_DEADLINE`]). Everything else about the call is
+    /// identical, quarantine on expiry included: this widens one method's
+    /// patience, it does not weaken the transport contract.
+    pub fn call_with_deadline(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: Duration,
+    ) -> Result<serde_json::Value, BridgeCallError> {
+        self.call_with_timeout(method, params, deadline)
+    }
+
     fn call_with_timeout(
         &self,
         method: &str,
@@ -828,6 +887,13 @@ pub struct RealLs5000 {
     /// without mutating process-global state that a concurrently-running
     /// test would also see.
     scan_silence_deadline: Duration,
+    /// This backend's `device.eject` bridge-call deadline, resolved once at
+    /// construction from `SCANSTUDIO_EJECT_DEADLINE_SECS` (see
+    /// `eject_call_deadline_from_env`). Held per instance for the same
+    /// reason as `scan_silence_deadline`: a test drives it through
+    /// [`with_eject_call_deadline`](Self::with_eject_call_deadline) instead
+    /// of mutating process-global environment a parallel test would share.
+    eject_call_deadline: Duration,
 }
 
 /// Preserves whether a session-scoped call was cleanly rejected by the same
@@ -838,6 +904,22 @@ pub struct RealLs5000 {
 enum SessionCallError {
     BridgeRejected(EngineError),
     OwnershipLost(EngineError),
+}
+
+/// Per-call overrides for `call_session_scoped_detailed`. `Default` is the
+/// historic behaviour byte for byte — the client's generic request timeout
+/// and no extra operator guidance — so only a call site that genuinely
+/// needs a different bound carries one.
+#[derive(Default, Clone, Copy)]
+struct SessionCallOptions<'a> {
+    /// Replaces `BridgeClient::request_timeout` for this one call.
+    deadline: Option<Duration>,
+    /// Appended to the ownership-lost detail when, and only when, the
+    /// request was actually written to the bridge and no answer came back.
+    /// Used to carry a method-specific physical caveat the generic
+    /// transport-failure text cannot express (see
+    /// [`EJECT_TRANSPORT_FAILURE_GUIDANCE`]).
+    transport_failure_guidance: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2552,6 +2634,7 @@ impl RealLs5000 {
             firmware_label,
             supported_multisample_passes,
             scan_silence_deadline: scan_silence_deadline_from_env(),
+            eject_call_deadline: eject_call_deadline_from_env(),
         })
     }
 
@@ -2565,6 +2648,18 @@ impl RealLs5000 {
     /// for it either.
     pub fn with_scan_silence_deadline(mut self, deadline: Duration) -> Self {
         self.scan_silence_deadline = deadline;
+        self
+    }
+
+    /// Overrides this backend's `device.eject` bridge-call deadline,
+    /// replacing whatever `SCANSTUDIO_EJECT_DEADLINE_SECS` resolved to at
+    /// construction. Same in-process rationale as
+    /// [`with_scan_silence_deadline`](Self::with_scan_silence_deadline):
+    /// the deadline is enforced by THIS process's transport, so
+    /// `Command::env` cannot reach it and `std::env::set_var` would leak
+    /// into concurrently-running tests.
+    pub fn with_eject_call_deadline(mut self, deadline: Duration) -> Self {
+        self.eject_call_deadline = deadline;
         self
     }
 
@@ -3060,6 +3155,7 @@ impl RealLs5000 {
         expected_bridge_generation: u64,
         method: &str,
         params: serde_json::Value,
+        options: SessionCallOptions<'_>,
     ) -> Result<serde_json::Value, SessionCallError> {
         let current_epoch = self.active_session_epoch.load(Ordering::Acquire);
         let session_bridge_generation = self
@@ -3083,7 +3179,11 @@ impl RealLs5000 {
             ));
         }
 
-        let result = match self.bridge.call(method, params) {
+        let call_result = match options.deadline {
+            Some(deadline) => self.bridge.call_with_deadline(method, params, deadline),
+            None => self.bridge.call(method, params),
+        };
+        let result = match call_result {
             Ok(result) => result,
             Err(bridge_error @ BridgeCallError::BridgeError { .. }) => {
                 return Err(SessionCallError::BridgeRejected(map_bridge_error(
@@ -3096,12 +3196,21 @@ impl RealLs5000 {
                 // direct backend callers that do not have server.rs around
                 // to reconcile the resulting NOT_CONNECTED error.
                 self.clear_completed_preview_approval_for_epoch(expected_epoch);
+                // Only this arm carries the caller's guidance: the request
+                // provably reached the bridge and its outcome is unknown.
+                // The pre-dispatch arm above correctly reports that nothing
+                // was attempted, and must not inherit a "may still be in
+                // progress" caveat.
+                let guidance = options
+                    .transport_failure_guidance
+                    .map(|guidance| format!("; {guidance}"))
+                    .unwrap_or_default();
                 return Err(SessionCallError::OwnershipLost(
                     self.session_ownership_lost_error(
                         method,
                         expected_epoch,
                         expected_bridge_generation,
-                        format!("bridge transport failure: {transport_error}"),
+                        format!("bridge transport failure: {transport_error}{guidance}"),
                     ),
                 ));
             }
@@ -3142,6 +3251,7 @@ impl RealLs5000 {
             expected_bridge_generation,
             method,
             params,
+            SessionCallOptions::default(),
         )
         .map_err(SessionCallError::into_engine_error)
     }
@@ -3659,15 +3769,33 @@ impl ScannerBackend for RealLs5000 {
         ))
     }
 
+    /// The one session-scoped call that waits on mechanics rather than on
+    /// computation, and therefore the one that carries its own deadline
+    /// (`eject_call_deadline`, see [`EJECT_CALL_DEADLINE`]) instead of the
+    /// client's generic control-plane `request_timeout`.
+    ///
+    /// Everything else here is deliberately unchanged. Success is still
+    /// only ever the bridge's own confirmed `{}` — BRIDGE.md's "`{}` means
+    /// confirmed ejected, never anything less" — followed by a fresh
+    /// `device.status`; a typed bridge refusal (`EJECT_FAILED`,
+    /// `FEEDER_PARKED`) still surfaces as itself; a genuine transport death
+    /// still quarantines the bridge and tears down session ownership,
+    /// because at that point the film state really is unknown and the child
+    /// may still own the USB transaction. No eject is ever retried.
     fn eject(&self) -> Result<ScannerStatus, EngineError> {
         let (session_epoch, bridge_generation) = self.active_session_identity()?;
         self.ensure_preview_stream_allows_connect_or_eject()?;
-        self.call_session_scoped(
+        self.call_session_scoped_detailed(
             session_epoch,
             bridge_generation,
             "device.eject",
             serde_json::json!({}),
-        )?;
+            SessionCallOptions {
+                deadline: Some(self.eject_call_deadline),
+                transport_failure_guidance: Some(EJECT_TRANSPORT_FAILURE_GUIDANCE),
+            },
+        )
+        .map_err(SessionCallError::into_engine_error)?;
         self.clear_preview_approvals_for_epoch(session_epoch);
         self.fresh_status_for_session(session_epoch, bridge_generation)
     }
@@ -4375,6 +4503,7 @@ fn dispatch_real_scan_with_output_authorities(
         bridge_generation,
         "scan.start",
         params_value,
+        SessionCallOptions::default(),
     ) {
         Ok(value) => match decode_scan_start_job_id(value) {
             Ok(job_id) => job_id,
@@ -5237,6 +5366,41 @@ fn scan_silence_deadline_from_env() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(STREAM_SILENCE_DEADLINE)
+}
+
+/// `device.eject`'s own bridge-call deadline, on the same env-tunable
+/// pattern as `scan_silence_deadline_from_env` above and for the same
+/// reason: an out-of-process harness can drive a short deadline without a
+/// rebuild, while in-process tests use
+/// `RealLs5000::with_eject_call_deadline` rather than mutating this
+/// process-global variable. Read exactly once per `RealLs5000`
+/// construction. Unset, unparseable, or zero falls back to
+/// [`EJECT_CALL_DEADLINE`] — zero is rejected on purpose, since it would
+/// expire before the bridge could answer anything and turn every eject
+/// into an unconfirmed-film-state teardown.
+fn eject_call_deadline_from_env() -> Duration {
+    parse_eject_call_deadline(
+        std::env::var("SCANSTUDIO_EJECT_DEADLINE_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The parsing half of `eject_call_deadline_from_env`, split out so it can
+/// be unit-tested exhaustively without `set_var` — which is process-global
+/// and would leak into every concurrently-running test in the same binary,
+/// the exact hazard both deadline knobs' doc comments warn about.
+///
+/// Deliberately NOT capped at an upper bound: the sibling
+/// `scan_silence_deadline_from_env` accepts any value, and giving two
+/// adjacent operator-facing knobs different validation semantics is worse
+/// than sharing one permissive rule. If a ceiling is ever wanted, both
+/// should get it in the same change.
+fn parse_eject_call_deadline(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(EJECT_CALL_DEADLINE)
 }
 
 /// Computes a passive duty-cycle report from observed frame-to-frame idle
@@ -7671,6 +7835,62 @@ mod tests {
             engine_receipt: json!({"frameIndex": frame_index}),
             attempts_root: None,
         }
+    }
+
+    /// `SCANSTUDIO_EJECT_DEADLINE_SECS` is the operator's escape hatch for
+    /// an eject slower than the shipped ceiling, so every way it can be
+    /// wrong must land on the safe default rather than on a bound too short
+    /// to let the bridge answer.
+    #[test]
+    fn eject_call_deadline_env_parsing_falls_back_on_everything_but_a_positive_whole_number() {
+        assert_eq!(
+            parse_eject_call_deadline(None),
+            EJECT_CALL_DEADLINE,
+            "unset must keep the shipped 300s ceiling"
+        );
+        assert_eq!(EJECT_CALL_DEADLINE, Duration::from_secs(300));
+
+        // Zero parses fine but would expire before the bridge could answer
+        // anything, turning every eject into an unconfirmed-film-state
+        // teardown — rejected on purpose, not by accident of parsing.
+        // The last entry is u64::MAX + 1: an overflowing value must fall
+        // back like any other unparseable one, never wrap.
+        for rejected in [
+            "0",
+            " 0 ",
+            "-5",
+            "12.5",
+            "45s",
+            "abc",
+            "",
+            "   ",
+            "1e3",
+            "+",
+            "0x10",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_eject_call_deadline(Some(rejected)),
+                EJECT_CALL_DEADLINE,
+                "{rejected:?} is not a positive whole number of seconds and must fall back"
+            );
+        }
+
+        assert_eq!(
+            parse_eject_call_deadline(Some("45")),
+            Duration::from_secs(45),
+            "a valid value must be honored even when it shortens the deadline"
+        );
+        assert_eq!(
+            parse_eject_call_deadline(Some("  600\n")),
+            Duration::from_secs(600),
+            "surrounding whitespace must be tolerated, matching the trim in the parser"
+        );
+        assert_eq!(
+            parse_eject_call_deadline(Some("1")),
+            Duration::from_secs(1),
+            "the smallest accepted value is 1s — the boundary immediately above the rejected 0"
+        );
     }
 
     #[test]
