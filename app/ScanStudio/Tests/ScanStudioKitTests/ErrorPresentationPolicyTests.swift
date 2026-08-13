@@ -498,6 +498,10 @@ struct ErrorPresentationPolicyTests {
         let rawMessage = "REFEED_REQUIRED: preview could not establish a usable roll session"
         let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
         #expect(presentation.probableCause == nil)
+        // Issue #16: a preview that returns REFEED_REQUIRED with low
+        // confidence but no Rung-3 diagnosis is the common case, not the
+        // exception -- manual placement must still be reachable here.
+        #expect(presentation.canPlaceFramesManually)
     }
 
     @Test("a completely unrelated error never fabricates a probableCause")
@@ -506,6 +510,7 @@ struct ErrorPresentationPolicyTests {
             lastErrorMessage: "NOT_CONNECTED: scanner is not connected"
         )
         #expect(presentation.probableCause == nil)
+        #expect(!presentation.canPlaceFramesManually)
     }
 
     /// S8 (adversarial review round 2, 2026-08-08): extraction must be
@@ -525,5 +530,44 @@ struct ErrorPresentationPolicyTests {
         #expect(presentation.probableCause == nil)
         #expect(presentation.title != "Film shifted—refeed required")
         #expect(presentation.title != "Film needs to be reloaded")
+        #expect(!presentation.canPlaceFramesManually)
+    }
+
+    // MARK: - canPlaceFramesManually (issue #16)
+
+    @Test("every REFEED_REQUIRED-classified refusal offers manual placement, with or without a probable cause")
+    func canPlaceFramesManuallyCoversEveryReclassifiedRefeed() {
+        let messages = [
+            // Plain known-code REFEED_REQUIRED (noProbableCauseWhenAbsent
+            // covers this one too; repeated here alongside its siblings for
+            // one place that documents the full REFEED_REQUIRED family).
+            "REFEED_REQUIRED: the transport index no longer matches",
+            // leadingFrameClippedCopy's reclassification.
+            "REFEED_REQUIRED: the first frame begins 17 preview rows before "
+                + "the captured preview area (88.1% remains); refeed the film slightly deeper "
+                + "and acquire a fresh preview. ScanStudio did not expose the cropped frame for scanning",
+            // filmTransportSlipCopy's reclassification -- raw code is
+            // INTERNAL, not REFEED_REQUIRED, and still qualifies.
+            "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): SynchronizedProtocolError: "
+                + "command 124: sense 045300 not in accepted ['000000']",
+        ]
+        for rawMessage in messages {
+            let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+            #expect(presentation.canPlaceFramesManually, "expected true for: \(rawMessage)")
+        }
+    }
+
+    @Test("codes that never resolve to REFEED_REQUIRED never offer manual placement")
+    func canPlaceFramesManuallyFalseForOtherCodes() {
+        let messages = [
+            "NOT_CONNECTED: scanner is not connected",
+            "FEEDER_PARKED: transport parked at end-stop",
+            "INVALID_PARAMS: frame selection was empty",
+            "BRIDGE_TIMEOUT: no terminal event arrived",
+        ]
+        for rawMessage in messages {
+            let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+            #expect(!presentation.canPlaceFramesManually, "expected false for: \(rawMessage)")
+        }
     }
 }

@@ -78,21 +78,31 @@ public struct ErrorPresentation: Equatable, Sendable {
     /// never the surrounding diagnostic prose. `nil` for the common case
     /// (most errors, including most REFEED_REQUIREDs, carry no Rung-3
     /// diagnosis). When present, the workspace error card shows it
-    /// prominently and offers "Place frames manually" alongside it.
+    /// prominently alongside "Place frames manually".
     public let probableCause: String?
+    /// True whenever this refusal classifies as `REFEED_REQUIRED` -- Rung 4
+    /// of the feeding UX ladder's manual-placement recovery is reachable for
+    /// every REFEED_REQUIRED, not only the minority that also carry a
+    /// Rung-3 `probableCause` (issue #16: a preview that returns with low
+    /// confidence but no diagnosis sentence still needs "Place frames
+    /// manually" offered). Drives the workspace error card's button on its
+    /// own; the diagnosis sentence next to it stays gated on `probableCause`.
+    public let canPlaceFramesManually: Bool
 
     public init(
         title: String,
         guidance: String,
         technicalDetails: String,
         issueURL: URL,
-        probableCause: String? = nil
+        probableCause: String? = nil,
+        canPlaceFramesManually: Bool = false
     ) {
         self.title = title
         self.guidance = guidance
         self.technicalDetails = technicalDetails
         self.issueURL = issueURL
         self.probableCause = probableCause
+        self.canPlaceFramesManually = canPlaceFramesManually
     }
 }
 
@@ -223,13 +233,15 @@ public enum ErrorPresentationPolicy {
             // REFEED_REQUIRED -- never merely because the raw text happens
             // to contain a probable_cause-shaped fragment. An INTERNAL (or
             // any other) error carrying an embedded, coincidental, or
-            // adversarial-looking fragment must never surface a sentence or
-            // the "Place frames manually" action; `copy.code` is this
-            // policy's own already-computed classification, not a second,
-            // independent guess.
+            // adversarial-looking fragment must never surface a sentence.
+            // `copy.code` is this policy's own already-computed
+            // classification, not a second, independent guess --
+            // `canPlaceFramesManually` below reuses the exact same gate, so
+            // an unclassified error cannot offer manual placement either.
             probableCause: copy.code == "REFEED_REQUIRED"
                 ? ProbableCauseExtractor.extract(from: lastErrorMessage)
-                : nil
+                : nil,
+            canPlaceFramesManually: copy.code == "REFEED_REQUIRED"
         )
     }
 
