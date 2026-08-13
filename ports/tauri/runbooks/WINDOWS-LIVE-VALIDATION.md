@@ -19,11 +19,11 @@ repeat that setup — it assumes WSL2 with the pinned Ubuntu-24.04 distro, the
 bridge bundle installed inside WSL, usbipd-win installed and bound, and the
 WebView2 runtime present.
 
-This runs on the owner's existing Filmscan Windows VM (or a clone of it).
-Attaching the LS-5000 to WSL2 via `usbipd attach` takes the device away from
-any Nikon Scan/USBPcap workflow running on that same VM for as long as it stays
-attached; this is reversible at any time via `usbipd detach --busid <busid>`.
-No driver is swapped or replaced by the WSL lane.
+This runs on a Windows VM with the Nikon Scan toolchain already installed (or
+a clone of one). Attaching the LS-5000 to WSL2 via `usbipd attach` takes the
+device away from any Nikon Scan/USBPcap workflow running on that same VM for
+as long as it stays attached; this is reversible at any time via `usbipd
+detach --busid <busid>`. No driver is swapped or replaced by the WSL lane.
 
 ### Checker pre-flight
 
