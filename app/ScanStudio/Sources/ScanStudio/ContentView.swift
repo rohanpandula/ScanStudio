@@ -458,7 +458,12 @@ private struct WorkspaceErrorBanner: View {
                 // engine attached that plain-English diagnosis, show it
                 // prominently -- never the raw JSON it was extracted from
                 // (`ProbableCauseExtractor`) -- right above the button.
-                if showsManualPlacementAction {
+                // The two are independent: the sentence renders on its own
+                // when `refeedRequired` has since cleared (a disconnect
+                // composes NOT_CONNECTED over the old message), and the
+                // button renders without a sentence for undiagnosed
+                // refeeds.
+                if showsManualPlacementAction || presentation.probableCause != nil {
                     VStack(alignment: .leading, spacing: 8) {
                         if let probableCause = presentation.probableCause {
                             Text(probableCause)
@@ -468,28 +473,30 @@ private struct WorkspaceErrorBanner: View {
                                 .textSelection(.enabled)
                         }
 
-                        Button {
-                            Task {
-                                await sessionModel.beginManualFramePlacement()
-                            }
-                        } label: {
-                            if isLoadingManualPlacement {
-                                HStack(spacing: 6) {
-                                    ProgressView().controlSize(.small)
-                                    Text("Loading Film Strip…")
+                        if showsManualPlacementAction {
+                            Button {
+                                Task {
+                                    await sessionModel.beginManualFramePlacement()
                                 }
-                            } else {
-                                Label(
-                                    "Place frames manually",
-                                    systemImage: "rectangle.and.hand.point.up.left"
-                                )
+                            } label: {
+                                if isLoadingManualPlacement {
+                                    HStack(spacing: 6) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Loading Film Strip…")
+                                    }
+                                } else {
+                                    Label(
+                                        "Place frames manually",
+                                        systemImage: "rectangle.and.hand.point.up.left"
+                                    )
+                                }
                             }
+                            .buttonStyle(.bordered)
+                            .tint(.scanStudioAmber)
+                            .font(.system(size: 11, weight: .medium))
+                            .disabled(isLoadingManualPlacement)
+                            .help("Draw your own frame boundaries on the captured film strip")
                         }
-                        .buttonStyle(.bordered)
-                        .tint(.scanStudioAmber)
-                        .font(.system(size: 11, weight: .medium))
-                        .disabled(isLoadingManualPlacement)
-                        .help("Draw your own frame boundaries on the captured film strip")
                     }
                     .padding(10)
                     .background(Color.scanStudioRaised, in: RoundedRectangle(cornerRadius: 6))

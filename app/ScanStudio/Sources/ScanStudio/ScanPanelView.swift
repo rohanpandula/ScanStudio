@@ -315,9 +315,10 @@ struct ScanPanelView: View {
     /// every frame before any capture). This footer label has no room for a
     /// second line, so the reason surfaces as a tooltip instead --
     /// `BatchInspectorView.batchResultSummary` shows the same reason inline
-    /// for the fuller Batch inspector. Falls back to the visible label text
-    /// when the batch did complete frames or no failed frame carries a real
-    /// (non-review) error detail.
+    /// for the fuller Batch inspector. The reason is appended after the
+    /// visible label text, never substituted for it: a reason no curated
+    /// matcher recognizes still gets its generic guidance, and the count
+    /// stays visible either way.
     private func batchSummaryHelp(_ summary: ScanSummary) -> String {
         guard summary.completed.isEmpty,
               let error = summary.failed.lazy.compactMap({ sessionModel.frameErrors[$0] }).first(where: {
@@ -326,7 +327,10 @@ struct ScanPanelView: View {
         else {
             return batchSummary(summary)
         }
-        return ErrorPresentationPolicy.make(lastErrorMessage: "\(error.code): \(error.message)").guidance
+        let guidance = ErrorPresentationPolicy.make(
+            lastErrorMessage: "\(error.code): \(error.message)"
+        ).guidance
+        return "\(batchSummary(summary)) — \(guidance)"
     }
 
     private var skipFrameHelpText: String {
