@@ -120,7 +120,7 @@ def fake_response_for(
     )
 
 
-def test_platform_details(
+def _platform_details(
     installer: ModuleType,
     archive_sha256: str,
     executable_sha256: str,
@@ -515,7 +515,7 @@ class InstallBoundaryTests(unittest.TestCase):
 
     def test_existing_install_root_fails_before_download(self) -> None:
         for installer_name, installer in INSTALLERS:
-            details = test_platform_details(installer, "0" * 64, "0" * 64)
+            details = _platform_details(installer, "0" * 64, "0" * 64)
             with self.subTest(installer=installer_name):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     install_root = Path(temporary_directory) / "existing"
@@ -538,7 +538,7 @@ class InstallBoundaryTests(unittest.TestCase):
     def test_archive_digest_mismatch_stops_before_extraction(self) -> None:
         archive_payload = b"tampered archive"
         for installer_name, installer in INSTALLERS:
-            details = test_platform_details(installer, "0" * 64, "0" * 64)
+            details = _platform_details(installer, "0" * 64, "0" * 64)
             with self.subTest(installer=installer_name):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     install_root = Path(temporary_directory) / "install"
@@ -569,7 +569,7 @@ class InstallBoundaryTests(unittest.TestCase):
         executable_payload = b"tampered executable"
         archive_sha256 = hashlib.sha256(archive_payload).hexdigest()
         for installer_name, installer in INSTALLERS:
-            details = test_platform_details(installer, archive_sha256, "0" * 64)
+            details = _platform_details(installer, archive_sha256, "0" * 64)
             with self.subTest(installer=installer_name):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     install_root = Path(temporary_directory) / "install"
