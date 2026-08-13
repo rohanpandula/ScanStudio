@@ -19,6 +19,11 @@ export interface FrameOverrideEditorProps {
   rollCapture: ResolvedCaptureRecipe;
   rollProcessing?: ProcessingRecipe;
   rollOutput: OutputRecipe;
+  // Device-aware multisamplePasses options (session/store/session.ts's
+  // multisampleOptionsForDevice), forwarded verbatim to this editor's own
+  // per-frame CaptureRecipeForm so a frame override picker never offers a
+  // count the connected device's scan.start gate would reject either.
+  multisampleOptions: readonly number[];
   // The active project's frame set — used to read any existing override and
   // to detect a whole-object-swap save (never a merged payload).
   project: ScanProject | null;
@@ -39,6 +44,7 @@ export default function FrameOverrideEditor({
   rollCapture,
   rollProcessing,
   rollOutput,
+  multisampleOptions,
   project,
 }: FrameOverrideEditorProps) {
   const frame = project?.frames.find((f) => f.index === frameIndex) ?? null;
@@ -154,6 +160,7 @@ export default function FrameOverrideEditor({
                   <CaptureRecipeForm
                     capture={drafts.capture}
                     filmProcess={filmProcess}
+                    multisampleOptions={multisampleOptions}
                     onChange={(next) => setDrafts((d) => ({ ...d, capture: next }))}
                   />
                 )}

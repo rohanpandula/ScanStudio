@@ -421,23 +421,108 @@ function isFilmFeedInterrupted(error: EngineError): boolean {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Multisample-pass device policy (defect fix: the picker and
+// applyRecipeDefaults used to hardcode [1,2,4,8,16]/1 with zero device
+// awareness, so a real LS-5000 scan.start got refused with INVALID_PARAMS --
+// "multisamplePasses must be one of [4] for this device", real_backend.rs's
+// scan_start). Mirrors Swift's MultisamplePassPolicy (SessionModel.swift)
+// exactly: a real LS-5000 only accepts the device's own bridge-reported set
+// (DeviceInfo.supportedMultisamplePasses, wired through engine domain.rs --
+// always [4] today per RealLs5000::supported_multisample_passes' own doc
+// comment); the simulator keeps the fuller historical [1,2,4,8,16] range.
+// ---------------------------------------------------------------------------
+
+/** The simulator's own fuller, historical range -- unchanged. */
+export const SIMULATED_MULTISAMPLE_PASSES: readonly number[] = [1, 2, 4, 8, 16];
+/**
+ * Matches real_backend.rs's derive_supported_multisample_passes /
+ * DeviceInfo.supportedMultisamplePasses today: always [4] for the LS-5000.
+ * Used only when a connected real device's own wire-reported value is
+ * absent (an older engine build predating that field) -- once every engine
+ * build forwards it, this fallback becomes unreachable but stays correct.
+ */
+export const REAL_DEVICE_MULTISAMPLE_PASSES_FALLBACK: readonly number[] = [4];
+
+/**
+ * The multisamplePasses options a picker should offer for `device` (`null`
+ * or `undefined` -- no device connected yet -- gets the fuller
+ * simulator-shaped range, matching this picker's own pre-existing behavior
+ * before any device connects). Mirrors Swift's
+ * `MultisamplePassPolicy.supportedOptions(for:)` exactly, including
+ * treating an empty wire-reported list as absent rather than offering zero
+ * options.
+ */
+export function multisampleOptionsForDevice(device?: DeviceInfo | null): number[] {
+  if (device === null || device === undefined) return [...SIMULATED_MULTISAMPLE_PASSES];
+  const supported = device.supportedMultisamplePasses;
+  if (supported !== undefined && supported.length > 0) {
+    return [...supported].sort((a, b) => a - b);
+  }
+  return device.kind === "real"
+    ? [...REAL_DEVICE_MULTISAMPLE_PASSES_FALLBACK]
+    : [...SIMULATED_MULTISAMPLE_PASSES];
+}
+
+/**
+ * The value a recipe should carry given `options`: `current` unchanged if
+ * it's still supported, otherwise coerced to the closest allowed value
+ * (nearest by absolute difference; ties break toward the lower value)
+ * rather than always snapping to the first/lowest entry -- mirrors Swift's
+ * `MultisamplePassPolicy.coerce(_:into:)` exactly, so a hypothetical future
+ * [4, 8]-only device coerces a stored 6 to 4 and a stored 9 to 8, never
+ * both to the same value. An empty `options` list is a no-op (returns
+ * `current` unchanged) rather than crashing or fabricating a value with no
+ * basis.
+ */
+export function coerceMultisamplePasses(current: number, options: readonly number[]): number {
+  if (options.length === 0) return current;
+  if (options.includes(current)) return current;
+  let best = options[0];
+  for (const candidate of options.slice(1)) {
+    const bestDistance = Math.abs(best - current);
+    const candidateDistance = Math.abs(candidate - current);
+    if (
+      candidateDistance < bestDistance ||
+      (candidateDistance === bestDistance && candidate < best)
+    ) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 /**
  * Fills in the documented defaults from PROTOCOL.md: CaptureRecipe
  * resolutionDpi 4000, bitDepth 16, multisamplePasses 1, channels "rgbi";
  * ArchiveRecipe.enabled true and fullCapturePackage true. Preview/positive
  * have no PROTOCOL.md-documented default `enabled` value and are left as
  * given -- no invented defaults.
+ *
+ * multisamplePasses is additionally coerced into `device`'s own supported
+ * options (multisampleOptionsForDevice/coerceMultisamplePasses above): the
+ * PROTOCOL.md default of 1 is fed in as the "current" value when the caller
+ * supplied none, so a real LS-5000 (whose only accepted value is 4)
+ * resolves straight to 4 instead of the simulator-only default of 1 the
+ * engine's own scan.start gate would then reject with INVALID_PARAMS.
+ * `device` omitted (or null) -- any caller with no device context yet --
+ * keeps today's simulator/no-device behavior (default 1) unchanged.
  */
 export function applyRecipeDefaults(
   capture?: CaptureRecipe,
   processing?: ProcessingRecipe,
   output?: OutputRecipe,
+  device?: DeviceInfo | null,
 ): ResolvedRecipes {
+  const multisampleOptions = multisampleOptionsForDevice(device);
   return {
     capture: {
       resolutionDpi: capture?.resolutionDpi ?? 4000,
       bitDepth: capture?.bitDepth ?? 16,
-      multisamplePasses: capture?.multisamplePasses ?? 1,
+      multisamplePasses: coerceMultisamplePasses(
+        capture?.multisamplePasses ?? 1,
+        multisampleOptions,
+      ) as ResolvedCaptureRecipe["multisamplePasses"],
       channels: capture?.channels ?? "rgbi",
     },
     processing,
@@ -486,6 +571,15 @@ export interface RecipeValidationContext {
   frameProcessingOverrides?: Record<number, ProcessingRecipe>;
   excludedFrameIndices?: Set<number>;
   requestedFrames: number[];
+  // Device-aware multisamplePasses bound (multisampleOptionsForDevice
+  // above). Omitted, this keeps validating against the full historical
+  // {1,2,4,8,16} set, matching every caller that predates device
+  // awareness. startScan's own call site supplies the connected device's
+  // actual options so a value that reaches validateRecipe already
+  // out-of-range for THIS device (bypassing applyRecipeDefaults'
+  // coercion, or called directly as in the tests below) is still rejected
+  // locally instead of round-tripping to the engine's INVALID_PARAMS.
+  supportedMultisamplePasses?: number[];
 }
 
 export type RecipeValidationResult =
@@ -525,11 +619,12 @@ export function validateRecipe(
       message: `bitDepth must be 8 or 16 (got ${capture.bitDepth})`,
     };
   }
-  if (!VALID_MULTISAMPLE_PASSES.includes(capture.multisamplePasses)) {
+  const multisampleOptions = ctx.supportedMultisamplePasses ?? VALID_MULTISAMPLE_PASSES;
+  if (!multisampleOptions.includes(capture.multisamplePasses)) {
     return {
       valid: false,
       field: "capture.multisamplePasses",
-      message: `multisamplePasses must be one of 1, 2, 4, 8, 16 (got ${capture.multisamplePasses})`,
+      message: `multisamplePasses must be one of ${multisampleOptions.join(", ")} (got ${capture.multisamplePasses})`,
     };
   }
   if (!VALID_CHANNELS.includes(capture.channels)) {
@@ -2039,7 +2134,18 @@ export class SessionStore {
     // rejection is EngineError-shaped; if the wire call itself still fails
     // (a case this mirror does not model), the engine's own
     // code/message/recoverable reach the caller byte-for-byte unmodified.
-    const resolved = applyRecipeDefaults(recipe, processing, output);
+    //
+    // multisamplePasses is additionally resolved against the CONNECTED
+    // device (multisampleOptionsForDevice/applyRecipeDefaults above): the
+    // same guarantee Swift's coerceMultisamplePassesForConnectedDevice
+    // gives by construction (its scanMultisamplePasses is proactively kept
+    // valid for the connected device at every connect/project boundary
+    // before scan.start ever sees it) reached here as a final coercion
+    // pass at the one place every scan.start call funnels through,
+    // regardless of what the caller's own recipe draft happened to carry.
+    const connectedDevice = this.#state.connection.device;
+    const multisampleOptions = multisampleOptionsForDevice(connectedDevice);
+    const resolved = applyRecipeDefaults(recipe, processing, output, connectedDevice);
     const effectiveProcessing =
       resolved.processing !== undefined
         ? resolveEffectiveProcessing(resolved.processing, resolved.capture.channels)
@@ -2066,6 +2172,7 @@ export class SessionStore {
         frameProcessingOverrides,
         excludedFrameIndices,
         requestedFrames: frames,
+        supportedMultisamplePasses: multisampleOptions,
       },
     );
     if (!validation.valid) {

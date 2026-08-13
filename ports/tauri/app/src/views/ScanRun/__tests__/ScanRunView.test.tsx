@@ -140,6 +140,13 @@ describe("ScanRunView", () => {
     expect(captureDurationLabel(0)).toBe("Capture timing not recorded");
   });
 
+  it("leaves multisamplePasses untouched for the simulated device (device-aware coercion is a no-op here)", async () => {
+    const fixture = await runFixture();
+    const scanStartCall = fixture.calls.find((call) => call.method === "scan.start");
+    const recipe = scanStartCall?.params.recipe as { multisamplePasses?: number } | undefined;
+    expect(recipe?.multisamplePasses).toBe(1);
+  });
+
   it("renders per-frame states and attempt counts", async () => {
     const fixture = await runFixture();
     mocks.sessionStore = fixture.store;

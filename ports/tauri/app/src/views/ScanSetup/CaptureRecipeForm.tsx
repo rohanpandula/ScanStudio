@@ -4,14 +4,24 @@ import styles from "./ScanSetup.module.css";
 export interface CaptureRecipeFormProps {
   capture: ResolvedCaptureRecipe;
   filmProcess?: FilmProcess;
+  // Device-aware multisamplePasses options (session/store/session.ts's
+  // multisampleOptionsForDevice, computed by the caller from the connected
+  // DeviceInfo). Plain numbers, not the narrower ResolvedCaptureRecipe
+  // union: a real device's wire-reported set is open-ended data, not a
+  // client-side literal type. Not defaulted here: a real LS-5000 only
+  // accepts [4], and a component-local [1,2,4,8,16] fallback would
+  // silently re-introduce the defect this prop exists to fix (offering
+  // multisample counts the connected device's own scan.start gate
+  // rejects). Every render caller must pass the list it actually wants
+  // offered.
+  multisampleOptions: readonly number[];
   onChange: (next: ResolvedCaptureRecipe) => void;
 }
-
-const MULTISAMPLE_PASSES: Array<ResolvedCaptureRecipe["multisamplePasses"]> = [1, 2, 4, 8, 16];
 
 export default function CaptureRecipeForm({
   capture,
   filmProcess,
+  multisampleOptions,
   onChange,
 }: CaptureRecipeFormProps) {
   const isBwNegative = filmProcess === "bwNegative";
@@ -84,7 +94,7 @@ export default function CaptureRecipeForm({
               update({ multisamplePasses: Number(event.target.value) as ResolvedCaptureRecipe["multisamplePasses"] })
             }
           >
-            {MULTISAMPLE_PASSES.map((passes) => (
+            {multisampleOptions.map((passes) => (
               <option key={passes} value={passes}>
                 {passes}
               </option>
