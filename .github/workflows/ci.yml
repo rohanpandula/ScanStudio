@@ -89,6 +89,8 @@ jobs:
         run: python3 scripts/check_github_action_pins.py
       - name: Test supply-chain policy gates
         run: python3 -I -S -B -m unittest discover -s scripts/tests -p 'test_*.py'
+      - name: Test Tauri packaging artifact-lock verifier
+        run: python3 -I -S -B -m unittest discover -s ports/tauri/packaging/tests -p 'test_*.py'
       - name: Check ports/tauri/vendor mirrors for drift beyond the known baseline
         run: scripts/check_ports_vendor_sync.sh
 

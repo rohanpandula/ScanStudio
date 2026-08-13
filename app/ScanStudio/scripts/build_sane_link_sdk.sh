@@ -300,10 +300,19 @@ require_directory_parent="${binding_destination:h}"
 [[ -d "$bridge_source" && ! -L "$bridge_source" ]] \
     || die "bridge source is missing, not a directory, or a symlink: $bridge_source"
 require_regular_file "bridge lockfile" "$bridge_source/uv.lock"
-[[ -x "$bridge_python" && ! -L "$bridge_python" || -x "$bridge_python" ]] \
+# A venv's own bin/python is conventionally a symlink chain (uv sync and the
+# stdlib venv module both produce one) ending at the real managed
+# interpreter, so banning ":L" outright refuses every ordinary build -- the
+# previous "&& ... || -x ..." form of this check was a no-op for the same
+# underlying reason, just by accident (operator precedence) rather than
+# design. Resolve the chain instead: ":A" fails closed on a dangling link
+# (nothing left to be "-f"), so this still refuses a symlink an attacker
+# planted ahead of its target existing, without refusing every real venv.
+bridge_python_resolved="${bridge_python:A}"
+[[ -f "$bridge_python_resolved" && -x "$bridge_python_resolved" && ! -L "$bridge_python_resolved" ]] \
     || die "bridge Python is not executable: $bridge_python"
 
-"$bridge_python" -I -B - "$bridge_source/uv.lock" <<'PYTHON'
+"$bridge_python_resolved" -I -B - "$bridge_source/uv.lock" <<'PYTHON'
 from pathlib import Path
 import platform
 import sys
@@ -376,11 +385,11 @@ if ! (
         HOME="$binding_home" PATH="$secure_path:$uv_dir" TMPDIR="$binding_tmp" \
         LANG=C LC_ALL=C \
         UV_PROJECT_ENVIRONMENT="$binding_destination" \
-        UV_PYTHON="$bridge_python" UV_PYTHON_PREFERENCE=only-managed \
+        UV_PYTHON="$bridge_python_resolved" UV_PYTHON_PREFERENCE=only-managed \
         UV_PYTHON_DOWNLOADS=never UV_NO_CONFIG=1 UV_NO_ENV_FILE=1 UV_NO_PROGRESS=1 \
         "$uv_path" sync --locked --extra scanner --no-dev --no-cache \
             --no-install-local --no-install-package python-sane \
-            --python "$bridge_python"
+            --python "$bridge_python_resolved"
 ); then
     die "locked production dependency sync failed"
 fi
@@ -390,8 +399,8 @@ binding_python="$binding_destination/bin/python"
 site_packages="$binding_destination/lib/python3.13/site-packages"
 [[ -d "$site_packages" && ! -L "$site_packages" ]] \
     || die "private package venv has no regular Python 3.13 site-packages directory"
-python_include="$($bridge_python -I -B -c 'import sysconfig; print(sysconfig.get_config_var("INCLUDEPY"))')"
-extension_suffix="$($bridge_python -I -B -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+python_include="$($bridge_python_resolved -I -B -c 'import sysconfig; print(sysconfig.get_config_var("INCLUDEPY"))')"
+extension_suffix="$($bridge_python_resolved -I -B -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 [[ "$extension_suffix" == ".cpython-313-darwin.so" ]] \
     || die "unexpected CPython extension ABI suffix: $extension_suffix"
 [[ -d "$python_include" && ! -L "$python_include" ]] \

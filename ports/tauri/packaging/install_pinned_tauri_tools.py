@@ -190,7 +190,9 @@ def _assert_plain_regular_file(path: Path) -> os.stat_result:
     return before
 
 
-def hash_regular_file(path: Path, *, expected_size: int | None = None) -> str:
+def hash_regular_file(
+    path: Path, *, expected_size: int | None = None
+) -> tuple[str, int]:
     _assert_plain_regular_file(path)
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
@@ -239,7 +241,7 @@ def hash_regular_file(path: Path, *, expected_size: int | None = None) -> str:
             or second_digest != first_digest
         ):
             raise ToolError(f"pinned tool changed while hashing: {path}")
-        return first_digest
+        return first_digest, stat.S_IMODE(after.st_mode)
     finally:
         os.close(descriptor)
 
@@ -343,6 +345,16 @@ def _collision_key(path: PurePosixPath) -> str:
     return unicodedata.normalize("NFC", path.as_posix()).casefold()
 
 
+def ensure_parent_directories(root: Path, parts: tuple[str, ...]) -> None:
+    current = root
+    for part in parts:
+        current = current / part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            _assert_plain_directory(current)
+
+
 def extract_nsis_archive(archive: Path, destination: Path) -> None:
     try:
         destination.mkdir(mode=0o700)
@@ -388,7 +400,7 @@ def extract_nsis_archive(archive: Path, destination: Path) -> None:
         for member, path in validated:
             relative = Path(*path.parts[1:])
             output_path = destination / relative
-            output_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            ensure_parent_directories(destination, relative.parts[:-1])
             copied = 0
             with (
                 bundle.open(member, "r") as source,
@@ -442,7 +454,7 @@ def _tree_commit(
                 records.append(f"D\0{relative_text}\n")
                 visit(Path(entry.path), relative)
             elif stat.S_ISREG(metadata.st_mode):
-                digest = hash_regular_file(
+                digest, _mode = hash_regular_file(
                     Path(entry.path), expected_size=metadata.st_size
                 )
                 file_count += 1
@@ -488,17 +500,19 @@ def _exact_entries(directory: Path, *, directories: set[str], files: set[str]) -
         )
 
 
-def _assert_asset(path: Path, asset: dict[str, object], *, installed: bool) -> str:
+def _assert_asset(
+    path: Path, asset: dict[str, object], *, installed: bool
+) -> tuple[str, int]:
     expected_sha256 = str(
         asset.get("installed_sha256", asset["sha256"]) if installed else asset["sha256"]
     )
-    actual_sha256 = hash_regular_file(path, expected_size=int(asset["size"]))
+    actual_sha256, mode = hash_regular_file(path, expected_size=int(asset["size"]))
     if actual_sha256 != expected_sha256:
         raise ToolError(
             f"pinned tool digest mismatch for {path}: "
             f"expected {expected_sha256}, got {actual_sha256}"
         )
-    return actual_sha256
+    return actual_sha256, mode
 
 
 def verify_linux(tools_root: Path) -> None:
@@ -506,8 +520,8 @@ def verify_linux(tools_root: Path) -> None:
     _exact_entries(tools_root, directories=set(), files=expected_names)
     for asset in LINUX_ASSETS:
         path = tools_root / str(asset["name"])
-        _assert_asset(path, asset, installed=True)
-        if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != 0o700:
+        _, mode = _assert_asset(path, asset, installed=True)
+        if os.name != "nt" and mode != 0o700:
             raise ToolError(f"pinned Linux tool mode is not exactly 0700: {path}")
 
 
