@@ -2046,6 +2046,11 @@ struct SessionEventPolicyTests {
         )
         model.handle(event: EngineEvent(name: "scanner.status", rawLine: notLoaded))
         #expect(model.refeedRequired)
+        // Issue #16: with no adapter identified, the diagnostic trail must
+        // say so honestly instead of omitting the field entirely.
+        let statusDetails = try? #require(model.errorPresentation?.technicalDetails)
+        #expect(statusDetails?.contains("adapter=unknown") == true)
+        #expect(statusDetails?.contains("carrier=unknown") == true)
     }
 
     @Test("a scan-time roll slip invalidates the preview and requires a refeed before another capture")
@@ -2130,6 +2135,11 @@ struct SessionEventPolicyTests {
             let statusDetails = try? #require(model.errorPresentation?.technicalDetails)
             #expect(statusDetails?.contains("filmPresent=false") == true)
             #expect(statusDetails?.contains("mediaLoaded=false") == true)
+            // Issue #16: "Adapter: unknown / Holder: unknown" left the three
+            // possible causes indistinguishable. The diagnostic trail must
+            // record the scanner's own adapter/carrier strings once known.
+            #expect(statusDetails?.contains("adapter=SA-21") == true)
+            #expect(statusDetails?.contains("carrier=strip6") == true)
         }
     }
 
