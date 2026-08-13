@@ -16,10 +16,18 @@ const DEFAULT_CAPTURE: ResolvedCaptureRecipe = {
   channels: "rgbi",
 };
 
+const SIMULATOR_OPTIONS = [1, 2, 4, 8, 16];
+const REAL_DEVICE_OPTIONS = [4];
+
 describe("CaptureRecipeForm", () => {
   it("renders every field with the PROTOCOL.md defaults", () => {
     render(
-      <CaptureRecipeForm capture={DEFAULT_CAPTURE} filmProcess="positive" onChange={() => {}} />,
+      <CaptureRecipeForm
+        capture={DEFAULT_CAPTURE}
+        filmProcess="positive"
+        multisampleOptions={SIMULATOR_OPTIONS}
+        onChange={() => {}}
+      />,
     );
     expect(screen.getByLabelText("Resolution (Dpi)")).toHaveValue(4000);
     expect(screen.getByLabelText("16 bits")).toBeChecked();
@@ -38,6 +46,7 @@ describe("CaptureRecipeForm", () => {
         <CaptureRecipeForm
           capture={capture}
           filmProcess="positive"
+          multisampleOptions={SIMULATOR_OPTIONS}
           onChange={(next) => {
             seen.push(next);
             setCapture(next);
@@ -56,7 +65,12 @@ describe("CaptureRecipeForm", () => {
     const onChange = vi.fn();
     const user = userEvent.setup();
     render(
-      <CaptureRecipeForm capture={DEFAULT_CAPTURE} filmProcess="positive" onChange={onChange} />,
+      <CaptureRecipeForm
+        capture={DEFAULT_CAPTURE}
+        filmProcess="positive"
+        multisampleOptions={SIMULATOR_OPTIONS}
+        onChange={onChange}
+      />,
     );
     await user.click(screen.getByLabelText("8 bits"));
     expect(onChange).toHaveBeenLastCalledWith({ ...DEFAULT_CAPTURE, bitDepth: 8 });
@@ -66,7 +80,12 @@ describe("CaptureRecipeForm", () => {
     const onChange = vi.fn();
     const user = userEvent.setup();
     render(
-      <CaptureRecipeForm capture={DEFAULT_CAPTURE} filmProcess="positive" onChange={onChange} />,
+      <CaptureRecipeForm
+        capture={DEFAULT_CAPTURE}
+        filmProcess="positive"
+        multisampleOptions={SIMULATOR_OPTIONS}
+        onChange={onChange}
+      />,
     );
     await user.selectOptions(screen.getByLabelText("Multisample passes"), "16");
     expect(onChange).toHaveBeenLastCalledWith({ ...DEFAULT_CAPTURE, multisamplePasses: 16 });
@@ -76,7 +95,12 @@ describe("CaptureRecipeForm", () => {
     const onChange = vi.fn();
     const user = userEvent.setup();
     render(
-      <CaptureRecipeForm capture={DEFAULT_CAPTURE} filmProcess="positive" onChange={onChange} />,
+      <CaptureRecipeForm
+        capture={DEFAULT_CAPTURE}
+        filmProcess="positive"
+        multisampleOptions={SIMULATOR_OPTIONS}
+        onChange={onChange}
+      />,
     );
     await user.click(screen.getByLabelText("Rgb"));
     expect(onChange).toHaveBeenLastCalledWith({ ...DEFAULT_CAPTURE, channels: "rgb" });
@@ -87,6 +111,7 @@ describe("CaptureRecipeForm", () => {
       <CaptureRecipeForm
         capture={{ ...DEFAULT_CAPTURE, channels: "rgbi" }}
         filmProcess="bwNegative"
+        multisampleOptions={SIMULATOR_OPTIONS}
         onChange={() => {}}
       />,
     );
@@ -99,10 +124,47 @@ describe("CaptureRecipeForm", () => {
 
   it("keeps the channels control enabled (never forced) for a non-B&W process", () => {
     render(
-      <CaptureRecipeForm capture={DEFAULT_CAPTURE} filmProcess="c41ColorNegative" onChange={() => {}} />,
+      <CaptureRecipeForm
+        capture={DEFAULT_CAPTURE}
+        filmProcess="c41ColorNegative"
+        multisampleOptions={SIMULATOR_OPTIONS}
+        onChange={() => {}}
+      />,
     );
     expect(screen.getByLabelText("Rgb")).not.toBeDisabled();
     expect(screen.getByLabelText("Rgb + infrared (rgbi)")).not.toBeDisabled();
     expect(screen.queryByTestId("capture-bw-channels-note")).toBeNull();
+  });
+
+  describe("device-aware multisampleOptions (Issue: real LS-5000 offered 2x/8x/16x)", () => {
+    it("offers the full simulator range when no device is connected yet", () => {
+      render(
+        <CaptureRecipeForm
+          capture={DEFAULT_CAPTURE}
+          filmProcess="positive"
+          multisampleOptions={SIMULATOR_OPTIONS}
+          onChange={() => {}}
+        />,
+      );
+      const options = screen
+        .getAllByRole<HTMLOptionElement>("option")
+        .map((option) => option.value);
+      expect(options).toEqual(["1", "2", "4", "8", "16"]);
+    });
+
+    it("offers only the connected real device's own set, never the simulator's 2x/8x/16x", () => {
+      render(
+        <CaptureRecipeForm
+          capture={{ ...DEFAULT_CAPTURE, multisamplePasses: 4 }}
+          filmProcess="positive"
+          multisampleOptions={REAL_DEVICE_OPTIONS}
+          onChange={() => {}}
+        />,
+      );
+      const options = screen
+        .getAllByRole<HTMLOptionElement>("option")
+        .map((option) => option.value);
+      expect(options).toEqual(["4"]);
+    });
   });
 });

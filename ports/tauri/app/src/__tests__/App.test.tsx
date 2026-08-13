@@ -116,8 +116,10 @@ describe("App release surfaces", () => {
 
   it("keeps real-hardware Stop controls visible by refusing Windows setup navigation", async () => {
     useUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
     const handle = createScriptedTransport({
-      onRequest: (method) => {
+      onRequest: (method, params) => {
+        calls.push({ method, params: params as Record<string, unknown> });
         if (method === "scanner.connect") {
           return {
             result: {
@@ -161,6 +163,14 @@ describe("App release surfaces", () => {
     });
 
     expect(await screen.findByTestId("stop-after-current")).toBeVisible();
+    // Issue: this real device reports no supportedMultisamplePasses wire
+    // field, so it falls back to real_backend.rs's documented [4]-only
+    // constraint -- the literal multisamplePasses: 1 requested above must
+    // reach scan.start already coerced to 4, proving the fix end to end
+    // through the full App shell (App -> SessionStore.startScan ->
+    // applyRecipeDefaults -> transport), not just the pure helpers.
+    const scanStartCall = calls.find((call) => call.method === "scan.start");
+    expect((scanStartCall?.params.recipe as { multisamplePasses?: number })?.multisamplePasses).toBe(4);
     const setup = screen.getByTestId("windows-setup-action");
     expect(setup).toBeDisabled();
     await user.click(setup);

@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useSyncExternalStore } from "react";
 import {
   applyRecipeDefaults,
+  coerceMultisamplePasses,
+  multisampleOptionsForDevice,
   type ResolvedCaptureRecipe,
   resolveEffectiveProcessing,
 } from "../../session/store/session";
@@ -79,11 +81,19 @@ export default function ScanSetupView({
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const project = state.project;
   const filmProcess = project?.filmProcess ?? "c41ColorNegative";
+  const connectedDevice = state.connection.device;
 
   // Roll-wide recipes: resolved defaults for capture (the project manifest
   // does not carry a capture/processing recipe), and the project's stored
-  // output recipe for output.
-  const resolved = applyRecipeDefaults(undefined, undefined, undefined);
+  // output recipe for output. Seeded with whatever device is already
+  // connected at mount time -- a real LS-5000 connected before this view
+  // ever rendered must not seed the simulator-shaped default of 1 that its
+  // own scan.start gate would then reject with INVALID_PARAMS.
+  const resolved = applyRecipeDefaults(undefined, undefined, undefined, connectedDevice);
+  // Device-aware picker options (mirrors Swift's MultisamplePassPolicy);
+  // recomputed every render, cheap, and always in sync with the connected
+  // device -- no memoization needed for a five-element-at-most array.
+  const multisampleOptions = multisampleOptionsForDevice(connectedDevice);
   const initialOutput = project?.recipes;
   const [capture, setCapture] = useState(resolved.capture);
   const [processing, setProcessing] = useState<ProcessingRecipe>(() => {
@@ -115,6 +125,34 @@ export default function ScanSetupView({
       .then((result) => setExifToolDetection(result))
       .catch(() => setExifToolDetection(null));
   }, []);
+
+  // Coerce on connect (mirrors Swift's coerceMultisamplePassesForConnectedDevice,
+  // called after scanner.connect and again after createProject while
+  // already connected): a device change can make the CURRENT
+  // multisamplePasses value unsupported (a real LS-5000 accepts only [4]).
+  // TS has no single persistent recipe draft to re-coerce at those two
+  // Swift call sites directly -- capture is this view's own local state --
+  // so this effect re-derives the connected device's options and
+  // re-coerces whenever the device's identity or its own reported options
+  // change; a no-op transition (options unchanged, current value still
+  // valid) returns the same object from the updater, so React bails out
+  // without an extra render. The mount-time seed above already covers a
+  // device connected before this view ever rendered; this effect covers
+  // one connecting (or reporting a different capability list) while the
+  // view stays mounted.
+  useEffect(() => {
+    setCapture((current) => {
+      const coerced = coerceMultisamplePasses(current.multisamplePasses, multisampleOptions);
+      return coerced === current.multisamplePasses
+        ? current
+        : { ...current, multisamplePasses: coerced as ResolvedCaptureRecipe["multisamplePasses"] };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    connectedDevice?.deviceId,
+    connectedDevice?.kind,
+    connectedDevice?.supportedMultisamplePasses?.join(","),
+  ]);
 
   // If a project loads after mount (or changes), adopt its output recipes as
   // the form's starting point instead of leaving stale defaults.
@@ -214,7 +252,12 @@ export default function ScanSetupView({
           {error.message}
         </p>
       )}
-      <CaptureRecipeForm capture={capture} filmProcess={filmProcess} onChange={setCapture} />
+      <CaptureRecipeForm
+        capture={capture}
+        filmProcess={filmProcess}
+        multisampleOptions={multisampleOptions}
+        onChange={setCapture}
+      />
       <ProcessingRecipeForm processing={processing} filmProcess={filmProcess} onChange={setProcessing} />
       {output && <OutputRecipeForm output={output} onChange={setOutput} />}
       {project && (
@@ -225,6 +268,7 @@ export default function ScanSetupView({
           rollCapture={capture}
           rollProcessing={processing}
           rollOutput={output ?? resolved.output}
+          multisampleOptions={multisampleOptions}
           project={project}
         />
       )}

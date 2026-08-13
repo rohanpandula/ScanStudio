@@ -358,6 +358,20 @@ impl SimulatedLs5000 {
                 firmware: "1.03-sim".to_string(),
                 connection: "USB (simulated)".to_string(),
                 supported: true,
+                // No bridge to source a capability list from, and
+                // skip_serializing_if keeps this key off the wire entirely
+                // (byte-identical scanner.list/scanner.connect JSON to
+                // before this field existed) rather than advertise an
+                // arbitrary simulator-only list. Every client's own
+                // device-aware policy already treats an absent value the
+                // same as this device's "simulated" kind would anyway
+                // (TS's multisampleOptionsForDevice / Swift's
+                // MultisamplePassPolicy.supportedOptions(for:) both fall
+                // back to the fuller [1, 2, 4, 8, 16] range for a
+                // non-"real" kind), so None and a spelled-out
+                // Some([1, 2, 4, 8, 16]) are observably identical here --
+                // None is simply the smaller, zero-new-fixtures change.
+                supported_multisample_passes: None,
             },
             state: Mutex::new(State::default()),
             cancelled: AtomicBool::new(false),

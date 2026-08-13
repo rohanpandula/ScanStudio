@@ -26,6 +26,21 @@ pub struct DeviceInfo {
     /// False for a recognized-but-unsupported Nikon model (Lane D): it is
     /// listed by name in ``scanner.list`` but is never connectable.
     pub supported: bool,
+    /// Device-sourced accepted set for `CaptureRecipe.multisample_passes`.
+    /// A real backend populates this from `RealLs5000::supported_multisample_passes`
+    /// (itself `derive_supported_multisample_passes`, read from BRIDGE.md's
+    /// `Capabilities.supportedMultisamplePasses` -- the same set `scan.start`
+    /// already validates `multisamplePasses` against, `real_backend.rs`'s
+    /// "multisamplePasses must be one of {:?} for this device"). The
+    /// simulator has no bridge-sourced capability list of its own and
+    /// leaves this `None` rather than fabricate one; a client with no value
+    /// (simulator, or an old engine build predating this field) keeps
+    /// offering its own historical `[1, 2, 4, 8, 16]` range. `#[serde(default)]`
+    /// makes an absent key on decode `None`, never a decode error --
+    /// forward- and backward-compatible with every engine build that does
+    /// not yet send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_multisample_passes: Option<Vec<u32>>,
 }
 
 // ---------------------------------------------------------------------
@@ -1363,10 +1378,40 @@ mod tests {
             firmware: "1.03-sim".into(),
             connection: "USB (simulated)".into(),
             supported: true,
+            supported_multisample_passes: None,
         };
         let value = serde_json::to_value(&device).unwrap();
         assert_eq!(value["deviceId"], json!("sim-ls5000-0"));
         assert_eq!(value["supported"], json!(true));
+        // None-safe: skip_serializing_if omits the key entirely rather than
+        // emitting `"supportedMultisamplePasses": null` -- an older/simulator
+        // wire payload with no such key at all must decode back to None too
+        // (checked by round_trip below), not merely tolerate an explicit null.
+        assert!(
+            !value.as_object().unwrap().contains_key("supportedMultisamplePasses"),
+            "None must omit the key, not serialize it as null: {value}"
+        );
+        round_trip(&device);
+    }
+
+    #[test]
+    fn device_info_supported_multisample_passes_serializes_for_a_real_device() {
+        // Mirrors what RealLs5000::device_info() now sends: the device's own
+        // derive_supported_multisample_passes()-derived set, camelCase on
+        // the wire, exactly the key WireProtocol.swift's DeviceInfo already
+        // decodes (`supportedMultisamplePasses`, added ahead of the engine
+        // actually sending it).
+        let device = DeviceInfo {
+            device_id: "bridge-ls5000-0".into(),
+            model: "SUPER COOLSCAN 5000 ED".into(),
+            kind: "real".into(),
+            firmware: "bridge 0.7.0".into(),
+            connection: "USB (bridge)".into(),
+            supported: true,
+            supported_multisample_passes: Some(vec![4]),
+        };
+        let value = serde_json::to_value(&device).unwrap();
+        assert_eq!(value["supportedMultisamplePasses"], json!([4]));
         round_trip(&device);
     }
 

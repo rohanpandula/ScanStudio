@@ -127,6 +127,32 @@ describe("alpha.11 wire compatibility", () => {
         connection: "USB",
       }),
     ).toBe(true);
+    // Forward compatibility: a future engine build sends DeviceInfo's new
+    // optional supportedMultisamplePasses key (engine domain.rs) exactly
+    // as WireProtocol.swift's DeviceInfo already decodes it -- accepted,
+    // not just tolerated as an unknown field.
+    expect(
+      isDeviceInfo({
+        deviceId: "real-ls5000-0",
+        model: "SUPER COOLSCAN 5000 ED",
+        kind: "real",
+        firmware: "1.02",
+        connection: "USB",
+        supportedMultisamplePasses: [4],
+      }),
+    ).toBe(true);
+    // A malformed value for the new field must still be rejected like any
+    // other typed field, not silently pass through.
+    expect(
+      isDeviceInfo({
+        deviceId: "real-ls5000-0",
+        model: "SUPER COOLSCAN 5000 ED",
+        kind: "real",
+        firmware: "1.02",
+        connection: "USB",
+        supportedMultisamplePasses: ["4"],
+      }),
+    ).toBe(false);
     expect(isOutputRecipe(projectWith().recipes)).toBe(true);
     expect(
       isFrameAlignment({

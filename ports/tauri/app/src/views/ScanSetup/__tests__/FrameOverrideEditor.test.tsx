@@ -97,6 +97,7 @@ describe("FrameOverrideEditor", () => {
         rollCapture={CAPTURE}
         rollProcessing={PROCESSING}
         rollOutput={OUTPUT}
+        multisampleOptions={[1, 2, 4, 8, 16]}
         project={PROJECT}
       />,
     );
@@ -125,6 +126,7 @@ describe("FrameOverrideEditor", () => {
         rollCapture={CAPTURE}
         rollProcessing={PROCESSING}
         rollOutput={OUTPUT}
+        multisampleOptions={[1, 2, 4, 8, 16]}
         project={projectWithOverride}
       />,
     );
@@ -155,10 +157,32 @@ describe("FrameOverrideEditor", () => {
         rollCapture={CAPTURE}
         rollProcessing={PROCESSING}
         rollOutput={OUTPUT}
+        multisampleOptions={[1, 2, 4, 8, 16]}
         project={projectWithOverride}
       />,
     );
     await user.click(screen.getByTestId("toggle-override-capture"));
     expect(screen.getByTestId("capture-res-dpi")).toHaveValue(2000);
+  });
+
+  it("forwards a device-constrained multisampleOptions to the per-frame capture picker", async () => {
+    fixture();
+    const user = userEvent.setup();
+    render(
+      <FrameOverrideEditor
+        frameIndex={1}
+        filmProcess="c41ColorNegative"
+        rollCapture={{ ...CAPTURE, multisamplePasses: 4 }}
+        rollProcessing={PROCESSING}
+        rollOutput={OUTPUT}
+        multisampleOptions={[4]}
+        project={PROJECT}
+      />,
+    );
+    await user.click(screen.getByTestId("toggle-override-capture"));
+    const options = screen
+      .getAllByRole<HTMLOptionElement>("option")
+      .map((option) => option.value);
+    expect(options).toEqual(["4"]);
   });
 });

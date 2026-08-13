@@ -11,6 +11,14 @@ export interface DeviceInfo {
   kind: "simulated" | "real";
   firmware: string;
   connection: string;
+  // Device-sourced accepted set for CaptureRecipe.multisamplePasses (engine
+  // domain.rs DeviceInfo.supportedMultisamplePasses, itself
+  // RealLs5000::supported_multisample_passes -- the same set scan.start's
+  // own INVALID_PARAMS gate validates multisamplePasses against). Absent
+  // for the simulator and for any older engine build that predates this
+  // field; store/session.ts's multisampleOptionsForDevice is the single
+  // place that interprets an absent value.
+  supportedMultisamplePasses?: number[];
 }
 
 export interface ScannerStatus {
@@ -398,6 +406,10 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
+function isNumberArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "number");
+}
+
 const CARRIERS = ["roll36", "strip6", "mounted"] as const;
 const FILM_PROCESSES = [
   "positive",
@@ -436,7 +448,8 @@ export function isDeviceInfo(value: unknown): value is DeviceInfo {
     typeof value.model === "string" &&
     isIn(value.kind, ["simulated", "real"] as const) &&
     typeof value.firmware === "string" &&
-    typeof value.connection === "string"
+    typeof value.connection === "string" &&
+    (!("supportedMultisamplePasses" in value) || isNumberArray(value.supportedMultisamplePasses))
   );
 }
 

@@ -10,11 +10,13 @@ import { describe, expect, it } from "vitest";
 import {
   SessionStore,
   applyRecipeDefaults,
+  coerceMultisamplePasses,
+  multisampleOptionsForDevice,
   resolveEffectiveProcessing,
   validateRecipe,
 } from "../store/session";
 import { createScriptedTransport } from "../testing/harness";
-import type { CaptureRecipe, OutputRecipe, ProcessingRecipe } from "../wire/types";
+import type { CaptureRecipe, DeviceInfo, OutputRecipe, ProcessingRecipe } from "../wire/types";
 
 const VALID_CAPTURE = {
   resolutionDpi: 4000,
@@ -56,6 +58,32 @@ const VALID_OUTPUT: OutputRecipe = {
 
 const EMPTY_CTX = { requestedFrames: [1] };
 
+// Issue: the Tauri client hardcoded [1,2,4,8,16]/multisamplePasses:1 with
+// zero device awareness, so a real LS-5000 scan.start got refused --
+// real_backend.rs's scan_start: "multisamplePasses must be one of [4] for
+// this device". These three DeviceInfo shapes are the exact ones
+// multisampleOptionsForDevice branches on.
+const REAL_DEVICE_NO_WIRE_FIELD: DeviceInfo = {
+  deviceId: "bridge-ls5000-0",
+  model: "SUPER COOLSCAN 5000 ED",
+  kind: "real",
+  firmware: "bridge 0.7.0",
+  connection: "USB (bridge)",
+};
+
+const REAL_DEVICE_WITH_WIRE_FIELD: DeviceInfo = {
+  ...REAL_DEVICE_NO_WIRE_FIELD,
+  supportedMultisamplePasses: [4, 8],
+};
+
+const SIMULATED_DEVICE: DeviceInfo = {
+  deviceId: "sim-ls5000-0",
+  model: "SUPER COOLSCAN 5000 ED",
+  kind: "simulated",
+  firmware: "1.03-sim",
+  connection: "USB (simulated)",
+};
+
 function expectInvalid(
   recipe: Parameters<typeof validateRecipe>[0],
   ctx: Parameters<typeof validateRecipe>[1],
@@ -93,6 +121,44 @@ describe("SessionStore recipe mirroring (pure helpers)", () => {
     expect(resolved.processing).toBeUndefined();
   });
 
+  describe("device-aware multisamplePasses (Issue: real LS-5000 refused scan.start)", () => {
+    it("defaults to [4] and coerces the PROTOCOL.md default of 1 to 4 for a real device with no wire field", () => {
+      expect(multisampleOptionsForDevice(REAL_DEVICE_NO_WIRE_FIELD)).toEqual([4]);
+      const resolved = applyRecipeDefaults(undefined, undefined, undefined, REAL_DEVICE_NO_WIRE_FIELD);
+      expect(resolved.capture.multisamplePasses).toBe(4);
+    });
+
+    it("honors the device's own wire-reported set when present, sorted", () => {
+      expect(multisampleOptionsForDevice(REAL_DEVICE_WITH_WIRE_FIELD)).toEqual([4, 8]);
+      // A caller-supplied value already valid for THIS device's own list
+      // (8) must be kept, not coerced away to the hardcoded [4] fallback --
+      // proves the wire field is actually consulted, not just kind==="real".
+      const resolved = applyRecipeDefaults(
+        { multisamplePasses: 8 },
+        undefined,
+        undefined,
+        REAL_DEVICE_WITH_WIRE_FIELD,
+      );
+      expect(resolved.capture.multisamplePasses).toBe(8);
+    });
+
+    it("keeps the simulator's fuller range and default of 1 unchanged", () => {
+      expect(multisampleOptionsForDevice(SIMULATED_DEVICE)).toEqual([1, 2, 4, 8, 16]);
+      expect(multisampleOptionsForDevice(null)).toEqual([1, 2, 4, 8, 16]);
+      expect(multisampleOptionsForDevice(undefined)).toEqual([1, 2, 4, 8, 16]);
+      const resolved = applyRecipeDefaults(undefined, undefined, undefined, SIMULATED_DEVICE);
+      expect(resolved.capture.multisamplePasses).toBe(1);
+    });
+
+    it("coerce prefers keeping a still-valid current value, else the nearest option (ties toward lower)", () => {
+      expect(coerceMultisamplePasses(4, [4])).toBe(4);
+      expect(coerceMultisamplePasses(2, [4])).toBe(4);
+      expect(coerceMultisamplePasses(6, [4, 8])).toBe(4);
+      expect(coerceMultisamplePasses(9, [4, 8])).toBe(8);
+      expect(coerceMultisamplePasses(2, [])).toBe(2);
+    });
+  });
+
   it("rejects bitDepth outside {8,16}", () => {
     expectInvalid(
       { capture: { ...VALID_CAPTURE, bitDepth: 12 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
@@ -107,6 +173,45 @@ describe("SessionStore recipe mirroring (pure helpers)", () => {
       EMPTY_CTX,
       "capture.multisamplePasses",
     );
+  });
+
+  it("rejects a multisamplePasses value valid historically but outside ctx.supportedMultisamplePasses", () => {
+    // 8 is a normal member of the historical {1,2,4,8,16} set (would pass
+    // the bare EMPTY_CTX check above) but is not one of this device's own
+    // accepted values -- validateRecipe must use the device-scoped bound
+    // when the caller supplies one, not silently fall back to the full set.
+    expectInvalid(
+      { capture: { ...VALID_CAPTURE, multisamplePasses: 8 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      { requestedFrames: [1], supportedMultisamplePasses: [4] },
+      "capture.multisamplePasses",
+      /must be one of 4/,
+    );
+    // The same value is accepted once it IS one of the device's own options.
+    expect(
+      validateRecipe(
+        { capture: { ...VALID_CAPTURE, multisamplePasses: 8 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+        { requestedFrames: [1], supportedMultisamplePasses: [4, 8] },
+      ),
+    ).toEqual({ valid: true });
+  });
+
+  it("intersects the device's set with the protocol invariant instead of replacing it", () => {
+    // A device advertising a value outside {1,2,4,8,16} narrows nothing
+    // for that value: 3 stays invalid even when the wire claims it, and a
+    // protocol-valid value outside the (filtered) device set stays
+    // rejected on the device bound.
+    expectInvalid(
+      { capture: { ...VALID_CAPTURE, multisamplePasses: 3 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+      { requestedFrames: [1], supportedMultisamplePasses: [3, 4] },
+      "capture.multisamplePasses",
+      /must be one of 4/,
+    );
+    expect(
+      validateRecipe(
+        { capture: { ...VALID_CAPTURE, multisamplePasses: 4 }, processing: VALID_PROCESSING, output: VALID_OUTPUT },
+        { requestedFrames: [1], supportedMultisamplePasses: [3, 4] },
+      ),
+    ).toEqual({ valid: true });
   });
 
   it("forces channels to rgb and digitalIceEnabled to false for bwNegative", () => {
@@ -245,6 +350,68 @@ describe("SessionStore recipe mirroring (wired into startScan)", () => {
       recoverable: false,
     });
     expect(calls.filter((call) => call.method === "scan.start")).toHaveLength(1);
+  });
+
+  // Connects the store to `device` via a scripted scanner.connect response,
+  // then asserts what multisamplePasses scan.start actually receives when
+  // startScan is called with `requested`. Isolates the three scenarios the
+  // defect fix must cover end to end, through the exact path a real UI
+  // startScan call takes (SessionStore.startScan -> applyRecipeDefaults ->
+  // validateRecipe -> transport.sendRequest("scan.start", ...)).
+  async function multisamplePassesSentToScanStart(
+    device: DeviceInfo,
+    requested: number,
+  ): Promise<unknown> {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const handle = createScriptedTransport({
+      onRequest: (method, params) => {
+        calls.push({ method, params: params as Record<string, unknown> });
+        if (method === "scanner.connect") {
+          return {
+            result: {
+              device,
+              status: {
+                connected: true,
+                adapter: null,
+                mediaLoaded: false,
+                carrier: null,
+                frameCount: null,
+                lamp: "off",
+                transport: "idle",
+                activeJobId: null,
+              },
+            },
+          };
+        }
+        if (method === "scan.start") return { result: { jobId: "job-multisample" } };
+        return { result: undefined };
+      },
+    });
+    const store = new SessionStore(handle.transport);
+    await store.connect(device.deviceId);
+    await store.startScan([1], {
+      ...VALID_CAPTURE,
+      multisamplePasses: requested as CaptureRecipe["multisamplePasses"],
+    });
+    const scanCall = calls.find((call) => call.method === "scan.start");
+    const recipe = scanCall?.params.recipe as CaptureRecipe;
+    return recipe.multisamplePasses;
+  }
+
+  it("coerces multisamplePasses:1 to 4 for a real device reporting no wire field", async () => {
+    await expect(
+      multisamplePassesSentToScanStart(REAL_DEVICE_NO_WIRE_FIELD, 1),
+    ).resolves.toBe(4);
+  });
+
+  it("honors an already-valid multisamplePasses against the device's own wire-reported set", async () => {
+    await expect(
+      multisamplePassesSentToScanStart(REAL_DEVICE_WITH_WIRE_FIELD, 8),
+    ).resolves.toBe(8);
+  });
+
+  it("leaves multisamplePasses untouched for the simulator", async () => {
+    await expect(multisamplePassesSentToScanStart(SIMULATED_DEVICE, 8)).resolves.toBe(8);
   });
 
   it("the bwNegative forcing reaches the wire call (channels rgb, digitalIceEnabled false)", async () => {

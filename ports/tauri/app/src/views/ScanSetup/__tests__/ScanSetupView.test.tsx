@@ -171,4 +171,82 @@ describe("ScanSetupView", () => {
     render(<ScanSetupView selectedFrames={[]} onScanStarted={onScanStarted} onRequestConnect={() => undefined} />);
     expect(screen.getByTestId("start-scan")).toBeDisabled();
   });
+
+  describe("device-aware multisamplePasses (Issue: real LS-5000 offered 2x/8x/16x)", () => {
+    async function connectedRealDeviceStore(
+      supportedMultisamplePasses: number[] | undefined,
+    ): Promise<SessionStore> {
+      const handle = createScriptedTransport({
+        onRequest: (method) => {
+          if (method === "scanner.connect") {
+            return {
+              result: {
+                device: {
+                  deviceId: "real-ls5000-0",
+                  model: "Nikon LS-5000",
+                  kind: "real" as const,
+                  firmware: "1.02",
+                  connection: "usb",
+                  ...(supportedMultisamplePasses ? { supportedMultisamplePasses } : {}),
+                },
+                status: {
+                  connected: true,
+                  adapter: null,
+                  mediaLoaded: false,
+                  carrier: null,
+                  frameCount: null,
+                  lamp: "off" as const,
+                  transport: "idle" as const,
+                  activeJobId: null,
+                },
+              },
+            };
+          }
+          if (method === "project.create") {
+            return { result: { project: PROJECT, directory: "/Users/test/projects/real-roll" } };
+          }
+          return { result: undefined };
+        },
+      });
+      const store = new SessionStore(handle.transport);
+      await act(async () => {
+        await store.connect("real-ls5000-0");
+        await store.createProject("Setup Roll", "roll36", 36, "c41ColorNegative");
+      });
+      mocks.sessionStore = store;
+      return store;
+    }
+
+    it("offers only [4] and coerces the default multisample select to 4 for a real device with no wire field", async () => {
+      await connectedRealDeviceStore(undefined);
+      render(
+        <ScanSetupView selectedFrames={[1]} onScanStarted={() => undefined} onRequestConnect={() => undefined} />,
+      );
+      const select = await screen.findByTestId("capture-multisample");
+      const options = Array.from(select.querySelectorAll("option")).map((option) => option.value);
+      expect(options).toEqual(["4"]);
+      expect(select).toHaveValue("4");
+    });
+
+    it("honors the device's own wire-reported set when scanner.connect sends supportedMultisamplePasses", async () => {
+      await connectedRealDeviceStore([4, 8]);
+      render(
+        <ScanSetupView selectedFrames={[1]} onScanStarted={() => undefined} onRequestConnect={() => undefined} />,
+      );
+      const select = await screen.findByTestId("capture-multisample");
+      const options = Array.from(select.querySelectorAll("option")).map((option) => option.value);
+      expect(options).toEqual(["4", "8"]);
+    });
+
+    it("keeps the simulator's full picker range unchanged", async () => {
+      await connectedStore({ result: { jobId: "job-1" } });
+      render(
+        <ScanSetupView selectedFrames={[1]} onScanStarted={() => undefined} onRequestConnect={() => undefined} />,
+      );
+      const select = await screen.findByTestId("capture-multisample");
+      const options = Array.from(select.querySelectorAll("option")).map((option) => option.value);
+      expect(options).toEqual(["1", "2", "4", "8", "16"]);
+      expect(select).toHaveValue("1");
+    });
+  });
 });
