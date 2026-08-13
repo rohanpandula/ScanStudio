@@ -803,7 +803,7 @@ Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.toml') -Patte
 # Cargo.toml, so the stamp must apply here too or cargo refuses to run at
 # all before any build step -- exactly what happened once Cargo.toml alone
 # was stamped.
-Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.lock') -Pattern '(?m)^name = "scanstudio-app"\nversion = "([^"]*)"' -Version $Version
+Set-StampedVersionField -Path (Join-Path $appRoot 'src-tauri\Cargo.lock') -Pattern '(?m)^name = "scanstudio-app"\r?\nversion = "([^"]*)"' -Version $Version
 
 $pinnedToolHandles = [Collections.Generic.List[System.IO.FileStream]]::new()
 $heldMakensisSha256 = ''

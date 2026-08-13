@@ -67,7 +67,7 @@ stamp(cargo_toml_path, r'(?m)^version = "([^"]*)"')
 # from Cargo.toml, so the stamp must apply here too or cargo/rustc refuse
 # to run at all before any build step -- exactly what happened once
 # Cargo.toml alone was stamped.
-stamp(cargo_lock_path, r'(?m)^name = "scanstudio-app"\nversion = "([^"]*)"')
+stamp(cargo_lock_path, r'(?m)^name = "scanstudio-app"\r?\nversion = "([^"]*)"')
 PY
 
 mkdir -p "$output_dir"
