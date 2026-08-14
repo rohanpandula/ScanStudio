@@ -32,6 +32,9 @@ jobs:
 
   release:
     name: Build and verify ${{ matrix.arch }} DMG
+    # Bounded because this job now waits on two Apple notarization
+    # round-trips (app + DMG) on top of the build itself.
+    timeout-minutes: 150
     needs: authorize
     # A universal bundle is impossible because the pinned cv2/numpy wheels are
     # not universal, so each architecture is built natively on its own runner
@@ -127,33 +130,54 @@ jobs:
           test -n "$IDENTITY" || { echo "no Developer ID Application identity found in the imported certificate"; exit 1; }
           echo "SCANSTUDIO_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
           echo "Imported signing identity: $IDENTITY"
+      - name: Write the notarization API key
+        env:
+          NOTARY_KEY_P8: ${{ secrets.APPSTORE_CONNECT_API_KEY_P8 }}
+        run: |
+          test -n "$NOTARY_KEY_P8" || { echo "APPSTORE_CONNECT_API_KEY_P8 secret is missing or empty"; exit 1; }
+          NOTARY_KEY_FILE="$RUNNER_TEMP/notary-key.p8"
+          printf '%s' "$NOTARY_KEY_P8" > "$NOTARY_KEY_FILE"
+          # The secret is the raw PEM text of the downloaded AuthKey .p8
+          # (NOT base64-wrapped, unlike the p12 secret) -- fail here, with a
+          # clear reason, rather than at the end of a 40-minute build.
+          grep -q "BEGIN PRIVATE KEY" "$NOTARY_KEY_FILE" || { echo "APPSTORE_CONNECT_API_KEY_P8 does not look like a raw PEM .p8 key"; exit 1; }
+          echo "NOTARY_KEY_FILE=$NOTARY_KEY_FILE" >> "$GITHUB_ENV"
+      - name: Build, sign, and verify the app
+        # package_app.sh signs to notarization requirements with the
+        # identity exported above; test_packaged_bridge.sh then executes the
+        # hardened-runtime bundle (bridge smoke on the signed app).
+        working-directory: app/ScanStudio
+        run: make package
+      - name: Notarize and staple the app
+        # The .app needs its own ticket: the in-app updater's
+        # publisher-trust gate requires a stapled ticket on the INSTALLED
+        # app, and an app copied out of a DMG does not inherit the DMG's
+        # ticket (it also covers offline first launch).
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
+        working-directory: app/ScanStudio
+        run: |
+          test -n "$NOTARY_KEY_ID" || { echo "APPSTORE_CONNECT_API_KEY_ID secret is missing or empty"; exit 1; }
+          test -n "$NOTARY_ISSUER_ID" || { echo "APPSTORE_CONNECT_API_ISSUER_ID secret is missing or empty"; exit 1; }
+          zsh scripts/notarize_artifact.sh app .build/ScanStudio.app
       - name: Build and verify the local DMG
         # package_dmg.sh names the artifact ScanStudio-<version>-macOS-<arch>.dmg
         # (arch from uname -m, i.e. this runner's native arch) and refuses to
-        # overwrite an existing artifact. It also verifies the mounted app's
-        # code signature and runs test_packaged_bridge.sh on it; any failure
-        # here aborts the job and nothing is released. With
-        # SCANSTUDIO_SIGNING_IDENTITY exported above, package_app.sh signs to
-        # notarization requirements instead of ad-hoc.
+        # overwrite an existing artifact; it builds from the already
+        # notarized-and-stapled app above.
         working-directory: app/ScanStudio
-        run: make dmg
+        run: ./scripts/package_dmg.sh
       - name: Notarize and staple the DMG
         # MUST run before SHA256SUMS/latest.json are emitted: stapling
         # mutates the DMG, so every published checksum has to be computed
         # from the stapled artifact.
         env:
-          NOTARY_KEY_B64: ${{ secrets.APPSTORE_CONNECT_API_KEY_P8 }}
           NOTARY_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
         working-directory: app/ScanStudio
         run: |
-          test -n "$NOTARY_KEY_B64" || { echo "APPSTORE_CONNECT_API_KEY_P8 secret is missing or empty"; exit 1; }
-          test -n "$NOTARY_KEY_ID" || { echo "APPSTORE_CONNECT_API_KEY_ID secret is missing or empty"; exit 1; }
-          test -n "$NOTARY_ISSUER_ID" || { echo "APPSTORE_CONNECT_API_ISSUER_ID secret is missing or empty"; exit 1; }
-          export NOTARY_KEY_FILE="$RUNNER_TEMP/notary-key.p8"
-          printf '%s' "$NOTARY_KEY_B64" > "$NOTARY_KEY_FILE"
-          zsh scripts/notarize_dmg.sh ".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
-          rm -f "$NOTARY_KEY_FILE"
+          zsh scripts/notarize_artifact.sh dmg ".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
       - name: Emit SHA256SUMS and arch-keyed latest.json
         working-directory: app/ScanStudio
         run: |
@@ -192,9 +216,10 @@ jobs:
             app/ScanStudio/.build/latest.json
           if-no-files-found: error
           retention-days: 1
-      - name: Delete the throwaway signing keychain
+      - name: Delete the throwaway signing keychain and key material
         if: always()
         run: |
+          rm -f "$RUNNER_TEMP/signing.p12" "$RUNNER_TEMP/notary-key.p8"
           KEYCHAIN="$RUNNER_TEMP/scanstudio-signing.keychain-db"
           if [ -f "$KEYCHAIN" ]; then
             security list-keychains -d user -s login.keychain-db

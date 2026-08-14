@@ -83,4 +83,7 @@ mounted=0
 mv "$temporary_dmg" "$output"
 digest="$(shasum -a 256 "$output" | awk '{print $1}')"
 print "Packaged $output"
-print "SHA-256 $digest"
+# Local digest of the freshly built DMG. In the release pipeline
+# notarization stapling mutates the file AFTER this point, so the published
+# SHA256SUMS value will differ from this line -- it is informational only.
+print "SHA-256 (pre-staple) $digest"

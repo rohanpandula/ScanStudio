@@ -9,11 +9,14 @@
 
 ## Why two paths
 
-ScanStudio is ad-hoc signed today (`codesign -dv` → `Signature=adhoc`, no
-TeamIdentifier). Neither the custom updater nor Sparkle may install a release
-from that trust state. A checksum supplied by the release server is an
-integrity check, not an independent publisher identity. Path A can check and
-download today, but installation fails closed until the running app and update
+Release builds are Developer-ID signed, notarized, and stapled as of the
+signing lane (release.yml's DMG job signs the app and DMG, notarizes both,
+and staples both; local/PR-CI builds stay ad-hoc — `codesign -dv` →
+`Signature=adhoc`). The packaged Info.plist stamps
+`ScanStudioUpdateTeamIdentifier`. A checksum supplied by the release server
+is an integrity check, not an independent publisher identity. Path A can
+check and download, and with the signing lane in place the running app and
+update
 are Developer ID signed, securely timestamped, notarized, and stapled.
 
 ## Path A — how it works and its publisher gate
@@ -108,12 +111,13 @@ imported into your keychain.
    the feed's base data (see reuse map below).
 5. **Decide and document repo-secret names before wiring CI** — settle the
    secret surface only after the cert + notary + key all exist.
-   **Why:** CI wiring is the last step and should reference already-decided
-   names (`DEVELOPER_ID_CERT`, `DEVELOPER_ID_TEAM`, `NOTARY_API_KEY`,
-   `NOTARY_KEY_ID`, `NOTARY_KEY_ISSUER_ID`, `SPARKLE_EDDSA_KEY`, …) so the
-   appcast step is a one-shot edit to `release.yml`. **Where:** repository
-   Settings → Secrets and variables → Actions; record the chosen names in the
-   future Sparkle plan.
+   **Why:** CI wiring should reference already-decided names. DECIDED and
+   live in the signing lane: `MACOS_SIGNING_CERT_P12_BASE64`,
+   `MACOS_SIGNING_CERT_PASSWORD`, `APPSTORE_CONNECT_API_KEY_P8` (raw PEM,
+   not base64), `APPSTORE_CONNECT_API_KEY_ID`,
+   `APPSTORE_CONNECT_API_ISSUER_ID`. A Sparkle path would add only
+   `SPARKLE_EDDSA_KEY`. **Where:** repository Settings → Secrets and
+   variables → Actions.
 
 ## Reuse map
 
@@ -127,9 +131,10 @@ What Path B reuses from Path A, and what Path B adds.
 | `UpdateDownloader` (01-04, planned) | Already validates hash + code signature; can gate what Sparkle is offered as a candidate |
 | `UpdateSettingsView` / `UpdateFlowModel` (01-05, planned) | Unchanged — they keep presenting version/install/rollback, just fed by Sparkle instead of Path A |
 
-**What Sparkle ADDS (none exist today):** the `SUFeedURL` key in the packaged
-`Info.plist`, EdDSA feed signatures, Developer ID signing, notarization +
-staple, and an appcast publish step in CI.
+**What Sparkle ADDS (beyond the signing lane, which already provides
+Developer ID signing, notarization, and stapling on releases):** the
+`SUFeedURL` key in the packaged `Info.plist`, EdDSA feed signatures, and an
+appcast publish step in CI.
 
 **What would change when the gate opens:** `app/ScanStudio/packaging/Info.plist`
 (SUFeedURL), `app/ScanStudio/scripts/package_app.sh` (sign `-` → Developer ID

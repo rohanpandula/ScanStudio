@@ -20,6 +20,8 @@
     <string>14</string>
     <key>ScanStudioRelease</key>
     <string></string>
+    <key>ScanStudioUpdateTeamIdentifier</key>
+    <string>L95G5TS6AK</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>

@@ -636,9 +636,11 @@ strip -S "$staged_app/Contents/MacOS/scanstudio-engine" "$staged_app/Contents/Ma
 # the bundle signed individually with a secure timestamp (notarytool rejects
 # any unsigned Mach-O, and --deep never descends into Resources, where the
 # whole BridgeRuntime CPython tree lives), hardened runtime on every
-# executable, and executables carrying the one entitlement the bridge's
-# ctypes loader needs to dlopen the bundled (same-team-signed) libusb under
-# library validation.
+# executable, and executables carrying disable-library-validation. That
+# entitlement exists for the HOST libraries the bridge's optional paths
+# ctypes-load -- a Homebrew libsane found via find_library is signed by a
+# foreign team, exactly what library validation blocks. (The bundled libusb
+# is same-team-signed and would pass validation on its own.)
 signing_identity="${SCANSTUDIO_SIGNING_IDENTITY:--}"
 timestamp_flags=()
 runtime_flags=()
@@ -666,7 +668,14 @@ PLIST
             codesign --force --sign "$signing_identity" --timestamp "$candidate"
         fi
     done < <(find "$staged_app/Contents/Resources" "$staged_app/Contents/Frameworks" \
-        -type f -print0 2>/dev/null)
+        -type f \( -perm -u+x -o -name '*.so' -o -name '*.dylib' \) -print0 2>/dev/null)
+    # The predicate above is a fork-saving pre-filter only (this tree holds
+    # thousands of plain-text files); file(1) remains the authority on what
+    # is actually a Mach-O. Every Mach-O in the uv-managed CPython layout is
+    # executable-bit or *.so/*.dylib. Note for provenance audits: this sweep
+    # re-signs files whose hashes were pinned earlier in this script (e.g.
+    # the python-sane extension), so release artifacts intentionally differ
+    # from those pre-signing pins.
 fi
 codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "$bundled_libusb"
 codesign --verify --strict "$bundled_libusb"
