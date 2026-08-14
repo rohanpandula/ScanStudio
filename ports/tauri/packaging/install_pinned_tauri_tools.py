@@ -115,7 +115,11 @@ NSIS_PLUGIN = {
     "sha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",
 }
 
-WEBVIEW2_GUID = "e4dd9b83-b7e3-4d17-8d7c-e14cdd7c3a51"
+# 2026-08-14: Microsoft rotated the fwlink 2124701 delivery GUID mid-day
+# (previous: e4dd9b83-b7e3-4d17-8d7c-e14cdd7c3a51); the pin gate failed
+# closed on the drift exactly as designed. New artifact re-verified via
+# the official fwlink redirect before re-pinning.
+WEBVIEW2_GUID = "eb04ea38-69c8-4b86-b65b-fd4c8469ae59"
 WEBVIEW2_ASSET = {
     "name": "MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
     "url": (
@@ -123,8 +127,8 @@ WEBVIEW2_ASSET = {
         "filestreamingservice/files/"
         f"{WEBVIEW2_GUID}/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
     ),
-    "size": 209_653_456,
-    "sha256": "f8d4ab074c22a0cd136434f37c6b34dfb64ebf8a32ce42e03bd8f2a6b51a3892",
+    "size": 212_668_624,
+    "sha256": "6ac57a21414742ac1a6a03bf9516a048897317cef04a49967b283093e29c31b7",
 }
 
 WINDOWS_RESERVED_NAMES = {

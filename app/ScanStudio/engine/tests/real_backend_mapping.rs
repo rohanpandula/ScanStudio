@@ -527,8 +527,8 @@ fn healthy_preview_timeout_quarantines_successors_until_disconnect_and_reconnect
         .expect("read mock bridge call log after rejected successor");
     assert_eq!(
         calls_after_successor.lines().collect::<Vec<_>>(),
-        vec!["roll.preview"],
-        "the quarantined successor must not issue a second roll.preview call"
+        vec!["device.status", "roll.preview"],
+        "the quarantined successor must not issue any bridge call"
     );
 
     let (scan_tx, _scan_rx) = mpsc::channel();
@@ -558,7 +558,7 @@ fn healthy_preview_timeout_quarantines_successors_until_disconnect_and_reconnect
             .expect("read call log after locally rejected session changes")
             .lines()
             .collect::<Vec<_>>(),
-        vec!["roll.preview"],
+        vec!["device.status", "roll.preview"],
         "undrained quarantine must reject session changes before bridge traffic"
     );
 
@@ -757,7 +757,7 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
             .expect("read calls while the original bridge still owns the process fence")
             .lines()
             .collect::<Vec<_>>(),
-        vec!["roll.preview", "device.status"],
+        vec!["device.status", "roll.preview", "device.status"],
         "failed-closed reconnect attempts must not reach the live hung bridge"
     );
 

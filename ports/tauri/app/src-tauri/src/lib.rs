@@ -7,11 +7,30 @@ mod wsl;
 /// read-only setup probes. Never automated install/elevate — the returned
 /// `fix_command` strings are display-only copy-paste text.
 #[tauri::command]
-fn wsl_run_checks() -> Vec<wsl::checker::ProbeResult> {
+fn wsl_run_checks(app: tauri::AppHandle) -> Vec<wsl::checker::ProbeResult> {
+    // The installed payload's driver identity: the NSIS install places
+    // CorrespondingSource/ next to the executable, and Tauri's resource
+    // directory is the layout-portable answer -- try both, first hit wins.
+    // A build without the payload (dev, portable) resolves to None and the
+    // bridge-identity probe reports honest Unknown, never a red
+    // "reinstall" instruction.
+    use tauri::Manager;
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().resource_dir() {
+        candidates.push(dir);
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+    {
+        candidates.push(dir);
+    }
+    let payload_identity = wsl::checker::windows_payload_identity(&candidates);
     wsl::checker::run_all_probes(
         &wsl::checker::RealCommandExecutor,
         cfg!(target_os = "windows"),
         wsl::bridge_cmd::BRIDGE_ENTRYPOINT,
+        payload_identity.as_ref(),
     )
 }
 

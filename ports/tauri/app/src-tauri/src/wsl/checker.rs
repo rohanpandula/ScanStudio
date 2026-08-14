@@ -82,10 +82,11 @@ impl CommandExecutor for RealCommandExecutor {
     }
 }
 
-pub const PROBE_IDS: [&str; 5] = [
+pub const PROBE_IDS: [&str; 6] = [
     "wsl_status",
     "bridge_which",
     "bridge_version",
+    "bridge_identity",
     "usbipd_attach",
     "webview2",
 ];
@@ -94,23 +95,154 @@ pub fn run_all_probes(
     executor: &dyn CommandExecutor,
     is_windows: bool,
     entrypoint: &str,
+    windows_payload: Option<&BridgePayloadIdentity>,
 ) -> Vec<ProbeResult> {
     vec![
         probe_wsl_status(executor, is_windows),
         probe_bridge_which(executor, is_windows, entrypoint),
         probe_bridge_version(executor, is_windows, entrypoint),
+        probe_bridge_identity(executor, is_windows, windows_payload),
         probe_usbipd_attach(executor, is_windows),
         probe_webview2(executor, is_windows),
     ]
 }
 
-/// The ONLY place `Unknown` is produced: a non-Windows host cannot run these
-/// probes, and the honest answer is "this check does not apply here".
+/// The installed payload's driver identity: the sha256 of its
+/// `CorrespondingSource` copy of the driver's `bundle.py`. That one file
+/// carries the pin table for every capture component, so equality of
+/// `bundle.py` plus the deployed side's own `verify_capture_bundle`
+/// self-check together bind the entire deployed driver tree to the
+/// installed payload -- not just a sample of files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgePayloadIdentity {
+    pub bundle_sha256: String,
+}
+
+/// Resolves the installed payload's driver identity from the first candidate
+/// directory that carries it, or None when no candidate does (a dev or
+/// portable run without the packaged payload -- reported as Unknown, never
+/// as a red instruction to reinstall).
+pub fn windows_payload_identity(
+    candidate_install_dirs: &[std::path::PathBuf],
+) -> Option<BridgePayloadIdentity> {
+    use sha2::{Digest, Sha256};
+    candidate_install_dirs.iter().find_map(|dir| {
+        let bundle_path = dir
+            .join("CorrespondingSource")
+            .join("coolscanpy")
+            .join("src")
+            .join("coolscanpy")
+            .join("protocol")
+            .join("ls5000_single_pass")
+            .join("bundle.py");
+        let bytes = std::fs::read(bundle_path).ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Some(BridgePayloadIdentity {
+            bundle_sha256: format!("{:x}", hasher.finalize()),
+        })
+    })
+}
+
+/// Runs the DEPLOYED bridge interpreter itself (honoring `XDG_DATA_HOME`,
+/// exactly like install-bridge-wsl.sh's own layout choice): line 1 prints
+/// the sha256 of the `bundle.py` the interpreter actually imports (the
+/// site-packages copy -- the code that runs, not the staged sources), and
+/// line 2 runs `verify_capture_bundle(require_python_sources=True)`, the
+/// installer's own all-components self-check, which raises (non-zero exit,
+/// reason on stderr) on any pinned-component mismatch.
+const DEPLOYED_IDENTITY_SH: &str = concat!(
+    "PY=\"${XDG_DATA_HOME:-$HOME/.local/share}/scanstudio/wsl-bridge/python/bin/python3.13\"; ",
+    "\"$PY\" -I -c \"",
+    "import hashlib; ",
+    "from coolscanpy.protocol.ls5000_single_pass import bundle; ",
+    "print(hashlib.sha256(open(bundle.__file__,'rb').read()).hexdigest()); ",
+    "print(bundle.verify_capture_bundle(require_python_sources=True))",
+    "\""
+);
+
+/// The ONLY place `Unknown` is produced for host reasons: a non-Windows
+/// host cannot run these probes, and the honest answer is "this check does
+/// not apply here". (`bridge-identity` also reports Unknown for a build
+/// without the packaged payload -- same honesty, different cause.)
 fn windows_only(id: &'static str) -> ProbeResult {
     ProbeResult {
         id,
         status: ProbeStatus::Unknown,
         detail: "windows only".to_string(),
+        fix_command: None,
+    }
+}
+
+/// WV-4 (first live Windows validation, 2026-08-13): a WSL bridge deployed
+/// days earlier -- inherited through a VM clone, from a commit window whose
+/// driver tree was internally inconsistent -- passed `bridge-which` and
+/// `bridge-version` all session and then refused the first real capture
+/// with a bundle-identity error. Nothing bound the deployed bridge to the
+/// installed app's payload. This probe closes that gap completely (review
+/// round 2): the deployed interpreter runs the driver's own
+/// `verify_capture_bundle` self-check over every pinned component of the
+/// copy it actually imports, and the imported `bundle.py` (the pin table
+/// itself) must hash byte-identically to the installed payload's copy.
+fn probe_bridge_identity(
+    executor: &dyn CommandExecutor,
+    is_windows: bool,
+    windows_payload: Option<&BridgePayloadIdentity>,
+) -> ProbeResult {
+    if !is_windows {
+        return windows_only("bridge-identity");
+    }
+    let redeploy_fix = Some(
+        "Re-run install-bridge-wsl.sh --force from the ScanStudio install directory (the deployed WSL bridge is not the one this ScanStudio version shipped)"
+            .to_string(),
+    );
+    let Some(payload) = windows_payload else {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Unknown,
+            detail: "this build does not carry the packaged CorrespondingSource payload (dev or portable run); the deployed bridge cannot be bound to it"
+                .to_string(),
+            fix_command: None,
+        };
+    };
+    let out = executor.run("wsl.exe", &["-d", WSL_DISTRO, "-e", "sh", "-c", DEPLOYED_IDENTITY_SH]);
+    if !out.success {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Fail,
+            detail: format!(
+                "deployed bridge failed its capture-bundle self-check or is not deployed: {}",
+                out.stderr.trim().lines().last().unwrap_or("").trim()
+            ),
+            fix_command: redeploy_fix,
+        };
+    }
+    let deployed_bundle_sha = out.stdout.lines().next().map(str::trim).unwrap_or("");
+    if deployed_bundle_sha.len() != 64 {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Fail,
+            detail: format!(
+                "could not read the deployed driver identity: {}",
+                out.stdout.trim()
+            ),
+            fix_command: redeploy_fix,
+        };
+    }
+    if deployed_bundle_sha != payload.bundle_sha256 {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Fail,
+            detail: "deployed WSL bridge driver differs from the installed payload (bundle.py pin table mismatch)"
+                .to_string(),
+            fix_command: redeploy_fix,
+        };
+    }
+    ProbeResult {
+        id: "bridge-identity",
+        status: ProbeStatus::Ok,
+        detail: "deployed WSL bridge passes its capture-bundle self-check and matches the installed payload (all pinned components)"
+            .to_string(),
         fix_command: None,
     }
 }
@@ -427,8 +559,8 @@ mod tests {
     #[test]
     fn every_probe_is_unknown_windows_only_on_non_windows() {
         let fake = FakeExecutor::new(HashMap::new());
-        let results = run_all_probes(&fake, false, super::super::bridge_cmd::BRIDGE_ENTRYPOINT);
-        assert_eq!(results.len(), 5);
+        let results = run_all_probes(&fake, false, super::super::bridge_cmd::BRIDGE_ENTRYPOINT, None);
+        assert_eq!(results.len(), 6);
         for r in &results {
             assert_eq!(r.status, ProbeStatus::Unknown);
             assert_eq!(r.detail, "windows only");
@@ -664,12 +796,105 @@ mod tests {
     #[test]
     fn run_all_probes_returns_probe_ids_in_order() {
         let fake = FakeExecutor::new(HashMap::new());
-        let results = run_all_probes(&fake, true, super::super::bridge_cmd::BRIDGE_ENTRYPOINT);
+        let results = run_all_probes(&fake, true, super::super::bridge_cmd::BRIDGE_ENTRYPOINT, None);
         let ids: Vec<&str> = results.iter().map(|r| r.id).collect();
         assert_eq!(
             ids,
-            vec!["wsl-status", "bridge-which", "bridge-version", "usbipd-attach", "webview2"]
+            vec![
+                "wsl-status",
+                "bridge-which",
+                "bridge-version",
+                "bridge-identity",
+                "usbipd-attach",
+                "webview2"
+            ]
         );
+    }
+
+    fn identity_fixture() -> BridgePayloadIdentity {
+        BridgePayloadIdentity {
+            bundle_sha256: "aa".repeat(32),
+        }
+    }
+
+    fn deployed_identity_key() -> (String, Vec<String>) {
+        key(
+            "wsl.exe",
+            &["-d", super::super::bridge_cmd::WSL_DISTRO, "-e", "sh", "-c", DEPLOYED_IDENTITY_SH],
+        )
+    }
+
+    #[test]
+    fn bridge_identity_selfcheck_pass_and_matching_pin_table_is_ok() {
+        let identity = identity_fixture();
+        let stdout = format!("{}\nfff{}\n", identity.bundle_sha256, "0".repeat(61));
+        let fake = FakeExecutor::new(HashMap::from([(deployed_identity_key(), success_out(&stdout))]));
+        let result = probe_bridge_identity(&fake, true, Some(&identity));
+        assert_eq!(result.status, ProbeStatus::Ok, "{result:#?}");
+        assert!(result.fix_command.is_none());
+    }
+
+    #[test]
+    fn bridge_identity_pin_table_mismatch_offers_redeploy() {
+        let identity = identity_fixture();
+        let stdout = format!("{}\nirrelevant\n", "bb".repeat(32));
+        let fake = FakeExecutor::new(HashMap::from([(deployed_identity_key(), success_out(&stdout))]));
+        let result = probe_bridge_identity(&fake, true, Some(&identity));
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(result.detail.contains("pin table mismatch"), "{result:#?}");
+        assert!(result.fix_command.as_deref().unwrap_or("").contains("install-bridge-wsl.sh --force"));
+    }
+
+    #[test]
+    fn bridge_identity_failed_selfcheck_surfaces_the_reason_and_redeploy() {
+        let identity = identity_fixture();
+        let fake = FakeExecutor::new(HashMap::from([(
+            deployed_identity_key(),
+            CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "coolscanpy...CaptureBundleIntegrityError: capture component worker.py SHA-256 mismatch: expected aa, got bb".to_string(),
+            },
+        )]));
+        let result = probe_bridge_identity(&fake, true, Some(&identity));
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(result.detail.contains("worker.py SHA-256 mismatch"), "{result:#?}");
+        assert!(result.fix_command.as_deref().unwrap_or("").contains("install-bridge-wsl.sh --force"));
+    }
+
+    #[test]
+    fn bridge_identity_without_a_packaged_payload_is_unknown_not_red() {
+        let fake = FakeExecutor::new(HashMap::new());
+        let result = probe_bridge_identity(&fake, true, None);
+        assert_eq!(result.status, ProbeStatus::Unknown);
+        assert!(result.detail.contains("dev or portable"), "{result:#?}");
+        assert!(result.fix_command.is_none());
+        assert_eq!(fake.called_args().len(), 0, "must not probe WSL without a payload to bind to");
+    }
+
+    #[test]
+    fn windows_payload_identity_uses_the_first_candidate_that_carries_the_payload() {
+        let base_dir = std::env::temp_dir().join(format!("checker-identity-{}", std::process::id()));
+        let empty = base_dir.join("empty");
+        let real = base_dir.join("real");
+        let bundle_dir = real
+            .join("CorrespondingSource")
+            .join("coolscanpy")
+            .join("src")
+            .join("coolscanpy")
+            .join("protocol")
+            .join("ls5000_single_pass");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("bundle.py"), b"pin-table-bytes").unwrap();
+        let identity = windows_payload_identity(&[empty.clone(), real.clone()])
+            .expect("second candidate carries the payload");
+        assert_eq!(identity.bundle_sha256.len(), 64);
+        assert!(
+            windows_payload_identity(&[empty]).is_none(),
+            "no candidate with the payload must resolve to None"
+        );
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]

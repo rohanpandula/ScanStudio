@@ -84,6 +84,17 @@ const STREAM_SILENCE_DEADLINE: Duration = Duration::from_secs(600);
 /// existing quarantine and session-ownership teardown are preserved
 /// unchanged (see `eject`).
 const EJECT_CALL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Deadline for the pre-preview film-presence probe (WV-5 review round 2):
+/// that `device.status` waits on mechanics -- the driver's adapter-status
+/// settle loop alone may spend ~10s draining a post-feed medium-change
+/// attention, plus an adapter-identity read -- while the generic
+/// control-plane timeout is 10s and its expiry RESTARTS the bridge and
+/// destroys the session (see `should_reject_concurrent_motion`'s warning
+/// about exactly this hazard on this method). An operator who feeds film
+/// and immediately asks to preview must never lose the session to the
+/// probe; a genuinely dead transport still surfaces, just on this bound.
+const PREVIEW_FILM_PROBE_DEADLINE: Duration = Duration::from_secs(30);
 /// Appended to the session-ownership-lost detail when a `device.eject`
 /// request crossed a broken bridge boundary. The physical fact an operator
 /// needs is the one the generic transport-failure text cannot carry: the
@@ -468,20 +479,38 @@ impl BridgeClient {
 
         // The handshake is just a normal correlated request — reuse
         // `call`. Propagate its Err verbatim: a version-mismatch or
-        // timeout during the handshake must never be swallowed.
-        let result_value = client.call("bridge.hello", hello_request_params())?;
-        let result: BridgeHelloResult = serde_json::from_value(result_value)
-            .map_err(|err| BridgeCallError::Io(format!("malformed bridge.hello result: {err}")))?;
-        if result.protocol_version != 1 {
-            return Err(BridgeCallError::BridgeError {
-                code: "INVALID_PARAMS".to_string(),
-                message: format!(
-                    "bridge reported protocolVersion {}, expected 1",
-                    result.protocol_version
-                ),
-                recoverable: false,
-            });
-        }
+        // timeout during the handshake must never be swallowed. A child
+        // that never completed this FIRST handshake cannot have opened the
+        // scanner, so on any handshake failure it is terminated outright
+        // (restart()'s own terminate_uninitialized_child policy) instead of
+        // receiving Drop's established-session leave-alive courtesy --
+        // otherwise every failed scanner.rescan during a slow bridge boot
+        // would orphan another child contending for the same physical
+        // scanner (WV round 2, second review).
+        let handshake = (|| -> Result<BridgeHelloResult, BridgeCallError> {
+            let result_value = client.call("bridge.hello", hello_request_params())?;
+            let result: BridgeHelloResult = serde_json::from_value(result_value).map_err(|err| {
+                BridgeCallError::Io(format!("malformed bridge.hello result: {err}"))
+            })?;
+            if result.protocol_version != 1 {
+                return Err(BridgeCallError::BridgeError {
+                    code: "INVALID_PARAMS".to_string(),
+                    message: format!(
+                        "bridge reported protocolVersion {}, expected 1",
+                        result.protocol_version
+                    ),
+                    recoverable: false,
+                });
+            }
+            Ok(result)
+        })();
+        let result = match handshake {
+            Ok(result) => result,
+            Err(error) => {
+                client.terminate_uninitialized_child();
+                return Err(error);
+            }
+        };
         *client.hello_info.lock().unwrap() = result;
         Ok(client)
     }
@@ -2623,6 +2652,14 @@ impl RealLs5000 {
         Self::new_with_env(bridge_cmd, request_timeout, &[])
     }
 
+    /// Whether this backend's bridge child is currently believed alive.
+    /// `scanner.rescan` consults this so a real backend whose bridge died
+    /// (WSL restart, bridge crash) can be replaced instead of staying
+    /// listed-but-unconnectable forever (WV round 2, second review).
+    pub fn bridge_is_healthy(&self) -> bool {
+        self.bridge.is_healthy()
+    }
+
     /// Like [`new`](Self::new), but additionally sets `bridge_env` on the
     /// spawned bridge subprocess — scoped to that child (and re-applied to
     /// every child respawned after a proven predecessor exit) via
@@ -3378,12 +3415,33 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<ScannerStatus, EngineError> {
-        let status_value = self.call_session_scoped(
+        self.fresh_status_for_session_with_options(
             session_epoch,
             bridge_generation,
-            "device.status",
-            serde_json::json!({}),
-        )?;
+            SessionCallOptions::default(),
+        )
+    }
+
+    /// `fresh_status_for_session` with a caller-supplied call bound. The
+    /// pre-preview film probe passes [`PREVIEW_FILM_PROBE_DEADLINE`] because
+    /// its status read can legitimately wait on the driver's settle loop;
+    /// everything else keeps the generic control-plane bound via the
+    /// zero-argument wrapper above.
+    fn fresh_status_for_session_with_options(
+        &self,
+        session_epoch: u64,
+        bridge_generation: u64,
+        options: SessionCallOptions<'_>,
+    ) -> Result<ScannerStatus, EngineError> {
+        let status_value = self
+            .call_session_scoped_detailed(
+                session_epoch,
+                bridge_generation,
+                "device.status",
+                serde_json::json!({}),
+                options,
+            )
+            .map_err(SessionCallError::into_engine_error)?;
         let status: BridgeDeviceStatus = serde_json::from_value(status_value).map_err(|err| {
             EngineError::new(
                 ErrorCode::Internal,
@@ -3915,6 +3973,46 @@ impl ScannerBackend for RealLs5000 {
         let (session_epoch, bridge_generation) = backend.active_session_identity()?;
         let preview_token =
             backend.begin_preview_approval_window(session_epoch, bridge_generation)?;
+        // WV-5 (first live Windows validation): a preview requested on an
+        // empty transport spent minutes in motion-adjacent work and then
+        // completed with zero frames and no explanation anywhere. Probe the
+        // transport fresh -- the same live status path `scanner.status`
+        // uses, never a cached snapshot, so a just-fed roll can never be
+        // falsely refused -- and refuse typed before any motion when film
+        // is definitively absent. An undetermined probe (None) proceeds:
+        // preview is exactly how presence becomes known on transports that
+        // cannot report it. Deliberately AFTER the approval window opens so
+        // a rejected overlapping preview still makes zero bridge calls; a
+        // refusal here retires the token exactly like a refused
+        // roll.preview below.
+        let fresh = backend
+            .fresh_status_for_session_with_options(
+                session_epoch,
+                bridge_generation,
+                SessionCallOptions {
+                    deadline: Some(PREVIEW_FILM_PROBE_DEADLINE),
+                    transport_failure_guidance: None,
+                },
+            )
+            .map_err(|error| {
+                backend.retire_preview_approval_window(
+                    preview_token,
+                    session_epoch,
+                    bridge_generation,
+                );
+                error
+            })?;
+        if fresh.film_present == Some(false) {
+            backend.retire_preview_approval_window(
+                preview_token,
+                session_epoch,
+                bridge_generation,
+            );
+            return Err(EngineError::new(
+                ErrorCode::NoMedia,
+                "no film is loaded (the scanner reports film not present); feed the roll or strip, then acquire a fresh preview",
+            ));
+        }
         // "Reject before accepting": validate/round-trip synchronously,
         // exactly like every other ScannerBackend method; the actual
         // preview stream is reported purely through events afterward.

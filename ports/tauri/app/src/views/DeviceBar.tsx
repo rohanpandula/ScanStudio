@@ -65,6 +65,7 @@ export default function DeviceBar() {
   const [connectionPending, setConnectionPending] = useState<string | null>(null);
   const connectionPendingRef = useRef(false);
   const [connectionError, setConnectionError] = useState<EngineError | null>(null);
+  const [rescanPending, setRescanPending] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -127,9 +128,39 @@ export default function DeviceBar() {
   // simulated/real backend discriminator.
   const isRealBackend = device?.kind === "real";
 
+  // WV-2 (first live Windows validation): device discovery ran only at app
+  // launch, so a WSL bridge stack that became healthy afterwards left the
+  // real scanner invisible until a full app restart. Rescan asks the engine
+  // for one deliberate re-attempt; the engine refuses it while connected,
+  // so the button is disabled then rather than surfacing that refusal.
+  const rescan = async (): Promise<void> => {
+    if (rescanPending || connected || operationBusy) return;
+    setRescanPending(true);
+    try {
+      const result = await sessionStore.rescanDevices();
+      setDevices(result.devices);
+      // Deliberately does NOT clear connectionError: a rescan succeeding
+      // says nothing about an earlier connect failure the operator has not
+      // yet read (review round 2).
+    } catch (error) {
+      setConnectionError(connectionErrorOf(error));
+    } finally {
+      setRescanPending(false);
+    }
+  };
+
   return (
     <div className={styles.deviceBar}>
       <h2 className={styles.heading}>Devices</h2>
+      <button
+        type="button"
+        className={styles.controlButton}
+        onClick={() => void rescan()}
+        disabled={rescanPending || connected || operationBusy}
+        data-testid="rescan-devices"
+      >
+        {rescanPending ? "Rescanning…" : "Rescan"}
+      </button>
       <ul className={styles.deviceList}>
         {(devices ?? []).map((listedDevice) => {
           const isActive =

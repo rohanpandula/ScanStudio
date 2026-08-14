@@ -605,10 +605,21 @@ try {
 
     Write-Host "ScanStudio hardware session started (PID $($process.Id))."
     Write-Host 'Keep this window open. The owned WSL latch will be removed when that app process exits.'
+    $sessionStartedAtUtc = [DateTime]::UtcNow
     $process.WaitForExit()
     $sessionExitCode = $process.ExitCode
     if ($sessionExitCode -ne 0) {
         Write-SessionError "$MainExecutableName exited with code $sessionExitCode."
+    }
+    # First live Windows validation: relaunching within a few seconds of
+    # closing the app made the fresh instance exit immediately (the previous
+    # instance's WebView2 teardown still holds its profile), and this console
+    # then showed a fully armed-and-disarmed session with no hint anything
+    # went wrong. Assert-NoExistingScanStudioProcesses cannot see that state
+    # -- the old app process is already gone -- so name the likely cause when
+    # the app lives for only a moment.
+    if (([DateTime]::UtcNow - $sessionStartedAtUtc).TotalSeconds -lt 10) {
+        Write-Host 'ScanStudio exited within seconds of starting. If you just closed a previous ScanStudio, its browser runtime may still have been shutting down; wait a few seconds and run this launcher again.'
     }
 }
 catch {

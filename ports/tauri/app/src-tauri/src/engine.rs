@@ -269,6 +269,59 @@ pub fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>
     spawn_engine(&app.handle().clone(), command)
 }
 
+/// WV-3 (first live Windows validation, 2026-08-13): the app is normally
+/// launched from a Start-menu shortcut, where this process's stderr goes
+/// nowhere -- every engine diagnostic that would have root-caused that
+/// session's failures in minutes was simply lost. Tee engine
+/// stderr/error/termination lines to a bounded log file under the platform
+/// app-log directory. Logging must never break the engine loop: every
+/// failure in here degrades to the pre-existing eprintln-only behavior.
+struct EngineLogSink {
+    path: std::path::PathBuf,
+}
+
+/// One rotation at 1 MiB (current file renamed to `.log.1`, replacing any
+/// previous rotation) bounds worst-case disk use at ~2 MiB.
+const ENGINE_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+impl EngineLogSink {
+    fn new<R: Runtime>(app: &AppHandle<R>) -> Option<Self> {
+        let dir = app.path().app_log_dir().ok()?;
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Self::at(dir.join("scanstudio-engine.log")))
+    }
+
+    fn at(path: std::path::PathBuf) -> Self {
+        EngineLogSink { path }
+    }
+
+    fn append(&self, line: &str) {
+        use std::io::Write;
+        let epoch_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        // One preformatted buffer, one write_all: writeln!'s per-fragment
+        // writes are not atomic under O_APPEND, and overlapping app
+        // instances (the launcher's own documented relaunch race) would
+        // interleave MID-line. Rotation uses the projected size so a large
+        // single entry cannot overshoot the cap by more than itself.
+        let entry = format!("[{epoch_seconds}] {line}\n");
+        if let Ok(metadata) = std::fs::metadata(&self.path) {
+            if metadata.len() + entry.len() as u64 > ENGINE_LOG_MAX_BYTES {
+                let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+            }
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = file.write_all(entry.as_bytes());
+        }
+    }
+}
+
 /// Spawns `command`, wires its stdout into the shared pending/event dispatch,
 /// and starts the `engine.hello` handshake task -- the exact sequence a real
 /// connection to the engine needs, regardless of which `Command` produced it
@@ -290,7 +343,27 @@ pub fn spawn_engine<R: Runtime>(
     if app.try_state::<crate::preview::PreviewAccess>().is_none() {
         app.manage(crate::preview::PreviewAccess::default());
     }
-    let (mut rx, child) = command.spawn()?;
+    // The sink exists BEFORE the spawn attempt (review round 2): a sidecar
+    // that cannot start at all is the most likely "app dies instantly with
+    // no diagnostics" case WV-3 is about, and its error must reach the file
+    // too, not just the discarded stderr.
+    let log_sink = EngineLogSink::new(app);
+    if let Some(sink) = &log_sink {
+        sink.append(concat!(
+            "engine spawning (app v",
+            env!("CARGO_PKG_VERSION"),
+            ")"
+        ));
+    }
+    let (mut rx, child) = match command.spawn() {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if let Some(sink) = &log_sink {
+                sink.append(&format!("[engine spawn failed] {error}"));
+            }
+            return Err(error.into());
+        }
+    };
     let (handshake_tx, _handshake_rx) = watch::channel(HandshakeState::Pending);
     app.manage(EngineHandle {
         child: Mutex::new(Some(child)),
@@ -317,13 +390,25 @@ pub fn spawn_engine<R: Runtime>(
                     );
                 }
                 CommandEvent::Stderr(bytes) => {
-                    eprintln!("[engine stderr] {}", String::from_utf8_lossy(&bytes));
+                    let line = format!("[engine stderr] {}", String::from_utf8_lossy(&bytes));
+                    eprintln!("{line}");
+                    if let Some(sink) = &log_sink {
+                        sink.append(&line);
+                    }
                 }
                 CommandEvent::Error(err) => {
-                    eprintln!("[engine error] {err}");
+                    let line = format!("[engine error] {err}");
+                    eprintln!("{line}");
+                    if let Some(sink) = &log_sink {
+                        sink.append(&line);
+                    }
                 }
                 CommandEvent::Terminated(payload) => {
-                    eprintln!("[engine terminated] {payload:?}");
+                    let line = format!("[engine terminated] {payload:?}");
+                    eprintln!("{line}");
+                    if let Some(sink) = &log_sink {
+                        sink.append(&line);
+                    }
                     let state = app_handle.state::<EngineHandle>();
                     fail_pending_requests(&state);
                 }
@@ -491,6 +576,29 @@ pub fn handle_run_event(app_handle: &AppHandle<Wry>, event: &tauri::RunEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_log_sink_appends_and_rotates_once_at_the_size_cap() {
+        let dir = std::env::temp_dir().join(format!("engine-log-sink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scanstudio-engine.log");
+        let sink = EngineLogSink::at(path.clone());
+        sink.append("first line");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("first line"), "{first:?}");
+        assert!(first.trim_start().starts_with('['), "epoch prefix expected: {first:?}");
+
+        // Push the file over the cap, then append: the oversized file must
+        // rotate to .log.1 and the fresh file must hold only the new line.
+        std::fs::write(&path, vec![b'x'; (ENGINE_LOG_MAX_BYTES + 1) as usize]).unwrap();
+        sink.append("post-rotation line");
+        let rotated = std::fs::read(path.with_extension("log.1")).unwrap();
+        assert_eq!(rotated.len() as u64, ENGINE_LOG_MAX_BYTES + 1);
+        let fresh = std::fs::read_to_string(&path).unwrap();
+        assert!(fresh.contains("post-rotation line"), "{fresh:?}");
+        assert!(!fresh.contains('x'), "rotation must start a fresh file: {fresh:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn production_engine_spawn_is_unarmed_by_default_on_windows() {
