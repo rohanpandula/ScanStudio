@@ -139,7 +139,9 @@ export default function DeviceBar() {
     try {
       const result = await sessionStore.rescanDevices();
       setDevices(result.devices);
-      setConnectionError(null);
+      // Deliberately does NOT clear connectionError: a rescan succeeding
+      // says nothing about an earlier connect failure the operator has not
+      // yet read (review round 2).
     } catch (error) {
       setConnectionError(connectionErrorOf(error));
     } finally {
@@ -152,6 +154,7 @@ export default function DeviceBar() {
       <h2 className={styles.heading}>Devices</h2>
       <button
         type="button"
+        className={styles.controlButton}
         onClick={() => void rescan()}
         disabled={rescanPending || connected || operationBusy}
         data-testid="rescan-devices"

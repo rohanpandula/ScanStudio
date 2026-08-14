@@ -84,6 +84,17 @@ const STREAM_SILENCE_DEADLINE: Duration = Duration::from_secs(600);
 /// existing quarantine and session-ownership teardown are preserved
 /// unchanged (see `eject`).
 const EJECT_CALL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Deadline for the pre-preview film-presence probe (WV-5 review round 2):
+/// that `device.status` waits on mechanics -- the driver's adapter-status
+/// settle loop alone may spend ~10s draining a post-feed medium-change
+/// attention, plus an adapter-identity read -- while the generic
+/// control-plane timeout is 10s and its expiry RESTARTS the bridge and
+/// destroys the session (see `should_reject_concurrent_motion`'s warning
+/// about exactly this hazard on this method). An operator who feeds film
+/// and immediately asks to preview must never lose the session to the
+/// probe; a genuinely dead transport still surfaces, just on this bound.
+const PREVIEW_FILM_PROBE_DEADLINE: Duration = Duration::from_secs(30);
 /// Appended to the session-ownership-lost detail when a `device.eject`
 /// request crossed a broken bridge boundary. The physical fact an operator
 /// needs is the one the generic transport-failure text cannot carry: the
@@ -3298,12 +3309,33 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<ScannerStatus, EngineError> {
-        let status_value = self.call_session_scoped(
+        self.fresh_status_for_session_with_options(
             session_epoch,
             bridge_generation,
-            "device.status",
-            serde_json::json!({}),
-        )?;
+            SessionCallOptions::default(),
+        )
+    }
+
+    /// `fresh_status_for_session` with a caller-supplied call bound. The
+    /// pre-preview film probe passes [`PREVIEW_FILM_PROBE_DEADLINE`] because
+    /// its status read can legitimately wait on the driver's settle loop;
+    /// everything else keeps the generic control-plane bound via the
+    /// zero-argument wrapper above.
+    fn fresh_status_for_session_with_options(
+        &self,
+        session_epoch: u64,
+        bridge_generation: u64,
+        options: SessionCallOptions<'_>,
+    ) -> Result<ScannerStatus, EngineError> {
+        let status_value = self
+            .call_session_scoped_detailed(
+                session_epoch,
+                bridge_generation,
+                "device.status",
+                serde_json::json!({}),
+                options,
+            )
+            .map_err(SessionCallError::into_engine_error)?;
         let status: BridgeDeviceStatus = serde_json::from_value(status_value).map_err(|err| {
             EngineError::new(
                 ErrorCode::Internal,
@@ -3848,7 +3880,14 @@ impl ScannerBackend for RealLs5000 {
         // refusal here retires the token exactly like a refused
         // roll.preview below.
         let fresh = backend
-            .fresh_status_for_session(session_epoch, bridge_generation)
+            .fresh_status_for_session_with_options(
+                session_epoch,
+                bridge_generation,
+                SessionCallOptions {
+                    deadline: Some(PREVIEW_FILM_PROBE_DEADLINE),
+                    transport_failure_guidance: None,
+                },
+            )
             .map_err(|error| {
                 backend.retire_preview_approval_window(
                     preview_token,

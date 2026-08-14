@@ -37,15 +37,18 @@ five ids below are the literal id strings the checker rows carry, pinned in
    entrypoint resolves on PATH inside WSL.
 3. confirm the checker row `bridge-version` is green — it verifies the bridge
    entrypoint launches and exits cleanly (bridge presence/version).
-4. confirm the checker row `bridge-identity` is green — it verifies the
-   deployed WSL bridge's driver identity files (`bundle.py`,
-   `usb_backend.py`) hash byte-identically to the installed payload's
-   CorrespondingSource copies. The first live Windows validation found a
-   stale bridge (inherited through a VM clone) that stayed green on the
-   presence/startup probes for an entire session and then refused its first
-   real capture on bundle identity; this row binds the deployed bridge to
-   the installed ScanStudio version so that state is visible before any
-   capture. Red here means: re-run `install-bridge-wsl.sh --force`.
+4. confirm the checker row `bridge-identity` is green — the deployed
+   bridge's own interpreter runs the driver's capture-bundle
+   self-check over every pinned component of the copy it actually imports,
+   and the imported pin table (`bundle.py`) must hash byte-identically to
+   the installed payload's CorrespondingSource copy. The first live Windows
+   validation found a stale bridge (inherited through a VM clone) that
+   stayed green on the presence/startup probes for an entire session and
+   then refused its first real capture on bundle identity; this row binds
+   the deployed bridge to the installed ScanStudio version so that state is
+   visible before any capture. Red here means: re-run
+   `install-bridge-wsl.sh --force`. A dev or portable run without the
+   packaged payload reports Unknown, not red.
 5. confirm the checker row `usbipd-attach` is green — it verifies `usbipd
    list` shows the LS-5000 (VID:PID `04b0:4002`) attached to WSL.
 6. confirm the checker row `webview2` is green — it verifies the WebView2
@@ -56,6 +59,12 @@ as the `PROBE_IDS` constant with underscore spellings — `wsl_status`,
 `bridge_which`, `bridge_version`, `bridge_identity`, `usbipd_attach`,
 `webview2` — while the checker rows themselves carry the hyphenated id
 strings enumerated above.)
+
+Engine log: the app tees engine diagnostics to
+`scanstudio-engine.log` (one rotation to `scanstudio-engine.log.1`) in the
+platform application-log directory — on Windows,
+`%LOCALAPPDATA%\com.scanstudio.desktop\logs`. When a Start-menu launch
+misbehaves with nothing on screen, read that file first.
 
 Pre-flight re-attach check: `usbipd attach` does not survive a reboot, a
 replug, or a usbipd service restart — only the one-time `usbipd bind` is

@@ -855,16 +855,33 @@ export class SessionStore {
     };
   }
 
-  /** Thin forward to scanner.rescan: one deliberate re-attempt of the real
+  /** Forward to scanner.rescan: one deliberate re-attempt of the real
    * backend's startup for the case the first live Windows validation hit
    * (WV-2) -- the engine started while the WSL bridge stack was still
    * coming up, so the real device stayed invisible until a full app
    * restart. Returns the refreshed device list; the engine refuses while a
-   * device is connected. */
+   * device is connected. Runs under `connectionChangePending` (review
+   * round 2): a rescan can hold the engine's single dispatch thread for a
+   * cold bridge start, so every other session mutation must see the store
+   * as busy for its whole duration, exactly like connect/disconnect. */
   async rescanDevices(): Promise<{ devices: DeviceInfo[] }> {
-    return (await this.transport.sendRequest("scanner.rescan", {})) as {
-      devices: DeviceInfo[];
-    };
+    if (sessionOperationBusy(this.#state)) {
+      throw {
+        code: "SCANNER_BUSY",
+        message: "wait for the active operation to finish before rescanning for devices",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    this.#state.connectionChangePending = true;
+    this.#notify();
+    try {
+      return (await this.transport.sendRequest("scanner.rescan", {})) as {
+        devices: DeviceInfo[];
+      };
+    } finally {
+      this.#state.connectionChangePending = false;
+      this.#notify();
+    }
   }
 
   /** Thin forward to scanner.status; refreshes connection.status. */

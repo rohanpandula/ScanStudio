@@ -269,17 +269,6 @@ pub fn setup(app: &mut tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error>
     spawn_engine(&app.handle().clone(), command)
 }
 
-/// Spawns `command`, wires its stdout into the shared pending/event dispatch,
-/// and starts the `engine.hello` handshake task -- the exact sequence a real
-/// connection to the engine needs, regardless of which `Command` produced it
-/// (the bundled sidecar in production, or a plain path to a locally built
-/// binary in tests). Generic over `R` (rather than pinned to the production
-/// `Wry` runtime) so the integration test can drive this identical code path
-/// against `tauri::test::mock_builder`'s `MockRuntime` instead of
-/// re-implementing spawn/wire/handshake by hand -- `Command::spawn` and the
-/// `CommandChild`/`CommandEvent` types it returns do not depend on the
-/// runtime at all, only `Manager::manage`/`AppHandle::state` do, and both
-/// work identically under a mocked runtime.
 /// WV-3 (first live Windows validation, 2026-08-13): the app is normally
 /// launched from a Start-menu shortcut, where this process's stderr goes
 /// nowhere -- every engine diagnostic that would have root-caused that
@@ -327,6 +316,17 @@ impl EngineLogSink {
     }
 }
 
+/// Spawns `command`, wires its stdout into the shared pending/event dispatch,
+/// and starts the `engine.hello` handshake task -- the exact sequence a real
+/// connection to the engine needs, regardless of which `Command` produced it
+/// (the bundled sidecar in production, or a plain path to a locally built
+/// binary in tests). Generic over `R` (rather than pinned to the production
+/// `Wry` runtime) so the integration test can drive this identical code path
+/// against `tauri::test::mock_builder`'s `MockRuntime` instead of
+/// re-implementing spawn/wire/handshake by hand -- `Command::spawn` and the
+/// `CommandChild`/`CommandEvent` types it returns do not depend on the
+/// runtime at all, only `Manager::manage`/`AppHandle::state` do, and both
+/// work identically under a mocked runtime.
 pub fn spawn_engine<R: Runtime>(
     app: &AppHandle<R>,
     command: Command,
@@ -337,7 +337,27 @@ pub fn spawn_engine<R: Runtime>(
     if app.try_state::<crate::preview::PreviewAccess>().is_none() {
         app.manage(crate::preview::PreviewAccess::default());
     }
-    let (mut rx, child) = command.spawn()?;
+    // The sink exists BEFORE the spawn attempt (review round 2): a sidecar
+    // that cannot start at all is the most likely "app dies instantly with
+    // no diagnostics" case WV-3 is about, and its error must reach the file
+    // too, not just the discarded stderr.
+    let log_sink = EngineLogSink::new(app);
+    if let Some(sink) = &log_sink {
+        sink.append(concat!(
+            "engine spawning (app v",
+            env!("CARGO_PKG_VERSION"),
+            ")"
+        ));
+    }
+    let (mut rx, child) = match command.spawn() {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if let Some(sink) = &log_sink {
+                sink.append(&format!("[engine spawn failed] {error}"));
+            }
+            return Err(error.into());
+        }
+    };
     let (handshake_tx, _handshake_rx) = watch::channel(HandshakeState::Pending);
     app.manage(EngineHandle {
         child: Mutex::new(Some(child)),
@@ -345,14 +365,6 @@ pub fn spawn_engine<R: Runtime>(
         pending: Mutex::new(HashMap::new()),
         handshake: handshake_tx,
     });
-    let log_sink = EngineLogSink::new(app);
-    if let Some(sink) = &log_sink {
-        sink.append(concat!(
-            "engine spawned (app v",
-            env!("CARGO_PKG_VERSION"),
-            ")"
-        ));
-    }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
