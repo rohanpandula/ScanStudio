@@ -307,7 +307,7 @@ Files app/ScanStudio/engine/src/render.rs and ports/tauri/vendor/engine/src/rend
 Only in ports/tauri/vendor/engine/src: wsl_io.rs
 EOF
 
-check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "c3d18d08b433e903c4ea30a422a8b3f239008224ff5a0b34cb2b98d6211d16dc" <<'EOF'
+check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "cb2105eaf2d62d7dfa49889d755e0ba6cdcb4ea8a2a5d9f480eac0d0a5df1682" <<'EOF'
 Only in ports/tauri/vendor/scanstudio-bridge: .github
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: probe-linux-env.py
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: verify-bridge.sh
@@ -322,7 +322,7 @@ Files bridge/tests/test_transport_mock.py and ports/tauri/vendor/scanstudio-brid
 Files bridge/uv.lock and ports/tauri/vendor/scanstudio-bridge/uv.lock differ
 EOF
 
-check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "65812839fa0d05285064804e367716d5b157123615ff78378059f6a6185644ba" <<'EOF'
+check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "4d2911476eb3e2a1831aa4b588ccb76b580b456914d65eb685b1c20789733629" <<'EOF'
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py differ
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py differ
 Files coolscanpy/tests/test_usb_backend.py and ports/tauri/vendor/coolscanpy/tests/test_usb_backend.py differ

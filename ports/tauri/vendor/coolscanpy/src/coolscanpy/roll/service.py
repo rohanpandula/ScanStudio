@@ -1970,10 +1970,18 @@ class RollScanService:
         return completed
 
     def eject(self, device_id: str) -> bool:
-        """Trigger a capability-gated film eject; False when unsupported.
+        """Eject the film over raw USB, returning True only once confirmed.
 
-        Thin passthrough to the wrapped ScannerService so callers that only
-        hold a RollScanService (e.g. the roll-scan CLI) do not need direct
-        access to the private scanner boundary.
+        Replays the scanner's own traced "Unload object" sequence through
+        ``transport.medium_unload`` -- no SANE, no ``scanimage``. Returns
+        ``True`` only when the medium is confirmed gone (an already-empty
+        transport counts and moves nothing); raises a
+        ``transport.medium_unload.MediumUnloadError`` subclass otherwise, so
+        an unconfirmed eject is never reported as done. The roll-scan CLI
+        wraps this fail-soft: a failed eject must not fail an
+        otherwise-complete archive.
         """
-        return self._scanner.eject(device_id)
+
+        from coolscanpy.transport.medium_unload import unload_medium
+
+        return bool(unload_medium(device_id=device_id).ejected)

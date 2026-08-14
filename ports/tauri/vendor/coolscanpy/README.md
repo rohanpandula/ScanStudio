@@ -133,20 +133,21 @@ than an index release, install it in editable mode:
 python -m pip install -e .
 ```
 
-The base install covers `get_devices()`, `open()`, and the roll preview,
-registration, and color-capture operations under `Device.roll()`. None of
-those needs SANE. `get_devices()`/`open()` fall back to direct USB enumeration
-when python-sane is not installed, and the roll-feeder capture extension talks
-to the scanner over raw USB in a separate process regardless. `Roll.eject()`
-is the exception: it delegates to the SANE-only `Device.eject()` path.
+The base install covers `get_devices()`, `open()`, `Device.eject()`, and the
+roll preview, registration, and color-capture operations under
+`Device.roll()`. None of those needs SANE. `get_devices()`/`open()` fall back
+to direct USB enumeration when python-sane is not installed, the roll-feeder
+capture extension talks to the scanner over raw USB in a separate process
+regardless, and `Device.eject()` (and `Roll.eject()`, which delegates to it)
+replays the scanner's own traced unload sequence over that same raw-USB
+transport.
 
 Standalone/source installs still need a host libusb shared library for PyUSB.
 On macOS, install it with `brew install libusb`. ScanStudio's release DMG is a
 separate distribution shape that includes and pins its own signed libusb, so
 ScanStudio users do not need that Homebrew installation for color-roll work.
 
-SANE is needed only for the plain `Device.scan()` path and the vendor
-`Device.eject()` action:
+SANE is needed only for the plain `Device.scan()` path:
 
 ```
 pip install "coolscanpy[scanner]"
@@ -316,8 +317,8 @@ API cannot express: archival capture with evidence. The honest split:
 
 They compose rather than compete: the direct-USB path owns capture and its
 evidence chain, and the optional SANE extra covers motion conveniences the
-capture path does not need. A live LS-5000 color-roll preview and capture
-requires no SANE; plain scan and software eject still do.
+capture path does not need. A live LS-5000 color-roll preview, capture, and
+eject requires no SANE; plain scan still does.
 
 ## Safety model
 

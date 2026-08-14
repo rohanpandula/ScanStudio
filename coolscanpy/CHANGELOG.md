@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+## 0.7.2 - 2026-08-13
+
+- `Device.eject()` no longer goes through SANE. It now replays the
+  scanner's own traced "Unload object" sequence directly over this
+  package's USB transport (`transport.medium_unload.unload_medium`):
+  `RESERVE_UNIT`, SET PARAMETER (E0h) carrying operation code D0h,
+  `EXECUTE` (C1h), `RELEASE_UNIT`. The bytes are the ones the capture
+  worker's held-session eject already replays, and the regression suite
+  asserts the two copies stay identical.
+- The eject therefore needs no python-sane and no host `scanimage` binary.
+  Motivation: the SANE route could not be shipped inside an application
+  bundle, and its vendor eject was observed accepted-but-inert against a
+  mounted slide on a real LS-5000. Calling `Device.eject()` without
+  python-sane installed no longer raises `ImportError`; it works.
+- `Device.eject()` also no longer gates on the SANE-advertised
+  `can_eject` capability, which the USB-fallback device reports
+  conservatively false.
+- Accepted is no longer treated as ejected. The command returning GOOD
+  status only means accepted, so the medium's departure is now confirmed
+  with the motion-free presence probe before success is reported. A
+  medium still definitively present at the deadline raises `FeederParked`;
+  an outcome that cannot be confirmed either way raises `EjectFailed`.
+  The eject command itself is never retried -- only the read-only probe
+  repeats.
+- The unload now refuses adapters that advertise no unload support,
+  before commanding any motion. The interface specification's per-adapter
+  capability table (VPD page E1h byte 30 bit 0, "Unload object") marks the
+  MA-21 mount adapter unsupported and every strip/slide feeder supported;
+  live VPD dumps of both an MA-21 and an SA-30 match that table
+  bit-for-bit. This is the mechanism behind the accepted-but-inert mount
+  eject, and it now surfaces as `FeederParked` naming the physical remedy
+  (the adapter's manual eject button, or a power cycle, which ejects on
+  power-on) instead of stalling against a deadline.
+- An already-empty transport short-circuits to a no-op success without
+  opening the interface or commanding motion.
+- The confirmation window defaults to the capture worker's own completion
+  budget rather than a short one: observed good clears range from about
+  14 s to 57 s, so a short window would report a physically successful
+  roll eject as a failure.
+- Attended scan binding (feed-detector round; ScanStudio #24, #16, #42 --
+  "previews fine but will not scan"). A roll the detector places at `medium`
+  confidence can now be fine-scanned when an operator explicitly approves
+  every requested frame, closing the gap where preview accepted a roll that
+  scanning then refused with `roll boundary lattice confidence is 'medium';
+  unattended frame binding requires 'high'`.
+  - `RollPreviewSession.attended_binding_available` / `Roll
+    .attended_binding_available` report whether a roll is rescuable this way
+    (automatic detection at `medium` only).
+  - `Roll.approve(slot, attended=True)` mints a `ManualFrameApproval` that
+    carries `ATTENDED_ROLL_BINDING_REASON` inside its signed binding payload,
+    and may approve a slot the detector did not itself flag.
+  - The capture worker's roll-confidence gate binds `medium` only when EVERY
+    requested frame in the batch carries such a receipt; the verdict is
+    derived from the receipts the batch already authenticates against this
+    preview's reviewed fingerprint, never asserted by a caller.
+  - No detector threshold, accept window, or lattice bound changed. `low`
+    always refuses, and UNATTENDED `medium` refuses with the identical
+    message as before.
+  - Every attended acceptance is journaled under
+    `live_frame_selection.attended_roll_binding`, so an evidence audit can
+    tell which mode bound a frame without re-running the detector.
+  - `Roll.scan_many()` refuses a partially approved medium roll before any
+    film moves, naming the unapproved frames, and now validates every
+    approval it forwards rather than only those on flagged slots.
+
 ## 0.7.1 - 2026-08-11
 
 - Capture workers launched under ScanStudio now inherit the bridge's exact

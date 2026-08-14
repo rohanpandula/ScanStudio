@@ -2134,35 +2134,150 @@ class TestDeviceScanAndEject:
         finally:
             dev.close()
 
-    def test_eject_returns_false_when_capability_absent(
-        self, fake_service_factory
+    def test_eject_drives_raw_usb_unload_with_the_exact_device_id(
+        self, fake_service_factory, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        backend = fake_service_factory([_coolscan_device(can_eject=False)])
+        from coolscanpy.transport import medium_unload
+
+        backend = fake_service_factory([_coolscan_device(can_eject=True)])
+        calls: list[str | None] = []
+
+        def unload(*, device_id: str | None = None, **_kwargs):
+            calls.append(device_id)
+            return medium_unload.UnloadOutcome(ejected=True, already_clear=False)
+
+        monkeypatch.setattr(medium_unload, "unload_medium", unload)
         dev = coolscanpy.open("ls5000")
         try:
-            assert dev.eject() is False
+            assert dev.eject() is True
+            assert calls == [_COOLSCAN_ID]
+            # SANE has left the eject path entirely.
             assert backend.eject_calls == []
         finally:
             dev.close()
 
-    def test_eject_delegates_to_backend_when_capable(
-        self, fake_service_factory
+    def test_eject_does_not_consult_the_sane_eject_capability(
+        self, fake_service_factory, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        backend = fake_service_factory([_coolscan_device(can_eject=True)])
+        """The raw-USB unload works regardless of what SANE advertised."""
+
+        from coolscanpy.transport import medium_unload
+
+        backend = fake_service_factory([_coolscan_device(can_eject=False)])
+        monkeypatch.setattr(
+            medium_unload,
+            "unload_medium",
+            lambda **_kwargs: medium_unload.UnloadOutcome(
+                ejected=True, already_clear=False
+            ),
+        )
         dev = coolscanpy.open("ls5000")
         try:
             assert dev.eject() is True
-            assert backend.eject_calls == [_COOLSCAN_ID]
+            assert backend.eject_calls == []
         finally:
             dev.close()
 
-    def test_eject_failure_raises_eject_failed(self, fake_service_factory) -> None:
-        backend = fake_service_factory([_coolscan_device(can_eject=True)])
-        backend.eject_error = RuntimeError("transport hiccup")
+    def test_eject_of_an_already_empty_transport_succeeds(
+        self, fake_service_factory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from coolscanpy.transport import medium_unload
+
+        fake_service_factory([_coolscan_device(can_eject=True)])
+        monkeypatch.setattr(
+            medium_unload,
+            "unload_medium",
+            lambda **_kwargs: medium_unload.UnloadOutcome(
+                ejected=True, already_clear=True
+            ),
+        )
         dev = coolscanpy.open("ls5000")
         try:
-            with pytest.raises(coolscanpy.EjectFailed):
+            assert dev.eject() is True
+        finally:
+            dev.close()
+
+    @pytest.mark.parametrize(
+        "raised",
+        (
+            "UnloadNotSupported",
+            "UnloadAcceptedWithoutProgress",
+        ),
+    )
+    def test_eject_maps_a_still_gripped_medium_to_feeder_parked(
+        self, fake_service_factory, monkeypatch: pytest.MonkeyPatch, raised: str
+    ) -> None:
+        from coolscanpy.transport import medium_unload
+
+        fake_service_factory([_coolscan_device(can_eject=True)])
+        error_type = getattr(medium_unload, raised)
+
+        def unload(**_kwargs):
+            raise error_type("the medium is still gripped")
+
+        monkeypatch.setattr(medium_unload, "unload_medium", unload)
+        dev = coolscanpy.open("ls5000")
+        try:
+            with pytest.raises(coolscanpy.FeederParked, match="still gripped"):
                 dev.eject()
+        finally:
+            dev.close()
+
+    def test_eject_maps_an_unconfirmed_outcome_to_eject_failed(
+        self, fake_service_factory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from coolscanpy.transport import medium_unload
+
+        fake_service_factory([_coolscan_device(can_eject=True)])
+
+        def unload(**_kwargs):
+            raise medium_unload.UnloadUnconfirmed("could not be confirmed")
+
+        monkeypatch.setattr(medium_unload, "unload_medium", unload)
+        dev = coolscanpy.open("ls5000")
+        try:
+            with pytest.raises(coolscanpy.EjectFailed, match="could not be confirmed"):
+                dev.eject()
+        finally:
+            dev.close()
+
+    def test_eject_failure_raises_eject_failed(
+        self, fake_service_factory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from coolscanpy.transport import medium_unload
+
+        fake_service_factory([_coolscan_device(can_eject=True)])
+
+        def unload(**_kwargs):
+            raise medium_unload.MediumUnloadError("transport hiccup")
+
+        monkeypatch.setattr(medium_unload, "unload_medium", unload)
+        dev = coolscanpy.open("ls5000")
+        try:
+            with pytest.raises(coolscanpy.EjectFailed, match="transport hiccup"):
+                dev.eject()
+        finally:
+            dev.close()
+
+    def test_eject_releases_the_io_lock_after_a_failure(
+        self, fake_service_factory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from coolscanpy.transport import medium_unload
+
+        fake_service_factory([_coolscan_device(can_eject=True)])
+        attempts: list[int] = []
+
+        def unload(**_kwargs):
+            attempts.append(1)
+            raise medium_unload.UnloadUnconfirmed("unconfirmed")
+
+        monkeypatch.setattr(medium_unload, "unload_medium", unload)
+        dev = coolscanpy.open("ls5000")
+        try:
+            for _ in range(2):
+                with pytest.raises(coolscanpy.EjectFailed):
+                    dev.eject()
+            assert len(attempts) == 2
         finally:
             dev.close()
 
@@ -5578,14 +5693,32 @@ class TestSaneFreeFallback:
         finally:
             dev.close()
 
-    def test_eject_without_python_sane_raises_import_error(
+    def test_eject_works_without_python_sane(
         self, python_sane_unavailable: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """0.7.2: the eject left SANE, so its absence no longer blocks it.
+
+        The USB-fallback device carries ``can_eject=False`` (there is no
+        SANE session to negotiate capabilities against), which used to make
+        this path unreachable twice over -- an ImportError behind a capability
+        gate that was conservatively false. Both are gone.
+        """
+
+        from coolscanpy.transport import medium_unload
+
         _mock_usb_find(monkeypatch, [_FakeUsbDevice(bus=1, address=7)])
+        calls: list[str | None] = []
+
+        def unload(*, device_id: str | None = None, **_kwargs):
+            calls.append(device_id)
+            return medium_unload.UnloadOutcome(ejected=True, already_clear=False)
+
+        monkeypatch.setattr(medium_unload, "unload_medium", unload)
         dev = coolscanpy.open("ls5000")
         try:
-            with pytest.raises(ImportError, match="python-sane not importable"):
-                dev.eject()
+            assert dev.capabilities.can_eject is False
+            assert dev.eject() is True
+            assert calls == ["usb:1:7"]
         finally:
             dev.close()
 

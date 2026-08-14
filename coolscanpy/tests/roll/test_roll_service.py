@@ -2186,3 +2186,44 @@ def test_approved_unverified_frame_requires_a_persisted_visual_override(tmp_path
             fine_params=ScanParams(dpi=4000, depth=16, capture_ir=True),
             stop=threading.Event(),
         )
+
+
+# ---------------------------------------------------------------------------
+# Eject (0.7.2: raw-USB unload, no SANE)
+# ---------------------------------------------------------------------------
+
+
+def test_eject_drives_the_raw_usb_unload_and_never_the_scanner_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from coolscanpy.transport import medium_unload
+
+    scanner = FakeScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    calls: list[str | None] = []
+
+    def unload(*, device_id: str | None = None, **_kwargs):
+        calls.append(device_id)
+        return medium_unload.UnloadOutcome(ejected=True, already_clear=False)
+
+    monkeypatch.setattr(medium_unload, "unload_medium", unload)
+
+    assert service.eject("usb:1:7") is True
+    assert calls == ["usb:1:7"]
+    assert not hasattr(scanner, "eject_calls")
+
+
+def test_eject_propagates_a_typed_refusal_for_the_cli_to_fail_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from coolscanpy.transport import medium_unload
+
+    service = RollScanService(scanner=FakeScanner(), registration=FakeRegistration())
+
+    def unload(**_kwargs):
+        raise medium_unload.UnloadAcceptedWithoutProgress("still gripped")
+
+    monkeypatch.setattr(medium_unload, "unload_medium", unload)
+
+    with pytest.raises(medium_unload.UnloadAcceptedWithoutProgress):
+        service.eject("usb:1:7")
