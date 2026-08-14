@@ -628,11 +628,54 @@ fi
 # before signing so the distributed binary contains no builder filesystem
 # paths. This does not alter executable code.
 strip -S "$staged_app/Contents/MacOS/scanstudio-engine" "$staged_app/Contents/MacOS/ScanStudio"
-codesign --force --sign - "$bundled_libusb"
+
+# Signing identity: "-" (the default) keeps the ad-hoc signature every local
+# and PR-CI build has always produced. The release workflow exports the
+# Developer ID Application identity it imported into a throwaway keychain,
+# which switches this block to notarization-grade signing: every Mach-O in
+# the bundle signed individually with a secure timestamp (notarytool rejects
+# any unsigned Mach-O, and --deep never descends into Resources, where the
+# whole BridgeRuntime CPython tree lives), hardened runtime on every
+# executable, and executables carrying the one entitlement the bridge's
+# ctypes loader needs to dlopen the bundled (same-team-signed) libusb under
+# library validation.
+signing_identity="${SCANSTUDIO_SIGNING_IDENTITY:--}"
+timestamp_flags=()
+runtime_flags=()
+if [[ "$signing_identity" != "-" ]]; then
+    timestamp_flags=(--timestamp)
+    runtime_flags=(--options runtime)
+    bridge_entitlements="$staging_root/bridge-runtime.entitlements"
+    cat > "$bridge_entitlements" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+    while IFS= read -r -d '' candidate; do
+        candidate_type="$(file -b "$candidate")"
+        [[ "$candidate_type" == *Mach-O* ]] || continue
+        if [[ "$candidate_type" == *executable* ]]; then
+            codesign --force --sign "$signing_identity" --timestamp --options runtime \
+                --entitlements "$bridge_entitlements" "$candidate"
+        else
+            codesign --force --sign "$signing_identity" --timestamp "$candidate"
+        fi
+    done < <(find "$staged_app/Contents/Resources" "$staged_app/Contents/Frameworks" \
+        -type f -print0 2>/dev/null)
+fi
+codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "$bundled_libusb"
 codesign --verify --strict "$bundled_libusb"
-codesign --force --sign - "$staged_app/Contents/MacOS/scanstudio-engine"
-codesign --force --sign - "$staged_app/Contents/MacOS/ScanStudio"
-codesign --force --deep --sign - "$staged_app"
+codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "${runtime_flags[@]}" \
+    "$staged_app/Contents/MacOS/scanstudio-engine"
+codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "${runtime_flags[@]}" \
+    "$staged_app/Contents/MacOS/ScanStudio"
+codesign --force --deep --sign "$signing_identity" "${timestamp_flags[@]}" "${runtime_flags[@]}" \
+    "$staged_app"
 codesign --verify --deep --strict "$staged_app"
 
 replacement_started=1

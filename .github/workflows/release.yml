@@ -101,14 +101,59 @@ jobs:
           echo "RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
           echo "SCANSTUDIO_RELEASE_VERSION=$STAMP" >> "$GITHUB_ENV"
           echo "Resolved release version: $STAMP"
+      - name: Import the Developer ID signing identity
+        # A release build must be signed for distribution: this job fails
+        # loudly when the signing secrets are absent rather than silently
+        # shipping another ad-hoc build. The certificate lives only in a
+        # throwaway keychain deleted in the always() cleanup below; the
+        # identity string (not a secret) is exported for package_app.sh.
+        env:
+          P12_B64: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+        run: |
+          test -n "$P12_B64" || { echo "MACOS_SIGNING_CERT_P12_BASE64 secret is missing or empty"; exit 1; }
+          test -n "$CERT_PW" || { echo "MACOS_SIGNING_CERT_PASSWORD secret is missing or empty"; exit 1; }
+          KEYCHAIN="$RUNNER_TEMP/scanstudio-signing.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          printf '%s' "$P12_B64" | base64 -d > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -P "$CERT_PW" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S 'apple-tool:,apple:' -s -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          test -n "$IDENTITY" || { echo "no Developer ID Application identity found in the imported certificate"; exit 1; }
+          echo "SCANSTUDIO_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Imported signing identity: $IDENTITY"
       - name: Build and verify the local DMG
         # package_dmg.sh names the artifact ScanStudio-<version>-macOS-<arch>.dmg
         # (arch from uname -m, i.e. this runner's native arch) and refuses to
         # overwrite an existing artifact. It also verifies the mounted app's
         # code signature and runs test_packaged_bridge.sh on it; any failure
-        # here aborts the job and nothing is released.
+        # here aborts the job and nothing is released. With
+        # SCANSTUDIO_SIGNING_IDENTITY exported above, package_app.sh signs to
+        # notarization requirements instead of ad-hoc.
         working-directory: app/ScanStudio
         run: make dmg
+      - name: Notarize and staple the DMG
+        # MUST run before SHA256SUMS/latest.json are emitted: stapling
+        # mutates the DMG, so every published checksum has to be computed
+        # from the stapled artifact.
+        env:
+          NOTARY_KEY_B64: ${{ secrets.APPSTORE_CONNECT_API_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
+        working-directory: app/ScanStudio
+        run: |
+          test -n "$NOTARY_KEY_B64" || { echo "APPSTORE_CONNECT_API_KEY_P8 secret is missing or empty"; exit 1; }
+          test -n "$NOTARY_KEY_ID" || { echo "APPSTORE_CONNECT_API_KEY_ID secret is missing or empty"; exit 1; }
+          test -n "$NOTARY_ISSUER_ID" || { echo "APPSTORE_CONNECT_API_ISSUER_ID secret is missing or empty"; exit 1; }
+          export NOTARY_KEY_FILE="$RUNNER_TEMP/notary-key.p8"
+          printf '%s' "$NOTARY_KEY_B64" > "$NOTARY_KEY_FILE"
+          zsh scripts/notarize_dmg.sh ".build/ScanStudio-$RELEASE_VERSION-macOS-$(uname -m).dmg"
+          rm -f "$NOTARY_KEY_FILE"
       - name: Emit SHA256SUMS and arch-keyed latest.json
         working-directory: app/ScanStudio
         run: |
@@ -147,6 +192,14 @@ jobs:
             app/ScanStudio/.build/latest.json
           if-no-files-found: error
           retention-days: 1
+      - name: Delete the throwaway signing keychain
+        if: always()
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/scanstudio-signing.keychain-db"
+          if [ -f "$KEYCHAIN" ]; then
+            security list-keychains -d user -s login.keychain-db
+            security delete-keychain "$KEYCHAIN"
+          fi
 
   windows-resources:
     name: Assemble Windows offline resources
