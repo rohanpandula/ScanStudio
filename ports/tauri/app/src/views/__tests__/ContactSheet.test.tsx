@@ -227,6 +227,42 @@ describe("ContactSheet", () => {
     expect(fixture.calls.some((call) => call.method === "sim.loadMedia")).toBe(false);
   });
 
+  it("preview click still sends the wire request when crypto.randomUUID is absent (live Windows regression)", async () => {
+    // First live Windows validation: the webview origin was not a secure
+    // context, crypto.randomUUID did not exist, and the bare call's
+    // TypeError was swallowed by the click handler -- an enabled, rendered
+    // Preview button that did nothing. This drives the real button.
+    const fixture = contactFixture({
+      device: REAL_DEVICE,
+      status: REAL_EMPTY_ARMED,
+    });
+    await fixture.store.connect(REAL_DEVICE.deviceId);
+    mocks.sessionStore = fixture.store;
+    const user = userEvent.setup();
+
+    render(<ContactSheet />);
+
+    const preview = screen.getByTestId("preview-button");
+    expect(preview).toBeEnabled();
+    vi.stubGlobal("crypto", {});
+    try {
+      await act(async () => {
+        await user.click(preview);
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const acquire = fixture.calls.find(
+      (call) => call.method === "scanner.acquireThumbnails",
+    );
+    expect(acquire).toBeDefined();
+    expect(acquire?.params.operationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(screen.queryByTestId("preview-request-failure")).toBeNull();
+    expect(screen.queryByTestId("preview-failure")).toBeNull();
+  });
+
   it("offers the first real preview before a project exists and sends the selected process", async () => {
     const fixture = contactFixture({
       device: REAL_DEVICE,

@@ -122,4 +122,31 @@ describe("SetupChecker", () => {
     );
     await waitFor(() => expect(screen.getByTestId("copy-probes-as-text")).toHaveTextContent("Copied"));
   });
+
+  it("says the clipboard is unavailable instead of silently doing nothing (live Windows regression)", async () => {
+    resolveAll(FIXTURE_PROBES, { maxBytes: null, entriesScanned: 0 }, WRITE_MODE_TEXT);
+    // Reproduce the insecure-context runtime: navigator.clipboard absent.
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    try {
+      render(<SetupChecker />);
+      await screen.findByText("OK");
+
+      fireEvent.click(screen.getByTestId("copy-probes-as-text"));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("copy-probes-as-text")).toHaveTextContent(
+          "Clipboard unavailable",
+        ),
+      );
+      expect(mocks.writeText).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: mocks.writeText },
+      });
+    }
+  });
 });

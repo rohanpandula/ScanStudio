@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { previewImageSrc } from "../../session/webApis";
 import type { DerivativeTransform } from "../../session/wire/types";
 import styles from "./FrameDetail.module.css";
 
@@ -135,7 +136,7 @@ export default function ZoomPanViewer({
           >
             <img
               className={styles.previewImage}
-              src={`scanstudio-preview://localhost/?id=${encodeURIComponent(imagePath)}`}
+              src={previewImageSrc(imagePath)}
               alt={alt ?? "Frame preview"}
               draggable={false}
               data-testid="zoom-pan-image"

@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatSetupCheckProbesAsText, setupCheckResults } from "../session/setupCheckResults";
+import { describeWebApiAvailability } from "../session/webApis";
+import { useClipboardCopy } from "./useClipboardCopy";
 import styles from "./SetupChecker.module.css";
 
 export type ProbeStatus = "Ok" | "Fail" | "Unknown";
@@ -36,7 +38,7 @@ export default function SetupChecker() {
   const [probes, setProbes] = useState<ProbeResult[] | null>(null);
   const [maxRead, setMaxRead] = useState<MaxReadReport | null>(null);
   const [writeMode, setWriteMode] = useState<string | null>(null);
-  const [didCopyProbes, setDidCopyProbes] = useState(false);
+  const { status: copyStatus, copy: copyToClipboard } = useClipboardCopy();
 
   useEffect(() => {
     let cancelled = false;
@@ -74,11 +76,11 @@ export default function SetupChecker() {
     );
   }
 
+  // navigator.clipboard only exists in secure contexts; the hook reports
+  // unavailability on the button instead of silently doing nothing (the
+  // pre-fix Windows behavior).
   const copyProbesAsText = () => {
-    void navigator.clipboard.writeText(formatSetupCheckProbesAsText(probes)).then(() => {
-      setDidCopyProbes(true);
-      setTimeout(() => setDidCopyProbes(false), 1500);
-    });
+    void copyToClipboard(formatSetupCheckProbesAsText(probes));
   };
 
   return (
@@ -89,15 +91,21 @@ export default function SetupChecker() {
         onClick={copyProbesAsText}
         disabled={probes.length === 0}
         data-testid="copy-probes-as-text"
-        aria-label="Copy probe results as text"
       >
-        {didCopyProbes ? "Copied" : "Copy as text"}
+        {copyStatus === "copied"
+          ? "Copied"
+          : copyStatus === "unavailable"
+            ? "Clipboard unavailable"
+            : "Copy as text"}
       </button>
       {writeMode !== "" && (
         <p className={styles.writeMode} data-testid="write-mode-row">
           <strong>Write mode:</strong> {writeMode}
         </p>
       )}
+      <p className={styles.writeMode} data-testid="web-apis-row">
+        <strong>Web APIs:</strong> {describeWebApiAvailability()}
+      </p>
       <table className={styles.probeTable}>
         <thead>
           <tr>

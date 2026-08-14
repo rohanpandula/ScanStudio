@@ -1,5 +1,6 @@
 import type { DiagnosticFields } from "./diagnosticField";
 import { formatDiagnosticFields } from "./diagnosticField";
+import { newOperationId } from "./webApis";
 
 export interface DiagnosticEntry {
   timestamp: string;
@@ -19,12 +20,10 @@ export function summaryLine(entry: DiagnosticEntry): string {
 }
 
 function generateSessionId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  // Every environment this app ships to has Web Crypto, but tests and
-  // unusual embeddings should still get a usable, non-throwing id.
-  return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  // Delegates to the shared guarded generator: live Windows shipped without
+  // crypto.randomUUID (insecure webview context), so the fallback is a real
+  // production path, not a test-only nicety. See webApis.ts.
+  return newOperationId();
 }
 
 /** Both report outputs show at most this many of the most recent diagnostic

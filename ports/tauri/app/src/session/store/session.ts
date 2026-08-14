@@ -22,6 +22,7 @@
 //   job.
 
 import { decodeEvent, type EngineTransport } from "../wire/codec";
+import { newOperationId } from "../webApis";
 import {
   assertFrameTransition,
   assertJobTransition,
@@ -1073,8 +1074,10 @@ export class SessionStore {
 
   /**
    * Forward to scanner.acquireThumbnails with a fresh correlation token.
-   * Preview correlation policy (04-03 Task 1): a fresh crypto.randomUUID()
-   * is generated per accepted preview; a second call while one is active is
+   * Preview correlation policy (04-03 Task 1): a fresh newOperationId()
+   * (crypto.randomUUID when the context provides it -- see webApis.ts for
+   * why Windows historically did not) is generated per accepted preview; a
+   * second call while one is active is
    * refused locally with no wire call; the previous completed-preview token
    * is cleared immediately at call time (roll.approve trigger 1 -- the new
    * preview supersedes it whether or not it succeeds); and a rejected wire
@@ -1135,7 +1138,28 @@ export class SessionStore {
         recoverable: false,
       } satisfies EngineError;
     }
-    const operationId = crypto.randomUUID();
+    // newOperationId never throws by contract, but the pre-wire section must
+    // stay visible if a platform surprise ever violates that again: the
+    // Windows insecure-context TypeError thrown here (bare crypto.randomUUID,
+    // pre-fix) was swallowed by the caller's rejection consumer and left no
+    // trace at all. Any throw before the wire call now records a typed
+    // request failure so the existing failure banner renders it.
+    let operationId: string;
+    try {
+      operationId = newOperationId();
+    } catch (error) {
+      const requestError: EngineError = {
+        code: "INTERNAL",
+        message:
+          error instanceof Error
+            ? `preview operation id could not be created: ${error.message}`
+            : "preview operation id could not be created",
+        recoverable: false,
+      };
+      this.#state.previewRequestFailure = { operationId: "preview-id-unavailable", error: requestError };
+      this.#notify();
+      throw error;
+    }
     const effectiveFilmProcess =
       this.#state.project?.filmProcess ??
       filmProcess ??

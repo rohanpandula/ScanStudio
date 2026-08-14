@@ -1,6 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../../session";
 import { sessionOperationBusy } from "../../session/store/session";
+import { previewImageSrc } from "../../session/webApis";
 import styles from "./FrameDetail.module.css";
 
 // useSyncExternalStore requires a referentially stable snapshot between
@@ -115,7 +116,7 @@ export default function SpacingOffsetControl({ frameIndex }: { frameIndex: numbe
         {thumbnail?.imagePath !== undefined ? (
           <img
             className={styles.replacementTile}
-            src={`scanstudio-preview://localhost/?id=${encodeURIComponent(thumbnail.imagePath)}`}
+            src={previewImageSrc(thumbnail.imagePath)}
             alt={`Frame ${frameIndex} replacement tile`}
             data-testid="replacement-tile"
           />
