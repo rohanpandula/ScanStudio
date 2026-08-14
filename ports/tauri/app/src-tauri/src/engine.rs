@@ -297,21 +297,27 @@ impl EngineLogSink {
 
     fn append(&self, line: &str) {
         use std::io::Write;
-        if let Ok(metadata) = std::fs::metadata(&self.path) {
-            if metadata.len() > ENGINE_LOG_MAX_BYTES {
-                let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
-            }
-        }
         let epoch_seconds = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
+        // One preformatted buffer, one write_all: writeln!'s per-fragment
+        // writes are not atomic under O_APPEND, and overlapping app
+        // instances (the launcher's own documented relaunch race) would
+        // interleave MID-line. Rotation uses the projected size so a large
+        // single entry cannot overshoot the cap by more than itself.
+        let entry = format!("[{epoch_seconds}] {line}\n");
+        if let Ok(metadata) = std::fs::metadata(&self.path) {
+            if metadata.len() + entry.len() as u64 > ENGINE_LOG_MAX_BYTES {
+                let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+            }
+        }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
         {
-            let _ = writeln!(file, "[{epoch_seconds}] {line}");
+            let _ = file.write_all(entry.as_bytes());
         }
     }
 }

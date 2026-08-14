@@ -28,7 +28,7 @@ detach --busid <busid>`. No driver is swapped or replaced by the WSL lane.
 ### Checker pre-flight
 
 Confirm each row of the app's setup checker is green before continuing. The
-five ids below are the literal id strings the checker rows carry, pinned in
+six ids below are the literal id strings the checker rows carry, pinned in
 `app/src-tauri/src/wsl/checker.rs`:
 
 1. confirm the checker row `wsl-status` is green — it verifies

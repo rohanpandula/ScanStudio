@@ -110,7 +110,12 @@ fn main() {
         .map(|v| match v.split_once(':') {
             Some((method, n)) => (
                 method.to_string(),
-                n.parse::<u32>().ok().filter(|n| *n >= 1).unwrap_or(1),
+                // A malformed occurrence is a test-authoring bug; failing
+                // loudly beats silently reinterpreting it as ":1".
+                n.parse::<u32>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .unwrap_or_else(|| panic!("malformed MOCK_BRIDGE_CRASH_ON occurrence: {n:?}")),
             ),
             None => (v, 1),
         });

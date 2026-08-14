@@ -479,20 +479,38 @@ impl BridgeClient {
 
         // The handshake is just a normal correlated request — reuse
         // `call`. Propagate its Err verbatim: a version-mismatch or
-        // timeout during the handshake must never be swallowed.
-        let result_value = client.call("bridge.hello", hello_request_params())?;
-        let result: BridgeHelloResult = serde_json::from_value(result_value)
-            .map_err(|err| BridgeCallError::Io(format!("malformed bridge.hello result: {err}")))?;
-        if result.protocol_version != 1 {
-            return Err(BridgeCallError::BridgeError {
-                code: "INVALID_PARAMS".to_string(),
-                message: format!(
-                    "bridge reported protocolVersion {}, expected 1",
-                    result.protocol_version
-                ),
-                recoverable: false,
-            });
-        }
+        // timeout during the handshake must never be swallowed. A child
+        // that never completed this FIRST handshake cannot have opened the
+        // scanner, so on any handshake failure it is terminated outright
+        // (restart()'s own terminate_uninitialized_child policy) instead of
+        // receiving Drop's established-session leave-alive courtesy --
+        // otherwise every failed scanner.rescan during a slow bridge boot
+        // would orphan another child contending for the same physical
+        // scanner (WV round 2, second review).
+        let handshake = (|| -> Result<BridgeHelloResult, BridgeCallError> {
+            let result_value = client.call("bridge.hello", hello_request_params())?;
+            let result: BridgeHelloResult = serde_json::from_value(result_value).map_err(|err| {
+                BridgeCallError::Io(format!("malformed bridge.hello result: {err}"))
+            })?;
+            if result.protocol_version != 1 {
+                return Err(BridgeCallError::BridgeError {
+                    code: "INVALID_PARAMS".to_string(),
+                    message: format!(
+                        "bridge reported protocolVersion {}, expected 1",
+                        result.protocol_version
+                    ),
+                    recoverable: false,
+                });
+            }
+            Ok(result)
+        })();
+        let result = match handshake {
+            Ok(result) => result,
+            Err(error) => {
+                client.terminate_uninitialized_child();
+                return Err(error);
+            }
+        };
         *client.hello_info.lock().unwrap() = result;
         Ok(client)
     }
@@ -2561,6 +2579,14 @@ impl RealLs5000 {
         request_timeout: std::time::Duration,
     ) -> Result<Self, EngineError> {
         Self::new_with_env(bridge_cmd, request_timeout, &[])
+    }
+
+    /// Whether this backend's bridge child is currently believed alive.
+    /// `scanner.rescan` consults this so a real backend whose bridge died
+    /// (WSL restart, bridge crash) can be replaced instead of staying
+    /// listed-but-unconnectable forever (WV round 2, second review).
+    pub fn bridge_is_healthy(&self) -> bool {
+        self.bridge.is_healthy()
     }
 
     /// Like [`new`](Self::new), but additionally sets `bridge_env` on the

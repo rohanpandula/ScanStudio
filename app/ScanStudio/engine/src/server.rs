@@ -221,6 +221,18 @@ impl Backends {
                 "disconnect the active device before rescanning for devices",
             ));
         }
+        if self
+            .real
+            .as_ref()
+            .is_some_and(|real| !real.bridge_is_healthy())
+        {
+            // A real backend whose bridge died would otherwise stay listed
+            // forever (this field is set-once) while every connect fails; a
+            // rescan is the operator's explicit ask to re-establish it.
+            // Dropping the dead client is safe: unhealthy means its child
+            // provably exited.
+            self.real = None;
+        }
         if self.real.is_none() {
             if let Some(cmd) = &self.bridge_cmd {
                 match RealLs5000::new(cmd, DEFAULT_BRIDGE_TIMEOUT) {
