@@ -68,7 +68,13 @@ class Transport(Protocol):
         on_thumbnail: Callable[[domain.Thumbnail], None],
     ) -> domain.PreviewResult: ...
 
-    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
+    def approve(
+        self,
+        slot: int,
+        *,
+        fingerprint: str | None = None,
+        attended: bool = False,
+    ) -> None:
         """Approve `slot`. `fingerprint`, when given, is the Roll
         fingerprint (BRIDGE.md's `roll.approve`) the approval being
         submitted was minted against -- additive (2026-08-08 adversarial
@@ -76,7 +82,15 @@ class Transport(Protocol):
         given value that no longer matches the roll's CURRENT fingerprint
         must be refused with `FINGERPRINT_REFUSED` before any underlying
         approval call, never silently approved against whatever session
-        happens to be current now."""
+        happens to be current now.
+
+        `attended` (feed-detector round; ScanStudio #24/#16/#42) marks this
+        as an operator-ATTENDED acceptance rather than a per-slot manual
+        review: it may approve a slot the detector never flagged, and it is
+        what lets a medium-confidence roll be scanned at all. It is only
+        valid on a roll whose detection is automatic and medium-confidence;
+        anywhere else it must be refused with `INVALID_PARAMS`. `False` (the
+        default, and every pre-existing caller) is unchanged behavior."""
         ...
 
     def set_spacing_offset(

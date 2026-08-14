@@ -596,7 +596,23 @@ impl SimulatedLs5000 {
     /// produced it" principle). Not part of `ScannerBackend`: dispatched
     /// directly from `Backends::roll_approve`, exactly like every other
     /// roll.* method that is real-only or sim-only.
-    pub fn roll_approve(&self, frame_index: u32, operation_id: &str) -> Result<(), EngineError> {
+    pub fn roll_approve(
+        &self,
+        frame_index: u32,
+        operation_id: &str,
+        attended: bool,
+    ) -> Result<(), EngineError> {
+        // The simulator has no lattice-confidence detector, so it has no
+        // medium-confidence roll for an attended acceptance to rescue. It
+        // refuses `attended` outright rather than pretending to support it,
+        // the same posture it already takes on the manual-review gate.
+        if attended {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                "attended roll binding is not available on the simulator; it has no \
+                 lattice-confidence detector",
+            ));
+        }
         let state = self.state.lock().unwrap();
         let approvable = state.manual_approval_binding.as_ref().is_some_and(|binding| {
             binding.operation_id == operation_id && binding.frame_indices.contains(&frame_index)
@@ -2917,9 +2933,9 @@ mod tests {
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
         let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
-        sim.roll_approve(1, &result.operation_id)
+        sim.roll_approve(1, &result.operation_id, false)
             .expect("a frame this placement returned must be approvable");
-        sim.roll_approve(2, &result.operation_id)
+        sim.roll_approve(2, &result.operation_id, false)
             .expect("every returned frame is individually approvable");
     }
 
@@ -2933,7 +2949,7 @@ mod tests {
         // No manual_frames() call was ever made this session -- the
         // simulator's pre-existing "no manual-review gate" refusal must be
         // completely unchanged.
-        let err = sim.roll_approve(1, "some-operation-id").unwrap_err();
+        let err = sim.roll_approve(1, "some-operation-id", false).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
         assert!(err.message.contains("no other manual-review gate"));
     }
@@ -2946,7 +2962,7 @@ mod tests {
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
         let result = sim.manual_frames(vec![0, 135, 270]).expect("2-frame placement");
-        let err = sim.roll_approve(99, &result.operation_id).unwrap_err();
+        let err = sim.roll_approve(99, &result.operation_id, false).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -2958,7 +2974,7 @@ mod tests {
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
         sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
-        let err = sim.roll_approve(1, "not-the-real-operation-id").unwrap_err();
+        let err = sim.roll_approve(1, "not-the-real-operation-id", false).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -2975,7 +2991,7 @@ mod tests {
         // materially different registration" principle, applied here to
         // the simulator's session-scoped approval binding).
         sim.load_media(MediaCarrier::Strip6).expect("reload media");
-        let err = sim.roll_approve(1, &result.operation_id).unwrap_err();
+        let err = sim.roll_approve(1, &result.operation_id, false).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -2991,7 +3007,7 @@ mod tests {
         sim.connect(DEVICE_ID, &ConnectOptions::default())
             .expect("reconnect");
         sim.load_media(MediaCarrier::Roll36).expect("reload media");
-        let err = sim.roll_approve(1, &result.operation_id).unwrap_err();
+        let err = sim.roll_approve(1, &result.operation_id, false).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 }

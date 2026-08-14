@@ -34,3 +34,14 @@ organization (CSS modules instead of a `Theme` struct) — are named intentional
 choices, not omissions. Reachability of the newly-wired Phase 7 components is
 guard-railed by `src/__tests__/App.test.tsx` (shell navigation) and the
 fixture-driven component tests.
+
+## Known parity gaps opened after this ledger was written
+
+This ledger was written at Phase 07-03 and maps the 14 SwiftUI files that
+existed then. Two later SwiftUI features have no Tauri equivalent. They are
+recorded here rather than silently carried as "parity".
+
+| SwiftUI feature | Added | Tauri status | notes |
+|---|---|---|---|
+| Manual frame placement (`ManualFramePlacementView.swift`, `ManualFramePlacementSheet`, `ManualFramePlacementValidation.swift`) | 2026-08-07 (feeding UX ladder, Rung 4) | **GAP — not ported** | The Tauri app implements neither `roll.previewStrip` nor `roll.manualFrames`; there is no strip editor and no boundary-drawing UI. A Tauri operator whose roll refuses with `REFEED_REQUIRED` can only refeed and retry. Porting this is a whole subsystem (raster strip viewer, draggable boundary model, row validation), not an affordance, and is deliberately out of scope for the feed-detector round. |
+| Attended scan binding — "Approve every frame and scan" (`ErrorPresentation.canApproveEveryFrameAndScan`, `SessionModel.approveEveryFrameAndScan`, workspace error-card button) | 2026-08-13 (feed-detector round; issues #24/#16/#42) | **partial — wire and store parity, no error-card button** | `SessionStore.approveFrame(frameIndex, { attended })` and `SessionStore.approveEveryFrameAttended(frames)` exist and are tested, so the capability is reachable from the Tauri store. What is not ported is the SwiftUI *presentation* layer that turns a confidence refusal into a one-click recovery: the Tauri app has no `ErrorPresentationPolicy` equivalent classifying refusal text into copy plus affordances (`src/session/store/session.ts` handles only the `FILM_FEED_INTERRUPTED` legacy-compat classification). Adding the button means porting that policy layer first. |

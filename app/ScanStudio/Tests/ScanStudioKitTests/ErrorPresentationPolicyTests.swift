@@ -583,13 +583,65 @@ struct ErrorPresentationPolicyTests {
         #expect(presentation.title == "This roll previewed with low confidence")
         #expect(
             presentation.guidance
-                == "This roll previewed below the confidence the unattended scanner binding requires. Refeeding the strip or previewing it again may raise that confidence. A future release is expected to widen what the detector accepts here."
+                == "This roll previewed below the confidence the unattended scanner binding requires. Refeeding the strip or previewing it again may raise that confidence."
         )
         #expect(presentation.technicalDetails == rawMessage)
         // Deliberately its own code, distinct from REFEED_REQUIRED: this is
         // a scan-time capture refusal, not a preview failure, and no
         // manual-placement raster is guaranteed to exist for it.
         #expect(!presentation.canPlaceFramesManually)
+        // Attended binding (feed-detector round; issues #24/#16/#42): 'low'
+        // is the confidence an operator's approval CANNOT rescue -- the
+        // detector never anchored a lattice -- so this copy must not offer
+        // a button that is guaranteed to refuse again.
+        #expect(!presentation.canApproveEveryFrameAndScan)
+    }
+
+    // MARK: - Attended binding (feed-detector round; issues #24/#16/#42)
+
+    @Test("a medium-confidence refusal offers approving every frame, and says so")
+    func mediumConfidenceRefusalOffersAttendedBinding() {
+        let rawMessage = "ROLL_MISMATCH: roll boundary lattice confidence is 'medium'; "
+            + "unattended frame binding requires 'high'"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.canApproveEveryFrameAndScan)
+        #expect(presentation.title == "This roll needs you to confirm the frames")
+        #expect(presentation.guidance.contains("approve every frame and scan"))
+        #expect(presentation.technicalDetails == rawMessage)
+        #expect(!presentation.canPlaceFramesManually)
+    }
+
+    @Test("the attended offer survives the engine's own wrapping of the bridge code")
+    func mediumConfidenceRefusalMatchesWrappedForm() {
+        let rawMessage = "INTERNAL: bridge scan.error (ROLL_MISMATCH): roll boundary lattice "
+            + "confidence is 'medium'; unattended frame binding requires 'high'"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.canApproveEveryFrameAndScan)
+        #expect(presentation.title == "This roll needs you to confirm the frames")
+    }
+
+    @Test("no other refusal offers approving every frame")
+    func attendedOfferIsNotLeakedToOtherRefusals() {
+        let rawMessages = [
+            "REFEED_REQUIRED: transport read was not one uniform traversal",
+            "ROLL_MISMATCH: the film in the scanner does not match this roll",
+            "INTERNAL: bridge scan.error (METER_UNUSABLE): meter pass 2 controller refused",
+            // The phrase without a confidence this path can bind.
+            "ROLL_MISMATCH: roll boundary lattice confidence is 'low'; "
+                + "unattended frame binding requires 'high'",
+        ]
+
+        for rawMessage in rawMessages {
+            let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+            #expect(
+                !presentation.canApproveEveryFrameAndScan,
+                "expected false for: \(rawMessage)"
+            )
+        }
     }
 
     @Test("the unattended-binding phrase is recognized regardless of how the engine wraps the code")

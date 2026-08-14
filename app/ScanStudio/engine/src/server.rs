@@ -398,7 +398,12 @@ impl Backends {
     /// real bridge session. `roll.approve` is deliberately not folded into
     /// `scan.start`: the operator must make a distinct, reviewable decision
     /// before a frame that was flagged by preview can move.
-    fn roll_approve(&self, frame_index: u32, operation_id: &str) -> Result<(), EngineError> {
+    fn roll_approve(
+        &self,
+        frame_index: u32,
+        operation_id: &str,
+        attended: bool,
+    ) -> Result<(), EngineError> {
         if frame_index == 0 {
             return Err(EngineError::new(
                 ErrorCode::InvalidParams,
@@ -416,14 +421,14 @@ impl Backends {
                 .real
                 .as_ref()
                 .unwrap()
-                .roll_approve(frame_index, operation_id),
+                .roll_approve(frame_index, operation_id, attended),
             // S7a (adversarial review, 2026-08-08): the simulator now has
             // exactly one manual-review gate -- a frame its own last
             // successful `manual_frames()` call returned, under that exact
             // operationId (see `SimulatedLs5000::roll_approve`'s own doc
             // comment). Every other case is refused with the same
             // "no manual-review gate" message as before this change.
-            Some(ActiveDevice::Sim) => self.sim.roll_approve(frame_index, operation_id),
+            Some(ActiveDevice::Sim) => self.sim.roll_approve(frame_index, operation_id, attended),
             None => Err(EngineError::new(
                 ErrorCode::NotConnected,
                 "scanner is not connected",
@@ -1053,7 +1058,7 @@ fn handle_request(
         }
         "roll.approve" => {
             let params: protocol::RollApproveParams = parse_params(&request.params)?;
-            backends.roll_approve(params.frame_index, &params.operation_id)?;
+            backends.roll_approve(params.frame_index, &params.operation_id, params.attended)?;
             to_json(&protocol::RollApproveResult {})
         }
         "roll.setSpacingOffset" => {

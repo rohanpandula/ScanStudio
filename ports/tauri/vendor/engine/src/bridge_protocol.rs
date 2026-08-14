@@ -602,6 +602,12 @@ pub struct BridgeRollApproveParams {
     /// roll's current fingerprint (BRIDGE.md `roll.approve`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Attended binding (feed-detector round; ScanStudio #24/#16/#42).
+    /// Omitted from the wire entirely when false (`skip_serializing_if`),
+    /// so a bridge or bridge test double that predates this field sees
+    /// byte-identical params to before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attended: bool,
 }
 
 // ---------------------------------------------------------------------
