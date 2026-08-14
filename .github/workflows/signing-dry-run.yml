@@ -1,0 +1,128 @@
+name: Signing dry run
+
+# Manually triggered rehearsal of the ENTIRE Developer ID signing +
+# notarization + stapling path on one arch, without tagging or publishing
+# anything. The release workflow's signing steps only ever run on a real
+# tag under fail-fast, so this is the only way to exercise the path -- and
+# the runtime checks the notary service cannot make (is the entitlement on
+# the right binary, does the hardened interpreter's ctypes dlopen actually
+# work under library validation) -- before a release depends on it.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    name: Sign, notarize, staple, and runtime-check (arm64)
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+      UV_PYTHON_CPYTHON_BUILD: "20260718"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+        with:
+          toolchain: '1.97.1'
+      - name: Install exact uv and managed Python build toolchain
+        run: |
+          python3 -I -S -B scripts/install_pinned_uv_python.py \
+            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
+      - name: Verify exact Rust toolchain
+        run: python3 -I -S -B scripts/verify_pinned_rust.py
+      - name: Install locked production bridge dependencies
+        working-directory: bridge
+        run: uv sync --locked --no-dev --no-install-package python-sane
+      - name: Import the Developer ID signing identity
+        env:
+          P12_B64: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+        run: |
+          test -n "$P12_B64" || { echo "MACOS_SIGNING_CERT_P12_BASE64 secret is missing or empty"; exit 1; }
+          test -n "$CERT_PW" || { echo "MACOS_SIGNING_CERT_PASSWORD secret is missing or empty"; exit 1; }
+          KEYCHAIN="$RUNNER_TEMP/scanstudio-signing.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          printf '%s' "$P12_B64" | base64 -d > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -P "$CERT_PW" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S 'apple-tool:,apple:' -s -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          test -n "$IDENTITY" || { echo "no Developer ID Application identity found in the imported certificate"; exit 1; }
+          echo "SCANSTUDIO_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Imported signing identity: $IDENTITY"
+      - name: Write the notarization API key
+        env:
+          NOTARY_KEY_P8: ${{ secrets.APPSTORE_CONNECT_API_KEY_P8 }}
+        run: |
+          test -n "$NOTARY_KEY_P8" || { echo "APPSTORE_CONNECT_API_KEY_P8 secret is missing or empty"; exit 1; }
+          NOTARY_KEY_FILE="$RUNNER_TEMP/notary-key.p8"
+          printf '%s' "$NOTARY_KEY_P8" > "$NOTARY_KEY_FILE"
+          grep -q "BEGIN PRIVATE KEY" "$NOTARY_KEY_FILE" || { echo "APPSTORE_CONNECT_API_KEY_P8 does not look like a raw PEM .p8 key"; exit 1; }
+          echo "NOTARY_KEY_FILE=$NOTARY_KEY_FILE" >> "$GITHUB_ENV"
+      - name: Build, sign, and verify the app
+        working-directory: app/ScanStudio
+        env:
+          SCANSTUDIO_RELEASE_VERSION: 0.0.0-signing-dry-run
+        run: make package
+      - name: Assert the entitlement landed on the bridge interpreter only
+        working-directory: app/ScanStudio
+        run: |
+          PYBIN="$(/usr/bin/find .build/ScanStudio.app/Contents/Resources -type f -name 'python3.13' -path '*/bin/*' | head -1)"
+          test -n "$PYBIN" || { echo "bridge interpreter not found in the bundle"; exit 1; }
+          codesign -d --entitlements - "$PYBIN" 2>/dev/null | grep -q "disable-library-validation" \
+            || { echo "bridge interpreter is missing the disable-library-validation entitlement"; exit 1; }
+          codesign -d --entitlements - .build/ScanStudio.app/Contents/MacOS/scanstudio-engine 2>/dev/null | grep -q "disable-library-validation" \
+            && { echo "engine unexpectedly carries the entitlement"; exit 1; }
+          echo "entitlement scoped correctly"
+      - name: Notarize and staple the app
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
+        working-directory: app/ScanStudio
+        run: |
+          test -n "$NOTARY_KEY_ID" || { echo "APPSTORE_CONNECT_API_KEY_ID secret is missing or empty"; exit 1; }
+          test -n "$NOTARY_ISSUER_ID" || { echo "APPSTORE_CONNECT_API_ISSUER_ID secret is missing or empty"; exit 1; }
+          zsh scripts/notarize_artifact.sh app .build/ScanStudio.app
+      - name: Prove the hardened interpreter can dlopen the bundled libusb
+        # The check the notary service cannot make: under hardened runtime +
+        # library validation, the entitled interpreter must still be able to
+        # ctypes-load the bundled dylib (the live capture path's first step).
+        working-directory: app/ScanStudio
+        run: |
+          PYBIN="$(/usr/bin/find .build/ScanStudio.app/Contents/Resources -type f -name 'python3.13' -path '*/bin/*' | head -1)"
+          "$PYBIN" -I -c "import ctypes; ctypes.CDLL('.build/ScanStudio.app/Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib'); print('dlopen ok under hardened runtime')"
+      - name: Build the DMG from the stapled app
+        working-directory: app/ScanStudio
+        run: ./scripts/package_dmg.sh
+      - name: Notarize and staple the DMG
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
+        working-directory: app/ScanStudio
+        run: |
+          zsh scripts/notarize_artifact.sh dmg .build/ScanStudio-*-macOS-$(uname -m).dmg
+      - name: Upload the dry-run DMG for manual inspection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signing-dry-run-dmg
+          path: app/ScanStudio/.build/ScanStudio-*-macOS-*.dmg
+          if-no-files-found: error
+          retention-days: 3
+      - name: Delete the throwaway signing keychain and key material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/signing.p12" "$RUNNER_TEMP/notary-key.p8"
+          KEYCHAIN="$RUNNER_TEMP/scanstudio-signing.keychain-db"
+          if [ -f "$KEYCHAIN" ]; then
+            security list-keychains -d user -s login.keychain-db
+            security delete-keychain "$KEYCHAIN"
+          fi
