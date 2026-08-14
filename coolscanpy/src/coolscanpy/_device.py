@@ -25,10 +25,16 @@ SANE is unavailable, fails to enumerate, or finds no Coolscan unit (``pyusb``,
 already a runtime dependency, matching the LS-5000's fixed vendor/product id) -- see
 ``_usb_fallback_device_infos``. That fallback device carries reduced,
 conservative capabilities, since there is no SANE session to negotiate the
-rest against. SANE-only operations (``Device.scan()``, ``Device.eject()``)
-still raise ``ImportError`` when actually called on such a device -- only
-enumeration and the roll-feeder extension, which never uses SANE, are
+rest against. ``Device.scan()`` is the one remaining SANE-only operation and
+still raises ``ImportError`` when called on such a device; enumeration, the
+roll-feeder extension, and ``Device.eject()`` never use SANE and are
 unaffected by its absence.
+
+``Device.eject()`` left the SANE path in 0.7.2: it now replays the scanner's
+own traced unload sequence over this package's USB transport
+(``transport.medium_unload``). SANE's vendor eject needed a host
+``scanimage`` binary an application bundle cannot ship, and was observed
+accepted-but-inert against a mounted slide on real hardware.
 """
 
 from __future__ import annotations
@@ -38,7 +44,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from coolscanpy._logging import get_logger
-from coolscanpy.exceptions import DeviceBusy, DeviceNotFound, EjectFailed
+from coolscanpy.exceptions import (
+    DeviceBusy,
+    DeviceNotFound,
+    EjectFailed,
+    FeederParked,
+)
 from coolscanpy.session.backend import ScannerCapabilities, ScannerDevice
 from coolscanpy.session.params import ScanParams
 from coolscanpy.types import (
@@ -647,14 +658,45 @@ class Device:
                 self._roll_lock.release()
 
     def eject(self) -> bool:
-        """Capability-gated vendor eject/unload."""
+        """Eject the loaded medium over raw USB, and confirm it left.
+
+        Replays the scanner's own traced "Unload object" sequence directly
+        over this package's USB transport
+        (:func:`coolscanpy.transport.medium_unload.unload_medium`). It needs
+        no SANE, no ``scanimage`` binary, and no capture session, so it works
+        on any install this package runs on.
+
+        Returns ``True`` only when the medium is *confirmed* gone: the
+        commands returning GOOD status means accepted, not completed, so a
+        motion-free presence probe must agree before this reports success.
+        An already-empty transport is a no-op success and moves nothing.
+
+        Raises :class:`~coolscanpy.exceptions.FeederParked` when the eject
+        cannot make progress and the medium is still gripped -- either the
+        inserted adapter advertises no unload support (the MA-21 mount
+        adapter), or the scanner accepted the command without acting on it.
+        Both need physical intervention: the adapter's manual eject button,
+        or a power cycle, which ejects on power-on. The eject is never
+        retried in either case.
+
+        Raises :class:`~coolscanpy.exceptions.EjectFailed` when the outcome
+        could not be confirmed, or the scanner could not be opened or
+        refused a command.
+        """
 
         self._acquire_io_lock("eject")
         try:
+            from coolscanpy.transport.medium_unload import (
+                UnloadAcceptedWithoutProgress,
+                UnloadNotSupported,
+                unload_medium,
+            )
+
             try:
-                return bool(self._service.eject(self._info.id))
+                return bool(unload_medium(device_id=self._info.id).ejected)
+            except (UnloadNotSupported, UnloadAcceptedWithoutProgress) as error:
+                raise FeederParked(str(error)) from error
             except RuntimeError as error:
-                self._mark_fault_if_cleanup_error(error)
                 raise EjectFailed(str(error)) from error
         finally:
             self._release_io_lock()

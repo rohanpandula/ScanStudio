@@ -49,6 +49,7 @@ from .density import (
     density_source_geometry_for_startup_records,
 )
 from .capture_process import (
+    ATTENDED_ROLL_BINDING_CONFIDENCE,
     ManualFrameApproval,
     ReviewedRollFingerprint,
     RollFingerprintComparison,
@@ -402,6 +403,7 @@ class LiveFrameSelection:
     reviewed_leading_residual_rows: float | None = None
     origin_rebased: bool = False
     origin_rebase_info: OriginRebaseInfo | None = None
+    attended_roll_binding_accepted: bool = False
 
     def diagnostics(self) -> dict[str, Any]:
         return {
@@ -410,6 +412,21 @@ class LiveFrameSelection:
             "usable_rows": self.usable_rows,
             "preview_sha256": self.preview_sha256,
             "table_sha256": self.table_sha256,
+            # Which mode bound this frame. None (the overwhelmingly common
+            # case) means it bound on detector confidence alone -- the
+            # journal shape every existing evidence audit already reads is
+            # unchanged for those. A dict means the roll was below "high"
+            # and an operator's per-frame approvals are what carried it, so
+            # an audit can find every attended frame without re-running the
+            # detector.
+            "attended_roll_binding": (
+                None
+                if not self.attended_roll_binding_accepted
+                else {
+                    "origin": ATTENDED_ROLL_BINDING_ACCEPTED_ORIGIN,
+                    "detection_confidence": self.detection.confidence,
+                }
+            ),
             "leading_anchor_divergence_accepted": (
                 None
                 if not self.leading_anchor_divergence_accepted
@@ -1326,6 +1343,12 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
 
 LEADING_ANCHOR_DIVERGENCE_ACCEPTED_ORIGIN = "leading-anchor-divergence-accepted"
 ORIGIN_REBASED_OUTSIDE_AFFINE_ACCEPTED_ORIGIN = "origin-rebased-outside-affine"
+# Journal marker for an acceptance that bound through the attended path
+# rather than on detector confidence alone. Every acceptance this gate makes
+# is journaled with its own origin string so an evidence audit can tell,
+# from the artifact alone and without re-running the detector, WHICH mode
+# bound a given frame.
+ATTENDED_ROLL_BINDING_ACCEPTED_ORIGIN = "attended-roll-binding-accepted"
 
 
 @dataclass(frozen=True)
@@ -1385,13 +1408,16 @@ def _derive_live_frame_selection(
     reviewed_as_automatic: bool = False,
     reviewed_leading_residual_rows: float | None = None,
     manual_boundary_rows: tuple[int, ...] | None = None,
+    attended_roll_binding: bool = False,
 ) -> LiveFrameSelection:
     """Resolve one frame origin from same-traversal live data.
 
     Automatic (default, ``manual_boundary_rows`` omitted): resolves via
     ``detect_roll_frames``/``derive_transport_mapping`` exactly as this
-    function has always worked. See the gate comment below for the one new
-    path manual placement adds to this function's confidence gate.
+    function has always worked. See the gate comment below for the two
+    paths that may bind an automatic or manually placed detection below
+    "high": manual placement, and (``attended_roll_binding``) an operator
+    who explicitly approved every frame of a medium-confidence roll.
 
     Manual (Rung 4, FEEDING-UX-LADDER-OVERNIGHT-20260807.md):
     ``manual_boundary_rows`` is never trusted as a serialized detection
@@ -1480,12 +1506,73 @@ def _derive_live_frame_selection(
     # every one of these frames independently. This gate only decides
     # whether the ROLL-level confidence check may be attempted at all; it
     # grants no exemption from any other check in this function.
+    #
+    # ------------------------------------------------------------------
+    # ATTENDED BINDING (feed-detector round; ScanStudio #24/#16/#42 --
+    # "previews fine but will not scan"). The SECOND, and only other, path
+    # this gate has ever granted below "high".
+    #
+    # The field shape: a roll the detector places at "medium" -- it found a
+    # lattice, corroborated it well enough to render every thumbnail the
+    # operator then visually checked, but not well enough to bind film
+    # geometry with nobody watching. Preview accepts it; scanning refuses
+    # it; the operator is standing right there looking at correct frames.
+    #
+    # What unlocks it is not a lower threshold -- no accept window, no
+    # lattice/evidence/direct-fraction bound in roll_index.py moves by this
+    # change, and "medium" is still exactly as hard to earn as it was. What
+    # unlocks it is EVIDENCE OF ATTENDANCE: a ManualFrameApproval receipt
+    # for EVERY frame this batch requested, each one carrying
+    # ATTENDED_ROLL_BINDING_REASON, which RollPreviewSession.
+    # approve_manual_origin only ever mints when an operator explicitly
+    # approves that slot against this session's own reviewed thumbnail.
+    # ``attended_roll_binding`` is that derived all-frames-approved verdict
+    # (see _derive_live_batch_selections, which is the only production
+    # caller that can ever pass it true).
+    #
+    # Why a caller cannot forge it, in the same terms as the manual gate
+    # above:
+    #   * The reason string lives inside ManualFrameApproval.
+    #     binding_payload(), hence inside binding_sha256, which
+    #     from_payload re-derives and compares -- a receipt cannot be
+    #     hand-edited to gain the marker.
+    #   * load_validated_batch_job already refuses any receipt whose
+    #     reviewed_fingerprint_sha256 is not THIS job's reviewed
+    #     fingerprint, and whose manual_boundary_rows_sha256 is not this
+    #     job's placement digest. So every receipt admitted here was signed
+    #     against the CURRENT preview operation's own evidence, not a
+    #     previous roll's, and not a different placement of this one.
+    #   * The whole-roll and per-slot visual fingerprint comparisons below
+    #     independently prove the bytes about to be bound are still the
+    #     bytes that were reviewed.
+    #   * ``all()`` over the batch's frames means a partially approved
+    #     batch is not attended. One unapproved requested frame refuses the
+    #     whole batch, because "the operator checked the ones that were
+    #     flagged" is not the claim this path binds on -- "the operator
+    #     accepted every frame about to be scanned" is.
+    #
+    # Deliberately NOT widened:
+    #   * 'low' still refuses with or without any number of approvals
+    #     (ATTENDED_ROLL_BINDING_CONFIDENCE; see its comment).
+    #   * UNATTENDED 'medium' still refuses byte-for-byte as before -- the
+    #     wide-gap-recovery/automatic caller that passes
+    #     manual_review_approved=True and nothing else takes the identical
+    #     raise with the identical message.
+    #   * Binding here grants no exemption from anything else in this
+    #     function or in apply_batch_boundary_offsets. It decides only
+    #     whether the ROLL-level confidence check may be passed at all.
     manual_placement = (
         manual_boundary_rows is not None
         and MANUAL_PLACEMENT_WARNING in detection.warnings
     )
+    attended_roll_binding_accepted = (
+        attended_roll_binding
+        and not manual_placement
+        and detection.confidence == ATTENDED_ROLL_BINDING_CONFIDENCE
+    )
     if detection.confidence != "high" and not (
-        manual_placement and manual_review_approved
+        (manual_placement and manual_review_approved)
+        or attended_roll_binding_accepted
     ):
         raise ProtocolError(
             f"roll boundary lattice confidence is {detection.confidence!r}; "
@@ -1622,6 +1709,7 @@ def _derive_live_frame_selection(
             if leading_anchor_divergence_accepted
             else None
         ),
+        attended_roll_binding_accepted=attended_roll_binding_accepted,
         origin_rebased=origin_rebase_info is not None,
         origin_rebase_info=origin_rebase_info,
         reviewed_fingerprint_sha256=(
@@ -1656,6 +1744,13 @@ def _derive_live_batch_selections(
     ``automatic=False, manual_review=True``, so every frame in a manual
     batch already has to appear in ``approved_manual_slots`` or that
     pre-existing, unmodified check refuses it).
+
+    Attended binding (feed-detector round, ScanStudio #24/#16/#42): this
+    function is also where the attended verdict is DERIVED -- see the
+    ``attended_roll_binding`` assignment below and the gate comment in
+    ``_derive_live_frame_selection``. It is deliberately not a parameter:
+    attendance is proven only by the per-frame receipts this batch already
+    carries, so there is nothing for a caller to assert.
     """
 
     if not frames:
@@ -1673,6 +1768,19 @@ def _derive_live_batch_selections(
     reviewed_automatic_slots = frozenset(
         spec.slot for spec in frames if spec.manual_review_approval is None
     )
+    # Attended binding (feed-detector round): the all-frames-approved verdict
+    # _derive_live_frame_selection's gate consumes. Derived here, from the
+    # receipts load_validated_batch_job already authenticated against THIS
+    # job's reviewed fingerprint and placement digest -- never taken as a
+    # bare boolean off the job JSON, so there is no wire field a caller could
+    # set to claim attendance it does not have. ``all()`` over every
+    # requested frame is the whole claim: one unapproved frame in the batch
+    # and this is False, and the gate refuses exactly as it does today.
+    attended_roll_binding = all(
+        spec.manual_review_approval is not None
+        and spec.manual_review_approval.is_attended_roll_binding
+        for spec in frames
+    )
     # A zero-offset selection performs the expensive same-traversal decode and
     # gives us the unmodified detector mapping.  All requested offsets are then
     # applied together to that mapping before SEND(0x8f) can execute.
@@ -1687,6 +1795,7 @@ def _derive_live_batch_selections(
         manual_review_approved=frames[0].manual_review_approval is not None,
         reviewed_as_automatic=frames[0].slot in reviewed_automatic_slots,
         manual_boundary_rows=manual_boundary_rows,
+        attended_roll_binding=attended_roll_binding,
     )
     if context.fresh_fingerprint is None:
         raise ProtocolError("fresh batch roll fingerprint was not retained")
@@ -1729,6 +1838,15 @@ def _derive_live_batch_selections(
     manual_placement = (
         manual_boundary_rows is not None
         and MANUAL_PLACEMENT_WARNING in context.detection.warnings
+    )
+    # The same verdict _derive_live_frame_selection's gate reached for this
+    # batch's one context call, recomputed for the per-frame journal
+    # annotation below. `attended_roll_binding` first: an unattended batch
+    # short-circuits before touching `detection`.
+    attended_roll_binding_accepted = (
+        attended_roll_binding
+        and not manual_placement
+        and context.detection.confidence == ATTENDED_ROLL_BINDING_CONFIDENCE
     )
     # S6 hardening (FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1 rework):
     # load_validated_batch_job already checked each approval's own
@@ -1856,6 +1974,17 @@ def _derive_live_batch_selections(
                 and spec.slot in reviewed_automatic_slots
                 and _is_narrowly_divergent_leading_anchor(base)
             ),
+            # Placement-wide, exactly like manual_boundary_rows: the single
+            # context call above is what actually passed (or failed) the
+            # roll-level confidence gate for this whole batch, so every
+            # frame in it is journaled with the same verdict. Recomputed
+            # here rather than read back off `context`, for the same reason
+            # leading_anchor_divergence_accepted just above is: this is the
+            # journal annotation, and the authoritative decision already
+            # happened inside the gate. Conjunction order matters -- the
+            # cheap, always-available flag first, so a batch that is not
+            # attended never dereferences `detection` at all.
+            attended_roll_binding_accepted=attended_roll_binding_accepted,
             origin_rebased=origin_rebase_info is not None,
             origin_rebase_info=origin_rebase_info,
             reviewed_fingerprint_sha256=context.reviewed_fingerprint_sha256,

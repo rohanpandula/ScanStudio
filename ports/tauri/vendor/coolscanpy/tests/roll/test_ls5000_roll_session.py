@@ -14,6 +14,7 @@ import pytest
 from coolscanpy.protocol.ls5000_single_pass import roll_index
 from coolscanpy.roll import preview_session as preview_session_module
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    ATTENDED_ROLL_BINDING_REASON,
     AttemptPaths,
     CaptureAttemptResult,
     CaptureMode,
@@ -29,6 +30,7 @@ from coolscanpy.roll.preview_session import (
     PARTIAL_FRAME_MIN_COVERAGE,
     ArtifactIdentity,
     CaptureRoute,
+    RollPreviewSession,
     RollSessionIntegrityError,
     ValidatedRollPreview,
     _crop_coverage,
@@ -1152,6 +1154,132 @@ def test_manual_origin_approval_is_bound_to_exact_reviewed_thumbnail_and_roll(
 
     with pytest.raises(ValueError, match="does not require manual review"):
         session.approve_manual_origin(2, 0)
+
+
+# ---------------------------------------------------------------------------
+# Attended binding (feed-detector round; ScanStudio #24/#16/#42) -- the
+# receipt-minting side of the worker's attended gate.
+# ---------------------------------------------------------------------------
+
+
+def _medium_confidence_session(tmp_path: Path) -> RollPreviewSession:
+    """The field shape: an automatically detected roll at medium confidence."""
+
+    session = build_roll_preview_session(
+        _preview_fixture(tmp_path, content_frames=36).result,
+        expected_frame_count=36,
+    )
+    return replace(
+        session,
+        detection=replace(session.detection, confidence="medium"),
+    )
+
+
+def test_medium_confidence_automatic_roll_offers_attended_binding(
+    tmp_path: Path,
+) -> None:
+    session = _medium_confidence_session(tmp_path)
+
+    assert session.detection.confidence == "medium"
+    assert session.manual_boundary_rows is None
+    assert session.attended_binding_available is True
+
+
+def test_attended_approval_marks_an_otherwise_unflagged_slot(
+    tmp_path: Path,
+) -> None:
+    """Slot 2 needs no manual review, so today it cannot be approved at all.
+    Attended acceptance is what lets an operator vouch for it."""
+
+    session = _medium_confidence_session(tmp_path)
+    assert session.slots[1].manual_review is False
+
+    with pytest.raises(ValueError, match="does not require manual review"):
+        session.approve_manual_origin(2, 0)
+
+    approval = session.approve_manual_origin(2, 0, attended_roll_binding=True)
+
+    assert approval.is_attended_roll_binding is True
+    assert ATTENDED_ROLL_BINDING_REASON in approval.review_reasons
+    assert approval.slot == 2
+    assert (
+        approval.reviewed_fingerprint_sha256
+        == session.reviewed_fingerprint().binding_sha256
+    )
+    assert session.validate_manual_approval(
+        approval, slot_id=2, boundary_offset_rows=0
+    )
+
+
+def test_attended_approval_keeps_a_flagged_slots_own_review_reasons(
+    tmp_path: Path,
+) -> None:
+    """Appending the marker must not erase why the slot was flagged -- the
+    worker cross-checks a receipt's reasons against the fresh origin's."""
+
+    session = _medium_confidence_session(tmp_path)
+    assert session.slots[36].manual_review is True
+
+    ordinary = session.approve_manual_origin(37, 0)
+    attended = session.approve_manual_origin(37, 0, attended_roll_binding=True)
+
+    assert set(ordinary.review_reasons) < set(attended.review_reasons)
+    assert attended.review_reasons[-1] == ATTENDED_ROLL_BINDING_REASON
+    assert ordinary.is_attended_roll_binding is False
+
+
+def test_high_confidence_session_refuses_to_mint_attended_receipts(
+    tmp_path: Path,
+) -> None:
+    """Nothing to rescue: a 'high' roll binds unattended already."""
+
+    session = build_roll_preview_session(
+        _preview_fixture(tmp_path, content_frames=36).result,
+        expected_frame_count=36,
+    )
+    session = replace(
+        session, detection=replace(session.detection, confidence="high")
+    )
+
+    assert session.attended_binding_available is False
+    with pytest.raises(ValueError, match="attended roll binding requires"):
+        session.approve_manual_origin(2, 0, attended_roll_binding=True)
+
+
+def test_low_confidence_session_refuses_to_mint_attended_receipts(
+    tmp_path: Path,
+) -> None:
+    """Nothing to vouch for: the detector never anchored a lattice."""
+
+    session = build_roll_preview_session(
+        _preview_fixture(tmp_path, content_frames=36).result,
+        expected_frame_count=36,
+    )
+    session = replace(
+        session, detection=replace(session.detection, confidence="low")
+    )
+
+    assert session.attended_binding_available is False
+    with pytest.raises(ValueError, match="attended roll binding requires"):
+        session.approve_manual_origin(37, 0, attended_roll_binding=True)
+
+
+def test_attended_receipt_fails_validation_against_a_high_confidence_session(
+    tmp_path: Path,
+) -> None:
+    """A receipt carrying the attended marker cannot be replayed against a
+    session that could never have minted one."""
+
+    medium = _medium_confidence_session(tmp_path)
+    approval = medium.approve_manual_origin(2, 0, attended_roll_binding=True)
+    high = replace(
+        medium, detection=replace(medium.detection, confidence="high")
+    )
+
+    assert (
+        high.validate_manual_approval(approval, slot_id=2, boundary_offset_rows=0)
+        is False
+    )
 
 
 def test_boundary_only_review_with_automatic_origin_can_be_approved(

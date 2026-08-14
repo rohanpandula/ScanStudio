@@ -93,6 +93,38 @@ REVIEWED_ROLL_FINGERPRINT_VERSION = 2
 # is), so there is no backward-compatibility case to preserve here the way
 # F7 preserved one for session JSON.
 MANUAL_FRAME_APPROVAL_VERSION = 2
+
+# Attended scan binding (FEEDING-DETECTOR-ROUND, ScanStudio #24/#16/#42).
+# The one review reason that marks a ManualFrameApproval as an OPERATOR-
+# ATTENDED acceptance of an automatically detected roll, rather than the
+# per-slot "this specific frame was flagged and a human looked at it"
+# receipt every other reason denotes.
+#
+# It lives here, beside ManualFrameApproval itself, for the same reason
+# digest_manual_boundary_rows does: the receipt's producer
+# (roll.preview_session.RollPreviewSession.approve_manual_origin) and its
+# consumer (the pinned capture worker's confidence gate) must never
+# independently drift on the exact string, and the string is inside
+# binding_payload()/binding_sha256 -- so a receipt cannot gain or lose this
+# marker after signing without invalidating its own digest.
+#
+# What it does NOT do: it grants no confidence, no threshold change, and no
+# exemption from any other check. It is only the evidence the worker gate
+# reads to tell "a human explicitly accepted every requested frame of this
+# medium-confidence automatic roll" apart from "an unattended caller passed
+# an approval flag" -- which still refuses, unchanged.
+ATTENDED_ROLL_BINDING_REASON = "attended-roll-binding"
+
+# The only detector confidence the attended path may bind. 'low' is not a
+# "slightly worse medium": it is the detector saying it could not anchor the
+# lattice at all, so a human approving thumbnails proves nothing about where
+# the frames physically are. Attended binding is an operator vouching for a
+# geometry the detector DID find but could not fully corroborate -- there is
+# no such geometry to vouch for at 'low'. Kept here, beside the reason
+# string, so the receipt producer and the pinned worker gate read one
+# definition rather than two.
+ATTENDED_ROLL_BINDING_CONFIDENCE = "medium"
+
 MAX_VISUAL_MEDIAN_HAMMING = 24
 MAX_VISUAL_P90_HAMMING = 48
 MAX_SELECTED_VISUAL_HAMMING = 48
@@ -634,6 +666,20 @@ class ManualFrameApproval:
     review_reasons: tuple[str, ...]
     manual_boundary_rows_sha256: str
     schema_version: int = MANUAL_FRAME_APPROVAL_VERSION
+
+    @property
+    def is_attended_roll_binding(self) -> bool:
+        """Whether this receipt is an operator-attended roll acceptance.
+
+        Single source of truth for reading ATTENDED_ROLL_BINDING_REASON off a
+        receipt, so the producer, the facade's own re-validation, and the
+        pinned worker gate all ask the same question the same way. The reason
+        is part of ``binding_payload()`` and therefore of ``binding_sha256``:
+        it cannot be added to or removed from a signed receipt without
+        breaking the digest ``from_payload`` re-checks.
+        """
+
+        return ATTENDED_ROLL_BINDING_REASON in self.review_reasons
 
     @staticmethod
     def digest_manual_boundary_rows(rows: Sequence[int] | None) -> str:

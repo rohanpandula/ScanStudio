@@ -20,6 +20,8 @@ import numpy as np
 
 from coolscanpy.exceptions import MeterUnusableError
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    ATTENDED_ROLL_BINDING_CONFIDENCE,
+    ATTENDED_ROLL_BINDING_REASON,
     AttemptPaths,
     CaptureAttemptResult,
     CaptureMode,
@@ -355,15 +357,65 @@ class RollPreviewSession:
             return None
         return tuple(boundary.output_row for boundary in self.detection.boundaries)
 
+    @property
+    def attended_binding_available(self) -> bool:
+        """Whether this session may be scanned through the attended path.
+
+        True exactly when the scan-time roll gate would refuse this session
+        unattended but an operator CAN rescue it by approving every frame:
+        an automatically detected roll the detector placed at
+        ATTENDED_ROLL_BINDING_CONFIDENCE. False for a 'high' session (which
+        needs no rescue), for 'low' (which no amount of approval rescues --
+        the detector never found a lattice to vouch for), and for a manual
+        placement (which already has its own binding path).
+
+        The application layer reads this to decide whether to offer the
+        "approve every frame and scan" affordance at all; it is advisory
+        UI state, and the authoritative refusal is still the pinned
+        worker's own gate.
+        """
+
+        return (
+            self.detection.confidence == ATTENDED_ROLL_BINDING_CONFIDENCE
+            and self.manual_boundary_rows is None
+        )
+
     def approve_manual_origin(
         self,
         slot_id: int,
         boundary_offset_rows: int = 0,
+        *,
+        attended_roll_binding: bool = False,
     ) -> ManualFrameApproval:
-        """Create an immutable receipt for one visually reviewed slot."""
+        """Create an immutable receipt for one visually reviewed slot.
+
+        ``attended_roll_binding`` (feed-detector round, ScanStudio
+        #24/#16/#42) is the opt-in that turns this into an ATTENDED
+        acceptance: the operator is not confirming a slot the detector
+        flagged, they are vouching for one frame of a medium-confidence
+        automatic roll so the whole roll can be scanned with them watching.
+        It is refused unless :attr:`attended_binding_available` -- a 'high'
+        session has nothing to rescue, a 'low' one has no geometry worth
+        vouching for, and a manual placement binds through its own path --
+        and, when granted, records ATTENDED_ROLL_BINDING_REASON inside the
+        receipt's signed payload. The pinned capture worker reads exactly
+        that marker, on every requested frame, before it will bind a roll
+        below "high".
+
+        Default (False) behavior is unchanged in every respect: the slot
+        must itself carry manual_review, and the receipt never gains the
+        attended marker.
+        """
 
         slot = self._slot(slot_id)
-        if not slot.manual_review:
+        if attended_roll_binding and not self.attended_binding_available:
+            raise ValueError(
+                "attended roll binding requires an automatically detected "
+                f"{ATTENDED_ROLL_BINDING_CONFIDENCE}-confidence roll; this "
+                f"session is {self.detection.confidence!r}"
+                + ("" if self.manual_boundary_rows is None else " and manually placed")
+            )
+        if not slot.manual_review and not attended_roll_binding:
             raise ValueError(f"slot {slot_id} does not require manual review")
         thumbnail = reload_thumbnail(
             self.preview,
@@ -378,6 +430,13 @@ class RollPreviewSession:
         reasons = tuple(
             dict.fromkeys((*slot.warnings, *slot.base_origin.review_reasons))
         )
+        if attended_roll_binding:
+            # Appended, never substituted: an attended acceptance of a slot
+            # that ALSO carries its own review reasons keeps every one of
+            # them, so the worker's per-slot fresh-origin cross-check
+            # (review_reasons must be a superset of the freshly resolved
+            # origin's) still has the real reasons to compare against.
+            reasons = tuple(dict.fromkeys((*reasons, ATTENDED_ROLL_BINDING_REASON)))
         if not reasons:
             reasons = ("transport-origin-manual-review",)
         return ManualFrameApproval(
@@ -403,14 +462,28 @@ class RollPreviewSession:
         slot_id: int,
         boundary_offset_rows: int,
     ) -> bool:
-        """Return whether an approval exactly matches this reviewed thumbnail."""
+        """Return whether an approval exactly matches this reviewed thumbnail.
+
+        The attended flag is read off the receipt rather than taken as a
+        parameter, so this stays a pure "would this exact session mint this
+        exact receipt again" comparison for both kinds. A receipt claiming
+        the attended marker against a session that cannot mint one (any
+        confidence but ATTENDED_ROLL_BINDING_CONFIDENCE, or a manual
+        placement) makes approve_manual_origin raise, which is a failed
+        validation, not an accepted one -- hence the ValueError catch.
+        """
 
         if not isinstance(approval, ManualFrameApproval):
             return False
-        return approval == self.approve_manual_origin(
-            slot_id,
-            boundary_offset_rows,
-        )
+        try:
+            expected = self.approve_manual_origin(
+                slot_id,
+                boundary_offset_rows,
+                attended_roll_binding=approval.is_attended_roll_binding,
+            )
+        except ValueError:
+            return False
+        return approval == expected
 
     def with_material(self, material: ScanMaterial) -> RollPreviewSession:
         """Return this preview with the material's explicit capture recipe."""

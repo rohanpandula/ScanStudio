@@ -28,6 +28,13 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-08-13 (attended scan binding, feed-detector round;
+    # ScanStudio #24/#16/#42): capture_process.py gained the
+    # ATTENDED_ROLL_BINDING_* pair and ManualFrameApproval.
+    # is_attended_roll_binding; worker.py gained the attended branch of the
+    # roll-confidence gate plus its journal marker, layered on this copy's
+    # standing issue #70 EVPD adapter-conditional replay below -- worker.py's
+    # bytes are therefore unique to this bundle and re-hashed accordingly.
     # Resealed 2026-08-10 (issue #70): worker.py gained adapter-conditional
     # EVPD replay -- the live page-00h list gates which traced EVPD INQUIRY
     # entries the inserted adapter can answer (MA-21 drops page E2h).
@@ -36,8 +43,8 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
     # Resealed 2026-08-11: capture descendants remain in the bridge-owned
     # process group and inherit its exclusive process-ownership fence.
-    "capture_process.py": "a7a4eb4d09c6c6daf399e4a868375a291cf80f220f45a1c13bc36ebff37e1cc9",
-    "worker.py": "d826249919c94b67f76b6a36400374a090ef2c9b2c05138f51913e9576e67650",
+    "capture_process.py": "c4d234c02bcabf5d10c83b9ef9f071c591546c2447ca004610cc0e0c804a3944",
+    "worker.py": "08b9fdb46bc072923d46c1efc4d4a901fd943de542624bc536cd440c3fb6294b",
     "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",

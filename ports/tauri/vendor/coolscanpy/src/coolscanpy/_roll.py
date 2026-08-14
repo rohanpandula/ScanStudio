@@ -944,11 +944,22 @@ class Roll:
 
     # -- manual review / approval --------------------------------------
 
-    def approve(self, slot: int) -> ManualFrameApproval:
+    def approve(self, slot: int, *, attended: bool = False) -> ManualFrameApproval:
         """Approve ``slot`` and return its immutable, content-bound receipt.
 
         The returned receipt is the exact object retained for the subsequent
         batch. Raises ``ValueError`` if the slot doesn't need approval.
+
+        ``attended`` (feed-detector round, ScanStudio #24/#16/#42) marks this
+        as an ATTENDED acceptance rather than a per-slot manual review. Use
+        it only when :attr:`attended_binding_available` is true, and only for
+        EVERY slot about to be scanned: the scan-time gate binds a
+        medium-confidence roll exclusively when every requested frame carries
+        one of these. Approving some frames attended and others not, or
+        approving only the flagged ones, refuses at bind time exactly as an
+        unapproved roll does. ``ValueError`` if this session cannot mint an
+        attended receipt at all (see
+        :attr:`RollPreviewSession.attended_binding_available`).
         """
 
         with self._state_condition:
@@ -956,9 +967,29 @@ class Roll:
             session = self._require_session_locked()
             self._check_slot(session, slot)
             offset = session.slots[slot - 1].boundary_offset_rows
-            approval = session.approve_manual_origin(slot, offset)
+            approval = session.approve_manual_origin(
+                slot,
+                offset,
+                attended_roll_binding=attended,
+            )
             self._approvals[slot] = approval
             return approval
+
+    @property
+    def attended_binding_available(self) -> bool:
+        """Whether this roll can be rescued by approving every frame.
+
+        True only for an automatically detected roll the detector placed at
+        medium confidence -- the "previews fine but will not scan" case. The
+        application layer reads this to decide whether to offer an
+        approve-every-frame affordance; ``False`` means either nothing needs
+        rescuing ('high') or nothing can rescue it ('low', where the detector
+        never anchored a lattice to vouch for).
+        """
+
+        with self._state_condition:
+            session = self._require_session_locked()
+            return session.attended_binding_available
 
     def needs_approval(self, slot: int) -> bool:
         with self._state_condition:
@@ -1082,9 +1113,9 @@ class Roll:
         with self._state_condition:
             approvals = dict(self._approvals)
             for slot in ordered_slots:
+                approval = approvals.get(slot)
+                offset = session.slots[slot - 1].boundary_offset_rows
                 if session.slots[slot - 1].manual_review:
-                    approval = approvals.get(slot)
-                    offset = session.slots[slot - 1].boundary_offset_rows
                     if approval is None or not session.validate_manual_approval(
                         approval,
                         slot_id=slot,
@@ -1095,6 +1126,46 @@ class Roll:
                             f"call approve({slot}) before scanning it",
                             slot=slot,
                         )
+                elif approval is not None and not session.validate_manual_approval(
+                    approval,
+                    slot_id=slot,
+                    boundary_offset_rows=offset,
+                ):
+                    # An approval retained for a slot that does NOT require
+                    # manual review is an attended receipt (or a stale one
+                    # left by an offset nudge that did not clear it). Either
+                    # way it is about to be put on the wire, so it gets the
+                    # same "does this session still mint exactly this" check
+                    # a flagged slot's receipt has always had, rather than
+                    # travelling unvalidated to the worker.
+                    raise ManualReviewRequired(
+                        f"slot {slot} approval no longer matches this reviewed "
+                        f"preview; re-approve slot {slot} before scanning it",
+                        slot=slot,
+                    )
+            # Attended binding (feed-detector round): a medium-confidence
+            # automatic roll can only bind with EVERY requested frame
+            # approved. Refuse the partial case here, before any film moves,
+            # with an error that names what to do -- the pinned worker's
+            # gate would refuse it anyway, but only after a reservation, a
+            # traversal, and a ROLL_MISMATCH the field cannot act on.
+            if session.attended_binding_available:
+                unapproved = [
+                    slot
+                    for slot in ordered_slots
+                    if approvals.get(slot) is None
+                    or not approvals[slot].is_attended_roll_binding
+                ]
+                if unapproved:
+                    raise ManualReviewRequired(
+                        "roll boundary lattice confidence is "
+                        f"{session.detection.confidence!r}; scanning it requires "
+                        "an operator to approve every requested frame -- "
+                        f"{len(unapproved)} of {len(ordered_slots)} still "
+                        f"unapproved (first: slot {unapproved[0]}); call "
+                        "approve(slot, attended=True) on each",
+                        slot=unapproved[0],
+                    )
 
             if session.recipe.capture_route is not CaptureRoute.SINGLE_PASS_RGBI4:
                 raise NotImplementedError(_BLACK_AND_WHITE_NOT_WIRED)
