@@ -3409,7 +3409,12 @@ impl RealLs5000 {
     /// scanner-addressable `slot`. This is intentionally a single
     /// session-scoped request: it never starts a preview, moves film, starts
     /// capture, or follows up with `device.status`.
-    pub fn roll_approve(&self, frame_index: u32, operation_id: &str) -> Result<(), EngineError> {
+    pub fn roll_approve(
+        &self,
+        frame_index: u32,
+        operation_id: &str,
+        attended: bool,
+    ) -> Result<(), EngineError> {
         if operation_id.trim().is_empty() {
             return Err(EngineError::new(
                 ErrorCode::InvalidParams,
@@ -3439,10 +3444,29 @@ impl RealLs5000 {
         // one the completed preview never returned at all, or one that was
         // never flagged for review in the first place. `binding` is `Some`
         // here (proven by the check immediately above).
+        //
+        // Attended binding (feed-detector round; ScanStudio #24/#16/#42)
+        // relaxes the SECOND half of that check only. The frame must still
+        // be one this exact completed preview actually returned -- an index
+        // the preview never produced is refused either way, which is the
+        // part of S3 that matters. What attended acceptance drops is the
+        // requirement that the DETECTOR flagged it: on a roll whose lattice
+        // confidence is too low to bind unattended, the frames an operator
+        // has to vouch for are precisely the ones nothing flagged. The
+        // driver remains the authority on whether this roll is eligible at
+        // all (it refuses `attended` on any roll that is not an
+        // automatically detected medium-confidence one), so relaxing it
+        // here cannot create a binding the driver would not make.
         let thumbnail = binding
             .as_ref()
             .and_then(|binding| binding.thumbnails.get(&frame_index));
-        if !thumbnail.is_some_and(|thumbnail| thumbnail.needs_approval) {
+        let Some(thumbnail) = thumbnail else {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                "frameIndex is not a frame the completed preview returned",
+            ));
+        };
+        if !attended && !thumbnail.needs_approval {
             return Err(EngineError::new(
                 ErrorCode::InvalidParams,
                 "frameIndex is not a frame the completed preview flagged for manual review",
@@ -3457,6 +3481,7 @@ impl RealLs5000 {
             fingerprint: binding
                 .as_ref()
                 .and_then(|binding| binding.fingerprint.clone()),
+            attended,
         };
         let value = serde_json::to_value(params).expect("BridgeRollApproveParams serializes");
         self.call_session_scoped(session_epoch, bridge_generation, "roll.approve", value)?;

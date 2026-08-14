@@ -779,7 +779,7 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     }
 
     let stale_approval = backend
-        .roll_approve(1, "predecessor-preview")
+        .roll_approve(1, "predecessor-preview", false)
         .expect_err("a predecessor approval must be stale after reconnect");
     assert_eq!(stale_approval.code, ErrorCode::InvalidParams);
 
@@ -794,7 +794,7 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     .expect("the replacement preview should be accepted only after the old reader detached");
 
     let premature_approval = backend
-        .roll_approve(1, "replacement-preview")
+        .roll_approve(1, "replacement-preview", false)
         .expect_err("the replacement is not approvable before its own completion");
     assert_eq!(premature_approval.code, ErrorCode::InvalidParams);
     assert!(
@@ -854,11 +854,11 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     );
 
     let stale_after_replacement = backend
-        .roll_approve(1, "predecessor-preview")
+        .roll_approve(1, "predecessor-preview", false)
         .expect_err("the predecessor remains stale after replacement completion");
     assert_eq!(stale_after_replacement.code, ErrorCode::InvalidParams);
     let mismatched_replacement = backend
-        .roll_approve(1, "wrong-replacement-preview")
+        .roll_approve(1, "wrong-replacement-preview", false)
         .expect_err("a mismatched replacement operation must be rejected locally");
     assert_eq!(mismatched_replacement.code, ErrorCode::InvalidParams);
     assert!(
@@ -870,7 +870,7 @@ fn restart_during_preview_keeps_old_reader_attached_until_it_detaches() {
     );
 
     backend
-        .roll_approve(1, "replacement-preview")
+        .roll_approve(1, "replacement-preview", false)
         .expect("the replacement becomes approvable only after its own completion");
     let bridge_calls = std::fs::read_to_string(&call_log_path)
         .expect("read final mock bridge call log")

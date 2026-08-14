@@ -1007,7 +1007,13 @@ class CoolscanPyTransport:
         self._preview_established = True
         return domain.PreviewResult(count=len(thumbnails), fingerprint=self._roll.fingerprint.sha256)
 
-    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
+    def approve(
+        self,
+        slot: int,
+        *,
+        fingerprint: str | None = None,
+        attended: bool = False,
+    ) -> None:
         if self._device is None:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
         if not self._preview_established:
@@ -1036,10 +1042,46 @@ class CoolscanPyTransport:
                 "that no longer matches the roll's current state; acquire a "
                 "fresh preview or placement and approve again",
             )
+        # Attended binding (feed-detector round; ScanStudio #24/#16/#42).
+        # coolscanpy owns the authority here: Roll.approve(attended=True)
+        # refuses with ValueError unless this roll is an automatically
+        # detected medium-confidence session, which is the only shape the
+        # scan-time gate will bind below "high". The bridge does not
+        # second-guess that -- it forwards the operator's intent and maps
+        # the refusal, exactly as it already does for "slot does not
+        # require manual review".
+        #
+        # Driver-compatibility shape: the keyword is passed ONLY when the
+        # operator actually opted in. An ordinary approval therefore calls
+        # `approve(slot)` exactly as it did before this parameter existed,
+        # so the common path keeps working against a coolscanpy that
+        # predates attended binding (the packaged bridge resolves the
+        # sibling checkout, but `dependencies` alone would let a plain
+        # `pip install` pull an older coolscanpy from PyPI).
+        #
+        # An attended approval against such a driver raises TypeError, not
+        # ValueError -- it is a missing capability, not a refused one -- so
+        # it needs its own arm. Left unmapped it reaches the client as a
+        # bare INTERNAL: precisely the undiagnosable shape the #16/#68/#76
+        # field reports were made of. Narrowly matched on the parameter
+        # name so a genuine TypeError from inside the driver still
+        # propagates as the defect it is.
         try:
-            self._roll.approve(slot)
+            if attended:
+                self._roll.approve(slot, attended=True)
+            else:
+                self._roll.approve(slot)
         except ValueError as exc:
             raise BridgeError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
+        except TypeError as exc:
+            if attended and "attended" in str(exc):
+                raise BridgeError(
+                    ErrorCode.INVALID_PARAMS,
+                    "this coolscanpy build has no attended roll binding; "
+                    "approving every frame to scan a medium-confidence roll "
+                    "requires a driver that supports it",
+                ) from exc
+            raise
 
     def set_spacing_offset(
         self, slot: int, offset_rows: int

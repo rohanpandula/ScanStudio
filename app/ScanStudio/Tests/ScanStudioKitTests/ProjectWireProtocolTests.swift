@@ -48,6 +48,28 @@ struct ProjectWireProtocolTests {
 
         #expect(object["frameIndex"] as? Int == 7)
         #expect(object["operationId"] as? String == "preview-operation-7")
+        // Attended binding (feed-detector round; issues #24/#16/#42) is
+        // additive: an ordinary approval must stay byte-identical on the
+        // wire, so the key is absent rather than present-and-false.
+        #expect(object["attended"] == nil)
+    }
+
+    @Test("an attended approval says so explicitly on the wire")
+    func rollApproveParamsEncodeAttendedOptIn() throws {
+        let data = try JSONEncoder().encode(
+            RollApproveParams(
+                frameIndex: 3,
+                operationId: "preview-operation-3",
+                attended: true
+            )
+        )
+        let object = try #require(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+
+        #expect(object["frameIndex"] as? Int == 3)
+        #expect(object["operationId"] as? String == "preview-operation-3")
+        #expect(object["attended"] as? Bool == true)
     }
 
     @Test("legacy ProcessingRecipe without software dust removal decodes as safely off")

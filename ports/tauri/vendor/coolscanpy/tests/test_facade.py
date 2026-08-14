@@ -2840,6 +2840,61 @@ class TestRollPreview:
             roll.close()
             dev.close()
 
+    def test_medium_confidence_roll_refuses_until_every_frame_is_attended(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """Attended binding, facade level (ScanStudio #24/#16/#42): the
+        'previews fine but will not scan' roll refuses BEFORE any film moves,
+        with an error naming what the operator has to do -- and stops
+        refusing once every requested frame carries an attended approval."""
+
+        from dataclasses import replace as _replace
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+            # Force the field shape: an automatically detected roll the
+            # detector placed at medium confidence.
+            roll._session = _replace(
+                roll._session,
+                detection=_replace(roll._session.detection, confidence="medium"),
+            )
+            assert roll.attended_binding_available is True
+
+            requested = [1, 2]
+            # A slot the detector itself flagged keeps its own, more precise
+            # pre-existing refusal -- attendance does not replace it.
+            for slot in requested:
+                if roll.needs_approval(slot):
+                    with pytest.raises(coolscanpy.ManualReviewRequired) as excinfo:
+                        next(iter(roll.scan_many(requested)))
+                    assert "requires visual review" in str(excinfo.value)
+                    roll.approve(slot)
+
+            # Every flagged slot is now approved, yet the roll still refuses:
+            # attendance is a claim about EVERY requested frame.
+            with pytest.raises(coolscanpy.ManualReviewRequired) as excinfo:
+                next(iter(roll.scan_many(requested)))
+            assert "approve every requested frame" in str(excinfo.value)
+            assert excinfo.value.slot in requested
+
+            # Approving only part of the batch is still not attendance.
+            roll.approve(requested[0], attended=True)
+            with pytest.raises(coolscanpy.ManualReviewRequired) as excinfo:
+                next(iter(roll.scan_many(requested)))
+            assert excinfo.value.slot == requested[1]
+
+            roll.approve(requested[1], attended=True)
+            approvals = roll._approvals
+            assert set(requested) <= set(approvals)
+            assert all(
+                approvals[slot].is_attended_roll_binding for slot in requested
+            )
+        finally:
+            roll.close()
+            dev.close()
+
     def test_approve_returns_the_exact_content_bound_receipt_retained_for_batch(
         self, fake_service_factory, tmp_path: Path
     ) -> None:

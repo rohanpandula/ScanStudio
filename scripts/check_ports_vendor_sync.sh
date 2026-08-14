@@ -296,7 +296,7 @@ EOF
 check_pair "protocol" "app/ScanStudio/protocol" "ports/tauri/vendor/protocol" "55577442d8b6a23ddcd3cc191ebf41a8258004047bc075511a241fa72adb0b65" <<'EOF'
 EOF
 
-check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "85ec493c2a081410b7aca78aaecb00f5630781db878925517c7321874828edcd" <<'EOF'
+check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "e2f134fb6885cf94d3f972732367e234f0c6373d15d813d49fac85c77cf7e816" <<'EOF'
 Files app/ScanStudio/engine/Cargo.lock and ports/tauri/vendor/engine/Cargo.lock differ
 Files app/ScanStudio/engine/Cargo.toml and ports/tauri/vendor/engine/Cargo.toml differ
 Files app/ScanStudio/engine/src/evidence_package.rs and ports/tauri/vendor/engine/src/evidence_package.rs differ
@@ -307,7 +307,7 @@ Files app/ScanStudio/engine/src/render.rs and ports/tauri/vendor/engine/src/rend
 Only in ports/tauri/vendor/engine/src: wsl_io.rs
 EOF
 
-check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "a5ce7bf643931229a66604487fe27c00865e7196a37f1c1985b9065b79447923" <<'EOF'
+check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "c3d18d08b433e903c4ea30a422a8b3f239008224ff5a0b34cb2b98d6211d16dc" <<'EOF'
 Only in ports/tauri/vendor/scanstudio-bridge: .github
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: probe-linux-env.py
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: verify-bridge.sh
@@ -322,7 +322,7 @@ Files bridge/tests/test_transport_mock.py and ports/tauri/vendor/scanstudio-brid
 Files bridge/uv.lock and ports/tauri/vendor/scanstudio-bridge/uv.lock differ
 EOF
 
-check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "557dec45c93435bd6270bf3419ebf7c740ad31f8a28b1c78ae4bbc65153e0101" <<'EOF'
+check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "65812839fa0d05285064804e367716d5b157123615ff78378059f6a6185644ba" <<'EOF'
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py differ
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py differ
 Files coolscanpy/tests/test_usb_backend.py and ports/tauri/vendor/coolscanpy/tests/test_usb_backend.py differ

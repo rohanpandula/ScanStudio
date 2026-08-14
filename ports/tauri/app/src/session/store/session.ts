@@ -1223,7 +1223,7 @@ export class SessionStore {
    * operationId, so a superseded token's approvals become unreachable
    * without an explicit clear).
    */
-  async approveFrame(frameIndex: number): Promise<void> {
+  async approveFrame(frameIndex: number, options?: { attended?: boolean }): Promise<void> {
     const operationId = this.#state.latestCompletedPreviewOperationId;
     if (operationId === null) {
       throw {
@@ -1232,13 +1232,42 @@ export class SessionStore {
         recoverable: false,
       } satisfies EngineError;
     }
-    await this.transport.sendRequest("roll.approve", { frameIndex, operationId });
+    // Attended binding (feed-detector round; ScanStudio #24/#16/#42).
+    // `attended` is omitted from the params entirely unless the caller opted
+    // in, so an ordinary approval stays byte-identical on the wire. It is
+    // the driver, not this store, that decides whether a roll may bind
+    // below "high"; an ineligible roll comes back INVALID_PARAMS.
+    const params: Record<string, unknown> = { frameIndex, operationId };
+    if (options?.attended === true) params.attended = true;
+    await this.transport.sendRequest("roll.approve", params);
     const approved = this.#state.approvedFrames[operationId] ?? [];
     if (!approved.includes(frameIndex)) {
       approved.push(frameIndex);
     }
     this.#state.approvedFrames = { ...this.#state.approvedFrames, [operationId]: approved };
     this.#notify();
+  }
+
+  /**
+   * Attended binding (feed-detector round; ScanStudio #24/#16/#42). Approves
+   * EVERY requested frame against the current completed preview as an
+   * operator-attended acceptance, so a roll whose lattice confidence is
+   * below what unattended scanning requires can still be scanned with a
+   * human watching. Anything less than every requested frame is refused by
+   * the driver, so this deliberately has no partial-subset form -- the same
+   * whole-batch shape the needsApproval gate above already enforces.
+   */
+  async approveEveryFrameAttended(frames: readonly number[]): Promise<void> {
+    if (frames.length === 0) {
+      throw {
+        code: "INVALID_PARAMS",
+        message: "attended approval requires at least one frame",
+        recoverable: false,
+      } satisfies EngineError;
+    }
+    for (const frameIndex of frames) {
+      await this.approveFrame(frameIndex, { attended: true });
+    }
   }
 
   /**

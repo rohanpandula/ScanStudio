@@ -1694,6 +1694,114 @@ public final class SessionModel {
         _ = await approveManualReviewAndStart(authorization)
     }
 
+    /// Attended binding (feed-detector round; issues #24/#16/#42). Recovery
+    /// for the one refusal a human standing at the scanner can legitimately
+    /// clear: the roll previewed correctly, the operator can see the frames
+    /// are right, but the detector's lattice confidence is below what
+    /// unattended scanning requires.
+    ///
+    /// This approves EVERY frame the operator is about to scan -- not only
+    /// the ones the detector flagged -- against the exact completed preview
+    /// they reviewed, then re-issues the scan. Anything less than every
+    /// frame is refused by the driver, so approving a subset here would only
+    /// produce the same refusal again more slowly.
+    ///
+    /// Fails closed the same way every other approval path does: no preview
+    /// binding, an approval error, or a readiness change all stop before
+    /// `scan.start`.
+    @discardableResult
+    public func approveEveryFrameAndScan() async -> Bool {
+        guard pendingManualReviewApproval == nil else { return false }
+        guard pendingScanStart == nil else {
+            lastErrorMessage = "A scan is already starting."
+            return false
+        }
+        let frames = selectedFrames
+        guard !frames.isEmpty else {
+            lastErrorMessage = "Select the frames to scan first."
+            return false
+        }
+        guard let previewOperationId = latestCompletedPreviewOperationId else {
+            lastErrorMessage =
+                "These frames are not bound to a completed preview. "
+                + "Acquire a fresh preview before scanning."
+            return false
+        }
+        let readiness = scanReadiness(for: frames)
+        guard readiness.isReady else {
+            lastErrorMessage = readiness.reason
+            return false
+        }
+
+        lastErrorMessage = nil
+        let marker = PendingManualReviewApproval(
+            id: UUID(),
+            requestId: UUID(),
+            previewOperationId: previewOperationId,
+            connectionEpoch: connectionEpoch
+        )
+        pendingManualReviewApproval = marker
+        defer {
+            if pendingManualReviewApproval?.id == marker.id {
+                pendingManualReviewApproval = nil
+                approvingFrameIndex = nil
+            }
+        }
+
+        for frameIndex in frames {
+            approvingFrameIndex = frameIndex
+            do {
+                let params = RollApproveParams(
+                    frameIndex: frameIndex,
+                    operationId: marker.previewOperationId,
+                    attended: true
+                )
+                let _: EmptyResult = try await engineClient.request(
+                    "roll.approve",
+                    params: params
+                )
+            } catch {
+                guard manualReviewApprovalIsCurrent(marker) else { return false }
+                recordOperationFailure(error, operation: "roll.approve")
+                lastErrorMessage = Self.describe(error)
+                return false
+            }
+            guard manualReviewApprovalIsCurrent(marker) else { return false }
+        }
+
+        for frameIndex in frames {
+            manualReviewDecisions[frameIndex] = .useFrameAnyway
+        }
+        recordDiagnostic(
+            event: "scan.attendedBinding.approved",
+            fields: [
+                "frames": frames.map(String.init).joined(separator: ","),
+                "requestedFrameCount": String(frames.count),
+            ]
+        )
+
+        let readinessAfterApproval = scanReadiness(for: frames)
+        guard readinessAfterApproval.isReady else {
+            lastErrorMessage = readinessAfterApproval.reason
+            return false
+        }
+
+        do {
+            guard let result = try await dispatchScanStart(frames: frames) else {
+                return false
+            }
+            clearPendingManualReviewScan()
+            beginJob(id: result.jobId, frames: frames)
+            return true
+        } catch {
+            guard manualReviewApprovalIsCurrent(marker) else { return false }
+            recordOperationFailure(error, operation: "scan.start")
+            lastErrorMessage = Self.describe(error)
+            noteRefeedRequired(from: error)
+            return false
+        }
+    }
+
     /// Executes one already-authorized manual-review path. The authorization
     /// may come from the scan-time sheet or from contact-sheet decisions that
     /// resolved every flagged frame before Scan was pressed.

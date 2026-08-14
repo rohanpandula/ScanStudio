@@ -448,10 +448,34 @@ public struct RollSetSpacingOffsetResult: Decodable, Sendable {
 public struct RollApproveParams: Codable, Sendable {
     public let frameIndex: Int
     public let operationId: String
+    /// Attended binding (feed-detector round; issues #24/#16/#42). `nil`
+    /// -- the default and every pre-existing caller -- is omitted from the
+    /// encoded params entirely, so this request stays byte-identical to
+    /// before the field existed. `true` accepts one frame of a roll whose
+    /// lattice confidence is too low to bind unattended; the driver
+    /// refuses it on any other roll shape.
+    public let attended: Bool?
 
-    public init(frameIndex: Int, operationId: String) {
+    public init(frameIndex: Int, operationId: String, attended: Bool? = nil) {
         self.frameIndex = frameIndex
         self.operationId = operationId
+        self.attended = attended
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case frameIndex
+        case operationId
+        case attended
+    }
+
+    // Written out rather than synthesized so the omission of `attended`
+    // when nil is a property of this type, not of whatever the compiler
+    // happens to synthesize for Optionals.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(frameIndex, forKey: .frameIndex)
+        try container.encode(operationId, forKey: .operationId)
+        try container.encodeIfPresent(attended, forKey: .attended)
     }
 }
 

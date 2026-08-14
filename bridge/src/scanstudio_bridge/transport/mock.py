@@ -296,7 +296,13 @@ class MockTransport:
         self._fingerprint = fingerprint
         return domain.PreviewResult(count=self._slot_count, fingerprint=fingerprint)
 
-    def approve(self, slot: int, *, fingerprint: str | None = None) -> None:
+    def approve(
+        self,
+        slot: int,
+        *,
+        fingerprint: str | None = None,
+        attended: bool = False,
+    ) -> None:
         self._require_connected()
         # Additive (2026-08-08 adversarial review, S1) -- see
         # transport.Transport.approve's own docstring. `None` (the default,
@@ -309,7 +315,19 @@ class MockTransport:
                 "that no longer matches the roll's current state; acquire a "
                 "fresh preview or placement and approve again",
             )
-        if slot < 1 or slot > self._slot_count or slot not in self._needs_approval_slots:
+        if slot < 1 or slot > self._slot_count:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, f"slot {slot} does not need approval")
+        # The simulator has no roll-confidence detector, so it has no
+        # medium-confidence roll for an attended acceptance to rescue. It
+        # refuses `attended` rather than pretending to support it -- the
+        # same posture PROTOCOL.md already documents for the simulator's
+        # missing manual-review gate.
+        if attended:
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "attended roll binding is not available on the mock transport",
+            )
+        if slot not in self._needs_approval_slots:
             raise BridgeError(ErrorCode.INVALID_PARAMS, f"slot {slot} does not need approval")
         self._approved_slots.add(slot)
 

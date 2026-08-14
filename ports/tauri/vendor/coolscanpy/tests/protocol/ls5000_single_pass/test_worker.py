@@ -17,6 +17,7 @@ import pytest
 from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
 from coolscanpy.protocol.ls5000_single_pass import manual_frames
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    ATTENDED_ROLL_BINDING_REASON,
     AttemptPaths,
     CaptureAttemptResult,
     CaptureMode,
@@ -3405,6 +3406,285 @@ def test_non_manual_medium_detection_still_refuses_even_with_approval_flags(
             manual_review_approved=True,
             # manual_boundary_rows intentionally omitted: the automatic path.
         )
+
+
+# ---------------------------------------------------------------------------
+# Attended binding (feed-detector round; ScanStudio #24/#16/#42). These tests
+# attack the SECOND path _derive_live_frame_selection's gate grants below
+# "high": an operator who explicitly approved every requested frame of an
+# automatically detected medium-confidence roll. The manual-placement tests
+# above, and test_non_manual_medium_detection_still_refuses_even_with_
+# approval_flags in particular, are the untouched regression proving the old
+# behavior is byte-for-byte intact.
+# ---------------------------------------------------------------------------
+
+
+def _attended_gate_mapping() -> TransportMapping:
+    """An ORDINARY automatic origin: nothing here is flagged for review."""
+
+    origin = NativeFrameOrigin(
+        frame=1,
+        boundary_index=0,
+        boundary_output_row=10,
+        lookup_row=10,
+        code=6 * (10 % 18),
+        selector=10 // 18,
+        native_origin=420,
+        method="affine-transport-fit",
+        automatic=True,
+        manual_review=False,
+        review_reasons=(),
+        affine_residual_rows=0.0,
+    )
+    return TransportMapping(
+        record_count=500,
+        native_intercept=0.0,
+        native_units_per_preview_row=42.0,
+        anchor_mae_rows=0.0,
+        anchor_max_error_rows=0.0,
+        origins=(origin,),
+    )
+
+
+def _wire_attended_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    confidence: str,
+) -> None:
+    """Wire the AUTOMATIC detector path at a chosen roll confidence."""
+
+    rgb = np.zeros((500, 96, 3), dtype=np.uint16)
+    _wire_manual_gate_common(monkeypatch, rgb)
+    # A geometry rich enough for LiveFrameSelection.diagnostics(), so these
+    # tests can assert the JOURNAL the gate produces, not just its verdict.
+    monkeypatch.setattr(
+        worker_module,
+        "_derive_index_geometry",
+        lambda _plan: SimpleNamespace(
+            height=500,
+            pitch=41,
+            native_height=250_278,
+            requested_resolution=97,
+            native_resolution=4000,
+            native_width=4000,
+            width=96,
+            expected_stream_bytes=500 * 96 * 6,
+        ),
+    )
+    detection = _manual_gate_detection(confidence=confidence, user_picked=False)
+    detection.diagnostics = lambda: {"confidence": confidence}
+    mapping = _attended_gate_mapping()
+    monkeypatch.setattr(worker_module, "detect_roll_frames", lambda *_a, **_k: detection)
+    monkeypatch.setattr(
+        worker_module, "scanner_addressable_interval_count", lambda *_a, **_k: 1
+    )
+    monkeypatch.setattr(
+        worker_module, "derive_transport_mapping", lambda *_a, **_k: mapping
+    )
+
+
+def test_attended_medium_detection_binds_and_marks_the_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The field case: automatic roll, medium confidence, operator approved
+    every frame. It binds, and the journal says WHICH mode bound it."""
+
+    _wire_attended_gate(monkeypatch, confidence="medium")
+
+    selection = worker_module._derive_live_frame_selection(
+        [],
+        b"fresh-preview",
+        b"fresh-table",
+        frame=1,
+        attended_roll_binding=True,
+    )
+
+    assert selection.detection.confidence == "medium"
+    assert selection.selected.native_origin == 420
+    assert selection.attended_roll_binding_accepted is True
+    marker = selection.diagnostics()["attended_roll_binding"]
+    assert marker == {
+        "origin": worker_module.ATTENDED_ROLL_BINDING_ACCEPTED_ORIGIN,
+        "detection_confidence": "medium",
+    }
+
+
+def test_high_confidence_binding_is_never_marked_attended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 'high' roll binds on confidence alone and must not be journaled as
+    an attended acceptance, even if every frame happens to be approved --
+    otherwise an evidence audit could not tell the two apart."""
+
+    _wire_attended_gate(monkeypatch, confidence="high")
+
+    selection = worker_module._derive_live_frame_selection(
+        [],
+        b"fresh-preview",
+        b"fresh-table",
+        frame=1,
+        attended_roll_binding=True,
+    )
+
+    assert selection.attended_roll_binding_accepted is False
+    assert selection.diagnostics()["attended_roll_binding"] is None
+
+
+def test_attended_low_confidence_detection_always_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'low' is not rescuable by attendance. The detector never anchored a
+    lattice, so there is no geometry for an operator to vouch for."""
+
+    _wire_attended_gate(monkeypatch, confidence="low")
+
+    with pytest.raises(
+        ProtocolError, match="unattended frame binding requires 'high'"
+    ):
+        worker_module._derive_live_frame_selection(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frame=1,
+            attended_roll_binding=True,
+        )
+
+
+def test_unattended_medium_detection_refuses_with_the_identical_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal a field user sees today must be byte-for-byte unchanged
+    when nobody is attending -- same text, same quoting, same confidence."""
+
+    _wire_attended_gate(monkeypatch, confidence="medium")
+
+    with pytest.raises(ProtocolError) as excinfo:
+        worker_module._derive_live_frame_selection(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frame=1,
+            attended_roll_binding=False,
+        )
+
+    assert str(excinfo.value) == (
+        "roll boundary lattice confidence is 'medium'; "
+        "unattended frame binding requires 'high'"
+    )
+
+
+def _attended_receipt(slot: int, *, attended: bool) -> ManualFrameApproval:
+    reasons: tuple[str, ...] = ("transport-origin-manual-review",)
+    if attended:
+        reasons = (*reasons, ATTENDED_ROLL_BINDING_REASON)
+    return ManualFrameApproval(
+        reviewed_fingerprint_sha256="a" * 64,
+        slot=slot,
+        boundary_offset_rows=0,
+        thumbnail_sha256="b" * 64,
+        reviewed_lookup_row=10,
+        reviewed_native_origin=420,
+        review_reasons=reasons,
+        manual_boundary_rows_sha256=(
+            ManualFrameApproval.digest_manual_boundary_rows(None)
+        ),
+    )
+
+
+def _capture_attended_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    frames: tuple[worker_module.BatchFrameSpec, ...],
+) -> bool:
+    """Run _derive_live_batch_selections far enough to observe the attended
+    verdict it derives, without needing a full live traversal."""
+
+    captured: dict[str, object] = {}
+
+    def fake_selection(*_args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        raise ProtocolError("stop-after-derivation")
+
+    monkeypatch.setattr(
+        worker_module, "_derive_live_frame_selection", fake_selection
+    )
+    reviewed = _reviewed_fingerprint_with_count(6)
+    with pytest.raises(ProtocolError, match="stop-after-derivation"):
+        worker_module._derive_live_batch_selections(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frames,
+            reviewed_fingerprint=reviewed,
+        )
+    verdict = captured["attended_roll_binding"]
+    assert isinstance(verdict, bool)
+    return verdict
+
+
+def _attended_batch(
+    tmp_path: Path, root_name: str, marks: dict[int, bool | None]
+) -> tuple[worker_module.BatchFrameSpec, ...]:
+    frame_root = tmp_path / root_name
+    return tuple(
+        worker_module.BatchFrameSpec(
+            slot=slot,
+            boundary_offset_rows=0,
+            manual_review_approval=(
+                None if attended is None else _attended_receipt(slot, attended=attended)
+            ),
+            output=frame_root / f"frame-{slot:03d}" / "capture.bin",
+            journal=frame_root / f"frame-{slot:03d}" / "journal.json",
+            ack=frame_root / f"frame-{slot:03d}" / "parent-ack.json",
+        )
+        for slot, attended in sorted(marks.items())
+    )
+
+
+def test_batch_derives_attended_only_when_every_frame_is_attended_approved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attendance is all-or-nothing across the requested batch."""
+
+    assert (
+        _capture_attended_flag(
+            monkeypatch, _attended_batch(tmp_path, "all", {1: True, 2: True, 3: True})
+        )
+        is True
+    )
+
+
+def test_batch_partial_attended_approval_is_not_attended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One requested frame the operator did not approve refuses the batch --
+    'they checked the flagged ones' is not the claim this path binds on."""
+
+    assert (
+        _capture_attended_flag(
+            monkeypatch,
+            _attended_batch(tmp_path, "partial", {1: True, 2: None, 3: True}),
+        )
+        is False
+    )
+
+
+def test_batch_ordinary_manual_review_receipts_are_not_attended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch where every frame carries an ORDINARY manual-review receipt
+    is still not attended: the pre-existing per-slot approval flow cannot
+    silently become a roll-level confidence bypass."""
+
+    assert (
+        _capture_attended_flag(
+            monkeypatch,
+            _attended_batch(tmp_path, "ordinary", {1: False, 2: False}),
+        )
+        is False
+    )
 
 
 def test_manual_selection_still_refuses_on_fingerprint_mismatch(
