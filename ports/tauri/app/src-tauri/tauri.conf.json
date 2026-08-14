@@ -15,11 +15,12 @@
         "label": "main",
         "title": "ScanStudio",
         "width": 1200,
-        "height": 800
+        "height": 800,
+        "useHttpsScheme": true
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost scanstudio-preview:"
+      "csp": "default-src 'self' ipc: http://ipc.localhost https://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost scanstudio-preview:"
     }
   },
   "bundle": {

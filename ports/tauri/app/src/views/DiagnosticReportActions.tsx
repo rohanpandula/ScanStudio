@@ -5,6 +5,7 @@ import { readPreviewRasterBytes, saveDiagnosticBundleFile } from "../session/dia
 import { buildErrorReportText, type ErrorReportContext, type SetupCheckProbeSummary } from "../session/errorReport";
 import { describeCpuArchitecture, describeOperatingSystem, getScanStudioVersion } from "../session/hostEnvironment";
 import { setupCheckResults } from "../session/setupCheckResults";
+import { writeClipboardText } from "../session/webApis";
 import type { DeviceInfo, EngineError, ScannerStatus, Thumbnail } from "../session/wire/types";
 
 export interface DiagnosticReportActionsProps {
@@ -35,6 +36,7 @@ export default function DiagnosticReportActions({
   thumbnails,
 }: DiagnosticReportActionsProps) {
   const [didCopyReport, setDidCopyReport] = useState(false);
+  const [clipboardUnavailable, setClipboardUnavailable] = useState(false);
   const [isSavingBundle, setIsSavingBundle] = useState(false);
   const [didSaveBundle, setDidSaveBundle] = useState(false);
 
@@ -80,7 +82,15 @@ export default function DiagnosticReportActions({
 
   const handleCopyReport = async (): Promise<void> => {
     const text = buildErrorReportText(await buildReportContext());
-    await navigator.clipboard.writeText(text);
+    // navigator.clipboard only exists in secure contexts; report
+    // unavailability on the button instead of dying on an unhandled
+    // rejection (the pre-fix Windows behavior).
+    const copied = await writeClipboardText(text);
+    if (!copied) {
+      setClipboardUnavailable(true);
+      setTimeout(() => setClipboardUnavailable(false), 3000);
+      return;
+    }
     setDidCopyReport(true);
     setTimeout(() => setDidCopyReport(false), 1500);
   };
@@ -115,7 +125,7 @@ export default function DiagnosticReportActions({
   return (
     <div data-testid="diagnostic-report-actions">
       <button type="button" onClick={() => void handleCopyReport()} data-testid="copy-report">
-        {didCopyReport ? "Copied" : "Copy Report"}
+        {didCopyReport ? "Copied" : clipboardUnavailable ? "Clipboard unavailable" : "Copy Report"}
       </button>
       <button
         type="button"

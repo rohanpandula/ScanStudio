@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatSetupCheckProbesAsText, setupCheckResults } from "../session/setupCheckResults";
+import { writeClipboardText } from "../session/webApis";
 import styles from "./SetupChecker.module.css";
 
 export type ProbeStatus = "Ok" | "Fail" | "Unknown";
@@ -37,6 +38,7 @@ export default function SetupChecker() {
   const [maxRead, setMaxRead] = useState<MaxReadReport | null>(null);
   const [writeMode, setWriteMode] = useState<string | null>(null);
   const [didCopyProbes, setDidCopyProbes] = useState(false);
+  const [clipboardUnavailable, setClipboardUnavailable] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -75,7 +77,15 @@ export default function SetupChecker() {
   }
 
   const copyProbesAsText = () => {
-    void navigator.clipboard.writeText(formatSetupCheckProbesAsText(probes)).then(() => {
+    // navigator.clipboard only exists in secure contexts; writeClipboardText
+    // reports unavailability instead of throwing so this button can say so
+    // rather than silently doing nothing (the pre-fix Windows behavior).
+    void writeClipboardText(formatSetupCheckProbesAsText(probes)).then((copied) => {
+      if (!copied) {
+        setClipboardUnavailable(true);
+        setTimeout(() => setClipboardUnavailable(false), 3000);
+        return;
+      }
       setDidCopyProbes(true);
       setTimeout(() => setDidCopyProbes(false), 1500);
     });
@@ -91,7 +101,7 @@ export default function SetupChecker() {
         data-testid="copy-probes-as-text"
         aria-label="Copy probe results as text"
       >
-        {didCopyProbes ? "Copied" : "Copy as text"}
+        {didCopyProbes ? "Copied" : clipboardUnavailable ? "Clipboard unavailable" : "Copy as text"}
       </button>
       {writeMode !== "" && (
         <p className={styles.writeMode} data-testid="write-mode-row">

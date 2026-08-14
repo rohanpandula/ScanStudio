@@ -22,6 +22,7 @@
 //   job.
 
 import { decodeEvent, type EngineTransport } from "../wire/codec";
+import { newOperationId } from "../webApis";
 import {
   assertFrameTransition,
   assertJobTransition,
@@ -1073,8 +1074,10 @@ export class SessionStore {
 
   /**
    * Forward to scanner.acquireThumbnails with a fresh correlation token.
-   * Preview correlation policy (04-03 Task 1): a fresh crypto.randomUUID()
-   * is generated per accepted preview; a second call while one is active is
+   * Preview correlation policy (04-03 Task 1): a fresh newOperationId()
+   * (crypto.randomUUID when the context provides it -- see webApis.ts for
+   * why Windows historically did not) is generated per accepted preview; a
+   * second call while one is active is
    * refused locally with no wire call; the previous completed-preview token
    * is cleared immediately at call time (roll.approve trigger 1 -- the new
    * preview supersedes it whether or not it succeeds); and a rejected wire
@@ -1135,7 +1138,7 @@ export class SessionStore {
         recoverable: false,
       } satisfies EngineError;
     }
-    const operationId = crypto.randomUUID();
+    const operationId = newOperationId();
     const effectiveFilmProcess =
       this.#state.project?.filmProcess ??
       filmProcess ??

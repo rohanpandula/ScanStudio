@@ -5,6 +5,7 @@ import {
   type SessionState,
 } from "../session";
 import { sessionOperationBusy } from "../session/store/session";
+import { isEngineError } from "../session/wire/types";
 import type { DerivativeTransform, EngineError, Thumbnail } from "../session/wire/types";
 import styles from "./ContactSheet.module.css";
 
@@ -206,9 +207,17 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
 
   const preview = (): void => {
     const filmProcess = project?.filmProcess ?? state.previewFilmProcessSelection;
-    // SessionStore owns the typed request-failure state. Deliberately consume
-    // the rejection here so a UI click never becomes an unhandled promise.
-    void sessionStore.acquireThumbnails(undefined, filmProcess).catch(() => {});
+    // SessionStore owns the typed request-failure state, so typed rejections
+    // are deliberately consumed here (the store already recorded them). An
+    // untyped rejection means the store threw before recording anything --
+    // exactly how the Windows insecure-context crypto.randomUUID TypeError
+    // made this button a silent no-op on real hardware -- so keep that class
+    // visible instead of swallowing it.
+    void sessionStore.acquireThumbnails(undefined, filmProcess).catch((error: unknown) => {
+      if (!isEngineError(error)) {
+        console.error("preview request threw outside the store's typed error path", error);
+      }
+    });
   };
 
   const frames: number[] = [];
