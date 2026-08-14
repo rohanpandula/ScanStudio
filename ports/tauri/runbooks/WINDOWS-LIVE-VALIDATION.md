@@ -37,15 +37,25 @@ five ids below are the literal id strings the checker rows carry, pinned in
    entrypoint resolves on PATH inside WSL.
 3. confirm the checker row `bridge-version` is green — it verifies the bridge
    entrypoint launches and exits cleanly (bridge presence/version).
-4. confirm the checker row `usbipd-attach` is green — it verifies `usbipd
+4. confirm the checker row `bridge-identity` is green — it verifies the
+   deployed WSL bridge's driver identity files (`bundle.py`,
+   `usb_backend.py`) hash byte-identically to the installed payload's
+   CorrespondingSource copies. The first live Windows validation found a
+   stale bridge (inherited through a VM clone) that stayed green on the
+   presence/startup probes for an entire session and then refused its first
+   real capture on bundle identity; this row binds the deployed bridge to
+   the installed ScanStudio version so that state is visible before any
+   capture. Red here means: re-run `install-bridge-wsl.sh --force`.
+5. confirm the checker row `usbipd-attach` is green — it verifies `usbipd
    list` shows the LS-5000 (VID:PID `04b0:4002`) attached to WSL.
-5. confirm the checker row `webview2` is green — it verifies the WebView2
+6. confirm the checker row `webview2` is green — it verifies the WebView2
    runtime is present via the registry probe.
 
-(The same five probe ids are declared in `app/src-tauri/src/wsl/checker.rs`
+(The same six probe ids are declared in `app/src-tauri/src/wsl/checker.rs`
 as the `PROBE_IDS` constant with underscore spellings — `wsl_status`,
-`bridge_which`, `bridge_version`, `usbipd_attach`, `webview2` — while the
-checker rows themselves carry the hyphenated id strings enumerated above.)
+`bridge_which`, `bridge_version`, `bridge_identity`, `usbipd_attach`,
+`webview2` — while the checker rows themselves carry the hyphenated id
+strings enumerated above.)
 
 Pre-flight re-attach check: `usbipd attach` does not survive a reboot, a
 replug, or a usbipd service restart — only the one-time `usbipd bind` is

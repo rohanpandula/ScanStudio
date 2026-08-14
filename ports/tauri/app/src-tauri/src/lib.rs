@@ -8,10 +8,19 @@ mod wsl;
 /// `fix_command` strings are display-only copy-paste text.
 #[tauri::command]
 fn wsl_run_checks() -> Vec<wsl::checker::ProbeResult> {
+    // The installed payload's driver identity lives next to the executable
+    // (CorrespondingSource/...); a resolution failure reports as the
+    // bridge-identity probe's distinct "installed payload incomplete" Fail
+    // rather than being silently skipped.
+    let payload_identity = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+        .and_then(|dir| wsl::checker::windows_payload_identity(&dir));
     wsl::checker::run_all_probes(
         &wsl::checker::RealCommandExecutor,
         cfg!(target_os = "windows"),
         wsl::bridge_cmd::BRIDGE_ENTRYPOINT,
+        payload_identity.as_ref(),
     )
 }
 

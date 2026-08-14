@@ -3915,6 +3915,39 @@ impl ScannerBackend for RealLs5000 {
         let (session_epoch, bridge_generation) = backend.active_session_identity()?;
         let preview_token =
             backend.begin_preview_approval_window(session_epoch, bridge_generation)?;
+        // WV-5 (first live Windows validation): a preview requested on an
+        // empty transport spent minutes in motion-adjacent work and then
+        // completed with zero frames and no explanation anywhere. Probe the
+        // transport fresh -- the same live status path `scanner.status`
+        // uses, never a cached snapshot, so a just-fed roll can never be
+        // falsely refused -- and refuse typed before any motion when film
+        // is definitively absent. An undetermined probe (None) proceeds:
+        // preview is exactly how presence becomes known on transports that
+        // cannot report it. Deliberately AFTER the approval window opens so
+        // a rejected overlapping preview still makes zero bridge calls; a
+        // refusal here retires the token exactly like a refused
+        // roll.preview below.
+        let fresh = backend
+            .fresh_status_for_session(session_epoch, bridge_generation)
+            .map_err(|error| {
+                backend.retire_preview_approval_window(
+                    preview_token,
+                    session_epoch,
+                    bridge_generation,
+                );
+                error
+            })?;
+        if fresh.film_present == Some(false) {
+            backend.retire_preview_approval_window(
+                preview_token,
+                session_epoch,
+                bridge_generation,
+            );
+            return Err(EngineError::new(
+                ErrorCode::NoMedia,
+                "no film is loaded (the scanner reports film not present); feed the roll or strip, then acquire a fresh preview",
+            ));
+        }
         // "Reject before accepting": validate/round-trip synchronously,
         // exactly like every other ScannerBackend method; the actual
         // preview stream is reported purely through events afterward.

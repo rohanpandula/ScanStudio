@@ -338,6 +338,58 @@ fn preview_motion_not_armed_surfaces_a_typed_public_error() {
     let _ = reader_handle.join();
 }
 
+/// WV-5 (first live Windows validation, 2026-08-13): a preview requested on
+/// an empty transport spent minutes in motion-adjacent work and completed
+/// with zero frames and no explanation anywhere in the UI. The engine now
+/// probes a fresh status before opening the preview lane and refuses typed
+/// (`NO_MEDIA`) when film is definitively absent; the mock's call log proves
+/// `roll.preview` was never sent. A `null` (undetermined) probe still
+/// proceeds -- preview is exactly how presence becomes known on transports
+/// that cannot report it -- so only the definitive `false` is gated.
+#[test]
+fn preview_with_film_definitively_absent_refuses_typed_before_any_motion() {
+    let log_directory = unique_output_destination("film-absent-preview-call-log");
+    let log_path = log_directory.join("bridge-calls.log");
+    std::fs::write(&log_path, "").expect("create mock bridge call log");
+    let log_path_string = log_path.display().to_string();
+    let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
+        "e2e-film-absent-preview",
+        &[
+            ("MOCK_BRIDGE_FILM_PRESENT", "false"),
+            ("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str()),
+        ],
+    );
+
+    std::fs::write(&log_path, "").expect("reset mock bridge call log");
+    send(
+        &mut stdin,
+        3,
+        "scanner.acquireThumbnails",
+        json!({"operationId": "film-absent-preview"}),
+    );
+    let preview = recv_response_for(&rx, 3, |_| {});
+    assert_eq!(
+        preview["error"]["code"], "NO_MEDIA",
+        "a definitively empty transport must refuse the preview typed: {preview:#?}"
+    );
+    let calls = read_mock_bridge_calls(&log_path);
+    assert!(
+        !calls.iter().any(|call| call == "roll.preview"),
+        "the refusal must happen before any motion-capable bridge call: {calls:#?}"
+    );
+    assert!(
+        calls.iter().any(|call| call == "device.status"),
+        "the gate must have probed a fresh status rather than a cached snapshot: {calls:#?}"
+    );
+
+    send(&mut stdin, 4, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 4, |_| {}).get("error").is_none());
+    let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
+    assert!(exit.success(), "engine did not exit 0: {exit:?}");
+    let _ = reader_handle.join();
+    let _ = std::fs::remove_dir_all(log_directory);
+}
+
 /// `roll.approve` is a public, real-device-only acknowledgement of an
 /// existing preview warning. It must make exactly one non-motion bridge call:
 /// it does not refresh status, acquire another preview, or start capture.
@@ -1058,8 +1110,11 @@ fn overlapping_preview_is_rejected_before_bridge_and_cannot_authorize_approval()
     );
     assert_eq!(
         read_mock_bridge_calls(&log_path),
-        vec!["roll.preview"],
-        "the rejected successor must not issue a second roll.preview bridge call"
+        // The accepted first preview probes film presence (one
+        // device.status) and then opens its stream; the rejected successor
+        // must contribute NOTHING to this log -- not a probe, not a preview.
+        vec!["device.status", "roll.preview"],
+        "the rejected successor must not issue any bridge call"
     );
 
     send(
@@ -1075,7 +1130,7 @@ fn overlapping_preview_is_rejected_before_bridge_and_cannot_authorize_approval()
     );
     assert_eq!(
         read_mock_bridge_calls(&log_path),
-        vec!["roll.preview"],
+        vec!["device.status", "roll.preview"],
         "neither the successor preview nor its approval may reach the bridge"
     );
 
@@ -1466,7 +1521,10 @@ fn terminal_scan_status_process_exit_invalidates_once_after_completion() {
 fn terminal_preview_status_process_exit_emits_correlated_disconnect() {
     let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
         "e2e-terminal-preview-status-session-loss",
-        &[("MOCK_BRIDGE_CRASH_ON", "device.status")],
+        // :2 -- the first device.status is the pre-preview film-presence
+        // gate; this test's subject is losing the POST-preview terminal
+        // status refresh.
+        &[("MOCK_BRIDGE_CRASH_ON", "device.status:2")],
     );
     let operation_id = "terminal-preview-status-session-loss-op";
 

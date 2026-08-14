@@ -66,6 +66,44 @@ function scriptedFixture(devices: DeviceInfo[], status?: ScannerStatus): Session
 }
 
 describe("DeviceBar", () => {
+  it("rescan asks the engine for a fresh device list and renders what arrives (WV-2)", async () => {
+    // Live Windows finding: discovery ran only at launch, so a WSL bridge
+    // stack that turned healthy afterwards left the real scanner invisible
+    // until a full app restart. Rescan replaces the restart.
+    const handle = createScriptedTransport({
+      onRequest: (method) => {
+        if (method === "scanner.list") return { result: { devices: [SIM_DEVICE] } };
+        if (method === "scanner.rescan") {
+          return { result: { devices: [SIM_DEVICE, REAL_DEVICE] } };
+        }
+        return { result: undefined };
+      },
+    });
+    mocks.sessionStore = new SessionStore(handle.transport);
+    const user = userEvent.setup();
+    render(<DeviceBar />);
+    expect(await screen.findByText(SIM_DEVICE.model)).toBeInTheDocument();
+    expect(screen.queryByText(REAL_DEVICE.model)).toBeNull();
+
+    await act(async () => {
+      await user.click(screen.getByTestId("rescan-devices"));
+    });
+    expect(await screen.findByText(REAL_DEVICE.model)).toBeInTheDocument();
+  });
+
+  it("rescan is disabled while a device is connected (the engine refuses it then)", async () => {
+    const store = scriptedFixture([SIM_DEVICE], CONNECTED_STATUS);
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<DeviceBar />);
+    const connectButton = await screen.findByRole("button", { name: "Connect" });
+    expect(screen.getByTestId("rescan-devices")).toBeEnabled();
+    await act(async () => {
+      await user.click(connectButton);
+    });
+    expect(screen.getByTestId("rescan-devices")).toBeDisabled();
+  });
+
   it("renders the model and a badge whose text is traceable to the device's kind field", async () => {
     mocks.sessionStore = scriptedFixture([SIM_DEVICE]);
     render(<DeviceBar />);

@@ -855,6 +855,18 @@ export class SessionStore {
     };
   }
 
+  /** Thin forward to scanner.rescan: one deliberate re-attempt of the real
+   * backend's startup for the case the first live Windows validation hit
+   * (WV-2) -- the engine started while the WSL bridge stack was still
+   * coming up, so the real device stayed invisible until a full app
+   * restart. Returns the refreshed device list; the engine refuses while a
+   * device is connected. */
+  async rescanDevices(): Promise<{ devices: DeviceInfo[] }> {
+    return (await this.transport.sendRequest("scanner.rescan", {})) as {
+      devices: DeviceInfo[];
+    };
+  }
+
   /** Thin forward to scanner.status; refreshes connection.status. */
   async refreshStatus(): Promise<ScannerStatus> {
     const recoveryCandidate =

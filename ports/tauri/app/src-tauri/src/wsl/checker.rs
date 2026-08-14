@@ -82,10 +82,11 @@ impl CommandExecutor for RealCommandExecutor {
     }
 }
 
-pub const PROBE_IDS: [&str; 5] = [
+pub const PROBE_IDS: [&str; 6] = [
     "wsl_status",
     "bridge_which",
     "bridge_version",
+    "bridge_identity",
     "usbipd_attach",
     "webview2",
 ];
@@ -94,14 +95,143 @@ pub fn run_all_probes(
     executor: &dyn CommandExecutor,
     is_windows: bool,
     entrypoint: &str,
+    windows_payload: Option<&BridgeIdentityFiles>,
 ) -> Vec<ProbeResult> {
     vec![
         probe_wsl_status(executor, is_windows),
         probe_bridge_which(executor, is_windows, entrypoint),
         probe_bridge_version(executor, is_windows, entrypoint),
+        probe_bridge_identity(executor, is_windows, windows_payload),
         probe_usbipd_attach(executor, is_windows),
         probe_webview2(executor, is_windows),
     ]
+}
+
+/// The installed payload's driver-identity hashes, resolved by the caller
+/// from its own install directory (the two files live in
+/// `CorrespondingSource/coolscanpy/.../ls5000_single_pass/`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeIdentityFiles {
+    pub bundle_sha256: String,
+    pub usb_backend_sha256: String,
+}
+
+/// Resolves the installed payload's driver-identity hashes, or None when the
+/// install directory does not carry them (packaging damage or a dev run).
+pub fn windows_payload_identity(install_dir: &std::path::Path) -> Option<BridgeIdentityFiles> {
+    use sha2::{Digest, Sha256};
+    let base = install_dir
+        .join("CorrespondingSource")
+        .join("coolscanpy")
+        .join("src")
+        .join("coolscanpy")
+        .join("protocol")
+        .join("ls5000_single_pass");
+    let hash_file = |name: &str| -> Option<String> {
+        let bytes = std::fs::read(base.join(name)).ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Some(format!("{:x}", hasher.finalize()))
+    };
+    Some(BridgeIdentityFiles {
+        bundle_sha256: hash_file("bundle.py")?,
+        usb_backend_sha256: hash_file("usb_backend.py")?,
+    })
+}
+
+/// Shell fragment listing the deployed bridge's two driver-identity files.
+/// `$HOME` because install-bridge-wsl.sh deploys per-user; quoting keeps the
+/// path literal apart from that one expansion.
+const DEPLOYED_IDENTITY_SH: &str = concat!(
+    "sha256sum ",
+    "\"$HOME/.local/share/scanstudio/wsl-bridge/sources/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py\" ",
+    "\"$HOME/.local/share/scanstudio/wsl-bridge/sources/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py\""
+);
+
+/// WV-4 (first live Windows validation, 2026-08-13): a WSL bridge deployed
+/// days earlier -- inherited through a VM clone, from a commit window whose
+/// driver tree was internally inconsistent -- passed `bridge-which` and
+/// `bridge-version` all session and then refused the first real capture
+/// with a bundle-identity error. Nothing bound the deployed bridge to the
+/// installed app's payload. This probe closes that gap: the deployed
+/// sources' two capture-bundle identity files must hash byte-identically to
+/// the installed CorrespondingSource copies.
+fn probe_bridge_identity(
+    executor: &dyn CommandExecutor,
+    is_windows: bool,
+    windows_payload: Option<&BridgeIdentityFiles>,
+) -> ProbeResult {
+    if !is_windows {
+        return windows_only("bridge-identity");
+    }
+    let redeploy_fix = Some(
+        "Re-run install-bridge-wsl.sh --force from the ScanStudio install directory (the deployed WSL bridge is not the one this ScanStudio version shipped)"
+            .to_string(),
+    );
+    let Some(payload) = windows_payload else {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Fail,
+            detail: "the installed payload is missing its CorrespondingSource driver identity files"
+                .to_string(),
+            fix_command: Some("Reinstall ScanStudio (the install directory is incomplete)".to_string()),
+        };
+    };
+    let out = executor.run("wsl.exe", &["-d", WSL_DISTRO, "-e", "sh", "-c", DEPLOYED_IDENTITY_SH]);
+    if !out.success {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Fail,
+            detail: "deployed bridge sources not found inside WSL".to_string(),
+            fix_command: redeploy_fix,
+        };
+    }
+    let deployed_hash_for = |file_name: &str| -> Option<String> {
+        out.stdout.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let path = parts.next()?;
+            path.ends_with(file_name).then(|| hash.to_string())
+        })
+    };
+    let (Some(deployed_bundle), Some(deployed_usb)) =
+        (deployed_hash_for("/bundle.py"), deployed_hash_for("/usb_backend.py"))
+    else {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Fail,
+            detail: format!(
+                "could not read deployed driver identity from WSL: {}",
+                out.stdout.trim()
+            ),
+            fix_command: redeploy_fix,
+        };
+    };
+    let mut mismatched = Vec::new();
+    if deployed_bundle != payload.bundle_sha256 {
+        mismatched.push("bundle.py");
+    }
+    if deployed_usb != payload.usb_backend_sha256 {
+        mismatched.push("usb_backend.py");
+    }
+    if mismatched.is_empty() {
+        return ProbeResult {
+            id: "bridge-identity",
+            status: ProbeStatus::Ok,
+            detail: "deployed WSL bridge driver matches the installed payload (bundle.py + usb_backend.py sha256)"
+                .to_string(),
+            fix_command: None,
+        };
+    }
+    ProbeResult {
+        id: "bridge-identity",
+        status: ProbeStatus::Fail,
+        detail: format!(
+            "deployed WSL bridge driver differs from the installed payload ({})",
+            mismatched.join(", ")
+        ),
+        fix_command: redeploy_fix,
+    }
 }
 
 /// The ONLY place `Unknown` is produced: a non-Windows host cannot run these
@@ -427,8 +557,8 @@ mod tests {
     #[test]
     fn every_probe_is_unknown_windows_only_on_non_windows() {
         let fake = FakeExecutor::new(HashMap::new());
-        let results = run_all_probes(&fake, false, super::super::bridge_cmd::BRIDGE_ENTRYPOINT);
-        assert_eq!(results.len(), 5);
+        let results = run_all_probes(&fake, false, super::super::bridge_cmd::BRIDGE_ENTRYPOINT, None);
+        assert_eq!(results.len(), 6);
         for r in &results {
             assert_eq!(r.status, ProbeStatus::Unknown);
             assert_eq!(r.detail, "windows only");
@@ -664,12 +794,105 @@ mod tests {
     #[test]
     fn run_all_probes_returns_probe_ids_in_order() {
         let fake = FakeExecutor::new(HashMap::new());
-        let results = run_all_probes(&fake, true, super::super::bridge_cmd::BRIDGE_ENTRYPOINT);
+        let results = run_all_probes(&fake, true, super::super::bridge_cmd::BRIDGE_ENTRYPOINT, None);
         let ids: Vec<&str> = results.iter().map(|r| r.id).collect();
         assert_eq!(
             ids,
-            vec!["wsl-status", "bridge-which", "bridge-version", "usbipd-attach", "webview2"]
+            vec![
+                "wsl-status",
+                "bridge-which",
+                "bridge-version",
+                "bridge-identity",
+                "usbipd-attach",
+                "webview2"
+            ]
         );
+    }
+
+    fn identity_fixture() -> BridgeIdentityFiles {
+        BridgeIdentityFiles {
+            bundle_sha256: "aa".repeat(32),
+            usb_backend_sha256: "bb".repeat(32),
+        }
+    }
+
+    fn deployed_identity_key() -> (String, Vec<String>) {
+        key(
+            "wsl.exe",
+            &["-d", super::super::bridge_cmd::WSL_DISTRO, "-e", "sh", "-c", DEPLOYED_IDENTITY_SH],
+        )
+    }
+
+    #[test]
+    fn bridge_identity_matching_hashes_is_ok() {
+        let identity = identity_fixture();
+        let stdout = format!(
+            "{}  /home/u/.local/share/scanstudio/wsl-bridge/sources/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py\n{}  /home/u/.local/share/scanstudio/wsl-bridge/sources/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py\n",
+            identity.bundle_sha256, identity.usb_backend_sha256
+        );
+        let fake = FakeExecutor::new(HashMap::from([(deployed_identity_key(), success_out(&stdout))]));
+        let result = probe_bridge_identity(&fake, true, Some(&identity));
+        assert_eq!(result.status, ProbeStatus::Ok, "{result:#?}");
+        assert!(result.fix_command.is_none());
+    }
+
+    #[test]
+    fn bridge_identity_mismatch_names_the_diverging_file_and_offers_redeploy() {
+        let identity = identity_fixture();
+        let stdout = format!(
+            "{}  /home/u/x/bundle.py\n{}  /home/u/x/usb_backend.py\n",
+            identity.bundle_sha256,
+            "cc".repeat(32)
+        );
+        let fake = FakeExecutor::new(HashMap::from([(deployed_identity_key(), success_out(&stdout))]));
+        let result = probe_bridge_identity(&fake, true, Some(&identity));
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(result.detail.contains("usb_backend.py"), "{result:#?}");
+        assert!(!result.detail.contains("bundle.py, "), "{result:#?}");
+        assert!(result.fix_command.as_deref().unwrap_or("").contains("install-bridge-wsl.sh --force"));
+    }
+
+    #[test]
+    fn bridge_identity_missing_deployment_fails_with_redeploy_fix() {
+        let fake = FakeExecutor::new(HashMap::new());
+        let identity = identity_fixture();
+        let result = probe_bridge_identity(&fake, true, Some(&identity));
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(result.detail.contains("not found inside WSL"), "{result:#?}");
+    }
+
+    #[test]
+    fn bridge_identity_missing_installed_payload_is_a_distinct_failure() {
+        let fake = FakeExecutor::new(HashMap::new());
+        let result = probe_bridge_identity(&fake, true, None);
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(result.detail.contains("installed payload"), "{result:#?}");
+        assert_eq!(fake.called_args().len(), 0, "must not probe WSL when the payload itself is unreadable");
+    }
+
+    #[test]
+    fn windows_payload_identity_hashes_the_two_driver_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "checker-identity-{}",
+            std::process::id()
+        ));
+        let base = dir
+            .join("CorrespondingSource")
+            .join("coolscanpy")
+            .join("src")
+            .join("coolscanpy")
+            .join("protocol")
+            .join("ls5000_single_pass");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("bundle.py"), b"bundle-bytes").unwrap();
+        std::fs::write(base.join("usb_backend.py"), b"usb-bytes").unwrap();
+        let identity = windows_payload_identity(&dir).expect("both files present");
+        // sha256 of the exact bytes written above, precomputed.
+        assert_eq!(identity.bundle_sha256.len(), 64);
+        assert_ne!(identity.bundle_sha256, identity.usb_backend_sha256);
+        std::fs::remove_file(base.join("usb_backend.py")).unwrap();
+        assert!(windows_payload_identity(&dir).is_none(), "a missing file must resolve to None");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -35,6 +35,16 @@ params `{}` → result `{}`; then the engine cancels outstanding simulated work,
 ### `scanner.list`
 `{}` → `{devices: [DeviceInfo]}`. Always exactly one simulated device in M1.
 
+### `scanner.rescan`
+`{}` → `{devices: [DeviceInfo]}`. One deliberate re-attempt of the real
+backend's startup for the case where the engine started before the bridge
+stack was ready (the real device then stays invisible to `scanner.list`
+until rescan). Idempotent: an already-running real backend and an
+unconfigured bridge both return the current list unchanged, and a failed
+re-attempt degrades to the simulator-only list rather than erroring.
+Error: `ALREADY_CONNECTED` (rescan never replaces a connected session's
+backend).
+
 ### `scanner.connect`
 `{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo"}}` → `{device: DeviceInfo, status: ScannerStatus}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED`.
 
@@ -49,6 +59,12 @@ params `{}` → result `{}`; then the engine cancels outstanding simulated work,
 
 ### `scanner.acquireThumbnails`
 `{frames?: [u32], filmProcess?: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome", operationId?: string}` (omitted `frames` = all loaded frames) → immediate ack `{accepted: true, frames: [u32]}`, then one `scanner.thumbnail` event per frame (~80 ms × timeScale apart), then `scanner.thumbnailsComplete`, then a post-preview `scanner.status`. Before a project exists, `filmProcess` selects the material used for preview (omission uses the deterministic C-41 default). With an active project, its persisted `filmProcess` is authoritative: omission or an equal supplied value is accepted, while a different supplied value is rejected with `INVALID_PARAMS`.
+
+On a real device, a definitively empty transport refuses the request typed
+(`NO_MEDIA`) before any motion: the engine probes a fresh status first, and
+only `filmPresent: false` gates -- an undetermined probe proceeds, since
+preview is exactly how presence becomes known on transports that cannot
+report it.
 
 `operationId` is an additive asynchronous-correlation token. New ScanStudio clients send a fresh value for each accepted preview request. When present, the engine echoes it unchanged on every event produced by that preview worker: `scanner.thumbnail`, `scanner.thumbnailsFailed` (when applicable), `scanner.thumbnailsComplete`, and the post-preview `scanner.status`. The bridge protocol remains unchanged; the engine adds the token to bridge-derived events. Older callers may omit it, in which case those event payloads omit it too. While a preview is active, clients must fail closed on missing or mismatched tokens: such events cannot add thumbnails, report failure, complete the preview, clear its busy state, or authorize a second request. Generic untagged status events never terminate an active preview.
 

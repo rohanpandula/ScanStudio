@@ -70,6 +70,13 @@ struct MockState {
     /// its terminal success event. These atomics are shared with that worker
     /// so a pending preview cannot masquerade as completed.
     preview_established: Arc<AtomicBool>,
+    /// True from `roll.preview` acceptance until `device.close` -- the
+    /// "a preview has been requested this session" half of the
+    /// WHILE_PREVIEW_PENDING hang seam (pending = requested and not yet
+    /// established). The engine's pre-preview film probe issues a
+    /// legitimate `device.status` BEFORE any preview; that probe must
+    /// never fall into the pending-status hang.
+    preview_requested: Arc<AtomicBool>,
     preview_slot_count: Arc<AtomicU32>,
 }
 
@@ -93,9 +100,21 @@ fn main() {
     let version_mismatch = std::env::var("MOCK_BRIDGE_VERSION_MISMATCH")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
-    let crash_on = std::env::var("MOCK_BRIDGE_CRASH_ON")
+    // `method` or `method:N` -- crash on the Nth occurrence of that method
+    // (default 1). The engine's pre-preview film probe added a legitimate
+    // early `device.status`, so tests that target a LATER status read (the
+    // post-preview terminal refresh) name the occurrence explicitly.
+    let crash_on: Option<(String, u32)> = std::env::var("MOCK_BRIDGE_CRASH_ON")
         .ok()
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .map(|v| match v.split_once(':') {
+            Some((method, n)) => (
+                method.to_string(),
+                n.parse::<u32>().ok().filter(|n| *n >= 1).unwrap_or(1),
+            ),
+            None => (v, 1),
+        });
+    let crash_on_seen = AtomicU32::new(0);
     // Scan-path silence-watchdog test double: when set, scan.start still accepts
     // normally (the bridge process and its main dispatch loop stay fully
     // alive and responsive to every other request) but the job's worker
@@ -351,6 +370,7 @@ fn main() {
         status_hang_active: false,
         call_log_path,
         preview_established: Arc::new(AtomicBool::new(false)),
+        preview_requested: Arc::new(AtomicBool::new(false)),
         preview_slot_count: Arc::new(AtomicU32::new(0)),
     };
     let mut hello_received = false;
@@ -383,8 +403,12 @@ fn main() {
         // Simulated hard crash: checked first, before any other handling
         // of this request (including the hello gate below), so it fires
         // regardless of which method triggers it.
-        if crash_on.as_deref() == Some(request.method.as_str()) {
-            std::process::exit(1);
+        if let Some((crash_method, crash_occurrence)) = &crash_on {
+            if crash_method == request.method.as_str()
+                && crash_on_seen.fetch_add(1, Ordering::SeqCst) + 1 == *crash_occurrence
+            {
+                std::process::exit(1);
+            }
         }
 
         // 10-06: once armed (inside the "scan.start" arm below),
@@ -395,6 +419,7 @@ fn main() {
         if request.method == "device.status"
             && (state.status_hang_active
                 || (hang_status_while_preview_pending
+                    && state.preview_requested.load(Ordering::Acquire)
                     && !state.preview_established.load(Ordering::Acquire)))
         {
             if let Some(trigger_path) = exit_trigger_on_hung_status.clone() {
@@ -577,6 +602,7 @@ fn handle_request(
             require_open(state)?;
             state.device_open = false;
             state.preview_established.store(false, Ordering::Release);
+            state.preview_requested.store(false, Ordering::Release);
             state.preview_slot_count.store(0, Ordering::Release);
             let status = current_status(state, false);
             emit_event(tx, "device.status", BridgeDeviceStatusPayload { status });
@@ -591,6 +617,7 @@ fn handle_request(
                 ));
             }
             let _params: BridgeRollPreviewParams = parse_params(&request.params)?;
+            state.preview_requested.store(true, Ordering::Release);
             state.preview_established.store(false, Ordering::Release);
             state.preview_slot_count.store(0, Ordering::Release);
             spawn_roll_preview_worker(

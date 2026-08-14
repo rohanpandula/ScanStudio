@@ -163,6 +163,10 @@ struct Backends {
     sim: Arc<SimulatedLs5000>,
     real: Option<Arc<RealLs5000>>,
     active: Option<ActiveDevice>,
+    /// The configured bridge command, retained so `scanner.rescan` can
+    /// re-attempt the real-backend startup that `from_env` performs exactly
+    /// once. None when `SCANSTUDIO_BRIDGE_CMD` is unset/empty.
+    bridge_cmd: Option<String>,
 }
 
 impl Backends {
@@ -175,25 +179,61 @@ impl Backends {
     /// (T-09-11).
     fn from_env() -> Self {
         let sim = Arc::new(SimulatedLs5000::new());
-        let real = match std::env::var("SCANSTUDIO_BRIDGE_CMD") {
-            Ok(cmd) if !cmd.trim().is_empty() => {
-                match RealLs5000::new(&cmd, DEFAULT_BRIDGE_TIMEOUT) {
-                    Ok(backend) => Some(Arc::new(backend)),
-                    Err(err) => {
-                        eprintln!(
-                            "scanstudio-engine: SCANSTUDIO_BRIDGE_CMD configured ('{cmd}') but the real backend could not start ({err}); falling back to simulator-only scanner.list"
-                        );
-                        None
-                    }
-                }
-            }
+        let bridge_cmd = match std::env::var("SCANSTUDIO_BRIDGE_CMD") {
+            Ok(cmd) if !cmd.trim().is_empty() => Some(cmd),
             _ => None,
+        };
+        let real = match &bridge_cmd {
+            Some(cmd) => match RealLs5000::new(cmd, DEFAULT_BRIDGE_TIMEOUT) {
+                Ok(backend) => Some(Arc::new(backend)),
+                Err(err) => {
+                    eprintln!(
+                        "scanstudio-engine: SCANSTUDIO_BRIDGE_CMD configured ('{cmd}') but the real backend could not start ({err}); falling back to simulator-only scanner.list"
+                    );
+                    None
+                }
+            },
+            None => None,
         };
         Backends {
             sim,
             real,
             active: None,
+            bridge_cmd,
         }
+    }
+
+    /// `scanner.rescan`: one deliberate re-attempt of the real-backend
+    /// startup `from_env` performs exactly once. Live-motivated (first
+    /// Windows hardware validation, WV-2): the engine starts while the WSL
+    /// bridge stack is still coming up, the single startup attempt times
+    /// out, and the real device stays invisible until a full app restart.
+    /// Idempotent by construction -- an already-running real backend and an
+    /// unconfigured `SCANSTUDIO_BRIDGE_CMD` both return the current list
+    /// unchanged -- and a failed re-attempt degrades to the same sim-only
+    /// list as `from_env` (T-09-11), never an error. Refused while any
+    /// device is connected so an active session's backend can never be
+    /// replaced underneath it (same invariant as T-09-12).
+    fn rescan(&mut self) -> Result<Vec<domain::DeviceInfo>, EngineError> {
+        if self.active.is_some() {
+            return Err(EngineError::new(
+                ErrorCode::AlreadyConnected,
+                "disconnect the active device before rescanning for devices",
+            ));
+        }
+        if self.real.is_none() {
+            if let Some(cmd) = &self.bridge_cmd {
+                match RealLs5000::new(cmd, DEFAULT_BRIDGE_TIMEOUT) {
+                    Ok(backend) => self.real = Some(Arc::new(backend)),
+                    Err(err) => {
+                        eprintln!(
+                            "scanstudio-engine: scanner.rescan could not start the real backend ({err}); the device list stays simulator-only"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(self.list_devices())
     }
 
     /// `scanner.list`: the simulator always, plus the real device only if
@@ -981,6 +1021,9 @@ fn handle_request(
         }
         "scanner.list" => to_json(&protocol::ScannerListResult {
             devices: backends.list_devices(),
+        }),
+        "scanner.rescan" => to_json(&protocol::ScannerListResult {
+            devices: backends.rescan()?,
         }),
         "scanner.connect" => {
             let params: protocol::ConnectParams = parse_params(&request.params)?;
@@ -2061,11 +2104,52 @@ mod tests {
     }
 
     #[test]
+    fn rescan_without_a_configured_bridge_is_an_idempotent_no_op() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+        };
+        let devices = backends.rescan().expect("rescan without a bridge cmd is a no-op");
+        assert_eq!(devices.len(), 1, "sim-only list stays sim-only: {devices:#?}");
+        assert!(backends.real.is_none());
+    }
+
+    #[test]
+    fn rescan_with_a_broken_bridge_cmd_degrades_to_sim_only_like_startup() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: Some("/nonexistent-wv2-rescan-bridge-cmd".to_string()),
+        };
+        let devices = backends
+            .rescan()
+            .expect("a broken bridge cmd must degrade exactly like from_env, never error");
+        assert_eq!(devices.len(), 1, "{devices:#?}");
+        assert!(backends.real.is_none());
+    }
+
+    #[test]
+    fn rescan_refuses_while_a_device_is_connected() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: Some(ActiveDevice::Sim),
+            bridge_cmd: None,
+        };
+        let error = backends.rescan().expect_err("rescan must refuse while connected");
+        assert_eq!(error.code, ErrorCode::AlreadyConnected);
+    }
+
+    #[test]
     fn acquire_thumbnails_uses_a_matching_active_project_film_process() {
         let mut backends = Backends {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2120,6 +2204,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2175,6 +2260,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let request = Request {
@@ -2196,6 +2282,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2263,6 +2350,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2306,6 +2394,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2325,6 +2414,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2366,6 +2456,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2424,6 +2515,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2493,6 +2585,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2574,6 +2667,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2617,6 +2711,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2672,6 +2767,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2704,6 +2800,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2746,6 +2843,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default(); // no project ever opened
@@ -2765,6 +2863,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2801,6 +2900,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2854,6 +2954,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2908,6 +3009,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2957,6 +3059,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3053,6 +3156,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3094,6 +3198,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default(); // no project.create call
@@ -3118,6 +3223,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3231,6 +3337,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3367,6 +3474,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3435,6 +3543,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3490,6 +3599,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3553,6 +3663,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3612,6 +3723,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3678,6 +3790,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3786,6 +3899,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3931,6 +4045,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4087,6 +4202,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4116,6 +4232,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4216,6 +4333,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4290,6 +4408,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4347,6 +4466,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let directory = temp_test_dir("all-off-effective-override");
@@ -4403,6 +4523,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4438,6 +4559,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4628,6 +4750,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4670,6 +4793,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4768,6 +4892,7 @@ mod tests {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
+            bridge_cmd: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
