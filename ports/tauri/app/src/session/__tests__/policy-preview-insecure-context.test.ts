@@ -33,6 +33,10 @@ const STATUS: ScannerStatus = {
   lamp: "stable",
   transport: "idle",
   activeJobId: null,
+  // The live Windows state this test reproduces: armed and idle, so the
+  // rendered Preview button would be enabled (previewDisabled false).
+  motionArmed: true,
+  filmPresent: true,
 };
 
 const UUID_V4_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

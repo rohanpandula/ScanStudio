@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost https://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost scanstudio-preview:"
+      "csp": "default-src 'self' ipc: http://ipc.localhost https://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost scanstudio-preview: http://scanstudio-preview.localhost https://scanstudio-preview.localhost"
     }
   },
   "bundle": {

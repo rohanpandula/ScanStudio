@@ -1138,7 +1138,28 @@ export class SessionStore {
         recoverable: false,
       } satisfies EngineError;
     }
-    const operationId = newOperationId();
+    // newOperationId never throws by contract, but the pre-wire section must
+    // stay visible if a platform surprise ever violates that again: the
+    // Windows insecure-context TypeError thrown here (bare crypto.randomUUID,
+    // pre-fix) was swallowed by the caller's rejection consumer and left no
+    // trace at all. Any throw before the wire call now records a typed
+    // request failure so the existing failure banner renders it.
+    let operationId: string;
+    try {
+      operationId = newOperationId();
+    } catch (error) {
+      const requestError: EngineError = {
+        code: "INTERNAL",
+        message:
+          error instanceof Error
+            ? `preview operation id could not be created: ${error.message}`
+            : "preview operation id could not be created",
+        recoverable: false,
+      };
+      this.#state.previewRequestFailure = { operationId: "preview-id-unavailable", error: requestError };
+      this.#notify();
+      throw error;
+    }
     const effectiveFilmProcess =
       this.#state.project?.filmProcess ??
       filmProcess ??

@@ -24,7 +24,14 @@
  * bare call -- can never throw. */
 export function newOperationId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
+    // The existence check and the call are separate invariants: a runtime
+    // could expose the property and still throw on invocation (the exact
+    // bug class this module exists to close), so the call is guarded too.
+    try {
+      return crypto.randomUUID();
+    } catch {
+      // fall through to the Math.random fallback below
+    }
   }
   let uuid = "";
   for (let index = 0; index < 32; index += 1) {
@@ -41,6 +48,49 @@ export function newOperationId(): string {
     }
   }
   return uuid;
+}
+
+/** One-line description of the runtime's secure-context API availability,
+ * shown by the Windows setup checker. This is the discriminating fact the
+ * first live Windows validation never captured directly: whether the
+ * webview treats its origin as a secure context, and whether the two APIs
+ * this module guards actually exist. */
+export function describeWebApiAvailability(): string {
+  const secure =
+    typeof window !== "undefined" && window.isSecureContext === true ? "yes" : "no";
+  const uuid =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? "available"
+      : "missing";
+  const clipboard =
+    typeof navigator !== "undefined" && navigator.clipboard !== undefined
+      ? "available"
+      : "missing";
+  return `secure context ${secure}; uuid ${uuid}; clipboard ${clipboard}`;
+}
+
+/** Platform-correct URL for a scanstudio-preview protocol resource.
+ *
+ * On macOS and Linux the webview loads custom protocols directly
+ * (`scanstudio-preview://localhost/...`). On Windows, wry serves every
+ * custom protocol through an `http(s)://<scheme>.localhost` origin instead
+ * -- the raw custom-scheme URL is unknown to WebView2 and the request
+ * never reaches the Rust handler. The document's own origin reveals which
+ * world we are in: a `*.localhost` hostname means the wry mapping is
+ * active, and mirroring the document's protocol tracks useHttpsScheme
+ * automatically. The Rust handler reads only the query string, so both
+ * URL forms hit the same code path. */
+export function previewImageSrc(
+  imagePath: string,
+  loc?: Pick<Location, "protocol" | "hostname">,
+): string {
+  const location =
+    loc ?? (typeof window !== "undefined" && window.location ? window.location : undefined);
+  const query = `?id=${encodeURIComponent(imagePath)}`;
+  if (location !== undefined && location.hostname.endsWith(".localhost")) {
+    return `${location.protocol}//scanstudio-preview.localhost/${query}`;
+  }
+  return `scanstudio-preview://localhost/${query}`;
 }
 
 /** Writes text to the system clipboard when the Clipboard API exists.

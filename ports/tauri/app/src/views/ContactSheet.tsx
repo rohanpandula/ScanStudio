@@ -5,6 +5,7 @@ import {
   type SessionState,
 } from "../session";
 import { sessionOperationBusy } from "../session/store/session";
+import { previewImageSrc } from "../session/webApis";
 import { isEngineError } from "../session/wire/types";
 import type { DerivativeTransform, EngineError, Thumbnail } from "../session/wire/types";
 import styles from "./ContactSheet.module.css";
@@ -552,13 +553,13 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
             let content: React.ReactNode;
             if (thumbnail?.imagePath !== undefined) {
               // Strict one-of rule (PROTOCOL.md Thumbnail): an imagePath tile
-              // decodes via Phase 3's scanstudio-preview:// protocol -- never
-              // convertFileSrc, never base64-over-invoke.
+              // decodes via Phase 3's scanstudio-preview protocol -- never
+              // convertFileSrc, never base64-over-invoke. previewImageSrc
+              // picks the platform-correct URL form (Windows serves custom
+              // protocols through an http(s)://<scheme>.localhost origin).
               content = (
                 <img
-                      src={`scanstudio-preview://localhost/?id=${encodeURIComponent(
-                        thumbnail.imagePath,
-                      )}`}
+                      src={previewImageSrc(thumbnail.imagePath)}
                   alt={`Frame ${frameIndex}`}
                   data-testid={`tile-image-${frameIndex}`}
                   data-axis-swapped={swapsAxes}

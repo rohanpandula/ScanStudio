@@ -18,6 +18,7 @@ import type {
   PreviewMetadataCommandResult,
 } from "../session/wire/types";
 import MetadataPanel from "./MetadataPanel";
+import { useClipboardCopy } from "./useClipboardCopy";
 import styles from "./Metadata.module.css";
 
 export interface FrameMetadataOverrideProps {
@@ -114,14 +115,13 @@ export default function FrameMetadataOverride({
     }
   };
 
+  const { status: copyStatus, copy: copyToClipboard } = useClipboardCopy();
+
   const copyArguments = async (): Promise<void> => {
     if (authoritativePreview === null || authoritativePreview.arguments.length === 0) return;
-    try {
-      await navigator.clipboard?.writeText(authoritativePreview.arguments.join("\n"));
-    } catch {
-      // Clipboard unavailable (non-secure context / jsdom): the block is
-      // still fully readable and the copy button is purely additive.
-    }
+    // The hook reports clipboard unavailability (non-secure context) on the
+    // button; the block is still fully readable either way.
+    await copyToClipboard(authoritativePreview.arguments.join("\n"));
   };
 
   return (
@@ -222,7 +222,11 @@ export default function FrameMetadataOverride({
                   disabled={authoritativePreview.arguments.length === 0}
                   onClick={() => void copyArguments()}
                 >
-                  Copy
+                  {copyStatus === "copied"
+                    ? "Copied"
+                    : copyStatus === "unavailable"
+                      ? "Clipboard unavailable"
+                      : "Copy"}
                 </button>
               </div>
               <pre className={styles.argBlock} data-testid="exiftool-arguments">
