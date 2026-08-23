@@ -1315,3 +1315,121 @@ def test_session_pixel_arrays_cannot_be_made_writeable(tmp_path: Path) -> None:
         session.preview.rgb.setflags(write=True)
     with pytest.raises(ValueError):
         session.slots[0].thumbnail.setflags(write=True)
+
+
+# -- ScanStudio #16: the three valid preview journal shapes --------------------
+#
+# A real Roll.preview() always runs as a held preview. Its journal is valid
+# in exactly three shapes: paused at the hold boundary (awaiting-hold-job),
+# and its two terminal states after the hold decision -- released or
+# ejected (status flips to complete, unit_released to True, capture_mode
+# stays preview-and-hold). A REFUSED preview is always torn down before its
+# evidence is recorded, so the on-disk journal a later manual_frames()/
+# preview_strip() reconstruction reads is always one of the terminal
+# states; refusing those made the manual-placement fallback crash INTERNAL
+# on exactly the field reports it existed for.
+
+
+def _held_preview_fixture(
+    tmp_path: Path,
+    *,
+    terminal: str | None,
+) -> PreviewFixture:
+    """The preview-only fixture rewritten into the preview-and-hold shape.
+
+    ``terminal=None`` pauses at the hold boundary; ``"released"`` and
+    ``"ejected"`` apply the worker's post-decision teardown stamps; any
+    other value produces an inconsistent journal that must stay refused.
+    """
+    fixture = _preview_fixture(tmp_path)
+    journal = json.loads(json.dumps(fixture.result.journal))
+    receipt = json.loads(json.dumps(journal["preview_only_receipt"]))
+    mapping_path = Path(journal["live_index_artifacts"]["mapping"])
+    receipt["status"] = "preview-and-hold-awaiting-job"
+    mapping_path.write_text(json.dumps(receipt), encoding="utf-8")
+    journal["capture_mode"] = "preview-and-hold"
+    journal["hold_session_id"] = "a" * 32
+    journal["hold_ready_unix"] = 0.0
+    journal["preview_only_receipt"] = receipt
+    if terminal is None:
+        journal["status"] = "awaiting-hold-job"
+        journal["unit_released"] = False
+    elif terminal in ("released", "ejected"):
+        journal["status"] = "complete"
+        journal["unit_released"] = True
+        journal["hold_outcome"] = terminal
+        if terminal == "ejected":
+            journal["eject"] = {
+                "eject_cdb_status": "0000000000000000",
+                "eject_execute_status": "0000000000000000",
+                "terminal_sense": "023a00",
+                "wait_polls": 5,
+                "stall_recoveries": 0,
+            }
+    else:
+        journal["status"] = "complete"
+        journal["unit_released"] = True
+        journal["hold_outcome"] = terminal
+    journal_path = fixture.result.paths.journal
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    return replace(fixture, result=replace(fixture.result, journal=journal))
+
+
+def test_held_preview_journal_at_its_hold_boundary_builds_a_session(
+    tmp_path: Path,
+) -> None:
+    session = build_roll_preview_session(_held_preview_fixture(tmp_path, terminal=None).result)
+
+    assert len(session.slots) == 40
+
+
+def test_released_hold_journal_builds_a_session(tmp_path: Path) -> None:
+    """#16: the terminal shape every refused preview leaves on disk must
+    validate -- manual_frames()/preview_strip() reconstruct their attempt
+    from exactly this journal."""
+
+    session = build_roll_preview_session(
+        _held_preview_fixture(tmp_path, terminal="released").result
+    )
+
+    assert len(session.slots) == 40
+
+
+def test_ejected_hold_journal_builds_a_session(tmp_path: Path) -> None:
+    session = build_roll_preview_session(
+        _held_preview_fixture(tmp_path, terminal="ejected").result
+    )
+
+    assert len(session.slots) == 40
+
+
+@pytest.mark.parametrize("outcome", ["resumed-as-batch", "mystery"])
+def test_non_preview_hold_outcomes_stay_refused(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    """A hold resumed into a fine scan moves bytes through other artifacts
+    and stamps non-preview fields -- it is not preview evidence and must
+    keep failing closed (as must any unrecognized outcome)."""
+
+    with pytest.raises(RollSessionIntegrityError):
+        build_roll_preview_session(
+            _held_preview_fixture(tmp_path, terminal=outcome).result
+        )
+
+
+def test_held_journal_claiming_release_without_an_outcome_stays_refused(
+    tmp_path: Path,
+) -> None:
+    """unit_released=True under capture_mode=preview-and-hold with no
+    hold_outcome is not a shape the worker ever writes; treating it as the
+    held-at-boundary shape would demand awaiting-hold-job and refuse --
+    assert exactly that fail-closed behavior."""
+
+    fixture = _held_preview_fixture(tmp_path, terminal="released")
+    journal = json.loads(json.dumps(fixture.result.journal))
+    del journal["hold_outcome"]
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(RollSessionIntegrityError, match="status"):
+        build_roll_preview_session(replace(fixture.result, journal=journal))

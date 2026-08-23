@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Roll previews whose physical inter-frame gaps are present but partially
+  occluded no longer refuse outright as low confidence (ScanStudio #16).
+  This is the field signature of full-roll-modified SA-21 strip feeders:
+  the frame lattice anchors exactly as on a stock adapter (same gap-run,
+  anchor-assignment, refined-fit, pitch, and direct-support floors), but
+  intruding mask edges dim the gap rows below the strict clear-film bar,
+  which used to drop the detection to "low" on the clean-gap fraction
+  alone -- refusing the preview AND, because low confidence is refused
+  unconditionally at the scan gate, locking out the attended binding path.
+  An anchored comb with an unambiguous lattice margin and at least three
+  independently supported boundaries now binds at medium with a
+  `degraded-gap-evidence` warning: every weak slot stays flagged for
+  manual review, unattended fine scanning still requires high confidence,
+  and heavily degraded captures (boundary evidence averaging under the
+  medium score bar) keep today's honest refusal. Field reports also carry
+  `lattice_margin` and `direct_fraction` so the failing gate is visible
+  without a replay.
+- `roll.previewStrip` and `roll.manualFrames` no longer crash with
+  INTERNAL ("preview journal status='complete', expected
+  'awaiting-hold-job'") when used after a refused preview (ScanStudio
+  #16). A real preview always runs as a held reservation, and a refused
+  one is torn down before its evidence is recorded, so the journal on
+  disk is the terminal preview-and-hold shape (status complete,
+  reservation released, hold outcome released/ejected) -- not the
+  paused-at-hold-boundary shape the validator demanded. Both terminal
+  shapes now validate; resumed-as-batch journals still fail closed.
+
 ## 0.7.2 - 2026-08-13
 
 - `Device.eject()` no longer goes through SANE. It now replays the

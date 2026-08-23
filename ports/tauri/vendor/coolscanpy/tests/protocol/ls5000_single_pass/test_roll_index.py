@@ -1395,6 +1395,137 @@ def test_recovery_confidence_cap_is_keyed_to_the_mode() -> None:
     assert "wide-gap-recovery" in detection.warnings
 
 
+def _occlude_gaps(
+    rgb: np.ndarray,
+    boundaries: list[int],
+    *,
+    occluded: list[int],
+    end_bands: bool = False,
+    factor: float = 0.855,
+) -> np.ndarray:
+    """Partially occlude chosen inter-frame gaps (ScanStudio #16).
+
+    The full-roll-modified strip-feeder signature: every gap still exists at
+    its true lattice position, but intruding mask edges dim those rows just
+    under the strict clear-film bar (transmission < 0.87) and add row-to-row
+    unevenness, so the gap runs shrink below the narrow width window or
+    vanish while the lattice itself stays anchored on the remaining clean
+    gaps.
+    """
+
+    out = rgb.copy()
+    height = out.shape[0]
+    clear_base = np.asarray((34_200, 25_500, 17_800), dtype=np.int64)
+    x = np.arange(90, dtype=np.int64)[None, :]
+    haze_gradient = ((x * 7) % 23 - 11)[:, :, None] * 160
+    for index in occluded:
+        boundary = boundaries[index]
+        lo = max(0, boundary - 3)
+        hi = min(height, boundary + 3)
+        hazy = (clear_base * factor).astype(np.int64) + haze_gradient[: hi - lo]
+        out[lo:hi, 2:92] = hazy.clip(0, 65_535).astype(np.uint16)
+        for edge in (lo - 1, hi):
+            if 0 <= edge < height:
+                out[edge, 2:92] = (
+                    (out[edge, 2:92].astype(np.int64) * 0.88)
+                    .clip(0, 65_535)
+                    .astype(np.uint16)
+                )
+    if end_bands:
+        for lo, hi in ((0, boundaries[0]), (boundaries[-1], height)):
+            hazy = (clear_base * 0.87).astype(np.int64) + haze_gradient[: hi - lo]
+            out[lo:hi, 2:92] = hazy.clip(0, 65_535).astype(np.uint16)
+    return out
+
+
+def test_occluded_gap_roll_binds_at_medium_with_the_degraded_warning() -> None:
+    """ScanStudio #16: a roll whose gaps are all present but partially
+    occluded -- the field signature of full-roll-modified SA-21 adapters --
+    anchored the same comb as any healthy roll (same floors, >=3 directly
+    supported boundaries) yet scored "low" on the clean-gap fraction alone,
+    which refused the preview outright AND locked the operator out of the
+    attended binding path (which admits exactly "medium"). Such a capture is
+    precisely the documented meaning of medium -- a geometry the detector
+    found but could not fully corroborate -- so it now binds at medium with
+    the degraded-gap warning, every weak slot flagged for review."""
+
+    rgb, boundaries = _synthetic_roll(6)
+    # Field-report profile: interior gaps occluded and no clean leader/tail
+    # band either -- lattice_score ~0.48 vs the report's 0.4622-0.4653,
+    # margin well above the high gate's own 0.08 bar.
+    occluded_rgb = _occlude_gaps(
+        rgb,
+        boundaries,
+        occluded=[1, 2, 3],
+        end_bands=True,
+    )
+
+    detection = _detect(occluded_rgb)
+
+    # Field-report band: the report's own captures scored
+    # 0.4622-0.4653 -- below the high gate's 0.65 bar, above the medium
+    # floor this tier still requires.
+    assert detection.lattice_score < 0.55
+    assert detection.direct_fraction < 0.60
+    assert detection.confidence == "medium"
+    assert roll.DEGRADED_GAP_EVIDENCE_WARNING in detection.warnings
+    assert detection.pitch_rows == pytest.approx(143.0, abs=0.5)
+    supported = [
+        boundary
+        for boundary in detection.boundaries[:-1]
+        if boundary.support in {"direct", "direct-wide", "cadence-broad"}
+        and boundary.evidence >= 0.40
+        and boundary.transmission >= 0.82
+        and boundary.nonuniformity <= 0.22
+    ]
+    assert len(supported) >= 3
+    flagged = {
+        boundary.index
+        for boundary in detection.boundaries
+        if "low-gap-evidence" in boundary.review_reasons
+        or "narrow-gap-evidence" in boundary.review_reasons
+        or "no-local-gap-run" in boundary.review_reasons
+    }
+    assert flagged, "occluded boundaries must stay visible for manual review"
+
+
+def test_healthy_rolls_never_carry_the_degraded_gap_warning() -> None:
+    """The tier is additive only: an untouched roll keeps bit-identical
+    confidence and no degraded-gap marker."""
+
+    rgb, boundaries = _synthetic_roll(6)
+
+    detection = _detect(rgb)
+
+    assert detection.confidence == "high"
+    assert roll.DEGRADED_GAP_EVIDENCE_WARNING not in detection.warnings
+    # Leader/tail edges are cadence-broad rather than narrow gaps, so a
+    # healthy strip sits at the high gate's own >= 0.80 bar, not exactly 1.
+    assert detection.direct_fraction >= 0.80
+
+
+def test_heavily_degraded_evidence_below_the_score_bar_stays_low() -> None:
+    """Guard rail: the tier never relaxes the lattice-score bar. When
+    occlusion is so heavy that even the anchored comb's own boundary rows
+    average below 0.45 evidence, the capture keeps today's honest 'low' --
+    refused at the session gate -- instead of riding the new tier up to
+    medium."""
+
+    rgb, boundaries = _synthetic_roll(6)
+    heavily_occluded = _occlude_gaps(
+        rgb,
+        boundaries,
+        occluded=[1, 2, 3, 4],
+        end_bands=True,
+    )
+
+    detection = _detect(heavily_occluded)
+
+    assert detection.lattice_score < 0.45
+    assert detection.confidence == "low"
+    assert roll.DEGRADED_GAP_EVIDENCE_WARNING not in detection.warnings
+
+
 def test_incomplete_index_never_triggers_recovery() -> None:
     """IncompleteIndexError is a subclass of IndexDecodeError; it must pass
     through the two-pass wrapper untouched, with no recovery note."""

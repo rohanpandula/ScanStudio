@@ -1053,6 +1053,13 @@ def build_manual_detection(
         lattice_margin_fraction=0.0,
         mean_boundary_evidence=float(np.mean(evidences)),
         minimum_boundary_evidence=float(np.min(evidences)),
+        direct_fraction=(
+            sum(
+                boundary.support in {"direct", "direct-wide"}
+                for boundary in boundaries[:-1]
+            )
+            / max(1, len(boundaries) - 1)
+        ),
         content_level_threshold=0.0,
         content_range_threshold=0.0,
         candidate_cell_count=frame_count,

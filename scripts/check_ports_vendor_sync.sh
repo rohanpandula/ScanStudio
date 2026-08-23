@@ -322,7 +322,7 @@ Files bridge/tests/test_transport_mock.py and ports/tauri/vendor/scanstudio-brid
 Files bridge/uv.lock and ports/tauri/vendor/scanstudio-bridge/uv.lock differ
 EOF
 
-check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "4d2911476eb3e2a1831aa4b588ccb76b580b456914d65eb685b1c20789733629" <<'EOF'
+check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "d4b4302da47a9c0cf44d74b8034bc6757550ecca8c46c50e24d331bc7b050ab4" <<'EOF'
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py differ
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py differ
 Files coolscanpy/tests/test_usb_backend.py and ports/tauri/vendor/coolscanpy/tests/test_usb_backend.py differ
