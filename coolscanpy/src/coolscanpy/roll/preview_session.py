@@ -755,11 +755,35 @@ def _validate_preview_result(
     # release decision exists (see run_live_capture's own comment at the
     # `journal["disk_bytes"] = 0` / `journal["unit_released"] = False`
     # stamps). That snapshot is legitimately never "complete"/"preview-
-    # only"/released -- it is the other of exactly two valid shapes this
-    # journal can take, never a partial or intermediate one.
-    held = journal.get("capture_mode") == "preview-and-hold"
+    # only"/released -- it is one of exactly three valid shapes this
+    # journal can take, never a partial or intermediate one. The third
+    # shape is that same held attempt's TERMINAL state (#16): after the
+    # hold decision, the worker's teardown flips status to "complete" and
+    # unit_released to True while capture_mode stays "preview-and-hold"
+    # and hold_outcome records "released"/"ejected" (worker.py's
+    # released_hold_without_scan branch; release_held_session validates the
+    # same terminal facts from its dedicated receipt file). A preview that
+    # was REFUSED -- exactly when manual_frames()/preview_strip() need this
+    # journal most -- is always torn down before its evidence is recorded,
+    # so reconstructing an attempt from disk sees only this terminal shape;
+    # refusing it made the manual-placement fallback INTERNAL-crash on
+    # every field report it existed for. The resumed-as-batch outcome is
+    # deliberately NOT admitted: it moves fine-scan bytes through other
+    # artifacts and stamps requested_frame/disk_bytes/output_sha256 with
+    # non-preview values, each of which its own exact check below refuses.
+    capture_mode = journal.get("capture_mode")
+    held = capture_mode == "preview-and-hold"
+    released_hold = (
+        held
+        and journal.get("status") == "complete"
+        and journal.get("unit_released") is True
+        and journal.get("hold_outcome") in ("released", "ejected")
+    )
     for key, expected in (
-        ("status", "awaiting-hold-job" if held else "complete"),
+        (
+            "status",
+            "awaiting-hold-job" if held and not released_hold else "complete",
+        ),
         ("capture_mode", "preview-and-hold" if held else "preview-only"),
         ("requested_frame", None),
         ("requested_boundary_offset_rows", 0),
@@ -769,7 +793,7 @@ def _validate_preview_result(
         ("expected_bytes", 0),
         ("completed_bytes", 0),
         ("disk_bytes", 0),
-        ("unit_released", False if held else True),
+        ("unit_released", False if held and not released_hold else True),
         ("plan_sha256", CANONICAL_PLAN_SHA256),
         ("preview_geometry_validated_before_reads", True),
     ):
@@ -1232,6 +1256,8 @@ def _roll_session_diagnostics(detection: RollDetection) -> str:
         + detection.count_confirmation
         + f" lattice_score={detection.lattice_score:.4f}"
         + f" alt_lattice_score={detection.alternative_lattice_score:.4f}"
+        + f" lattice_margin={detection.lattice_margin_fraction:.4f}"
+        + f" direct_fraction={detection.direct_fraction:.4f}"
         + f" mean_boundary_evidence={detection.mean_boundary_evidence:.4f}"
         + f" min_boundary_evidence={detection.minimum_boundary_evidence:.4f}"
         + f" autocorr_peak={detection.autocorrelation_peak:.4f}"

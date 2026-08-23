@@ -539,17 +539,23 @@ def _synthetic_transport_table(rows: int) -> bytes:
 
 
 def _write_synthetic_preview_attempt(
-    attempts_root: Path, *, slot_capacity_hint: int = 40
+    attempts_root: Path,
+    *,
+    slot_capacity_hint: int = 40,
+    hold_terminal: str | None = None,
 ) -> Path:
     """Write one complete, byte-valid preview attempt directory under
     ``attempts_root`` with CoolscanPyTransport's own "preview-" mkdtemp
     prefix -- everything manual_frames()/preview_strip()'s
     _reconstruct_last_preview_attempt/_validated_preview_from_attempt need to
     find and validate it, exactly as if a real roll.preview attempt had just
-    completed (this journal shape is "preview-only"/"complete"/released --
-    see preview_session.py's _validate_preview_result: both that shape and
-    the "preview-and-hold" shape a real Roll.preview() always uses today
-    validate identically). Returns the attempt directory."""
+    completed. The default journal shape is "preview-only"/"complete";
+    ``hold_terminal="released"/"ejected"`` writes the TERMINAL preview-and-
+    hold shape a real Roll.preview() always leaves behind instead (a real
+    preview runs as a held reservation, and a REFUSED one -- exactly when
+    manual_frames()/preview_strip() are needed (#16) -- is always torn down
+    to this terminal state before its evidence is recorded). Returns the
+    attempt directory."""
     contract = _preview_binding_contract(slot_capacity_hint)
     native_height = contract["native_height"]
     decoded_height = contract["decoded_height"]
@@ -587,7 +593,11 @@ def _write_synthetic_preview_attempt(
         source_height=decoded_height,
     )
     receipt = {
-        "status": "preview-only-complete",
+        "status": (
+            "preview-and-hold-awaiting-job"
+            if hold_terminal
+            else "preview-only-complete"
+        ),
         "slot_capacity_hint": slot_capacity_hint,
         "slot_capacity_semantics": (
             "scanner-addressable preview slots; not an exposure count"
@@ -657,6 +667,23 @@ def _write_synthetic_preview_attempt(
         },
         "preview_only_receipt": receipt,
     }
+    if hold_terminal:
+        # The worker's post-decision teardown stamps (worker.py's
+        # released_hold_without_scan branch): capture_mode stays
+        # preview-and-hold, status flips to complete, the reservation is
+        # released, and hold_outcome records which decision ended it.
+        journal["capture_mode"] = "preview-and-hold"
+        journal["hold_session_id"] = "a" * 32
+        journal["hold_ready_unix"] = 0.0
+        journal["hold_outcome"] = hold_terminal
+        if hold_terminal == "ejected":
+            journal["eject"] = {
+                "eject_cdb_status": "0000000000000000",
+                "eject_execute_status": "0000000000000000",
+                "terminal_sense": "023a00",
+                "wait_polls": 5,
+                "stall_recoveries": 0,
+            }
     (attempt / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
     return attempt
 
@@ -1399,6 +1426,8 @@ def test_preview_strip_without_any_preview_attempt_is_no_preview(
 
 def _transport_with_synthetic_preview_attempt(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    hold_terminal: str | None = None,
 ) -> tuple[CoolscanPyTransport, _FakeRoll, Path]:
     """An opened transport whose attempts_root already holds one real,
     byte-valid preview attempt on disk -- the "completed-but-refused (or
@@ -1409,6 +1438,9 @@ def _transport_with_synthetic_preview_attempt(
     attempt this test actually reads back is a separately-written synthetic
     one, matching how a real refused preview would leave its own evidence
     on disk without ever producing a _FakeRoll-shaped in-memory session.
+    ``hold_terminal`` forwards to _write_synthetic_preview_attempt to write
+    the terminal preview-and-hold journal shape a real refused preview
+    leaves behind (#16).
 
     S5 fix (2026-08-08 adversarial review): manual_frames()/preview_strip()
     now read ONLY `transport._recorded_preview_attempt_journal`, never a
@@ -1424,7 +1456,10 @@ def _transport_with_synthetic_preview_attempt(
     transport, _device = _opened_transport(monkeypatch, roll)
     transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
     assert transport.attempts_root is not None
-    attempt_dir = _write_synthetic_preview_attempt(transport.attempts_root)
+    attempt_dir = _write_synthetic_preview_attempt(
+        transport.attempts_root,
+        hold_terminal=hold_terminal,
+    )
     transport._recorded_preview_attempt_journal = (
         attempt_dir / "journal.json"
     ).resolve(strict=True)
@@ -1548,6 +1583,54 @@ def test_preview_strip_refuses_when_current_attempt_has_no_recorded_evidence(
     assert excinfo.value.code == ErrorCode.NO_PREVIEW
     assert "left no usable evidence" in str(excinfo.value)
     assert "acquire a fresh preview" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("hold_terminal", ["released", "ejected"])
+def test_preview_strip_renders_from_a_released_hold_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    hold_terminal: str,
+) -> None:
+    """#16 regression: a real Roll.preview() is always a held reservation,
+    and a REFUSED one -- exactly when the UI falls back to manual placement
+    via roll.previewStrip -- is torn down before its evidence is recorded.
+    The on-disk journal it leaves is therefore the TERMINAL preview-and-
+    hold shape (status=complete, unit_released=true, capture_mode stays
+    preview-and-hold), which the validator used to refuse with
+    "preview journal status='complete', expected 'awaiting-hold-job'" --
+    surfacing as INTERNAL and killing the manual-placement fallback on
+    every field report it existed for."""
+
+    transport, _roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch,
+        hold_terminal=hold_terminal,
+    )
+
+    strip = transport.preview_strip()
+
+    assert strip.row_count == 6_104
+    assert Path(strip.image_path).is_file()
+
+
+def test_manual_frames_arms_a_session_from_a_released_hold_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#16 regression, manualFrames' half of the same bug: manual placement
+    against a refused preview's terminal journal must arm the roll for
+    approve/scan instead of crashing INTERNAL."""
+
+    transport, roll, _attempt_dir = _transport_with_synthetic_preview_attempt(
+        monkeypatch,
+        hold_terminal="released",
+    )
+
+    result, thumbnails, snaps, material = transport.manual_frames([128, 271, 414])
+
+    assert material is domain.Material.COLOR_NEGATIVE
+    assert result.count == 2
+    assert [t.slot for t in thumbnails] == [1, 2]
+    assert snaps == ()
+    assert transport._preview_established is True
+    assert roll._session is not None
 
 
 # -- 2026-08-08 adversarial review, S1 (manual placement replacement safety) --

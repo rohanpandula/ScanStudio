@@ -62,6 +62,22 @@ _WIDE_GAP_RECOVERY_ERROR_IDS = frozenset(
     }
 )
 
+# Degrated-gap confidence tier (ScanStudio #16). A roll whose inter-frame
+# gaps are all present at the fitted lattice positions but partially
+# occluded -- the field signature of full-roll-modified strip feeders,
+# where mask edges intrude into the film window -- still anchors the same
+# physical comb (same >=3-run, anchor-assignment, refined-fit, and pitch
+# floors as every other detection) yet fails the medium gate's clean
+# direct-gap fraction because many boundary rows read dimmer or less
+# uniform than stock-adapter gaps. Such a capture is exactly the documented
+# meaning of "medium" (capture_process.py ATTENDED_ROLL_BINDING_CONFIDENCE):
+# a geometry the detector DID find but could not fully corroborate -- every
+# slot lands in manual review, and fine scanning still requires the
+# attended all-frames approval path. Labeling it "low" instead refused the
+# preview outright and, because 'low' is refused unconditionally at the
+# worker gate, locked the operator out of even that attended path.
+DEGRADED_GAP_EVIDENCE_WARNING = "degraded-gap-evidence"
+
 
 class IndexDecodeError(ValueError):
     """Input is not a self-consistent LS-5000 roll-index capture.
@@ -298,6 +314,12 @@ class RollDetection:
     boundaries: tuple[GapBoundary, ...]
     intervals: tuple[FrameInterval, ...]
     manual_review_frames: tuple[int, ...]
+    # Additive (#16 field reports), defaulted so every existing constructor
+    # keeps its exact behavior: the alignment-boundary clean-gap fraction
+    # the confidence ladder itself gates on, carried on the result so error
+    # reports can discriminate "score too low" from "direct_fraction too
+    # low" -- the two distinct ways a detection lands at low confidence.
+    direct_fraction: float = 0.0
 
     @property
     def frame_starts(self) -> list[int]:
@@ -337,6 +359,7 @@ class RollDetection:
             "lattice_margin_fraction": self.lattice_margin_fraction,
             "mean_boundary_evidence": self.mean_boundary_evidence,
             "minimum_boundary_evidence": self.minimum_boundary_evidence,
+            "direct_fraction": self.direct_fraction,
             "count_method": (
                 "all physically aligned, scanner-addressable lattice slots; "
                 "scene content only supplies advisory flags"
@@ -1542,6 +1565,7 @@ def _detect_roll_frames_single(
         for item in alignment_boundaries[:-1]
     ) / max(1, len(alignment_boundaries) - 1)
     recovered_wide_gap = wide_gap_ceiling is not None
+    degraded_gap_evidence = False
     if (
         lattice_score >= 0.65
         and lattice_margin >= 0.08
@@ -1551,6 +1575,24 @@ def _detect_roll_frames_single(
         confidence = "high"
     elif lattice_score >= 0.45 and direct_fraction >= 0.60:
         confidence = "medium"
+    elif (
+        # Degrated-gap tier (#16): the comb is anchored -- reaching this
+        # point already required >=3 distinct narrow gap runs, >=3 anchor
+        # assignments within 8 rows, a refined fit agreeing within 3 rows,
+        # a pitch inside the film-geometry band, and >=3 directly supported
+        # alignment boundaries -- but the gaps are partially occluded, so
+        # the clean-gap fraction fell below the medium gate. Admit it as
+        # medium only when the fit is unambiguous (the same lattice-margin
+        # bar "high" requires) and at least three boundaries carry
+        # independently supported evidence. Everything still lands in
+        # manual review per slot, and the worker gate still refuses any
+        # unattended binding below "high".
+        lattice_score >= 0.45
+        and lattice_margin >= 0.08
+        and len(supported_alignment_boundaries) >= 3
+    ):
+        confidence = "medium"
+        degraded_gap_evidence = True
     else:
         confidence = "low"
     if recovered_wide_gap and confidence == "high":
@@ -1560,6 +1602,8 @@ def _detect_roll_frames_single(
     warnings: list[str] = []
     if recovered_wide_gap:
         warnings.append(WIDE_GAP_RECOVERY_WARNING)
+    if degraded_gap_evidence:
+        warnings.append(DEGRADED_GAP_EVIDENCE_WARNING)
     if expected_frame_count is not None:
         expected_frame_count_matches = expected_frame_count in content_end_candidates
         if expected_frame_count_matches:
@@ -1592,6 +1636,7 @@ def _detect_roll_frames_single(
         lattice_margin_fraction=lattice_margin,
         mean_boundary_evidence=float(boundary_evidence.mean()),
         minimum_boundary_evidence=float(boundary_evidence.min()),
+        direct_fraction=direct_fraction,
         content_level_threshold=content_level_threshold,
         content_range_threshold=content_range_threshold,
         candidate_cell_count=len(cell_supported),
