@@ -307,7 +307,7 @@ Files app/ScanStudio/engine/src/render.rs and ports/tauri/vendor/engine/src/rend
 Only in ports/tauri/vendor/engine/src: wsl_io.rs
 EOF
 
-check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "cb2105eaf2d62d7dfa49889d755e0ba6cdcb4ea8a2a5d9f480eac0d0a5df1682" <<'EOF'
+check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "727af553df64c52db8c95a0666d69fc71784d8b9e7012deed363aaadc18c318e" <<'EOF'
 Only in ports/tauri/vendor/scanstudio-bridge: .github
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: probe-linux-env.py
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: verify-bridge.sh

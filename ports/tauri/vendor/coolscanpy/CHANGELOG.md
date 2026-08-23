@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.3 - 2026-08-23
+
 - Roll previews whose physical inter-frame gaps are present but partially
   occluded no longer refuse outright as low confidence (ScanStudio #16).
   This is the field signature of full-roll-modified SA-21 strip feeders:

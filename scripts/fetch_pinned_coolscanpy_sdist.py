@@ -16,20 +16,20 @@ import unicodedata
 import urllib.request
 
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 FILENAME = f"coolscanpy-{VERSION}.tar.gz"
 URL = (
-    "https://files.pythonhosted.org/packages/94/df/"
-    "6f07433d58ed06caf6cfc37692b894d203567a28fca8e4466083e8f02c20/"
+    "https://files.pythonhosted.org/packages/f8/c3/"
+    "b0d5c50e600f0332e7fa4bd280eff988130c138533dbb5223d4101c0f75c/"
     f"{FILENAME}"
 )
-SIZE = 546_175
-SHA256 = "6a354e98da623f38c2ca33764887621eba99f780d5e765ec69b690192176324f"
+SIZE = 547_912
+SHA256 = "c249ee47e550b6a30ec846963742bf92f71bf5253bd07c590ce3cb798e978cab"
 ROOT = f"coolscanpy-{VERSION}"
 ENTRY_COUNT = 104
 FILE_COUNT = 89
 DIRECTORY_COUNT = 15
-EXPANDED_FILE_BYTES = 2_404_264
+EXPANDED_FILE_BYTES = 2_409_028
 
 
 class FetchError(RuntimeError):
