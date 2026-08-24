@@ -379,10 +379,13 @@ def write_dng_linear_to_file(file: BinaryIO, result: ScanResult) -> None:
     # ExtraSamples; patching only the already-emitted SHORT tag then gives
     # DNG its required LinearRaw value without changing any strip bytes.
     #
-    # tifffile also emits classic-TIFF SubIFDs (330) using datatype IFD (13).
-    # TIFF/EP and DNG require the classic 32-bit pointer form LONG (4).
-    # Both datatypes store the same four-byte offset, so patching the two-byte
-    # directory-entry datatype preserves the exact IFD offsets and pixels.
+    # Issue #105: tifffile also emits the classic-TIFF SubIFDs pointer with
+    # field type 13 (TIFF "IFD"), but TIFF/EP and the DNG profile require
+    # type 4 (LONG) — strict readers such as ExifTool warn about the non-
+    # standard encoding. Both types store four-byte elements, so a count-1
+    # pointer occupies exactly the same four inline bytes either way:
+    # rewriting only the two-byte type code cannot move any other byte, and
+    # RawPy/NegPy decode the same pixels from both encodings.
     file.flush()
     file.seek(0)
     with tifffile.TiffFile(named_file) as tiff:
@@ -390,27 +393,18 @@ def write_dng_linear_to_file(file: BinaryIO, result: ScanResult) -> None:
         if page.samplesperpixel != 3 or page.extrasamples:
             raise RuntimeError("Linear DNG main IFD did not encode as three plain RGB samples")
         photometric_offset = page.tags["PhotometricInterpretation"].valueoffset
+        subifds_tag = page.tags.get(330)
+        subifds_entry_offset = None if subifds_tag is None else subifds_tag.offset
         byteorder = tiff.byteorder
-        subifds_datatype_offset: int | None = None
-        if ir is not None:
-            subifds = page.tags.get("SubIFDs")
-            if subifds is None or subifds.count != 1:
-                raise RuntimeError("Linear DNG IR did not encode as exactly one SubIFD")
-            if subifds.dtype == tifffile.DATATYPE.IFD:
-                subifds_datatype_offset = subifds.offset + 2
-            elif subifds.dtype != tifffile.DATATYPE.LONG:
-                raise RuntimeError(
-                    f"Linear DNG SubIFDs encoded with unsupported datatype {subifds.dtype}"
-                )
     file.seek(photometric_offset)
     written = file.write(struct.pack(byteorder + "H", 34892))
     if written != 2:
         raise OSError("short write while setting LinearRaw photometric tag")
-    if subifds_datatype_offset is not None:
-        file.seek(subifds_datatype_offset)
-        written = file.write(struct.pack(byteorder + "H", int(tifffile.DATATYPE.LONG)))
+    if subifds_entry_offset is not None:
+        file.seek(subifds_entry_offset + 2)
+        written = file.write(struct.pack(byteorder + "H", 4))
         if written != 2:
-            raise OSError("short write while setting DNG SubIFDs datatype")
+            raise OSError("short write while setting SubIFDs pointer type to LONG")
     file.flush()
 
 

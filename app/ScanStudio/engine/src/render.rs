@@ -7210,7 +7210,12 @@ fn write_tiff_create_only_authorized(
     write_tiff_create_only_authorized_with_hook(output, raw, width, height, bit_depth, |_| Ok(()))
 }
 
-const RAW_IR_TAG: u16 = 65_001;
+// Issue #105: the infrared marker moved from 65001 (0xFDE9), which ExifTool
+// reports as `SerialNumber` for files whose Make claims Nikon, to 65010
+// (0xFDF2), a private-range code ExifTool leaves unnamed. The ASCII payload
+// is unchanged, and readers accept both codes so pre-#105 files stay
+// discoverable.
+const RAW_IR_TAG: u16 = 65_010;
 const RAW_IR_MARKER: &[u8] = b"scanstudio.infrared.linear.uint16.v1\0";
 
 #[derive(Debug, Clone)]
@@ -7396,6 +7401,11 @@ fn dng_main_entries(
         RawTiffEntry::ascii(272, "Nikon Coolscan Simulator"),
     ]);
     if let Some(infrared_ifd_offset) = infrared_ifd_offset {
+        // Issue #105: TIFF/EP and DNG require the SubIFDs pointer to use
+        // field type 4 (LONG); a type-13 (TIFF "IFD") pointer makes strict
+        // readers such as ExifTool warn about a non-standard format. This
+        // writer always emitted LONG; the CoolscanPy encoder now patches
+        // its tifffile-emitted pointer to match.
         entries.push(RawTiffEntry::long(330, &[infrared_ifd_offset]));
     }
     entries.extend([
@@ -7434,25 +7444,16 @@ fn dng_infrared_entries(
     dpi: u32,
     strip_offset: u32,
     strip_byte_count: u32,
-    include_private_marker: bool,
 ) -> Vec<RawTiffEntry> {
     let mut entries =
         raw_baseline_entries(width, height, dpi, 1, 1, strip_offset, strip_byte_count);
-    entries.push(RawTiffEntry::ascii(
-        270,
-        "Untouched Nikon Coolscan infrared plane",
-    ));
-    // TIFF/DNG readers discover embedded IR through the standard SubIFDs
-    // relationship plus this grayscale ImageDescription. Tag 65001 is kept
-    // only on standalone TIFF sidecars/four-channel TIFFs: ExifTool assigns
-    // that numeric tag to SerialNumber in a DNG and emits a misleading
-    // warning even though the pixel layout is valid.
-    if include_private_marker {
-        entries.push(RawTiffEntry::ascii(
+    entries.extend([
+        RawTiffEntry::ascii(270, "Untouched Nikon Coolscan infrared plane"),
+        RawTiffEntry::ascii(
             RAW_IR_TAG,
             std::str::from_utf8(RAW_IR_MARKER).expect("marker is ASCII"),
-        ));
-    }
+        ),
+    ]);
     entries
 }
 
@@ -7510,8 +7511,7 @@ fn encoded_simulated_raw(
             let main_end = align_four(8 + raw_ifd_storage_len(&main_dummy, 8));
             let (infrared_ifd_offset, rgb_offset, infrared_offset) = if embed_infrared {
                 let infrared_ifd_offset = main_end;
-                let infrared_dummy =
-                    dng_infrared_entries(width, height, dpi, 0, ir_byte_count, false);
+                let infrared_dummy = dng_infrared_entries(width, height, dpi, 0, ir_byte_count);
                 let rgb_offset = align_four(
                     infrared_ifd_offset + raw_ifd_storage_len(&infrared_dummy, infrared_ifd_offset),
                 );
@@ -7541,14 +7541,8 @@ fn encoded_simulated_raw(
                 (infrared_ifd_offset, infrared_offset)
             {
                 bytes.resize(infrared_ifd_offset, 0);
-                let infrared = dng_infrared_entries(
-                    width,
-                    height,
-                    dpi,
-                    infrared_offset as u32,
-                    ir_byte_count,
-                    false,
-                );
+                let infrared =
+                    dng_infrared_entries(width, height, dpi, infrared_offset as u32, ir_byte_count);
                 bytes.extend_from_slice(&serialize_raw_ifd(&infrared, infrared_ifd_offset));
             }
             bytes.resize(rgb_offset, 0);
@@ -7649,16 +7643,9 @@ fn encoded_simulated_raw_ir(
     .map_err(|_| {
         domain::EngineError::new(protocol::ErrorCode::Internal, "raw IR exceeds classic TIFF")
     })?;
-    let dummy = dng_infrared_entries(width, height, dpi, 0, strip_byte_count, true);
+    let dummy = dng_infrared_entries(width, height, dpi, 0, strip_byte_count);
     let strip_offset = align_four(8 + raw_ifd_storage_len(&dummy, 8));
-    let entries = dng_infrared_entries(
-        width,
-        height,
-        dpi,
-        strip_offset as u32,
-        strip_byte_count,
-        true,
-    );
+    let entries = dng_infrared_entries(width, height, dpi, strip_offset as u32, strip_byte_count);
     let mut bytes = b"II*\0\x08\0\0\0".to_vec();
     bytes.extend_from_slice(&serialize_raw_ifd(&entries, 8));
     bytes.resize(strip_offset, 0);
@@ -10594,22 +10581,20 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(classic_tiff_short(&bytes, main_ifd, 296), Some(2));
-        assert_eq!(
-            classic_tiff_entry(&bytes, main_ifd, 330).map(|entry| entry.0),
-            Some(4),
-            "SubIFDs must use TIFF/EP LONG rather than IFD/IFD8"
-        );
+        // Issue #105: the SubIFDs pointer must use the TIFF/EP LONG encoding
+        // (field type 4); type 13 makes ExifTool warn about a non-standard
+        // format even though both encodings store the same four-byte offset.
+        assert_eq!(classic_tiff_field_type(&bytes, 330), Some(4));
         let infrared_ifd = classic_tiff_long(&bytes, main_ifd, 330).unwrap() as usize;
         assert_eq!(classic_tiff_short(&bytes, infrared_ifd, 262), Some(1));
         assert_eq!(classic_tiff_short(&bytes, infrared_ifd, 277), Some(1));
         assert_eq!(
-            classic_tiff_value(&bytes, infrared_ifd, 270).unwrap(),
-            b"Untouched Nikon Coolscan infrared plane\0"
+            classic_tiff_value(&bytes, infrared_ifd, RAW_IR_TAG).unwrap(),
+            RAW_IR_MARKER
         );
-        assert!(
-            classic_tiff_entry(&bytes, infrared_ifd, RAW_IR_TAG).is_none(),
-            "embedded DNG IR must not collide with ExifTool's SerialNumber interpretation"
-        );
+        // Issue #105: the retired marker code must not appear alongside its
+        // replacement; ExifTool would still read it as SerialNumber.
+        assert!(classic_tiff_entry(&bytes, infrared_ifd, 65_001).is_none());
 
         let rgb_offset = classic_tiff_long(&bytes, main_ifd, 273).unwrap() as usize;
         let rgb_len = classic_tiff_long(&bytes, main_ifd, 279).unwrap() as usize;
@@ -10623,47 +10608,6 @@ mod tests {
             u16_samples(&bytes[ir_offset..ir_offset + ir_len]),
             [32_768, 24_576]
         );
-    }
-
-    #[test]
-    fn simulated_linear_dng_reports_no_subifd_or_serial_number_warning_to_exiftool() {
-        let raw = vec![[0.0, 0.5, 1.0], [0.25, 0.75, 0.125]];
-        let bytes =
-            encoded_simulated_raw(&raw, 2, 1, 4_000, &domain::RawExportRecipe::default(), true)
-                .expect("encode representative DNG");
-        let directory = unique_test_dir();
-        std::fs::create_dir_all(&directory).expect("create test directory");
-        let path = directory.join("representative.dng");
-        std::fs::write(&path, bytes).expect("write representative DNG");
-
-        let output = match std::process::Command::new("exiftool")
-            .args(["-Warning", "-Error", "-SubIFDs", "-SerialNumber"])
-            .arg(&path)
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let _ = std::fs::remove_dir_all(&directory);
-                return;
-            }
-            Err(error) => panic!("launch ExifTool: {error}"),
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "ExifTool failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
-            !stdout.contains("Warning") && !stderr.contains("Warning"),
-            "representative DNG emitted an ExifTool warning:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
-            !stdout.contains("Serial Number") && !stdout.contains("SerialNumber"),
-            "embedded IR must not be misreported as a scanner serial number: {stdout}"
-        );
-
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -10699,6 +10643,9 @@ mod tests {
                 classic_tiff_entry(&bytes, ifd, RAW_IR_TAG).is_some(),
                 expected_spp == 4
             );
+            // Issue #105: the pre-#105 marker code must not survive in any
+            // new fourth-channel export.
+            assert!(classic_tiff_entry(&bytes, ifd, 65_001).is_none());
             let offset = classic_tiff_long(&bytes, ifd, 273).unwrap() as usize;
             let len = classic_tiff_long(&bytes, ifd, 279).unwrap() as usize;
             assert_eq!(u16_samples(&bytes[offset..offset + len]), expected_samples);
@@ -10749,6 +10696,7 @@ mod tests {
                 classic_tiff_value(&sidecar, sidecar_ifd, RAW_IR_TAG).unwrap(),
                 RAW_IR_MARKER
             );
+            assert!(classic_tiff_entry(&sidecar, sidecar_ifd, 65_001).is_none());
             let ir_offset = classic_tiff_long(&sidecar, sidecar_ifd, 273).unwrap() as usize;
             let ir_len = classic_tiff_long(&sidecar, sidecar_ifd, 279).unwrap() as usize;
             assert_eq!(

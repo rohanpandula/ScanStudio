@@ -296,7 +296,7 @@ EOF
 check_pair "protocol" "app/ScanStudio/protocol" "ports/tauri/vendor/protocol" "55577442d8b6a23ddcd3cc191ebf41a8258004047bc075511a241fa72adb0b65" <<'EOF'
 EOF
 
-check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "d17e2ab8de9658cd3f7da032f5fcb88eeb41d320624640691537fff6c05ccc22" <<'EOF'
+check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "228c9c43e13a1e817cfb7e7c84f501d14b9e6af89d659ce2a1c828ec2474ca56" <<'EOF'
 Files app/ScanStudio/engine/Cargo.lock and ports/tauri/vendor/engine/Cargo.lock differ
 Files app/ScanStudio/engine/Cargo.toml and ports/tauri/vendor/engine/Cargo.toml differ
 Files app/ScanStudio/engine/src/evidence_package.rs and ports/tauri/vendor/engine/src/evidence_package.rs differ
@@ -307,7 +307,7 @@ Files app/ScanStudio/engine/src/render.rs and ports/tauri/vendor/engine/src/rend
 Only in ports/tauri/vendor/engine/src: wsl_io.rs
 EOF
 
-check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "ae540b5016c9d91898297a067b135c22ec26c279dcb11f9aac1aedfa474600a7" <<'EOF'
+check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "bc7676818b08648d47753255783e3b06105feed0aa4cf41d50174c98f7ab37aa" <<'EOF'
 Only in ports/tauri/vendor/scanstudio-bridge: .github
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: probe-linux-env.py
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: verify-bridge.sh
@@ -318,15 +318,13 @@ Files bridge/src/scanstudio_bridge/transport/output_reservation.py and ports/tau
 Only in ports/tauri/vendor/scanstudio-bridge/tests: test_probe_linux_env.py
 Files bridge/tests/test_safety.py and ports/tauri/vendor/scanstudio-bridge/tests/test_safety.py differ
 Only in ports/tauri/vendor/scanstudio-bridge/tests: test_stdout_byte_discipline.py
-Files bridge/tests/test_transport_mock.py and ports/tauri/vendor/scanstudio-bridge/tests/test_transport_mock.py differ
 Files bridge/uv.lock and ports/tauri/vendor/scanstudio-bridge/uv.lock differ
 EOF
 
-check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "2470d5afd11e4d2223ec796b28159f7e2a62fd84b540eb392f0989b8c7ad25fd" <<'EOF'
+check_pair "coolscanpy" "coolscanpy" "ports/tauri/vendor/coolscanpy" "63d4ce49d4e1977cb5a38b1fb99992d2f844de15dd39cb85fe2ec04c34920140" <<'EOF'
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/bundle.py differ
 Files coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py and ports/tauri/vendor/coolscanpy/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py differ
 Files coolscanpy/tests/test_usb_backend.py and ports/tauri/vendor/coolscanpy/tests/test_usb_backend.py differ
-Files coolscanpy/tests/transport/test_scanner_eject.py and ports/tauri/vendor/coolscanpy/tests/transport/test_scanner_eject.py differ
 EOF
 
 if [ "$FAIL" = 1 ]; then

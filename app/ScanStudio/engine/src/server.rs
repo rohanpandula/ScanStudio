@@ -2428,6 +2428,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Issue #99: `project.create` aimed at a directory that already holds
+    /// a project must fail closed with `PROJECT_ALREADY_EXISTS` and leave
+    /// the engine's active in-memory project exactly as it was — a refused
+    /// creation never switches projects or adopts the target directory.
+    #[test]
+    fn project_create_into_an_occupied_directory_is_refused_and_keeps_the_active_project() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let occupied = temp_test_dir("issue99-occupied");
+        let other = temp_test_dir("issue99-other");
+
+        // Seed the occupied directory with a real zero-receipt project,
+        // then open a different project so the active state has something
+        // to lose if the guard were broken.
+        for (name, directory) in [("Occupied", &occupied), ("Other", &other)] {
+            let request = Request {
+                id: 1,
+                method: "project.create".into(),
+                params: serde_json::json!({
+                    "name": name,
+                    "carrier": "mounted",
+                    "frameCount": 1,
+                    "filmProcess": "positive",
+                    "directory": directory.display().to_string(),
+                }),
+            };
+            handle_request(&mut backends, &tx, &request, &mut project_state)
+                .unwrap_or_else(|_| panic!("{name} setup create"));
+        }
+        let active_before = project_state
+            .active
+            .clone()
+            .expect("a successful create leaves an active project");
+        assert_eq!(active_before.name, "Other");
+
+        let manifest_before =
+            std::fs::read(occupied.join("manifest.json")).expect("seeded manifest exists");
+        let attempt = Request {
+            id: 2,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Collision",
+                "carrier": "roll36",
+                "frameCount": 36,
+                "filmProcess": "positive",
+                "directory": occupied.display().to_string(),
+            }),
+        };
+        let err = handle_request(&mut backends, &tx, &attempt, &mut project_state)
+            .expect_err("creating over an existing project must be refused");
+        assert_eq!(err.code, ErrorCode::ProjectAlreadyExists);
+
+        // The active in-memory project did not move to the refused target.
+        assert_eq!(
+            project_state.active.as_ref().map(|project| project.id.clone()),
+            Some(active_before.id.clone()),
+            "a refused create must not switch the active project"
+        );
+        assert_eq!(
+            project_state.directory.as_deref(),
+            // ProjectState.set stores the canonicalized directory.
+            Some(
+                std::fs::canonicalize(&other)
+                    .expect("canonicalize the active directory")
+                    .as_path()
+            ),
+            "a refused create must not adopt the refused directory"
+        );
+        // And the occupied project's own bytes are untouched.
+        assert_eq!(
+            std::fs::read(occupied.join("manifest.json")).expect("manifest still present"),
+            manifest_before,
+            "the existing manifest must survive byte-for-byte"
+        );
+
+        let _ = std::fs::remove_dir_all(&occupied);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
     #[test]
     fn failed_project_create_collision_does_not_switch_the_active_project() {
         let mut backends = Backends {

@@ -16,7 +16,7 @@ Contract between the SwiftUI app and the `scanstudio-engine` subprocess. This fi
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `PROJECT_ALREADY_EXISTS`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
 
 `recoverable` is `true` only for faults where retrying the same operation can succeed (`FEED_JAM`). All others are `false`.
 
@@ -138,16 +138,12 @@ fresh `imagePath`; changing the offset invalidates prior manual approval.
 
 ### Receipt-preserving project mutations
 
-Every `project.setFrame*` and `project.setRollMetadata` mutation re-reads the
-fresh manifest while holding the project lock, merges receipts written by the
-scan worker after the client snapshot was taken, and publishes atomically. A
-mutation refuses rather than publish if fresh-disk receipt coverage would be
-lost or the manifest cannot be trusted. The in-memory active project is updated
-only from that successfully persisted result; a stale client snapshot is never
-allowed to erase durable completion evidence.
+The engine's project-mutating handlers (`project.setFrameExcluded`, `project.setFrameCaptureOverride`, `project.setFrameProcessingOverride`, `project.setFrameOutputOverride`, `project.setFrameAlignment`, `project.setFrameMetadataOverride`, and `project.setRollMetadata`) re-reads the fresh manifest while holding the project lock and persist through `manifest.rs::persist_project_update` / `persist_project_update_at`: the write reads the manifest fresh from disk, merges the incoming mutation into whatever receipts the scan worker thread has durably attached since the project was loaded, and folds the merged result back into `server.rs`'s in-memory `ProjectState.active` so memory converges toward disk truth on every call. A write that would cost any frame its on-disk receipt -- i.e. one not derived from the manifest currently on disk -- refuses rather than publish if fresh-disk receipt coverage would be lost and is otherwise refused fail-closed ("would lose its on-disk receipt ... read, merge, and retry through persist_project_update") instead of overwriting, so a stale in-memory copy can no longer clobber scan results. The authoritative write runs under the manifest transaction boundary (process mutex + OS held-directory lock), and since #99 a brand-new `project.create` publishes create-only, refusing any directory that already holds a manifest.
 
 ### `project.create`
 `{name: string, carrier: "roll36"|"strip6"|"mounted", frameCount: u32, filmProcess: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome", directory?: string}` → `{project: ScanProject, directory: string}`. `roll36` is the legacy wire token for SA-30 35 mm roll film; its preview-established `frameCount` must be 1-40. `mounted` must be exactly 1, and `strip6` must be 1-6 (else `INVALID_PARAMS`). `directory` overrides the default `~/ScanStudio Projects/<slug>-<id>` location. Creation is create-only: any existing ScanStudio manifest at the target, including an unreadable or wrong-kind manifest, is refused with `PROJECT_ALREADY_EXISTS` and its bytes are left untouched. Unrelated pre-existing files do not by themselves make a directory a project. The initial manifest is published atomically under the project lock and only then becomes the engine's active project.
+
+Creating never replaces an existing project (#99): if the target directory already contains any `manifest.json` — a fully populated project, a valid zero-receipt one, or an unreadable/corrupt file — the engine refuses atomically with `PROJECT_ALREADY_EXISTS` before modifying anything: the existing project's bytes are unchanged and the active in-memory project is not switched. The refusal is enforced by create-only publication inside the project manifest lock, so concurrent creates into one directory allow at most one success. A directory without a `manifest.json` may contain unrelated files and remains creatable; to work with an existing project, use `project.open`.
 
 ### `project.open`
 `{directory: string}` → `{project: ScanProject, directory: string}`. Errors: `PROJECT_NOT_FOUND`, `MANIFEST_INVALID`.

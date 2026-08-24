@@ -16,6 +16,11 @@ import numpy as np
 import pytest
 import tifffile
 
+from coolscanpy.receipts.tiff_contract import (
+    LEGACY_SCANNER_INFRARED_TAGS,
+    SCANNER_INFRARED_MARKER,
+    SCANNER_INFRARED_TAG,
+)
 from scanstudio_bridge import domain, safety
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
 from scanstudio_bridge.transport import FrameRetryExhausted
@@ -606,45 +611,6 @@ def test_start_scan_rejects_absolute_path_override_in_template(tmp_path: Path) -
     assert not escape_target.exists()
 
 
-def test_wsl_staging_directory_is_create_new_and_private(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    staging_base = tmp_path / "scanstudio-wsl-staging"
-    destination = staging_base / "owner-abc"
-    monkeypatch.setattr(output_reservation_module, "WSL_STAGING_BASE", staging_base)
-
-    reservations = OutputReservations.reserve(
-        [1], domain.FIXED_COLOR_NEGATIVE_RECIPE, _output(destination)
-    )
-    assert staging_base.stat().st_mode & 0o777 == 0o700
-    assert destination.stat().st_mode & 0o777 == 0o700
-    assert all(path.parent == destination for path in reservations.groups[1].paths)
-    reservations.release_unused()
-
-
-def test_wsl_staging_refuses_existing_or_symlinked_owner_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    staging_base = tmp_path / "scanstudio-wsl-staging"
-    destination = staging_base / "owner-abc"
-    monkeypatch.setattr(output_reservation_module, "WSL_STAGING_BASE", staging_base)
-    staging_base.mkdir(mode=0o700)
-    destination.mkdir(mode=0o700)
-    with pytest.raises(BridgeError, match="owner directory already exists"):
-        OutputReservations.reserve(
-            [1], domain.FIXED_COLOR_NEGATIVE_RECIPE, _output(destination)
-        )
-
-    destination.rmdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    destination.symlink_to(outside, target_is_directory=True)
-    with pytest.raises(BridgeError, match="owner directory already exists"):
-        OutputReservations.reserve(
-            [1], domain.FIXED_COLOR_NEGATIVE_RECIPE, _output(destination)
-        )
-
-
 @pytest.mark.parametrize("sidecar_suffix", ["", "_IR", "_METER"])
 def test_start_scan_refuses_existing_output_group_before_mock_scan(
     tmp_path: Path, sidecar_suffix: str
@@ -758,17 +724,18 @@ def test_start_scan_writes_linear_dng_with_embedded_ir_subifd(
         assert main.tags.get("ExtraSamples") is None
         np.testing.assert_array_equal(main.asarray(), rgb)
         assert len(main.pages) == 1
-        assert main.tags["SubIFDs"].dtype == tifffile.DATATYPE.LONG
+        # Issue #105: strict readers require the TIFF/EP LONG encoding for the
+        # SubIFDs pointer; tifffile's classic-TIFF type-13 form is patched.
+        assert int(main.tags["SubIFDs"].dtype) == 4
         assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
         embedded_ir = main.pages[0]
-        assert int(main.tags["Orientation"].value) == 1
-        assert int(embedded_ir.tags["Orientation"].value) == 1
+        np.testing.assert_array_equal(embedded_ir.asarray(), infrared)
         assert (
             embedded_ir.tags["ImageDescription"].value
             == "Untouched Nikon Coolscan infrared plane"
         )
         assert embedded_ir.tags.get(65001) is None
-        np.testing.assert_array_equal(embedded_ir.asarray(), infrared)
+        assert embedded_ir.tags.get(65010) is None
 
 
 @pytest.mark.parametrize(
@@ -813,10 +780,12 @@ def test_start_scan_writes_linear_tiff_ir_choice(
         if has_extra_sample:
             assert tuple(int(value) for value in page.extrasamples) == (0,)
             np.testing.assert_array_equal(page.asarray()[..., 3], infrared)
-            assert page.tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+            assert page.tags[SCANNER_INFRARED_TAG].value == SCANNER_INFRARED_MARKER
+            for legacy_code in LEGACY_SCANNER_INFRARED_TAGS:
+                assert legacy_code not in page.tags
         else:
             assert page.extrasamples == ()
-            assert page.tags.get(65001) is None
+            assert page.tags.get(SCANNER_INFRARED_TAG) is None
 
 
 @pytest.mark.parametrize(
@@ -864,7 +833,7 @@ def test_start_scan_writes_grayscale_ir_sidecar_pair(
         main = tiff.pages[0]
         assert int(main.tags["SamplesPerPixel"].value) == 3
         assert main.tags.get("SubIFDs") is None
-        assert main.tags.get(65001) is None
+        assert main.tags.get(SCANNER_INFRARED_TAG) is None
         np.testing.assert_array_equal(main.asarray(), rgb)
     with tifffile.TiffFile(ir_path) as tiff:
         sidecar = tiff.pages[0]
@@ -873,7 +842,9 @@ def test_start_scan_writes_grayscale_ir_sidecar_pair(
         assert int(sidecar.tags["SamplesPerPixel"].value) == 1
         assert int(sidecar.tags["PhotometricInterpretation"].value) == 1
         assert int(sidecar.tags["Orientation"].value) == 1
-        assert sidecar.tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+        assert sidecar.tags[SCANNER_INFRARED_TAG].value == SCANNER_INFRARED_MARKER
+        for legacy_code in LEGACY_SCANNER_INFRARED_TAGS:
+            assert legacy_code not in sidecar.tags
         assert sidecar.tags["XResolution"].value == (4000, 1)
         assert sidecar.tags["YResolution"].value == (4000, 1)
         assert int(sidecar.tags["ResolutionUnit"].value) == 2

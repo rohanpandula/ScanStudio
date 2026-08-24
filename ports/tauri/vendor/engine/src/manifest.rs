@@ -434,16 +434,19 @@ fn unlock_file(_file: &File) {}
 /// read and this guard should never fire against them in normal operation;
 /// it exists as the structural backstop for a write that reaches here some
 /// other way — a future caller that skips the lock, or a lock-holder racing
-/// one of the two callers that don't take it (`create_project`, whose fresh
-/// directory has nothing to race; `open_project`'s destination-migration
-/// write, which touches `recipes` only and carries forward whatever
-/// receipts it just read) — in which case refusing the write outright is
-/// still strictly safer than the silent overwrite this guard exists to
-/// make impossible. A missing manifest has nothing to compare against and
-/// is always allowed (a brand new project's first save); an existing
-/// manifest that cannot be read or parsed is refused rather than trusted or
-/// blindly overwritten — that corruption needs a human, not this function,
-/// to resolve.
+/// one of the callers that don't take it (`open_project`'s
+/// destination-migration write, which touches `recipes` only and carries
+/// forward whatever receipts it just read) — in which case refusing the
+/// write outright is still strictly safer than the silent overwrite this
+/// guard exists to make impossible. A missing manifest has nothing to
+/// compare against and is always allowed (a brand new project's first
+/// save); an existing manifest that cannot be read or parsed is refused
+/// rather than trusted or blindly overwritten — that corruption needs a
+/// human, not this function, to resolve. Since issue #99 `create_project`
+/// no longer routes through this function at all: its receipt-only guard
+/// would have allowed replacing a zero-receipt project's manifest, so
+/// creation publishes through the create-only `publish_manifest_create_only`
+/// instead.
 pub fn write_manifest_atomically(
     directory: &Path,
     project: &ScanProject,
@@ -563,110 +566,6 @@ fn write_manifest_bytes_locked(
         let _ = crate::exiftool::metadata_publish_sys::unlink(directory_handle, &tmp_name);
     }
     write_result
-}
-
-fn project_already_exists_error(directory: &Path) -> EngineError {
-    EngineError::new(
-        ErrorCode::ProjectAlreadyExists,
-        format!(
-            "a ScanStudio project already exists at {}; open the existing project or choose a different directory",
-            directory.display()
-        ),
-    )
-}
-
-/// Publishes the first manifest for a project without a replace-capable
-/// filesystem operation anywhere in the commit path. The preliminary
-/// `symlink_metadata` check avoids touching an established project at all;
-/// it is only an early refusal. `rename_exclusive` under the held directory
-/// capability is the authoritative race backstop, so a non-cooperating
-/// process that creates any `manifest.json` after the check still wins and
-/// its bytes are never replaced.
-fn write_initial_manifest_create_only(
-    directory: &Path,
-    project: &ScanProject,
-) -> Result<(), EngineError> {
-    write_initial_manifest_create_only_with_hook(directory, project, || Ok(()))
-}
-
-fn write_initial_manifest_create_only_with_hook<Hook>(
-    directory: &Path,
-    project: &ScanProject,
-    before_commit: Hook,
-) -> Result<(), EngineError>
-where
-    Hook: FnOnce() -> Result<(), EngineError>,
-{
-    let manifest_path = directory.join(MANIFEST_FILE_NAME);
-    match fs::symlink_metadata(&manifest_path) {
-        Ok(_) => return Err(project_already_exists_error(directory)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(EngineError::new(
-                ErrorCode::ManifestInvalid,
-                format!(
-                    "cannot prove that project creation is safe at {}: failed to inspect manifest.json: {error}",
-                    directory.display()
-                ),
-            ));
-        }
-    }
-
-    fs::create_dir_all(directory).map_err(io_err_to_internal)?;
-    let guard = lock_manifest_transaction(directory)?;
-    crate::exiftool::verify_directory_path_authority(
-        directory,
-        &guard.directory,
-        "new project manifest root",
-    )?;
-
-    let json = serde_json::to_string_pretty(project).map_err(|error| {
-        EngineError::new(
-            ErrorCode::Internal,
-            format!("failed to serialize initial manifest: {error}"),
-        )
-    })?;
-    ensure_manifest_write_size(json.len() as u64, MAX_MANIFEST_BYTES)?;
-
-    let (temporary_name, mut temporary_file) = create_manifest_temp_file(&guard.directory)?;
-    let result = (|| {
-        temporary_file
-            .write_all(json.as_bytes())
-            .map_err(io_err_to_internal)?;
-        temporary_file.sync_all().map_err(io_err_to_internal)?;
-        drop(temporary_file);
-
-        before_commit()?;
-        crate::exiftool::verify_directory_path_authority(
-            directory,
-            &guard.directory,
-            "new project manifest root before create-only commit",
-        )?;
-        match crate::exiftool::metadata_publish_sys::rename_exclusive(
-            &guard.directory,
-            &temporary_name,
-            &guard.directory,
-            std::ffi::OsStr::new(MANIFEST_FILE_NAME),
-        ) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(project_already_exists_error(directory));
-            }
-            Err(error) => return Err(io_err_to_internal(error)),
-        }
-        crate::exiftool::metadata_publish_sys::sync_directory(&guard.directory)
-            .map_err(io_err_to_internal)?;
-        crate::exiftool::verify_directory_path_authority(
-            directory,
-            &guard.directory,
-            "new project manifest root after create-only commit",
-        )
-    })();
-
-    if result.is_err() {
-        let _ = crate::exiftool::metadata_publish_sys::unlink(&guard.directory, &temporary_name);
-    }
-    result
 }
 
 fn ensure_manifest_write_size(length: u64, maximum: u64) -> Result<(), EngineError> {
@@ -868,10 +767,27 @@ fn validate_frame_count(carrier: MediaCarrier, frame_count: u32) -> Result<(), E
 
 /// Creates a new project: validates `frame_count` against `carrier`,
 /// builds a fresh `ScanProject` (all frames unexcluded, no receipts yet),
-/// and writes its manifest atomically. `directory_override` picks the
-/// target directory verbatim (tests and any future "choose a location"
-/// UI flow use this); when `None`, the project lands under
+/// and publishes its manifest with create-only semantics. `directory_override`
+/// picks the target directory verbatim (tests and any future "choose a
+/// location" UI flow use this); when `None`, the project lands under
 /// `default_projects_root()` in a `<slug>-<id>` subdirectory.
+///
+/// Issue #99: creation must never replace an existing project. The whole
+/// publication runs inside `lock_manifest_transaction`'s authoritative
+/// held-directory boundary (process mutex + OS project lock + path↔handle
+/// identity verification) and the final commit is an exclusive
+/// create-only rename, not a replacing one: if any `manifest.json` is
+/// present at commit time — a valid zero-receipt project, a fully
+/// populated one, or an unreadable/corrupt file — the rename fails with
+/// `AlreadyExists` and the request is refused with
+/// `ErrorCode::ProjectAlreadyExists` before a single byte of the existing
+/// project changes. The receipt-preservation guard in
+/// `write_manifest_atomically` is deliberately NOT reused here: it
+/// protects only durable receipts, so it would silently allow overwriting
+/// a zero-receipt project's manifest — exactly the data loss #99 exists
+/// to prevent. A directory with no `manifest.json` is still creatable no
+/// matter what unrelated files it contains, because only the manifest
+/// leaf's absence is load-bearing.
 pub fn create_project(
     name: &str,
     carrier: MediaCarrier,
@@ -949,9 +865,79 @@ pub fn create_project(
         frames,
     };
 
-    write_initial_manifest_create_only(&directory, &project)?;
+    fs::create_dir_all(&directory).map_err(io_err_to_internal)?;
+    let guard = lock_manifest_transaction(&directory)?;
+    // Deliberately no `recover_pending_metadata_transactions_locked` call
+    // (issue #99): recovery converges crash debris by rewriting project
+    // files, and a create that is about to be refused must leave every
+    // byte of the existing project untouched. A journaled attempt can only
+    // exist for a project whose manifest is present — and any present
+    // manifest refuses this create outright below — so there is no
+    // committed state here for recovery to restore.
+    publish_manifest_create_only(&guard.directory, &directory, &project)?;
 
     Ok((project, directory))
+}
+
+/// Issue #99 create-only publication: stage the serialized manifest as a
+/// same-directory temp file, then commit it with an exclusive
+/// (never-replacing) rename. On any staging or commit failure the staged
+/// temp file is removed, so a refused or failed create leaves the target
+/// directory byte-for-byte as it found it. The `AlreadyExists` commit
+/// outcome is the authoritative refusal: it means a `manifest.json`
+/// appeared (or was always there) regardless of what any earlier probe
+/// observed, which is what makes this safe against creators that do not
+/// cooperate with the manifest lock.
+fn publish_manifest_create_only(
+    directory_handle: &File,
+    display_directory: &Path,
+    project: &ScanProject,
+) -> Result<(), EngineError> {
+    crate::exiftool::verify_directory_path_authority(
+        display_directory,
+        directory_handle,
+        "project manifest root",
+    )?;
+    let json = serde_json::to_string_pretty(project).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to serialize manifest: {err}"),
+        )
+    })?;
+    ensure_manifest_write_size(json.len() as u64, MAX_MANIFEST_BYTES)?;
+
+    let (tmp_name, mut tmp_file) = create_manifest_temp_file(directory_handle)?;
+    let staged = (|| {
+        tmp_file.write_all(json.as_bytes()).map_err(io_err_to_internal)?;
+        tmp_file.sync_all().map_err(io_err_to_internal)
+    })();
+    if let Err(err) = staged {
+        let _ = crate::exiftool::metadata_publish_sys::unlink(directory_handle, &tmp_name);
+        return Err(err);
+    }
+    drop(tmp_file);
+
+    if let Err(err) = crate::exiftool::metadata_publish_sys::rename_exclusive(
+        directory_handle,
+        &tmp_name,
+        directory_handle,
+        std::ffi::OsStr::new(MANIFEST_FILE_NAME),
+    ) {
+        let _ = crate::exiftool::metadata_publish_sys::unlink(directory_handle, &tmp_name);
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            return Err(EngineError::new(
+                ErrorCode::ProjectAlreadyExists,
+                format!(
+                    "refusing to create a project at {}: a manifest.json already exists — open the existing project or choose a different directory; the existing project was not modified",
+                    display_directory.display()
+                ),
+            ));
+        }
+        return Err(io_err_to_internal(err));
+    }
+
+    crate::exiftool::metadata_publish_sys::sync_directory(directory_handle)
+        .map_err(io_err_to_internal)
 }
 
 /// True when `path` sits under `<OS temp dir>/ScanStudio` — the exact
@@ -1536,180 +1522,6 @@ mod tests {
     }
 
     #[test]
-    fn create_project_never_replaces_an_existing_zero_receipt_project() {
-        let dir = temp_project_dir();
-        let (mut original, _) = create_project(
-            "Original",
-            MediaCarrier::Strip6,
-            3,
-            FilmProcess::C41ColorNegative,
-            Some(&dir),
-        )
-        .expect("seed project");
-        original.frames[1].excluded = true;
-        original.roll_metadata.notes = Some("irreplaceable project state".into());
-        write_manifest_atomically(&dir, &original).expect("persist custom state");
-        let sentinel = dir.join("unrelated.bin");
-        fs::write(&sentinel, b"unrelated bytes").expect("write unrelated sentinel");
-        let manifest_before = fs::read(dir.join(MANIFEST_FILE_NAME)).expect("read manifest");
-
-        let error = create_project(
-            "Replacement",
-            MediaCarrier::Mounted,
-            1,
-            FilmProcess::Positive,
-            Some(&dir),
-        )
-        .expect_err("project creation must never replace an existing manifest");
-
-        assert_eq!(error.code, ErrorCode::ProjectAlreadyExists);
-        assert_eq!(
-            fs::read(dir.join(MANIFEST_FILE_NAME)).expect("reread manifest"),
-            manifest_before
-        );
-        assert_eq!(
-            fs::read(&sentinel).expect("read sentinel"),
-            b"unrelated bytes"
-        );
-        assert_eq!(read_manifest(&dir).expect("reopen original"), original);
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn create_project_refuses_corrupt_or_wrong_kind_manifest_without_mutation() {
-        for manifest_is_directory in [false, true] {
-            let dir = temp_project_dir();
-            fs::create_dir_all(&dir).expect("create target directory");
-            let manifest = dir.join(MANIFEST_FILE_NAME);
-            if manifest_is_directory {
-                fs::create_dir(&manifest).expect("create wrong-kind manifest");
-                fs::write(manifest.join("sentinel"), b"directory sentinel")
-                    .expect("write directory sentinel");
-            } else {
-                fs::write(&manifest, b"{not valid json").expect("write corrupt manifest");
-            }
-
-            let error = create_project(
-                "Must Refuse",
-                MediaCarrier::Mounted,
-                1,
-                FilmProcess::Positive,
-                Some(&dir),
-            )
-            .expect_err("any manifest entry must collide");
-
-            assert_eq!(error.code, ErrorCode::ProjectAlreadyExists);
-            if manifest_is_directory {
-                assert_eq!(
-                    fs::read(manifest.join("sentinel")).expect("read directory sentinel"),
-                    b"directory sentinel"
-                );
-            } else {
-                assert_eq!(
-                    fs::read(&manifest).expect("read corrupt manifest"),
-                    b"{not valid json"
-                );
-            }
-            cleanup(&dir);
-        }
-    }
-
-    #[test]
-    fn create_project_allows_unrelated_files_when_no_manifest_exists() {
-        let dir = temp_project_dir();
-        fs::create_dir_all(&dir).expect("create target directory");
-        let sentinel = dir.join("keep.txt");
-        fs::write(&sentinel, b"keep me").expect("write unrelated file");
-
-        create_project(
-            "Coexists",
-            MediaCarrier::Mounted,
-            1,
-            FilmProcess::Positive,
-            Some(&dir),
-        )
-        .expect("unrelated files must not make a directory an existing project");
-
-        assert_eq!(
-            fs::read(&sentinel).expect("read unrelated file"),
-            b"keep me"
-        );
-        assert!(dir.join(MANIFEST_FILE_NAME).is_file());
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn concurrent_cooperative_project_creates_allow_at_most_one_success() {
-        let dir = temp_project_dir();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let mut threads = Vec::new();
-        for name in ["First", "Second"] {
-            let dir = dir.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                create_project(
-                    name,
-                    MediaCarrier::Mounted,
-                    1,
-                    FilmProcess::Positive,
-                    Some(&dir),
-                )
-            }));
-        }
-        barrier.wait();
-
-        let results = threads
-            .into_iter()
-            .map(|thread| thread.join().expect("creator thread"))
-            .collect::<Vec<_>>();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        let collision = results
-            .iter()
-            .find_map(|result| result.as_ref().err())
-            .expect("one creator must collide");
-        assert!(matches!(
-            collision.code,
-            ErrorCode::ProjectAlreadyExists | ErrorCode::ScannerBusy
-        ));
-        read_manifest(&dir).expect("the winning manifest must be readable");
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn noncooperating_manifest_race_is_never_overwritten() {
-        let dir = temp_project_dir();
-        let project = n_frame_project_for_mutate_frame_tests(1);
-        let foreign = b"foreign creator won the final-name race";
-
-        let error = write_initial_manifest_create_only_with_hook(&dir, &project, || {
-            fs::write(dir.join(MANIFEST_FILE_NAME), foreign).map_err(io_err_to_internal)
-        })
-        .expect_err("create-only publication must lose to an existing final name");
-
-        assert_eq!(error.code, ErrorCode::ProjectAlreadyExists);
-        assert_eq!(
-            fs::read(dir.join(MANIFEST_FILE_NAME)).expect("read raced manifest"),
-            foreign
-        );
-        let leaked_temporaries = fs::read_dir(&dir)
-            .expect("list project directory")
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".manifest.json.")
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            leaked_temporaries.is_empty(),
-            "failed publication must clean only its private staging file"
-        );
-        cleanup(&dir);
-    }
-
-    #[test]
     fn create_project_roll36_accepts_one_through_forty_and_rejects_outside_that_range() {
         for frame_count in [1, 36, 39, 40] {
             let dir = temp_project_dir();
@@ -1816,6 +1628,361 @@ mod tests {
         }
 
         cleanup(&dir);
+    }
+
+    /// Snapshots every byte of `directory`'s regular files (recursively)
+    /// so a refusal test can prove the guard left the existing project
+    /// exactly as it found it (issue #99 acceptance: "leaves every byte of
+    /// the existing manifest and all project-owned files unchanged").
+    /// Directory mtimes are deliberately not captured — refusing a create
+    /// never adds, removes, or rewrites entries, but the OS may bump a
+    /// directory's mtime for reasons outside this process's control.
+    fn snapshot_regular_files(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .expect("snapshot reads the project directory")
+                .map(|entry| entry.expect("snapshot reads each directory entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    visit(&path, out);
+                } else {
+                    out.push((path.clone(), fs::read(&path).expect("snapshot reads file bytes")));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        visit(directory, &mut files);
+        files
+    }
+
+    /// Issue #99: creating into a directory that already holds a valid
+    /// zero-receipt project must be refused with `PROJECT_ALREADY_EXISTS`.
+    /// This is the exact repro from the issue: a fresh project has no
+    /// receipts, so the old receipt-preservation guard let the second
+    /// create silently replace its manifest.
+    #[test]
+    fn create_project_refuses_to_replace_an_existing_zero_receipt_project() {
+        let dir = temp_project_dir();
+        let (first, _) = create_project(
+            "Original Roll",
+            MediaCarrier::Roll36,
+            3,
+            FilmProcess::C41ColorNegative,
+            Some(&dir),
+        )
+        .expect("first create into an empty directory must succeed");
+        assert!(first.frames.iter().all(|frame| frame.receipts.is_empty()));
+
+        let before = snapshot_regular_files(&dir);
+        let err = create_project(
+            "Replacement Roll",
+            MediaCarrier::Roll36,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect_err("creating over an existing zero-receipt project must be refused");
+        assert_eq!(err.code, ErrorCode::ProjectAlreadyExists);
+        assert_eq!(
+            snapshot_regular_files(&dir),
+            before,
+            "a refused create must not modify any project byte"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// Issue #99: a receipt-bearing project must also refuse creation,
+    /// with its receipts still intact afterwards — the refusal path must
+    /// be independent of what the old receipt-preservation guard would
+    /// have decided.
+    #[test]
+    fn create_project_refuses_to_replace_a_receipt_bearing_project_and_preserves_its_bytes() {
+        let dir = temp_project_dir();
+        let (first, _) = create_project(
+            "Scanned Roll",
+            MediaCarrier::Roll36,
+            2,
+            FilmProcess::BwNegative,
+            Some(&dir),
+        )
+        .expect("first create must succeed");
+        crate::manifest::persist_frame_receipt(
+            &dir,
+            1,
+            &ScanReceipt {
+                exposure_authority: None,
+                auto_crop: None,
+                job_id: "job-issue99".into(),
+                frame_index: 1,
+                started_at: "2026-08-01T09:00:00Z".into(),
+                duration_ms: 1200,
+                passes: 1,
+                resolution_dpi: 4000,
+                bit_depth: 16,
+                channels: "rgbi".into(),
+                engine_version: "test".into(),
+                device_id: "sim".into(),
+                simulated: true,
+                settings_fingerprint: "fingerprint".into(),
+                processing: None,
+                output: None,
+                outputs: None,
+                rgb_path: None,
+                ir_path: None,
+                storage_transform: None,
+                meter_rgbi_path: None,
+                hardware_telemetry: None,
+                nikonlook: None,
+            },
+        )
+        .expect("receipt persist must succeed");
+
+        // Re-read so the snapshot reflects the durable on-disk state.
+        let on_disk =
+            read_manifest(&dir).expect("the project with its receipt must remain readable");
+        assert_eq!(
+            on_disk.frames[0].receipts.len(),
+            1,
+            "precondition: the existing project carries one receipt"
+        );
+        let _ = first;
+
+        let before = snapshot_regular_files(&dir);
+        let err = create_project(
+            "Overwrite Attempt",
+            MediaCarrier::Roll36,
+            36,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect_err("creating over a scanned project must be refused");
+        assert_eq!(err.code, ErrorCode::ProjectAlreadyExists);
+        assert_eq!(
+            snapshot_regular_files(&dir),
+            before,
+            "the refused create must leave the receipt-bearing manifest byte-for-byte intact"
+        );
+        let after = read_manifest(&dir).expect("project stays readable after refusal");
+        assert_eq!(after.frames[0].receipts.len(), 1);
+
+        cleanup(&dir);
+    }
+
+    /// Issue #99: an unreadable/corrupt manifest is still A MANIFEST.
+    /// Creation must refuse rather than treat the directory as vacant —
+    /// the corrupt bytes belong to some project's recovery story, not to
+    /// this create call. Both a valid-UTF-8-but-invalid-JSON body and a
+    /// non-UTF-8 binary body are covered: `read_manifest` rejects them at
+    /// different layers (parse vs UTF-8), and the refusal must not depend
+    /// on which layer fires.
+    #[test]
+    fn create_project_refuses_when_an_unreadable_or_corrupt_manifest_exists() {
+        for corruption in [
+            "not json at all".as_bytes(),
+            b"\xff\xfe\x00broken utf-8".as_slice(),
+        ] {
+            let dir = temp_project_dir();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(MANIFEST_FILE_NAME), corruption).unwrap();
+
+            let before = snapshot_regular_files(&dir);
+            let err = create_project(
+                "Fresh Name",
+                MediaCarrier::Mounted,
+                1,
+                FilmProcess::Positive,
+                Some(&dir),
+            )
+            .expect_err("creating over a corrupt manifest must be refused");
+            assert_eq!(err.code, ErrorCode::ProjectAlreadyExists);
+            assert_eq!(
+                snapshot_regular_files(&dir),
+                before,
+                "the corrupt manifest's own bytes must survive the refusal untouched"
+            );
+
+            cleanup(&dir);
+        }
+    }
+
+    /// Issue #99: the authoritative publication step itself must be
+    /// create-only. A creator that does not cooperate with the manifest
+    /// lock (another process, an older engine build using rename_replace)
+    /// can plant a manifest.json between our vacancy observation and the
+    /// final commit; because the commit is an exclusive rename, that leaf
+    /// can never be overwritten — the exclusive rename refuses, and the
+    /// planted bytes win. Proven here against the same held-capability
+    /// boundary `create_project` uses, with the colliding leaf written by
+    /// raw filesystem calls that ignore every lock.
+    #[test]
+    fn create_only_publication_cannot_overwrite_a_leaf_planted_by_a_non_cooperating_creator() {
+        let dir = temp_project_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let handle =
+            crate::exiftool::metadata_publish_sys::open_directory(&dir).expect("open directory");
+        let guard = lock_manifest_transaction_at(&handle).expect("hold the project lock");
+
+        // The non-cooperating creator's manifest lands while this
+        // process's own lock is held — locks are irrelevant to it.
+        let planted = b"{\"planted\": true}";
+        fs::write(dir.join(MANIFEST_FILE_NAME), planted).unwrap();
+
+        let project = ScanProject {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            id: generate_project_id(),
+            name: "Racer".into(),
+            carrier: MediaCarrier::Mounted,
+            frame_count: 1,
+            film_process: FilmProcess::Positive,
+            recipes: OutputRecipe::default(),
+            roll_metadata: MetadataSet::default(),
+            created_at: "2026-08-22T00:00:00Z".into(),
+            frames: vec![],
+        };
+        let err = publish_manifest_create_only(&guard.directory, &dir, &project)
+            .expect_err("create-only publication must refuse an occupied leaf");
+        assert_eq!(err.code, ErrorCode::ProjectAlreadyExists);
+        assert_eq!(
+            fs::read(dir.join(MANIFEST_FILE_NAME)).unwrap(),
+            planted,
+            "the non-cooperating creator's manifest must survive byte-for-byte"
+        );
+        // No staged temp file may leak from the refused attempt.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".manifest.json."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "refused publication must clean up its staging temp file, found {leftovers:?}"
+        );
+
+        drop(guard);
+        cleanup(&dir);
+    }
+
+    /// Issue #99: cooperative concurrent creates into the same explicit
+    /// directory serialize on the manifest transaction boundary and allow
+    /// at most one success; every loser receives the typed
+    /// `PROJECT_ALREADY_EXISTS` refusal and the surviving manifest is one
+    /// of the attempted projects, fully readable afterwards.
+    #[test]
+    fn concurrent_creates_into_one_directory_allow_at_most_one_success() {
+        const RACERS: usize = 8;
+        let dir = temp_project_dir();
+        let shared_dir = std::sync::Arc::new(dir.clone());
+        let handles: Vec<_> = (0..RACERS)
+            .map(|racer| {
+                let shared_dir = std::sync::Arc::clone(&shared_dir);
+                std::thread::spawn(move || {
+                    create_project(
+                        &format!("Racer {racer}"),
+                        MediaCarrier::Mounted,
+                        1,
+                        FilmProcess::Positive,
+                        Some(shared_dir.as_path()),
+                    )
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("racer thread must not panic"))
+            .collect();
+        let winners: Vec<_> = outcomes.iter().filter(|outcome| outcome.is_ok()).collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one cooperative create may win, got {outcomes:?}"
+        );
+        for outcome in outcomes.iter().filter(|outcome| outcome.is_err()) {
+            assert_eq!(outcome.as_ref().unwrap_err().code, ErrorCode::ProjectAlreadyExists);
+        }
+        let survivor = read_manifest(&dir).expect("the winning manifest must be readable");
+        let winner_outcome = outcomes.iter().find(|outcome| outcome.is_ok()).unwrap();
+        let (winner_project, _) = winner_outcome.as_ref().unwrap();
+        assert_eq!(winner_project.id, survivor.id);
+        // No staging temp files may survive the race.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".manifest.json."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp litter allowed, found {leftovers:?}");
+
+        cleanup(&dir);
+    }
+
+    /// Issue #99: unrelated files in a manifest-less directory are not a
+    /// refusal reason — only the presence of `manifest.json` is.
+    #[test]
+    fn create_project_succeeds_in_a_directory_holding_only_unrelated_files() {
+        let dir = temp_project_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "operator scratch notes").unwrap();
+        fs::write(dir.join(".DS_Store"), b"junk").unwrap();
+        fs::create_dir_all(dir.join("Archive")).unwrap();
+        fs::write(dir.join("Archive").join("old.tif"), b"not ours").unwrap();
+
+        let (project, returned_dir) = create_project(
+            "Fresh Roll",
+            MediaCarrier::Strip6,
+            6,
+            FilmProcess::Kodachrome,
+            Some(&dir),
+        )
+        .expect("creating beside unrelated files must succeed");
+        assert_eq!(returned_dir, dir);
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "operator scratch notes");
+        assert_eq!(
+            read_manifest(&dir).expect("created project opens again").id,
+            project.id
+        );
+
+        cleanup(&dir);
+    }
+
+    /// Issue #99: choosing a parent that already contains another project
+    /// must still allow a unique new child project — sibling projects
+    /// never collide through the parent's contents.
+    #[test]
+    fn choosing_a_parent_directory_creates_a_unique_child_beside_an_existing_project() {
+        let parent = temp_project_dir();
+        fs::create_dir_all(&parent).unwrap();
+        let existing = parent.join("existing-roll");
+        create_project(
+            "Existing",
+            MediaCarrier::Mounted,
+            1,
+            FilmProcess::Positive,
+            Some(&existing),
+        )
+        .expect("sibling setup create must succeed");
+
+        let fresh_child = parent.join("fresh-child-roll");
+        let (child, child_dir) = create_project(
+            "Fresh Child",
+            MediaCarrier::Strip6,
+            4,
+            FilmProcess::Positive,
+            Some(&fresh_child),
+        )
+        .expect("a unique child of a chosen parent must be creatable");
+        assert_eq!(child_dir, fresh_child);
+        assert_eq!(
+            read_manifest(&existing).expect("existing sibling untouched").carrier,
+            MediaCarrier::Mounted
+        );
+        assert_eq!(
+            read_manifest(&fresh_child).expect("new child readable").id,
+            child.id
+        );
+
+        cleanup(&parent);
     }
 
     #[test]

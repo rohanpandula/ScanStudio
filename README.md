@@ -34,12 +34,14 @@ tested one are the most useful thing you can send.
 
 ## Platform support
 
-The current status is maintained in one place: the [hardware and platform
-evidence matrix](docs/HARDWARE-SUPPORT.md). macOS needs macOS 14 (Sonoma) or
-newer. Current macOS release artifacts are Developer ID signed, notarized, and
-stapled; Windows and Linux artifacts remain unsigned. There is no support or
-release-schedule promise. Cross-platform source, setup instructions, and
-live-validation runbooks are in [`ports/tauri`](ports/tauri).
+| Platform | Level | Notes |
+| --- | --- | --- |
+| macOS Apple Silicon | **Beta** | Real-scanner validated, including the detection-recovery paths live on real rolls. |
+| macOS Intel | Preview | Built and package-verified in CI; not yet validated with a real scanner. |
+| Windows x64 | Preview | Runs the capture path through WSL2 (Ubuntu 24.04) with usbipd-win for USB pass-through. Raw negative export is not yet supported on this path and refuses up front. |
+| Linux x64 | Preview | AppImage and portable tarball; needs the distribution's SANE/libusb runtime packages and scanner permissions. |
+
+macOS needs macOS 14 (Sonoma) or newer. Current macOS release artifacts are Developer ID signed, notarized, and stapled; Windows and Linux artifacts remain unsigned. There is no support or release-schedule promise. The cross-platform source, setup instructions, and live-validation runbooks are in [`ports/tauri`](ports/tauri).
 
 ## Download
 
@@ -56,9 +58,10 @@ A release DMG contains the app, the GPL hardware bridge and CoolscanPy source
 required for redistribution, and the applicable dependency notices. The
 supported LS-5000 color-roll workflow uses the signed libusb copy inside the
 app, so installing ScanStudio does not require Homebrew, SANE, or a Nikon
-driver. A system SANE backend remains required for discovery, scanning, and
-legacy plain-scan operations on the applicable Linux/WSL lanes; eject uses the
-direct USB transport and does not require SANE or `scanimage`.
+driver. Software eject is likewise direct over USB (the traced unload
+sequence, with typed failures and presence confirmation) and needs no SANE.
+Only the legacy plain-scan path still requires a system SANE backend, which
+also remains how SANE-based discovery lists scanners.
 
 For scripting, or for running the FireWire probe without the app, the bundled
 driver is also published on its own:

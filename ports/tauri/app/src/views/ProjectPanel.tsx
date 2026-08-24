@@ -1,8 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { homeDir, join } from "@tauri-apps/api/path";
+import { homeDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import { sessionStore, type SessionState } from "../session";
-import { newOperationId } from "../session/webApis";
 import {
   preProjectPreviewRegistration,
   sessionOperationBusy,
@@ -46,14 +45,6 @@ const FILM_PROCESSES = [
 type FilmProcess = (typeof FILM_PROCESSES)[number];
 
 function messageOf(err: unknown): string {
-  if (
-    typeof err === "object" &&
-    err !== null &&
-    "code" in err &&
-    (err as { code: unknown }).code === "PROJECT_ALREADY_EXISTS"
-  ) {
-    return "A ScanStudio project already exists in that folder. Use Open existing project instead.";
-  }
   if (err instanceof Error) return err.message;
   if (
     typeof err === "object" &&
@@ -66,17 +57,27 @@ function messageOf(err: unknown): string {
   return "Unknown error";
 }
 
-function projectDirectoryStem(name: string): string {
-  const stem = name
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[\u0300-\u036f]/gu, "")
-    .replace(/[^a-z0-9]+/gu, "-")
-    .replace(/^-+|-+$/gu, "")
-    .slice(0, 48)
-    .replace(/-+$/gu, "");
-  return stem || "project";
+/** Extracts the engine's typed wire error code when one is present (#99). */
+function errorCodeOf(err: unknown): string | null {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    typeof (err as { code: unknown }).code === "string"
+  ) {
+    return (err as { code: string }).code;
+  }
+  return null;
 }
+
+/**
+ * Typed refusal copy for `PROJECT_ALREADY_EXISTS` (issue #99): creating over
+ * an existing project is refused by the engine without modifying anything,
+ * so the operator's recovery is to open the existing project or pick a
+ * different folder -- never to retry the same create.
+ */
+const PROJECT_ALREADY_EXISTS_COPY =
+  "This folder already contains a ScanStudio project, so the new roll was not saved and nothing was changed. Open the existing project under Open Recent, or choose a different folder.";
 
 export default function ProjectPanel() {
   const [name, setName] = useState("");
@@ -84,10 +85,10 @@ export default function ProjectPanel() {
   const [frameCount, setFrameCount] = useState("36");
   const [filmProcess, setFilmProcess] = useState<FilmProcess>("positive");
   const [carrierConfirmed, setCarrierConfirmed] = useState(false);
-  const [parentDirectory, setParentDirectory] = useState<string | undefined>(undefined);
+  const [directory, setDirectory] = useState<string | undefined>(undefined);
   const [recent, setRecent] = useState<ProjectSummary[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ code: string | null; message: string } | null>(null);
 
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const project = state.project;
@@ -159,14 +160,14 @@ export default function ProjectPanel() {
     submitting ||
     operationBusy;
 
-  const pickParentDirectory = async (): Promise<void> => {
+  const pickDirectory = async (): Promise<void> => {
     try {
       const chosen = await open({
         directory: true,
         defaultPath: `${await homeDir()}ScanStudio Projects`,
         multiple: false,
       });
-      if (chosen !== null) setParentDirectory(chosen);
+      if (chosen !== null) setDirectory(chosen);
     } catch {
       // Dialog unavailable (e.g. non-Tauri shell): keep the default directory.
     }
@@ -178,13 +179,6 @@ export default function ProjectPanel() {
     setError(null);
     setSubmitting(true);
     try {
-      const directory =
-        parentDirectory === undefined
-          ? undefined
-          : await join(
-              parentDirectory,
-              projectDirectoryStem(name.trim()) + "-" + newOperationId(),
-            );
       await sessionStore.createProject(
         name.trim(),
         resolvedCarrier,
@@ -193,26 +187,7 @@ export default function ProjectPanel() {
         directory,
       );
     } catch (err) {
-      setError(messageOf(err));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const pickExistingProject = async (): Promise<void> => {
-    if (operationBusy || submitting) return;
-    setError(null);
-    try {
-      const chosen = await open({
-        directory: true,
-        defaultPath: `${await homeDir()}ScanStudio Projects`,
-        multiple: false,
-      });
-      if (chosen === null) return;
-      setSubmitting(true);
-      await sessionStore.openProject(chosen);
-    } catch (err) {
-      setError(messageOf(err));
+      setError({ code: errorCodeOf(err), message: messageOf(err) });
     } finally {
       setSubmitting(false);
     }
@@ -223,7 +198,7 @@ export default function ProjectPanel() {
     try {
       await sessionStore.openProject(summary.directory);
     } catch (err) {
-      setError(messageOf(err));
+      setError({ code: errorCodeOf(err), message: messageOf(err) });
     }
   };
 
@@ -232,7 +207,7 @@ export default function ProjectPanel() {
     try {
       await sessionStore.refreshStatus();
     } catch (err) {
-      setError(messageOf(err));
+      setError({ code: errorCodeOf(err), message: messageOf(err) });
     }
   };
 
@@ -338,16 +313,10 @@ export default function ProjectPanel() {
             </button>
           )}
         <div className={styles.directoryRow}>
-          <button
-            type="button"
-            className={styles.controlButton}
-            onClick={() => void pickParentDirectory()}
-          >
-            Choose parent folder
+          <button type="button" className={styles.controlButton} onClick={() => void pickDirectory()}>
+            Choose output folder
           </button>
-          {parentDirectory !== undefined && (
-            <span className={styles.directory}>{parentDirectory}</span>
-          )}
+          {directory !== undefined && <span className={styles.directory}>{directory}</span>}
         </div>
         {!validation.valid && (
           <p className={styles.inlineError} role="alert" data-testid="frame-count-error">
@@ -358,17 +327,14 @@ export default function ProjectPanel() {
           Create
         </button>
       </form>
-      <button
-        type="button"
-        className={styles.controlButton}
-        disabled={operationBusy || submitting}
-        onClick={() => void pickExistingProject()}
-      >
-        Open existing project…
-      </button>
-      {error !== null && (
+      {error !== null && error.code === "PROJECT_ALREADY_EXISTS" && (
+        <p className={styles.error} role="alert" data-testid="project-already-exists-error">
+          {PROJECT_ALREADY_EXISTS_COPY}
+        </p>
+      )}
+      {error !== null && error.code !== "PROJECT_ALREADY_EXISTS" && (
         <p className={styles.error} role="alert" data-testid="project-error">
-          {error}
+          {error.message}
         </p>
       )}
       <h3 className={styles.heading}>Open Recent</h3>

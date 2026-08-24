@@ -16,7 +16,7 @@ struct ErrorPresentationPolicyTests {
         #expect(presentation.title == "The first frame is not fully inside the scanner")
         #expect(
             presentation.guidance
-                == "Reinsert the film a little farther into the adapter, then preview it again. No automatic cropped frame was created. Manual placement can use the visible portion, but it cannot restore pixels that were outside the preview; refeed for full coverage."
+                == "Reinsert the film a little farther into the adapter, then preview it again. ScanStudio did not automatically crop this frame for scanning; manual placement can review the captured area, but it cannot restore the missing part of the frame."
         )
         #expect(presentation.technicalDetails == rawMessage)
     }
@@ -168,6 +168,11 @@ struct ErrorPresentationPolicyTests {
                 "PROJECT_NOT_FOUND: no active project",
                 "Save or open a roll first",
                 "Save this roll or open its existing project, then try again."
+            ),
+            (
+                "PROJECT_ALREADY_EXISTS: refusing to create a project at /scans/trip — a manifest.json already exists — open the existing project or choose a different directory; the existing project was not modified",
+                "That folder already has a project",
+                "ScanStudio will not overwrite an existing project. Open it from Open Recent, or choose a different folder for the new roll."
             ),
             (
                 "ARCHIVE_COLLISION: an archive master already exists",
@@ -661,20 +666,5 @@ struct ErrorPresentationPolicyTests {
 
         #expect(presentation.title != "This roll previewed with low confidence")
         #expect(presentation.title == "ScanStudio could not complete that action")
-    }
-}
-
-@Suite("Project collision presentation")
-struct ProjectCollisionPresentationTests {
-    @Test("the typed collision tells the operator to open the existing roll instead of retrying create")
-    func projectAlreadyExistsIsActionable() {
-        let presentation = ErrorPresentationPolicy.make(
-            lastErrorMessage:
-                "PROJECT_ALREADY_EXISTS: manifest.json already exists and was left unchanged"
-        )
-
-        #expect(presentation.title == "A roll already exists here")
-        #expect(presentation.guidance.contains("Open Existing"))
-        #expect(!presentation.canApproveEveryFrameAndScan)
     }
 }

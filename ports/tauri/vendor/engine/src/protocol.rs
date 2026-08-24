@@ -124,9 +124,11 @@ pub enum ErrorCode {
     FilmFeedInterrupted,
     Internal,
     ProjectNotFound,
-    /// `project.create` targeted a directory that already contains any
-    /// `manifest.json`. Creating a project is create-only; callers must
-    /// explicitly open the existing project or choose another directory.
+    /// Issue #99: `project.create` refused because the target directory
+    /// already contains a project manifest (valid, zero-receipt, or corrupt).
+    /// Creating a project must never replace an existing one; the operator
+    /// opens the existing project or picks a different directory.
+
     ProjectAlreadyExists,
     ManifestInvalid,
     ArchiveCollision,

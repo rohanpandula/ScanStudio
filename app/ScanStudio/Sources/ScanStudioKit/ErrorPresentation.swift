@@ -205,8 +205,8 @@ public enum ErrorPresentationPolicy {
         ),
         Copy(
             code: "PROJECT_ALREADY_EXISTS",
-            title: "A roll already exists here",
-            guidance: "Choose Open Existing to keep working with that roll, or use a different name for a new roll. ScanStudio did not replace the existing project."
+            title: "That folder already has a project",
+            guidance: "ScanStudio will not overwrite an existing project. Open it from Open Recent, or choose a different folder for the new roll."
         ),
         Copy(
             code: ScanFailureCode.attendedBindingRequired,
@@ -326,9 +326,7 @@ public enum ErrorPresentationPolicy {
             code: "REFEED_REQUIRED",
             title: "The first frame is not fully inside the scanner",
             guidance: "Reinsert the film a little farther into the adapter, then preview it again. "
-                + "No automatic cropped frame was created. Manual placement can use the visible "
-                + "portion, but it cannot restore pixels that were outside the preview; refeed "
-                + "for full coverage."
+                + "ScanStudio did not automatically crop this frame for scanning; manual placement can review the captured area, but it cannot restore the missing part of the frame."
         )
     }
 

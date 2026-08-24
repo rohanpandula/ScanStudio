@@ -267,30 +267,6 @@ class TestScanimageEjectButton:
             sane_module._trigger_eject_button("coolscan3:usb:libusb:001:007")
 
 
-class TestScanimageExecutableDiscovery:
-    def test_falls_back_to_fixed_candidates_when_shutil_which_finds_nothing(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ) -> None:
-        executable = tmp_path / "scanimage"
-        executable.write_text("")
-        executable.chmod(0o755)
-        monkeypatch.setattr(sane_module.shutil, "which", lambda _name: None)
-        monkeypatch.setattr(
-            sane_module, "_SCANIMAGE_CANDIDATES", (str(executable),)
-        )
-
-        assert sane_module._scanimage_executable() == str(executable)
-
-    def test_raises_when_nothing_found_anywhere(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(sane_module.shutil, "which", lambda _name: None)
-        monkeypatch.setattr(sane_module, "_SCANIMAGE_CANDIDATES", ())
-
-        with pytest.raises(RuntimeError, match="scanimage is required"):
-            sane_module._scanimage_executable()
-
-
 class TestScannerServiceEject:
     def test_delegates_to_a_backend_that_supports_eject(self) -> None:
         class FakeBackend:

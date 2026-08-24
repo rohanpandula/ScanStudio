@@ -233,33 +233,37 @@ jobs:
                     expected,
                 )
 
-    def test_only_reviewed_local_reusable_workflow_is_allowed_at_job_level(
+    def test_repository_owned_workflow_reuse_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workflow_root = root / ".github" / "workflows"
+            workflow_root.mkdir(parents=True)
+            (workflow_root / "ci.yml").write_text(
+                "name: CI\non:\n  workflow_call:\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n"
+                f"      - uses: {GENERIC_ACTION}\n"
+            )
+            (workflow_root / "test.yml").write_text(
+                "jobs:\n  verify:\n    uses: ./.github/workflows/ci.yml\n"
+            )
+            checker = load_checker()
+            checker.REPOSITORY_ROOT = root
+            checker.WORKFLOW_ROOT = workflow_root
+            output = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(output):
+                result = checker.main()
+            self.assertEqual(result, 0, output)
+
+    def test_local_workflow_path_without_repository_workflow_is_rejected(
         self,
     ) -> None:
-        result, output = self.run_policy(
+        self.assert_rejected(
             f"""jobs:
-  delegated:
-    uses: ./.github/workflows/ci.yml
-  pinned:
-    steps:
-      - uses: {GENERIC_ACTION}
-"""
-        )
-        self.assertEqual(result, 0, output)
-
-        for workflow in (
-            """jobs:
-  delegated:
-    uses: ./.github/workflows/other.yml
-""",
-            """jobs:
   test:
     steps:
-      - uses: ./.github/workflows/ci.yml
+      - uses: ./.github/workflows/missing.yml
 """,
-        ):
-            with self.subTest(workflow=workflow):
-                self.assert_rejected(workflow, "local action wrappers are forbidden")
+            "local action wrappers are forbidden",
+        )
 
     def test_duplicate_keys_are_rejected_at_every_security_boundary(self) -> None:
         for duplicate_fragment, expected in (

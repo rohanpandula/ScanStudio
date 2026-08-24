@@ -102,8 +102,8 @@ struct ProjectCreateCollisionTests {
         #expect(model.projectDirectory == "/tmp/existing")
         #expect(model.project?.frames[1].excluded == true)
         #expect(model.lastErrorMessage?.hasPrefix("PROJECT_ALREADY_EXISTS:") == true)
-        #expect(model.errorPresentation?.title == "A roll already exists here")
-        #expect(model.errorPresentation?.guidance.contains("Open Existing") == true)
+        #expect(model.errorPresentation?.title == "That folder already has a project")
+        #expect(model.errorPresentation?.guidance.contains("Open Recent") == true)
         #expect(await client.calledMethods().filter { $0 == "project.open" }.count == 1)
         #expect(await client.calledMethods().filter { $0 == "project.create" }.count == 1)
     }
