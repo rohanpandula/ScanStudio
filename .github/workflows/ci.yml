@@ -3,6 +3,11 @@ name: Verify
 on:
   push:
   pull_request:
+  # ScanStudio #104: the Release workflow invokes this workflow directly for
+  # the exact tagged commit, making the full verification set a direct,
+  # same-run dependency of every release build instead of a side-channel run
+  # that could silently disagree with what was published.
+  workflow_call:
 
 permissions:
   contents: read

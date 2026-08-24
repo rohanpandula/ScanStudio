@@ -30,12 +30,28 @@ jobs:
           python3 -I -S -B scripts/verify_release_notes.py \
             "docs/releases/$GITHUB_REF_NAME.md" "$GITHUB_REF_NAME" "$version"
 
+  # ScanStudio #104: a release may be drafted or published only after the
+  # COMPLETE required verification set succeeds for the exact tagged commit.
+  # This job invokes this repository's own Verify workflow in-run; because a
+  # local `uses:` resolves against the same commit as the calling workflow,
+  # the verification provably ran THIS tag's tree -- another commit's green
+  # run, an earlier run, or an independent same-SHA run can never satisfy
+  # it. Failure, cancellation, timeout, or a skip of any required family
+  # fails (or skips) this job, and every build/publish job below depends on
+  # it, so nothing downstream can start.
+  verify:
+    name: Same-run verification for the tagged commit
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+
   release:
     name: Build and verify ${{ matrix.arch }} DMG
     # Bounded because this job now waits on two Apple notarization
     # round-trips (app + DMG) on top of the build itself.
     timeout-minutes: 150
-    needs: authorize
+    needs: [authorize, verify]
     # A universal bundle is impossible because the pinned cv2/numpy wheels are
     # not universal, so each architecture is built natively on its own runner
     # through the SAME verified `make dmg` path (codesign --deep --strict,
@@ -228,7 +244,7 @@ jobs:
 
   windows-resources:
     name: Assemble Windows offline resources
-    needs: authorize
+    needs: [authorize, verify]
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
@@ -350,7 +366,7 @@ jobs:
 
   linux:
     name: Build and verify Linux x64 Preview
-    needs: authorize
+    needs: [authorize, verify]
     runs-on: ubuntu-22.04
     container: ubuntu@sha256:0199853f6d6b20b0424f3c5694a72a62764f01e6a771b1eb48a4197848986c7e
     timeout-minutes: 90
@@ -411,6 +427,23 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # ScanStudio #104, first of two live re-checks (the second runs again
+      # immediately before publication): prove the remote tag STILL resolves
+      # to exactly this run's commit. A deleted, moved, or replaced tag
+      # aborts here -- artifacts and same-run verification were both produced
+      # for one commit, and this job refuses to publish them under a name
+      # that no longer means that commit.
+      - name: Prove the remote tag still resolves to this exact commit
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          RESOLVED="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
+          test "$RESOLVED" = "$GITHUB_SHA" || {
+            echo "::error::tag $GITHUB_REF_NAME now resolves to $RESOLVED, not this run's $GITHUB_SHA; refusing to publish"
+            exit 1
+          }
+          echo "Tag integrity confirmed: $GITHUB_REF_NAME -> $RESOLVED"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ScanStudio-dmg-arm64
@@ -587,6 +620,19 @@ jobs:
               assert remote[name].get("digest") == f"sha256:{digest}", name
           print("draft release has exact tag-bound notes and eight byte-verified assets")
           PY
+      # ScanStudio #104, second of two live re-checks: re-prove tag
+      # integrity at the last possible moment before the release becomes
+      # public. Everything between the first check and here takes minutes;
+      # this closes that window.
+      - name: Re-prove tag integrity immediately before publication
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          RESOLVED="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
+          test "$RESOLVED" = "$GITHUB_SHA" || {
+            echo "::error::tag $GITHUB_REF_NAME moved to $RESOLVED during publication; aborting"
+            exit 1
+          }
       - name: Publish and re-verify the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
