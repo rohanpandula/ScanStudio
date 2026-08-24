@@ -7,11 +7,7 @@ from typing import BinaryIO
 import numpy as np
 import tifffile
 
-from coolscanpy.receipts.tiff_contract import (
-    LINEAR_SCANNER_RGB_EXTRATAG,
-    SCANNER_INFRARED_MARKER,
-    SCANNER_INFRARED_TAG,
-)
+from coolscanpy.receipts.tiff_contract import LINEAR_SCANNER_RGB_EXTRATAG
 from coolscanpy.session.result import ScanResult
 from coolscanpy._logging import get_logger
 
@@ -263,6 +259,7 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
 
 _DNG_VERSION = (1, 4, 0, 0)
 _DNG_BACKWARD_VERSION = (1, 1, 0, 0)
+_DNG_INFRARED_DESCRIPTION = "Untouched Nikon Coolscan infrared plane"
 
 
 class _NamedBinaryFile:
@@ -319,11 +316,11 @@ def _dng_ir_extratags() -> list[tuple]:
     return [
         (254, 4, 1, 0, True),
         (274, 3, 1, 1, True),
-        (270, 2, 0, "Untouched scanner infrared plane", True),
-        # Issue #105: the marker moved from 65001 (which ExifTool renames to
-        # SerialNumber for Nikon files) to the collision-free private code
-        # 65010; see tiff_contract.SCANNER_INFRARED_TAG for the full survey.
-        (SCANNER_INFRARED_TAG, 2, 0, SCANNER_INFRARED_MARKER, True),
+        # DNG has no standard scanner-infrared role. The standard
+        # ImageDescription field, together with the grayscale SubIFD
+        # relationship, identifies this plane without using private tag
+        # 65001, which ExifTool assigns to SerialNumber in DNG files.
+        (270, 2, 0, _DNG_INFRARED_DESCRIPTION, True),
     ]
 
 
@@ -331,10 +328,10 @@ def write_dng_linear_to_file(file: BinaryIO, result: ScanResult) -> None:
     """Encode one uncompressed LinearRaw DNG into a readable, seekable file.
 
     The converter-facing main IFD is always three plain RGB samples. Infrared,
-    when present, is a same-size grayscale SubIFD carrying a versioned private
-    marker. Keeping IR out of the main image avoids the ambiguous four-sample
-    LinearRaw layout that raw processors commonly interpret as one color
-    sample plus three auxiliaries.
+    when present, is a same-size grayscale SubIFD identified through its
+    standard ImageDescription. Keeping IR out of the main image avoids the
+    ambiguous four-sample LinearRaw layout that raw processors commonly
+    interpret as one color sample plus three auxiliaries.
 
     ``file`` is not closed. The caller owns publication and durability.
     """

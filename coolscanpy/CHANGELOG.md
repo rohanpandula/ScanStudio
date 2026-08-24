@@ -2,7 +2,17 @@
 
 ## Unreleased
 
-## Unreleased
+## 0.7.4 - 2026-08-23
+
+- Linear DNG and raw-export infrared markers moved from private tag
+  65001 -- which ExifTool reports as `SerialNumber` for Nikon files --
+  to collision-free private code 65010, shared through one contract
+  constant; readers accept both codes so earlier exports stay
+  discoverable (ScanStudio #105).
+- The linear-DNG encoder now patches tifffile's classic-TIFF SubIFDs
+  pointer from field type 13 to the TIFF/EP-required LONG (type 4);
+  strict readers such as ExifTool no longer warn, with zero pixel-byte
+  movement (ScanStudio #105).
 
 - An unrecognized SANE `coolscan3:` identity no longer classifies as
   supported (ScanStudio #103). Discovery now marks a device supported only
@@ -15,6 +25,8 @@
   every motion-capable entry point: scan and eject re-verify the freshly
   enumerated model string before the device is opened, so unsupported
   hardware refuses with zero scanner interaction.
+
+
 ## 0.7.3 - 2026-08-23
 
 - Roll previews whose physical inter-frame gaps are present but partially
@@ -43,6 +55,7 @@
   reservation released, hold outcome released/ejected) -- not the
   paused-at-hold-boundary shape the validator demanded. Both terminal
   shapes now validate; resumed-as-batch journals still fail closed.
+
 
 ## 0.7.2 - 2026-08-13
 

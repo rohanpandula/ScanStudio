@@ -587,6 +587,15 @@ def _check_uses(
         violations.append(f"{location}:{error.line}: {error.message}")
         return 0
     if action.startswith("./"):
+        # Repository-owned workflow files are same-commit by construction: a
+        # `uses: ./.github/workflows/ci.yml` reference from release.yml is
+        # pinned to the same tag/commit as the caller, so it cannot silently
+        # pull unpinned code the way a third-party action could. Arbitrary
+        # local action directories (./.github/actions/*) stay forbidden: they
+        # are exactly the unpinned indirection this policy exists to block.
+        local_target = (REPOSITORY_ROOT / action).resolve()
+        if local_target.is_relative_to(WORKFLOW_ROOT.resolve()) and local_target.is_file():
+            return 0
         violations.append(
             f"{location}:{node.line}: local action wrappers are forbidden: {action}"
         )

@@ -233,6 +233,38 @@ jobs:
                     expected,
                 )
 
+    def test_repository_owned_workflow_reuse_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workflow_root = root / ".github" / "workflows"
+            workflow_root.mkdir(parents=True)
+            (workflow_root / "ci.yml").write_text(
+                "name: CI\non:\n  workflow_call:\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n"
+                f"      - uses: {GENERIC_ACTION}\n"
+            )
+            (workflow_root / "test.yml").write_text(
+                "jobs:\n  verify:\n    uses: ./.github/workflows/ci.yml\n"
+            )
+            checker = load_checker()
+            checker.REPOSITORY_ROOT = root
+            checker.WORKFLOW_ROOT = workflow_root
+            output = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(output):
+                result = checker.main()
+            self.assertEqual(result, 0, output)
+
+    def test_local_workflow_path_without_repository_workflow_is_rejected(
+        self,
+    ) -> None:
+        self.assert_rejected(
+            f"""jobs:
+  test:
+    steps:
+      - uses: ./.github/workflows/missing.yml
+""",
+            "local action wrappers are forbidden",
+        )
+
     def test_duplicate_keys_are_rejected_at_every_security_boundary(self) -> None:
         for duplicate_fragment, expected in (
             (

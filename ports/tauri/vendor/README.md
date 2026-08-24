@@ -35,11 +35,10 @@ overlay. The exact exception set is enforced by
   Windows NDJSON, fail-closed bridge ownership, sealed run-from-source startup,
   and private WSL staging.
 - `coolscanpy/` differs only in
-  `src/coolscanpy/protocol/ls5000_single_pass/bundle.py`,
+  `src/coolscanpy/protocol/ls5000_single_pass/bundle.py` and
   `src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py`,
-  `tests/test_usb_backend.py`, and
-  `tests/transport/test_scanner_eject.py`: the sealed bundle/Linux USB overlay
-  and its USB/scanner-eject policy tests.
+  `tests/test_usb_backend.py`: the sealed bundle/Linux USB overlay
+  and its USB policy tests.
 
 No differing filename is a blanket permission to change that file. Each
 exception is a small platform overlay on the canonical source.

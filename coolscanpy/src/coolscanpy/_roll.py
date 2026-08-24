@@ -60,8 +60,10 @@ from coolscanpy.exceptions import (
     FingerprintRefused,
     GeometryValidationError,
     ManualReviewRequired,
+    MeterControllerRefused,
     PyCoolscanError,
     RefeedRequired,
+    TransportIndexRefused,
     RollMismatch,
     SafeStopRequested,
     TransportSmearDetected,
@@ -93,6 +95,9 @@ from coolscanpy.protocol.ls5000_single_pass.manual_frames import (
 from coolscanpy.protocol.ls5000_single_pass.meter import (
     EXPOSURE_MAX,
     EXPOSURE_MIN,
+)
+from coolscanpy.protocol.ls5000_single_pass.roll_index import (
+    replay_transport_failure_witness,
 )
 from coolscanpy.roll.preview_session import (
     CaptureRoute,
@@ -1438,6 +1443,69 @@ class Roll:
                     message = (result.session_journal or {}).get("error") or (
                         "roll batch was refused before any frame was captured"
                     )
+                    meter_refusal_record = (result.session_journal or {}).get(
+                        "meter_controller_refusal"
+                    )
+                    transport_refusal_record = (result.session_journal or {}).get(
+                        "transport_failure_evidence"
+                    )
+                    if transport_refusal_record is None:
+                        # Backward compatibility for an attempt journal written
+                        # by the short-lived pre-schema producer.
+                        transport_refusal_record = (result.session_journal or {}).get(
+                            "transport_index_refusal"
+                        )
+                    if isinstance(transport_refusal_record, dict):
+                        error_id = transport_refusal_record.get("error_id")
+                        diagnostics = transport_refusal_record.get(
+                            "witness", transport_refusal_record.get("diagnostics")
+                        )
+                        try:
+                            replayed_error_id = replay_transport_failure_witness(diagnostics)
+                        except (TypeError, ValueError):
+                            replayed_error_id = None
+                        if (
+                            isinstance(error_id, str)
+                            and isinstance(diagnostics, dict)
+                            and replayed_error_id == error_id
+                        ):
+                            frame_queue.put(
+                                (
+                                    "error",
+                                    TransportIndexRefused(
+                                        message,
+                                        error_id=error_id,
+                                        diagnostics=diagnostics,
+                                    ),
+                                )
+                            )
+                        else:
+                            frame_queue.put(
+                                (
+                                    "error",
+                                    BatchIntegrityError(
+                                        "transport-index refusal evidence is malformed or does not replay"
+                                    ),
+                                )
+                            )
+                        return
+                    if meter_refusal_record is not None:
+                        try:
+                            meter_refusal = MeterControllerRefused.from_dict(
+                                meter_refusal_record
+                            )
+                        except ValueError:
+                            frame_queue.put(
+                                (
+                                    "error",
+                                    BatchIntegrityError(
+                                        "meter-controller refusal evidence is malformed"
+                                    ),
+                                )
+                            )
+                        else:
+                            frame_queue.put(("error", meter_refusal))
+                        return
                     if (
                         "does not match the reviewed roll fingerprint" in message
                         or "does not match its reviewed visual fingerprint" in message

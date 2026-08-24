@@ -1191,6 +1191,7 @@ class _RefusalBatchProcess:
     job_path: Path
     session_journal_path: Path
     message: str
+    journal_overrides: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         job = json.loads(self.job_path.read_text(encoding="utf-8"))
@@ -1210,6 +1211,7 @@ class _RefusalBatchProcess:
             json.dumps(
                 {
                     **_density_calibration_provenance(calibration_session_id),
+                    **self.journal_overrides,
                     "batch_job_sha256": _sha256(self.job_path.read_bytes()),
                     "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
                     "capture_engine_sha256": _sha256(_FAKE_WORKER_SOURCE),
@@ -1789,9 +1791,18 @@ def _tampered_meter_spawner(events: list[str], *, tamper: str):
     return spawn
 
 
-def _refusal_spawner(message: str):
+def _refusal_spawner(
+    message: str,
+    *,
+    journal_overrides: dict[str, object] | None = None,
+):
     def make_refusal_process(job_path: Path, session_journal_path: Path) -> _RefusalBatchProcess:
-        return _RefusalBatchProcess(job_path, session_journal_path, message)
+        return _RefusalBatchProcess(
+            job_path,
+            session_journal_path,
+            message,
+            journal_overrides=dict(journal_overrides or {}),
+        )
 
     def spawn(
         argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object
@@ -5528,6 +5539,116 @@ class TestRollBatchRefusal:
 # ===========================================================================
 
 
+
+    def test_meter_controller_record_raises_typed_refusal_with_all_reasons(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        reasons = [
+            {
+                "code": "linearity_insufficient",
+                "message": "too few unclipped pixels remain for pass-linearity proof",
+                "channel": "R",
+                "valid_raw_samples": 255,
+                "required_raw_samples": 256,
+                "valid_aggregate_samples": 28,
+                "required_aggregate_samples": 24,
+            },
+            {
+                "code": "linearity_insufficient",
+                "message": "too few unclipped pixels remain for pass-linearity proof",
+                "channel": "G",
+                "valid_raw_samples": 12_800,
+                "required_raw_samples": 256,
+                "valid_aggregate_samples": 0,
+                "required_aggregate_samples": 24,
+            },
+        ]
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_refusal_spawner(
+                "SynchronizedProtocolError: meter pass 2 controller refused: "
+                "linearity_insufficient, linearity_insufficient",
+                journal_overrides={
+                    "meter_controller_refusal": {"pass": 2, "reasons": reasons}
+                },
+            ),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(coolscanpy.MeterControllerRefused) as excinfo:
+                next(iter(roll.scan_many([1])))
+
+            error = excinfo.value
+            assert not isinstance(error, coolscanpy.RollMismatch)
+            assert error.pass_number == 2
+            assert [reason.channel for reason in error.reasons] == ["R", "G"]
+            assert error.to_dict() == {"pass": 2, "reasons": reasons}
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_transport_failure_record_raises_typed_refeed_with_witness(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        witness = {
+            "kind": "affine",
+            "anchors": [
+                {
+                    "ordinal": ordinal,
+                    "input_row": ordinal * 10.0,
+                    "observed_row": ordinal * 420.0 - residual * 42.0,
+                    "fitted_row": ordinal * 420.0,
+                    "residual_rows": residual,
+                }
+                for ordinal, residual in enumerate((3.005, 0.2, 0.2, 0.2, 0.137, 0.2))
+            ],
+            "transform": {"slope": 42.0, "intercept": 0.0},
+            "thresholds": {
+                "maximum_mean_absolute_residual_rows": 1.0,
+                "maximum_residual_rows": 2.0,
+            },
+            "mean_absolute_residual_rows": 0.657,
+            "maximum_residual_rows": 3.005,
+        }
+        message = (
+            "SynchronizedProtocolError: transport anchor residual is inconsistent "
+            "with one affine preview traversal (MAE 0.657 rows, max 3.005 rows)"
+        )
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_refusal_spawner(
+                message,
+                journal_overrides={
+                    "transport_failure_evidence": {
+                        "error_id": "transport-affine-residual",
+                        "witness": witness,
+                    }
+                },
+            ),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(coolscanpy.TransportIndexRefused) as excinfo:
+                next(iter(roll.scan_many([1])))
+
+            error = excinfo.value
+            assert isinstance(error, coolscanpy.RefeedRequired)
+            assert error.error_id == "transport-affine-residual"
+            assert error.diagnostics == witness
+            assert str(error) == message
+        finally:
+            roll.close()
+            dev.close()
+
+
 @dataclass
 class _FakeUsbDevice:
     """Just enough of a ``usb.core.Device`` for ``_usb_fallback_device_infos``
@@ -5785,6 +5906,9 @@ class TestSaneFreeFallback:
 # coolscan3 SANE backend also drives the LS-40/LS-50.
 # ===========================================================================
 
+
+
+@dataclass
 
 @dataclass
 class _FakeSaneListingOption:

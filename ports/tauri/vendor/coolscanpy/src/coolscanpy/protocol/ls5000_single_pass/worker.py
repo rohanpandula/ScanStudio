@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Sequence, TypedDict, cast
+from typing import Any, NoReturn, Sequence, TypedDict, cast
 
 from . import meter as meter_module
 from .bundle import (
@@ -68,6 +68,7 @@ from .meter import (
     EXPOSURE_MIN,
     NIKON_PARITY_PROFILE,
     MeterObservation,
+    SafetyRefusal,
     calculate_nikon_parity_shadow,
     observe_meter_pass,
     propose_next_exposures,
@@ -75,6 +76,7 @@ from .meter import (
 )
 from .plan import CANONICAL_PLAN_SHA256, canonical_plan_bytes, load_canonical_plan
 from .roll_index import (
+    IndexDecodeError,
     IndexGeometry,
     LEADING_ANCHOR_REVIEW_REASON,
     MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS,
@@ -87,6 +89,7 @@ from .roll_index import (
     derive_transport_mapping,
     detect_roll_frames,
     parse_live_transport_records_bytes,
+    replay_transport_failure_witness,
     scanner_addressable_interval_count,
     terminal_transport_tail_start,
     transport_native_origin,
@@ -2839,6 +2842,79 @@ def _write_journal(path: Path, journal: dict) -> None:
     _fsync_parent_directory(path)
 
 
+def _record_transport_failure_evidence(
+    error: BaseException,
+    *,
+    journal_path: Path,
+    journal: dict,
+    session_journal_path: Path | None,
+    session_journal: dict | None,
+    frame_journal_finalized: bool,
+) -> bool:
+    """Durably preserve one independently replayable transport refusal.
+
+    Invalid or mismatched diagnostics are ignored so this best-effort record
+    can never replace the authoritative scanner exception. A finalized frame
+    journal is immutable; a batch-session journal may still receive the
+    failure that ended the later continuation.
+    """
+
+    if not isinstance(error, IndexDecodeError):
+        return False
+    error_id = error.error_id
+    witness = error.diagnostics
+    if not isinstance(error_id, str) or not isinstance(witness, dict):
+        return False
+    try:
+        replayed_error_id = replay_transport_failure_witness(witness)
+    except (TypeError, ValueError):
+        return False
+    if replayed_error_id != error_id:
+        return False
+
+    record = {"error_id": error_id, "witness": witness}
+    persisted = False
+    if not frame_journal_finalized:
+        journal["transport_failure_evidence"] = record
+        try:
+            _write_journal(journal_path, journal)
+        except Exception:  # noqa: BLE001 - evidence cannot mask scanner failure
+            journal.pop("transport_failure_evidence", None)
+        else:
+            persisted = True
+    if session_journal_path is not None and session_journal is not None:
+        session_journal["transport_failure_evidence"] = record
+        try:
+            _write_journal(session_journal_path, session_journal)
+        except Exception:  # noqa: BLE001 - evidence cannot mask scanner failure
+            session_journal.pop("transport_failure_evidence", None)
+        else:
+            persisted = True
+    return persisted
+
+
+def _raise_meter_controller_refusal(
+    journal_path: Path,
+    journal: dict,
+    *,
+    pass_number: int,
+    refusals: Sequence[SafetyRefusal],
+    final: bool = False,
+) -> NoReturn:
+    """Durably preserve the bounded typed refusal before synchronized cleanup."""
+
+    journal["meter_controller_refusal"] = {
+        "pass": pass_number,
+        "reasons": [refusal.to_dict() for refusal in refusals],
+    }
+    _write_journal(journal_path, journal)
+    codes = ", ".join(refusal.code for refusal in refusals)
+    final_label = " final" if final else ""
+    raise SynchronizedProtocolError(
+        f"meter pass {pass_number}{final_label} controller refused: {codes}"
+    )
+
+
 def _iso_utc_now() -> str:
     """Current UTC wall clock as an ISO-8601 UTC timestamp."""
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -5014,12 +5090,11 @@ def _run_live_continuation_frame(
                                 proposal_record
                             )
                             if not proposal.accepted:
-                                codes = ", ".join(
-                                    refusal.code for refusal in proposal.refusals
-                                )
-                                raise SynchronizedProtocolError(
-                                    f"meter pass {group_index + 1} controller "
-                                    f"refused: {codes}"
+                                _raise_meter_controller_refusal(
+                                    journal_path,
+                                    journal,
+                                    pass_number=group_index + 1,
+                                    refusals=proposal.refusals,
                                 )
                             next_group = group_index + 1
                             patched_wire = _patch_exposure_contract(
@@ -5047,11 +5122,12 @@ def _run_live_continuation_frame(
                                 not final_result.accepted
                                 or final_result.final_exposures is None
                             ):
-                                codes = ", ".join(
-                                    refusal.code for refusal in final_result.refusals
-                                )
-                                raise SynchronizedProtocolError(
-                                    f"meter pass 3 final controller refused: {codes}"
+                                _raise_meter_controller_refusal(
+                                    journal_path,
+                                    journal,
+                                    pass_number=3,
+                                    refusals=final_result.refusals,
+                                    final=True,
                                 )
                             commanded_exposures = _resolve_parity_active_exposures(
                                 journal,
@@ -6685,12 +6761,11 @@ def run_live_capture(
                             meter_controller_proposals.append(proposal_record)
                             _write_journal(journal_path, journal)
                             if not proposal.accepted:
-                                codes = ", ".join(
-                                    refusal.code for refusal in proposal.refusals
-                                )
-                                raise SynchronizedProtocolError(
-                                    f"meter pass {group_index + 1} controller "
-                                    f"refused: {codes}"
+                                _raise_meter_controller_refusal(
+                                    journal_path,
+                                    journal,
+                                    pass_number=group_index + 1,
+                                    refusals=proposal.refusals,
                                 )
                             next_group = group_index + 1
                             patched_wire = _patch_exposure_contract(
@@ -6719,11 +6794,12 @@ def run_live_capture(
                                 not final_result.accepted
                                 or final_result.final_exposures is None
                             ):
-                                codes = ", ".join(
-                                    refusal.code for refusal in final_result.refusals
-                                )
-                                raise SynchronizedProtocolError(
-                                    f"meter pass 3 final controller refused: {codes}"
+                                _raise_meter_controller_refusal(
+                                    journal_path,
+                                    journal,
+                                    pass_number=3,
+                                    refusals=final_result.refusals,
+                                    final=True,
                                 )
                             commanded_exposures = _resolve_parity_active_exposures(
                                 journal,
@@ -7358,6 +7434,14 @@ def run_live_capture(
             journal["finished_unix"] = time.time()
             _write_journal(journal_path, journal)
     except BaseException as error:
+        _record_transport_failure_evidence(
+            error,
+            journal_path=journal_path,
+            journal=journal,
+            session_journal_path=session_journal_path,
+            session_journal=session_journal,
+            frame_journal_finalized=frame_journal_finalized,
+        )
         failed_capture_duration_ms = _elapsed_ms(_capture_started_monotonic)
         if not frame_journal_finalized:
             _abort_fine_stream(

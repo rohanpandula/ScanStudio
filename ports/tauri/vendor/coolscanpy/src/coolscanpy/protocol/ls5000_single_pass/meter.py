@@ -140,11 +140,24 @@ class SafetyRefusal:
     code: str
     message: str
     channel: str | None = None
+    valid_raw_samples: int | None = None
+    required_raw_samples: int | None = None
+    valid_aggregate_samples: int | None = None
+    required_aggregate_samples: int | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        result = {"code": self.code, "message": self.message}
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {"code": self.code, "message": self.message}
         if self.channel is not None:
             result["channel"] = self.channel
+        bounded_counts = {
+            "valid_raw_samples": self.valid_raw_samples,
+            "required_raw_samples": self.required_raw_samples,
+            "valid_aggregate_samples": self.valid_aggregate_samples,
+            "required_aggregate_samples": self.required_aggregate_samples,
+        }
+        result.update(
+            {key: value for key, value in bounded_counts.items() if value is not None}
+        )
         return result
 
 
@@ -831,6 +844,12 @@ def propose_next_exposures(
                         "linearity_insufficient",
                         "too few unclipped pixels remain for pass-linearity proof",
                         channel,
+                        valid_raw_samples=int(linearity["valid_samples"]),
+                        required_raw_samples=LINEARITY_MIN_SAMPLES,
+                        valid_aggregate_samples=int(
+                            linearity["correlation_samples"]
+                        ),
+                        required_aggregate_samples=LINEARITY_MIN_AGGREGATES,
                     )
                 )
             else:
