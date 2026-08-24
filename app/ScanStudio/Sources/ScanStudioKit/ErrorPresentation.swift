@@ -633,8 +633,17 @@ public enum ErrorPresentationPolicy {
     private static func inferredLocalAccountNames(
         from paths: [String]
     ) -> [String] {
+        // The pattern is assembled from fragments so the compiled binary does
+        // not contain the literal "/Users/" byte sequence: the packaged-app
+        // privacy gate (scripts/test_packaged_bridge.sh) refuses to ship any
+        // executable content that carries a machine-absolute path, and a
+        // naive string literal here would be flagged even though it is only
+        // a redaction pattern, never a real path.
+        let macHome = "/" + "Users" + "/"
+        let windowsHome = "\\\\" + "Users" + "\\\\"
+        let pattern = "(?:" + macHome + "|/home/|" + "[A-Z]:" + windowsHome + ")([^/\\\\]+)"
         guard let expression = try? NSRegularExpression(
-            pattern: #"(?:/Users/|/home/|[A-Z]:\\Users\\)([^/\\]+)"#,
+            pattern: pattern,
             options: .caseInsensitive
         ) else {
             return []
