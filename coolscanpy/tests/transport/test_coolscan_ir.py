@@ -384,6 +384,18 @@ class SplitCaptureFakeSaneDev(FakeSaneDev):
 class FakeSaneModule:
     dev: FakeSaneDev
     opened: list = field(default_factory=list)
+    # #103: scan() re-verifies identity from fresh enumeration before open.
+    raw_devices: list = field(default_factory=lambda: [
+        ("coolscan3:usb:test", "Nikon", "LS-5000 ED", "film scanner"),
+        ("coolscan3:usb:libusb:001:007", "Nikon", "LS-5000 ED", "film scanner"),
+        ("net:192.0.2.10:coolscan3:usb:libusb:001:007", "Nikon", "LS-5000 ED", "film scanner"),
+    ])
+
+    def init(self) -> None:
+        pass
+
+    def get_devices(self) -> list:
+        return list(self.raw_devices)
 
     def open(self, device_id: str) -> FakeSaneDev:
         self.opened.append(device_id)
@@ -410,6 +422,11 @@ def test_scan_initializes_sane_before_opening_a_fresh_backend() -> None:
         def init(self) -> None:
             self.initialized = True
             self.init_calls += 1
+
+        # #103: the identity gate enumerates (after init, before open).
+        def get_devices(self) -> list:
+            assert self.initialized
+            return [("coolscan3:usb:test", "Nikon", "LS-5000 ED", "film scanner")]
 
         def open(self, _device_id: str) -> FakeSaneDev:
             assert self.initialized

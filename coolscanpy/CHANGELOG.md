@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## Unreleased
+
+- An unrecognized SANE `coolscan3:` identity no longer classifies as
+  supported (ScanStudio #103). Discovery now marks a device supported only
+  when its model string is the exact canonical LS-5000 identity after
+  conservative whitespace normalization; unknown, blank, and near-match
+  models stay visible under their real reported names but can never connect,
+  and the bridge can therefore never synthesize an LS-5000 identity for one.
+  The plain-scan lane -- which reaches the SANE backend directly with a
+  device id, bypassing discovery's flag entirely -- gained the same gate at
+  every motion-capable entry point: scan and eject re-verify the freshly
+  enumerated model string before the device is opened, so unsupported
+  hardware refuses with zero scanner interaction.
 ## 0.7.3 - 2026-08-23
 
 - Roll previews whose physical inter-frame gaps are present but partially

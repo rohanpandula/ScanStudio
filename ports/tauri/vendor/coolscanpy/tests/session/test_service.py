@@ -287,3 +287,109 @@ class TestRenderScanFilename:
 
         result = render_scan_filename("{{ unclosed", "20260511", 1)
         assert result == "20260511_001"
+
+
+# -- ScanStudio #103: the plain-scan motion gate --------------------------------
+#
+# ScannerService.run_scan reaches SaneBackend directly with a device id --
+# no facade `open()` in between -- so discovery's `supported` flag alone
+# cannot protect it. Every motion-capable backend entry point must
+# re-verify the freshly enumerated model string against the exact LS-5000
+# identity contract BEFORE opening the device, and an unknown or
+# recognized-but-unsupported identity must refuse with zero hardware
+# interaction.
+
+
+class _RecordingIdentitySaneModule:
+    """Stands in for python-sane: serves fixed enumeration rows and records
+    every open() so a test can prove refusal happened before any open."""
+
+    def __init__(self, raw_devices: list[tuple[str, str, str, str]]) -> None:
+        self.raw_devices = raw_devices
+        self.opened: list[str] = []
+
+    def init(self) -> None:
+        pass
+
+    def get_devices(self) -> list[tuple[str, str, str, str]]:
+        return list(self.raw_devices)
+
+    def open(self, device_id: str) -> object:
+        self.opened.append(device_id)
+        raise RuntimeError("sentinel-open-reached")
+
+
+def _identity_backend(monkeypatch: pytest.MonkeyPatch, module: _RecordingIdentitySaneModule) -> SaneBackend:
+    monkeypatch.setitem(sys.modules, "sane", module)
+    return SaneBackend()
+
+
+_PARAMS = ScanParams(dpi=4000, depth=16, capture_ir=False)
+_PROGRESS = lambda _fraction: None  # noqa: E731
+_CANCEL = threading.Event()
+
+
+@pytest.mark.parametrize(
+    "raw_model",
+    ["Coolscan Mystery Model", "", "LS-5000X", "LS-40 ED"],
+)
+def test_plain_scan_refuses_unsupported_identity_before_any_open(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_model: str,
+) -> None:
+    module = _RecordingIdentitySaneModule(
+        [("coolscan3:usb:001:009", "Nikon", raw_model, "film scanner")]
+    )
+    backend = _identity_backend(monkeypatch, module)
+
+    with pytest.raises(RuntimeError, match="not supported"):
+        backend.scan(
+            "coolscan3:usb:001:009", _PARAMS, _PROGRESS, _CANCEL
+        )
+
+    assert module.opened == []
+
+
+def test_plain_scan_refuses_when_the_device_vanishes_from_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _RecordingIdentitySaneModule(
+        [("coolscan3:usb:001:009", "Nikon", "LS-5000 ED", "film scanner")]
+    )
+    backend = _identity_backend(monkeypatch, module)
+
+    with pytest.raises(RuntimeError, match="disappeared"):
+        backend.scan("coolscan3:usb:001:999", _PARAMS, _PROGRESS, _CANCEL)
+
+    assert module.opened == []
+
+
+def test_plain_scan_identity_gate_passes_the_canonical_ls5000_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _RecordingIdentitySaneModule(
+        [("coolscan3:usb:001:007", "Nikon", "LS-5000 ED", "film scanner")]
+    )
+    backend = _identity_backend(monkeypatch, module)
+
+    # The fake's open() raises a sentinel: reaching it proves the gate let a
+    # genuine LS-5000 through to the capture path (which then stops at the
+    # sentinel instead of touching real options).
+    with pytest.raises(RuntimeError, match="sentinel-open-reached"):
+        backend.scan("coolscan3:usb:001:007", _PARAMS, _PROGRESS, _CANCEL)
+
+    assert module.opened == ["coolscan3:usb:001:007"]
+
+
+def test_eject_refuses_unsupported_identity_before_any_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _RecordingIdentitySaneModule(
+        [("coolscan3:usb:001:009", "Nikon", "Coolscan Mystery Model", "film scanner")]
+    )
+    backend = _identity_backend(monkeypatch, module)
+
+    with pytest.raises(RuntimeError, match="not supported"):
+        backend.eject("coolscan3:usb:001:009")
+
+    assert module.opened == []

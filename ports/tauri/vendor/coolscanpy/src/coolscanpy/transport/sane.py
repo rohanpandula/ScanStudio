@@ -1429,6 +1429,46 @@ class SaneBackend:
         self._sane.init()
         self._sane_initialized = True
 
+    def _require_supported_coolscan_identity(self, device_id: str) -> None:
+        """Fail closed BEFORE any scanner mutation for non-LS-5000 identities.
+
+        Discovery's ``supported`` flag alone cannot protect the public
+        plain-scan lane: ``ScannerService.run_scan`` reaches this backend
+        directly with a device id, and a ``coolscan3:`` identity the host's
+        SANE stack reports for arbitrary hardware used to classify as
+        supported (ScanStudio #103). Every motion-capable entry point here --
+        scan and eject -- re-classifies the freshly enumerated model string
+        through the same exact-identity contract discovery uses, so an
+        unknown or recognized-but-unsupported unit refuses before its device
+        is ever opened for capture. Motion-free probe/list paths are
+        deliberately not gated: enumerating and reading options of an
+        unsupported unit is how it stays visible with its real name.
+        """
+
+        from coolscanpy._device import _sane_model_string_and_supported
+
+        try:
+            self._ensure_initialized()
+            raw_devices = self._sane.get_devices()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not enumerate SANE devices to verify the identity of "
+                f"{device_id!r} before capture: {exc}"
+            ) from exc
+        match = next((raw for raw in raw_devices if raw[0] == device_id), None)
+        if match is None:
+            raise RuntimeError(
+                f"Scanner device {device_id!r} disappeared from fresh SANE "
+                "enumeration; refusing to move an unverified scanner"
+            )
+        raw_model = match[2] if len(match) > 2 else ""
+        _model, supported = _sane_model_string_and_supported(raw_model)
+        if not supported:
+            raise RuntimeError(
+                f"{raw_model or device_id} is recognized but not supported; "
+                "only the LS-5000 is supported"
+            )
+
     def list_devices(self) -> list[ScannerDevice]:
         if self._devices_cache is not None:
             return self._devices_cache
@@ -1536,6 +1576,11 @@ class SaneBackend:
             self._ensure_initialized()
         except Exception as exc:
             raise RuntimeError(f"Failed to initialize SANE before scanning: {exc}") from exc
+
+        # #103: identity gate BEFORE the capture open -- an unsupported or
+        # unknown coolscan3 identity must never reach scanner motion, even
+        # when a caller holds a backend object straight from the service.
+        self._require_supported_coolscan_identity(device_id)
 
         try:
             dev = self._sane.open(device_id)
@@ -2040,6 +2085,10 @@ class SaneBackend:
             self._ensure_initialized()
         except Exception as exc:
             raise RuntimeError(f"Failed to initialize SANE before eject: {exc}") from exc
+
+        # #103: the eject button moves hardware too -- same identity gate as
+        # scan, before the device is opened.
+        self._require_supported_coolscan_identity(device_id)
 
         try:
             dev = self._sane.open(device_id)
