@@ -16,7 +16,7 @@ Contract between the SwiftUI app and the `scanstudio-engine` subprocess. This fi
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `PROJECT_ALREADY_EXISTS`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
 
 `recoverable` is `true` only for faults where retrying the same operation can succeed (`FEED_JAM`). All others are `false`.
 
@@ -142,6 +142,8 @@ The engine's project-mutating handlers (`project.setFrameExcluded`, `project.set
 
 ### `project.create`
 `{name: string, carrier: "roll36"|"strip6"|"mounted", frameCount: u32, filmProcess: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome", directory?: string}` → `{project: ScanProject, directory: string}`. `roll36` is the legacy wire token for SA-30 35 mm roll film; its preview-established `frameCount` must be 1-40. `mounted` must be exactly 1, and `strip6` must be 1-6 (else `INVALID_PARAMS`). `directory` overrides the default `~/ScanStudio Projects/<slug>-<id>` location. The manifest is written atomically and becomes the engine's active project.
+
+Creating never replaces an existing project (#99): if the target directory already contains any `manifest.json` — a fully populated project, a valid zero-receipt one, or an unreadable/corrupt file — the engine refuses atomically with `PROJECT_ALREADY_EXISTS` before modifying anything: the existing project's bytes are unchanged and the active in-memory project is not switched. The refusal is enforced by create-only publication inside the project manifest lock, so concurrent creates into one directory allow at most one success. A directory without a `manifest.json` may contain unrelated files and remains creatable; to work with an existing project, use `project.open`.
 
 ### `project.open`
 `{directory: string}` → `{project: ScanProject, directory: string}`. Errors: `PROJECT_NOT_FOUND`, `MANIFEST_INVALID`.

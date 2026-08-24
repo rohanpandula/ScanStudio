@@ -104,6 +104,11 @@ pub enum ErrorCode {
     FilmFeedInterrupted,
     Internal,
     ProjectNotFound,
+    /// Issue #99: `project.create` refused because the target directory
+    /// already contains a project manifest (valid, zero-receipt, or corrupt).
+    /// Creating a project must never replace an existing one; the operator
+    /// opens the existing project or picks a different directory.
+    ProjectAlreadyExists,
     ManifestInvalid,
     ArchiveCollision,
     /// A real preview marked this frame as requiring an explicit human
@@ -876,6 +881,7 @@ mod tests {
             ),
             (ErrorCode::Internal, "INTERNAL"),
             (ErrorCode::ProjectNotFound, "PROJECT_NOT_FOUND"),
+            (ErrorCode::ProjectAlreadyExists, "PROJECT_ALREADY_EXISTS"),
             (ErrorCode::ManifestInvalid, "MANIFEST_INVALID"),
             (ErrorCode::ArchiveCollision, "ARCHIVE_COLLISION"),
             (ErrorCode::ManualReviewRequired, "MANUAL_REVIEW_REQUIRED"),

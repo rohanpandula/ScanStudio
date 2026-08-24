@@ -57,6 +57,28 @@ function messageOf(err: unknown): string {
   return "Unknown error";
 }
 
+/** Extracts the engine's typed wire error code when one is present (#99). */
+function errorCodeOf(err: unknown): string | null {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    typeof (err as { code: unknown }).code === "string"
+  ) {
+    return (err as { code: string }).code;
+  }
+  return null;
+}
+
+/**
+ * Typed refusal copy for `PROJECT_ALREADY_EXISTS` (issue #99): creating over
+ * an existing project is refused by the engine without modifying anything,
+ * so the operator's recovery is to open the existing project or pick a
+ * different folder -- never to retry the same create.
+ */
+const PROJECT_ALREADY_EXISTS_COPY =
+  "This folder already contains a ScanStudio project, so the new roll was not saved and nothing was changed. Open the existing project under Open Recent, or choose a different folder.";
+
 export default function ProjectPanel() {
   const [name, setName] = useState("");
   const [carrier, setCarrier] = useState<Carrier>("roll36");
@@ -66,7 +88,7 @@ export default function ProjectPanel() {
   const [directory, setDirectory] = useState<string | undefined>(undefined);
   const [recent, setRecent] = useState<ProjectSummary[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ code: string | null; message: string } | null>(null);
 
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const project = state.project;
@@ -165,7 +187,7 @@ export default function ProjectPanel() {
         directory,
       );
     } catch (err) {
-      setError(messageOf(err));
+      setError({ code: errorCodeOf(err), message: messageOf(err) });
     } finally {
       setSubmitting(false);
     }
@@ -176,7 +198,7 @@ export default function ProjectPanel() {
     try {
       await sessionStore.openProject(summary.directory);
     } catch (err) {
-      setError(messageOf(err));
+      setError({ code: errorCodeOf(err), message: messageOf(err) });
     }
   };
 
@@ -185,7 +207,7 @@ export default function ProjectPanel() {
     try {
       await sessionStore.refreshStatus();
     } catch (err) {
-      setError(messageOf(err));
+      setError({ code: errorCodeOf(err), message: messageOf(err) });
     }
   };
 
@@ -305,9 +327,14 @@ export default function ProjectPanel() {
           Create
         </button>
       </form>
-      {error !== null && (
+      {error !== null && error.code === "PROJECT_ALREADY_EXISTS" && (
+        <p className={styles.error} role="alert" data-testid="project-already-exists-error">
+          {PROJECT_ALREADY_EXISTS_COPY}
+        </p>
+      )}
+      {error !== null && error.code !== "PROJECT_ALREADY_EXISTS" && (
         <p className={styles.error} role="alert" data-testid="project-error">
-          {error}
+          {error.message}
         </p>
       )}
       <h3 className={styles.heading}>Open Recent</h3>
