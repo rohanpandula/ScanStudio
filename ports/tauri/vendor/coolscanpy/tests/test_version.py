@@ -25,6 +25,6 @@ def test_source_tree_fallback_reads_project_metadata(
     with monkeypatch.context() as context:
         context.setattr(importlib.metadata, "version", missing_distribution)
         reloaded = importlib.reload(coolscanpy)
-        assert reloaded.__version__ == "0.7.2"
+        assert reloaded.__version__ == "0.7.3"
 
     importlib.reload(coolscanpy)

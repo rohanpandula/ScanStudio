@@ -5941,19 +5941,19 @@ class TestSaneLaneDiscoveryGate:
             )
         ) == ("LS-4000 ED", False)
 
-    def test_sane_listed_unrecognized_coolscan3_model_stays_supported(
+    def test_sane_listed_unrecognized_coolscan3_model_fails_closed(
         self,
         fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
     ) -> None:
-        # R2 (reviewer's call): this backend's device family is closed to
-        # the models coolscan3.c's identification table names -- a
-        # coolscan3: id whose model string matches none of them is most
-        # plausibly a firmware/model-string variant of the one model this
-        # package actually drives, not a foreign device (get_devices()
-        # already filtered to coolscan3: ids). Bricking a genuine LS-5000
-        # on an exact-string mismatch would be worse than the reverse, so
-        # this defaults supported=True with the raw reported string
-        # preserved (not relabeled) instead of failing closed.
+        # #103 (reversing the R2 reviewer's call): a coolscan3: id whose
+        # model string matches no entry in coolscan3.c's identification
+        # table used to default supported=True on the theory that it was
+        # most plausibly an LS-5000 string variant. The hardware-free
+        # reproduction behind the issue proved the other direction: arbitrary
+        # hardware wearing a coolscan3: identity presented as connectable,
+        # and the bridge synthesized an LS-5000 model name for it. Fail
+        # closed: keep the device visible under its real reported name, mark
+        # it unsupported, and refuse every open route.
         fake_sane_module(
             [
                 (
@@ -5969,13 +5969,60 @@ class TestSaneLaneDiscoveryGate:
 
         assert len(devices) == 1
         assert devices[0].model == "Coolscan Mystery Model"
-        assert devices[0].supported is True
+        assert devices[0].supported is False
 
-        dev = coolscanpy.open("ls5000")
-        try:
-            assert dev._info.supported is True
-        finally:
-            dev.close()
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000")
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("coolscan3:usb:001:009")
+
+    @pytest.mark.parametrize(
+        ("model", "expected_name", "expected_supported"),
+        [
+            # Exact canonical identity -- including benign SCSI-INQUIRY
+            # padding shapes (leading/trailing spaces, repeated internal
+            # spaces) that conservative normalization must forgive.
+            ("LS-5000 ED", "LS-5000 ED", True),
+            ("  LS-5000   ED  ", "LS-5000 ED", True),
+            ("\tLS-5000\tED\n", "LS-5000 ED", True),
+            # Blank: nothing to identify, nothing to trust.
+            ("", "", False),
+            ("   ", "", False),
+            # Near-matches keep their raw reported string and stay refused:
+            # only the exact canonical identity is connectable.
+            ("LS-5000X", "LS-5000X", False),
+            ("LS-50000 ED", "LS-50000 ED", False),
+            ("Nikon SuperCoolscan 5000", "Nikon SuperCoolscan 5000", False),
+            # Recognized-but-unsupported families keep their canonical names.
+            ("LS-40 ED", "LS-40 ED", False),
+            ("COOLSCANIII", "COOLSCANIII", False),
+        ],
+    )
+    def test_sane_model_classification_is_fail_closed(
+        self,
+        model: str,
+        expected_name: str,
+        expected_supported: bool,
+    ) -> None:
+        assert device_module._sane_model_string_and_supported(model) == (
+            expected_name,
+            expected_supported,
+        )
+
+    def test_network_prefixed_canonical_ls5000_stays_supported(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+    ) -> None:
+        # saned remote units keep their net prefix on the id; the model
+        # classification itself is prefix-independent and must stay exact.
+        fake_sane_module(
+            [("net:192.0.2.10:coolscan3:usb:001:007", "Nikon", "LS-5000 ED", "film scanner")]
+        )
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].supported is True
 
 
 # ===========================================================================

@@ -78,9 +78,21 @@ class FakeSaneModule:
     dev: FakeSaneDev | None = None
     open_error: Exception | None = None
     opened: list[str] = field(default_factory=list)
+    # #103: eject re-verifies the device identity from fresh enumeration
+    # before opening. Default to one canonical LS-5000 row for the
+    # conventional test id so every pre-existing eject test still exercises
+    # its own concern past the gate.
+    raw_devices: list[tuple[str, str, str, str]] = field(
+        default_factory=lambda: [
+            ("coolscan3:usb:libusb:001:007", "Nikon", "LS-5000 ED", "film scanner")
+        ]
+    )
 
     def init(self) -> None:
         pass
+
+    def get_devices(self) -> list[tuple[str, str, str, str]]:
+        return list(self.raw_devices)
 
     def open(self, device_id: str) -> FakeSaneDev:
         self.opened.append(device_id)
