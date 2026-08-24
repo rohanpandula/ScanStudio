@@ -122,6 +122,7 @@ class _StubTransport:
         self,
         *,
         preview_thumbnails: int = 2,
+        preview_raises: Exception | None = None,
         start_scan_raises: Exception | None = None,
         start_scan_returns: domain.ScanSummary | None = None,
         attempts_root: str | None = None,
@@ -130,6 +131,7 @@ class _StubTransport:
         self.device_open = False
         self.eject_called = False
         self._preview_thumbnails = preview_thumbnails
+        self._preview_raises = preview_raises
         self._start_scan_raises = start_scan_raises
         self._start_scan_returns = start_scan_returns
         self.attempts_root = attempts_root
@@ -162,6 +164,8 @@ class _StubTransport:
         self.device_open = False
 
     def preview(self, material, slots, on_thumbnail):
+        if self._preview_raises is not None:
+            raise self._preview_raises
         for i in range(self._preview_thumbnails):
             on_thumbnail(_thumbnail(i + 1))
         return domain.PreviewResult(count=self._preview_thumbnails, fingerprint="stub-fp")
@@ -427,6 +431,149 @@ def test_bridge_error_with_chained_coolscanpy_exception_surfaces_its_real_class(
     assert closure_entries[0]["code"] == "FINGERPRINT_REFUSED"
     # JSONL round-trip always yields string keys for a JSON object.
     assert closure_entries[0]["reasons"] == {"2": "FingerprintRefused"}
+
+
+def test_meter_controller_details_reach_frame_error_and_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    details = {
+        "pass": 3,
+        "reasons": [
+            {
+                "code": "linearity_insufficient",
+                "message": "too few unclipped pixels remain for pass-linearity proof",
+                "channel": "G",
+                "validRawSamples": 12_800,
+                "requiredRawSamples": 256,
+                "validAggregateSamples": 0,
+                "requiredAggregateSamples": 24,
+            }
+        ],
+    }
+    original = coolscanpy.MeterControllerRefused(
+        pass_number=3,
+        reasons=(
+            coolscanpy.MeterControllerRefusalReason(
+                code="linearity_insufficient",
+                message="too few unclipped pixels remain for pass-linearity proof",
+                channel="G",
+                valid_raw_samples=12_800,
+                required_raw_samples=256,
+                valid_aggregate_samples=0,
+                required_aggregate_samples=24,
+            ),
+        ),
+    )
+    bridge_error = BridgeError(
+        ErrorCode.METER_CONTROLLER_REFUSED,
+        str(original),
+        details=details,
+    )
+    bridge_error.__cause__ = original
+    transport = _StubTransport(start_scan_raises=bridge_error)
+    svc, telemetry, emit = _driven_service(tmp_path, monkeypatch, transport)
+
+    _start_scan(svc, tmp_path, emit, [1])
+    _wait_for(lambda: emit.has("scan.completed"))
+
+    assert emit.payload_of("scan.frameFailed")["details"] == details
+    assert emit.payload_of("scan.error")["details"] == details
+    entries = _read_telemetry(tmp_path, telemetry.session_id)
+    frame_entry = next(e for e in entries if e["method"] == "scan.frameFailed")
+    scan_entry = next(
+        e
+        for e in entries
+        if e["method"] == "scan.start" and e["outcome"] == "error"
+    )
+    assert frame_entry["details"] == details
+    assert scan_entry["details"] == details
+
+
+def test_scan_failure_evidence_reaches_frame_error_and_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = {
+        "schemaVersion": 1,
+        "evidenceId": "scan-binding-68",
+        "witness": {
+            "kind": "terminalPadding",
+            "recordCount": 2,
+            "byteCount": 2048,
+            "parity": "even",
+            "housekeepingByteCount": 448,
+            "nonzeroRgbCount": 1,
+            "mismatchLocation": {"recordIndex": 1, "byteOffset": 1038},
+        },
+    }
+    bridge_error = BridgeError(
+        ErrorCode.REFEED_REQUIRED,
+        "fresh scan binding rejected terminal padding",
+        diagnostic_evidence=evidence,
+    )
+    transport = _StubTransport(start_scan_raises=bridge_error)
+    svc, telemetry, emit = _driven_service(tmp_path, monkeypatch, transport)
+    _start_scan(svc, tmp_path, emit, [1])
+    _wait_for(lambda: emit.has("scan.completed"))
+
+    assert emit.payload_of("scan.frameFailed")["diagnosticEvidence"] == evidence
+    assert emit.payload_of("scan.error")["diagnosticEvidence"] == evidence
+    entries = _read_telemetry(tmp_path, telemetry.session_id)
+    frame_entry = next(entry for entry in entries if entry["method"] == "scan.frameFailed")
+    scan_entry = next(
+        entry
+        for entry in entries
+        if entry["method"] == "scan.start" and entry["outcome"] == "error"
+    )
+    assert frame_entry["diagnostic_evidence"] == evidence
+    assert scan_entry["diagnostic_evidence"] == evidence
+
+
+def test_preview_failure_evidence_reaches_preview_error_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = {
+        "schemaVersion": 1,
+        "evidenceId": "preview-43",
+        "witness": {
+            "kind": "terminalPadding",
+            "recordCount": 2,
+            "byteCount": 2048,
+            "parity": "even",
+            "housekeepingByteCount": 448,
+            "nonzeroRgbCount": 1,
+            "mismatchLocation": {"recordIndex": 1, "byteOffset": 1038},
+        },
+    }
+    transport = _StubTransport(
+        preview_raises=BridgeError(
+            ErrorCode.REFEED_REQUIRED,
+            "preview rejected terminal padding",
+            diagnostic_evidence=evidence,
+        )
+    )
+    _arm(monkeypatch, tmp_path)
+    telemetry = safety.TelemetryLog(tmp_path)
+    svc = service.BridgeService(transport, telemetry, base_dir=tmp_path)
+    svc.dispatch(
+        {
+            "id": 0,
+            "method": "bridge.hello",
+            "params": {"clientName": "test", "protocolVersion": 1},
+        },
+        lambda *_a: None,
+    )
+    svc.dispatch(
+        {"id": 1, "method": "device.open", "params": {"deviceId": _DEVICE_ID}},
+        lambda *_a: None,
+    )
+    emit = _RecordingEmit()
+    svc.dispatch(
+        {"id": 2, "method": "roll.preview", "params": {"material": "colorNegative"}},
+        emit,
+    )
+    _wait_for(lambda: emit.has("roll.previewError"))
+
+    assert emit.payload_of("roll.previewError")["diagnosticEvidence"] == evidence
 
 
 def test_bridge_error_without_a_chained_cause_uses_bridge_error_itself_as_reason(

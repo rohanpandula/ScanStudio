@@ -3,6 +3,11 @@ name: Verify
 on:
   push:
   pull_request:
+  workflow_call:
+    outputs:
+      verified_sha:
+        description: Exact commit that passed every required verification family
+        value: ${{ jobs.verification-gate.outputs.verified_sha }}
 
 permissions:
   contents: read
@@ -87,6 +92,8 @@ jobs:
           persist-credentials: false
       - name: Enforce immutable GitHub Action references
         run: python3 scripts/check_github_action_pins.py
+      - name: Enforce fail-closed release workflow structure
+        run: python3 -I -S -B scripts/verify_release_workflow.py
       - name: Test supply-chain policy gates
         run: python3 -I -S -B -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Test Tauri packaging artifact-lock verifier
@@ -239,3 +246,32 @@ jobs:
         run: |
           scripts/verify_updater.sh 2>&1 | tee "$RUNNER_TEMP/verify_updater.log"
           grep -q "VERIFY_UPDATER OK" "$RUNNER_TEMP/verify_updater.log"
+
+  verification-gate:
+    name: Required verification gate
+    if: ${{ always() }}
+    needs:
+      - app-and-engine
+      - bridge
+      - coolscanpy
+      - ports-vendor-sync
+      - package
+      - package-macos-14
+      - updater-integration
+    runs-on: ubuntu-22.04
+    outputs:
+      verified_sha: ${{ steps.prove.outputs.verified_sha }}
+    steps:
+      - id: prove
+        name: Prove every required family succeeded for this commit
+        run: |
+          set -euo pipefail
+          test "${{ needs.app-and-engine.result }}" = success
+          test "${{ needs.bridge.result }}" = success
+          test "${{ needs.coolscanpy.result }}" = success
+          test "${{ needs.ports-vendor-sync.result }}" = success
+          test "${{ needs.package.result }}" = success
+          test "${{ needs.package-macos-14.result }}" = success
+          test "${{ needs.updater-integration.result }}" = success
+          test -n "$GITHUB_SHA"
+          echo "verified_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"

@@ -204,7 +204,17 @@ public actor EngineClient {
             return
         }
         let task = Task<Void, Error> {
-            let params = HelloParams(clientName: "ScanStudio", protocolVersion: 1)
+            let appBuild =
+                Bundle.main.infoDictionary?["ScanStudioRelease"] as? String
+                ?? Bundle.main.object(
+                    forInfoDictionaryKey: "CFBundleShortVersionString"
+                ) as? String
+                ?? "source-build"
+            let params = HelloParams(
+                clientName: "ScanStudio",
+                protocolVersion: 1,
+                clientBuild: appBuild
+            )
             let result: HelloResult = try await self.performRequest("engine.hello", params: params)
             try Self.validateHandshake(result)
             self.engineVersion = result.engineVersion
@@ -328,7 +338,12 @@ public actor EngineClient {
             pending.continuation.resume(throwing: EngineRequestError(
                 code: errorEnvelope.error.code,
                 message: errorEnvelope.error.message,
-                recoverable: errorEnvelope.error.recoverable
+                recoverable: errorEnvelope.error.recoverable,
+                details: errorEnvelope.error.details,
+                evidence: errorEnvelope.error.evidence,
+                diagnosticEvidence: errorEnvelope.error.diagnosticEvidence,
+                diagnosticEvidenceUnavailableReason:
+                    errorEnvelope.error.diagnosticEvidenceUnavailableReason
             ))
         } else {
             pending.continuation.resume(returning: data)

@@ -12,30 +12,55 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify exact tagged commit
+    needs: authorize
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   authorize:
     name: Authorize tag from reviewed main history
     runs-on: ubuntu-22.04
+    outputs:
+      tag_object_sha: ${{ steps.remote-tag.outputs.tag_object_sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
           fetch-depth: 0
+      - name: Fetch and pin the exact remote tag object
+        id: remote-tag
+        run: |
+          set -euo pipefail
+          python3 -I -S -B scripts/verify_remote_release_tag.py \
+            --tag "$GITHUB_REF_NAME" \
+            --expected-commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --stage authorize \
+            --github-output "$GITHUB_OUTPUT"
       - name: Verify tag commit, main containment, and full notes
         run: |
           set -euo pipefail
           test "$GITHUB_REF_TYPE" = tag
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          git fetch --no-tags --force origin \
+            "+refs/heads/main:refs/remotes/origin/main"
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
           version="${GITHUB_REF_NAME#v}"
           python3 -I -S -B scripts/verify_release_notes.py \
             "docs/releases/$GITHUB_REF_NAME.md" "$GITHUB_REF_NAME" "$version"
+          python3 -I -S -B scripts/verify_release_workflow.py
 
   release:
     name: Build and verify ${{ matrix.arch }} DMG
     # Bounded because this job now waits on two Apple notarization
     # round-trips (app + DMG) on top of the build itself.
     timeout-minutes: 150
-    needs: authorize
+    needs: verify
     # A universal bundle is impossible because the pinned cv2/numpy wheels are
     # not universal, so each architecture is built natively on its own runner
     # through the SAME verified `make dmg` path (codesign --deep --strict,
@@ -73,6 +98,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
       - name: coolscanpy PyPI sync gate
         # Owner policy (2026-08-08): a release may not ship driver code that
         # standalone `pip install coolscanpy` users would not have -- version
@@ -206,6 +232,19 @@ jobs:
           print(f"{arch} entry present and matches checksum {actual}")
           PY
           echo "Checksum re-verified: $ACTUAL"
+      - name: Bind Mac artifacts to this workflow run and commit
+        run: |
+          set -euo pipefail
+          python3 -I -S -B scripts/release_provenance.py emit \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --output "app/ScanStudio/.build/ScanStudio-macOS-${{ matrix.arch }}.provenance.json" \
+            --artifact "app/ScanStudio/.build/ScanStudio-$RELEASE_VERSION-macOS-${{ matrix.arch }}.dmg" \
+            --artifact app/ScanStudio/.build/SHA256SUMS \
+            --artifact app/ScanStudio/.build/latest.json
       - name: Upload ${{ matrix.arch }} release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -214,6 +253,7 @@ jobs:
             app/ScanStudio/.build/ScanStudio-${{ env.RELEASE_VERSION }}-macOS-${{ matrix.arch }}.dmg
             app/ScanStudio/.build/SHA256SUMS
             app/ScanStudio/.build/latest.json
+            app/ScanStudio/.build/ScanStudio-macOS-${{ matrix.arch }}.provenance.json
           if-no-files-found: error
           retention-days: 1
       - name: Delete the throwaway signing keychain and key material
@@ -228,7 +268,7 @@ jobs:
 
   windows-resources:
     name: Assemble Windows offline resources
-    needs: authorize
+    needs: verify
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
@@ -238,6 +278,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Install exact Node and Python build toolchains
         run: |
           python3 -I -S -B scripts/install_pinned_node.py \
@@ -306,6 +347,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ScanStudio-windows-staging
@@ -341,6 +383,20 @@ jobs:
           ports/tauri/packaging/windows/build-and-verify.ps1 `
             -Version "$env:RELEASE_VERSION" `
             -OutputDir "$env:RUNNER_TEMP/scanstudio-windows-release"
+      - name: Bind Windows artifacts to this workflow run and commit
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP/scanstudio-windows-release"
+          python -I -S -B scripts/release_provenance.py emit `
+            --repository "$env:GITHUB_REPOSITORY" `
+            --run-id "$env:GITHUB_RUN_ID" `
+            --run-attempt "$env:GITHUB_RUN_ATTEMPT" `
+            --commit "$env:GITHUB_SHA" `
+            --tag "$env:GITHUB_REF_NAME" `
+            --output "$root/ScanStudio-Windows-x86_64-preview.provenance.json" `
+            --artifact "$root/ScanStudio-$env:RELEASE_VERSION-Windows-x86_64-preview-setup.exe" `
+            --artifact "$root/ScanStudio-$env:RELEASE_VERSION-Windows-x86_64-preview-portable.zip"
+          if ($LASTEXITCODE -ne 0) { throw "Windows provenance emission failed" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ScanStudio-windows-x86_64-preview
@@ -350,7 +406,7 @@ jobs:
 
   linux:
     name: Build and verify Linux x64 Preview
-    needs: authorize
+    needs: verify
     runs-on: ubuntu-22.04
     container: ubuntu@sha256:0199853f6d6b20b0424f3c5694a72a62764f01e6a771b1eb48a4197848986c7e
     timeout-minutes: 90
@@ -364,6 +420,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Install Linux build and runtime prerequisites
         run: scripts/install_ubuntu_build_prerequisites.sh
       - name: Install exact Node and Python build toolchains
@@ -393,6 +450,19 @@ jobs:
           ports/tauri/packaging/linux/build-and-verify.sh \
             "$RELEASE_VERSION" \
             "$RUNNER_TEMP/scanstudio-linux-release"
+      - name: Bind Linux artifacts to this workflow run and commit
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/scanstudio-linux-release"
+          python3 -I -S -B scripts/release_provenance.py emit \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --output "$root/ScanStudio-Linux-x86_64-preview.provenance.json" \
+            --artifact "$root/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" \
+            --artifact "$root/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ScanStudio-linux-x86_64-preview
@@ -400,9 +470,35 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  verification-gate:
+    name: Require every same-run release job to succeed
+    if: ${{ always() }}
+    needs:
+      - verify
+      - authorize
+      - release
+      - windows-resources
+      - windows
+      - linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Reject failure cancellation timeout skip or missing result
+        env:
+          SCANSTUDIO_REQUIRED_JOB_RESULTS: ${{ toJSON(needs) }}
+          VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
+        run: |
+          test -n "$VERIFIED_SHA"
+          test "$VERIFIED_SHA" = "$GITHUB_SHA"
+          python3 -I -S -B scripts/verify_required_job_results.py
+
   publish:
     name: Publish combined Beta and Previews
-    needs: [release, windows, linux]
+    needs: [authorize, verify, verification-gate]
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
@@ -411,6 +507,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ScanStudio-dmg-arm64
@@ -427,8 +524,39 @@ jobs:
         with:
           name: ScanStudio-linux-x86_64-preview
           path: ${{ runner.temp }}/linux
-      - name: Resolve release version from the tag
+      - name: Verify all exact-run artifact provenance
         run: |
+          set -euo pipefail
+          python3 -I -S -B scripts/release_provenance.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --receipt "$RUNNER_TEMP/arm64/ScanStudio-macOS-arm64.provenance.json" \
+            --artifact-root "$RUNNER_TEMP/arm64"
+          python3 -I -S -B scripts/release_provenance.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --receipt "$RUNNER_TEMP/x86_64/ScanStudio-macOS-x86_64.provenance.json" \
+            --artifact-root "$RUNNER_TEMP/x86_64"
+          python3 -I -S -B scripts/release_provenance.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --receipt "$RUNNER_TEMP/windows/ScanStudio-Windows-x86_64-preview.provenance.json" \
+            --artifact-root "$RUNNER_TEMP/windows"
+          python3 -I -S -B scripts/release_provenance.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --receipt "$RUNNER_TEMP/linux/ScanStudio-Linux-x86_64-preview.provenance.json" \
+            --artifact-root "$RUNNER_TEMP/linux"
+      - name: Resolve release version from the tag
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
+        run: |
+          test -n "$VERIFIED_SHA"
+          test "$VERIFIED_SHA" = "$GITHUB_SHA"
           STAMP="${GITHUB_REF_NAME#v}"
           {
             echo "RELEASE_VERSION=$STAMP"
@@ -524,8 +652,17 @@ jobs:
       - name: Create and verify a draft GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          AUTHORIZED_TAG_OBJECT: ${{ needs.authorize.outputs.tag_object_sha }}
         run: |
           set -euo pipefail
+          test -n "$AUTHORIZED_TAG_OBJECT"
+          python3 -I -S -B scripts/verify_remote_release_tag.py \
+            --tag "$GITHUB_REF_NAME" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-object "$AUTHORIZED_TAG_OBJECT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --stage draft
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
@@ -590,8 +727,17 @@ jobs:
       - name: Publish and re-verify the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          AUTHORIZED_TAG_OBJECT: ${{ needs.authorize.outputs.tag_object_sha }}
         run: |
           set -euo pipefail
+          test -n "$AUTHORIZED_TAG_OBJECT"
+          python3 -I -S -B scripts/verify_remote_release_tag.py \
+            --tag "$GITHUB_REF_NAME" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-object "$AUTHORIZED_TAG_OBJECT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --stage publication
           gh release edit "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \

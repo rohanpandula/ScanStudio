@@ -9,6 +9,7 @@ exceptions describe.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -28,11 +29,14 @@ __all__ = [
     "FingerprintRefused",
     "ManualReviewRequired",
     "RefeedRequired",
+    "TransportIndexRefused",
     "GeometryValidationError",
     "TransportSmearDetected",
     "SplitAlignmentError",
     "BatchIntegrityError",
     "MeterUnusableError",
+    "MeterControllerRefusalReason",
+    "MeterControllerRefused",
 ]
 
 
@@ -152,6 +156,21 @@ class RefeedRequired(RollMismatch):
     """
 
 
+class TransportIndexRefused(RefeedRequired):
+    """A fresh scan binding produced a bounded replayable transport witness."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_id: str,
+        diagnostics: dict,
+    ) -> None:
+        super().__init__(message)
+        self.error_id = error_id
+        self.diagnostics = diagnostics
+
+
 class GeometryValidationError(PyCoolscanError):
     """A returned frame's shape, dpi, depth, or resolution tag did not match
     the request."""
@@ -174,6 +193,158 @@ class SplitAlignmentError(PyCoolscanError):
 class BatchIntegrityError(PyCoolscanError):
     """The packaged capture worker, plan, or manifest failed self-
     verification before any hardware access was attempted."""
+
+
+@dataclass(frozen=True)
+class MeterControllerRefusalReason:
+    """One bounded, machine-readable meter-controller safety refusal."""
+
+    code: str
+    message: str
+    channel: str | None = None
+    valid_raw_samples: int | None = None
+    required_raw_samples: int | None = None
+    valid_aggregate_samples: int | None = None
+    required_aggregate_samples: int | None = None
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "MeterControllerRefusalReason":
+        if not isinstance(payload, dict):
+            raise ValueError("meter-controller refusal reason must be an object")
+        allowed = {
+            "code",
+            "message",
+            "channel",
+            "valid_raw_samples",
+            "required_raw_samples",
+            "valid_aggregate_samples",
+            "required_aggregate_samples",
+        }
+        if set(payload) - allowed:
+            raise ValueError("meter-controller refusal reason has unknown fields")
+        code = payload.get("code")
+        message = payload.get("message")
+        channel = payload.get("channel")
+        if (
+            not isinstance(code, str)
+            or not 1 <= len(code) <= 128
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in code)
+        ):
+            raise ValueError("meter-controller refusal code is invalid")
+        if (
+            not isinstance(message, str)
+            or not 1 <= len(message) <= 512
+            or "\n" in message
+            or "\r" in message
+        ):
+            raise ValueError("meter-controller refusal message is invalid")
+        if channel is not None and channel not in {"R", "G", "B", "IR"}:
+            raise ValueError("meter-controller refusal channel is invalid")
+
+        counts: dict[str, int | None] = {}
+        for field in (
+            "valid_raw_samples",
+            "required_raw_samples",
+            "valid_aggregate_samples",
+            "required_aggregate_samples",
+        ):
+            value = payload.get(field)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 2**31 - 1
+            ):
+                raise ValueError(f"meter-controller refusal {field} is invalid")
+            counts[field] = value
+        if code == "linearity_insufficient" and any(
+            counts[field] is None for field in counts
+        ):
+            raise ValueError(
+                "linearity-insufficient refusal is missing bounded sample counts"
+            )
+        return cls(
+            code=code,
+            message=message,
+            channel=channel,
+            **counts,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {"code": self.code, "message": self.message}
+        if self.channel is not None:
+            result["channel"] = self.channel
+        for field in (
+            "valid_raw_samples",
+            "required_raw_samples",
+            "valid_aggregate_samples",
+            "required_aggregate_samples",
+        ):
+            value = getattr(self, field)
+            if value is not None:
+                result[field] = value
+        return result
+
+
+class MeterControllerRefused(PyCoolscanError):
+    """Fine capture was blocked by one or more meter-controller safeguards.
+
+    This is deliberately distinct from :class:`MeterUnusableError` (no usable
+    meter mean) and from :class:`RollMismatch` (roll identity or feed shift).
+    """
+
+    def __init__(
+        self,
+        *,
+        pass_number: int,
+        reasons: tuple[MeterControllerRefusalReason, ...],
+    ) -> None:
+        if isinstance(pass_number, bool) or pass_number not in (1, 2, 3):
+            raise ValueError("meter-controller refusal pass must be 1, 2, or 3")
+        if not reasons or not all(
+            isinstance(reason, MeterControllerRefusalReason) for reason in reasons
+        ):
+            raise ValueError("meter-controller refusal must contain typed reasons")
+        self.pass_number = pass_number
+        self.reasons = tuple(reasons)
+        channels = tuple(
+            dict.fromkeys(
+                reason.channel for reason in self.reasons if reason.channel is not None
+            )
+        )
+        codes = ", ".join(reason.code for reason in self.reasons)
+        channel_suffix = (
+            f"; affected channels: {', '.join(channels)}" if channels else ""
+        )
+        super().__init__(
+            f"meter pass {pass_number} controller refused: {codes}{channel_suffix}"
+        )
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "MeterControllerRefused":
+        if not isinstance(payload, dict) or set(payload) != {"pass", "reasons"}:
+            raise ValueError("meter-controller refusal record is invalid")
+        pass_number = payload.get("pass")
+        raw_reasons = payload.get("reasons")
+        if (
+            isinstance(pass_number, bool)
+            or not isinstance(pass_number, int)
+            or not isinstance(raw_reasons, list)
+            or not 1 <= len(raw_reasons) <= 4
+        ):
+            raise ValueError("meter-controller refusal record is invalid")
+        return cls(
+            pass_number=pass_number,
+            reasons=tuple(
+                MeterControllerRefusalReason.from_dict(reason)
+                for reason in raw_reasons
+            ),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "pass": self.pass_number,
+            "reasons": [reason.to_dict() for reason in self.reasons],
+        }
 
 
 class MeterUnusableError(PyCoolscanError):

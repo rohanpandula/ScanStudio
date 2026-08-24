@@ -603,8 +603,8 @@ complete pinned source archive is in ../CorrespondingSource/libusb. Normal
 LS-5000 color-roll detection, preview, and capture require no host driver.
 The python-sane 2.9.2 binding is built from the exact source and instructions
 in ../CorrespondingSource/python-sane against a private SANE 1.4.0 link SDK.
-The SDK and SANE runtime are not bundled; optional plain-scan and software-
-eject paths still need a compatible system SANE backend.
+The SDK and SANE runtime are not bundled; the optional plain-scan path still
+needs a compatible system SANE backend. Eject uses the direct-USB transport.
 LICENSES
 
 # Final runtime-boundary proof before signing: source/rebuild material is

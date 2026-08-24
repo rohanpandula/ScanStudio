@@ -212,8 +212,14 @@ class _FakeRoll:
 
 
 class _FakeDevice:
-    def __init__(self, roll: _FakeRoll | None = None) -> None:
+    def __init__(
+        self,
+        roll: _FakeRoll | None = None,
+        *,
+        info: "coolscanpy.DeviceInfo | None" = None,
+    ) -> None:
         self._roll = roll
+        self.info = info or _fake_device_info()
         self.eject_effect: object = True
         # The vendor-eject confirmation probe (Device.film_present): None
         # (undetermined) mirrors the pre-probe default; vendor-route eject
@@ -312,12 +318,15 @@ def _fake_capabilities() -> "coolscanpy.Capabilities":
 
 
 def _fake_device_info(
-    device_id: str = _DEVICE_ID, *, supported: bool = True
+    device_id: str = _DEVICE_ID,
+    *,
+    model: str = "SUPER COOLSCAN 5000 ED",
+    supported: bool = True,
 ) -> "coolscanpy.DeviceInfo":
     return coolscanpy.DeviceInfo(
         id=device_id,
         vendor="Nikon",
-        model="SUPER COOLSCAN 5000 ED",
+        model=model,
         capabilities=_fake_capabilities(),
         supported=supported,
     )
@@ -404,11 +413,23 @@ def _fake_smear() -> "coolscanpy.TransportSmearDetected":
     )
 
 
+def _terminal_padding_witness() -> dict[str, object]:
+    return {
+        "kind": "terminal_padding",
+        "record_count": 2,
+        "byte_count": 2048,
+        "parity": "even",
+        "housekeeping_byte_count": 448,
+        "nonzero_rgb_count": 1,
+        "mismatch_location": {"record_index": 1, "byte_offset": 1038},
+    }
+
+
 def _opened_transport(
     monkeypatch: pytest.MonkeyPatch, roll: _FakeRoll, device_id: str = _DEVICE_ID
 ) -> tuple[CoolscanPyTransport, _FakeDevice]:
     info = _fake_device_info(device_id)
-    fake_device = _FakeDevice(roll=roll)
+    fake_device = _FakeDevice(roll=roll, info=info)
     monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
     monkeypatch.setattr(coolscanpy, "open", lambda devname: fake_device)
     # CoolscanPyTransport.preview() writes under safety.DEFAULT_BASE_DIR --
@@ -808,6 +829,43 @@ def test_open_device_rejects_second_open_with_already_connected(
     with pytest.raises(BridgeError) as excinfo:
         transport.open_device(_DEVICE_ID)
     assert excinfo.value.code == ErrorCode.ALREADY_CONNECTED
+
+
+def test_open_device_reports_the_exact_identity_validated_by_coolscanpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = _fake_device_info(
+        device_id="net:lab:coolscan3:usb:004:007",
+        model="LS-5000 ED",
+    )
+    device = _FakeDevice(info=info)
+    monkeypatch.setattr(coolscanpy, "open", lambda _device_id: device)
+
+    opened = CoolscanPyTransport().open_device("ls5000")
+
+    assert opened.device_id == info.id
+    assert opened.vendor == info.vendor
+    assert opened.model == info.model
+    assert opened.supported is True
+
+
+def test_open_device_refuses_an_unverified_identity_without_synthesizing_ls5000(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = _fake_device_info(
+        device_id="coolscan3:usb:001:009",
+        model="Coolscan Mystery Model",
+        supported=False,
+    )
+    device = _FakeDevice(info=info)
+    monkeypatch.setattr(coolscanpy, "open", lambda _device_id: device)
+
+    with pytest.raises(BridgeError) as excinfo:
+        CoolscanPyTransport().open_device(info.id)
+
+    assert excinfo.value.code == ErrorCode.DEVICE_NOT_FOUND
+    assert "Coolscan Mystery Model" in str(excinfo.value)
+    assert device.closed is True
 
 
 # -- preview -----------------------------------------------------------------------
@@ -1269,6 +1327,42 @@ def test_preview_maps_leaked_index_decode_error(monkeypatch: pytest.MonkeyPatch)
     message = str(excinfo.value)
     assert "refeed" in message or "eject" in message
     assert "MAE 4.447" in message
+
+
+def test_preview_publishes_bounded_terminal_failure_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from coolscanpy.protocol.ls5000_single_pass.roll_index import IndexDecodeError
+
+    class _IndexDecodeErrorRoll(_FakeRoll):
+        def preview(self, slots: list[int] | None = None) -> list["coolscanpy.Thumbnail"]:
+            raise IndexDecodeError(
+                "terminal padding is not one byte-identical blank-row suffix",
+                error_id="terminal-padding-mismatch",
+                diagnostics=_terminal_padding_witness(),
+            )
+
+    transport, _device = _opened_transport(monkeypatch, _IndexDecodeErrorRoll())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    error = excinfo.value
+    assert error.code == ErrorCode.REFEED_REQUIRED
+    assert error.diagnostic_evidence is not None
+    assert error.diagnostic_evidence["schemaVersion"] == 1
+    assert error.diagnostic_evidence["witness"] == {
+        "kind": "terminalPadding",
+        "recordCount": 2,
+        "byteCount": 2048,
+        "parity": "even",
+        "housekeepingByteCount": 448,
+        "nonzeroRgbCount": 1,
+        "mismatchLocation": {"recordIndex": 1, "byteOffset": 1038},
+    }
+    evidence_id = error.diagnostic_evidence["evidenceId"]
+    path = safety.DEFAULT_BASE_DIR / "failed-attempt-evidence" / f"{evidence_id}.json"
+    assert json.loads(path.read_text(encoding="utf-8")) == error.diagnostic_evidence
 
 
 def test_preview_preserves_leading_frame_clipped_refeed_guidance(
@@ -2035,6 +2129,73 @@ def test_start_scan_maps_meter_unusable(
     assert excinfo.value.code == ErrorCode.METER_UNUSABLE
     assert "could not find usable image data" in str(excinfo.value)
     assert "channel G" in str(excinfo.value)
+
+
+def test_start_scan_maps_typed_meter_controller_refusal_with_all_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reasons = (
+        coolscanpy.MeterControllerRefusalReason(
+            code="linearity_insufficient",
+            message="too few unclipped pixels remain for pass-linearity proof",
+            channel="R",
+            valid_raw_samples=255,
+            required_raw_samples=256,
+            valid_aggregate_samples=28,
+            required_aggregate_samples=24,
+        ),
+        coolscanpy.MeterControllerRefusalReason(
+            code="linearity_insufficient",
+            message="too few unclipped pixels remain for pass-linearity proof",
+            channel="G",
+            valid_raw_samples=12_800,
+            required_raw_samples=256,
+            valid_aggregate_samples=0,
+            required_aggregate_samples=24,
+        ),
+    )
+    refusal = coolscanpy.MeterControllerRefused(pass_number=2, reasons=reasons)
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1)],
+        scan_results={1: [refusal]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.start_scan(
+            slots=[1],
+            recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            output=_output(tmp_path),
+            on_progress=lambda _p: None,
+            on_retry=lambda *a: None,
+            on_frame=lambda *_a: None,
+        )
+
+    assert excinfo.value.code == ErrorCode.METER_CONTROLLER_REFUSED
+    assert excinfo.value.details == {
+        "pass": 2,
+        "reasons": [
+            {
+                "code": "linearity_insufficient",
+                "message": "too few unclipped pixels remain for pass-linearity proof",
+                "channel": "R",
+                "validRawSamples": 255,
+                "requiredRawSamples": 256,
+                "validAggregateSamples": 28,
+                "requiredAggregateSamples": 24,
+            },
+            {
+                "code": "linearity_insufficient",
+                "message": "too few unclipped pixels remain for pass-linearity proof",
+                "channel": "G",
+                "validRawSamples": 12_800,
+                "requiredRawSamples": 256,
+                "validAggregateSamples": 0,
+                "requiredAggregateSamples": 24,
+            },
+        ],
+    }
 
 
 @pytest.mark.parametrize(
@@ -3056,6 +3217,39 @@ def test_start_scan_maps_refeed_required(
             on_frame=lambda *a: None,
         )
     assert excinfo.value.code == ErrorCode.REFEED_REQUIRED
+    assert roll.scan_many_calls == [(1,)]
+
+
+def test_scan_binding_publishes_typed_transport_failure_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refusal = coolscanpy.TransportIndexRefused(
+        "fresh scan binding rejected terminal padding",
+        error_id="terminal-padding-mismatch",
+        diagnostics=_terminal_padding_witness(),
+    )
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1)],
+        scan_results={1: [refusal]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport.start_scan(
+            slots=[1],
+            recipe=domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            output=_output(tmp_path),
+            on_progress=lambda _p: None,
+            on_retry=lambda *a: None,
+            on_frame=lambda *a: None,
+        )
+
+    error = excinfo.value
+    assert error.code == ErrorCode.REFEED_REQUIRED
+    assert error.diagnostic_evidence is not None
+    assert error.diagnostic_evidence["witness"]["kind"] == "terminalPadding"
+    assert error.diagnostic_evidence_unavailable_reason is None
     assert roll.scan_many_calls == [(1,)]
 
 

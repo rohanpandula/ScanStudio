@@ -233,6 +233,34 @@ jobs:
                     expected,
                 )
 
+    def test_only_reviewed_local_reusable_workflow_is_allowed_at_job_level(
+        self,
+    ) -> None:
+        result, output = self.run_policy(
+            f"""jobs:
+  delegated:
+    uses: ./.github/workflows/ci.yml
+  pinned:
+    steps:
+      - uses: {GENERIC_ACTION}
+"""
+        )
+        self.assertEqual(result, 0, output)
+
+        for workflow in (
+            """jobs:
+  delegated:
+    uses: ./.github/workflows/other.yml
+""",
+            """jobs:
+  test:
+    steps:
+      - uses: ./.github/workflows/ci.yml
+""",
+        ):
+            with self.subTest(workflow=workflow):
+                self.assert_rejected(workflow, "local action wrappers are forbidden")
+
     def test_duplicate_keys_are_rejected_at_every_security_boundary(self) -> None:
         for duplicate_fragment, expected in (
             (

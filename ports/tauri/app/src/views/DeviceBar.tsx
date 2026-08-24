@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../session";
 import { sessionOperationBusy } from "../session/store/session";
+import { resolveDiagnosticEvidence } from "../session/diagnosticEvidence";
 import type { DeviceInfo, EngineError } from "../session/wire/types";
 import DiagnosticReportActions from "./DiagnosticReportActions";
 import HardwareErrorPanel from "./HardwareErrorPanel";
@@ -88,9 +89,18 @@ export default function DeviceBar() {
   const device = state.connection.device;
   const operationBusy = sessionOperationBusy(state);
   const visibleError =
+    state.sequenceError ??
     state.previewRequestFailure?.error ??
     state.filmFeedInterrupted ??
     connectionError;
+  const diagnosticError =
+    state.previewOutcome === "failed" && state.previewError !== null
+      ? state.previewError
+      : visibleError;
+  const evidenceResolution =
+    diagnosticError === null
+      ? { evidence: null, unavailableReason: null }
+      : resolveDiagnosticEvidence(state.diagnosticEvidence, diagnosticError);
 
   const connect = async (deviceId: string): Promise<void> => {
     if (connectionPendingRef.current || operationBusy) return;
@@ -262,6 +272,8 @@ export default function DeviceBar() {
         device={device}
         status={status}
         thumbnails={state.thumbnails}
+        transportEvidence={evidenceResolution.evidence}
+        unavailableEvidenceReason={evidenceResolution.unavailableReason}
       />
     </div>
   );

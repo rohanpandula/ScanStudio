@@ -104,9 +104,12 @@ _NIKON_COOLSCAN_USB_MODELS: dict[int, dict[int, str]] = {
     },
 }
 
-# SANE lane counterpart of the USB lane's product-id table above (#14): SANE
-# has no product id, only the backend's free-text model string, so a
-# recognized non-LS-5000 model is matched by substring instead.
+# SANE lane counterpart of the USB lane's product-id table above (#14/#103):
+# SANE has no product id, only the backend's free-text model string.  That
+# string is therefore identity evidence, not display copy: support is granted
+# only for an exact known model after whitespace normalization.  In
+# particular, the broad ``coolscan3:`` backend prefix is not proof that the
+# body is an LS-5000.
 #
 # Sourced from the coolscan3 SANE backend's own device-identification table,
 # not guessed: sane-backends backend/coolscan3.c, cs3_open(), the
@@ -120,51 +123,36 @@ _NIKON_COOLSCAN_USB_MODELS: dict[int, dict[int, str]] = {
 # identification switch never added it (a late, SCSI-only, high-end model),
 # so it cannot be matched by name here regardless.
 #
-# Ordered most-specific-marker-first: "LS-50" is itself a substring of
-# "LS-5000", and likewise "LS-40" of "LS-4000" -- checking the 4/5-digit
-# models before their 2-digit siblings is load-bearing, not stylistic.
-_SANE_COOLSCAN_MODEL_MARKERS: tuple[tuple[str, str], ...] = (
-    ("LS-5000", "LS-5000 ED"),
-    ("LS-4000", "LS-4000 ED"),
-    ("LS-50", "LS-50 ED"),
-    ("LS-40", "LS-40 ED"),
-    ("LS-8000", "LS-8000 ED"),
-    ("LS-2000", "LS-2000"),
-    ("COOLSCANIII", "COOLSCANIII"),
-)
+_SANE_COOLSCAN_MODELS: dict[str, str] = {
+    "LS-5000 ED": "LS-5000 ED",
+    "LS-4000 ED": "LS-4000 ED",
+    "LS-50 ED": "LS-50 ED",
+    "LS-40 ED": "LS-40 ED",
+    "LS-8000 ED": "LS-8000 ED",
+    "LS-2000": "LS-2000",
+    "COOLSCANIII": "COOLSCANIII",
+}
 
 
 def _sane_model_and_supported(device: ScannerDevice) -> tuple[str, bool]:
     """Classify a SANE-enumerated coolscan3 device's free-text model string.
 
     Returns ``(model, supported)``. Only the LS-5000 is supported. A
-    RECOGNIZED but unsupported Nikon Coolscan (LS-40/50/4000/8000/2000, the
-    original Coolscan III) is labeled with the backend's own exact name and
-    refused -- see :func:`open`'s ``supported`` gate (Lane D, #14) -- from
-    ``_SANE_COOLSCAN_MODEL_MARKERS``, sourced from coolscan3.c's own
-    identification table (see its comment).
-
-    A ``coolscan3:`` id whose model string matches none of those markers is
-    left ``supported=True`` (reviewer's call, R2) rather than guessed-
-    unsupported: this backend's device family is closed to the models in
-    that table, so a string that doesn't match any of them is most plausibly
-    a firmware/model-string variant of the one model this package actually
-    drives (the LS-5000) that the table's exact literals don't happen to
-    match byte-for-byte -- not a foreign device slipping through a loose
-    filter, since :func:`_is_coolscan_device_id` already restricted the
-    caller to a ``coolscan3:``-backed id before this function ever runs.
-    Bricking a genuine LS-5000 on a model-string mismatch would be worse
-    than the reverse. Fail-closed only for the models this table can
-    actually NAME as unsupported; fail-open for everything it cannot name at
-    all. The raw reported string is returned unchanged in that case -- not
-    relabeled -- since it is now being treated as usable, not guessed.
+    A recognized but unsupported Nikon Coolscan (LS-40/50/4000/8000/2000,
+    the original Coolscan III) is labeled with the backend's canonical name
+    and refused by :func:`open`.  Unknown, blank, substring, case-changed,
+    and near-match identities retain the exact reported string for display
+    but are also unsupported.  The only normalization permitted before the
+    exact comparison is stripping/collapsing whitespace; model characters
+    and case are never guessed.
     """
 
     raw_model = device.model or ""
-    for marker, canonical_name in _SANE_COOLSCAN_MODEL_MARKERS:
-        if marker in raw_model:
-            return canonical_name, canonical_name == "LS-5000 ED"
-    return raw_model, True
+    normalized_model = " ".join(raw_model.split())
+    canonical_name = _SANE_COOLSCAN_MODELS.get(normalized_model)
+    if canonical_name is None:
+        return raw_model, False
+    return canonical_name, canonical_name == "LS-5000 ED"
 
 
 def _default_service_factory() -> "ScannerService":
@@ -490,6 +478,16 @@ class Device:
     @property
     def capabilities(self):
         return self._info.capabilities
+
+    @property
+    def info(self) -> DeviceInfo:
+        """The exact identity that passed discovery/open validation.
+
+        Exposing this immutable value lets adapters report the opened body's
+        real model instead of reconstructing or hard-coding an LS-5000 name.
+        """
+
+        return self._info
 
     @property
     def option_names(self) -> list[str]:

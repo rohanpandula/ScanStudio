@@ -30,6 +30,10 @@ const DEFAULT_BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 struct ProjectState {
     active: Option<domain::ScanProject>,
     directory: Option<std::path::PathBuf>,
+    /// Process-client build reported by engine.hello. Stored in the existing
+    /// single-threaded request state so a later scanner.rescan can apply it to
+    /// a newly-created real backend without process-global mutable state.
+    client_build: Option<String>,
 }
 
 impl ProjectState {
@@ -214,7 +218,10 @@ impl Backends {
     /// list as `from_env` (T-09-11), never an error. Refused while any
     /// device is connected so an active session's backend can never be
     /// replaced underneath it (same invariant as T-09-12).
-    fn rescan(&mut self) -> Result<Vec<domain::DeviceInfo>, EngineError> {
+    fn rescan(
+        &mut self,
+        client_build: Option<&str>,
+    ) -> Result<Vec<domain::DeviceInfo>, EngineError> {
         if self.active.is_some() {
             return Err(EngineError::new(
                 ErrorCode::AlreadyConnected,
@@ -236,7 +243,10 @@ impl Backends {
         if self.real.is_none() {
             if let Some(cmd) = &self.bridge_cmd {
                 match RealLs5000::new(cmd, DEFAULT_BRIDGE_TIMEOUT) {
-                    Ok(backend) => self.real = Some(Arc::new(backend)),
+                    Ok(backend) => {
+                        backend.set_client_build(client_build.map(str::to_string));
+                        self.real = Some(Arc::new(backend));
+                    }
                     Err(err) => {
                         eprintln!(
                             "scanstudio-engine: scanner.rescan could not start the real backend ({err}); the device list stays simulator-only"
@@ -256,6 +266,12 @@ impl Backends {
             v.push(real.device_info());
         }
         v
+    }
+
+    fn set_client_build(&self, client_build: Option<String>) {
+        if let Some(real) = &self.real {
+            real.set_client_build(client_build);
+        }
     }
 
     /// Routes `scanner.connect` by device id. Refuses to switch the active
@@ -1024,6 +1040,8 @@ fn handle_request(
                     ),
                 ));
             }
+            project_state.client_build = params.client_build.clone();
+            backends.set_client_build(params.client_build);
             to_json(&protocol::HelloResult {
                 engine_name: "scanstudio-engine".to_string(),
                 engine_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1035,7 +1053,7 @@ fn handle_request(
             devices: backends.list_devices(),
         }),
         "scanner.rescan" => to_json(&protocol::ScannerListResult {
-            devices: backends.rescan()?,
+            devices: backends.rescan(project_state.client_build.as_deref())?,
         }),
         "scanner.connect" => {
             let params: protocol::ConnectParams = parse_params(&request.params)?;
@@ -2029,6 +2047,12 @@ fn respond_ok(tx: &mpsc::Sender<String>, id: u64, result: serde_json::Value) {
 }
 
 fn respond_error(tx: &mpsc::Sender<String>, id: u64, error: &EngineError) {
+    if let Some(evidence) = error.diagnostic_evidence.as_ref() {
+        // Publish the immutable artifact before the terminal response that
+        // references it. Exporters retain this in memory and perform no
+        // scanner/bridge request to resolve it later.
+        emit_event(tx, "diagnostic.evidence", evidence);
+    }
     let payload: ErrorPayload = error.into();
     let response = protocol::ErrorResponse::new(id, payload);
     match serde_json::to_string(&response) {
@@ -2123,7 +2147,9 @@ mod tests {
             active: None,
             bridge_cmd: None,
         };
-        let devices = backends.rescan().expect("rescan without a bridge cmd is a no-op");
+        let devices = backends
+            .rescan(None)
+            .expect("rescan without a bridge cmd is a no-op");
         assert_eq!(devices.len(), 1, "sim-only list stays sim-only: {devices:#?}");
         assert!(backends.real.is_none());
     }
@@ -2137,7 +2163,7 @@ mod tests {
             bridge_cmd: Some("/nonexistent-wv2-rescan-bridge-cmd".to_string()),
         };
         let devices = backends
-            .rescan()
+            .rescan(None)
             .expect("a broken bridge cmd must degrade exactly like from_env, never error");
         assert_eq!(devices.len(), 1, "{devices:#?}");
         assert!(backends.real.is_none());
@@ -2151,7 +2177,9 @@ mod tests {
             active: Some(ActiveDevice::Sim),
             bridge_cmd: None,
         };
-        let error = backends.rescan().expect_err("rescan must refuse while connected");
+        let error = backends
+            .rescan(None)
+            .expect_err("rescan must refuse while connected");
         assert_eq!(error.code, ErrorCode::AlreadyConnected);
     }
 
@@ -2398,6 +2426,77 @@ mod tests {
         assert_eq!(open_result["project"], create_result["project"]);
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn failed_project_create_collision_does_not_switch_the_active_project() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let active_directory = temp_test_dir("active-before-create-collision");
+        let collision_directory = temp_test_dir("existing-create-collision");
+
+        let create_active = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Active",
+                "carrier": "mounted",
+                "frameCount": 1,
+                "filmProcess": "positive",
+                "directory": active_directory.display().to_string(),
+            }),
+        };
+        handle_request(&mut backends, &tx, &create_active, &mut project_state)
+            .expect("create active project");
+        let active_before = project_state.active.clone().expect("active project");
+        let directory_before = project_state.directory.clone().expect("active directory");
+
+        crate::manifest::create_project(
+            "Existing",
+            domain::MediaCarrier::Mounted,
+            1,
+            domain::FilmProcess::Kodachrome,
+            Some(&collision_directory),
+        )
+        .expect("seed collision project");
+        let manifest_before = std::fs::read(collision_directory.join("manifest.json"))
+            .expect("read collision manifest");
+
+        let error = handle_request(
+            &mut backends,
+            &tx,
+            &Request {
+                id: 2,
+                method: "project.create".into(),
+                params: serde_json::json!({
+                    "name": "Replacement",
+                    "carrier": "mounted",
+                    "frameCount": 1,
+                    "filmProcess": "positive",
+                    "directory": collision_directory.display().to_string(),
+                }),
+            },
+            &mut project_state,
+        )
+        .expect_err("existing project must refuse create");
+
+        assert_eq!(error.code, ErrorCode::ProjectAlreadyExists);
+        assert_eq!(project_state.active.as_ref(), Some(&active_before));
+        assert_eq!(project_state.directory.as_ref(), Some(&directory_before));
+        assert_eq!(
+            std::fs::read(collision_directory.join("manifest.json"))
+                .expect("reread collision manifest"),
+            manifest_before
+        );
+
+        let _ = std::fs::remove_dir_all(&active_directory);
+        let _ = std::fs::remove_dir_all(&collision_directory);
     }
 
     #[test]

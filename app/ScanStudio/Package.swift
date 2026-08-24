@@ -26,7 +26,8 @@ let package = Package(
         ),
         .testTarget(
             name: "ScanStudioKitTests",
-            dependencies: ["ScanStudioKit"]
+            dependencies: ["ScanStudioKit"],
+            resources: [.process("Fixtures")]
         )
     ]
 )

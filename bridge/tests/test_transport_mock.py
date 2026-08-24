@@ -719,9 +719,17 @@ def test_start_scan_writes_linear_dng_with_embedded_ir_subifd(
         assert main.tags.get("ExtraSamples") is None
         np.testing.assert_array_equal(main.asarray(), rgb)
         assert len(main.pages) == 1
+        assert main.tags["SubIFDs"].dtype == tifffile.DATATYPE.LONG
         assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
-        np.testing.assert_array_equal(main.pages[0].asarray(), infrared)
-        assert main.pages[0].tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+        embedded_ir = main.pages[0]
+        assert int(main.tags["Orientation"].value) == 1
+        assert int(embedded_ir.tags["Orientation"].value) == 1
+        assert (
+            embedded_ir.tags["ImageDescription"].value
+            == "Untouched Nikon Coolscan infrared plane"
+        )
+        assert embedded_ir.tags.get(65001) is None
+        np.testing.assert_array_equal(embedded_ir.asarray(), infrared)
 
 
 @pytest.mark.parametrize(

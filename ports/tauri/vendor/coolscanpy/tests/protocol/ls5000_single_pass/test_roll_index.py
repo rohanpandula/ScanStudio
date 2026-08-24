@@ -745,8 +745,138 @@ def test_transport_envelope_and_anchor_residuals_fail_closed() -> None:
     rows = [20, 163, 306, 449, 592, 735]
     boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
     boundaries[3] = _boundary(3, rows[3], evidence_run=(rows[3] - 3, rows[3] + 24))
-    with pytest.raises(roll.IndexDecodeError, match="transport anchor residual"):
+    with pytest.raises(
+        roll.IndexDecodeError, match="transport anchor residual"
+    ) as excinfo:
         roll.derive_transport_mapping(boundaries, len(rows), records)
+
+    assert excinfo.value.error_id == roll.TRANSPORT_AFFINE_RESIDUAL_ERROR_ID
+    witness = excinfo.value.diagnostics
+    assert roll.replay_transport_failure_witness(witness) == excinfo.value.error_id
+    assert witness["kind"] == "affine"
+    assert 3 <= len(witness["anchors"]) <= 40
+    assert witness["mean_absolute_residual_rows"] > witness["thresholds"][
+        "maximum_mean_absolute_residual_rows"
+    ] or witness["maximum_residual_rows"] > witness["thresholds"][
+        "maximum_residual_rows"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("residuals", "mean_absolute", "maximum"),
+    [
+        # GitHub #42: REFEED_REQUIRED, MAE 0.657 rows, max 3.005 rows.
+        ((3.005, 0.2, 0.2, 0.2, 0.137, 0.2), 0.657, 3.005),
+        # GitHub #68: repeated SA-30 refusal, MAE 8.273, max 21.975.
+        ((21.975, 5.0, 3.0, 3.117), 8.273, 21.975),
+    ],
+)
+def test_historical_affine_failure_witnesses_replay_offline(
+    residuals: tuple[float, ...],
+    mean_absolute: float,
+    maximum: float,
+) -> None:
+    anchors = [
+        {
+            "ordinal": ordinal,
+            "input_row": ordinal * 10.0,
+            "observed_row": ordinal * 420.0 - residual * 42.0,
+            "fitted_row": ordinal * 420.0,
+            "residual_rows": residual,
+        }
+        for ordinal, residual in enumerate(residuals)
+    ]
+    witness = {
+        "kind": "affine",
+        "anchors": anchors,
+        "transform": {"slope": 42.0, "intercept": 0.0},
+        "thresholds": {
+            "maximum_mean_absolute_residual_rows": 1.0,
+            "maximum_residual_rows": 2.0,
+        },
+        "mean_absolute_residual_rows": mean_absolute,
+        "maximum_residual_rows": maximum,
+    }
+
+    assert (
+        roll.replay_transport_failure_witness(witness)
+        == roll.TRANSPORT_AFFINE_RESIDUAL_ERROR_ID
+    )
+
+
+@pytest.mark.parametrize(
+    ("mismatch_record", "mismatch_word", "message"),
+    [
+        (0, 0, "does not begin"),
+        (1, 7, "not one byte-identical"),
+    ],
+)
+def test_terminal_padding_refusals_carry_counts_only_replayable_evidence(
+    mismatch_record: int,
+    mismatch_word: int,
+    message: str,
+) -> None:
+    rgb = np.zeros((8, 96, 3), dtype=np.uint16)
+    rows = np.frombuffer(_encode_index(rgb), dtype=">u2").copy().reshape(8, -1)
+    # A valid two-record terminal suffix repeats the first blank record.
+    rows[7] = rows[6]
+    rows[6 + mismatch_record, mismatch_word] = 1
+    stream = rows.astype(">u2", copy=False).tobytes()
+    geometry = roll.IndexGeometry(
+        97, 4000, 41, 3946, 8, 96, 8, 2048, len(stream)
+    )
+
+    with pytest.raises(roll.IndexDecodeError, match=message) as excinfo:
+        roll.decode_full_index_bytes(stream, geometry, usable_rows=6)
+
+    assert excinfo.value.error_id == roll.TERMINAL_PADDING_ERROR_ID
+    witness = excinfo.value.diagnostics
+    assert witness == {
+        "kind": "terminal_padding",
+        "record_count": 2,
+        "byte_count": 2 * roll.INDEX_ROW_WORDS * 2,
+        "parity": "even",
+        "housekeeping_byte_count": roll.INDEX_TRAILER_WORDS * 2,
+        "nonzero_rgb_count": 1,
+        "mismatch_location": {
+            "record_index": mismatch_record,
+            "byte_offset": (
+                mismatch_record * roll.INDEX_ROW_WORDS * 2 + mismatch_word * 2
+            ),
+        },
+    }
+    assert roll.replay_transport_failure_witness(witness) == excinfo.value.error_id
+    serialized = json.dumps(witness, sort_keys=True).lower()
+    for forbidden in ("path", "serial", "raw", "pixel", "sha", "project"):
+        assert forbidden not in serialized
+
+
+def test_transport_failure_witness_replay_rejects_extra_or_unbounded_fields() -> None:
+    anchor = {
+        "ordinal": 0,
+        "input_row": 0.0,
+        "observed_row": -126.0,
+        "fitted_row": 0.0,
+        "residual_rows": 3.0,
+    }
+    witness = {
+        "kind": "affine",
+        "anchors": [{**anchor, "ordinal": ordinal} for ordinal in range(41)],
+        "transform": {"slope": 42.0, "intercept": 0.0},
+        "thresholds": {
+            "maximum_mean_absolute_residual_rows": 1.0,
+            "maximum_residual_rows": 2.0,
+        },
+        "mean_absolute_residual_rows": 3.0,
+        "maximum_residual_rows": 3.0,
+    }
+    with pytest.raises(ValueError, match="anchors"):
+        roll.replay_transport_failure_witness(witness)
+
+    witness["anchors"] = witness["anchors"][:3]
+    witness["raw_path"] = "/private/capture.bin"
+    with pytest.raises(ValueError, match="fields"):
+        roll.replay_transport_failure_witness(witness)
 
 
 def test_transport_anchor_fit_accepts_bounded_live_leading_anchor_divergence() -> None:

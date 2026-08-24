@@ -204,9 +204,34 @@ public enum ErrorPresentationPolicy {
             guidance: "Choose a different name or save location. ScanStudio will not overwrite an archive master."
         ),
         Copy(
+            code: "PROJECT_ALREADY_EXISTS",
+            title: "A roll already exists here",
+            guidance: "Choose Open Existing to keep working with that roll, or use a different name for a new roll. ScanStudio did not replace the existing project."
+        ),
+        Copy(
+            code: ScanFailureCode.attendedBindingRequired,
+            title: "This roll needs you to confirm the frames",
+            guidance: "Check that every preview thumbnail is framed correctly, then approve every frame and scan once. A changed preview or scanner connection requires starting over."
+        ),
+        Copy(
+            code: "SCAN_ZERO_COMPLETED",
+            title: "No frames were completed",
+            guidance: "Review each frame's error below. ScanStudio will not retry the batch automatically."
+        ),
+        Copy(
+            code: "ATTENDED_RETRY_CONSUMED",
+            title: "A fresh preview is required",
+            guidance: "This preview already used its one attended retry. Acquire a fresh preview before scanning again."
+        ),
+        Copy(
             code: "METER_UNUSABLE",
             title: "This film could not be metered",
             guidance: "ScanStudio couldn't find usable image data to meter this frame — the film may be too dense, upside down, or the film adapter may be modified. Check the film's density and orientation, then try a different process setting."
+        ),
+        Copy(
+            code: "METER_CONTROLLER_REFUSED",
+            title: "Exposure control stopped safely",
+            guidance: "The bounded meter controller refused the next pass because its quality gates did not pass. No fallback exposure was invented and ScanStudio will not retry automatically. Review the pass and channel reasons, then choose whether to change the film setup or process settings."
         ),
     ]
 
@@ -215,12 +240,20 @@ public enum ErrorPresentationPolicy {
         context: ErrorPresentationContext = .init()
     ) -> ErrorPresentation {
         let normalizedMessage = lastErrorMessage.uppercased()
-        let copy = leadingFrameClippedCopy(in: lastErrorMessage)
+        let explicitTypedRecovery = knownCopy.first {
+            $0.code == ScanFailureCode.attendedBindingRequired
+                && leadingCode(in: normalizedMessage) == $0.code
+        }
+        let copy = explicitTypedRecovery
+            ?? leadingFrameClippedCopy(in: lastErrorMessage)
             ?? filmFeedInterruptedCopy(in: lastErrorMessage)
             ?? filmTransportSlipCopy(in: lastErrorMessage)
             ?? unattendedBindingConfidenceCopy(in: lastErrorMessage)
             ?? previewReadinessTimeoutCopy(in: lastErrorMessage)
-            ?? knownCopy.first { containsCode($0.code, in: normalizedMessage) }
+            ?? knownCopy.first {
+                $0.code != ScanFailureCode.attendedBindingRequired
+                    && containsCode($0.code, in: normalizedMessage)
+            }
             ?? Copy(
                 code: leadingCode(in: normalizedMessage) ?? "UNKNOWN",
                 title: "ScanStudio could not complete that action",
@@ -253,15 +286,11 @@ public enum ErrorPresentationPolicy {
                 ? ProbableCauseExtractor.extract(from: lastErrorMessage)
                 : nil,
             canPlaceFramesManually: copy.code == "REFEED_REQUIRED",
-            // Attended binding (feed-detector round; issues #24/#16/#42).
-            // Offered only for the confidence gate this policy itself
-            // classified, and only when the roll is rescuable: the driver
-            // binds an operator-approved roll at 'medium' but never at
-            // 'low', so offering the button on a 'low' refusal would
-            // promise a recovery that is guaranteed to refuse again.
-            canApproveEveryFrameAndScan: isAttendedRescuableConfidenceRefusal(
-                in: lastErrorMessage
-            )
+            // Safety-sensitive eligibility is code-driven only. Human text
+            // may change between bridge versions and is never authority for
+            // approving or retrying scanner movement.
+            canApproveEveryFrameAndScan:
+                copy.code == ScanFailureCode.attendedBindingRequired
         )
     }
 
@@ -297,7 +326,9 @@ public enum ErrorPresentationPolicy {
             code: "REFEED_REQUIRED",
             title: "The first frame is not fully inside the scanner",
             guidance: "Reinsert the film a little farther into the adapter, then preview it again. "
-                + "ScanStudio did not offer the cropped frame for scanning."
+                + "No automatic cropped frame was created. Manual placement can use the visible "
+                + "portion, but it cannot restore pixels that were outside the preview; refeed "
+                + "for full coverage."
         )
     }
 
@@ -557,17 +588,24 @@ public enum ErrorPresentationPolicy {
         return String(body.prefix(maximumIssueBodyCharacters - suffix.count)) + suffix
     }
 
-    private static func redactIssueText(
+    /// Applies the public/share-facing redaction policy while preserving the
+    /// local technical-details view unchanged.
+    public static func redactShareFacingText(
         _ text: String,
         context: ErrorPresentationContext
     ) -> String {
+        let pathValues = context.selectedPaths
+            + [context.diagnosticLogPath].compactMap { $0 }
         var redacted = replacing(
-            context.selectedPaths,
+            pathValues,
             in: text,
             with: "<redacted path>"
         )
         redacted = replacing(
-            context.filmMetadataValues + context.deviceIdentifiers,
+            context.filmMetadataValues
+                + context.deviceIdentifiers
+                + [context.diagnosticSessionId].compactMap { $0 }
+                + inferredLocalAccountNames(from: pathValues),
             in: redacted,
             with: "<redacted>"
         )
@@ -582,11 +620,45 @@ public enum ErrorPresentationPolicy {
             options: [.regularExpression, .caseInsensitive]
         )
         redacted = redacted.replacingOccurrences(
+            of: #"(?:file://)?(?:[A-Z]:\\|/(?:home|var/tmp|var/log|opt|srv)/)[^\n;,\]\[(){}<>"']+"#,
+            with: "<redacted path>",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        redacted = redacted.replacingOccurrences(
             of: #"("?(?:film[_ -]?stock|stock|camera|lens|device[_ -]?id|serial(?:[_ -]?(?:number|no))?)"?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\n;,]+)"#,
             with: "$1<redacted>",
             options: [.regularExpression, .caseInsensitive]
         )
         return redacted
+    }
+
+    private static func inferredLocalAccountNames(
+        from paths: [String]
+    ) -> [String] {
+        guard let expression = try? NSRegularExpression(
+            pattern: #"(?:/Users/|/home/|[A-Z]:\\Users\\)([^/\\]+)"#,
+            options: .caseInsensitive
+        ) else {
+            return []
+        }
+        return paths.compactMap { path in
+            guard let match = expression.firstMatch(
+                in: path,
+                range: NSRange(path.startIndex..., in: path)
+            ),
+            let range = Range(match.range(at: 1), in: path)
+            else {
+                return nil
+            }
+            return String(path[range])
+        }
+    }
+
+    private static func redactIssueText(
+        _ text: String,
+        context: ErrorPresentationContext
+    ) -> String {
+        redactShareFacingText(text, context: context)
     }
 
     private static func replacing(

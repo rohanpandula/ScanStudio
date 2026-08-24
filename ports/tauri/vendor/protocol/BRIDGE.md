@@ -143,8 +143,12 @@ Returns `HARDWARE_LANE_BUSY` while a scan job holds the lane — mirrors PROTOCO
 
 **`{}` means confirmed ejected, never anything less (2026-07-26).** A transport that reports the film did not come out, a capability-gated no-op, or any accepted-without-progress outcome surfaces as a typed error, never as `{}`. This rule exists because an LS-5000 can acknowledge an eject command while the parked mechanism does not actuate.
 
-- `EJECT_FAILED` — the eject could not run or the transport reported not-ejected. On the current CoolscanPy pin a real eject needs the `[scanner]` extra plus SANE in the bridge's own environment, so on a rig without them every real `device.eject` is this error, with the message naming the missing dependency.
+- `EJECT_FAILED` — the direct-USB unload could not run, returned an unconfirmed result, or the post-unload presence check did not prove the film clear. Eject does not require SANE or `scanimage`. The typed error preserves the underlying refusal; callers must not infer success or auto-retry it.
 - `FEEDER_PARKED` — the typed stalled outcome: the driver's traced eject reported accepted-without-confirmed-clear (CoolscanPy `FeederParked`). The film state is unknown-but-likely-inside, the session is left untouched, and a power cycle is the only demonstrated recovery. A client must NEVER auto-retry this (or any) eject outcome — retry decisions belong to the operator at the machine.
+
+SANE remains a host/runtime requirement on lanes that use it for discovery,
+scanning, or the legacy plain-scan path. That requirement is independent of
+`device.eject`, whose supported implementation is the direct-USB unload above.
 
 **Caller-side deadline (2026-08-13).** This is the one synchronous bridge method whose duration is mechanical rather than computational — a roll rewind measured at 57 s on a full 36-exposure roll from a normal post-traversal position (`shortstrip-lab/INCIDENT-20260719-eject-from-park.md`) — so the engine bounds it with its own `device.eject` deadline (300 s, `SCANSTUDIO_EJECT_DEADLINE_SECS`) instead of the generic 10 s bridge request timeout every other method uses. That value is chosen to strictly dominate the bridge's own bounded eject work (eject CDB + EXECUTE + the post-eject sense-chain wait, 180 s worst case on the current pin, before the presence-confirmation gate), so the bridge always gets to deliver its typed verdict here rather than having a caller time out underneath it. A bridge change that could make `device.eject` block longer than that ceiling must raise the ceiling in the same change. Discovered live: the previous 10 s bound made the engine report `NOT_CONNECTED` and drop the session while a real roll was still ejecting, twice (`shortstrip-lab/live-attempts/20260813-beta8-linux-validation/`, LV-1).
 
@@ -232,13 +236,16 @@ Thumbnail
   imagePath: string
   partial: bool?  (optional; present only when true)
 
-`Thumbnail.partial` (Lane C, additive) is present as `partial: true` ONLY on a
-frame whose crop overlaps the preview with >=90% of its height inside but not
-all of it (a frame running off the top/bottom edge). It is ABSENT (never
-`null`) on every full-cover frame, so existing wire bytes are unchanged.
-Strictly-below-90% coverage is not a thumbnail at all: it is a `REFEED_REQUIRED`
-failure. An absent/omitted `partial` means a full frame; old readers ignore the
-additive key.
+`Thumbnail.partial` (Lane C, additive) is present as `partial: true` only on a
+reviewable edge crop, and leading and trailing edges are intentionally
+asymmetric. A fitted first frame may begin exactly one preview row before the
+saved raster and remain visible for explicit review; a larger leading clip is
+`REFEED_REQUIRED` so the detector cannot silently crop frame 1 and renumber the
+strip. A trailing frame with at least 90% of its fitted height inside the
+preview remains visible as `partial: true`; below 90% it is refused. “Partial”
+therefore means that some fitted frame pixels lie outside the saved preview,
+not merely that local gap evidence is weak. It is absent (never `null`) on a
+full-cover frame, so existing wire bytes are unchanged.
 
 BoundarySnap
   boundaryIndex: number
@@ -356,7 +363,7 @@ ScanReceipt
 
 CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanReceipt` as `meterRgbiPath` starting this phase (Phase 10): the bridge writes `frame.meter_rgbi` (an HxWx4 uint16 array) to `{stem}_METER.tif` alongside the RGB/IR files, unconditionally whenever CoolscanPy supplies it — never fabricated; `null` only if absent.
 
-`rawExport` is optional and create-only. When present, the bridge writes directly from the completed frame's original `numpy.uint16` RGB and IR arrays before emitting `scan.frameCompleted`, then returns the validated main file in `rawExportPath`; otherwise that receipt field is `null`. `linearDng` stores RGB in a three-sample DNG `LinearRaw` main IFD and, for the legacy `fourthChannel`/`omitted` values, available IR in a grayscale SubIFD carrying private ASCII tag 65001 (`scanstudio.infrared.linear.uint16.v1`). `linearTiff` either interleaves IR as one `ExtraSamples=0` fourth sample or omits it. For either format, `sidecar` keeps the main RGB-only and writes available IR to `{main-stem}-ir.tif`, returning that path in `rawExportIrPath`. Both pair targets are reserved before motion; neither is accepted as written until both files have been flushed and synced. Failure of either write removes both identity-owned reservations and emits no completed-frame receipt. If the capture has no IR, `sidecar` writes only the format's existing no-IR main file and `rawExportIrPath` is `null`. No path applies inversion, color processing, crop, geometry, or dust removal. A requested fourth-channel TIFF without an IR capture is rejected before motion.
+`rawExport` is optional and create-only. When present, the bridge writes directly from the completed frame's original `numpy.uint16` RGB and IR arrays before emitting `scan.frameCompleted`, then returns the validated main file in `rawExportPath`; otherwise that receipt field is `null`. `linearDng` stores RGB in a three-sample DNG `LinearRaw` main IFD and, for the legacy `fourthChannel`/`omitted` values, available IR in a grayscale SubIFD referenced by a TIFF/EP `LONG` offset and identified by standard `ImageDescription` value `Untouched Nikon Coolscan infrared plane`; DNG never emits private tag 65001. `linearTiff` either interleaves IR as one `ExtraSamples=0` fourth sample or omits it. For either format, `sidecar` keeps the main RGB-only and writes available IR to `{main-stem}-ir.tif`, returning that path in `rawExportIrPath`. Both pair targets are reserved before motion; neither is accepted as written until both files have been flushed and synced. Failure of either write removes both identity-owned reservations and emits no completed-frame receipt. If the capture has no IR, `sidecar` writes only the format's existing no-IR main file and `rawExportIrPath` is `null`. No path applies inversion, color processing, crop, geometry, or dust removal. A requested fourth-channel TIFF without an IR capture is rejected before motion.
 
 `exposureAuthority` is a best-effort, additive copy of CoolscanPy's per-frame `active_exposure_authority` journal block. It distinguishes the guarded Nikon-parity RGB command from the active controller's accepted solve, preserves the controller-owned IR command, and records any RGB channels clamped to the device exposure window. It is `null` when the journal block is absent, malformed, or cannot be read; that telemetry failure never invalidates an otherwise completed frame receipt.
 

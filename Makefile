@@ -16,9 +16,9 @@ coolscanpy-test:
 
 test: app-test bridge-test coolscanpy-test
 
-# The packaged bridge retains python-sane for optional plain scan and software
-# eject, so packaging needs CoolscanPy's scanner extra even though color-roll
-# capture and the bridge test suite do not. See bridge/pyproject.toml.
+# The packaged bridge retains python-sane for optional plain scanning, so
+# packaging needs CoolscanPy's scanner extra even though color-roll capture,
+# direct-USB eject, and the bridge test suite do not. See bridge/pyproject.toml.
 bridge-sync-scanner:
 	cd bridge && $(UV) sync --locked --extra scanner
 

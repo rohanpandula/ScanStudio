@@ -70,7 +70,7 @@ The file is classic little-endian TIFF/DNG with uncompressed strips. Real files 
 - `Model`: the receipt's scanner model.
 - `Software`: `ScanStudio`.
 - `DNGVersion` (50706): `1,4,0,0`.
-- `DNGBackwardVersion` (50707): `1,1,0,0`. LinearRaw entered the baseline in DNG 1.1; the private IR SubIFD is ignorable by a 1.1 reader.
+- `DNGBackwardVersion` (50707): `1,1,0,0`. LinearRaw entered the baseline in DNG 1.1; the auxiliary IR SubIFD is ignorable by a 1.1 reader.
 - `UniqueCameraModel` (50708): a stable Nikon scanner model string derived from the receipt model.
 - `BlackLevel` (50714): zero for all three channels.
 - `WhiteLevel` (50717): 65535 for all three channels.
@@ -81,9 +81,9 @@ The file is classic little-endian TIFF/DNG with uncompressed strips. Real files 
 - `AsShotNeutral` (50728): `1,1,1`; no capture-time white balance is applied.
 - `CalibrationIlluminant1` (50778): `0` (unknown).
 - `ColorMatrix1` (50721): a 3x3 identity SRATIONAL matrix. ScanStudio has no measured LS-5000 scanner-to-XYZ calibration to publish. Omitting the matrix causes stricter DNG consumers to refuse an otherwise usable color DNG; publishing an sRGB or camera matrix would make a false calibration claim and steer negative pixels through an invented transform. Identity is therefore an explicit interoperability placeholder, paired with an unknown illuminant and neutral balance. It changes no stored samples, and converter-specific scanner profiling remains the right place for real color characterization.
-- `SubIFDs` (330): one offset when IR exists and the policy is embedded; absent for RGB-only capture and `sidecar`.
+- `SubIFDs` (330): one TIFF/EP `LONG` offset when IR exists and the policy is embedded; absent for RGB-only capture and `sidecar`.
 
-The main IFD deliberately has no `ExtraSamples`. This preserves three plain color samples, matching the existing pidng-derived convention in this repository. LibRaw/dcraw-family readers, and applications built on them such as RawTherapee and darktable, are much more likely to accept a three-sample LinearRaw main image than a four-sample LinearRaw image whose photometric sample count is ambiguous. Those applications are expected to open and process the RGB negative while ignoring the private IR SubIFD. NegPy or another TIFF-aware converter can additionally locate and consume the embedded IR plane.
+The main IFD deliberately has no `ExtraSamples`. This preserves three plain color samples, matching the existing pidng-derived convention in this repository. LibRaw/dcraw-family readers, and applications built on them such as RawTherapee and darktable, are much more likely to accept a three-sample LinearRaw main image than a four-sample LinearRaw image whose photometric sample count is ambiguous. Those applications are expected to open and process the RGB negative while ignoring the auxiliary IR SubIFD. NegPy or another TIFF-aware converter can additionally locate and consume the embedded IR plane through the standard SubIFD relationship and `ImageDescription` marker.
 
 This plan does not claim that generic raw processors will perform dust removal from the embedded IR plane. DNG 1.4 has no standardized scanner-infrared role. The interoperability goal is that the RGB raw opens normally and the IR remains inside the same durable container for software that understands ScanStudio's marker.
 
@@ -99,8 +99,7 @@ This plan does not claim that generic raw processors will perform dust removal f
 - `SampleFormat`: unsigned integer through TIFF 6.0's default value of `1`; the redundant tag is not emitted.
 - `Orientation`: `1`.
 - `XResolution`, `YResolution`, `ResolutionUnit`: the same capture DPI.
-- `ImageDescription`: plain text identifying an untouched scanner infrared plane.
-- private tag `65001`: ASCII marker `scanstudio.infrared.linear.uint16.v1` so a TIFF-aware importer can distinguish it from an arbitrary auxiliary image without guessing.
+- `ImageDescription`: standard ASCII marker `Untouched Nikon Coolscan infrared plane`. Together with the grayscale `SubIFDs` relationship, this identifies the embedded IR plane without colliding with ExifTool's DNG interpretation of private tag 65001 as `SerialNumber`.
 
 A SubIFD is chosen instead of a fourth main-image `ExtraSample`. TIFF's `ExtraSamples=0` can honestly label a non-alpha auxiliary sample, but DNG defines `LinearRaw` around color planes and does not standardize IR. Keeping IR out of the converter-facing three-channel IFD prevents raw engines from treating R/G/B/IR as an unknown four-color camera or one color channel plus three auxiliaries.
 
@@ -132,8 +131,9 @@ The four-channel TIFF also carries private tag 65001 with the same infrared mark
 
 - Parse the main DNG IFD and assert all required TIFF/DNG tags and exact types/values.
 - Assert main `SamplesPerPixel=3`, no `ExtraSamples`, `PhotometricInterpretation=LinearRaw`.
-- Follow `SubIFDs`, assert its grayscale/marker layout, and prove it is not a top-level page.
+- Follow `SubIFDs`, assert its TIFF/EP `LONG` datatype and grayscale/standard-marker layout, prove private tag 65001 is absent, and prove it is not a top-level page.
 - Round-trip a small nontrivial `uint16` RGB+IR fixture and compare every sample, including zero, midrange, and 65535.
+- When available, run ExifTool validation and RawPy exact-RGB decoding against representative output.
 - Assert RGB-only DNG omits `SubIFDs`.
 - Inject encoder/patch failures and assert no final DNG is published.
 
@@ -171,11 +171,11 @@ The four-channel TIFF also carries private tag 65001 with the same infrared mark
 - `cd app/ScanStudio && CLANG_MODULE_CACHE_PATH=/tmp/scanstudio-dng-swift/clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/scanstudio-dng-swift/swiftpm XDG_CACHE_HOME=/tmp/scanstudio-dng-swift swift test --disable-sandbox --scratch-path /tmp/scanstudio-dng-swift/scratch --skip 'UpdateServiceTests/(testMountLocateApp|testMountLocateAppNoAppThrows)'`
 - Ruff over touched Python paths in CoolscanPy and the bridge.
 
-Converter binaries are not vendored in this worktree and network access is forbidden, so automated tests cannot launch NegPy, dcraw, RawTherapee, or darktable here. Compatibility is based on the repository's existing pidng/LibRaw constraints and will be reported as an expectation, not as a claim of an external smoke test.
+ExifTool validation is exercised when the executable is available, and RawPy exact-RGB decoding is exercised when the Python package is available. NegPy, dcraw, RawTherapee, and darktable are not vendored here, so compatibility with those consumers remains based on the documented IFD shape rather than an external smoke test.
 
 ## Risks and open design consequences
 
-- There is no standard DNG role for scanner IR. The private marker is intentionally simple and versioned; consumers must opt in.
+- There is no standard DNG role for scanner IR. Consumers must opt in by recognizing the grayscale SubIFD and its standard `ImageDescription` marker.
 - Identity `ColorMatrix1` maximizes structural acceptance but is not scanner calibration. A measured LS-5000 profile can replace it in a later version without changing pixels or IR layout.
 - Uncompressed RGB+IR is large. Embedded, fourth-channel, and sidecar variants are all roughly four 16-bit samples per pixel plus small metadata overhead; sidecar mode trades one-file convenience for broader converter access to the grayscale plane.
 - A real frame may have a bridge-written Master pair and a raw export. Filesystem publication is atomic per file, not across every filename in the frame. The frame is reported complete only after all requested files finish; receipts and recovery evidence distinguish a recoverable capture from a successful requested output set.

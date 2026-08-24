@@ -8,10 +8,14 @@ import pytest
 from coolscanpy.protocol.ls5000_single_pass.meter import (
     CHANNELS,
     DEFAULT_EXPOSURES,
+    LINEARITY_MIN_AGGREGATES,
+    LINEARITY_MIN_SAMPLES,
     METER_PASS_BYTES,
     METER_ROWS,
     METER_TAIL_SAMPLES,
     METER_WIDTH,
+    DecodedMeterPass,
+    MeterObservation,
     NIKON_PARITY_REVIEWED_HIGH_THRESHOLD,
     NIKON_PARITY_TARGET_FRACTIONS,
     NikonParityShadowResult,
@@ -57,6 +61,71 @@ def _rescale(
             65_535,
         ).astype(np.uint16)
     return result
+
+
+def _observations_with_bounded_linearity_pairs() -> tuple[
+    MeterObservation, MeterObservation
+]:
+    """Pass pair with R below the raw floor and G below only the aggregate floor."""
+
+    first_image = _textured((31_000, 30_000, 32_000, 29_000))
+    first = observe_meter_pass(_payload(first_image), DEFAULT_EXPOSURES)
+    second_exposures = {
+        channel: int(exposure * 1.1)
+        for channel, exposure in DEFAULT_EXPOSURES.items()
+    }
+    second_image = _rescale(first_image, DEFAULT_EXPOSURES, second_exposures)
+    second = observe_meter_pass(_payload(second_image), second_exposures)
+
+    row_inset = round(METER_ROWS * 0.10)
+    column_inset = round(METER_WIDTH * 0.10)
+    central_rows = METER_ROWS - 2 * row_inset
+    central_columns = METER_WIDTH - 2 * column_inset
+
+    first_sparse = first.decoded.image.copy()
+    second_sparse = second.decoded.image.copy()
+    for channel_index, channel in enumerate(("R", "G")):
+        first_sparse[:, :, channel_index] = round(
+            first.channel_statistics[channel].black
+        )
+        second_sparse[:, :, channel_index] = round(
+            second.channel_statistics[channel].black
+        )
+
+    raw_mask = np.zeros((central_rows, central_columns), dtype=bool)
+    raw_mask.flat[: LINEARITY_MIN_SAMPLES - 1] = True
+    aggregate_mask = np.zeros_like(raw_mask)
+    # Eight valid values per 9-wide block gives abundant raw pairs while no
+    # aggregate is admissible (aggregates require all nine raw pairs).
+    aggregate_mask[:, :] = True
+    aggregate_mask[:, ::9] = False
+
+    for channel_index, mask in enumerate((raw_mask, aggregate_mask)):
+        first_plane = first_sparse[
+            row_inset : METER_ROWS - row_inset,
+            column_inset : METER_WIDTH - column_inset,
+            channel_index,
+        ]
+        second_plane = second_sparse[
+            row_inset : METER_ROWS - row_inset,
+            column_inset : METER_WIDTH - column_inset,
+            channel_index,
+        ]
+        first_plane[mask] = 12_000
+        second_plane[mask] = 13_200
+
+    return (
+        MeterObservation(
+            decoded=DecodedMeterPass(first_sparse, first.decoded.row_tail),
+            exposures=dict(first.exposures),
+            channel_statistics=dict(first.channel_statistics),
+        ),
+        MeterObservation(
+            decoded=DecodedMeterPass(second_sparse, second.decoded.row_tail),
+            exposures=dict(second.exposures),
+            channel_statistics=dict(second.channel_statistics),
+        ),
+    )
 
 
 def test_meter_decode_preserves_channel_order_and_opaque_row_tail() -> None:
@@ -240,6 +309,42 @@ def test_final_acceptance_requires_fresh_previous_pass_linearity() -> None:
     result = verify_final_convergence(observation)
     assert not result.accepted
     assert "missing_previous_linearity" in {item.code for item in result.refusals}
+
+
+def test_pass_two_refusal_preserves_all_channels_and_raw_aggregate_counts() -> None:
+    first, second = _observations_with_bounded_linearity_pairs()
+
+    proposal = propose_next_exposures(second, previous=first)
+    refusal_by_channel = {
+        refusal.channel: refusal.to_dict()
+        for refusal in proposal.refusals
+        if refusal.code == "linearity_insufficient"
+    }
+
+    assert set(refusal_by_channel) == {"R", "G"}
+    assert refusal_by_channel["R"]["valid_raw_samples"] == LINEARITY_MIN_SAMPLES - 1
+    assert refusal_by_channel["R"]["required_raw_samples"] == LINEARITY_MIN_SAMPLES
+    assert refusal_by_channel["G"]["valid_raw_samples"] > LINEARITY_MIN_SAMPLES
+    assert refusal_by_channel["G"]["valid_aggregate_samples"] == 0
+    assert (
+        refusal_by_channel["G"]["required_aggregate_samples"]
+        == LINEARITY_MIN_AGGREGATES
+    )
+
+
+def test_final_pass_refusal_preserves_the_same_bounded_diagnostics() -> None:
+    first, second = _observations_with_bounded_linearity_pairs()
+
+    result = verify_final_convergence(second, previous=first)
+    refusal_by_channel = {
+        refusal.channel: refusal.to_dict()
+        for refusal in result.refusals
+        if refusal.code == "linearity_insufficient"
+    }
+
+    assert set(refusal_by_channel) == {"R", "G"}
+    assert refusal_by_channel["R"]["valid_raw_samples"] == LINEARITY_MIN_SAMPLES - 1
+    assert refusal_by_channel["G"]["valid_aggregate_samples"] == 0
 
 
 def test_predictive_ceiling_hold_is_not_refused_as_clipped_increase() -> None:

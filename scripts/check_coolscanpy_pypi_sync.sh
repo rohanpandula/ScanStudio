@@ -33,19 +33,19 @@ KNOWN_VENDORED_DIVERGENCE=(
   # required scanner_identity + capture-timing feature, plus this copy's
   # standing issue #70 EVPD adapter-conditional replay (not yet upstreamed);
   # re-pinned for 0.7.3 (degraded-gap tier + direct_fraction landed upstream)
-  "protocol/ls5000_single_pass/worker.py|08b9fdb46bc072923d46c1efc4d4a901fd943de542624bc536cd440c3fb6294b|1c8c99bc12ca3664ba7f344d8a053b764568e0311ba709a63e7cff1187b2f048"
+  "protocol/ls5000_single_pass/worker.py|773d9915cf68fd5f6d0937a3f26cdee488f257a584ff8bfe4950b33b96678777|1c8c99bc12ca3664ba7f344d8a053b764568e0311ba709a63e7cff1187b2f048"
   # LeadingFrameClippedError + confident-clear-film gate; re-pinned for 0.7.3
-  "protocol/ls5000_single_pass/roll_index.py|5b192213d4c070f53e1733f22fc4e744a9142126f7ef4204a41c943efae8329a|7b2217ef91cfde98744e0c5db6d08ac8c517124015aa1df03649f9ab55449450"
+  "protocol/ls5000_single_pass/roll_index.py|c99c54a434d0d53e94e51ed503f0289709b5f20365e16606f365264a617c8b17|7b2217ef91cfde98744e0c5db6d08ac8c517124015aa1df03649f9ab55449450"
   # its export surface for the class above
   "protocol/ls5000_single_pass/__init__.py|ce8aa97b707f5ef83f96128b378722191f7280bd41c1f3acbb04c75e3ea7523e|1f0f324034a95e2c8ca772ce52a78a800b0bf215d3ae4ec77422b08b1376856c"
   # pins differ because the two files above differ; re-pinned for 0.7.3
-  "protocol/ls5000_single_pass/bundle.py|b049f767db384c44e4a35093bbce9b5faac58a04f5b70150d6befb627fbd5b11|9889bb45ae6f7c29d604e1bc374ced755eb18bc6214cddfbabc287d88e2f3fe9"
+  "protocol/ls5000_single_pass/bundle.py|7167c9cd7cbc50d1d641b3847fc1f71e6d37a06d6d8c4d90f2199443d1d5e812|9889bb45ae6f7c29d604e1bc374ced755eb18bc6214cddfbabc287d88e2f3fe9"
   # packaged-app libusb resolution (app bundles its own signed binary)
   "protocol/ls5000_single_pass/usb_backend.py|afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62|666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1"
   # capture-timing receipt fields (started_at/duration), plus this copy's
   # standing non-strip-adapter refusal (issue #70); re-pinned for 0.7.3
   # (spec-based Unload eject + attended scan binding landed upstream)
-  "_roll.py|c2b29d203ed810d9e3c142d42c19087f06ba34d7694807879f90c3094c5f5d16|682fc73df8dd93c91efdfd7abb2f1e728f2ad63b4479ac352cbb7e722c206c0e"
+  "_roll.py|29903307ce3c0e6f76785b437857450de1d35783fc01c2df9705f03f94fa3df3|682fc73df8dd93c91efdfd7abb2f1e728f2ad63b4479ac352cbb7e722c206c0e"
   "capture/single_pass_workflow.py|a5a01b15ff50df9a6f78d1c2c4f39d10548e7651cf3365e8698d479b633b5914|c8d93dce3c7de3b585c2d051b7d09054802a130797c590c97b36b78889def15c"
   "types.py|1343c93c03ade64f0927602fe8e8e25353bada6b1b8a919ce9084c5cbcb321de|f853b8dde9c4a6c3b7ce96195d320c7ba9c88839019bed9ce55fe444ea08e54a"
 )

@@ -1,0 +1,16 @@
+{
+  "username": "private-user-avery",
+  "absolutePaths": [
+    "/Users/private-user-avery/Pictures/Secret Roll/manifest.json",
+    "/Volumes/Private Archive/Secret Roll/frame-0001.tif",
+    "/private/tmp/private-user-avery/diagnostics.jsonl"
+  ],
+  "projectName": "Secret Roll 2026",
+  "filmMetadata": [
+    "Private Portra Batch 4815",
+    "Private Nikon F6",
+    "Private 50mm Lens"
+  ],
+  "deviceIdentifier": "ls5000-private-device-4815",
+  "rasterMarker": "PRIVATE_FILM_RASTER_BYTES_4815"
+}

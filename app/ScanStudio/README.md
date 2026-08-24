@@ -140,11 +140,13 @@ film-status checks, whole-roll preview, and color fine scanning use direct USB
 and the exact signed libusb copy inside the app. A recipient does not need
 Homebrew, SANE, or a Nikon driver for that workflow. If a working host SANE
 installation already exists, discovery may use it, but capture remains direct
-USB. The bridge still includes `python-sane` for its separate plain-scan and
-software-eject paths; those optional actions need a compatible system SANE
-backend (`brew install sane-backends` on the tested Apple Silicon setup). If
-an unavailable optional path is requested, it fails rather than pretending it
-succeeded; it does not turn a real scanner into the simulator.
+USB. The bridge still includes `python-sane` for its separate plain-scan path;
+that optional path needs a compatible system SANE backend (`brew install
+sane-backends` on the tested Apple Silicon setup). Eject replays the traced
+Unload sequence over direct USB and confirms film absence; it needs neither
+SANE nor `scanimage`. If an unavailable optional path is requested, it fails
+rather than pretending it succeeded; it does not turn a real scanner into the
+simulator.
 
 Release and CI packaging do not install Homebrew SANE as a build input. Use
 `make sane-link-sdk` only to inspect the create-only private SDK generated from

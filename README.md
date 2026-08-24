@@ -27,25 +27,19 @@ simulator absent, no media or preview shown.
 Real scanning has been validated end-to-end on one Apple Silicon Mac and one
 LS-5000. Treat everything else as narrow results rather than a promise for
 every scanner, adapter, computer, or film holder. The hardware bridge can move
-film, so stay nearby and supervise any real job. The hardware and OS testing
-index is [#29](https://github.com/rohanpandula/ScanStudio/issues/29) -- reports
-from setups unlike the tested one are the most useful thing you can send.
+film, so stay nearby and supervise any real job. The canonical [hardware and
+platform evidence matrix](docs/HARDWARE-SUPPORT.md) separates package,
+enumeration, preview, and capture evidence. Reports from setups unlike the
+tested one are the most useful thing you can send.
 
 ## Platform support
 
-| Platform | Level | Notes |
-| --- | --- | --- |
-| macOS Apple Silicon | **Beta** | Real-scanner validated, including the detection-recovery paths live on real rolls. |
-| macOS Intel | Preview | Built and package-verified in CI; not yet validated with a real scanner. |
-| Windows x64 | Preview | Runs the capture path through WSL2 (Ubuntu 24.04) with usbipd-win for USB pass-through. Raw negative export is not yet supported on this path and refuses up front. |
-| Linux x64 | Preview | AppImage and portable tarball; needs the distribution's SANE/libusb runtime packages and scanner permissions. |
-
-macOS needs macOS 14 (Sonoma) or newer. The macOS packages are ad-hoc-signed
-prereleases rather than notarized Developer ID builds, so macOS may require the
-normal Control-click **Open** confirmation on first launch; do not disable
-Gatekeeper globally. There is no support or release-schedule promise. The
-cross-platform source, setup instructions, and live-validation runbooks are in
-[`ports/tauri`](ports/tauri).
+The current status is maintained in one place: the [hardware and platform
+evidence matrix](docs/HARDWARE-SUPPORT.md). macOS needs macOS 14 (Sonoma) or
+newer. Current macOS release artifacts are Developer ID signed, notarized, and
+stapled; Windows and Linux artifacts remain unsigned. There is no support or
+release-schedule promise. Cross-platform source, setup instructions, and
+live-validation runbooks are in [`ports/tauri`](ports/tauri).
 
 ## Download
 
@@ -62,8 +56,9 @@ A release DMG contains the app, the GPL hardware bridge and CoolscanPy source
 required for redistribution, and the applicable dependency notices. The
 supported LS-5000 color-roll workflow uses the signed libusb copy inside the
 app, so installing ScanStudio does not require Homebrew, SANE, or a Nikon
-driver. The optional software-eject and legacy plain-scan paths still need a
-system SANE backend.
+driver. A system SANE backend remains required for discovery, scanning, and
+legacy plain-scan operations on the applicable Linux/WSL lanes; eject uses the
+direct USB transport and does not require SANE or `scanimage`.
 
 For scripting, or for running the FireWire probe without the app, the bundled
 driver is also published on its own:

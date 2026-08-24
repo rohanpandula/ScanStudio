@@ -1283,6 +1283,12 @@ pub struct ExposureAuthority {
 pub struct EngineError {
     pub code: ErrorCode,
     pub message: String,
+    /// Bounded structural witness for this exact failed operation. It stays
+    /// internal until the server emits it once as `diagnostic.evidence`; the
+    /// ordinary error payload carries only its immutable reference.
+    pub diagnostic_evidence: Option<crate::diagnostic_evidence::DiagnosticEvidence>,
+    pub diagnostic_evidence_unavailable_reason: Option<String>,
+    pub details: Option<serde_json::Value>,
     recoverable_override: Option<bool>,
 }
 
@@ -1291,8 +1297,25 @@ impl EngineError {
         EngineError {
             code,
             message: message.into(),
+            diagnostic_evidence: None,
+            diagnostic_evidence_unavailable_reason: None,
+            details: None,
             recoverable_override: None,
         }
+    }
+
+    pub(crate) fn with_details(mut self, details: Option<serde_json::Value>) -> Self {
+        self.details = details;
+        self
+    }
+
+    pub(crate) fn with_diagnostic_evidence_binding(
+        mut self,
+        binding: crate::diagnostic_evidence::DiagnosticEvidenceBinding,
+    ) -> Self {
+        self.diagnostic_evidence = binding.evidence;
+        self.diagnostic_evidence_unavailable_reason = binding.unavailable_reason;
+        self
     }
 
     /// Explicitly sets the recoverable bit for this error, overriding the
@@ -1388,7 +1411,10 @@ mod tests {
         // wire payload with no such key at all must decode back to None too
         // (checked by round_trip below), not merely tolerate an explicit null.
         assert!(
-            !value.as_object().unwrap().contains_key("supportedMultisamplePasses"),
+            !value
+                .as_object()
+                .unwrap()
+                .contains_key("supportedMultisamplePasses"),
             "None must omit the key, not serialize it as null: {value}"
         );
         round_trip(&device);

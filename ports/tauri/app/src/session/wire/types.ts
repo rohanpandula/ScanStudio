@@ -338,6 +338,28 @@ export interface EngineError {
   code: string;
   message: string;
   recoverable: boolean;
+  details?: {
+    pass: number;
+    reasons: Array<{
+      code: string;
+      message: string;
+      channel?: string | null;
+      validRawSamples?: number | null;
+      requiredRawSamples?: number | null;
+      validAggregateSamples?: number | null;
+      requiredAggregateSamples?: number | null;
+    }>;
+  } | null;
+  /** Stable machine discriminator for policy; presentation wording is never
+   * inspected to decide whether an operator action is safe. */
+  reason?: string;
+  /** Optional bounded diagnostic-artifact reference. Validation is deferred
+   * to diagnosticEvidence.ts so malformed witness data never hides this
+   * underlying engine error. */
+  evidence?: unknown;
+  /** Additive reason emitted when a relevant guard could not publish its
+   * witness. It is diagnostic only and never replaces code/message. */
+  diagnosticEvidenceUnavailableReason?: string | null;
 }
 
 export interface WireRequest {

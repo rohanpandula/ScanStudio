@@ -53,6 +53,18 @@ pub struct ErrorPayload {
     pub code: ErrorCode,
     pub message: String,
     pub recoverable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    /// Exact artifact identity for the failed operation. The bounded artifact
+    /// itself is emitted once as `diagnostic.evidence`; clients must resolve
+    /// this complete key and never select a merely newer artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::diagnostic_evidence::DiagnosticEvidenceReference>,
+    /// Present when a transport-binding guard should have produced evidence
+    /// but generation or validation failed. Additive and secondary: it never
+    /// changes `code`, `message`, recovery, or cleanup behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_evidence_unavailable_reason: Option<String>,
 }
 
 impl From<&domain::EngineError> for ErrorPayload {
@@ -61,6 +73,14 @@ impl From<&domain::EngineError> for ErrorPayload {
             code: err.code,
             message: err.message.clone(),
             recoverable: err.recoverable(),
+            details: err.details.clone(),
+            evidence: err
+                .diagnostic_evidence
+                .as_ref()
+                .map(crate::diagnostic_evidence::DiagnosticEvidence::reference),
+            diagnostic_evidence_unavailable_reason: err
+                .diagnostic_evidence_unavailable_reason
+                .clone(),
         }
     }
 }
@@ -104,6 +124,10 @@ pub enum ErrorCode {
     FilmFeedInterrupted,
     Internal,
     ProjectNotFound,
+    /// `project.create` targeted a directory that already contains any
+    /// `manifest.json`. Creating a project is create-only; callers must
+    /// explicitly open the existing project or choose another directory.
+    ProjectAlreadyExists,
     ManifestInvalid,
     ArchiveCollision,
     /// A real preview marked this frame as requiring an explicit human
@@ -124,6 +148,11 @@ pub enum ErrorCode {
     /// (INCIDENT-20260719-eject-from-park): the transport never actuated
     /// and a power cycle is the only demonstrated recovery.
     FeederParked,
+    /// The bounded pass-to-pass exposure controller refused to command a
+    /// next pass. Structured pass/reason evidence is preserved in details;
+    /// clients must not convert this into an automatic retry.
+    MeterControllerRefused,
+    MeterUnusable,
 }
 
 // ---------------------------------------------------------------------
@@ -135,6 +164,11 @@ pub enum ErrorCode {
 pub struct HelloParams {
     pub client_name: String,
     pub protocol_version: u32,
+    /// Exact frontend build identity used only to bind bounded diagnostic
+    /// evidence. Optional for wire compatibility; evidence publication fails
+    /// closed with an explicit unavailable reason when an old client omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_build: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -772,6 +806,10 @@ pub struct ThumbnailsFailedPayload {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::diagnostic_evidence::DiagnosticEvidenceReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_evidence_unavailable_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -870,12 +908,10 @@ mod tests {
             (ErrorCode::ScannerBusy, "SCANNER_BUSY"),
             (ErrorCode::UnknownJob, "UNKNOWN_JOB"),
             (ErrorCode::FeedJam, "FEED_JAM"),
-            (
-                ErrorCode::FilmFeedInterrupted,
-                "FILM_FEED_INTERRUPTED",
-            ),
+            (ErrorCode::FilmFeedInterrupted, "FILM_FEED_INTERRUPTED"),
             (ErrorCode::Internal, "INTERNAL"),
             (ErrorCode::ProjectNotFound, "PROJECT_NOT_FOUND"),
+            (ErrorCode::ProjectAlreadyExists, "PROJECT_ALREADY_EXISTS"),
             (ErrorCode::ManifestInvalid, "MANIFEST_INVALID"),
             (ErrorCode::ArchiveCollision, "ARCHIVE_COLLISION"),
             (ErrorCode::ManualReviewRequired, "MANUAL_REVIEW_REQUIRED"),
@@ -1186,6 +1222,8 @@ mod tests {
             code: "PREVIEW_FAILED".to_string(),
             message: "preview failed".to_string(),
             operation_id: operation_id.clone(),
+            evidence: None,
+            diagnostic_evidence_unavailable_reason: None,
         })
         .unwrap();
         let complete = serde_json::to_value(ThumbnailsCompletePayload {

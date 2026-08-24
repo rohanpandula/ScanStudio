@@ -43,6 +43,7 @@ REVIEWED_UV_ENVIRONMENT = {
     "UV_PYTHON_PREFERENCE": "only-managed",
     "UV_PYTHON_CPYTHON_BUILD": "20260718",
 }
+REVIEWED_LOCAL_REUSABLE_WORKFLOWS = {"./.github/workflows/ci.yml"}
 
 
 class PolicyError(Exception):
@@ -580,6 +581,8 @@ def _check_uses(
     owner: dict[str, _Node],
     location: str,
     violations: list[str],
+    *,
+    reusable_job: bool = False,
 ) -> int:
     try:
         action = _scalar(node, "uses", plain=True)
@@ -587,6 +590,8 @@ def _check_uses(
         violations.append(f"{location}:{error.line}: {error.message}")
         return 0
     if action.startswith("./"):
+        if reusable_job and action in REVIEWED_LOCAL_REUSABLE_WORKFLOWS:
+            return 0
         violations.append(
             f"{location}:{node.line}: local action wrappers are forbidden: {action}"
         )
@@ -663,7 +668,9 @@ def _inspect_workflow(root: _Node, relative: Path) -> tuple[int, list[str]]:
             )
             continue
         if has_job_uses:
-            count += _check_uses(job["uses"], job, location, violations)
+            count += _check_uses(
+                job["uses"], job, location, violations, reusable_job=True
+            )
             continue
         steps_node = job["steps"]
         if steps_node.kind != "list" or steps_node.style == "flow":

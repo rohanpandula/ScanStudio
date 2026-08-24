@@ -18,17 +18,12 @@ from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
 from coolscanpy.protocol.ls5000_single_pass import manual_frames
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     ATTENDED_ROLL_BINDING_REASON,
-    AttemptPaths,
-    CaptureAttemptResult,
-    CaptureMode,
-    CaptureOutcome,
-    CaptureRequest,
     ManualFrameApproval,
     ReviewedRollFingerprint,
     build_reviewed_roll_fingerprint,
 )
-from coolscanpy.roll.preview_session import _validate_preview_result
 from coolscanpy.protocol.ls5000_single_pass.roll_index import (
+    IndexDecodeError,
     NativeFrameOrigin,
     TransportMapping,
 )
@@ -39,6 +34,7 @@ from coolscanpy.protocol.ls5000_single_pass.plan import (
 from coolscanpy.protocol.ls5000_single_pass.continuation_plan import (
     load_canonical_continuation_plan,
 )
+from coolscanpy.protocol.ls5000_single_pass.meter import SafetyRefusal
 from coolscanpy.protocol.ls5000_single_pass.worker import (
     DATA_PACKAGE,
     FRAME_TABLE_SEND_BYTES,
@@ -1761,8 +1757,123 @@ def test_parent_ack_is_bound_to_session_frame_slot_and_fresh_nonce(
     assert action == "continue"
 
     assert _meter_controller_sha256() == (
-        "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c"
+        "b03b3212d1ff1f8e3ad8ca7b512765ad6a115d4766e3f3eb5a86de3573076d4e"
     )
+
+
+@pytest.mark.parametrize(("pass_number", "final"), ((2, False), (3, True)))
+def test_meter_controller_refusal_is_durable_and_bounded_before_cleanup(
+    tmp_path: Path,
+    pass_number: int,
+    final: bool,
+) -> None:
+    journal_path = tmp_path / "session-journal.json"
+    journal: dict[str, object] = {"status": "capturing"}
+    refusals = (
+        SafetyRefusal(
+            "linearity_insufficient",
+            "too few unclipped pixels remain for pass-linearity proof",
+            "R",
+            valid_raw_samples=255,
+            required_raw_samples=256,
+            valid_aggregate_samples=28,
+            required_aggregate_samples=24,
+        ),
+        SafetyRefusal(
+            "linearity_insufficient",
+            "too few unclipped pixels remain for pass-linearity proof",
+            "G",
+            valid_raw_samples=12_800,
+            required_raw_samples=256,
+            valid_aggregate_samples=0,
+            required_aggregate_samples=24,
+        ),
+    )
+
+    with pytest.raises(worker_module.SynchronizedProtocolError):
+        worker_module._raise_meter_controller_refusal(
+            journal_path,
+            journal,
+            pass_number=pass_number,
+            refusals=refusals,
+            final=final,
+        )
+
+    persisted = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert persisted["meter_controller_refusal"] == {
+        "pass": pass_number,
+        "reasons": [refusal.to_dict() for refusal in refusals],
+    }
+    assert "observation" not in persisted["meter_controller_refusal"]
+    assert "path" not in json.dumps(persisted["meter_controller_refusal"])
+
+
+def test_transport_failure_evidence_is_durable_before_cleanup(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.json"
+    session_journal_path = tmp_path / "session-journal.json"
+    journal: dict[str, object] = {"status": "capturing"}
+    session_journal: dict[str, object] = {"status": "capturing"}
+    witness = {
+        "kind": "terminal_padding",
+        "record_count": 2,
+        "byte_count": 2048,
+        "parity": "even",
+        "housekeeping_byte_count": 448,
+        "nonzero_rgb_count": 1,
+        "mismatch_location": {"record_index": 1, "byte_offset": 1038},
+    }
+    error = IndexDecodeError(
+        "terminal padding is not one byte-identical blank-row suffix",
+        error_id="terminal-padding-mismatch",
+        diagnostics=witness,
+    )
+
+    assert worker_module._record_transport_failure_evidence(
+        error,
+        journal_path=journal_path,
+        journal=journal,
+        session_journal_path=session_journal_path,
+        session_journal=session_journal,
+        frame_journal_finalized=False,
+    )
+
+    expected = {
+        "error_id": "terminal-padding-mismatch",
+        "witness": witness,
+    }
+    assert json.loads(journal_path.read_text(encoding="utf-8"))[
+        "transport_failure_evidence"
+    ] == expected
+    assert json.loads(session_journal_path.read_text(encoding="utf-8"))[
+        "transport_failure_evidence"
+    ] == expected
+    serialized = json.dumps(expected).lower()
+    for forbidden in ("path", "serial", "raw", "pixel", "sha", "project"):
+        assert forbidden not in serialized
+
+
+def test_malformed_transport_failure_evidence_never_replaces_original_error(
+    tmp_path: Path,
+) -> None:
+    journal_path = tmp_path / "journal.json"
+    journal: dict[str, object] = {"status": "capturing"}
+    error = IndexDecodeError(
+        "original transport refusal",
+        error_id="terminal-padding-mismatch",
+        diagnostics={"kind": "terminal_padding", "raw_path": "/private/capture.bin"},
+    )
+
+    assert not worker_module._record_transport_failure_evidence(
+        error,
+        journal_path=journal_path,
+        journal=journal,
+        session_journal_path=None,
+        session_journal=None,
+        frame_journal_finalized=False,
+    )
+    assert journal == {"status": "capturing"}
+    assert not journal_path.exists()
+    assert str(error).startswith("original transport refusal")
 
 
 def test_wait_for_hold_decision_accepts_scan_and_release_actions(

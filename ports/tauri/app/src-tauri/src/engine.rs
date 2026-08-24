@@ -14,10 +14,17 @@ use crate::wsl::bridge_cmd::{
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EngineError {
     pub code: String,
     pub message: String,
     pub recoverable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_evidence_unavailable_reason: Option<String>,
 }
 
 type PendingMap = Mutex<HashMap<u64, oneshot::Sender<Result<Value, EngineError>>>>;
@@ -56,6 +63,9 @@ async fn await_handshake(handshake: &watch::Sender<HandshakeState>) -> Result<()
             code: "INTERNAL".into(),
             message: "engine handshake never completed".into(),
             recoverable: false,
+            reason: None,
+            evidence: None,
+            diagnostic_evidence_unavailable_reason: None,
         })?;
     match &*outcome {
         HandshakeState::Ready => Ok(()),
@@ -137,6 +147,14 @@ fn command_on_path(name: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+fn engine_hello_params() -> Value {
+    serde_json::json!({
+        "clientName": env!("CARGO_PKG_NAME"),
+        "clientBuild": concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION")),
+        "protocolVersion": 1,
+    })
+}
+
 fn runtime_linux_bridge_cmd(app: &tauri::App<Wry>) -> Option<String> {
     let environment_override = std::env::var("SCANSTUDIO_BRIDGE_CMD").ok();
     let config_contents = std::env::var_os("HOME").and_then(|home| {
@@ -214,6 +232,15 @@ fn dispatch_value(parsed: Value, pending: &PendingMap, on_event: &dyn Fn(Value))
                         .get("recoverable")
                         .and_then(|r| r.as_bool())
                         .unwrap_or(false),
+                    reason: err
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    evidence: err.get("evidence").cloned(),
+                    diagnostic_evidence_unavailable_reason: err
+                        .get("diagnosticEvidenceUnavailableReason")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
                 };
                 let _ = sender.send(Err(engine_err));
             }
@@ -233,6 +260,9 @@ fn fail_pending_requests(handle: &EngineHandle) {
             code: "INTERNAL".into(),
             message: "engine process terminated".into(),
             recoverable: false,
+            reason: None,
+            evidence: None,
+            diagnostic_evidence_unavailable_reason: None,
         }));
     }
 }
@@ -438,10 +468,7 @@ pub fn spawn_engine<R: Runtime>(
         let outcome = send_request_unchecked(
             &state,
             "engine.hello",
-            serde_json::json!({
-                "clientName": env!("CARGO_PKG_NAME"),
-                "protocolVersion": 1,
-            }),
+            engine_hello_params(),
         )
         .await;
         let resolved = match outcome {
@@ -488,6 +515,9 @@ async fn send_request_unchecked(
                 code: "INTERNAL".into(),
                 message,
                 recoverable: false,
+                reason: None,
+                evidence: None,
+                diagnostic_evidence_unavailable_reason: None,
             });
         }
     }
@@ -497,6 +527,9 @@ async fn send_request_unchecked(
             code: "INTERNAL".into(),
             message: "engine process terminated before responding".into(),
             recoverable: false,
+            reason: None,
+            evidence: None,
+            diagnostic_evidence_unavailable_reason: None,
         }),
         Err(_) => {
             state.pending.lock().unwrap().remove(&id);
@@ -504,6 +537,9 @@ async fn send_request_unchecked(
                 code: "INTERNAL".into(),
                 message: "engine response timed out".into(),
                 recoverable: false,
+                reason: None,
+                evidence: None,
+                diagnostic_evidence_unavailable_reason: None,
             })
         }
     }
@@ -724,7 +760,7 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         pending.lock().unwrap().insert(2, tx);
         dispatch_line(
-            r#"{"id":2,"error":{"code":"NOT_CONNECTED","message":"x","recoverable":false}}"#,
+            r#"{"id":2,"error":{"code":"NOT_CONNECTED","message":"x","recoverable":false,"reason":"MEDIUM_CONFIDENCE_ATTENDED_BINDING_REQUIRED","evidence":{"schemaVersion":1,"evidenceId":"ev","operationId":"op","sessionEpoch":"7"},"diagnosticEvidenceUnavailableReason":"secondary"}}"#,
             &pending,
             &|_| panic!("no event expected"),
         );
@@ -737,8 +773,32 @@ mod tests {
             EngineError {
                 code: "NOT_CONNECTED".into(),
                 message: "x".into(),
-                recoverable: false
+                recoverable: false,
+                reason: Some("MEDIUM_CONFIDENCE_ATTENDED_BINDING_REQUIRED".into()),
+                evidence: Some(serde_json::json!({
+                    "schemaVersion": 1,
+                    "evidenceId": "ev",
+                    "operationId": "op",
+                    "sessionEpoch": "7",
+                })),
+                diagnostic_evidence_unavailable_reason: Some("secondary".into()),
             }
+        );
+    }
+
+    #[test]
+    fn hello_reports_the_bounded_app_build_identity_needed_for_evidence_binding() {
+        assert_eq!(
+            engine_hello_params(),
+            serde_json::json!({
+                "clientName": "scanstudio-app",
+                "clientBuild": concat!(
+                    env!("CARGO_PKG_NAME"),
+                    "-",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                "protocolVersion": 1,
+            })
         );
     }
 
@@ -822,6 +882,9 @@ mod tests {
             code: "INTERNAL".into(),
             message: "engine process terminated".into(),
             recoverable: false,
+            reason: None,
+            evidence: None,
+            diagnostic_evidence_unavailable_reason: None,
         };
         let (tx, _rx) = watch::channel(HandshakeState::Failed(failure.clone()));
         let err = await_handshake(&tx)

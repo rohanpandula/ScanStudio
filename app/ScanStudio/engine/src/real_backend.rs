@@ -132,6 +132,10 @@ pub enum BridgeCallError {
         code: String,
         message: String,
         recoverable: bool,
+        details: Option<serde_json::Value>,
+        /// Untrusted bridge-authored source witness. It remains raw until a
+        /// session-scoped caller can bind the exact operation/session/device.
+        diagnostic_evidence: Option<serde_json::Value>,
     },
     /// Spawning the subprocess failed, or an I/O error occurred writing to
     /// its stdin, or a response line could not be interpreted.
@@ -147,6 +151,7 @@ impl std::fmt::Display for BridgeCallError {
                 code,
                 message,
                 recoverable,
+                ..
             } => write!(f, "{code}: {message} (recoverable: {recoverable})"),
             BridgeCallError::Io(message) => write!(f, "bridge io error: {message}"),
         }
@@ -500,6 +505,8 @@ impl BridgeClient {
                         result.protocol_version
                     ),
                     recoverable: false,
+                    details: None,
+                    diagnostic_evidence: None,
                 });
             }
             Ok(result)
@@ -608,10 +615,14 @@ impl BridgeClient {
                         .get("recoverable")
                         .and_then(|r| r.as_bool())
                         .unwrap_or(false);
+                    let details = error.get("details").cloned();
+                    let diagnostic_evidence = error.get("diagnosticEvidence").cloned();
                     Err(BridgeCallError::BridgeError {
                         code,
                         message,
                         recoverable,
+                        details,
+                        diagnostic_evidence,
                     })
                 } else if let Some(result) = value.get("result") {
                     Ok(result.clone())
@@ -806,6 +817,10 @@ impl Drop for BridgeClient {
 // ---------------------------------------------------------------------
 
 use crate::bridge_protocol::*;
+use crate::diagnostic_evidence::{
+    bind_bridge_diagnostic_evidence, DiagnosticEvidenceBinding, DiagnosticEvidenceContext,
+    DiagnosticHolder, DiagnosticOperationKind,
+};
 use crate::domain::{
     self, CaptureRecipe, Channels, EngineError, FilmProcess, FrameState, JobState, MediaCarrier,
     OutputRecipe, ProcessingRecipe, ScannerBackend,
@@ -879,6 +894,10 @@ pub struct RealLs5000 {
     /// of issuing `device.status`, which could itself time out and quarantine
     /// the bridge session while the scanner is mid-USB transaction.
     active_scan_job_id: Arc<Mutex<Option<String>>>,
+    /// Frontend build identity reported by the one successful engine.hello
+    /// for this process. It is metadata only: never used for hardware policy,
+    /// and absent/invalid values merely make #106 evidence unavailable.
+    client_build: Mutex<Option<String>>,
     device_id: String,
     model: String,
     /// False when the bridge discovered a recognized-but-unsupported Nikon
@@ -2663,6 +2682,7 @@ impl RealLs5000 {
             preview_reader_detach_delay: Duration::ZERO,
             preview_terminal_session_loss_test_hook: false,
             active_scan_job_id: Arc::new(Mutex::new(None)),
+            client_build: Mutex::new(None),
             device_id: bridge_device.device_id,
             model: bridge_device.model,
             supported: bridge_device.supported,
@@ -2756,6 +2776,10 @@ impl RealLs5000 {
             // Capabilities, never absent data.
             supported_multisample_passes: Some(self.supported_multisample_passes.clone()),
         }
+    }
+
+    pub(crate) fn set_client_build(&self, client_build: Option<String>) {
+        *self.client_build.lock().unwrap() = client_build;
     }
 
     /// Pure in-process scan ownership snapshot. Unlike `status()`, this does
@@ -3216,6 +3240,10 @@ impl RealLs5000 {
             ));
         }
 
+        let diagnostic_operation_id = (method == "scan.start")
+            .then(|| params.get("jobId").and_then(|value| value.as_str()))
+            .flatten()
+            .map(str::to_string);
         let call_result = match options.deadline {
             Some(deadline) => self.bridge.call_with_deadline(method, params, deadline),
             None => self.bridge.call(method, params),
@@ -3223,9 +3251,24 @@ impl RealLs5000 {
         let result = match call_result {
             Ok(result) => result,
             Err(bridge_error @ BridgeCallError::BridgeError { .. }) => {
-                return Err(SessionCallError::BridgeRejected(map_bridge_error(
-                    bridge_error,
-                )));
+                let evidence_binding = match &bridge_error {
+                    BridgeCallError::BridgeError {
+                        code,
+                        diagnostic_evidence,
+                        ..
+                    } if method == "scan.start" => self.bind_diagnostic_evidence(
+                        diagnostic_evidence.as_ref(),
+                        diagnostic_evidence_expected_for_code(code),
+                        diagnostic_operation_id.as_deref(),
+                        expected_epoch,
+                        DiagnosticOperationKind::ScanBinding,
+                    ),
+                    _ => DiagnosticEvidenceBinding::default(),
+                };
+                return Err(SessionCallError::BridgeRejected(
+                    map_bridge_error(bridge_error)
+                        .with_diagnostic_evidence_binding(evidence_binding),
+                ));
             }
             Err(transport_error) => {
                 // The request crossed a broken bridge ownership boundary.
@@ -3430,6 +3473,8 @@ impl RealLs5000 {
                     "bridge session ownership was lost asynchronously mid-preview; reconnect required; {connection_evidence}"
                 ),
                 operation_id: operation_id.clone(),
+                evidence: None,
+                diagnostic_evidence_unavailable_reason: None,
             },
         );
         self.invalidate_async_session(session_epoch, event_tx, operation_id.clone());
@@ -3455,6 +3500,39 @@ impl RealLs5000 {
 
     fn detected_holder(&self) -> Option<DetectedHolder> {
         *self.detected_holder.lock().unwrap()
+    }
+
+    fn bind_diagnostic_evidence(
+        &self,
+        raw: Option<&serde_json::Value>,
+        expected: bool,
+        operation_id: Option<&str>,
+        session_epoch: u64,
+        operation_kind: DiagnosticOperationKind,
+    ) -> DiagnosticEvidenceBinding {
+        let detected_holder = self.detected_holder();
+        let holder = detected_holder.map(|detected| match detected.carrier {
+            MediaCarrier::Mounted => DiagnosticHolder::Mounted,
+            MediaCarrier::Strip6 => DiagnosticHolder::Strip6,
+            MediaCarrier::Roll36 => DiagnosticHolder::Roll36,
+        });
+        let app_build = self.client_build.lock().unwrap().clone();
+        let bridge_build = self.bridge.hello_info().bridge_version;
+        bind_bridge_diagnostic_evidence(
+            raw,
+            expected,
+            DiagnosticEvidenceContext {
+                operation_id,
+                session_epoch,
+                operation_kind,
+                app_build: app_build.as_deref(),
+                engine_build: env!("CARGO_PKG_VERSION"),
+                bridge_build: &bridge_build,
+                model: &self.model,
+                adapter: detected_holder.map(|detected| detected.adapter),
+                holder,
+            },
+        )
     }
 
     fn refresh_detected_holder(&self, capabilities: &BridgeCapabilities) {
@@ -4076,6 +4154,8 @@ impl ScannerBackend for RealLs5000 {
                                                 "{dropped_count} bridge thumbnail event(s) failed to decode and were dropped"
                                             ),
                                             operation_id: operation_id.clone(),
+                                            evidence: None,
+                                            diagnostic_evidence_unavailable_reason: None,
                                         },
                                     );
                                 }
@@ -4129,6 +4209,14 @@ impl ScannerBackend for RealLs5000 {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("bridge preview failed")
                                     .to_string();
+                                let evidence_binding = backend_for_thread.bind_diagnostic_evidence(
+                                    value.pointer("/payload/diagnosticEvidence"),
+                                    diagnostic_evidence_expected_for_code(&code),
+                                    operation_id.as_deref(),
+                                    session_epoch,
+                                    DiagnosticOperationKind::Preview,
+                                );
+                                emit_bound_diagnostic_evidence(&event_tx, &evidence_binding);
                                 emit(
                                     &event_tx,
                                     "scanner.thumbnailsFailed",
@@ -4136,6 +4224,10 @@ impl ScannerBackend for RealLs5000 {
                                         code: code.clone(),
                                         message,
                                         operation_id: operation_id.clone(),
+                                        evidence: evidence_binding.reference(),
+                                        diagnostic_evidence_unavailable_reason: evidence_binding
+                                            .unavailable_reason
+                                            .clone(),
                                     },
                                 );
                                 if code == "NOT_CONNECTED" {
@@ -4219,6 +4311,8 @@ impl ScannerBackend for RealLs5000 {
                                     "bridge event stream stalled mid-preview (BRIDGE_STREAM_STALLED); {connection_evidence}; the predecessor stream is quarantined and its sole worker will discard the late terminal before disconnect and explicit reconnect are allowed"
                                 ),
                                 operation_id: operation_id.clone(),
+                                evidence: None,
+                                diagnostic_evidence_unavailable_reason: None,
                             },
                         );
                         emit(
@@ -4676,6 +4770,9 @@ fn dispatch_real_scan_with_output_authorities(
                         code: ErrorCode::NotConnected,
                         message: held_error.message.clone(),
                         recoverable: false,
+                        details: None,
+                        evidence: None,
+                        diagnostic_evidence_unavailable_reason: None,
                     }),
                 },
             );
@@ -4741,11 +4838,13 @@ fn map_bridge_error(err: BridgeCallError) -> EngineError {
         BridgeCallError::BridgeError {
             ref code,
             ref message,
+            ref details,
             ..
         } => {
             let mapped = map_bridge_error_code_str(code);
             EngineError::new(mapped, format!("bridge error {code}: {message}"))
                 .with_recoverable(map_bridge_error_code_recoverable(code))
+                .with_details(details.clone())
         }
     }
 }
@@ -4771,6 +4870,8 @@ fn map_bridge_error_code_str(code: &str) -> ErrorCode {
         "UNKNOWN_JOB" => ErrorCode::UnknownJob,
         "EJECT_FAILED" => ErrorCode::EjectFailed,
         "FEEDER_PARKED" => ErrorCode::FeederParked,
+        "METER_CONTROLLER_REFUSED" => ErrorCode::MeterControllerRefused,
+        "METER_UNUSABLE" => ErrorCode::MeterUnusable,
         _ => ErrorCode::Internal,
     }
 }
@@ -5470,6 +5571,19 @@ fn emit<T: Serialize>(event_tx: &mpsc::Sender<String>, event_name: &str, payload
             eprintln!("scanstudio-engine: failed to serialize event '{event_name}': {err}");
         }
     }
+}
+
+fn emit_bound_diagnostic_evidence(
+    event_tx: &mpsc::Sender<String>,
+    binding: &DiagnosticEvidenceBinding,
+) {
+    if let Some(evidence) = binding.evidence.as_ref() {
+        emit(event_tx, "diagnostic.evidence", evidence);
+    }
+}
+
+fn diagnostic_evidence_expected_for_code(code: &str) -> bool {
+    code == "REFEED_REQUIRED"
 }
 
 /// Scan-path mirror of `acquire_thumbnails`'s own silence-tolerant
@@ -7622,11 +7736,13 @@ fn run_real_scan_job_inner(
                             .unwrap_or("bridge reported a frame failure")
                             .to_string();
                         let mapped_code = map_bridge_error_code_str(&code);
+                        let details = value.pointer("/payload/details").cloned();
                         let error = EngineError::new(
                             mapped_code,
                             format!("bridge scan.frameFailed ({code}): {message}"),
                         )
-                        .with_recoverable(map_bridge_error_code_recoverable(&code));
+                        .with_recoverable(map_bridge_error_code_recoverable(&code))
+                        .with_details(details);
                         let error_payload = ErrorPayload::from(&error);
                         if let Some(slot) = slot {
                             if remaining.contains(&slot) {
@@ -7683,11 +7799,28 @@ fn run_real_scan_job_inner(
                             .unwrap_or("bridge reported a scan error")
                             .to_string();
                         let mapped_code = map_bridge_error_code_str(&code);
+                        let details = value.pointer("/payload/details").cloned();
+                        let evidence_binding = if completed.is_empty() {
+                            backend.bind_diagnostic_evidence(
+                                value.pointer("/payload/diagnosticEvidence"),
+                                diagnostic_evidence_expected_for_code(&code),
+                                Some(&job_id),
+                                session_epoch,
+                                DiagnosticOperationKind::ScanBinding,
+                            )
+                        } else {
+                            DiagnosticEvidenceBinding::default()
+                        };
                         let error = EngineError::new(
                             mapped_code,
                             format!("bridge scan.error ({code}): {message}"),
                         )
-                        .with_recoverable(map_bridge_error_code_recoverable(&code));
+                        .with_recoverable(map_bridge_error_code_recoverable(&code))
+                        .with_details(details)
+                        .with_diagnostic_evidence_binding(evidence_binding);
+                        if let Some(evidence) = error.diagnostic_evidence.as_ref() {
+                            emit(&event_tx, "diagnostic.evidence", evidence);
+                        }
                         let error_payload = ErrorPayload::from(&error);
                         // `scan.error` is additive, not a terminal bridge
                         // closure. Give its worker a bounded opportunity to

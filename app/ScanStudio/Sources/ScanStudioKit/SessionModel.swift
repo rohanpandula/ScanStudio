@@ -402,6 +402,34 @@ public final class SessionModel {
     private struct PendingScanStart {
         let id: UUID
         let connectionEpoch: UInt64
+        let previewOperationId: String
+        let frames: [Int]
+    }
+
+    /// Immutable authority for the accepted scan whose terminal summary may
+    /// mint one attended-recovery offer. Mutable selection never participates.
+    private struct ActiveScanAuthorization {
+        let jobId: String
+        let frames: [Int]
+        let previewOperationId: String
+        let connectionEpoch: UInt64
+        let isAttendedRetry: Bool
+    }
+
+    /// One explicit retry of one exact, zero-completed terminal run. It is
+    /// consumed before the first approval request so repeated clicks cannot
+    /// create duplicate approval sequences or duplicate scanner movement.
+    private struct AttendedScanRecoveryAuthorization {
+        let id: UUID
+        let sourceJobId: String
+        let frames: [Int]
+        let previewOperationId: String
+        let connectionEpoch: UInt64
+    }
+
+    private struct PendingAttendedScanApproval {
+        let id: UUID
+        let authorization: AttendedScanRecoveryAuthorization
     }
 
     /// One-shot authority to apply exactly the command the user most
@@ -502,6 +530,15 @@ public final class SessionModel {
     @ObservationIgnored
     private var pendingScanStart: PendingScanStart?
     @ObservationIgnored
+    private var activeScanAuthorization: ActiveScanAuthorization?
+    @ObservationIgnored
+    private var attendedScanRecoveryAuthorization:
+        AttendedScanRecoveryAuthorization?
+    @ObservationIgnored
+    private var pendingAttendedScanApproval: PendingAttendedScanApproval?
+    @ObservationIgnored
+    private var attendedRetryBlockedPreviewOperationId: String?
+    @ObservationIgnored
     private var pendingManualReviewScanAuthorization: PendingManualReviewScanAuthorization?
     @ObservationIgnored
     private var pendingManualReviewApproval: PendingManualReviewApproval?
@@ -574,12 +611,37 @@ public final class SessionModel {
     public private(set) var frameTransportSmearReasons: [Int: String] = [:]
     public private(set) var scanSummary: ScanSummary?
     public private(set) var lastErrorMessage: String?
+    /// Strictly validated witness (or an explicit reason it was unavailable)
+    /// from the exact terminal attempt currently represented in diagnostics.
+    public private(set) var diagnosticEvidenceAvailability:
+        DiagnosticEvidenceAvailability?
+    private var diagnosticEvidenceByKey: [String: DiagnosticEvidenceArtifact] = [:]
+
+    /// Model-authoritative attended eligibility. The presentation policy may
+    /// explain a typed code, but only this snapshot/state check can authorize
+    /// the recovery action.
+    public var canApproveEveryFrameAndScan: Bool {
+        guard pendingAttendedScanApproval == nil,
+              pendingScanStart == nil,
+              let authorization = attendedScanRecoveryAuthorization
+        else {
+            return false
+        }
+        return attendedRecoveryAuthorizationIsCurrent(authorization)
+    }
     /// Calm, actionable copy for the workspace plus a privacy-scrubbed,
     /// user-initiated issue URL. `lastErrorMessage` remains the compatibility
     /// source of truth and the technical detail shown locally.
     public var errorPresentation: ErrorPresentation? {
         guard let lastErrorMessage else { return nil }
 
+        return ErrorPresentationPolicy.make(
+            lastErrorMessage: lastErrorMessage,
+            context: errorPresentationContext
+        )
+    }
+
+    private var errorPresentationContext: ErrorPresentationContext {
         let projectMetadata = project.map(\.rollMetadata)
         let frameMetadata = project?.frames.compactMap(\.metadataOverride) ?? []
         let metadataSets = [rollMetadataDraft] + [projectMetadata].compactMap { $0 } + frameMetadata
@@ -608,28 +670,26 @@ public final class SessionModel {
             outputRecipe.preview.destination,
         ].compactMap { $0 }.filter { !$0.isEmpty } + frameOutputPaths
 
-        return ErrorPresentationPolicy.make(
-            lastErrorMessage: lastErrorMessage,
-            context: ErrorPresentationContext(
-                scanStudioVersion: Self.releaseStamp,
-                operatingSystemVersion: "macOS " + ProcessInfo.processInfo.operatingSystemVersionString,
-                cpuArchitecture: HostArchitectureProvider.currentHostArchitecture.rawValue,
-                scannerFirmware: device?.firmware,
-                scannerAdapter: status?.adapter,
-                scannerHolder: status?.carrier,
-                selectedPaths: selectedPaths,
-                filmMetadataValues: metadataValues,
-                deviceIdentifiers: (
-                    [device?.deviceId].compactMap { $0 }
-                        + availableDevices.map(\.deviceId)
-                ),
-                diagnosticSessionId: diagnosticTimeline.sessionID,
-                engineVersion: engineVersion,
-                connectionSummary: diagnosticConnectionSummary,
-                recentDiagnosticEvents: diagnosticTimeline.summaryLines,
-                diagnosticLogRelativePath: diagnosticLogRelativePath,
-                diagnosticLogPath: diagnosticLogPath
-            )
+        return ErrorPresentationContext(
+            scanStudioVersion: Self.releaseStamp,
+            operatingSystemVersion:
+                "macOS " + ProcessInfo.processInfo.operatingSystemVersionString,
+            cpuArchitecture: HostArchitectureProvider.currentHostArchitecture.rawValue,
+            scannerFirmware: device?.firmware,
+            scannerAdapter: status?.adapter,
+            scannerHolder: status?.carrier,
+            selectedPaths: selectedPaths,
+            filmMetadataValues: metadataValues,
+            deviceIdentifiers: (
+                [device?.deviceId].compactMap { $0 }
+                    + availableDevices.map(\.deviceId)
+            ),
+            diagnosticSessionId: diagnosticTimeline.sessionID,
+            engineVersion: engineVersion,
+            connectionSummary: diagnosticConnectionSummary,
+            recentDiagnosticEvents: diagnosticTimeline.summaryLines,
+            diagnosticLogRelativePath: diagnosticLogRelativePath,
+            diagnosticLogPath: diagnosticLogPath
         )
     }
 
@@ -1439,9 +1499,12 @@ public final class SessionModel {
         // "Preview Again" must leave its still-visible Review buttons and
         // choices usable rather than orphaning them before any motion began.
         clearPendingManualReviewScan()
+        clearAttendedScanRecovery()
         manualReviewDecisions.removeAll()
         clearFrameAlignmentSessionState()
         latestCompletedPreviewOperationId = nil
+        diagnosticEvidenceAvailability = nil
+        diagnosticEvidenceByKey.removeAll(keepingCapacity: true)
 
         lastErrorMessage = nil
         // A fresh preview attempt supersedes the previous refeed verdict;
@@ -1511,7 +1574,11 @@ public final class SessionModel {
             activeOperationStartedAt = nil
             pendingPreviewFilmProcess = nil
             latestCompletedPreviewOperationId = nil
-            recordOperationFailure(error, operation: "preview")
+            recordOperationFailure(
+                error,
+                operation: "preview",
+                expectedEvidenceOperationId: intent.operationID
+            )
             lastErrorMessage = Self.describe(error)
             return .failedToStart
         }
@@ -1711,49 +1778,38 @@ public final class SessionModel {
     /// `scan.start`.
     @discardableResult
     public func approveEveryFrameAndScan() async -> Bool {
-        guard pendingManualReviewApproval == nil else { return false }
-        guard pendingScanStart == nil else {
-            lastErrorMessage = "A scan is already starting."
-            return false
-        }
-        let frames = selectedFrames
-        guard !frames.isEmpty else {
-            lastErrorMessage = "Select the frames to scan first."
-            return false
-        }
-        guard let previewOperationId = latestCompletedPreviewOperationId else {
-            lastErrorMessage =
-                "These frames are not bound to a completed preview. "
-                + "Acquire a fresh preview before scanning."
-            return false
-        }
-        let readiness = scanReadiness(for: frames)
-        guard readiness.isReady else {
-            lastErrorMessage = readiness.reason
+        guard pendingAttendedScanApproval == nil,
+              pendingManualReviewApproval == nil,
+              pendingScanStart == nil,
+              let authorization = attendedScanRecoveryAuthorization,
+              attendedRecoveryAuthorizationIsCurrent(authorization)
+        else {
             return false
         }
 
+        // Consume the sole retry before the first suspension point. Even a
+        // failed approval remains an explicit attempt and is never replayed
+        // automatically or re-minted from the same terminal summary.
+        attendedScanRecoveryAuthorization = nil
         lastErrorMessage = nil
-        let marker = PendingManualReviewApproval(
+        let marker = PendingAttendedScanApproval(
             id: UUID(),
-            requestId: UUID(),
-            previewOperationId: previewOperationId,
-            connectionEpoch: connectionEpoch
+            authorization: authorization
         )
-        pendingManualReviewApproval = marker
+        pendingAttendedScanApproval = marker
         defer {
-            if pendingManualReviewApproval?.id == marker.id {
-                pendingManualReviewApproval = nil
+            if pendingAttendedScanApproval?.id == marker.id {
+                pendingAttendedScanApproval = nil
                 approvingFrameIndex = nil
             }
         }
 
-        for frameIndex in frames {
+        for frameIndex in authorization.frames {
             approvingFrameIndex = frameIndex
             do {
                 let params = RollApproveParams(
                     frameIndex: frameIndex,
-                    operationId: marker.previewOperationId,
+                    operationId: authorization.previewOperationId,
                     attended: true
                 )
                 let _: EmptyResult = try await engineClient.request(
@@ -1761,40 +1817,45 @@ public final class SessionModel {
                     params: params
                 )
             } catch {
-                guard manualReviewApprovalIsCurrent(marker) else { return false }
+                guard attendedApprovalIsCurrent(marker) else { return false }
                 recordOperationFailure(error, operation: "roll.approve")
                 lastErrorMessage = Self.describe(error)
                 return false
             }
-            guard manualReviewApprovalIsCurrent(marker) else { return false }
+            guard attendedApprovalIsCurrent(marker) else { return false }
         }
 
-        for frameIndex in frames {
+        for frameIndex in authorization.frames {
             manualReviewDecisions[frameIndex] = .useFrameAnyway
         }
         recordDiagnostic(
             event: "scan.attendedBinding.approved",
             fields: [
-                "frames": frames.map(String.init).joined(separator: ","),
-                "requestedFrameCount": String(frames.count),
+                "frames": authorization.frames.map(String.init).joined(separator: ","),
+                "requestedFrameCount": String(authorization.frames.count),
+                "sourceJobId": authorization.sourceJobId,
             ]
         )
 
-        let readinessAfterApproval = scanReadiness(for: frames)
-        guard readinessAfterApproval.isReady else {
-            lastErrorMessage = readinessAfterApproval.reason
+        guard attendedApprovalIsCurrent(marker) else {
             return false
         }
 
         do {
-            guard let result = try await dispatchScanStart(frames: frames) else {
+            guard let result = try await dispatchScanStart(
+                frames: authorization.frames
+            ) else {
                 return false
             }
             clearPendingManualReviewScan()
-            beginJob(id: result.jobId, frames: frames)
+            beginJob(
+                id: result.jobId,
+                frames: authorization.frames,
+                isAttendedRetry: true
+            )
             return true
         } catch {
-            guard manualReviewApprovalIsCurrent(marker) else { return false }
+            guard attendedApprovalIsCurrent(marker) else { return false }
             recordOperationFailure(error, operation: "scan.start")
             lastErrorMessage = Self.describe(error)
             noteRefeedRequired(from: error)
@@ -1924,12 +1985,21 @@ public final class SessionModel {
     /// forgotten or delayed UI confirmation cannot bypass it.
     @discardableResult
     private func startScanOrRequestManualReview(frames: [Int]) async -> Bool {
-        lastErrorMessage = nil
+        guard pendingAttendedScanApproval == nil else { return false }
         guard pendingManualReviewApproval == nil else { return false }
         guard pendingScanStart == nil else {
             lastErrorMessage = "A scan is already starting."
             return false
         }
+        if let blockedPreview = attendedRetryBlockedPreviewOperationId,
+           blockedPreview == latestCompletedPreviewOperationId {
+            if attendedScanRecoveryAuthorization == nil {
+                lastErrorMessage =
+                    "ATTENDED_RETRY_CONSUMED: This preview already used its one attended retry. Acquire a fresh preview before scanning again."
+            }
+            return false
+        }
+        lastErrorMessage = nil
 
         let readiness = scanReadiness(for: frames)
         guard readiness.isReady else {
@@ -2074,6 +2144,51 @@ public final class SessionModel {
             return false
         }
         return manualReviewAuthorizationIsCurrent(authorization)
+    }
+
+    private func attendedRecoveryAuthorizationIsCurrent(
+        _ authorization: AttendedScanRecoveryAuthorization
+    ) -> Bool {
+        guard attendedScanRecoveryAuthorization?.id == authorization.id,
+              authorization.connectionEpoch == connectionEpoch,
+              diagnosticUIConnected,
+              jobId == nil,
+              latestCompletedPreviewOperationId
+                == authorization.previewOperationId,
+              !authorization.frames.isEmpty,
+              Set(authorization.frames).count == authorization.frames.count
+        else {
+            return false
+        }
+        return scanReadiness(for: authorization.frames).isReady
+    }
+
+    private func attendedApprovalIsCurrent(
+        _ marker: PendingAttendedScanApproval
+    ) -> Bool {
+        let authorization = marker.authorization
+        guard pendingAttendedScanApproval?.id == marker.id,
+              authorization.connectionEpoch == connectionEpoch,
+              diagnosticUIConnected,
+              latestCompletedPreviewOperationId
+                == authorization.previewOperationId,
+              !authorization.frames.isEmpty,
+              Set(authorization.frames).count == authorization.frames.count
+        else {
+            return false
+        }
+        return scanReadiness(for: authorization.frames).isReady
+    }
+
+    private func clearAttendedScanRecovery(
+        preservingRetryBlock: Bool = false
+    ) {
+        attendedScanRecoveryAuthorization = nil
+        pendingAttendedScanApproval = nil
+        approvingFrameIndex = nil
+        if !preservingRetryBlock {
+            attendedRetryBlockedPreviewOperationId = nil
+        }
     }
 
     private func clearPendingManualReviewScan(requestId: UUID? = nil) {
@@ -2606,6 +2721,8 @@ public final class SessionModel {
         thumbnails = [:]
         latestCompletedPreviewOperationId = nil
         clearPendingManualReviewScan()
+        clearAttendedScanRecovery()
+        activeScanAuthorization = nil
         manualReviewDecisions.removeAll()
         clearFrameAlignmentSessionState()
         selectedFrameIndices.removeAll()
@@ -2969,6 +3086,8 @@ public final class SessionModel {
     /// to a manifest. Job receipts, summaries, selection, analysis, and
     /// metadata preview must never cross that boundary.
     private func resetProjectScopedScanState() {
+        clearAttendedScanRecovery()
+        activeScanAuthorization = nil
         jobId = nil
         jobState = nil
         progress = nil
@@ -3841,6 +3960,21 @@ public final class SessionModel {
     /// from the engine event stream above.
     func handle(event: EngineEvent) {
         switch event.name {
+        case "diagnostic.evidence":
+            decodeAndApply(event, as: DiagnosticEvidenceArtifact.self) { artifact in
+                do {
+                    _ = try DiagnosticEvidenceValidator.validate(artifact)
+                    let key = Self.diagnosticEvidenceKey(artifact.reference)
+                    if let existing = self.diagnosticEvidenceByKey[key],
+                       existing != artifact {
+                        self.diagnosticEvidenceByKey.removeValue(forKey: key)
+                    } else {
+                        self.diagnosticEvidenceByKey[key] = artifact
+                    }
+                } catch {
+                    return
+                }
+            }
         case "scanner.status":
             decodeAndApply(event, as: ScannerStatusPayload.self) {
                 guard self.previewIntentStateMachine.admitsStatusEvent(
@@ -3938,6 +4072,16 @@ public final class SessionModel {
                 self.activeOperationStartedAt = nil
                 self.pendingPreviewFilmProcess = nil
                 self.lastErrorMessage = "\($0.code): \($0.message)"
+                self.captureDiagnosticEvidence(
+                    artifact: self.resolveDiagnosticEvidence(
+                        inline: $0.diagnosticEvidence,
+                        reference: $0.evidence
+                    ),
+                    unavailableReason:
+                        $0.diagnosticEvidenceUnavailableReason
+                            ?? "the failed preview did not provide bounded evidence",
+                    expectedOperationId: $0.operationId
+                )
                 let wasConnected = self.diagnosticUIConnected
                 self.recordDiagnostic(
                     event: "preview.failed",
@@ -4008,6 +4152,8 @@ public final class SessionModel {
         thumbnails = [:]
         latestCompletedPreviewOperationId = nil
         clearPendingManualReviewScan()
+        clearAttendedScanRecovery()
+        activeScanAuthorization = nil
         manualReviewDecisions.removeAll()
         clearFrameAlignmentSessionState()
         selectedFrameIndices.removeAll()
@@ -4062,14 +4208,35 @@ public final class SessionModel {
 
     /// Internal for lifecycle tests that verify a bridge-reused job id cannot
     /// consume terminal events buffered for a prior connection.
-    func beginJob(id: String, frames: [Int] = []) {
+    func beginJob(
+        id: String,
+        frames: [Int] = [],
+        isAttendedRetry: Bool = false
+    ) {
         let previouslyCompleted = Set(
             frameStates.compactMap { index, state in
                 state == .completed ? index : nil
             }
         ).subtracting(frames)
         clearPendingManualReviewScan()
+        clearAttendedScanRecovery(
+            preservingRetryBlock: isAttendedRetry
+        )
+        diagnosticEvidenceAvailability = nil
+        diagnosticEvidenceByKey.removeAll(keepingCapacity: true)
         jobId = id
+        if let previewOperationId = latestCompletedPreviewOperationId,
+           !frames.isEmpty {
+            activeScanAuthorization = ActiveScanAuthorization(
+                jobId: id,
+                frames: frames,
+                previewOperationId: previewOperationId,
+                connectionEpoch: connectionEpoch,
+                isAttendedRetry: isAttendedRetry
+            )
+        } else {
+            activeScanAuthorization = nil
+        }
         jobState = .queued
         progress = nil
         if let project {
@@ -4120,9 +4287,15 @@ public final class SessionModel {
             return nil
         }
 
+        guard let previewOperationId = latestCompletedPreviewOperationId else {
+            return nil
+        }
+        attendedScanRecoveryAuthorization = nil
         let marker = PendingScanStart(
             id: UUID(),
-            connectionEpoch: connectionEpoch
+            connectionEpoch: connectionEpoch,
+            previewOperationId: previewOperationId,
+            frames: frames
         )
         pendingScanStart = marker
         defer {
@@ -4159,9 +4332,12 @@ public final class SessionModel {
             throw error
         }
 
-        guard pendingScanStart?.id == marker.id,
-              connectionEpoch == marker.connectionEpoch,
-              diagnosticUIConnected
+        // Once the engine returns a job id, it may already be moving film.
+        // Adopt that accepted job whenever this connection still owns the
+        // response, even if an early status/event changed ordinary readiness
+        // while the response was in flight. Discarding it would orphan real
+        // movement and hide stop controls.
+        guard scanStartResponseBelongsToCurrentSession(marker, frames: frames)
         else {
             bufferedJobEvents.removeAll()
             recordDiagnostic(
@@ -4171,6 +4347,20 @@ public final class SessionModel {
             return nil
         }
         return result
+    }
+
+    private func scanStartResponseBelongsToCurrentSession(
+        _ marker: PendingScanStart,
+        frames: [Int]
+    ) -> Bool {
+        guard let pendingScanStart else { return false }
+        return pendingScanStart.id == marker.id
+            && pendingScanStart.connectionEpoch == marker.connectionEpoch
+            && pendingScanStart.previewOperationId == marker.previewOperationId
+            && pendingScanStart.frames == marker.frames
+            && marker.frames == frames
+            && connectionEpoch == marker.connectionEpoch
+            && diagnosticUIConnected
     }
 
     /// Makes the active manifest authoritative for the exact crop/rotation/
@@ -4270,8 +4460,12 @@ public final class SessionModel {
         guard let pendingScanStart,
               pendingScanStart.id == marker.id,
               pendingScanStart.connectionEpoch == marker.connectionEpoch,
+              pendingScanStart.previewOperationId == marker.previewOperationId,
+              pendingScanStart.frames == marker.frames,
+              marker.frames == frames,
               connectionEpoch == marker.connectionEpoch,
-              diagnosticUIConnected
+              diagnosticUIConnected,
+              latestCompletedPreviewOperationId == marker.previewOperationId
         else {
             return false
         }
@@ -4314,6 +4508,14 @@ public final class SessionModel {
                     )
                 }
             frameErrors[payload.frameIndex] = error
+            captureDiagnosticEvidence(
+                artifact: resolveDiagnosticEvidence(
+                    inline: error.diagnosticEvidence,
+                    reference: error.evidence
+                ),
+                unavailableReason: error.diagnosticEvidenceUnavailableReason,
+                expectedOperationId: payload.jobId
+            )
             let diagnosticCode = Self.diagnosticErrorCode(
                 code: error.code,
                 message: error.message
@@ -4367,6 +4569,9 @@ public final class SessionModel {
 
     private func applyCompleted(_ payload: ScanCompletedPayload, source: EngineEvent) {
         guard eventIsRelevant(payload.jobId, source: source) else { return }
+        let completedAuthorization = activeScanAuthorization.flatMap {
+            $0.jobId == payload.jobId ? $0 : nil
+        }
         let transportFailure = payload.summary.failed
             .compactMap { frameErrors[$0] }
             .first {
@@ -4404,6 +4609,75 @@ public final class SessionModel {
         // otherwise stuck "SCANNING"); an existing terminal state is preserved,
         // never overridden. See `ScanCompletionPolicy`.
         jobState = ScanCompletionPolicy.resolveJobState(current: jobState, summary: payload.summary)
+
+        if payload.summary.completed.isEmpty,
+           completedAuthorization?.frames.isEmpty == false {
+            let failedErrors = payload.summary.failed.compactMap {
+                frameErrors[$0]
+            }
+            let failureCodes = Set(failedErrors.map(\.code))
+            if failedErrors.count == payload.summary.failed.count,
+               failureCodes.count == 1,
+               let representative = failedErrors.first {
+                lastErrorMessage =
+                    "\(representative.code): \(representative.message)"
+            } else {
+                let failedFrames = payload.summary.failed
+                    .map(String.init)
+                    .joined(separator: ", ")
+                lastErrorMessage =
+                    "SCAN_ZERO_COMPLETED: No requested frames were completed."
+                    + (failedFrames.isEmpty
+                        ? " Review the terminal scan details before trying again."
+                        : " Failed frames: \(failedFrames). Review each frame's error before trying again.")
+            }
+
+            if diagnosticEvidenceAvailability == nil {
+                diagnosticEvidenceAvailability = .unavailable(
+                    reason: "the failed scan did not provide bounded evidence"
+                )
+            }
+
+            let failedExactlyMatchesRequest: Bool
+            if let completedAuthorization {
+                failedExactlyMatchesRequest =
+                    payload.summary.failed.count
+                        == completedAuthorization.frames.count
+                    && Set(payload.summary.failed)
+                        == Set(completedAuthorization.frames)
+            } else {
+                failedExactlyMatchesRequest = false
+            }
+            if let completedAuthorization,
+               completedAuthorization.connectionEpoch == connectionEpoch,
+               latestCompletedPreviewOperationId
+                    == completedAuthorization.previewOperationId,
+               failedExactlyMatchesRequest,
+               payload.summary.skipped.isEmpty,
+               !payload.summary.stopped,
+               failedErrors.count == completedAuthorization.frames.count,
+               !completedAuthorization.isAttendedRetry,
+               failedErrors.allSatisfy({
+                   $0.code == ScanFailureCode.attendedBindingRequired
+               }) {
+                attendedScanRecoveryAuthorization =
+                    AttendedScanRecoveryAuthorization(
+                        id: UUID(),
+                        sourceJobId: payload.jobId,
+                        frames: completedAuthorization.frames,
+                        previewOperationId:
+                            completedAuthorization.previewOperationId,
+                        connectionEpoch:
+                            completedAuthorization.connectionEpoch
+                    )
+                attendedRetryBlockedPreviewOperationId =
+                    completedAuthorization.previewOperationId
+            } else {
+                attendedScanRecoveryAuthorization = nil
+            }
+        } else {
+            attendedScanRecoveryAuthorization = nil
+        }
         if let transportFailure {
             requirePhysicalRefeed(
                 errorCode: transportFailure.code,
@@ -4411,6 +4685,7 @@ public final class SessionModel {
                 preservingActiveJob: true
             )
         }
+        activeScanAuthorization = nil
         jobId = nil
     }
 
@@ -4485,25 +4760,80 @@ public final class SessionModel {
         diagnosticTimeline.logURL?.path
     }
 
-    /// Builds "Save Diagnostic Bundle..."'s zip bytes (T-ERR-04): the
-    /// session's diagnostics.jsonl, the current generated report text, and
-    /// -- when the session had a roll preview whose image path is still
-    /// readable -- that preview raster. The raster comes only from
-    /// already-decoded `Thumbnail.imagePath` state; this never opens a new
-    /// engine/bridge round trip to locate it.
-    public func makeDiagnosticBundleData() -> Data {
+    /// The one preview tile that can be explicitly opted into for the next
+    /// export. Merely reading this value performs no filesystem or engine I/O.
+    public var diagnosticPreviewCandidate: DiagnosticPreviewConsent? {
+        DiagnosticBundleRasterPolicy.candidate(thumbnails: thumbnails)
+    }
+
+    /// Exact proposed archive inventory for the current export controls.
+    /// Film content appears only while consent still matches its candidate.
+    public func diagnosticBundleEntryNames(
+        previewConsent: DiagnosticPreviewConsent? = nil
+    ) -> [String] {
+        var names = ["diagnostics.jsonl", "report.txt", "manifest.txt"]
+        if let artifact = diagnosticEvidenceAvailability?.artifact,
+           DiagnosticBundleBuilder.encodedShareSafeEvidence(
+                artifact,
+                context: errorPresentationContext
+           ) != nil {
+            names.append("evidence-v1.json")
+        }
+        if let previewConsent,
+           previewConsent == diagnosticPreviewCandidate {
+            names.append(previewConsent.filename)
+        }
+        return names.sorted()
+    }
+
+    /// Builds the share-facing archive synchronously from current in-memory
+    /// state. It never sends an engine request. Film bytes are excluded by
+    /// default and read only after exact, per-export consent is revalidated.
+    public func makeDiagnosticBundleData(
+        previewConsent: DiagnosticPreviewConsent? = nil
+    ) -> Data {
         let reportText = errorPresentation?.technicalDetails
             ?? lastErrorMessage
             ?? "No error was active when this bundle was saved."
-        let (raster, unavailableReason) = DiagnosticBundleRasterPolicy.resolve(
-            thumbnails: thumbnails,
-            readFile: { FileManager.default.contents(atPath: $0) }
-        )
+
+        let candidate = diagnosticPreviewCandidate
+        let previewContent: DiagnosticBundleBuilder.PreviewContent
+        if let previewConsent {
+            let resolved = DiagnosticBundleRasterPolicy.resolve(
+                consent: previewConsent,
+                currentCandidate: candidate,
+                readFile: { FileManager.default.contents(atPath: $0) }
+            )
+            if let raster = resolved.raster {
+                previewContent = .included(
+                    consent: previewConsent,
+                    raster: raster
+                )
+            } else {
+                previewContent = .unavailable(
+                    reason: resolved.unavailableReason
+                        ?? "the consented film preview could not be included"
+                )
+            }
+        } else {
+            previewContent = .excludedByPrivacyDefault(candidate: candidate)
+        }
+
+        let evidenceContent: DiagnosticBundleBuilder.EvidenceContent
+        if let artifact = diagnosticEvidenceAvailability?.artifact {
+            evidenceContent = .included(artifact)
+        } else {
+            evidenceContent = .unavailable(
+                reason: diagnosticEvidenceAvailability?.unavailableReason
+                    ?? "no bounded evidence was supplied for this diagnostic state"
+            )
+        }
         let entries = DiagnosticBundleBuilder.makeEntries(
             diagnosticsJSONL: diagnosticsJSONLData(),
             reportText: reportText,
-            previewRaster: raster,
-            unavailableRasterReason: unavailableReason
+            redactionContext: errorPresentationContext,
+            preview: previewContent,
+            evidence: evidenceContent
         )
         return StoredZipWriter.write(entries)
     }
@@ -4540,9 +4870,24 @@ public final class SessionModel {
     /// result. That refusal is authoritative: clear the stale READY state and
     /// require an explicit reconnect. Never auto-open the bridge or replay a
     /// motion command from here.
-    private func recordOperationFailure(_ error: Error, operation: String) {
+    private func recordOperationFailure(
+        _ error: Error,
+        operation: String,
+        expectedEvidenceOperationId: String? = nil
+    ) {
         let wasConnected = diagnosticUIConnected
         let code = Self.diagnosticErrorCode(error)
+        if let requestError = error as? EngineRequestError {
+            captureDiagnosticEvidence(
+                artifact: resolveDiagnosticEvidence(
+                    inline: requestError.diagnosticEvidence,
+                    reference: requestError.evidence
+                ),
+                unavailableReason:
+                    requestError.diagnosticEvidenceUnavailableReason,
+                expectedOperationId: expectedEvidenceOperationId
+            )
+        }
         recordDiagnostic(
             event: "\(operation).failed",
             fields: [
@@ -4556,6 +4901,67 @@ public final class SessionModel {
                 uiConnectedBefore: wasConnected
             )
         }
+    }
+
+    private func captureDiagnosticEvidence(
+        artifact: DiagnosticEvidenceArtifact?,
+        unavailableReason: String?,
+        expectedOperationId: String?
+    ) {
+        if let artifact {
+            do {
+                _ = try DiagnosticEvidenceValidator.validate(
+                    artifact,
+                    expectedOperationId: expectedOperationId
+                )
+                if let current = diagnosticEvidenceAvailability?.artifact,
+                   current != artifact {
+                    diagnosticEvidenceAvailability = .unavailable(
+                        reason: "the failed attempt supplied conflicting bounded evidence"
+                    )
+                } else {
+                    diagnosticEvidenceAvailability = .included(artifact)
+                }
+            } catch {
+                if diagnosticEvidenceAvailability?.artifact == nil {
+                    let detail = (error as? LocalizedError)?.errorDescription
+                        ?? "strict validation failed"
+                    diagnosticEvidenceAvailability = .unavailable(
+                        reason: "the failed attempt's bounded evidence was rejected: "
+                            + String(detail.prefix(256))
+                    )
+                }
+            }
+            return
+        }
+
+        guard diagnosticEvidenceAvailability == nil,
+              let unavailableReason,
+              !unavailableReason.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ).isEmpty
+        else {
+            return
+        }
+        diagnosticEvidenceAvailability = .unavailable(
+            reason: String(unavailableReason.prefix(512))
+        )
+    }
+
+    private static func diagnosticEvidenceKey(
+        _ reference: DiagnosticEvidenceReference
+    ) -> String {
+        "\(reference.schemaVersion):\(reference.sessionEpoch):"
+            + "\(reference.operationId):\(reference.evidenceId)"
+    }
+
+    private func resolveDiagnosticEvidence(
+        inline: DiagnosticEvidenceArtifact?,
+        reference: DiagnosticEvidenceReference?
+    ) -> DiagnosticEvidenceArtifact? {
+        if let inline { return inline }
+        guard let reference else { return nil }
+        return diagnosticEvidenceByKey[Self.diagnosticEvidenceKey(reference)]
     }
 
     private func invalidateConnection(
@@ -4603,6 +5009,8 @@ public final class SessionModel {
         latestCompletedPreviewOperationId = nil
         pendingScanStart = nil
         clearPendingManualReviewScan()
+        clearAttendedScanRecovery()
+        activeScanAuthorization = nil
         manualReviewDecisions.removeAll()
         clearFrameAlignmentSessionState()
         pendingManualReviewApproval = nil

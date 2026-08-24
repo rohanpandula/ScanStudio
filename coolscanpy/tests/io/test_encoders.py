@@ -10,6 +10,8 @@ stayed in coolscanpy.receipts.writer; see tests/receipts/test_writer.py.
 """
 
 import os
+import shutil
+import subprocess
 import tempfile
 
 import numpy as np
@@ -149,16 +151,81 @@ class TestDngWriter:
                 assert int(main.tags["SamplesPerPixel"].value) == 3
                 assert main.tags.get("ExtraSamples") is None
                 assert len(main.pages) == 1
+                assert main.tags["SubIFDs"].dtype == tifffile.DATATYPE.LONG
                 assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
                 infrared = main.pages[0]
                 assert infrared.shape == (2, 3)
                 assert int(infrared.tags["NewSubfileType"].value) == 0
+                assert infrared.tags["NewSubfileType"].dtype == tifffile.DATATYPE.LONG
                 assert int(infrared.tags["BitsPerSample"].value) == 16
                 assert int(infrared.tags["SamplesPerPixel"].value) == 1
                 assert int(infrared.tags["PhotometricInterpretation"].value) == 1
-                assert infrared.tags["ImageDescription"].value == "Untouched scanner infrared plane"
-                assert infrared.tags[encoders._INFRARED_TAG].value == encoders._INFRARED_MARKER
+                assert int(main.tags["Orientation"].value) == 1
+                assert int(infrared.tags["Orientation"].value) == 1
+                assert (
+                    infrared.tags["ImageDescription"].dtype == tifffile.DATATYPE.ASCII
+                )
+                assert (
+                    infrared.tags["ImageDescription"].value
+                    == encoders._DNG_INFRARED_DESCRIPTION
+                )
+                assert infrared.tags.get(65001) is None
                 np.testing.assert_array_equal(infrared.asarray(), ir)
+
+    def test_exiftool_reports_no_dng_metadata_warning_or_serial_number(
+        self, tmp_path
+    ) -> None:
+        exiftool = shutil.which("exiftool")
+        if exiftool is None:
+            pytest.skip("ExifTool is not installed")
+
+        path = write_dng_linear(_result(with_ir=True), str(tmp_path / "representative"))
+        completed = subprocess.run(
+            [
+                exiftool,
+                "-validate",
+                "-warning",
+                "-error",
+                "-SubIFDs",
+                "-SerialNumber",
+                path,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        output = completed.stdout + completed.stderr
+        assert completed.returncode == 0, output
+        assert "Warning" not in output
+        assert "Error" not in output
+        assert "Serial Number" not in output
+        assert "SerialNumber" not in output
+
+    def test_rawpy_reads_linear_rgb_samples_exactly_when_available(
+        self, tmp_path
+    ) -> None:
+        rawpy = pytest.importorskip("rawpy")
+        height = width = 32  # LibRaw rejects unrealistically tiny raw rasters.
+        samples = np.arange(height * width, dtype=np.uint16).reshape(height, width)
+        rgb = np.stack(
+            (
+                samples,
+                np.bitwise_xor(samples, np.uint16(0xAAAA)),
+                np.uint16(65535) - samples,
+            ),
+            axis=2,
+        )
+        ir = np.bitwise_xor(samples, np.uint16(0x5555))
+        result = ScanResult(rgb=rgb, ir=ir, dpi=4000, device_model="LS-5000 ED")
+        path = write_dng_linear(result, str(tmp_path / "rawpy-rgb"))
+
+        with rawpy.imread(path) as raw:
+            readback = raw.raw_image_visible.copy()
+            assert raw.sizes.flip == 0
+
+        assert readback.shape[:2] == rgb.shape[:2]
+        np.testing.assert_array_equal(readback[:, :, :3], rgb)
 
     def test_adds_dng_extension(self) -> None:
         rgb = np.random.randint(0, 65535, (50, 50, 3), dtype=np.uint16)

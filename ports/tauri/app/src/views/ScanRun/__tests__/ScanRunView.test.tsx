@@ -3,7 +3,10 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SessionStore } from "../../../session/store/session";
+import {
+  ATTENDED_BINDING_REQUIRED_REASON,
+  SessionStore,
+} from "../../../session/store/session";
 import { createScriptedTransport } from "../../../session/testing/harness";
 import type { DeviceInfo, EngineError, ScanProject } from "../../../session/wire/types";
 import ScanRunView from "../ScanRunView";
@@ -407,5 +410,55 @@ describe("ScanRunView", () => {
     expect(receipt).toHaveTextContent("nikonlook-v2 hardwareExposure");
     expect(receipt).toHaveTextContent("auto-cropped");
     expect(receipt).toHaveTextContent("90° + left/right flip");
+  });
+
+  it("makes a zero-completed typed attended refusal prominent and explicitly reachable", async () => {
+    const fixture = await runFixture();
+    mocks.sessionStore = fixture.store;
+    for (const frameIndex of [1, 2, 3, 4, 13]) {
+      fixture.emitEvent({
+        event: "scan.frameState",
+        payload: { jobId: "job-1", frameIndex, state: "active", attempt: 1 },
+      });
+      fixture.emitEvent({
+        event: "scan.frameState",
+        payload: {
+          jobId: "job-1",
+          frameIndex,
+          state: "failed",
+          attempt: 1,
+          error: {
+            code: "MANUAL_REVIEW_REQUIRED",
+            message: "presentation wording is deliberately irrelevant",
+            recoverable: false,
+            reason: ATTENDED_BINDING_REQUIRED_REASON,
+          },
+        },
+      });
+    }
+    fixture.emitEvent({
+      event: "scan.completed",
+      payload: {
+        jobId: "job-1",
+        summary: {
+          completed: [],
+          failed: [13, 4, 3, 2, 1],
+          skipped: [],
+          stopped: false,
+        },
+      },
+    });
+
+    const user = userEvent.setup();
+    render(<ScanRunView jobId="job-1" />);
+    expect(screen.getByTestId("scan-sequence-error")).toHaveTextContent("SCAN_ZERO_COMPLETED");
+    const action = screen.getByTestId("approve-every-frame-and-retry");
+    expect(action).toBeEnabled();
+
+    await act(async () => {
+      await user.click(action);
+    });
+    expect(fixture.calls.filter((call) => call.method === "roll.approve")).toHaveLength(5);
+    expect(fixture.calls.filter((call) => call.method === "scan.start")).toHaveLength(2);
   });
 });

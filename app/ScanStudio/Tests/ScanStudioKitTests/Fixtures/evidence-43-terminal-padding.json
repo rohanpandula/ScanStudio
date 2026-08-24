@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "evidence-43-terminal-padding",
+  "operationId": "preview-43",
+  "sessionEpoch": "engine-session-43",
+  "operationKind": "preview",
+  "appBuild": "0.7.0-beta.3",
+  "engineBuild": "0.1.0+engine-43",
+  "bridgeBuild": "0.1.0+bridge-43",
+  "device": {
+    "model": "SUPER COOLSCAN 5000 ED",
+    "adapter": "SA-21",
+    "holder": "strip6"
+  },
+  "witness": {
+    "kind": "terminalPadding",
+    "recordCount": 91,
+    "byteCount": 5824,
+    "parity": "even",
+    "housekeepingBytes": [0, 0, 16, 0],
+    "nonzeroRGBCounts": [1, 0, 0],
+    "mismatchRecordIndex": 90
+  }
+}

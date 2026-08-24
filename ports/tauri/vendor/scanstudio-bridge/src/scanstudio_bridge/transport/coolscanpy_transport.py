@@ -87,7 +87,11 @@ from coolscanpy.roll.preview_session import (
 
 from scanstudio_bridge import domain, safety
 from scanstudio_bridge.exposure_authority import build_exposure_authority
-from scanstudio_bridge.protocol import BridgeError, ErrorCode
+from scanstudio_bridge.failed_attempt_evidence import (
+    EvidencePublicationError,
+    publish_index_failure,
+)
+from scanstudio_bridge.protocol import BridgeError, ErrorCode, to_wire
 from scanstudio_bridge.transport import FrameRetryExhausted, OnCall, phased_call
 from scanstudio_bridge.transport.output_reservation import (
     OutputReservations,
@@ -188,9 +192,6 @@ def _vendor_eject_confirm_settle_seconds() -> float:
         return _VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
     return value
 
-
-_DEVICE_VENDOR = "Nikon"
-_DEVICE_MODEL = "SUPER COOLSCAN 5000 ED"
 
 # The wire and CoolscanPy enum string VALUES do not match (see BRIDGE.md's
 # Types note) -- never assume they do, always translate explicitly.
@@ -756,6 +757,24 @@ class CoolscanPyTransport:
         # comment for why a filesystem scan is no longer trusted here.
         self._recorded_preview_attempt_journal: Path | None = None
 
+    def _failed_attempt_evidence(
+        self, error: IndexDecodeError
+    ) -> tuple[dict[str, object] | None, str | None]:
+        info = getattr(self._device, "info", None)
+        capabilities = getattr(info, "capabilities", None)
+        capacity = getattr(capabilities, "adapter_frame_capacity", 40)
+        try:
+            return (
+                publish_index_failure(
+                    error,
+                    base_dir=safety.DEFAULT_BASE_DIR,
+                    holder_capacity=capacity,
+                ),
+                None,
+            )
+        except EvidencePublicationError as publication_error:
+            return None, f"bounded diagnostic evidence unavailable: {publication_error}"
+
     # -- device lifecycle -----------------------------------------------------
 
     def list_devices(self) -> list[domain.DeviceInfo]:
@@ -765,19 +784,25 @@ class CoolscanPyTransport:
         if self._device is not None:
             raise BridgeError(ErrorCode.ALREADY_CONNECTED, "a device is already open")
         try:
-            self._device = coolscanpy.open(device_id)
+            opened_device = coolscanpy.open(device_id)
         except coolscanpy.DeviceNotFound as exc:
             raise BridgeError(ErrorCode.DEVICE_NOT_FOUND, str(exc)) from exc
         except coolscanpy.DeviceBusy as exc:
             raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
-        self._device_id = device_id
-        return domain.DeviceInfo(
-            device_id=device_id,
-            vendor=_DEVICE_VENDOR,
-            model=_DEVICE_MODEL,
-            capabilities=_capabilities_from_coolscanpy(self._device.capabilities),
-            supported=True,
-        )
+        info = getattr(opened_device, "info", None)
+        if not isinstance(info, coolscanpy.DeviceInfo) or not info.supported:
+            try:
+                opened_device.close()
+            except Exception:
+                pass
+            model = getattr(info, "model", "unverified scanner identity")
+            raise BridgeError(
+                ErrorCode.DEVICE_NOT_FOUND,
+                f"{model} is not a positively identified supported LS-5000",
+            )
+        self._device = opened_device
+        self._device_id = info.id
+        return _device_info_from_coolscanpy(info)
 
     def status(self) -> domain.DeviceStatus:
         if self._device is None:
@@ -931,6 +956,14 @@ class CoolscanPyTransport:
                 raise BridgeError(ErrorCode.ADAPTER_UNSUPPORTED, str(exc)) from exc
             except coolscanpy.FeederParked as exc:
                 raise BridgeError(ErrorCode.FEEDER_PARKED, str(exc)) from exc
+            except coolscanpy.TransportIndexRefused as exc:
+                evidence, unavailable_reason = self._failed_attempt_evidence(exc)
+                raise BridgeError(
+                    ErrorCode.REFEED_REQUIRED,
+                    str(exc),
+                    diagnostic_evidence=evidence,
+                    diagnostic_evidence_unavailable_reason=unavailable_reason,
+                ) from exc
             except coolscanpy.RefeedRequired as exc:
                 raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
             except coolscanpy.DeviceBusy as exc:
@@ -946,11 +979,14 @@ class CoolscanPyTransport:
                 # geometry defects, which are capture/driver faults a refeed
                 # cannot fix -- refeed-and-retry stays the first move, but the
                 # message must not sell a software fault as a film problem.
+                evidence, unavailable_reason = self._failed_attempt_evidence(exc)
                 raise BridgeError(
                     ErrorCode.REFEED_REQUIRED,
                     "transport read was not one uniform traversal; eject or refeed "
                     "the strip and run the preview again -- if this recurs on "
                     f"clean feeds it may be a capture or driver defect ({exc})",
+                    diagnostic_evidence=evidence,
+                    diagnostic_evidence_unavailable_reason=unavailable_reason,
                 ) from exc
             except RollSessionIntegrityError:
                 # Artifact/journal integrity faults are driver-side defects, not
@@ -1592,6 +1628,14 @@ class CoolscanPyTransport:
                     raise BridgeError(ErrorCode.FEEDER_PARKED, str(exc)) from exc
                 except coolscanpy.FingerprintRefused as exc:
                     raise BridgeError(ErrorCode.FINGERPRINT_REFUSED, str(exc)) from exc
+                except coolscanpy.TransportIndexRefused as exc:
+                    evidence, unavailable_reason = self._failed_attempt_evidence(exc)
+                    raise BridgeError(
+                        ErrorCode.REFEED_REQUIRED,
+                        str(exc),
+                        diagnostic_evidence=evidence,
+                        diagnostic_evidence_unavailable_reason=unavailable_reason,
+                    ) from exc
                 except coolscanpy.RefeedRequired as exc:
                     raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
                 except coolscanpy.GeometryValidationError as exc:
@@ -1606,6 +1650,15 @@ class CoolscanPyTransport:
                     # exposure -- surfaced as a friendly METER_UNUSABLE card,
                     # never INTERNAL. Guidance text is in the exception.
                     raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
+                except coolscanpy.MeterControllerRefused as exc:
+                    raise BridgeError(
+                        ErrorCode.METER_CONTROLLER_REFUSED,
+                        str(exc),
+                        details={
+                            "pass": exc.pass_number,
+                            "reasons": [to_wire(reason) for reason in exc.reasons],
+                        },
+                    ) from exc
                 except coolscanpy.RollMismatch as exc:
                     # Base-class fallback AFTER every mapped RollMismatch
                     # subclass above (FingerprintRefused, RefeedRequired;

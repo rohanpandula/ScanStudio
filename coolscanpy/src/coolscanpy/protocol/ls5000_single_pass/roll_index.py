@@ -41,6 +41,15 @@ MINIMUM_CONFIDENT_CLEAR_FILM_FRACTION = 0.95
 GAP_COUNT_FLOOR_ERROR_ID = "gap-count-floor"
 GAP_LATTICE_ANCHOR_ERROR_ID = "gap-lattice-anchor-floor"
 GAP_DIRECT_SUPPORT_ERROR_ID = "gap-direct-support-floor"
+TERMINAL_PADDING_ERROR_ID = "terminal-padding-mismatch"
+TRANSPORT_AFFINE_RESIDUAL_ERROR_ID = "transport-affine-residual"
+
+_MAX_FAILURE_RECORD_COUNT = 8_192
+_MAX_FAILURE_SOURCE_BYTES = 8 * 1024 * 1024
+_MAX_FAILURE_ANCHORS = 40
+_MAX_FAILURE_WITNESS_BYTES = 16 * 1024
+_MAX_ABSOLUTE_ROW_VALUE = 1_000_000_000.0
+_MAX_RESIDUAL_VALUE = 1_000.0
 
 # Wide-gap recovery (FEEDING-DETECTOR-ROUND-20260807): a clear-film run
 # wider than the 12-row narrow ceiling but no wider than this is treated
@@ -107,6 +116,225 @@ class IndexDecodeError(ValueError):
         super().__init__(full_message)
         self.error_id = error_id
         self.diagnostics = diagnostics
+
+
+def _failure_int(value: object, name: str, *, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a bounded whole number")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} is outside its bound")
+    return value
+
+
+def _failure_number(
+    value: object,
+    name: str,
+    *,
+    minimum: float = -_MAX_ABSOLUTE_ROW_VALUE,
+    maximum: float = _MAX_ABSOLUTE_ROW_VALUE,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a bounded number")
+    result = float(value)
+    if not math.isfinite(result) or not minimum <= result <= maximum:
+        raise ValueError(f"{name} is outside its bound")
+    return result
+
+
+def _require_exact_fields(
+    payload: object, expected: set[str], name: str
+) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise ValueError(f"{name} has unknown or missing fields")
+    return payload
+
+
+def replay_transport_failure_witness(payload: object) -> str:
+    """Validate and replay one bounded, numbers-only transport refusal.
+
+    The return value is the stable guard id whose decision the witness
+    reproduces. This function deliberately accepts neither source paths nor
+    image/table excerpts, and can run with no scanner or capture artifacts.
+    """
+
+    witness = _require_exact_fields(
+        payload,
+        (
+            {
+                "kind",
+                "record_count",
+                "byte_count",
+                "parity",
+                "housekeeping_byte_count",
+                "nonzero_rgb_count",
+                "mismatch_location",
+            }
+            if isinstance(payload, dict) and payload.get("kind") == "terminal_padding"
+            else {
+                "kind",
+                "anchors",
+                "transform",
+                "thresholds",
+                "mean_absolute_residual_rows",
+                "maximum_residual_rows",
+            }
+        ),
+        "transport failure witness",
+    )
+    try:
+        encoded = json.dumps(
+            witness,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError("transport failure witness is not JSON-safe") from error
+    if len(encoded) > _MAX_FAILURE_WITNESS_BYTES:
+        raise ValueError("transport failure witness exceeds its byte bound")
+
+    kind = witness["kind"]
+    if kind == "terminal_padding":
+        record_count = _failure_int(
+            witness["record_count"],
+            "terminal record_count",
+            minimum=1,
+            maximum=_MAX_FAILURE_RECORD_COUNT,
+        )
+        byte_count = _failure_int(
+            witness["byte_count"],
+            "terminal byte_count",
+            minimum=1,
+            maximum=_MAX_FAILURE_SOURCE_BYTES,
+        )
+        if witness["parity"] not in {"even", "odd"}:
+            raise ValueError("terminal parity is invalid")
+        _failure_int(
+            witness["housekeeping_byte_count"],
+            "terminal housekeeping_byte_count",
+            minimum=0,
+            maximum=byte_count,
+        )
+        _failure_int(
+            witness["nonzero_rgb_count"],
+            "terminal nonzero_rgb_count",
+            minimum=0,
+            maximum=record_count * 96 * INDEX_CHANNELS,
+        )
+        mismatch = _require_exact_fields(
+            witness["mismatch_location"],
+            {"record_index", "byte_offset"},
+            "terminal mismatch_location",
+        )
+        _failure_int(
+            mismatch["record_index"],
+            "terminal mismatch record_index",
+            minimum=0,
+            maximum=record_count - 1,
+        )
+        _failure_int(
+            mismatch["byte_offset"],
+            "terminal mismatch byte_offset",
+            minimum=0,
+            maximum=byte_count - 1,
+        )
+        return TERMINAL_PADDING_ERROR_ID
+
+    if kind != "affine":
+        raise ValueError("transport failure witness kind is unsupported")
+    anchors = witness["anchors"]
+    if not isinstance(anchors, list) or not 3 <= len(anchors) <= _MAX_FAILURE_ANCHORS:
+        raise ValueError("affine anchors are outside the three-to-40 bound")
+    transform = _require_exact_fields(
+        witness["transform"], {"slope", "intercept"}, "affine transform"
+    )
+    transform_slope = _failure_number(
+        transform["slope"],
+        "affine transform slope",
+        minimum=sys.float_info.min,
+    )
+    transform_intercept = _failure_number(
+        transform["intercept"], "affine transform intercept"
+    )
+    ordinals: set[int] = set()
+    residuals: list[float] = []
+    for index, raw_anchor in enumerate(anchors):
+        anchor = _require_exact_fields(
+            raw_anchor,
+            {"ordinal", "input_row", "observed_row", "fitted_row", "residual_rows"},
+            f"affine anchors[{index}]",
+        )
+        ordinal = _failure_int(
+            anchor["ordinal"],
+            f"affine anchors[{index}].ordinal",
+            minimum=0,
+            maximum=_MAX_FAILURE_ANCHORS - 1,
+        )
+        if ordinal in ordinals:
+            raise ValueError("affine anchors contain duplicate ordinals")
+        ordinals.add(ordinal)
+        input_row = _failure_number(
+            anchor["input_row"], f"affine anchors[{index}].input_row"
+        )
+        observed = _failure_number(
+            anchor["observed_row"], f"affine anchors[{index}].observed_row"
+        )
+        fitted = _failure_number(
+            anchor["fitted_row"], f"affine anchors[{index}].fitted_row"
+        )
+        residual = _failure_number(
+            anchor["residual_rows"],
+            f"affine anchors[{index}].residual_rows",
+            minimum=-_MAX_RESIDUAL_VALUE,
+            maximum=_MAX_RESIDUAL_VALUE,
+        )
+        expected_fitted = transform_intercept + transform_slope * input_row
+        expected_residual = (expected_fitted - observed) / transform_slope
+        if abs(expected_fitted - fitted) > 0.01:
+            raise ValueError("affine fitted row does not match the reported transform")
+        if abs(expected_residual - residual) > 0.01:
+            raise ValueError("affine anchor residual does not replay from the transform")
+        residuals.append(residual)
+    thresholds = _require_exact_fields(
+        witness["thresholds"],
+        {"maximum_mean_absolute_residual_rows", "maximum_residual_rows"},
+        "affine thresholds",
+    )
+    mean_threshold = _failure_number(
+        thresholds["maximum_mean_absolute_residual_rows"],
+        "affine mean threshold",
+        minimum=sys.float_info.min,
+        maximum=_MAX_RESIDUAL_VALUE,
+    )
+    maximum_threshold = _failure_number(
+        thresholds["maximum_residual_rows"],
+        "affine maximum threshold",
+        minimum=sys.float_info.min,
+        maximum=_MAX_RESIDUAL_VALUE,
+    )
+    mean_absolute = _failure_number(
+        witness["mean_absolute_residual_rows"],
+        "affine mean absolute residual",
+        minimum=0.0,
+        maximum=_MAX_RESIDUAL_VALUE,
+    )
+    maximum = _failure_number(
+        witness["maximum_residual_rows"],
+        "affine maximum residual",
+        minimum=0.0,
+        maximum=_MAX_RESIDUAL_VALUE,
+    )
+    calculated_mean = sum(abs(value) for value in residuals) / len(residuals)
+    calculated_maximum = max(abs(value) for value in residuals)
+    if abs(calculated_mean - mean_absolute) > 0.01:
+        raise ValueError("affine mean residual does not match its selected anchors")
+    if abs(calculated_maximum - maximum) > 0.01:
+        raise ValueError("affine maximum residual does not match its selected anchors")
+    if mean_absolute > maximum:
+        raise ValueError("affine mean residual exceeds its maximum")
+    if not (mean_absolute > mean_threshold or maximum > maximum_threshold):
+        raise ValueError("affine witness does not reproduce a refusal")
+    return TRANSPORT_AFFINE_RESIDUAL_ERROR_ID
 
 
 class LeadingFrameClippedError(IndexDecodeError):
@@ -618,15 +846,46 @@ def _validate_full_index_rows(rows: np.ndarray, usable_rows: int) -> dict:
     if len(padding):
         expected_housekeeping = final_housekeeping[usable_rows % 2]
         first = padding[0]
+        expected_record = np.concatenate(
+            (np.zeros(INDEX_RGB_WORDS_PER_ROW, dtype=rows.dtype), expected_housekeeping)
+        )
+        parity = "even" if usable_rows % 2 == 0 else "odd"
+
+        def terminal_witness(record_index: int, word_offset: int) -> dict[str, object]:
+            return {
+                "kind": "terminal_padding",
+                "record_count": int(len(padding)),
+                "byte_count": int(len(padding) * INDEX_ROW_WORDS * 2),
+                "parity": parity,
+                "housekeeping_byte_count": INDEX_TRAILER_WORDS * 2,
+                "nonzero_rgb_count": int(
+                    np.count_nonzero(padding[:, :INDEX_RGB_WORDS_PER_ROW])
+                ),
+                "mismatch_location": {
+                    "record_index": int(record_index),
+                    "byte_offset": int(
+                        record_index * INDEX_ROW_WORDS * 2 + word_offset * 2
+                    ),
+                },
+            }
+
         if bool(np.any(first[:INDEX_RGB_WORDS_PER_ROW])) or not np.array_equal(
             first[INDEX_RGB_WORDS_PER_ROW:], expected_housekeeping
         ):
+            mismatch_word = int(np.flatnonzero(first != expected_record)[0])
             raise IndexDecodeError(
-                "terminal padding does not begin with the expected blank row record"
+                "terminal padding does not begin with the expected blank row record",
+                error_id=TERMINAL_PADDING_ERROR_ID,
+                diagnostics=terminal_witness(0, mismatch_word),
             )
         if not bool(np.all(padding == first)):
+            mismatch_record, mismatch_word = np.argwhere(padding != first)[0]
             raise IndexDecodeError(
-                "terminal padding is not one byte-identical blank-row suffix"
+                "terminal padding is not one byte-identical blank-row suffix",
+                error_id=TERMINAL_PADDING_ERROR_ID,
+                diagnostics=terminal_witness(
+                    int(mismatch_record), int(mismatch_word)
+                ),
             )
         padding_record_type = (
             "even-housekeeping" if usable_rows % 2 == 0 else "sync-trailer"
@@ -1881,10 +2140,42 @@ def derive_transport_mapping(
     anchor_mae = float(np.mean(np.abs(residual_rows)))
     anchor_max = float(np.max(np.abs(residual_rows)))
     if anchor_mae > maximum_anchor_mae_rows or anchor_max > maximum_anchor_error_rows:
+        anchors = [
+            {
+                "ordinal": ordinal,
+                "input_row": float(input_row),
+                "observed_row": float(observed),
+                "fitted_row": float(fitted),
+                "residual_rows": float(residual),
+            }
+            for ordinal, (input_row, observed, fitted, residual) in enumerate(
+                zip(
+                    x,
+                    y,
+                    design @ np.asarray((intercept, scale)),
+                    residual_rows,
+                    strict=True,
+                )
+            )
+        ]
         raise IndexDecodeError(
             "transport anchor residual is inconsistent with one affine "
             f"preview traversal (MAE {anchor_mae:.3f} rows, max "
-            f"{anchor_max:.3f} rows)"
+            f"{anchor_max:.3f} rows)",
+            error_id=TRANSPORT_AFFINE_RESIDUAL_ERROR_ID,
+            diagnostics={
+                "kind": "affine",
+                "anchors": anchors,
+                "transform": {"slope": float(scale), "intercept": float(intercept)},
+                "thresholds": {
+                    "maximum_mean_absolute_residual_rows": float(
+                        maximum_anchor_mae_rows
+                    ),
+                    "maximum_residual_rows": float(maximum_anchor_error_rows),
+                },
+                "mean_absolute_residual_rows": anchor_mae,
+                "maximum_residual_rows": anchor_max,
+            },
         )
     leading_anchor_requires_review = False
     if leading_anchor is not None and leading_anchor not in fit_direct:

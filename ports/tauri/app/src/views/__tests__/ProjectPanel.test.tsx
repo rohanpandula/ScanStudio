@@ -24,8 +24,10 @@ vi.mock("../../session", () => mocks);
 
 const dialogMocks = vi.hoisted(() => ({ open: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: dialogMocks.open }));
+const pathMocks = vi.hoisted(() => ({ join: vi.fn() }));
 vi.mock("@tauri-apps/api/path", () => ({
   homeDir: () => Promise.resolve("/Users/test/"),
+  join: pathMocks.join,
 }));
 
 const PROJECT: ScanProject = {
@@ -103,6 +105,8 @@ function projectFixture(
 
 beforeEach(() => {
   dialogMocks.open.mockReset();
+  pathMocks.join.mockReset();
+  pathMocks.join.mockImplementation(async (...parts: string[]) => parts.join("/").replace(/\/+/g, "/"));
 });
 
 describe("ProjectPanel", () => {
@@ -322,7 +326,7 @@ describe("ProjectPanel", () => {
     expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
   });
 
-  it("passes the native picker's returned directory to createProject when one is chosen", async () => {
+  it("treats the chosen folder as a parent and creates in a fresh named child, never the selected directory itself", async () => {
     dialogMocks.open.mockResolvedValue("/Users/test/My Scans");
     const store = projectFixture((method) => {
       if (method !== "project.create") return undefined;
@@ -333,19 +337,19 @@ describe("ProjectPanel", () => {
     const user = userEvent.setup();
     render(<ProjectPanel />);
     await user.type(await screen.findByLabelText("Project name"), "Trip");
-    await user.click(screen.getByRole("button", { name: "Choose output folder" }));
+    await user.click(screen.getByRole("button", { name: "Choose parent folder" }));
     expect(dialogMocks.open).toHaveBeenCalledWith(
       expect.objectContaining({ directory: true, multiple: false }),
     );
     await act(async () => {
       await user.click(screen.getByRole("button", { name: "Create" }));
     });
-    expect(createSpy).toHaveBeenCalledWith(
-      "Trip",
-      "roll36",
-      36,
-      "positive",
+    const destination = createSpy.mock.calls[0][4];
+    expect(destination).not.toBe("/Users/test/My Scans");
+    expect(destination).toMatch(/^\/Users\/test\/My Scans\/trip-[0-9a-f-]{36}$/);
+    expect(pathMocks.join).toHaveBeenCalledWith(
       "/Users/test/My Scans",
+      expect.stringMatching(/^trip-[0-9a-f-]{36}$/),
     );
   });
 
@@ -360,11 +364,26 @@ describe("ProjectPanel", () => {
     const user = userEvent.setup();
     render(<ProjectPanel />);
     await user.type(await screen.findByLabelText("Project name"), "Trip");
-    await user.click(screen.getByRole("button", { name: "Choose output folder" }));
+    await user.click(screen.getByRole("button", { name: "Choose parent folder" }));
     await act(async () => {
       await user.click(screen.getByRole("button", { name: "Create" }));
     });
     expect(createSpy).toHaveBeenCalledWith("Trip", "roll36", 36, "positive", undefined);
+  });
+
+  it("opens an explicitly selected existing project instead of sending project.create", async () => {
+    dialogMocks.open.mockResolvedValue("/Users/test/My Existing Project");
+    const store = projectFixture();
+    mocks.sessionStore = store;
+    const createSpy = vi.spyOn(store, "createProject");
+    const openSpy = vi.spyOn(store, "openProject");
+    const user = userEvent.setup();
+    render(<ProjectPanel />);
+
+    await user.click(screen.getByRole("button", { name: "Open existing project…" }));
+
+    expect(openSpy).toHaveBeenCalledWith("/Users/test/My Existing Project");
+    expect(createSpy).not.toHaveBeenCalled();
   });
 
   it("renders an active-project banner with name, carrier, and frame count when a project is active", async () => {
@@ -427,5 +446,30 @@ describe("ProjectPanel", () => {
     expect(
       await screen.findByText("frameCount 41 exceeds roll36 capacity of 40"),
     ).toBeInTheDocument();
+  });
+
+  it("turns a typed project collision into an actionable Open Existing message", async () => {
+    const store = projectFixture((method) => {
+      if (method === "project.create") {
+        return {
+          error: {
+            code: "PROJECT_ALREADY_EXISTS",
+            message: "manifest already exists",
+            recoverable: false,
+          },
+        };
+      }
+      return undefined;
+    });
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<ProjectPanel />);
+    await user.type(await screen.findByLabelText("Project name"), "Trip");
+    await act(async () => {
+      await user.click(screen.getByRole("button", { name: "Create" }));
+    });
+    expect(await screen.findByTestId("project-error")).toHaveTextContent(
+      "A ScanStudio project already exists in that folder. Use Open existing project instead.",
+    );
   });
 });

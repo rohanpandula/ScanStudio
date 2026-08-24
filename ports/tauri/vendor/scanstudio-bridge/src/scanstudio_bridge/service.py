@@ -789,10 +789,22 @@ class BridgeService:
                     # scanner-addressable slots") rather than returning empty.
                     event_name = "roll.previewError"
                     event_payload = {"code": exc.code.value, "message": str(exc)}
+                    if exc.diagnostic_evidence is not None:
+                        event_payload["diagnosticEvidence"] = exc.diagnostic_evidence
+                    if exc.diagnostic_evidence_unavailable_reason is not None:
+                        event_payload["diagnosticEvidenceUnavailableReason"] = (
+                            exc.diagnostic_evidence_unavailable_reason
+                        )
                     telemetry_outcome = "error"
                     telemetry_kwargs = {
                         "material": material.value, "code": exc.code.value, "message": str(exc),
                     }
+                    if exc.diagnostic_evidence is not None:
+                        telemetry_kwargs["diagnostic_evidence"] = exc.diagnostic_evidence
+                    if exc.diagnostic_evidence_unavailable_reason is not None:
+                        telemetry_kwargs["diagnostic_evidence_unavailable_reason"] = (
+                            exc.diagnostic_evidence_unavailable_reason
+                        )
                 except Exception as exc:  # noqa: BLE001 -- boundary: every failure must reach the wire
                     event_name = "roll.previewError"
                     event_payload = {
@@ -1052,6 +1064,9 @@ class BridgeService:
             code: str,
             extra_attributes: dict[str, object] | None = None,
             attribution: str | None = None,
+            details: dict[str, object] | None = None,
+            diagnostic_evidence: dict[str, object] | None = None,
+            diagnostic_evidence_unavailable_reason: str | None = None,
         ) -> None:
             """Deliverable 1 (durable per-frame failure reasons): one
             `scan.frameFailed` telemetry entry (slot, reason_class,
@@ -1081,6 +1096,14 @@ class BridgeService:
             extra_telemetry: dict[str, object] = dict(extra_attributes or {})
             if attribution is not None:
                 extra_telemetry["attribution"] = attribution
+            if details is not None:
+                extra_telemetry["details"] = details
+            if diagnostic_evidence is not None:
+                extra_telemetry["diagnostic_evidence"] = diagnostic_evidence
+            if diagnostic_evidence_unavailable_reason is not None:
+                extra_telemetry["diagnostic_evidence_unavailable_reason"] = (
+                    diagnostic_evidence_unavailable_reason
+                )
             telemetry.record(
                 "scan.frameFailed",
                 "failed",
@@ -1096,6 +1119,14 @@ class BridgeService:
             }
             if attribution is not None:
                 wire_payload["attribution"] = attribution
+            if details is not None:
+                wire_payload["details"] = details
+            if diagnostic_evidence is not None:
+                wire_payload["diagnosticEvidence"] = diagnostic_evidence
+            if diagnostic_evidence_unavailable_reason is not None:
+                wire_payload["diagnosticEvidenceUnavailableReason"] = (
+                    diagnostic_evidence_unavailable_reason
+                )
             emit("scan.frameFailed", wire_payload)
             frame_reasons[slot] = reason_class
 
@@ -1105,6 +1136,9 @@ class BridgeService:
             code: str,
             *,
             attribution: str | None = None,
+            details: dict[str, object] | None = None,
+            diagnostic_evidence: dict[str, object] | None = None,
+            diagnostic_evidence_unavailable_reason: str | None = None,
         ) -> None:
             """`emit_frame_failed` from a raised exception: captures the
             exception's class + message + (if present) coolscanpy error
@@ -1132,6 +1166,11 @@ class BridgeService:
                 code=code,
                 extra_attributes=_coolscanpy_error_attributes(reason_exc),
                 attribution=attribution,
+                details=details,
+                diagnostic_evidence=diagnostic_evidence,
+                diagnostic_evidence_unavailable_reason=(
+                    diagnostic_evidence_unavailable_reason
+                ),
             )
 
         def on_progress(progress: domain.ScanProgress) -> None:
@@ -1368,18 +1407,48 @@ class BridgeService:
                             exc.__cause__ or exc,
                             exc.code.value,
                             attribution=_BATCH_PRE_FRAME_ATTRIBUTION if ambiguous else None,
+                            details=exc.details,
+                            diagnostic_evidence=exc.diagnostic_evidence,
+                            diagnostic_evidence_unavailable_reason=(
+                                exc.diagnostic_evidence_unavailable_reason
+                            ),
                         )
+                    error_details = (
+                        {} if exc.details is None else {"details": exc.details}
+                    )
+                    evidence_fields: dict[str, object] = {}
+                    if exc.diagnostic_evidence is not None:
+                        evidence_fields["diagnosticEvidence"] = exc.diagnostic_evidence
+                    if exc.diagnostic_evidence_unavailable_reason is not None:
+                        evidence_fields["diagnosticEvidenceUnavailableReason"] = (
+                            exc.diagnostic_evidence_unavailable_reason
+                        )
+                    telemetry_evidence_fields: dict[str, object] = {}
+                    if exc.diagnostic_evidence is not None:
+                        telemetry_evidence_fields["diagnostic_evidence"] = (
+                            exc.diagnostic_evidence
+                        )
+                    if exc.diagnostic_evidence_unavailable_reason is not None:
+                        telemetry_evidence_fields[
+                            "diagnostic_evidence_unavailable_reason"
+                        ] = exc.diagnostic_evidence_unavailable_reason
                     closing_telemetry = (
                         "error",
                         {
                             "job_id": job_id,
                             "code": exc.code.value,
                             "message": str(exc),
+                            **error_details,
+                            **telemetry_evidence_fields,
                             **scan_start_closure_fields(),
                         },
                     )
                     scan_error_payload = {
-                        "jobId": job_id, "code": exc.code.value, "message": str(exc)
+                        "jobId": job_id,
+                        "code": exc.code.value,
+                        "message": str(exc),
+                        **error_details,
+                        **evidence_fields,
                     }
                     summary = domain.ScanSummary(
                         completed=tuple(slot for slot in slots if slot in resolved_slots),

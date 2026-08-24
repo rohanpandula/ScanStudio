@@ -108,6 +108,93 @@ def test_write_error_writes_one_flushed_json_line() -> None:
     assert stream.flush_count == 1
 
 
+def test_write_error_preserves_bounded_structured_details() -> None:
+    stream = _RecordingStream()
+    details = {
+        "pass": 2,
+        "reasons": [
+            {
+                "code": "linearity_insufficient",
+                "channel": "G",
+                "validRawSamples": 12_800,
+                "requiredRawSamples": 256,
+                "validAggregateSamples": 0,
+                "requiredAggregateSamples": 24,
+            }
+        ],
+    }
+
+    write_error(
+        stream,
+        3,
+        BridgeError(
+            ErrorCode.METER_CONTROLLER_REFUSED,
+            "meter pass 2 controller refused",
+            details=details,
+        ),
+    )
+
+    assert json.loads(stream.getvalue())["error"] == {
+        "code": "METER_CONTROLLER_REFUSED",
+        "message": "meter pass 2 controller refused",
+        "recoverable": False,
+        "details": details,
+    }
+
+
+def test_write_error_preserves_diagnostic_evidence_without_changing_error() -> None:
+    stream = _RecordingStream()
+    evidence = {
+        "schemaVersion": 1,
+        "evidenceId": "failed-preview-42",
+        "witness": {
+            "kind": "terminalPadding",
+            "recordCount": 2,
+            "byteCount": 2048,
+            "parity": "even",
+            "housekeepingByteCount": 448,
+            "nonzeroRgbCount": 1,
+            "mismatchLocation": {"recordIndex": 1, "byteOffset": 1038},
+        },
+    }
+
+    write_error(
+        stream,
+        4,
+        BridgeError(
+            ErrorCode.REFEED_REQUIRED,
+            "original transport refusal",
+            diagnostic_evidence=evidence,
+        ),
+    )
+
+    assert json.loads(stream.getvalue())["error"] == {
+        "code": "REFEED_REQUIRED",
+        "message": "original transport refusal",
+        "recoverable": False,
+        "diagnosticEvidence": evidence,
+    }
+
+
+def test_write_error_carries_explicit_evidence_unavailable_reason() -> None:
+    stream = _RecordingStream()
+    write_error(
+        stream,
+        5,
+        BridgeError(
+            ErrorCode.REFEED_REQUIRED,
+            "original transport refusal",
+            diagnostic_evidence_unavailable_reason=(
+                "bounded diagnostic evidence could not be published"
+            ),
+        ),
+    )
+
+    assert json.loads(stream.getvalue())["error"][
+        "diagnosticEvidenceUnavailableReason"
+    ] == "bounded diagnostic evidence could not be published"
+
+
 def test_write_event_writes_one_flushed_json_line() -> None:
     stream = _RecordingStream()
     write_event(stream, "device.status", {"connected": True})

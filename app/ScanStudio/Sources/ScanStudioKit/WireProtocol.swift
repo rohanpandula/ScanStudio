@@ -54,15 +54,112 @@ public struct ResponseErrorEnvelope: Decodable, Sendable {
     public let error: ErrorPayload
 }
 
+/// Machine-readable failure discriminators the native client is allowed to
+/// branch on. Human-readable messages remain display/diagnostic text only.
+public enum ScanFailureCode {
+    public static let attendedBindingRequired = "ATTENDED_BINDING_REQUIRED"
+}
+
+public struct MeterControllerRefusalReason: Codable, Equatable, Sendable {
+    public let code: String
+    public let message: String
+    public let channel: String?
+    public let validRawSamples: Int?
+    public let requiredRawSamples: Int?
+    public let validAggregateSamples: Int?
+    public let requiredAggregateSamples: Int?
+}
+
+public struct MeterControllerRefusalDetails: Codable, Equatable, Sendable {
+    public let pass: Int
+    public let reasons: [MeterControllerRefusalReason]
+}
+
 public struct ErrorPayload: Codable, Equatable, Sendable {
     public let code: String
     public let message: String
     public let recoverable: Bool
+    public let details: MeterControllerRefusalDetails?
+    public let evidence: DiagnosticEvidenceReference?
+    public let diagnosticEvidence: DiagnosticEvidenceArtifact?
+    public let diagnosticEvidenceUnavailableReason: String?
 
-    public init(code: String, message: String, recoverable: Bool) {
+    public init(
+        code: String,
+        message: String,
+        recoverable: Bool,
+        details: MeterControllerRefusalDetails? = nil,
+        evidence: DiagnosticEvidenceReference? = nil,
+        diagnosticEvidence: DiagnosticEvidenceArtifact? = nil,
+        diagnosticEvidenceUnavailableReason: String? = nil
+    ) {
         self.code = code
         self.message = message
         self.recoverable = recoverable
+        self.details = details
+        self.evidence = evidence
+        self.diagnosticEvidence = diagnosticEvidence
+        self.diagnosticEvidenceUnavailableReason =
+            diagnosticEvidenceUnavailableReason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case code
+        case message
+        case recoverable
+        case details
+        case evidence
+        case diagnosticEvidence
+        case diagnosticEvidenceUnavailableReason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        code = try container.decode(String.self, forKey: .code)
+        message = try container.decode(String.self, forKey: .message)
+        recoverable = try container.decode(Bool.self, forKey: .recoverable)
+        details = try? container.decodeIfPresent(
+            MeterControllerRefusalDetails.self,
+            forKey: .details
+        )
+        evidence = try container.decodeIfPresent(
+            DiagnosticEvidenceReference.self,
+            forKey: .evidence
+        )
+        let suppliedReason = try container.decodeIfPresent(
+            String.self,
+            forKey: .diagnosticEvidenceUnavailableReason
+        )
+        do {
+            diagnosticEvidence = try container.decodeIfPresent(
+                DiagnosticEvidenceArtifact.self,
+                forKey: .diagnosticEvidence
+            )
+            diagnosticEvidenceUnavailableReason = suppliedReason
+        } catch {
+            // Evidence is additive. A future/malformed witness must never
+            // erase the typed terminal failure carrying it.
+            diagnosticEvidence = nil
+            diagnosticEvidenceUnavailableReason =
+                "bounded diagnostic evidence could not be decoded by this client"
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(code, forKey: .code)
+        try container.encode(message, forKey: .message)
+        try container.encode(recoverable, forKey: .recoverable)
+        try container.encodeIfPresent(details, forKey: .details)
+        try container.encodeIfPresent(evidence, forKey: .evidence)
+        try container.encodeIfPresent(
+            diagnosticEvidence,
+            forKey: .diagnosticEvidence
+        )
+        try container.encodeIfPresent(
+            diagnosticEvidenceUnavailableReason,
+            forKey: .diagnosticEvidenceUnavailableReason
+        )
     }
 }
 
@@ -88,11 +185,28 @@ public struct EngineRequestError: Error, Equatable, Sendable {
     public let code: String
     public let message: String
     public let recoverable: Bool
+    public let details: MeterControllerRefusalDetails?
+    public let evidence: DiagnosticEvidenceReference?
+    public let diagnosticEvidence: DiagnosticEvidenceArtifact?
+    public let diagnosticEvidenceUnavailableReason: String?
 
-    public init(code: String, message: String, recoverable: Bool) {
+    public init(
+        code: String,
+        message: String,
+        recoverable: Bool,
+        details: MeterControllerRefusalDetails? = nil,
+        evidence: DiagnosticEvidenceReference? = nil,
+        diagnosticEvidence: DiagnosticEvidenceArtifact? = nil,
+        diagnosticEvidenceUnavailableReason: String? = nil
+    ) {
         self.code = code
         self.message = message
         self.recoverable = recoverable
+        self.details = details
+        self.evidence = evidence
+        self.diagnosticEvidence = diagnosticEvidence
+        self.diagnosticEvidenceUnavailableReason =
+            diagnosticEvidenceUnavailableReason
     }
 }
 
@@ -122,10 +236,16 @@ public struct EmptyResult: Decodable, Sendable {}
 public struct HelloParams: Codable, Sendable {
     public let clientName: String
     public let protocolVersion: Int
+    public let clientBuild: String?
 
-    public init(clientName: String, protocolVersion: Int) {
+    public init(
+        clientName: String,
+        protocolVersion: Int,
+        clientBuild: String? = nil
+    ) {
         self.clientName = clientName
         self.protocolVersion = protocolVersion
+        self.clientBuild = clientBuild
     }
 }
 
@@ -1674,6 +1794,47 @@ public struct ThumbnailsFailedPayload: Decodable, Sendable {
     public let code: String
     public let message: String
     public let operationId: String?
+    public let evidence: DiagnosticEvidenceReference?
+    public let diagnosticEvidence: DiagnosticEvidenceArtifact?
+    public let diagnosticEvidenceUnavailableReason: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case code
+        case message
+        case operationId
+        case evidence
+        case diagnosticEvidence
+        case diagnosticEvidenceUnavailableReason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        code = try container.decode(String.self, forKey: .code)
+        message = try container.decode(String.self, forKey: .message)
+        operationId = try container.decodeIfPresent(
+            String.self,
+            forKey: .operationId
+        )
+        evidence = try container.decodeIfPresent(
+            DiagnosticEvidenceReference.self,
+            forKey: .evidence
+        )
+        let suppliedReason = try container.decodeIfPresent(
+            String.self,
+            forKey: .diagnosticEvidenceUnavailableReason
+        )
+        do {
+            diagnosticEvidence = try container.decodeIfPresent(
+                DiagnosticEvidenceArtifact.self,
+                forKey: .diagnosticEvidence
+            )
+            diagnosticEvidenceUnavailableReason = suppliedReason
+        } catch {
+            diagnosticEvidence = nil
+            diagnosticEvidenceUnavailableReason =
+                "bounded diagnostic evidence could not be decoded by this client"
+        }
+    }
 }
 
 public struct JobStatePayload: Decodable, Sendable {

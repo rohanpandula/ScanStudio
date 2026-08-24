@@ -23,6 +23,10 @@ use image::{ImageBuffer, Rgb};
 use serde::Serialize;
 
 use scanstudio_engine::bridge_protocol::*;
+use scanstudio_engine::diagnostic_evidence::{
+    AffineWitness, BridgeDiagnosticEvidence, DiagnosticAffineAnchor, DiagnosticAffineThresholds,
+    DiagnosticAffineTransform, DiagnosticWitness, DIAGNOSTIC_EVIDENCE_SCHEMA_VERSION,
+};
 
 const DEVICE_ID: &str = "bridge-ls5000-0";
 // Lane D, #14-C: a second, always-unsupported device id, reported alongside
@@ -30,6 +34,52 @@ const DEVICE_ID: &str = "bridge-ls5000-0";
 // engine's connect() decides per REQUESTED device id, not whichever device
 // this engine happened to see first in device.list.
 const UNSUPPORTED_DEVICE_ID: &str = "bridge-ls50-0";
+
+fn mock_refeed_evidence(evidence_id: &str) -> BridgeDiagnosticEvidence {
+    BridgeDiagnosticEvidence {
+        schema_version: DIAGNOSTIC_EVIDENCE_SCHEMA_VERSION,
+        evidence_id: evidence_id.to_string(),
+        witness: DiagnosticWitness::Affine(AffineWitness {
+            holder_capacity: 40,
+            anchors: vec![
+                DiagnosticAffineAnchor {
+                    ordinal: 0,
+                    input_row: 0.0,
+                    observed_row: -126.21,
+                    fitted_row: 0.0,
+                    residual_rows: 3.005,
+                },
+                DiagnosticAffineAnchor {
+                    ordinal: 1,
+                    input_row: 10.0,
+                    observed_row: 411.6,
+                    fitted_row: 420.0,
+                    residual_rows: 0.2,
+                },
+                DiagnosticAffineAnchor {
+                    ordinal: 2,
+                    input_row: 20.0,
+                    observed_row: 831.6,
+                    fitted_row: 840.0,
+                    residual_rows: 0.2,
+                },
+                DiagnosticAffineAnchor { ordinal: 3, input_row: 30.0, observed_row: 1251.6, fitted_row: 1260.0, residual_rows: 0.2 },
+                DiagnosticAffineAnchor { ordinal: 4, input_row: 40.0, observed_row: 1674.246, fitted_row: 1680.0, residual_rows: 0.137 },
+                DiagnosticAffineAnchor { ordinal: 5, input_row: 50.0, observed_row: 2091.6, fitted_row: 2100.0, residual_rows: 0.2 },
+            ],
+            transform: DiagnosticAffineTransform {
+                slope: 42.0,
+                intercept: 0.0,
+            },
+            thresholds: DiagnosticAffineThresholds {
+                maximum_mean_absolute_residual_rows: 0.5,
+                maximum_residual_rows: 3.0,
+            },
+            mean_absolute_residual_rows: 0.657,
+            maximum_residual_rows: 3.005,
+        }),
+    }
+}
 
 struct MockState {
     device_open: bool,
@@ -929,14 +979,16 @@ fn spawn_roll_preview_worker(
         if let Some(code) = preview_error_code {
             preview_established.store(false, Ordering::Release);
             preview_slot_count.store(0, Ordering::Release);
-            emit_event(
-                &tx,
-                "roll.previewError",
-                serde_json::json!({
-                    "code": code,
-                    "message": "mock preview failure",
-                }),
-            );
+            let mut payload = serde_json::json!({
+                "code": code,
+                "message": "mock preview failure",
+            });
+            if payload["code"] == "REFEED_REQUIRED" {
+                payload["diagnosticEvidence"] =
+                    serde_json::to_value(mock_refeed_evidence("mock-preview-refeed-evidence"))
+                        .expect("mock diagnostic evidence serializes");
+            }
+            emit_event(&tx, "roll.previewError", payload);
             return;
         }
         for slot in [1u32, 2, 3] {
@@ -1083,6 +1135,9 @@ fn spawn_scan_worker(
                     job_id: job_id.clone(),
                     code: code.clone(),
                     message: format!("mock scan.error: {code}"),
+                    details: None,
+                    diagnostic_evidence: (code == "REFEED_REQUIRED")
+                        .then(|| mock_refeed_evidence("mock-scan-refeed-evidence")),
                 },
             );
             emit_event(
@@ -1109,6 +1164,7 @@ fn spawn_scan_worker(
                     slot: 1,
                     code: emit_frame_failed_code.clone(),
                     message: format!("mock scan.frameFailed: frame 1 requires manual review ({emit_frame_failed_code})"),
+                    details: None,
                 },
             );
             emit_event(
@@ -1414,6 +1470,8 @@ fn respond_error(tx: &mpsc::Sender<String>, id: u64, code: BridgeErrorCode, mess
         code,
         message: message.to_string(),
         recoverable: false,
+        details: None,
+        diagnostic_evidence: None,
     };
     let response = BridgeErrorResponse::new(id, payload);
     match serde_json::to_string(&response) {

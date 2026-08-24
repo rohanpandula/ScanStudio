@@ -1335,6 +1335,9 @@ fn run_one_attempt(
                         code: ErrorCode::FeedJam,
                         message: format!("Simulated feed jam on frame {frame_index}"),
                         recoverable: true,
+                        details: None,
+                        evidence: None,
+                        diagnostic_evidence_unavailable_reason: None,
                     }),
                 },
             );
@@ -1584,6 +1587,9 @@ fn run_scan_job(
                             code: ErrorCode::Internal,
                             message: "unexpected repeated fault".to_string(),
                             recoverable: false,
+                            details: None,
+                            evidence: None,
+                            diagnostic_evidence_unavailable_reason: None,
                         }),
                     },
                 );
@@ -1733,6 +1739,9 @@ fn run_scan_job(
                                     code: write_err.code,
                                     message: write_err.message.clone(),
                                     recoverable: write_err.recoverable(),
+                                    details: None,
+                                    evidence: None,
+                                    diagnostic_evidence_unavailable_reason: None,
                                 }),
                             },
                         );

@@ -1191,6 +1191,7 @@ class _RefusalBatchProcess:
     job_path: Path
     session_journal_path: Path
     message: str
+    journal_overrides: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         job = json.loads(self.job_path.read_text(encoding="utf-8"))
@@ -1240,6 +1241,7 @@ class _RefusalBatchProcess:
                     "finished_unix": 0.0,
                     "unit_release_attempts": 1,
                     "unit_released": True,
+                    **self.journal_overrides,
                 }
             ),
             encoding="utf-8",
@@ -1789,9 +1791,18 @@ def _tampered_meter_spawner(events: list[str], *, tamper: str):
     return spawn
 
 
-def _refusal_spawner(message: str):
+def _refusal_spawner(
+    message: str,
+    *,
+    journal_overrides: dict[str, object] | None = None,
+):
     def make_refusal_process(job_path: Path, session_journal_path: Path) -> _RefusalBatchProcess:
-        return _RefusalBatchProcess(job_path, session_journal_path, message)
+        return _RefusalBatchProcess(
+            job_path,
+            session_journal_path,
+            message,
+            journal_overrides=dict(journal_overrides or {}),
+        )
 
     def spawn(
         argv: Sequence[str], *, cwd: Path, stdout: object, stderr: object
@@ -5407,6 +5418,114 @@ class TestRollMultiBatchHold:
 
 
 class TestRollBatchRefusal:
+    def test_meter_controller_record_raises_typed_refusal_with_all_reasons(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        reasons = [
+            {
+                "code": "linearity_insufficient",
+                "message": "too few unclipped pixels remain for pass-linearity proof",
+                "channel": "R",
+                "valid_raw_samples": 255,
+                "required_raw_samples": 256,
+                "valid_aggregate_samples": 28,
+                "required_aggregate_samples": 24,
+            },
+            {
+                "code": "linearity_insufficient",
+                "message": "too few unclipped pixels remain for pass-linearity proof",
+                "channel": "G",
+                "valid_raw_samples": 12_800,
+                "required_raw_samples": 256,
+                "valid_aggregate_samples": 0,
+                "required_aggregate_samples": 24,
+            },
+        ]
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_refusal_spawner(
+                "SynchronizedProtocolError: meter pass 2 controller refused: "
+                "linearity_insufficient, linearity_insufficient",
+                journal_overrides={
+                    "meter_controller_refusal": {"pass": 2, "reasons": reasons}
+                },
+            ),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(coolscanpy.MeterControllerRefused) as excinfo:
+                next(iter(roll.scan_many([1])))
+
+            error = excinfo.value
+            assert not isinstance(error, coolscanpy.RollMismatch)
+            assert error.pass_number == 2
+            assert [reason.channel for reason in error.reasons] == ["R", "G"]
+            assert error.to_dict() == {"pass": 2, "reasons": reasons}
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_transport_failure_record_raises_typed_refeed_with_witness(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        witness = {
+            "kind": "affine",
+            "anchors": [
+                {
+                    "ordinal": ordinal,
+                    "input_row": ordinal * 10.0,
+                    "observed_row": ordinal * 420.0 - residual * 42.0,
+                    "fitted_row": ordinal * 420.0,
+                    "residual_rows": residual,
+                }
+                for ordinal, residual in enumerate((3.005, 0.2, 0.2, 0.2, 0.137, 0.2))
+            ],
+            "transform": {"slope": 42.0, "intercept": 0.0},
+            "thresholds": {
+                "maximum_mean_absolute_residual_rows": 1.0,
+                "maximum_residual_rows": 2.0,
+            },
+            "mean_absolute_residual_rows": 0.657,
+            "maximum_residual_rows": 3.005,
+        }
+        message = (
+            "SynchronizedProtocolError: transport anchor residual is inconsistent "
+            "with one affine preview traversal (MAE 0.657 rows, max 3.005 rows)"
+        )
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_refusal_spawner(
+                message,
+                journal_overrides={
+                    "transport_failure_evidence": {
+                        "error_id": "transport-affine-residual",
+                        "witness": witness,
+                    }
+                },
+            ),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(coolscanpy.TransportIndexRefused) as excinfo:
+                next(iter(roll.scan_many([1])))
+
+            error = excinfo.value
+            assert isinstance(error, coolscanpy.RefeedRequired)
+            assert error.error_id == "transport-affine-residual"
+            assert error.diagnostics == witness
+            assert str(error) == message
+        finally:
+            roll.close()
+            dev.close()
+
     def test_fingerprint_mismatch_message_raises_fingerprint_refused(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
@@ -5941,19 +6060,13 @@ class TestSaneLaneDiscoveryGate:
             )
         ) == ("LS-4000 ED", False)
 
-    def test_sane_listed_unrecognized_coolscan3_model_stays_supported(
+    def test_sane_listed_unrecognized_coolscan3_model_is_visible_but_unsupported(
         self,
         fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
     ) -> None:
-        # R2 (reviewer's call): this backend's device family is closed to
-        # the models coolscan3.c's identification table names -- a
-        # coolscan3: id whose model string matches none of them is most
-        # plausibly a firmware/model-string variant of the one model this
-        # package actually drives, not a foreign device (get_devices()
-        # already filtered to coolscan3: ids). Bricking a genuine LS-5000
-        # on an exact-string mismatch would be worse than the reverse, so
-        # this defaults supported=True with the raw reported string
-        # preserved (not relabeled) instead of failing closed.
+        # #103: a coolscan3: prefix identifies only the broad SANE backend,
+        # not the exact scanner body. Unknown models remain visible under
+        # their reported identity but must never become connectable.
         fake_sane_module(
             [
                 (
@@ -5969,13 +6082,78 @@ class TestSaneLaneDiscoveryGate:
 
         assert len(devices) == 1
         assert devices[0].model == "Coolscan Mystery Model"
+        assert devices[0].supported is False
+
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000")
+
+    @pytest.mark.parametrize(
+        "reported_model",
+        (
+            "",
+            "LS-5000",
+            "LS-5000 ED prototype",
+            "SUPER LS-5000 ED",
+            "ls-5000 ed",
+            "Coolscan Mystery Model",
+        ),
+    )
+    def test_sane_support_requires_the_exact_ls5000_identity(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+        reported_model: str,
+    ) -> None:
+        fake_sane_module(
+            [("coolscan3:usb:001:009", "Nikon", reported_model, "film scanner")]
+        )
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].model == reported_model
+        assert devices[0].supported is False
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("coolscan3:usb:001:009")
+
+    @pytest.mark.parametrize(
+        "device_id",
+        (
+            "coolscan3:usb:001:002",
+            "net:scanner:coolscan3:usb:001:002",
+        ),
+    )
+    def test_local_and_network_ls5000_accept_conservative_whitespace_normalization(
+        self,
+        fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
+        device_id: str,
+    ) -> None:
+        fake_sane_module(
+            [(device_id, "Nikon", "  LS-5000\t ED  ", "film scanner")]
+        )
+
+        devices = coolscanpy.get_devices()
+
+        assert len(devices) == 1
+        assert devices[0].model == "LS-5000 ED"
         assert devices[0].supported is True
 
-        dev = coolscanpy.open("ls5000")
-        try:
-            assert dev._info.supported is True
-        finally:
-            dev.close()
+    def test_unknown_sane_identity_refuses_before_public_plain_scan(
+        self,
+        fake_service_factory: Callable[[list[ScannerDevice]], _FakeBackend],
+    ) -> None:
+        unknown = ScannerDevice(
+            id="coolscan3:usb:001:009",
+            vendor="Nikon",
+            model="Coolscan Mystery Model",
+            capabilities=_caps(),
+        )
+        backend = fake_service_factory([unknown])
+
+        for device_name in ("ls5000", unknown.id):
+            with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+                coolscanpy.open(device_name)
+
+        assert backend.scan_calls == []
 
 
 # ===========================================================================
