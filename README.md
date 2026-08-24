@@ -62,8 +62,10 @@ A release DMG contains the app, the GPL hardware bridge and CoolscanPy source
 required for redistribution, and the applicable dependency notices. The
 supported LS-5000 color-roll workflow uses the signed libusb copy inside the
 app, so installing ScanStudio does not require Homebrew, SANE, or a Nikon
-driver. The optional software-eject and legacy plain-scan paths still need a
-system SANE backend.
+driver. Software eject is likewise direct over USB (the traced unload
+sequence, with typed failures and presence confirmation) and needs no SANE.
+Only the legacy plain-scan path still requires a system SANE backend, which
+also remains how SANE-based discovery lists scanners.
 
 For scripting, or for running the FireWire probe without the app, the bundled
 driver is also published on its own:

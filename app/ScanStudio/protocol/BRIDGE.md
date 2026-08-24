@@ -240,6 +240,15 @@ Strictly-below-90% coverage is not a thumbnail at all: it is a `REFEED_REQUIRED`
 failure. An absent/omitted `partial` means a full frame; old readers ignore the
 additive key.
 
+The >=90% band applies to TRAILING frames only, whose end may run past the
+captured preview while the rest of the roll stays usable. The leading edge is
+deliberately asymmetric: a first frame clipped by more than its final preview
+row refuses the whole preview up front (`LeadingFrameClippedError`,
+`REFEED_REQUIRED`) because a cropped leading frame cannot be scanned whole --
+no automatic cropped frame is created. After such a refusal the operator
+refeeds the film slightly deeper; manual placement can review what was
+captured but cannot restore pixels the scanner never saw.
+
 BoundarySnap
   boundaryIndex: number
   requestedRow: number

@@ -16,7 +16,7 @@ struct ErrorPresentationPolicyTests {
         #expect(presentation.title == "The first frame is not fully inside the scanner")
         #expect(
             presentation.guidance
-                == "Reinsert the film a little farther into the adapter, then preview it again. ScanStudio did not offer the cropped frame for scanning."
+                == "Reinsert the film a little farther into the adapter, then preview it again. ScanStudio did not automatically crop this frame for scanning; manual placement can review the captured area, but it cannot restore the missing part of the frame."
         )
         #expect(presentation.technicalDetails == rawMessage)
     }
