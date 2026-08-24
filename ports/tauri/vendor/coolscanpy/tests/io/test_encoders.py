@@ -10,6 +10,7 @@ stayed in coolscanpy.receipts.writer; see tests/receipts/test_writer.py.
 """
 
 import os
+import struct
 import tempfile
 
 import numpy as np
@@ -19,6 +20,12 @@ import tifffile
 from coolscanpy.session.result import ScanResult
 from coolscanpy.io import encoders
 from coolscanpy.io.encoders import write_dng_linear, write_tiff_16bit
+from coolscanpy.receipts.tiff_contract import (
+    LEGACY_SCANNER_INFRARED_TAGS,
+    SCANNER_INFRARED_MARKER,
+    SCANNER_INFRARED_TAG,
+    has_scanner_infrared_marker,
+)
 
 
 class TestTiffWriter:
@@ -157,7 +164,7 @@ class TestDngWriter:
                 assert int(infrared.tags["SamplesPerPixel"].value) == 1
                 assert int(infrared.tags["PhotometricInterpretation"].value) == 1
                 assert infrared.tags["ImageDescription"].value == "Untouched scanner infrared plane"
-                assert infrared.tags[encoders._INFRARED_TAG].value == encoders._INFRARED_MARKER
+                assert infrared.tags[SCANNER_INFRARED_TAG].value == SCANNER_INFRARED_MARKER
                 np.testing.assert_array_equal(infrared.asarray(), ir)
 
     def test_adds_dng_extension(self) -> None:
@@ -201,6 +208,111 @@ def _result(with_ir: bool = True) -> ScanResult:
     rgb = np.random.randint(0, 65535, (20, 30, 3), dtype=np.uint16)
     ir = np.random.randint(0, 65535, (20, 30), dtype=np.uint16) if with_ir else None
     return ScanResult(rgb=rgb, ir=ir, dpi=1200, device_model="TestScanner")
+
+
+class TestIssue105DngMetadata:
+    """Regression tests for the #105 metadata-hygiene change.
+
+    New Linear DNGs must carry the infrared marker under the collision-free
+    private tag 65010 (not 65001, which ExifTool reports as SerialNumber for
+    Nikon files) and must encode the SubIFDs pointer with the TIFF/EP LONG
+    field type 4 (not tifffile's classic-TIFF type 13). Pixel bytes are
+    unchanged by both edits, and pre-#105 files stay readable.
+    """
+
+    def test_subifd_pointer_uses_tiff_ep_long_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = write_dng_linear(_result(with_ir=True), os.path.join(tmpdir, "ir.dng"))
+            with open(path, "rb") as handle:
+                raw = handle.read()
+
+            # Authoritative byte-level check: walk the first IFD from the
+            # header and read the SubIFDs entry's field type directly.
+            ifd_offset = struct.unpack_from("<I", raw, 4)[0]
+            entry_count = struct.unpack_from("<H", raw, ifd_offset)[0]
+            subifds_type = None
+            for index in range(entry_count):
+                base = ifd_offset + 2 + index * 12
+                code = struct.unpack_from("<H", raw, base)[0]
+                if code == 330:
+                    subifds_type = struct.unpack_from("<H", raw, base + 2)[0]
+                    break
+            assert subifds_type is not None, "embedded-IR DNG must have a SubIFDs pointer"
+            # Issue #105: type 13 (TIFF "IFD") triggered ExifTool's datatype
+            # warning; TIFF/EP LONG is the required encoding.
+            assert subifds_type == 4
+
+            with tifffile.TiffFile(path) as tf:
+                main = tf.pages[0]
+                assert int(main.tags["SubIFDs"].dtype) == 4
+                # The pointer value survives the retype unchanged.
+                assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
+
+    def test_new_dng_carries_no_conflicting_private_marker(self) -> None:
+        rgb = np.arange(2 * 3 * 3, dtype=np.uint16).reshape(2, 3, 3)
+        ir = np.arange(2 * 3, dtype=np.uint16).reshape(2, 3)
+        result = ScanResult(rgb=rgb, ir=ir, dpi=1200, device_model="TestScanner")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = write_dng_linear(result, os.path.join(tmpdir, "marker.dng"))
+            with tifffile.TiffFile(path) as tf:
+                main = tf.pages[0]
+                infrared = main.pages[0]
+                assert SCANNER_INFRARED_TAG in infrared.tags
+                assert infrared.tags[SCANNER_INFRARED_TAG].value == SCANNER_INFRARED_MARKER
+                for legacy_code in LEGACY_SCANNER_INFRARED_TAGS:
+                    assert legacy_code not in main.tags, (
+                        "#105: the retired SerialNumber-colliding code must not appear in new output"
+                    )
+                    assert legacy_code not in infrared.tags
+                assert has_scanner_infrared_marker(infrared.tags)
+
+    def test_legacy_pre_105_files_still_discover_and_decode(self) -> None:
+        """A file written by a pre-#105 release (marker under 65001, SubIFDs
+        typed 13) keeps decoding pixel-exactly and stays discoverable."""
+        rgb = np.arange(2 * 3 * 3, dtype=np.uint16).reshape(2, 3, 3)
+        ir = ((np.arange(2 * 3) + 60000).reshape(2, 3) % 65536).astype(np.uint16)
+        result = ScanResult(rgb=rgb, ir=ir, dpi=1200, device_model="TestScanner")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = write_dng_linear(result, os.path.join(tmpdir, "legacy.dng"))
+            with open(path, "rb") as handle:
+                raw = bytearray(handle.read())
+
+            def find_entry(buf: bytearray, ifd_offset: int, wanted_tag: int) -> int:
+                """Return the byte offset of one 12-byte IFD entry."""
+                entry_count = struct.unpack_from("<H", buf, ifd_offset)[0]
+                for index in range(entry_count):
+                    base = ifd_offset + 2 + index * 12
+                    if struct.unpack_from("<H", buf, base)[0] == wanted_tag:
+                        return base
+                raise AssertionError(f"tag {wanted_tag} not found in IFD at {ifd_offset}")
+
+            main_ifd = struct.unpack_from("<I", raw, 4)[0]
+            # Reproduce the exact pre-#105 encoding: LONG pointer -> type 13,
+            # and the marker payload moved back under tag 65001. Neither edit
+            # moves any other byte. The infrared IFD is reached through the
+            # SubIFDs value, never the top-level page chain.
+            subifds_entry = find_entry(raw, main_ifd, 330)
+            struct.pack_into("<H", raw, subifds_entry + 2, 13)
+            infrared_ifd = struct.unpack_from("<I", raw, subifds_entry + 8)[0]
+            marker_entry = find_entry(raw, infrared_ifd, SCANNER_INFRARED_TAG)
+            struct.pack_into("<H", raw, marker_entry, LEGACY_SCANNER_INFRARED_TAGS[0])
+            legacy_path = os.path.join(tmpdir, "legacy-pre105.dng")
+            with open(legacy_path, "wb") as handle:
+                handle.write(bytes(raw))
+
+            with tifffile.TiffFile(legacy_path) as tf:
+                main = tf.pages[0]
+                assert len(tf.pages) == 1
+                np.testing.assert_array_equal(main.asarray(), rgb)
+                infrared = main.pages[0]
+                np.testing.assert_array_equal(infrared.asarray(), ir)
+                assert infrared.tags[LEGACY_SCANNER_INFRARED_TAGS[0]].value == SCANNER_INFRARED_MARKER
+                assert SCANNER_INFRARED_TAG not in infrared.tags
+                assert has_scanner_infrared_marker(infrared.tags), (
+                    "#105 readers must keep accepting files exported before the marker move"
+                )
 
 
 def test_backup_name_stays_reserved_until_atomic_replace(tmp_path) -> None:

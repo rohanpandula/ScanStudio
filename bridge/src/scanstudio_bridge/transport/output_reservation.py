@@ -362,6 +362,20 @@ def write_tiff(
     reservations.mark_written(path)
 
 
+def _scanner_infrared_extratag() -> tuple[Any, Any, Any, Any, bool]:
+    """Return the versioned infrared-marker tag from CoolscanPy's contract.
+
+    The import stays lazy like the other CoolscanPy touchpoints: importing it
+    at module scope would pull the scanning package into every transport that
+    only reserves output paths. Issue #105 replaced the literal 65001 tuple
+    with this shared constant so writer and discovery readers cannot drift.
+    """
+
+    from coolscanpy.receipts.tiff_contract import SCANNER_INFRARED_EXTRATAG
+
+    return SCANNER_INFRARED_EXTRATAG
+
+
 def write_raw_export(
     reservations: OutputReservations,
     path: Path,
@@ -418,8 +432,11 @@ def write_raw_export(
                     raise ValueError("fourth-channel linear TIFF requires an infrared capture plane")
                 data = np.ascontiguousarray(np.dstack((rgb, ir)))
                 kwargs["extrasamples"] = (0,)
+                # Issue #105: the marker moved from private tag 65001, which
+                # ExifTool reports as SerialNumber for Nikon files, to the
+                # collision-free code 65010 defined next to the RGB contract.
                 kwargs["extratags"] = [
-                    (65001, "s", 0, "scanstudio.infrared.linear.uint16.v1", True)
+                    _scanner_infrared_extratag(),
                 ]
             with reservations.open_for_write(path) as file:
                 tifffile.imwrite(_NamedReservationFile(file, path), data, **kwargs)
@@ -442,7 +459,11 @@ def write_raw_export(
                         (254, "I", 1, 0, True),
                         (274, "H", 1, 1, True),
                         (270, "s", 0, "Untouched scanner infrared plane", True),
-                        (65001, "s", 0, "scanstudio.infrared.linear.uint16.v1", True),
+                        # Issue #105: same 65001 -> 65010 marker move as the
+                        # embedded-IR paths above, so every artifact shares
+                        # one contract constant and legacy files stay
+                        # discoverable through the tolerant reader.
+                        _scanner_infrared_extratag(),
                     ],
                 )
                 file.flush()

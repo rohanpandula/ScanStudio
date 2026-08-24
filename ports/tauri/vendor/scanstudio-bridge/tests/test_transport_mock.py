@@ -16,6 +16,11 @@ import numpy as np
 import pytest
 import tifffile
 
+from coolscanpy.receipts.tiff_contract import (
+    LEGACY_SCANNER_INFRARED_TAGS,
+    SCANNER_INFRARED_MARKER,
+    SCANNER_INFRARED_TAG,
+)
 from scanstudio_bridge import domain, safety
 from scanstudio_bridge.protocol import BridgeError, ErrorCode
 from scanstudio_bridge.transport import FrameRetryExhausted
@@ -760,7 +765,16 @@ def test_start_scan_writes_linear_dng_with_embedded_ir_subifd(
         assert len(main.pages) == 1
         assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
         np.testing.assert_array_equal(main.pages[0].asarray(), infrared)
-        assert main.pages[0].tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+        assert (
+            main.pages[0].tags[SCANNER_INFRARED_TAG].value
+            == "scanstudio.infrared.linear.uint16.v1"
+            == SCANNER_INFRARED_MARKER
+        )
+        for legacy_code in LEGACY_SCANNER_INFRARED_TAGS:
+            # Issue #105: 65001 collides with ExifTool's SerialNumber mapping
+            # and must not appear in new output.
+            assert legacy_code not in main.tags
+            assert legacy_code not in main.pages[0].tags
 
 
 @pytest.mark.parametrize(
@@ -805,10 +819,12 @@ def test_start_scan_writes_linear_tiff_ir_choice(
         if has_extra_sample:
             assert tuple(int(value) for value in page.extrasamples) == (0,)
             np.testing.assert_array_equal(page.asarray()[..., 3], infrared)
-            assert page.tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+            assert page.tags[SCANNER_INFRARED_TAG].value == SCANNER_INFRARED_MARKER
+            for legacy_code in LEGACY_SCANNER_INFRARED_TAGS:
+                assert legacy_code not in page.tags
         else:
             assert page.extrasamples == ()
-            assert page.tags.get(65001) is None
+            assert page.tags.get(SCANNER_INFRARED_TAG) is None
 
 
 @pytest.mark.parametrize(
@@ -856,7 +872,7 @@ def test_start_scan_writes_grayscale_ir_sidecar_pair(
         main = tiff.pages[0]
         assert int(main.tags["SamplesPerPixel"].value) == 3
         assert main.tags.get("SubIFDs") is None
-        assert main.tags.get(65001) is None
+        assert main.tags.get(SCANNER_INFRARED_TAG) is None
         np.testing.assert_array_equal(main.asarray(), rgb)
     with tifffile.TiffFile(ir_path) as tiff:
         sidecar = tiff.pages[0]
@@ -865,7 +881,7 @@ def test_start_scan_writes_grayscale_ir_sidecar_pair(
         assert int(sidecar.tags["SamplesPerPixel"].value) == 1
         assert int(sidecar.tags["PhotometricInterpretation"].value) == 1
         assert int(sidecar.tags["Orientation"].value) == 1
-        assert sidecar.tags[65001].value == "scanstudio.infrared.linear.uint16.v1"
+        assert sidecar.tags[SCANNER_INFRARED_TAG].value == SCANNER_INFRARED_MARKER
         assert sidecar.tags["XResolution"].value == (4000, 1)
         assert sidecar.tags["YResolution"].value == (4000, 1)
         assert int(sidecar.tags["ResolutionUnit"].value) == 2

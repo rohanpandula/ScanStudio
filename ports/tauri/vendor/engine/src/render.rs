@@ -7211,7 +7211,12 @@ fn write_tiff_create_only_authorized(
     write_tiff_create_only_authorized_with_hook(output, raw, width, height, bit_depth, |_| Ok(()))
 }
 
-const RAW_IR_TAG: u16 = 65_001;
+// Issue #105: the infrared marker moved from 65001 (0xFDE9), which ExifTool
+// reports as `SerialNumber` for files whose Make claims Nikon, to 65010
+// (0xFDF2), a private-range code ExifTool leaves unnamed. The ASCII payload
+// is unchanged, and readers accept both codes so pre-#105 files stay
+// discoverable.
+const RAW_IR_TAG: u16 = 65_010;
 const RAW_IR_MARKER: &[u8] = b"scanstudio.infrared.linear.uint16.v1\0";
 
 #[derive(Debug, Clone)]
@@ -7397,6 +7402,11 @@ fn dng_main_entries(
         RawTiffEntry::ascii(272, "Nikon Coolscan Simulator"),
     ]);
     if let Some(infrared_ifd_offset) = infrared_ifd_offset {
+        // Issue #105: TIFF/EP and DNG require the SubIFDs pointer to use
+        // field type 4 (LONG); a type-13 (TIFF "IFD") pointer makes strict
+        // readers such as ExifTool warn about a non-standard format. This
+        // writer always emitted LONG; the CoolscanPy encoder now patches
+        // its tifffile-emitted pointer to match.
         entries.push(RawTiffEntry::long(330, &[infrared_ifd_offset]));
     }
     entries.extend([
