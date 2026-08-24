@@ -428,4 +428,33 @@ describe("ProjectPanel", () => {
       await screen.findByText("frameCount 41 exceeds roll36 capacity of 40"),
     ).toBeInTheDocument();
   });
+
+  it("shows typed actionable guidance when the engine refuses create because the project already exists", async () => {
+    const store = projectFixture((method) => {
+      if (method === "project.create") {
+        return {
+          error: {
+            code: "PROJECT_ALREADY_EXISTS",
+            message:
+              "refusing to create a project at /scans/trip: a manifest.json already exists — open the existing project or choose a different directory; the existing project was not modified",
+            recoverable: false,
+          },
+        };
+      }
+      return undefined;
+    });
+    mocks.sessionStore = store;
+    const user = userEvent.setup();
+    render(<ProjectPanel />);
+    await user.type(await screen.findByLabelText("Project name"), "Trip");
+    await act(async () => {
+      await user.click(screen.getByRole("button", { name: "Create" }));
+    });
+    const typedError = await screen.findByTestId("project-already-exists-error");
+    expect(typedError).toHaveTextContent(/already contains a ScanStudio project/i);
+    expect(typedError).toHaveTextContent(/Open the existing project under Open Recent/i);
+    expect(typedError).not.toHaveTextContent("manifest.json");
+    // The raw engine detail must not leak through the generic channel too.
+    expect(screen.queryByTestId("project-error")).toBeNull();
+  });
 });

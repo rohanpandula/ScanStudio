@@ -199,6 +199,12 @@ public enum ErrorPresentationPolicy {
             guidance: "Save this roll or open its existing project, then try again."
         ),
         Copy(
+            code: "PROJECT_ALREADY_EXISTS",
+            title: "That folder already has a project",
+            guidance: "ScanStudio will not overwrite an existing project. "
+                + "Open it from Open Recent, or choose a different folder for the new roll."
+        ),
+        Copy(
             code: "ARCHIVE_COLLISION",
             title: "A master TIFF already exists",
             guidance: "Choose a different name or save location. ScanStudio will not overwrite an archive master."

@@ -170,6 +170,11 @@ struct ErrorPresentationPolicyTests {
                 "Save this roll or open its existing project, then try again."
             ),
             (
+                "PROJECT_ALREADY_EXISTS: refusing to create a project at /scans/trip — a manifest.json already exists — open the existing project or choose a different directory; the existing project was not modified",
+                "That folder already has a project",
+                "ScanStudio will not overwrite an existing project. Open it from Open Recent, or choose a different folder for the new roll."
+            ),
+            (
                 "ARCHIVE_COLLISION: an archive master already exists",
                 "A master TIFF already exists",
                 "Choose a different name or save location. ScanStudio will not overwrite an archive master."
