@@ -728,17 +728,14 @@ def test_start_scan_writes_linear_dng_with_embedded_ir_subifd(
         # SubIFDs pointer; tifffile's classic-TIFF type-13 form is patched.
         assert int(main.tags["SubIFDs"].dtype) == 4
         assert main.tags["SubIFDs"].value == (main.pages[0].offset,)
-        np.testing.assert_array_equal(main.pages[0].asarray(), infrared)
+        embedded_ir = main.pages[0]
+        np.testing.assert_array_equal(embedded_ir.asarray(), infrared)
         assert (
-            main.pages[0].tags[SCANNER_INFRARED_TAG].value
-            == "scanstudio.infrared.linear.uint16.v1"
-            == SCANNER_INFRARED_MARKER
+            embedded_ir.tags["ImageDescription"].value
+            == "Untouched Nikon Coolscan infrared plane"
         )
-        for legacy_code in LEGACY_SCANNER_INFRARED_TAGS:
-            # Issue #105: 65001 collides with ExifTool's SerialNumber mapping
-            # and must not appear in new output.
-            assert legacy_code not in main.tags
-            assert legacy_code not in main.pages[0].tags
+        assert embedded_ir.tags.get(65001) is None
+        assert embedded_ir.tags.get(65010) is None
 
 
 @pytest.mark.parametrize(

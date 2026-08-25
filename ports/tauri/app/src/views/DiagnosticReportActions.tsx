@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
 import { diagnosticTimeline } from "../session";
-import { buildDiagnosticBundleZip, resolveDiagnosticBundleRaster } from "../session/diagnosticBundle";
+import {
+  buildDiagnosticBundleZip,
+  resolveDiagnosticBundleRasterCandidate,
+  selectDiagnosticBundleRasterCandidate,
+  type PreviewRasterCandidate,
+} from "../session/diagnosticBundle";
 import { readPreviewRasterBytes, saveDiagnosticBundleFile } from "../session/diagnosticBundleIO";
 import { buildErrorReportText, type ErrorReportContext, type SetupCheckProbeSummary } from "../session/errorReport";
 import { describeCpuArchitecture, describeOperatingSystem, getScanStudioVersion } from "../session/hostEnvironment";
 import { setupCheckResults } from "../session/setupCheckResults";
 import { useClipboardCopy } from "./useClipboardCopy";
 import type { DeviceInfo, EngineError, ScannerStatus, Thumbnail } from "../session/wire/types";
+import type { DiagnosticEvidence } from "../session/diagnosticEvidence";
 
 export interface DiagnosticReportActionsProps {
   error: EngineError | null;
@@ -14,6 +20,8 @@ export interface DiagnosticReportActionsProps {
   device: DeviceInfo | null;
   status: ScannerStatus | null;
   thumbnails: Record<number, Thumbnail>;
+  transportEvidence?: DiagnosticEvidence | null;
+  unavailableEvidenceReason?: string | null;
 }
 
 function timestampForFilename(): string {
@@ -34,20 +42,34 @@ export default function DiagnosticReportActions({
   device,
   status,
   thumbnails,
+  transportEvidence = null,
+  unavailableEvidenceReason = null,
 }: DiagnosticReportActionsProps) {
   const { status: copyStatus, copy: copyToClipboard } = useClipboardCopy();
   const [isSavingBundle, setIsSavingBundle] = useState(false);
   const [didSaveBundle, setDidSaveBundle] = useState(false);
+  const [showBundleOptions, setShowBundleOptions] = useState(false);
+  const [includePreview, setIncludePreview] = useState(false);
+  const [bundlePreviewCandidate, setBundlePreviewCandidate] =
+    useState<PreviewRasterCandidate | null>(null);
 
   // thumbnailsFailed takes precedence over a typed request rejection,
   // mirroring HardwareErrorPanel's own branch order.
   const errorCode = thumbnailsFailed?.code ?? error?.code ?? null;
   const errorMessage = thumbnailsFailed?.message ?? error?.message ?? null;
+  const previewFrameIndex = bundlePreviewCandidate?.frameIndex;
+  const previewAvailable = Boolean(bundlePreviewCandidate?.imagePath);
 
   useEffect(() => {
     if (errorCode === null) return;
     diagnosticTimeline.record("error.surfaced", { code: errorCode });
-  }, [errorCode]);
+  }, [errorCode, error, thumbnailsFailed]);
+
+  useEffect(() => {
+    setShowBundleOptions(false);
+    setIncludePreview(false);
+    setBundlePreviewCandidate(null);
+  }, [errorCode, error, thumbnailsFailed]);
 
   if (errorCode === null || errorMessage === null) {
     return null;
@@ -76,6 +98,7 @@ export default function DiagnosticReportActions({
       errorCode,
       errorMessage,
       setupCheckProbes,
+      sensitiveValues: device?.deviceId ? [device.deviceId] : [],
     };
   };
 
@@ -88,18 +111,26 @@ export default function DiagnosticReportActions({
   };
 
   const handleSaveDiagnosticBundle = async (): Promise<void> => {
+    const consentedPreview = includePreview && previewAvailable;
     setIsSavingBundle(true);
     try {
       const reportText = buildErrorReportText(await buildReportContext());
-      const { raster, unavailableReason } = await resolveDiagnosticBundleRaster(
-        thumbnails,
-        readPreviewRasterBytes,
-      );
+      const { raster, unavailableReason } = consentedPreview
+        ? await resolveDiagnosticBundleRasterCandidate(
+            bundlePreviewCandidate,
+            readPreviewRasterBytes,
+          )
+        : { raster: null, unavailableReason: null };
       const zipBytes = buildDiagnosticBundleZip({
         diagnosticsJsonl: diagnosticTimeline.toJsonl(),
         reportText,
         previewRaster: raster,
         unavailableRasterReason: unavailableReason,
+        includePreview: consentedPreview,
+        previewFrameIndex,
+        transportEvidence,
+        unavailableEvidenceReason,
+        sensitiveValues: device?.deviceId ? [device.deviceId] : [],
       });
 
       const saved = await saveDiagnosticBundleFile(
@@ -111,6 +142,9 @@ export default function DiagnosticReportActions({
       setTimeout(() => setDidSaveBundle(false), 1500);
     } finally {
       setIsSavingBundle(false);
+      setShowBundleOptions(false);
+      setIncludePreview(false);
+      setBundlePreviewCandidate(null);
     }
   };
 
@@ -125,12 +159,58 @@ export default function DiagnosticReportActions({
       </button>
       <button
         type="button"
-        onClick={() => void handleSaveDiagnosticBundle()}
+        onClick={() => {
+          setIncludePreview(false);
+          setBundlePreviewCandidate(selectDiagnosticBundleRasterCandidate(thumbnails));
+          setShowBundleOptions(true);
+        }}
         disabled={isSavingBundle}
         data-testid="save-diagnostic-bundle"
       >
         {didSaveBundle ? "Saved" : "Save Diagnostic Bundle…"}
       </button>
+      {showBundleOptions && (
+        <div data-testid="diagnostic-bundle-options">
+          <p data-testid="diagnostic-bundle-inventory">
+            Bundle files: diagnostics.jsonl, manifest.txt, report.txt
+            {transportEvidence ? ", evidence-v1.json" : ""}.
+            {bundlePreviewCandidate !== null
+              ? ` Optional candidate currently excluded: one validated preview.png, preview.jpg, or preview.tif for Frame ${bundlePreviewCandidate.frameIndex}.`
+              : " No optional film-content candidate exists."}
+          </p>
+          {previewAvailable && (
+            <label data-testid="include-film-preview-label">
+              <input
+                type="checkbox"
+                checked={includePreview}
+                onChange={(event) => setIncludePreview(event.currentTarget.checked)}
+                data-testid="include-film-preview"
+              />
+              Include film-content preview for Frame {previewFrameIndex}
+            </label>
+          )}
+          <p>Film imagery is excluded by default. Consent applies to this export only.</p>
+          <button
+            type="button"
+            disabled={isSavingBundle}
+            onClick={() => void handleSaveDiagnosticBundle()}
+            data-testid="confirm-save-diagnostic-bundle"
+          >
+            {isSavingBundle ? "Saving…" : "Save bundle"}
+          </button>
+          <button
+            type="button"
+            disabled={isSavingBundle}
+            onClick={() => {
+              setShowBundleOptions(false);
+              setIncludePreview(false);
+              setBundlePreviewCandidate(null);
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
     </div>
   );
 }

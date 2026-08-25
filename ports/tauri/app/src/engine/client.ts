@@ -5,6 +5,9 @@ export interface EngineError {
   code: string;
   message: string;
   recoverable: boolean;
+  reason?: string;
+  evidence?: unknown;
+  diagnosticEvidenceUnavailableReason?: string | null;
 }
 
 export async function engineRequest<T = unknown>(

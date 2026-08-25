@@ -229,6 +229,7 @@ describe("SessionStore preview outcome exposure", () => {
     expect(store.getState().previewError).toEqual({
       code: "BRIDGE_STREAM_STALLED",
       message: "preview stream stalled",
+      recoverable: false,
     });
 
     handle.emitEvent({

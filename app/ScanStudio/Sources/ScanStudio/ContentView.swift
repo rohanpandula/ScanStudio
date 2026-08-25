@@ -399,6 +399,7 @@ private struct WorkspaceErrorBanner: View {
     @State private var didCopyTechnicalDetails = false
     @State private var didSaveDiagnosticBundle = false
     @State private var diagnosticBundleSaveError: String?
+    @State private var diagnosticPreviewConsent: DiagnosticPreviewConsent?
 
     private var isLoadingManualPlacement: Bool {
         sessionModel.manualPlacementStripState == .loading
@@ -413,14 +414,10 @@ private struct WorkspaceErrorBanner: View {
         presentation.canPlaceFramesManually && sessionModel.refeedRequired
     }
 
-    /// Attended binding (feed-detector round; issues #24/#16/#42). Offered
-    /// only when the policy classified this refusal as the rescuable
-    /// (medium) confidence gate AND there are frames selected to approve --
-    /// the action approves every selected frame and re-scans, so with an
-    /// empty selection it would have nothing to authorize.
+    /// The model, not error prose or mutable selection, owns the exact failed
+    /// run and revalidates its preview/connection before exposing this action.
     private var showsApproveEveryFrameAction: Bool {
-        presentation.canApproveEveryFrameAndScan
-            && !sessionModel.selectedFrames.isEmpty
+        sessionModel.canApproveEveryFrameAndScan
     }
 
     private var isApprovingEveryFrame: Bool {
@@ -544,8 +541,8 @@ private struct WorkspaceErrorBanner: View {
                             .font(.system(size: 11, weight: .medium))
                             .disabled(isApprovingEveryFrame)
                             .help(
-                                "Confirm the previewed framing yourself and scan the "
-                                + "selected frames with you supervising"
+                                "Confirm the failed run's original previewed frames and "
+                                + "retry that exact ordered batch once"
                             )
                         }
                     }
@@ -626,8 +623,8 @@ private struct WorkspaceErrorBanner: View {
                             .buttonStyle(.borderless)
                             .font(.system(size: 11, weight: .medium))
                             .help(
-                                "Save a zip with this session's diagnostics, the report, "
-                                    + "and the roll preview when one is available"
+                                "Save a share-redacted zip. Film content is excluded unless "
+                                    + "you explicitly include the listed preview frame."
                             )
                             .accessibilityLabel("Save diagnostic bundle")
                         }
@@ -641,6 +638,55 @@ private struct WorkspaceErrorBanner: View {
                                     "Diagnostic bundle save failed: \(diagnosticBundleSaveError)"
                                 )
                         }
+
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Proposed bundle contents")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(Color.scanStudioSecondaryText)
+                            ForEach(
+                                sessionModel.diagnosticBundleEntryNames(
+                                    previewConsent: diagnosticPreviewConsent
+                                ),
+                                id: \.self
+                            ) { filename in
+                                Text("• \(filename)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(Color.scanStudioPrimaryText)
+                            }
+
+                            if let candidate = sessionModel.diagnosticPreviewCandidate {
+                                Toggle(
+                                    "Include film content: preview frame \(candidate.frameIndex)",
+                                    isOn: Binding(
+                                        get: {
+                                            diagnosticPreviewConsent == candidate
+                                        },
+                                        set: { include in
+                                            diagnosticPreviewConsent = include
+                                                ? candidate
+                                                : nil
+                                        }
+                                    )
+                                )
+                                .font(.system(size: 10, weight: .medium))
+                                Text(
+                                    "Off by default. This adds image data from exactly frame "
+                                        + "\(candidate.frameIndex) for this export only."
+                                )
+                                .font(.system(size: 10))
+                                .foregroundStyle(Color.scanStudioSecondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                            } else {
+                                Text("No locally-known preview image is available to include.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.scanStudioSecondaryText)
+                            }
+                        }
+                        .padding(8)
+                        .background(
+                            Color.scanStudioRaised,
+                            in: RoundedRectangle(cornerRadius: 4)
+                        )
 
                         ScrollView(.vertical) {
                             Text(presentation.technicalDetails)
@@ -667,6 +713,14 @@ private struct WorkspaceErrorBanner: View {
         }
         .accessibilityElement(children: .contain)
         .transition(.move(edge: .top).combined(with: .opacity))
+        .onChange(of: sessionModel.diagnosticPreviewCandidate) { _, candidate in
+            if diagnosticPreviewConsent != candidate {
+                diagnosticPreviewConsent = nil
+            }
+        }
+        .onChange(of: presentation.technicalDetails) { _, _ in
+            diagnosticPreviewConsent = nil
+        }
     }
 
     private func copyTechnicalDetails() {
@@ -685,6 +739,7 @@ private struct WorkspaceErrorBanner: View {
     /// builds the archive itself, so the saved bundle always matches
     /// whatever ScanStudioKit assembled (T-ERR-04).
     private func saveDiagnosticBundle() {
+        defer { diagnosticPreviewConsent = nil }
         didSaveDiagnosticBundle = false
         diagnosticBundleSaveError = nil
         let panel = NSSavePanel()
@@ -695,7 +750,9 @@ private struct WorkspaceErrorBanner: View {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        let data = sessionModel.makeDiagnosticBundleData()
+        let data = sessionModel.makeDiagnosticBundleData(
+            previewConsent: diagnosticPreviewConsent
+        )
         do {
             try DiagnosticBundleFileWriter.write(data, to: url)
             didSaveDiagnosticBundle = true

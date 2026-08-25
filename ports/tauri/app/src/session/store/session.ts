@@ -22,6 +22,12 @@
 //   job.
 
 import { decodeEvent, type EngineTransport } from "../wire/codec";
+import {
+  MAX_DIAGNOSTIC_EVIDENCE_ARTIFACTS,
+  diagnosticEvidenceKey,
+  parseDiagnosticEvidence,
+  type DiagnosticEvidence,
+} from "../diagnosticEvidence";
 import { newOperationId } from "../webApis";
 import {
   assertFrameTransition,
@@ -70,6 +76,19 @@ export interface ConnectOptions {
 }
 
 export type StopMode = "afterCurrentFrame" | "immediate";
+
+/** Stable engine/client policy discriminator from #76. Human-readable
+ * messages may change without changing recovery eligibility. */
+export const ATTENDED_BINDING_REQUIRED_REASON =
+  "MEDIUM_CONFIDENCE_ATTENDED_BINDING_REQUIRED";
+
+export interface AttendedRecoveryState {
+  sourceJobId: string;
+  previewOperationId: string;
+  connectionEpoch: number;
+  requestedFrames: number[];
+  status: "available" | "approving" | "consumed";
+}
 
 export interface ScanStartResult {
   jobId: string;
@@ -126,7 +145,7 @@ export interface SessionState {
   // carries the wire thumbnailsFailed code/message verbatim in previewError
   // for the contact sheet's failure banner (never invented copy).
   previewOutcome: "active" | "succeeded" | "failed" | null;
-  previewError: { code: string; message: string } | null;
+  previewError: EngineError | null;
   // A request can be rejected before the asynchronous preview operation is
   // accepted (for example HW_MOTION_NOT_ARMED). Keep that transport phase
   // separate from scanner.thumbnailsFailed so typed hardware guidance and
@@ -177,6 +196,14 @@ export interface SessionState {
   frameAttempts: Record<number, number>;
   frameErrors: Record<number, EngineError>;
   frameReceipts: Record<number, ScanReceipt[]>;
+  // Immutable, bounded, non-pixel diagnostic witnesses. Artifacts are
+  // selected only through an exact reference carried by a terminal error;
+  // insertion order or recency is never an authority signal.
+  diagnosticEvidence: Record<string, DiagnosticEvidence>;
+  // Every zero-completed terminal failure is promoted above its individual
+  // frame rows. Recovery remains a separate, narrowly typed capability.
+  sequenceError: EngineError | null;
+  attendedRecovery: AttendedRecoveryState | null;
   // True from the moment scan startup begins persisting frame geometry until
   // scan.start has either established the job or failed. Transform controls
   // are locked across that whole boundary so the manifest cannot lag the UI.
@@ -239,6 +266,18 @@ interface ScanCompletedEventPayload {
   summary?: unknown;
 }
 
+interface ScanAttemptSnapshot {
+  jobId: string;
+  previewOperationId: string | null;
+  connectionEpoch: number;
+  projectId: string | null;
+  requestedFrames: number[];
+  recipe: CaptureRecipe;
+  processing?: ProcessingRecipe;
+  output?: OutputRecipe;
+  frameAlignments?: Record<number, FrameAlignment>;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -272,6 +311,9 @@ function createInitialState(): SessionState {
     frameAttempts: {},
     frameErrors: {},
     frameReceipts: {},
+    diagnosticEvidence: {},
+    sequenceError: null,
+    attendedRecovery: null,
     scanStartPending: false,
     filmFeedInterrupted: null,
     scanProgress: null,
@@ -732,6 +774,8 @@ export class SessionStore {
   // of its own response line.
   #jobBoundaryPending = false;
   #pendingScanEvents: unknown[] = [];
+  #lastScanAttempt: ScanAttemptSnapshot | null = null;
+  #terminalCompletionJobIds = new Set<string>();
 
   #invalidateScanAuthorization(): void {
     this.#scanAuthorizationEpoch += 1;
@@ -1195,6 +1239,10 @@ export class SessionStore {
       this.#state.previewFilmProcessSelection;
     this.#previewOutcome = "active";
     this.#state.previewOutcome = "active";
+    // Evidence is scoped to one attended operation. Retire prior artifacts
+    // before accepting a new preview so the bounded cache cannot retain
+    // unrelated failed-attempt witnesses indefinitely.
+    this.#state.diagnosticEvidence = {};
     this.#state.previewError = null;
     this.#state.previewRequestFailure = null;
     this.#state.previewFilmProcess = null;
@@ -1211,6 +1259,7 @@ export class SessionStore {
     }
     this.#state.activeOperationId = operationId;
     this.#state.latestCompletedPreviewOperationId = null;
+    this.#state.attendedRecovery = null;
     this.#pendingPreviewFilmProcess = { operationId, filmProcess: effectiveFilmProcess };
     this.#invalidateScanAuthorization();
     this.#activePreviewAuthorizationEpoch = this.#scanAuthorizationEpoch;
@@ -1320,6 +1369,83 @@ export class SessionStore {
     }
     for (const frameIndex of frames) {
       await this.approveFrame(frameIndex, { attended: true });
+    }
+  }
+
+  #invalidAttendedRecovery(message: string): never {
+    throw {
+      code: "INVALID_PARAMS",
+      message,
+      recoverable: false,
+    } satisfies EngineError;
+  }
+
+  #assertAttendedRecoveryCurrent(
+    recovery: AttendedRecoveryState,
+    snapshot: ScanAttemptSnapshot | null,
+  ): asserts snapshot is ScanAttemptSnapshot {
+    if (
+      snapshot === null ||
+      snapshot.jobId !== recovery.sourceJobId ||
+      snapshot.previewOperationId !== recovery.previewOperationId ||
+      snapshot.connectionEpoch !== recovery.connectionEpoch ||
+      snapshot.projectId !== (this.#state.project?.id ?? null) ||
+      this.#scanAuthorizationEpoch !== recovery.connectionEpoch ||
+      this.#state.latestCompletedPreviewOperationId !== recovery.previewOperationId ||
+      this.#state.activeOperationId !== null ||
+      this.#state.jobId !== recovery.sourceJobId ||
+      this.#state.jobState === null ||
+      !isTerminalJobState(this.#state.jobState) ||
+      !this.#terminalCompletionJobIds.has(recovery.sourceJobId) ||
+      snapshot.requestedFrames.length !== recovery.requestedFrames.length ||
+      snapshot.requestedFrames.some(
+        (frameIndex, index) => frameIndex !== recovery.requestedFrames[index],
+      )
+    ) {
+      this.#invalidAttendedRecovery(
+        "the zero-completed recovery no longer belongs to the current preview and connection; acquire or review the current preview before scanning again",
+      );
+    }
+  }
+
+  /**
+   * The only #76 retry entry point. A click consumes the capability before
+   * the first await, approves the original ordered batch against its exact
+   * preview, revalidates after every response, and starts at most one job.
+   */
+  async retryZeroCompletedWithAttendedApproval(): Promise<ScanStartResult> {
+    const recovery = this.#state.attendedRecovery;
+    if (recovery === null || recovery.status !== "available") {
+      this.#invalidAttendedRecovery("no attended zero-completed recovery is available");
+    }
+    this.#state.attendedRecovery = { ...recovery, status: "approving" };
+    this.#notify();
+
+    const snapshot = this.#lastScanAttempt;
+    try {
+      this.#assertAttendedRecoveryCurrent(recovery, snapshot);
+      for (const frameIndex of recovery.requestedFrames) {
+        this.#assertAttendedRecoveryCurrent(recovery, snapshot);
+        await this.approveFrame(frameIndex, { attended: true });
+        this.#assertAttendedRecoveryCurrent(recovery, snapshot);
+      }
+      this.#state.attendedRecovery = { ...recovery, status: "consumed" };
+      this.#notify();
+      return await this.startScan(
+        [...snapshot.requestedFrames],
+        structuredClone(snapshot.recipe),
+        snapshot.processing === undefined ? undefined : structuredClone(snapshot.processing),
+        snapshot.output === undefined ? undefined : structuredClone(snapshot.output),
+        snapshot.frameAlignments === undefined
+          ? undefined
+          : structuredClone(snapshot.frameAlignments),
+      );
+    } catch (error) {
+      if (this.#state.attendedRecovery?.sourceJobId === recovery.sourceJobId) {
+        this.#state.attendedRecovery = { ...recovery, status: "consumed" };
+        this.#notify();
+      }
+      throw error;
     }
   }
 
@@ -2003,6 +2129,10 @@ export class SessionStore {
     this.#state.jobId = null;
     this.#state.scanStartPending = false;
     this.#state.filmFeedInterrupted = null;
+    this.#state.sequenceError = null;
+    this.#state.attendedRecovery = null;
+    this.#lastScanAttempt = null;
+    this.#terminalCompletionJobIds.clear();
     this.#jobBoundaryPending = false;
     this.#pendingScanEvents = [];
     this.#invalidateScanAuthorization();
@@ -2364,7 +2494,23 @@ export class SessionStore {
 
     const authorizationEpoch = this.#scanAuthorizationEpoch;
     const authorizationProjectId = this.#state.project?.id ?? null;
+    const attempt = {
+      jobId: "",
+      previewOperationId: operationId,
+      connectionEpoch: authorizationEpoch,
+      projectId: authorizationProjectId,
+      requestedFrames: [...frames],
+      recipe: structuredClone(recipe),
+      ...(processing === undefined ? {} : { processing: structuredClone(processing) }),
+      ...(output === undefined ? {} : { output: structuredClone(output) }),
+      ...(frameAlignments === undefined
+        ? {}
+        : { frameAlignments: structuredClone(frameAlignments) }),
+    } satisfies ScanAttemptSnapshot;
     assertJobTransition(null, "queued");
+    // A scan is a new evidence scope. Any event for this attempt arrives
+    // only after this boundary and remains available to its terminal error.
+    this.#state.diagnosticEvidence = {};
     this.#state.scanStartPending = true;
     this.#state.jobState = "queued";
     this.#state.scanProgress = null;
@@ -2394,6 +2540,10 @@ export class SessionStore {
       this.#assertScanAuthorizationCurrent(authorizationEpoch, authorizationProjectId);
       const result = (await this.transport.sendRequest("scan.start", params)) as ScanStartResult;
       this.#state.jobId = result.jobId;
+      this.#lastScanAttempt = { ...attempt, jobId: result.jobId };
+      this.#terminalCompletionJobIds.delete(result.jobId);
+      this.#state.sequenceError = null;
+      this.#state.attendedRecovery = null;
       this.#jobBoundaryPending = false;
       this.#state.scanStartPending = false;
       this.#flushPendingScanEvents();
@@ -2497,6 +2647,7 @@ export class SessionStore {
     this.#state.selectedFrameIndices = [];
     this.#state.focusedFrameIndex = null;
     this.#selectionAnchor = null;
+    this.#state.attendedRecovery = null;
     this.#clearUnsavedPreProjectAlignment();
     this.#invalidateScanAuthorization();
   }
@@ -2524,6 +2675,7 @@ export class SessionStore {
     this.#state.selectedFrameIndices = [];
     this.#state.focusedFrameIndex = null;
     this.#selectionAnchor = null;
+    this.#state.attendedRecovery = null;
     this.#clearUnsavedPreProjectAlignment();
     this.#invalidateScanAuthorization();
   }
@@ -2549,6 +2701,34 @@ export class SessionStore {
     const event = decodeEvent(raw);
     if (event === null) return;
     switch (event.event) {
+      case "diagnostic.evidence": {
+        const parsed = parseDiagnosticEvidence(event.payload);
+        if (!parsed.ok) {
+          this.#reportIntegrityError(new Error(`invalid diagnostic evidence: ${parsed.reason}`));
+          return;
+        }
+        const key = diagnosticEvidenceKey(parsed.value);
+        const existing = this.#state.diagnosticEvidence[key];
+        if (existing !== undefined) {
+          if (JSON.stringify(existing) !== JSON.stringify(parsed.value)) {
+            this.#reportIntegrityError(
+              new Error(`conflicting immutable diagnostic evidence: ${parsed.value.evidenceId}`),
+            );
+          }
+          return;
+        }
+        const nextEvidence = {
+          ...this.#state.diagnosticEvidence,
+          [key]: parsed.value,
+        };
+        const keys = Object.keys(nextEvidence);
+        if (keys.length > MAX_DIAGNOSTIC_EVIDENCE_ARTIFACTS) {
+          delete nextEvidence[keys[0]];
+        }
+        this.#state.diagnosticEvidence = nextEvidence;
+        this.#notify();
+        return;
+      }
       case "scanner.status": {
         const payload = event.payload as { status?: unknown; operationId?: unknown };
         if (!isRecord(payload) || !isScannerStatus(payload.status)) return;
@@ -2640,7 +2820,14 @@ export class SessionStore {
         return;
       }
       case "scanner.thumbnailsFailed": {
-        const payload = event.payload as { code?: unknown; message?: unknown; operationId?: unknown };
+        const payload = event.payload as {
+          code?: unknown;
+          message?: unknown;
+          operationId?: unknown;
+          reason?: unknown;
+          evidence?: unknown;
+          diagnosticEvidenceUnavailableReason?: unknown;
+        };
         if (!isRecord(payload) || typeof payload.code !== "string" || typeof payload.message !== "string") {
           return;
         }
@@ -2660,7 +2847,19 @@ export class SessionStore {
         // are notified now, not only at the trailing zero-count completion.
         this.#previewOutcome = "failed";
         this.#state.previewOutcome = "failed";
-        this.#state.previewError = { code: payload.code, message: payload.message };
+        this.#state.previewError = {
+          code: payload.code,
+          message: payload.message,
+          recoverable: false,
+          ...(typeof payload.reason === "string" ? { reason: payload.reason } : {}),
+          ...(payload.evidence !== undefined ? { evidence: payload.evidence } : {}),
+          ...(typeof payload.diagnosticEvidenceUnavailableReason === "string"
+            ? {
+                diagnosticEvidenceUnavailableReason:
+                  payload.diagnosticEvidenceUnavailableReason,
+              }
+            : {}),
+        };
         this.#pendingPreviewFilmProcess = null;
         this.#state.previewFilmProcess = null;
         this.#notify();
@@ -2858,7 +3057,122 @@ export class SessionStore {
             ? { dutyCycle: payload.summary.dutyCycle }
             : {}),
         };
+        if (this.#terminalCompletionJobIds.has(payload.jobId)) return;
+        this.#terminalCompletionJobIds.add(payload.jobId);
+        while (this.#terminalCompletionJobIds.size > 8) {
+          const oldest = this.#terminalCompletionJobIds.values().next().value;
+          if (oldest === undefined) break;
+          this.#terminalCompletionJobIds.delete(oldest);
+        }
         this.#state.lastCompletedSummary = summary;
+        this.#state.sequenceError = null;
+        this.#state.attendedRecovery = null;
+
+        const snapshot =
+          this.#lastScanAttempt?.jobId === payload.jobId ? this.#lastScanAttempt : null;
+        const zeroCompletedFailure =
+          summary.completed.length === 0 &&
+          summary.stopped === false &&
+          ((snapshot?.requestedFrames.length ?? 0) > 0 ||
+            summary.failed.length > 0 ||
+            summary.skipped.length > 0);
+        if (zeroCompletedFailure) {
+          const requestedFrames = snapshot?.requestedFrames ?? [];
+          const requestedSet = new Set(requestedFrames);
+          const failedSet = new Set(summary.failed);
+          const failedExactlyRequested =
+            snapshot !== null &&
+            requestedFrames.length > 0 &&
+            requestedSet.size === requestedFrames.length &&
+            failedSet.size === summary.failed.length &&
+            summary.failed.length === requestedFrames.length &&
+            requestedFrames.every((frameIndex) => failedSet.has(frameIndex)) &&
+            summary.skipped.length === 0;
+          const allFailuresTyped =
+            failedExactlyRequested &&
+            requestedFrames.every(
+              (frameIndex) =>
+                this.#state.frameStates[frameIndex] === "failed" &&
+                this.#state.frameErrors[frameIndex]?.reason ===
+                  ATTENDED_BINDING_REQUIRED_REASON,
+            );
+          const recoveryIsCurrent =
+            snapshot !== null &&
+            snapshot.previewOperationId !== null &&
+            snapshot.connectionEpoch === this.#scanAuthorizationEpoch &&
+            snapshot.previewOperationId ===
+              this.#state.latestCompletedPreviewOperationId &&
+            snapshot.projectId === (this.#state.project?.id ?? null) &&
+            this.#state.activeOperationId === null;
+          const recoveryEligible = allFailuresTyped && recoveryIsCurrent;
+
+          const relevantErrors = summary.failed
+            .map((frameIndex) => this.#state.frameErrors[frameIndex])
+            .filter((error): error is EngineError => error !== undefined);
+          let commonEvidence: unknown = undefined;
+          if (
+            relevantErrors.length === summary.failed.length &&
+            relevantErrors.length > 0 &&
+            relevantErrors[0].evidence !== undefined
+          ) {
+            const first = JSON.stringify(relevantErrors[0].evidence);
+            if (relevantErrors.every((error) => JSON.stringify(error.evidence) === first)) {
+              commonEvidence = structuredClone(relevantErrors[0].evidence);
+            }
+          }
+          const commonUnavailableReason =
+            relevantErrors.length === summary.failed.length &&
+            relevantErrors.length > 0 &&
+            typeof relevantErrors[0].diagnosticEvidenceUnavailableReason === "string" &&
+            relevantErrors.every(
+              (error) =>
+                error.diagnosticEvidenceUnavailableReason ===
+                relevantErrors[0].diagnosticEvidenceUnavailableReason,
+            )
+              ? relevantErrors[0].diagnosticEvidenceUnavailableReason
+              : undefined;
+          const commonDetails =
+            relevantErrors.length === summary.failed.length &&
+            relevantErrors.length > 0 &&
+            relevantErrors[0].details !== undefined &&
+            relevantErrors.every(
+              (error) => JSON.stringify(error.details) === JSON.stringify(relevantErrors[0].details),
+            )
+              ? structuredClone(relevantErrors[0].details)
+              : undefined;
+
+          const failedCodes = [
+            ...new Set(relevantErrors.map((error) => error.code)),
+          ];
+          this.#state.sequenceError = {
+            code: "SCAN_ZERO_COMPLETED",
+            message:
+              "Scan finished with zero completed frames. Review the retained frame errors" +
+              (failedCodes.length > 0 ? ` (${failedCodes.join(", ")})` : "") +
+              " before scanning again.",
+            recoverable: false,
+            ...(recoveryEligible
+              ? { reason: ATTENDED_BINDING_REQUIRED_REASON }
+              : {}),
+            ...(commonEvidence === undefined ? {} : { evidence: commonEvidence }),
+            ...(commonDetails === undefined ? {} : { details: commonDetails }),
+            ...(commonUnavailableReason === undefined
+              ? {}
+              : {
+                  diagnosticEvidenceUnavailableReason:
+                    commonUnavailableReason,
+                }),
+          };
+          if (recoveryEligible && snapshot.previewOperationId !== null) {
+            this.#state.attendedRecovery = {
+              sourceJobId: payload.jobId,
+              previewOperationId: snapshot.previewOperationId,
+              connectionEpoch: snapshot.connectionEpoch,
+              requestedFrames: [...snapshot.requestedFrames],
+              status: "available",
+            };
+          }
+        }
         if (this.#state.jobState !== null && !isTerminalJobState(this.#state.jobState)) {
           this.#state.jobState = payload.summary.stopped ? "stopped" : "completed";
         }

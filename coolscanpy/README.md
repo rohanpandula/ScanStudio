@@ -311,14 +311,14 @@ API cannot express: archival capture with evidence. The honest split:
 | Hash-pinned capture bundle provenance | yes | no |
 | Roll batch under one reservation with fingerprint identity checks | yes | no — per-frame `--frame n` |
 | Whole-roll preview with per-slot review states | yes | no |
-| Eject | delegated to SANE (`coolscanpy[scanner]` extra) | yes |
+| Eject | direct-USB traced Unload plus presence confirmation | yes |
 | Scanner model breadth | one tested body (LS-5000/SA-30 wiring) | many Coolscan models |
 | Years in production | extracted 2026 | decades |
 
-They compose rather than compete: the direct-USB path owns capture and its
-evidence chain, and the optional SANE extra covers motion conveniences the
-capture path does not need. A live LS-5000 color-roll preview, capture, and
-eject requires no SANE; plain scan still does.
+They compose rather than compete: the direct-USB path owns color-roll capture,
+its evidence chain, and eject. A live LS-5000 color-roll preview, capture, and
+eject requires no SANE; discovery may use SANE when present, and the legacy
+plain-scan path still requires it.
 
 ## Safety model
 

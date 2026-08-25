@@ -57,13 +57,13 @@ describe("buildErrorReportText", () => {
     expect(text).not.toContain("Recent diagnostic events:");
   });
 
-  it("shows the local log path near the top when known, and nothing when unknown", () => {
+  it("never exposes an absolute local log path in share-facing report text", () => {
     const withPath = buildErrorReportText({
       ...baseContext,
       diagnosticLogPath: "/Users/tester/.scanstudio/diagnostics/session-1234.jsonl",
     });
-    expect(withPath).toContain("Local log: /Users/tester/.scanstudio/diagnostics/session-1234.jsonl");
-    expect(withPath.indexOf("Local log:")).toBeLessThan(withPath.indexOf("Error code:"));
+    expect(withPath).not.toContain("/Users/tester");
+    expect(withPath).toContain("Local log: <redacted path>");
 
     const withoutPath = buildErrorReportText(baseContext);
     expect(withoutPath).not.toContain("Local log:");
@@ -86,6 +86,37 @@ describe("buildErrorReportText", () => {
 
     const withEmptyProbes = buildErrorReportText({ ...baseContext, setupCheckProbes: [] });
     expect(withEmptyProbes).not.toContain("Windows setup check:");
+  });
+
+  it("sanitizes error messages, diagnostic events, setup details, paths, film metadata, and identifiers", () => {
+    const privateValues = [
+      "/Users/alice/Photo Work/roll.scanstudio",
+      "/private/var/folders/ab/session/preview.tiff",
+      "/tmp/studio-job/engine.log",
+      "/Volumes/Film Archive/master.tif",
+      "Ilford HP5 Plus",
+      "Leica M6",
+      "Summicron 50mm",
+      "coolscan3:usb:libusb:000:013",
+      "NK12345",
+    ];
+    const text = buildErrorReportText({
+      ...baseContext,
+      errorMessage:
+        `project=${privateValues[0]}; preview=${privateValues[1]}; filmStock=${privateValues[4]}; ` +
+        `camera=${privateValues[5]}; lens=${privateValues[6]}; deviceId=${privateValues[7]}; serial=${privateValues[8]}`,
+      recentDiagnosticEvents: [
+        `write.failed path=${privateValues[2]} filmStock=${privateValues[4]} deviceId=${privateValues[7]}`,
+      ],
+      setupCheckProbes: [
+        { id: "bridge", status: "Fail", detail: `log=${privateValues[3]}; serial=${privateValues[8]}` },
+      ],
+      sensitiveValues: privateValues,
+    });
+
+    for (const value of privateValues) expect(text).not.toContain(value);
+    expect(text).toContain("<redacted path>");
+    expect(text).toContain("<redacted>");
   });
 
   it("always ends with the honest no-automatic-attachments footer", () => {

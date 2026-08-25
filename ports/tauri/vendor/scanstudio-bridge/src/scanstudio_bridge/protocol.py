@@ -45,17 +45,33 @@ class ErrorCode(StrEnum):
     SPLIT_ALIGNMENT_ERROR = "SPLIT_ALIGNMENT_ERROR"
     BATCH_INTEGRITY_ERROR = "BATCH_INTEGRITY_ERROR"
     METER_UNUSABLE = "METER_UNUSABLE"
+    METER_CONTROLLER_REFUSED = "METER_CONTROLLER_REFUSED"
     NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
     INTERNAL = "INTERNAL"
 
 
 class BridgeError(Exception):
-    """One BRIDGE.md error code plus a human message."""
+    """One BRIDGE.md error code, human message, and optional safe details."""
 
-    def __init__(self, code: ErrorCode, message: str) -> None:
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        details: dict[str, object] | None = None,
+        diagnostic_evidence: dict[str, object] | None = None,
+        diagnostic_evidence_unavailable_reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = None if details is None else dict(details)
+        self.diagnostic_evidence = (
+            None if diagnostic_evidence is None else dict(diagnostic_evidence)
+        )
+        self.diagnostic_evidence_unavailable_reason = (
+            diagnostic_evidence_unavailable_reason
+        )
 
     @property
     def recoverable(self) -> bool:
@@ -292,15 +308,24 @@ def write_response(stream: IO[str], id_: int, result: object) -> None:
 
 
 def write_error(stream: IO[str], id_: int, error: BridgeError) -> None:
+    error_payload: dict[str, object] = {
+        "code": error.code.value,
+        "message": error.message,
+        "recoverable": error.recoverable,
+    }
+    if error.details is not None:
+        error_payload["details"] = error.details
+    if error.diagnostic_evidence is not None:
+        error_payload["diagnosticEvidence"] = error.diagnostic_evidence
+    if error.diagnostic_evidence_unavailable_reason is not None:
+        error_payload["diagnosticEvidenceUnavailableReason"] = (
+            error.diagnostic_evidence_unavailable_reason
+        )
     _write_line(
         stream,
         {
             "id": id_,
-            "error": {
-                "code": error.code.value,
-                "message": error.message,
-                "recoverable": error.recoverable,
-            },
+            "error": error_payload,
         },
     )
 

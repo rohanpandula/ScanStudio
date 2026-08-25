@@ -5,7 +5,7 @@ import Testing
 
 @Suite("Error presentation policy")
 struct ErrorPresentationPolicyTests {
-    @Test("a clipped first frame asks for a deeper refeed without offering a crop")
+    @Test("a clipped first frame explains refeed, automatic refusal, and manual limits")
     func leadingFrameClipped() {
         let rawMessage = "REFEED_REQUIRED: the first frame begins 17 preview rows before "
             + "the captured preview area (88.1% remains); refeed the film slightly deeper "
@@ -604,10 +604,9 @@ struct ErrorPresentationPolicyTests {
 
     // MARK: - Attended binding (feed-detector round; issues #24/#16/#42)
 
-    @Test("a medium-confidence refusal offers approving every frame, and says so")
-    func mediumConfidenceRefusalOffersAttendedBinding() {
-        let rawMessage = "ROLL_MISMATCH: roll boundary lattice confidence is 'medium'; "
-            + "unattended frame binding requires 'high'"
+    @Test("the dedicated typed refusal offers attended recovery regardless of human wording")
+    func typedRefusalOffersAttendedBinding() {
+        let rawMessage = "\(ScanFailureCode.attendedBindingRequired): driver wording version B"
 
         let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
 
@@ -618,14 +617,14 @@ struct ErrorPresentationPolicyTests {
         #expect(!presentation.canPlaceFramesManually)
     }
 
-    @Test("the attended offer survives the engine's own wrapping of the bridge code")
-    func mediumConfidenceRefusalMatchesWrappedForm() {
+    @Test("legacy prose is presentation-only and cannot mint movement authority")
+    func legacyMediumConfidenceProseDoesNotAuthorize() {
         let rawMessage = "INTERNAL: bridge scan.error (ROLL_MISMATCH): roll boundary lattice "
             + "confidence is 'medium'; unattended frame binding requires 'high'"
 
         let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
 
-        #expect(presentation.canApproveEveryFrameAndScan)
+        #expect(!presentation.canApproveEveryFrameAndScan)
         #expect(presentation.title == "This roll needs you to confirm the frames")
     }
 
@@ -635,6 +634,7 @@ struct ErrorPresentationPolicyTests {
             "REFEED_REQUIRED: transport read was not one uniform traversal",
             "ROLL_MISMATCH: the film in the scanner does not match this roll",
             "INTERNAL: bridge scan.error (METER_UNUSABLE): meter pass 2 controller refused",
+            "INTERNAL: diagnostic text mentioned ATTENDED_BINDING_REQUIRED but did not return it as the outer code",
             // The phrase without a confidence this path can bind.
             "ROLL_MISMATCH: roll boundary lattice confidence is 'low'; "
                 + "unattended frame binding requires 'high'",

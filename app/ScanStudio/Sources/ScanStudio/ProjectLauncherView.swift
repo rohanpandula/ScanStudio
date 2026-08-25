@@ -6,6 +6,11 @@ private enum LauncherTab: Hashable {
     case openRecent
 }
 
+private struct LauncherAttemptError: Equatable {
+    let title: String
+    let guidance: String
+}
+
 enum ProjectLauncherPurpose: Equatable {
     case manageProjects
     case saveRollAndScan
@@ -27,8 +32,8 @@ struct ProjectLauncherView: View {
     @State private var name = ""
     @State private var carrier: SimulatedFilmCarrier?
     @State private var selectedTab: LauncherTab = .newProject
-    @State private var createAttemptError: String?
-    @State private var openRecentAttemptError: String?
+    @State private var createAttemptError: LauncherAttemptError?
+    @State private var openRecentAttemptError: LauncherAttemptError?
     @State private var isSubmitting = false
 
     init(
@@ -143,10 +148,15 @@ struct ProjectLauncherView: View {
                     .foregroundStyle(Color.scanStudioSecondaryText)
             }
 
-            if let message = createAttemptError {
-                Text(message)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.scanStudioRed)
+            if let error = createAttemptError {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(error.title)
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(error.guidance)
+                        .font(.system(size: 11))
+                }
+                .foregroundStyle(Color.scanStudioRed)
+                .fixedSize(horizontal: false, vertical: true)
             }
 
             if let disabledReason {
@@ -199,8 +209,17 @@ struct ProjectLauncherView: View {
                         // Curated title, not the raw `lastErrorMessage` --
                         // this sheet is the primary new-project flow, not a
                         // developer pane.
-                        createAttemptError = session.errorPresentation?.title
-                            ?? "Couldn’t save this roll."
+                        if let presentation = session.errorPresentation {
+                            createAttemptError = LauncherAttemptError(
+                                title: presentation.title,
+                                guidance: presentation.guidance
+                            )
+                        } else {
+                            createAttemptError = LauncherAttemptError(
+                                title: "Couldn’t save this roll.",
+                                guidance: "Review the project details and try again."
+                            )
+                        }
                     }
                 }
             }
@@ -289,7 +308,12 @@ struct ProjectLauncherView: View {
                             } else {
                                 // Curated title, not the raw `lastErrorMessage`
                                 // -- same reasoning as `createAttemptError`.
-                                openRecentAttemptError = session.errorPresentation?.title
+                                if let presentation = session.errorPresentation {
+                                    openRecentAttemptError = LauncherAttemptError(
+                                        title: presentation.title,
+                                        guidance: presentation.guidance
+                                    )
+                                }
                             }
                         }
                     } label: {
@@ -300,10 +324,15 @@ struct ProjectLauncherView: View {
                 }
             }
 
-            if let message = openRecentAttemptError {
-                Text(message)
-                    .font(.system(size: 11))
+            if let error = openRecentAttemptError {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(error.title)
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(error.guidance)
+                        .font(.system(size: 11))
+                }
                     .foregroundStyle(Color.scanStudioRed)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal)
             }
         }

@@ -101,6 +101,7 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
   const mediaLoaded = state.connection.connected && state.connection.status?.mediaLoaded === true;
   const [ejectPending, setEjectPending] = useState(false);
   const [ejectResult, setEjectResult] = useState<"succeeded" | EngineError | null>(null);
+  const [recoveryActionError, setRecoveryActionError] = useState<string | null>(null);
 
   // Cumulative event ticker built from store state changes: every frame-state
   // transition and every failing error produce an entry, capped at the 200
@@ -153,6 +154,22 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
     if (onResume !== undefined) onResume(pending);
   };
 
+  const retryWithAttendedApproval = async (): Promise<void> => {
+    setRecoveryActionError(null);
+    try {
+      await sessionStore.retryZeroCompletedWithAttendedApproval();
+    } catch (error) {
+      setRecoveryActionError(
+        typeof error === "object" &&
+          error !== null &&
+          "message" in error &&
+          typeof (error as { message: unknown }).message === "string"
+          ? (error as { message: string }).message
+          : "The attended retry could not be started.",
+      );
+    }
+  };
+
   const eject = async (): Promise<void> => {
     if (ejectPending) return;
     setEjectPending(true);
@@ -200,6 +217,32 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
           Inter-frame idle: {Math.round(state.lastCompletedSummary.dutyCycle.meanIdleMs)} ms average,
           {" "}{state.lastCompletedSummary.dutyCycle.maxIdleMs} ms maximum
         </p>
+      )}
+
+      {state.sequenceError !== null && (
+        <div
+          className={styles.frameError}
+          role="alert"
+          data-testid="scan-sequence-error"
+          data-code={state.sequenceError.code}
+        >
+          <strong>{state.sequenceError.code}</strong> — {state.sequenceError.message}
+          {state.attendedRecovery !== null &&
+            state.attendedRecovery.status !== "consumed" && (
+              <button
+                type="button"
+                className={styles.primaryButton}
+                data-testid="approve-every-frame-and-retry"
+                disabled={state.attendedRecovery.status !== "available"}
+                onClick={() => void retryWithAttendedApproval()}
+              >
+                {state.attendedRecovery.status === "approving"
+                  ? "Approving every frame…"
+                  : "Approve every frame and retry once"}
+              </button>
+            )}
+          {recoveryActionError !== null && <p>{recoveryActionError}</p>}
+        </div>
       )}
 
       <div className={styles.controls}>

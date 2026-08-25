@@ -67,6 +67,7 @@ const NOT_CONNECTED_ERROR: EngineError = {
   message: "NOT_CONNECTED: no device is open",
   recoverable: true,
 };
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 function baseProps() {
   return {
@@ -185,11 +186,19 @@ describe("DiagnosticReportActions", () => {
     render(<DiagnosticReportActions {...baseProps()} error={NOT_CONNECTED_ERROR} />);
 
     fireEvent.click(screen.getByTestId("save-diagnostic-bundle"));
+    expect(screen.getByTestId("diagnostic-bundle-options")).toBeInTheDocument();
+    expect(screen.getByTestId("diagnostic-bundle-inventory")).toHaveTextContent(
+      "diagnostics.jsonl, manifest.txt, report.txt",
+    );
+    expect(bundleIOMocks.readPreviewRasterBytes).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("confirm-save-diagnostic-bundle"));
     await waitFor(() => expect(bundleIOMocks.saveDiagnosticBundleFile).toHaveBeenCalledTimes(1));
+    expect(bundleIOMocks.readPreviewRasterBytes).not.toHaveBeenCalled();
     expect(screen.getByTestId("save-diagnostic-bundle")).not.toHaveTextContent("Saved");
 
     bundleIOMocks.saveDiagnosticBundleFile.mockResolvedValueOnce(true);
     fireEvent.click(screen.getByTestId("save-diagnostic-bundle"));
+    fireEvent.click(screen.getByTestId("confirm-save-diagnostic-bundle"));
     await waitFor(() => expect(bundleIOMocks.saveDiagnosticBundleFile).toHaveBeenCalledTimes(2));
 
     const [suggestedName, bytes] = bundleIOMocks.saveDiagnosticBundleFile.mock.calls[1] as [string, Uint8Array];
@@ -198,5 +207,66 @@ describe("DiagnosticReportActions", () => {
     // real archive was assembled and handed to the writer, not empty bytes.
     expect(Array.from(bytes.slice(0, 4))).toEqual([0x50, 0x4b, 0x03, 0x04]);
     await waitFor(() => expect(screen.getByTestId("save-diagnostic-bundle")).toHaveTextContent("Saved"));
+  });
+
+  it("names the exact film-content tile and reads it only after non-persistent explicit consent", async () => {
+    bundleIOMocks.readPreviewRasterBytes.mockResolvedValue(PNG);
+    bundleIOMocks.saveDiagnosticBundleFile.mockResolvedValue(true);
+    render(
+      <DiagnosticReportActions
+        {...baseProps()}
+        error={NOT_CONNECTED_ERROR}
+        thumbnails={{ 5: { imagePath: "opaque-preview-5" }, 2: { imagePath: "opaque-preview-2" } }}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("save-diagnostic-bundle"));
+    expect(screen.getByTestId("include-film-preview-label")).toHaveTextContent(
+      "Include film-content preview for Frame 2",
+    );
+    expect(screen.getByTestId("include-film-preview")).not.toBeChecked();
+    expect(bundleIOMocks.readPreviewRasterBytes).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("include-film-preview"));
+    expect(bundleIOMocks.readPreviewRasterBytes).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("confirm-save-diagnostic-bundle"));
+
+    await waitFor(() => expect(bundleIOMocks.saveDiagnosticBundleFile).toHaveBeenCalledTimes(1));
+    expect(bundleIOMocks.readPreviewRasterBytes).toHaveBeenCalledTimes(1);
+    expect(bundleIOMocks.readPreviewRasterBytes).toHaveBeenCalledWith("opaque-preview-2");
+
+    fireEvent.click(screen.getByTestId("save-diagnostic-bundle"));
+    expect(screen.getByTestId("include-film-preview")).not.toBeChecked();
+  });
+
+  it("keeps consent bound to the proposed tile if live thumbnails change before confirmation", async () => {
+    bundleIOMocks.readPreviewRasterBytes.mockResolvedValue(PNG);
+    bundleIOMocks.saveDiagnosticBundleFile.mockResolvedValue(true);
+    const props = {
+      ...baseProps(),
+      error: NOT_CONNECTED_ERROR,
+      thumbnails: { 2: { imagePath: "opaque-preview-2" } },
+    };
+    const { rerender } = render(<DiagnosticReportActions {...props} />);
+
+    fireEvent.click(screen.getByTestId("save-diagnostic-bundle"));
+    expect(screen.getByTestId("diagnostic-bundle-inventory")).toHaveTextContent(
+      "currently excluded: one validated preview.png, preview.jpg, or preview.tif for Frame 2",
+    );
+    rerender(
+      <DiagnosticReportActions
+        {...props}
+        thumbnails={{ 1: { imagePath: "newer-opaque-preview-1" } }}
+      />,
+    );
+    expect(screen.getByTestId("include-film-preview-label")).toHaveTextContent("Frame 2");
+    fireEvent.click(screen.getByTestId("include-film-preview"));
+    fireEvent.click(screen.getByTestId("confirm-save-diagnostic-bundle"));
+
+    await waitFor(() => expect(bundleIOMocks.saveDiagnosticBundleFile).toHaveBeenCalledTimes(1));
+    expect(bundleIOMocks.readPreviewRasterBytes).toHaveBeenCalledWith("opaque-preview-2");
+    expect(bundleIOMocks.readPreviewRasterBytes).not.toHaveBeenCalledWith(
+      "newer-opaque-preview-1",
+    );
   });
 });

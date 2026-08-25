@@ -99,6 +99,36 @@ export default function HardwareErrorPanel({
     );
   }
 
+  if (error.code === "METER_CONTROLLER_REFUSED") {
+    const details = error.details;
+    return (
+      <div
+        className={styles.errorPanel}
+        data-testid="hardware-error-panel"
+        data-code="METER_CONTROLLER_REFUSED"
+      >
+        <p className={styles.errorTitle}>Exposure control stopped safely</p>
+        <p className={styles.errorMessage}>{error.message}</p>
+        {details && (
+          <div data-testid="meter-controller-refusal-details">
+            <p>Meter pass {details.pass} was refused:</p>
+            <ul>
+              {details.reasons.map((reason, index) => (
+                <li key={`${reason.code}-${reason.channel ?? "all"}-${index}`}>
+                  {reason.channel ? `${reason.channel}: ` : ""}{reason.message}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <p className={styles.guidance}>
+          ScanStudio did not invent a fallback exposure and will not retry automatically.
+          Review the pass and channel reasons before changing the film setup or process settings.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className={styles.errorPanel} data-testid="hardware-error-panel">
       <p className={styles.errorCode} data-testid="generic-error-code">
@@ -107,6 +137,21 @@ export default function HardwareErrorPanel({
       <p className={styles.errorMessage} data-testid="generic-error-message">
         {error.message}
       </p>
+      {error.details && (
+        <div data-testid="meter-controller-refusal-details">
+          <p>Meter pass {error.details.pass} was refused:</p>
+          <ul>
+            {error.details.reasons.map((reason, index) => (
+              <li key={`${reason.code}-${reason.channel ?? "all"}-${index}`}>
+                {reason.channel ? `${reason.channel}: ` : ""}{reason.message}
+              </li>
+            ))}
+          </ul>
+          <p className={styles.guidance}>
+            No fallback exposure was invented and ScanStudio will not retry automatically.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

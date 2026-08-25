@@ -7,6 +7,8 @@
 // the mac side (app/ScanStudio/Sources/ScanStudioKit/ErrorPresentation.swift)
 // so both frontends render the same shape for the same inputs.
 
+import { redactShareText } from "./shareSafeDiagnostics";
+
 /** Both report outputs show at most this many of the most recent diagnostic
  * events -- matches DiagnosticTimeline's own retention cap. */
 export const MAXIMUM_RECENT_DIAGNOSTIC_EVENTS = 40;
@@ -41,6 +43,9 @@ export interface ErrorReportContext {
    * this session (item 5). Omitted entirely from the report when `null` or
    * empty -- never an empty "Windows setup check:" section. */
   setupCheckProbes?: SetupCheckProbeSummary[] | null;
+  /** Known private values gathered from current local state. They are used
+   * only to remove content from this share-facing derivative. */
+  sensitiveValues?: string[];
 }
 
 function rendered(value: string | null | undefined): string {
@@ -49,41 +54,42 @@ function rendered(value: string | null | undefined): string {
 }
 
 export function buildErrorReportText(context: ErrorReportContext): string {
+  const safe = (value: string): string => redactShareText(value, context.sensitiveValues);
   const lines: string[] = ["ScanStudio error report"];
 
   // Build-identifying header (T-ERR-01): every field always renders,
   // falling back to "unknown" rather than being silently omitted.
-  lines.push(`ScanStudio version: ${rendered(context.scanStudioVersion)}`);
-  lines.push(`Operating system: ${rendered(context.operatingSystem)}`);
-  lines.push(`CPU architecture: ${rendered(context.cpuArchitecture)}`);
-  lines.push(`Scanner firmware: ${rendered(context.scannerFirmware)}`);
-  lines.push(`Adapter: ${rendered(context.scannerAdapter)}`);
-  lines.push(`Holder: ${rendered(context.scannerHolder)}`);
+  lines.push(`ScanStudio version: ${safe(rendered(context.scanStudioVersion))}`);
+  lines.push(`Operating system: ${safe(rendered(context.operatingSystem))}`);
+  lines.push(`CPU architecture: ${safe(rendered(context.cpuArchitecture))}`);
+  lines.push(`Scanner firmware: ${safe(rendered(context.scannerFirmware))}`);
+  lines.push(`Adapter: ${safe(rendered(context.scannerAdapter))}`);
+  lines.push(`Holder: ${safe(rendered(context.scannerHolder))}`);
 
   // Near the top, per T-ERR-02, and only when actually known -- unlike the
   // header fields above this is not forced to "unknown" when absent.
   if (context.diagnosticLogPath) {
-    lines.push(`Local log: ${context.diagnosticLogPath}`);
+    lines.push("Local log: <redacted path>");
   }
   if (context.diagnosticSessionId) {
-    lines.push(`Diagnostic session: ${context.diagnosticSessionId}`);
+    lines.push(`Diagnostic session: ${safe(context.diagnosticSessionId)}`);
   }
   if (context.engineVersion) {
-    lines.push(`Engine version: ${context.engineVersion}`);
+    lines.push(`Engine version: ${safe(context.engineVersion)}`);
   }
   if (context.connectionSummary) {
-    lines.push(`Connection state: ${context.connectionSummary}`);
+    lines.push(`Connection state: ${safe(context.connectionSummary)}`);
   }
-  lines.push(`Error code: ${context.errorCode}`);
+  lines.push(`Error code: ${safe(context.errorCode)}`);
   lines.push("");
   lines.push("Message:");
-  lines.push(context.errorMessage);
+  lines.push(safe(context.errorMessage));
 
   if (context.recentDiagnosticEvents.length > 0) {
     lines.push("");
     lines.push("Recent diagnostic events:");
     for (const event of context.recentDiagnosticEvents.slice(-MAXIMUM_RECENT_DIAGNOSTIC_EVENTS)) {
-      lines.push(`- ${event}`);
+      lines.push(`- ${safe(event)}`);
     }
   }
 
@@ -91,7 +97,7 @@ export function buildErrorReportText(context: ErrorReportContext): string {
     lines.push("");
     lines.push("Windows setup check:");
     for (const probe of context.setupCheckProbes) {
-      lines.push(`- ${probe.id}: ${probe.status} -- ${probe.detail}`);
+      lines.push(`- ${safe(probe.id)}: ${safe(probe.status)} -- ${safe(probe.detail)}`);
     }
   }
 

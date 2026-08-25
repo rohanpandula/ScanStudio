@@ -258,7 +258,11 @@ fn spawn_connected_engine_with_bridge_env(
         &mut stdin,
         1,
         "engine.hello",
-        json!({"clientName": client_name, "protocolVersion": 1}),
+        json!({
+            "clientName": client_name,
+            "clientBuild": "0.0.0-test+e2e",
+            "protocolVersion": 1
+        }),
     );
     assert!(recv_response_for(&rx, 1, |_| {}).get("error").is_none());
     send(
@@ -1240,6 +1244,56 @@ fn failed_preview_never_claims_established_media_or_authorizes_approval() {
         }),
         "a preview error must be public rather than fabricated as a successful preview: {events:#?}"
     );
+    let evidence_position = events
+        .iter()
+        .position(|event| event["event"] == "diagnostic.evidence")
+        .expect("the failing guard's bounded evidence must be emitted");
+    let failure_position = events
+        .iter()
+        .position(|event| event["event"] == "scanner.thumbnailsFailed")
+        .expect("failed preview terminal");
+    assert!(
+        evidence_position < failure_position,
+        "artifact must precede the terminal reference: {events:#?}"
+    );
+    let evidence = &events[evidence_position]["payload"];
+    let failure = &events[failure_position]["payload"];
+    assert_eq!(evidence["schemaVersion"], 1);
+    assert_eq!(evidence["operationId"], "failed-preview");
+    assert!(evidence["sessionEpoch"].as_str().is_some());
+    assert_eq!(evidence["operationKind"], "preview");
+    assert_eq!(evidence["builds"]["app"], "0.0.0-test+e2e");
+    assert_eq!(evidence["builds"]["engine"], "0.1.0");
+    assert_eq!(evidence["builds"]["bridge"], "0.0.1-mock");
+    assert_eq!(evidence["device"]["model"], "SUPER COOLSCAN 5000 ED");
+    assert_eq!(evidence["device"]["adapter"], "SA-30");
+    assert_eq!(evidence["device"]["holder"], "roll36");
+    assert_eq!(evidence["witness"]["kind"], "affine");
+    assert_eq!(
+        failure["evidence"]["schemaVersion"],
+        evidence["schemaVersion"]
+    );
+    assert_eq!(failure["evidence"]["evidenceId"], evidence["evidenceId"]);
+    assert_eq!(failure["evidence"]["operationId"], evidence["operationId"]);
+    assert_eq!(
+        failure["evidence"]["sessionEpoch"],
+        evidence["sessionEpoch"]
+    );
+    assert!(failure.get("diagnosticEvidenceUnavailableReason").is_none());
+    let serialized_evidence = serde_json::to_string(evidence).expect("serialize evidence");
+    for forbidden in [
+        "serial",
+        "deviceId",
+        "path",
+        "rawExcerpt",
+        "completeTransportTable",
+        "rgbValues",
+    ] {
+        assert!(
+            !serialized_evidence.contains(forbidden),
+            "bounded evidence must exclude {forbidden}: {serialized_evidence}"
+        );
+    }
     let terminal_status = events
         .iter()
         .find(|event| event["event"] == "scanner.status")
@@ -2511,7 +2565,11 @@ fn scan_error_reaches_the_client_through_the_full_server_path() {
         &mut stdin,
         1,
         "engine.hello",
-        json!({"clientName": "e2e-scan-error-test", "protocolVersion": 1}),
+        json!({
+            "clientName": "e2e-scan-error-test",
+            "clientBuild": "0.0.0-test+scan-binding",
+            "protocolVersion": 1
+        }),
     );
     let hello_resp = recv_response_for(&rx, 1, |_| {});
     assert!(
@@ -2579,6 +2637,29 @@ fn scan_error_reaches_the_client_through_the_full_server_path() {
             .unwrap_or("")
             .contains("REFEED_REQUIRED"),
         "error message must name the real bridge code: {frame_state_failed:#?}"
+    );
+    let evidence = events
+        .iter()
+        .find(|event| event["event"] == "diagnostic.evidence")
+        .unwrap_or_else(|| {
+            panic!("zero-completed binding must emit bounded evidence: {events:#?}")
+        });
+    assert_eq!(evidence["payload"]["operationKind"], "scanBinding");
+    assert_eq!(
+        evidence["payload"]["builds"]["app"],
+        "0.0.0-test+scan-binding"
+    );
+    assert_eq!(
+        frame_state_failed["payload"]["error"]["evidence"]["evidenceId"],
+        evidence["payload"]["evidenceId"]
+    );
+    assert_eq!(
+        frame_state_failed["payload"]["error"]["evidence"]["operationId"],
+        evidence["payload"]["operationId"]
+    );
+    assert_eq!(
+        frame_state_failed["payload"]["error"]["evidence"]["sessionEpoch"],
+        evidence["payload"]["sessionEpoch"]
     );
 
     let scan_completed_count = events

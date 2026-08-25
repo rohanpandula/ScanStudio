@@ -1,5 +1,5 @@
 pub mod bridge_protocol;
-pub mod real_backend;
+pub mod diagnostic_evidence;
 pub mod domain;
 pub mod evidence_package;
 pub mod exiftool;
@@ -8,6 +8,7 @@ pub mod manifest;
 pub mod parity;
 pub mod processing;
 pub mod protocol;
+pub mod real_backend;
 pub mod render;
 pub mod server;
 pub mod sim;

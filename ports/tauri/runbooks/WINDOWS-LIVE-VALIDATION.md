@@ -318,11 +318,11 @@ Record which of these was observed, quoting the app's text exactly:
   surfaces as a typed error, never as {}. This rule exists because an LS-5000
   can acknowledge an eject command while the parked mechanism does not
   actuate." (BRIDGE.md, device.eject)
-- Known-bad eject outcome: `EJECT_FAILED` — "EJECT_FAILED — the eject could not
-  run or the transport reported not-ejected. On the current CoolscanPy pin a
-  real eject needs the [scanner] extra plus SANE in the bridge's own
-  environment, so on a rig without them every real device.eject is this error,
-  with the message naming the missing dependency." (BRIDGE.md, device.eject)
+- Known-bad eject outcome: `EJECT_FAILED` — the direct-USB unload could not
+  run, returned an unconfirmed result, or the post-unload presence check did
+  not prove the film clear. Eject needs neither SANE nor `scanimage`; retain
+  the complete typed refusal and do not infer success or auto-retry it.
+  (BRIDGE.md, device.eject)
 - Known-bad eject outcome: `FEEDER_PARKED` — "FEEDER_PARKED — the typed stalled
   outcome: the driver's traced eject reported accepted-without-confirmed-clear
   (CoolscanPy FeederParked). The film state is unknown-but-likely-inside, the

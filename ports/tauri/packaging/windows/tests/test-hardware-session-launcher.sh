@@ -152,6 +152,28 @@ fi
 # shellcheck disable=SC2016 # literal PowerShell source assertion
 require_text "$windows_black_box" '$forcedLauncher.Kill()' \
     'Windows behavioral suite force-kills the launcher owner'
+require_text "$windows_black_box" 'engineInfo.Arguments = "--fixture-child "' \
+    'Windows behavioral fixture app starts a distinct engine child'
+# shellcheck disable=SC2016 # literal PowerShell source assertions
+require_text "$windows_black_box" '[ScanStudio.LauncherTestProcess]::GetParentProcessId($forcedEngine.Handle)' \
+    'Windows behavioral suite proves fixture app-to-engine ancestry from a retained handle'
+require_text "$windows_black_box" 'kill-on-close job terminates the exact fixture engine descendant handle' \
+    'Windows behavioral suite waits on the exact engine handle after forced death'
+require_text "$windows_black_box" 'same-image non-member control survives fixture launcher death' \
+    'Windows behavioral suite proves a same-image non-member survives fixture cleanup'
+require_text "$windows_black_box" 'native process ancestry proves the fixture control is outside the launcher tree' \
+    'Windows behavioral suite proves the fixture control is not a launcher descendant'
+# shellcheck disable=SC2016 # literal PowerShell source assertions
+require_text "$windows_black_box" '$packagedEngineProcess = Wait-ForExactChildProcessHandle' \
+    'Windows behavioral suite opens the actual packaged engine descendant'
+require_text "$windows_black_box" 'kill-on-close job terminates the exact packaged engine descendant handle' \
+    'Windows behavioral suite waits on the exact packaged engine handle after forced death'
+require_text "$windows_black_box" 'same-name non-member control survives packaged launcher death' \
+    'Windows behavioral suite scopes packaged cleanup to job members'
+require_text "$windows_black_box" 'native process ancestry proves the packaged control is outside the launcher tree' \
+    'Windows behavioral suite proves the packaged control is not a launcher descendant'
+reject_regex "$windows_black_box" 'Wait-ForProcessIdAbsent' \
+    'Windows behavioral suite does not confuse PID reuse with exact process death'
 require_text "$windows_black_box" 'guardian leaves a foreign replacement latch untouched' \
     'Windows behavioral suite checks guardian ownership after forced death'
 require_text "$windows_black_box" 'guardian removes the matching owned latch after forced launcher death' \

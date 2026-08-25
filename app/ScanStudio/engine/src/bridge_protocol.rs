@@ -66,6 +66,10 @@ pub struct BridgeErrorPayload {
     pub code: BridgeErrorCode,
     pub message: String,
     pub recoverable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_evidence: Option<crate::diagnostic_evidence::BridgeDiagnosticEvidence>,
 }
 
 /// Outbound event shape (bridge -> engine, unsolicited):
@@ -118,6 +122,8 @@ pub enum BridgeErrorCode {
     GeometryValidationError,
     SplitAlignmentError,
     BatchIntegrityError,
+    MeterUnusable,
+    MeterControllerRefused,
     NotImplemented,
     Internal,
 }
@@ -727,6 +733,10 @@ pub struct BridgeScanErrorPayload {
     pub job_id: String,
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_evidence: Option<crate::diagnostic_evidence::BridgeDiagnosticEvidence>,
 }
 
 /// `scan.frameFailed`'s payload (BRIDGE.md "`scan.frameFailed` (additive,
@@ -743,6 +753,8 @@ pub struct BridgeFrameFailedPayload {
     pub slot: u32,
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------
@@ -764,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_error_code_screaming_snake_case_all_21_variants() {
+    fn bridge_error_code_screaming_snake_case_all_variants() {
         for (code, wire) in [
             (BridgeErrorCode::UnknownMethod, "UNKNOWN_METHOD"),
             (BridgeErrorCode::InvalidParams, "INVALID_PARAMS"),
@@ -800,6 +812,11 @@ mod tests {
             (
                 BridgeErrorCode::BatchIntegrityError,
                 "BATCH_INTEGRITY_ERROR",
+            ),
+            (BridgeErrorCode::MeterUnusable, "METER_UNUSABLE"),
+            (
+                BridgeErrorCode::MeterControllerRefused,
+                "METER_CONTROLLER_REFUSED",
             ),
             (BridgeErrorCode::NotImplemented, "NOT_IMPLEMENTED"),
             (BridgeErrorCode::Internal, "INTERNAL"),
@@ -1041,6 +1058,8 @@ mod tests {
             job_id: "job-7f3a".to_string(),
             code: "REFEED_REQUIRED".to_string(),
             message: "roll fingerprint mismatch mid-batch".to_string(),
+            details: None,
+            diagnostic_evidence: None,
         };
         let value = serde_json::to_value(&payload).unwrap();
         assert_eq!(value["jobId"], json!("job-7f3a"));
@@ -1066,6 +1085,7 @@ mod tests {
             slot: 1,
             code: "MANUAL_REVIEW_REQUIRED".to_string(),
             message: "frame 1 transport origin requires manual review".to_string(),
+            details: None,
         };
         let value = serde_json::to_value(&payload).unwrap();
         assert_eq!(value["jobId"], json!("job-7f3a"));

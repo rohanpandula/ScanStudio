@@ -182,10 +182,12 @@ current runner images).
   macOS/Linux-safe adversarial launcher suite, including concurrent owners,
   hostile latch object types, invalid labels, and packaging-wiring checks.
 - `packaging/windows/tests/test-hardware-session-launcher.ps1` is run under
-  Windows PowerShell 5.1 with fake `wsl.exe` and `scanstudio-app.exe`
-  processes. It verifies child-only environment scope, exact pinned WSL
-  arguments, failures/exit codes, cleanup, and force-kill job/guardian
-  behavior without opening WSL or touching scanner hardware. The Windows
+  Windows PowerShell 5.1 with fake `wsl.exe` and deterministic app/engine
+  fixtures. Installed and portable runs additionally launch the real packaged
+  app and engine sidecar. The suite retains exact process handles, proves the
+  app-to-engine ancestry, force-kills the launcher, verifies both job members
+  terminate while a same-name non-member survives, and checks guardian
+  cleanup without opening WSL or touching scanner hardware. The Windows
   packager runs it against source, installed, and portable launcher layouts.
 - `packaging/windows/assemble-staging.sh` assembles `packaging/.staging/windows/`
   locally on any host (no Windows machine needed).

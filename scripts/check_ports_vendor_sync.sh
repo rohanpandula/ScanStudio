@@ -296,7 +296,7 @@ EOF
 check_pair "protocol" "app/ScanStudio/protocol" "ports/tauri/vendor/protocol" "55577442d8b6a23ddcd3cc191ebf41a8258004047bc075511a241fa72adb0b65" <<'EOF'
 EOF
 
-check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "fb05a60e15da3cc29a86d224103a0fbaa63080f7c70bd17fa0564cfbbb30f9d9" <<'EOF'
+check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "228c9c43e13a1e817cfb7e7c84f501d14b9e6af89d659ce2a1c828ec2474ca56" <<'EOF'
 Files app/ScanStudio/engine/Cargo.lock and ports/tauri/vendor/engine/Cargo.lock differ
 Files app/ScanStudio/engine/Cargo.toml and ports/tauri/vendor/engine/Cargo.toml differ
 Files app/ScanStudio/engine/src/evidence_package.rs and ports/tauri/vendor/engine/src/evidence_package.rs differ
@@ -307,7 +307,7 @@ Files app/ScanStudio/engine/src/render.rs and ports/tauri/vendor/engine/src/rend
 Only in ports/tauri/vendor/engine/src: wsl_io.rs
 EOF
 
-check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "d03d1678207011fe26747fed49151c965410449b4712f42c871533974f830e12" <<'EOF'
+check_pair "bridge" "bridge" "ports/tauri/vendor/scanstudio-bridge" "bc7676818b08648d47753255783e3b06105feed0aa4cf41d50174c98f7ab37aa" <<'EOF'
 Only in ports/tauri/vendor/scanstudio-bridge: .github
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: probe-linux-env.py
 Only in ports/tauri/vendor/scanstudio-bridge/scripts: verify-bridge.sh
@@ -318,7 +318,6 @@ Files bridge/src/scanstudio_bridge/transport/output_reservation.py and ports/tau
 Only in ports/tauri/vendor/scanstudio-bridge/tests: test_probe_linux_env.py
 Files bridge/tests/test_safety.py and ports/tauri/vendor/scanstudio-bridge/tests/test_safety.py differ
 Only in ports/tauri/vendor/scanstudio-bridge/tests: test_stdout_byte_discipline.py
-Files bridge/tests/test_transport_mock.py and ports/tauri/vendor/scanstudio-bridge/tests/test_transport_mock.py differ
 Files bridge/uv.lock and ports/tauri/vendor/scanstudio-bridge/uv.lock differ
 EOF
 

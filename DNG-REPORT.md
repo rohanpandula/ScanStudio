@@ -4,7 +4,7 @@
 
 Raw export now has a third infrared policy, `sidecar`, for both main formats. With captured IR it writes a fail-closed pair: the untouched RGB main export and a same-size 16-bit grayscale TIFF named `{main-stem}-ir.tif`. The DNG main has no embedded IR SubIFD in this mode; the TIFF main uses the existing RGB-only layout. The sidecar carries the established private ASCII tag 65001 marker `scanstudio.infrared.linear.uint16.v1`, Orientation 1, and capture-matching X/Y resolution in inches.
 
-All established branches remain on their existing encoders and layouts: DNG with embedded IR SubIFD, four-channel RGBI TIFF with `ExtraSamples=0`, and RGB-only TIFF with no IR. Raw export still performs no inversion, color conversion, crop, rotation, flip, Digital ICE, Nikonlook, ICC assignment, rescaling, or requantization.
+All established branches remain on their existing pixel layouts: DNG with an embedded IR SubIFD, four-channel RGBI TIFF with `ExtraSamples=0`, and RGB-only TIFF with no IR. Embedded DNG IR is identified by the standard `ImageDescription` marker `Untouched Nikon Coolscan infrared plane`; DNG no longer emits private tag 65001, which ExifTool interprets as `SerialNumber`, and its SubIFD pointer uses the TIFF/EP `LONG` datatype. Raw export still performs no inversion, color conversion, crop, rotation, flip, Digital ICE, Nikonlook, ICC assignment, rescaling, or requantization.
 
 ## Exact option surface
 
@@ -120,7 +120,7 @@ Test run with 459 tests in 46 suites passed after 0.252 seconds.
 - No Git command was run, no GitHub content was posted, and no network access was used.
 - No dependency was added and no existing output compression or color metadata policy changed.
 - No converter or physical-scanner smoke test was attempted. NegPy, LibRaw, RawTherapee, darktable, and dcraw are not vendored here, so compatibility remains a container-shape expectation rather than an external test claim.
-- No standardized DNG meaning for scanner IR was claimed; the existing private, versioned tag remains the opt-in interoperability marker.
+- No standardized DNG meaning for scanner IR was claimed; the grayscale SubIFD relationship plus its standard `ImageDescription` is the opt-in interoperability marker.
 - The serialized field was not renamed from `tiffInfrared`, preserving legacy recipes even though `sidecar` now applies to DNG too.
 - No empty, synthetic, or placeholder sidecar is emitted when IR was not captured.
 - The two `UpdateServiceTests` that require creating disk images were not run; every other Swift test ran green with the sandbox workaround.

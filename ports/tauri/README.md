@@ -6,12 +6,10 @@ receipts, and non-destructive archive format with the macOS app.
 
 ## Release status
 
-| Build | Status | Hardware validation |
-| --- | --- | --- |
-| macOS Apple Silicon | **Beta** | Nikon LS-5000 real-film workflow validated |
-| macOS Intel | **Preview** | Native build and package checks only |
-| Windows x86-64 | **Preview** | Native installer and bundled bridge resources checked; live WSL2 scanner validation pending |
-| Linux x86-64 | **Preview** | Package and clean Linux runtime verified; live scanner validation pending |
+The canonical [hardware and platform evidence
+matrix](../../docs/HARDWARE-SUPPORT.md) distinguishes package, enumeration,
+preview, and one-frame capture results. Do not infer live scanner support from
+a successful package build.
 
 The Tauri macOS build in this directory is a packaging proof. Mac users should
 download one of the native macOS DMGs from the main

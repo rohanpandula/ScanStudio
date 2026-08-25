@@ -106,14 +106,22 @@ class ReleaseGateStructure(unittest.TestCase):
     def test_publish_reproves_tag_integrity_before_draft_and_before_publication(
         self,
     ) -> None:
-        occurrences = "\n".join(self.jobs["publish"]).count(
-            'test "$RESOLVED" = "$GITHUB_SHA"'
+        body = "\n".join(self.jobs["publish"])
+        inline_occurrences = body.count('test "$RESOLVED" = "$GITHUB_SHA"')
+        # The adopted release pipeline re-proves the remote tag through the
+        # scripted verifier (verify_remote_release_tag.py) at the draft and
+        # publication stages, pinning the tag OBJECT in addition to the
+        # commit. Either mechanical form satisfies the #104 contract, but the
+        # two checks must exist in some form before draft AND publication.
+        staged_occurrences = body.count("--stage draft") + body.count(
+            "--stage publication"
         )
         self.assertGreaterEqual(
-            occurrences,
+            inline_occurrences + staged_occurrences,
             2,
-            "publish must re-prove remote tag integrity immediately before "
-            f"draft creation AND again before publication (#104); found {occurrences}",
+            "publish must re-prove remote tag integrity before draft "
+            f"creation AND again before publication (#104); found "
+            f"{inline_occurrences} inline + {staged_occurrences} staged",
         )
 
 

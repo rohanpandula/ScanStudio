@@ -127,13 +127,26 @@ public enum StoredZipWriter {
     }
 }
 
-/// Assembles "Save Diagnostic Bundle..."'s contents (T-ERR-04) from
-/// already-in-memory data -- no filesystem access here, so the exact
-/// contents (including the honest manifest note when the raster is missing)
-/// are unit-testable with plain values, no real files or fake filesystem
-/// needed for this half of the pipeline.
+/// Consent for one exact preview tile. Consent is bound to the frame and
+/// source path visible when the operator opts in; a replacement preview or
+/// path change invalidates it before any film bytes are read.
+public struct DiagnosticPreviewConsent: Equatable, Sendable {
+    public let frameIndex: Int
+    public let sourcePath: String
+    public let filename: String
+
+    public init(frameIndex: Int, sourcePath: String, filename: String) {
+        self.frameIndex = frameIndex
+        self.sourcePath = sourcePath
+        self.filename = filename
+    }
+}
+
+/// Assembles a share-facing archive from already-held state. The local
+/// technical-details view remains complete; this boundary applies a second,
+/// archive-specific redaction pass to every text route.
 public enum DiagnosticBundleBuilder {
-    public struct PreviewRaster: Equatable {
+    public struct PreviewRaster: Equatable, Sendable {
         public let filename: String
         public let data: Data
 
@@ -143,75 +156,274 @@ public enum DiagnosticBundleBuilder {
         }
     }
 
-    /// - Parameters:
-    ///   - diagnosticsJSONL: the current session's diagnostics log, one JSON
-    ///     object per line (`SessionDiagnosticTimeline`'s durable format).
-    ///   - reportText: the generated error report (`ErrorPresentation
-    ///     .technicalDetails`) at the moment the bundle was requested.
-    ///   - previewRaster: the roll preview raster file, when the session had
-    ///     one and the frontend could locate it from already-decoded
-    ///     `Thumbnail.imagePath` state -- never a new engine round trip.
-    ///   - unavailableRasterReason: when `previewRaster` is `nil`, the
-    ///     specific, honest reason recorded in `manifest.txt` instead of
-    ///     silently omitting the raster with no explanation.
+    public enum PreviewContent: Equatable, Sendable {
+        case included(consent: DiagnosticPreviewConsent, raster: PreviewRaster)
+        case excludedByPrivacyDefault(candidate: DiagnosticPreviewConsent?)
+        case unavailable(reason: String)
+    }
+
+    public enum EvidenceContent: Equatable, Sendable {
+        case included(DiagnosticEvidenceArtifact)
+        case unavailable(reason: String)
+    }
+
     public static func makeEntries(
         diagnosticsJSONL: Data,
         reportText: String,
-        previewRaster: PreviewRaster?,
-        unavailableRasterReason: String?
+        redactionContext: ErrorPresentationContext,
+        preview: PreviewContent,
+        evidence: EvidenceContent
     ) -> [StoredZipWriter.Entry] {
         var manifestLines = [
             "ScanStudio diagnostic bundle",
             "",
-            "diagnostics.jsonl: this session's diagnostic events, one JSON object per line",
-            "report.txt: the generated error report at the time of export",
+            "diagnostics.jsonl: share-redacted session events, one JSON object per line",
+            "report.txt: share-redacted error report at the time of export",
         ]
         var entries = [
-            StoredZipWriter.Entry(name: "diagnostics.jsonl", data: diagnosticsJSONL),
-            StoredZipWriter.Entry(name: "report.txt", data: Data(reportText.utf8)),
-        ]
-        if let previewRaster {
-            manifestLines.append("\(previewRaster.filename): the roll preview raster")
-            entries.append(StoredZipWriter.Entry(name: previewRaster.filename, data: previewRaster.data))
-        } else {
-            let reason = unavailableRasterReason ?? "no roll preview in this session"
-            manifestLines.append("raster: not available in this build (\(reason))")
-        }
-        entries.append(
             StoredZipWriter.Entry(
-                name: "manifest.txt",
-                data: Data(manifestLines.joined(separator: "\n").utf8)
+                name: "diagnostics.jsonl",
+                data: sanitizedDiagnosticsJSONL(
+                    diagnosticsJSONL,
+                    context: redactionContext
+                )
+            ),
+            StoredZipWriter.Entry(
+                name: "report.txt",
+                data: Data(ErrorPresentationPolicy.redactShareFacingText(
+                    reportText,
+                    context: redactionContext
+                ).utf8)
+            ),
+        ]
+
+        switch preview {
+        case .included(let consent, let raster):
+            let filename = canonicalPreviewFilename(raster.filename)
+            manifestLines.append(
+                "\(filename): explicitly included film content from frame \(consent.frameIndex)"
             )
-        )
+            entries.append(StoredZipWriter.Entry(name: filename, data: raster.data))
+        case .excludedByPrivacyDefault(let candidate):
+            if let candidate {
+                manifestLines.append(
+                    "film preview: excluded by privacy default (available frame: \(candidate.frameIndex))"
+                )
+            } else {
+                manifestLines.append(
+                    "film preview: excluded by privacy default (no locally-known candidate)"
+                )
+            }
+        case .unavailable(let reason):
+            manifestLines.append(
+                "film preview: unavailable (\(safeReason(reason, context: redactionContext)))"
+            )
+        }
+
+        switch evidence {
+        case .included(let artifact):
+            if let data = encodedShareSafeEvidence(
+                artifact,
+                context: redactionContext
+            ) {
+                entries.append(StoredZipWriter.Entry(
+                    name: "evidence-v1.json",
+                    data: data
+                ))
+                manifestLines.append(
+                    "bounded evidence: included \(artifact.evidenceId) as evidence-v1.json"
+                )
+            } else {
+                manifestLines.append(
+                    "bounded evidence: unavailable (the supplied witness failed strict validation or share-safety checks)"
+                )
+            }
+        case .unavailable(let reason):
+            manifestLines.append(
+                "bounded evidence: unavailable (\(safeReason(reason, context: redactionContext)))"
+            )
+        }
+
+        entries.append(StoredZipWriter.Entry(
+            name: "manifest.txt",
+            data: Data(manifestLines.joined(separator: "\n").utf8)
+        ))
         return entries
+    }
+
+    private static func sanitizedDiagnosticsJSONL(
+        _ data: Data,
+        context: ErrorPresentationContext
+    ) -> Data {
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var output = Data()
+
+        for line in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
+            guard let entry = try? decoder.decode(
+                SessionDiagnosticEntry.self,
+                from: Data(line)
+            ) else {
+                // Unknown JSON cannot be proven share-safe, so fail closed.
+                continue
+            }
+            let sanitized = SessionDiagnosticEntry(
+                timestamp: ErrorPresentationPolicy.redactShareFacingText(
+                    entry.timestamp,
+                    context: context
+                ),
+                sessionId: "redacted",
+                event: ErrorPresentationPolicy.redactShareFacingText(
+                    entry.event,
+                    context: context
+                ),
+                fields: sanitizedObject(entry.fields, context: context)
+            )
+            guard let encoded = try? encoder.encode(sanitized) else { continue }
+            output.append(encoded)
+            output.append(0x0A)
+        }
+        return output
+    }
+
+    private static func sanitizedField(
+        _ field: DiagnosticFieldValue,
+        context: ErrorPresentationContext
+    ) -> DiagnosticFieldValue {
+        switch field {
+        case .string(let value):
+            return .string(ErrorPresentationPolicy.redactShareFacingText(
+                value,
+                context: context
+            ))
+        case .number, .bool:
+            return field
+        case .array(let values):
+            return .array(values.map { sanitizedField($0, context: context) })
+        case .object(let values):
+            return .object(sanitizedObject(values, context: context))
+        }
+    }
+
+    private static func sanitizedObject(
+        _ values: [String: DiagnosticFieldValue],
+        context: ErrorPresentationContext
+    ) -> [String: DiagnosticFieldValue] {
+        var sanitized: [String: DiagnosticFieldValue] = [:]
+        for (index, pair) in values.sorted(by: { $0.key < $1.key }).enumerated() {
+            let redactedKey = ErrorPresentationPolicy.redactShareFacingText(
+                pair.key,
+                context: context
+            )
+            let keyIsStructurallySafe = !pair.key.isEmpty
+                && pair.key.utf8.count <= 64
+                && pair.key.allSatisfy {
+                    $0.isLetter || $0.isNumber
+                        || $0 == "." || $0 == "_" || $0 == "-"
+                }
+            var safeKey = redactedKey == pair.key && keyIsStructurallySafe
+                ? pair.key
+                : "redactedField\(index)"
+            while sanitized[safeKey] != nil {
+                safeKey += "_"
+            }
+            sanitized[safeKey] = sanitizedField(pair.value, context: context)
+        }
+        return sanitized
+    }
+
+    static func canonicalPreviewFilename(_ proposed: String) -> String {
+        let pathExtension = URL(fileURLWithPath: proposed)
+            .pathExtension
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+        return pathExtension.isEmpty
+            ? "preview"
+            : "preview.\(pathExtension.prefix(12))"
+    }
+
+    static func encodedShareSafeEvidence(
+        _ artifact: DiagnosticEvidenceArtifact,
+        context: ErrorPresentationContext
+    ) -> Data? {
+        guard (try? DiagnosticEvidenceValidator.validate(
+            artifact,
+            expectedOperationId: artifact.operationId
+        )) != nil else {
+            return nil
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(artifact),
+              let text = String(data: data, encoding: .utf8),
+              ErrorPresentationPolicy.redactShareFacingText(
+                text,
+                context: context
+              ) == text,
+              ErrorPresentationPolicy.redactShareFacingText(
+                artifact.evidenceId,
+                context: context
+              ) == artifact.evidenceId
+        else {
+            return nil
+        }
+        return data
+    }
+
+    private static func safeReason(
+        _ reason: String,
+        context: ErrorPresentationContext
+    ) -> String {
+        let safe = ErrorPresentationPolicy.redactShareFacingText(
+            reason,
+            context: context
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        return safe.isEmpty ? "not supplied" : String(safe.prefix(512))
     }
 }
 
-/// Resolves the diagnostic bundle's preview raster from state the frontend
-/// already holds -- `Thumbnail.imagePath`, exactly what the contact sheet
-/// already reads to render preview tiles -- never a new bridge/engine wire
-/// method. `readFile` is injectable so this is testable against a fake
-/// filesystem (a plain `[String: Data]` lookup) with zero real disk I/O.
+/// Resolves preview film bytes only after exact, per-export opt-in. Candidate
+/// discovery reads metadata already held by the UI; `resolve` is the sole
+/// file-read boundary and checks that consent still matches first.
 public enum DiagnosticBundleRasterPolicy {
+    public static func candidate(
+        thumbnails: [Int: Thumbnail]
+    ) -> DiagnosticPreviewConsent? {
+        for frameIndex in thumbnails.keys.sorted() {
+            guard let imagePath = thumbnails[frameIndex]?.imagePath,
+                  !imagePath.isEmpty
+            else { continue }
+            let pathExtension = URL(fileURLWithPath: imagePath).pathExtension
+            let filename = DiagnosticBundleBuilder.canonicalPreviewFilename(
+                pathExtension.isEmpty ? "preview" : "preview.\(pathExtension)"
+            )
+            return DiagnosticPreviewConsent(
+                frameIndex: frameIndex,
+                sourcePath: imagePath,
+                filename: filename
+            )
+        }
+        return nil
+    }
+
     public static func resolve(
-        thumbnails: [Int: Thumbnail],
+        consent: DiagnosticPreviewConsent,
+        currentCandidate: DiagnosticPreviewConsent?,
         readFile: (String) -> Data?
     ) -> (raster: DiagnosticBundleBuilder.PreviewRaster?, unavailableReason: String?) {
-        guard !thumbnails.isEmpty else {
-            return (nil, "no roll preview in this session")
+        guard consent == currentCandidate else {
+            return (nil, "the consented film preview changed before export")
         }
-        guard
-            let lowestIndex = thumbnails.keys.sorted().first,
-            let imagePath = thumbnails[lowestIndex]?.imagePath,
-            !imagePath.isEmpty
-        else {
-            return (nil, "the roll preview has no locally-known image path")
+        guard let data = readFile(consent.sourcePath) else {
+            return (nil, "the consented film preview image file is missing or unreadable")
         }
-        guard let data = readFile(imagePath) else {
-            return (nil, "the roll preview image file is missing or unreadable")
-        }
-        let extensionName = URL(fileURLWithPath: imagePath).pathExtension
-        let filename = extensionName.isEmpty ? "preview" : "preview.\(extensionName)"
-        return (DiagnosticBundleBuilder.PreviewRaster(filename: filename, data: data), nil)
+        return (
+            DiagnosticBundleBuilder.PreviewRaster(
+                filename: consent.filename,
+                data: data
+            ),
+            nil
+        )
     }
 }
