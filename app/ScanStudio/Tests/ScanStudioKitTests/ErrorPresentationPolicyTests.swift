@@ -21,6 +21,20 @@ struct ErrorPresentationPolicyTests {
         #expect(presentation.technicalDetails == rawMessage)
     }
 
+    @Test("a meter controller refusal wrapped as ROLL_MISMATCH keeps its exposure guidance")
+    func meterControllerRefusalWrappedAsRollMismatch() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): "
+            + "SynchronizedProtocolError: meter pass 3 final controller refused: nonconverged"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "Exposure control stopped safely")
+        #expect(presentation.guidance.contains("will not retry automatically"))
+        #expect(presentation.technicalDetails == rawMessage)
+        #expect(presentation.canPlaceFramesManually == false)
+        #expect(presentation.canApproveEveryFrameAndScan == false)
+    }
+
     @Test("medium-not-present during batch positioning is a clear feed interruption")
     func filmFeedInterrupted() {
         let rawMessage = "FILM_FEED_INTERRUPTED: bridge scan.frameFailed "
@@ -147,7 +161,9 @@ struct ErrorPresentationPolicyTests {
             (
                 "NOT_CONNECTED: no scanner session",
                 "Scanner connection was lost",
-                "Reconnect ScanStudio to the scanner, then try again. You do not need to power-cycle it."
+                "Reconnect ScanStudio to the scanner, then try again. "
+                    + "If the last failure asked for a scanner power-cycle, do that first. "
+                    + "If reconnecting keeps failing, quit and reopen ScanStudio."
             ),
             (
                 "NO_MEDIA: no film detected",

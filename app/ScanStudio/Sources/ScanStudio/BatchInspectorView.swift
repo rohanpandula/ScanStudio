@@ -632,10 +632,14 @@ struct BatchInspectorView: View {
                 // Issue #76/#24: a whole-batch refusal (e.g. the unattended
                 // binding confidence gate) can fail every frame for the same
                 // one reason before any capture is attempted, leaving
-                // "Completed: 0" with nothing explaining why. Smallest
-                // honest surfacing of that reason, not a redesign.
+                // "Completed: 0" with nothing explaining why; a single
+                // refused frame after completed ones needs the same reason.
+                // Smallest honest surfacing of that reason, not a redesign.
                 if let batchFailureReason {
-                    Label(batchFailureReason.guidance, systemImage: "info.circle")
+                    Label(
+                        "\(batchFailureReason.title). \(batchFailureReason.guidance)",
+                        systemImage: "info.circle"
+                    )
                         .font(.system(size: 10))
                         .foregroundStyle(Color.scanStudioSecondaryText)
                         .fixedSize(horizontal: false, vertical: true)
@@ -657,14 +661,15 @@ struct BatchInspectorView: View {
         }
     }
 
-    /// The scanner's own explanation for a batch that finished without
-    /// completing a single frame -- distinct from `needsReviewFrames`/
-    /// `failedFrames` (which list WHICH frames failed): a whole-batch
-    /// refusal fails every frame for the same one reason before any capture
-    /// is attempted. `nil` whenever the batch completed at least one frame,
-    /// or no failed frame carries a real (non-review) error detail.
+    /// The scanner's own explanation for the first failed (non-review)
+    /// frame -- distinct from `needsReviewFrames`/`failedFrames` (which list
+    /// WHICH frames failed). Originally shown only for a whole-batch refusal
+    /// that left "Completed: 0"; live LS-5000 QA (2026-09-06) completed five
+    /// frames and had frame 6 refused by the exposure-meter controller with
+    /// nothing in the app saying why while Resume and Retry were offered.
+    /// `nil` only when no failed frame carries a real (non-review) detail.
     private var batchFailureReason: ErrorPresentation? {
-        guard let summary = sessionModel.scanSummary, summary.completed.isEmpty else {
+        guard let summary = sessionModel.scanSummary else {
             return nil
         }
         guard let error = summary.failed.lazy.compactMap({ sessionModel.frameErrors[$0] }).first(where: {

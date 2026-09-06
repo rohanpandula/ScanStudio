@@ -13,6 +13,7 @@ private actor DiscoveryEngineStub: EngineClientProtocol {
     enum Mode: Sendable {
         case gatedSuccess
         case failure
+        case startupFailure
     }
 
     nonisolated let events: AsyncStream<EngineEvent>
@@ -33,6 +34,13 @@ private actor DiscoveryEngineStub: EngineClientProtocol {
     ) async throws -> Result {
         guard method == "scanner.list" else {
             throw DiscoveryStubError.unexpectedMethod(method)
+        }
+        if mode == .startupFailure {
+            throw EngineRequestError(
+                code: "INTERNAL",
+                message: "BRIDGE_STARTUP_FAILED: bridge spawn/handshake failed: bridge call timed out",
+                recoverable: true
+            )
         }
         guard mode == .gatedSuccess else {
             throw DiscoveryStubError.forcedFailure
@@ -87,6 +95,19 @@ private func waitForDiscoveryState(
 
 @Suite("Device discovery lifecycle")
 struct DeviceDiscoveryLifecycleTests {
+    @Test("Configured bridge startup failure is actionable and retains the cause")
+    @MainActor
+    func startupFailureIsVisible() async {
+        let stub = DiscoveryEngineStub(mode: .startupFailure)
+        let model = SessionModel(engineClient: stub)
+
+        #expect(await waitForDiscoveryState(false, model: model))
+        #expect(model.availableDevices.isEmpty)
+        #expect(model.errorPresentation?.title == "Scanner discovery failed")
+        #expect(model.errorPresentation?.guidance.contains("Look Again") == true)
+        #expect(model.errorPresentation?.technicalDetails.contains("bridge call timed out") == true)
+    }
+
     @Test("Overlapping refreshes stay discovering until both finish")
     @MainActor
     func overlappingRefreshes() async {

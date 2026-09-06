@@ -1277,7 +1277,7 @@ public final class SessionModel {
     /// action. Called once from `init` (fire-and-forget); also called by
     /// `connect(deviceId:)` if `availableDevices` is still empty when a
     /// specific device is requested.
-    public func refreshAvailableDevices() async {
+    public func refreshAvailableDevices(rescan: Bool = false) async {
         deviceDiscoveryRequestsInFlight += 1
         isDiscoveringDevices = true
         defer {
@@ -1286,9 +1286,12 @@ public final class SessionModel {
         }
         do {
             let listResult: ScannerListResult = try await engineClient.request(
-                "scanner.list", params: EmptyParams()
+                rescan ? "scanner.rescan" : "scanner.list", params: EmptyParams()
             )
             availableDevices = listResult.devices
+            if lastErrorMessage?.contains("BRIDGE_STARTUP_FAILED") == true {
+                lastErrorMessage = nil
+            }
             recordDiagnostic(
                 event: "device.discovery.succeeded",
                 fields: ["count": String(listResult.devices.count)]

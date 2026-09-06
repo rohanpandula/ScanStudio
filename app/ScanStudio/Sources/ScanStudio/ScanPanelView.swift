@@ -326,16 +326,16 @@ struct ScanPanelView: View {
 
     /// Issue #76/#24: "Last batch: 0 completed" alone hid the driver's own
     /// refusal reason (e.g. the unattended-binding confidence gate failing
-    /// every frame before any capture). This footer label has no room for a
-    /// second line, so the reason surfaces as a tooltip instead --
-    /// `BatchInspectorView.batchResultSummary` shows the same reason inline
-    /// for the fuller Batch inspector. The reason is appended after the
-    /// visible label text, never substituted for it: a reason no curated
-    /// matcher recognizes still gets its generic guidance, and the count
-    /// stays visible either way.
+    /// every frame before any capture); live LS-5000 QA (2026-09-06) showed
+    /// "5 saved" hiding a meter refusal of frame 6 the same way. This footer
+    /// label has no room for a second line, so the reason surfaces as a
+    /// tooltip instead -- `BatchInspectorView.batchResultSummary` shows the
+    /// same reason inline for the fuller Batch inspector. The reason is
+    /// appended after the visible label text, never substituted for it: a
+    /// reason no curated matcher recognizes still gets its generic
+    /// guidance, and the count stays visible either way.
     private func batchSummaryHelp(_ summary: ScanSummary) -> String {
-        guard summary.completed.isEmpty,
-              let error = summary.failed.lazy.compactMap({ sessionModel.frameErrors[$0] }).first(where: {
+        guard let error = summary.failed.lazy.compactMap({ sessionModel.frameErrors[$0] }).first(where: {
                   $0.code != FrameFailureLabel.manualReviewCode
               })
         else {

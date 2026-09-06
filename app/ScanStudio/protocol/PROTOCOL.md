@@ -33,17 +33,21 @@ params `{clientName: string, protocolVersion: 1}` → result `{engineName: "scan
 params `{}` → result `{}`; then the engine cancels outstanding simulated work, flushes the response, and exits 0. Cancellation is bounded so an active operation cannot keep shutdown waiting on its normal simulated delay.
 
 ### `scanner.list`
-`{}` → `{devices: [DeviceInfo]}`. Always exactly one simulated device in M1.
+`{}` → `{devices: [DeviceInfo]}`. The simulated device, plus the real device
+when a configured bridge started successfully. When a configured bridge's
+startup failed, this returns a recoverable `INTERNAL` error whose message
+starts with `BRIDGE_STARTUP_FAILED:` and names the cause; it never silently
+degrades to a simulator-only list. The error stays until a `scanner.rescan`
+succeeds; listing itself never retries the bridge.
 
 ### `scanner.rescan`
 `{}` → `{devices: [DeviceInfo]}`. One deliberate re-attempt of the real
 backend's startup for the case where the engine started before the bridge
-stack was ready (the real device then stays invisible to `scanner.list`
-until rescan). Idempotent: an already-running real backend and an
-unconfigured bridge both return the current list unchanged, and a failed
-re-attempt degrades to the simulator-only list rather than erroring.
-Error: `ALREADY_CONNECTED` (rescan never replaces a connected session's
-backend).
+stack was ready, or the bridge process later exited. Idempotent: an
+already-running real backend and an unconfigured bridge both return the
+current list unchanged. A failed re-attempt returns the same recoverable
+`BRIDGE_STARTUP_FAILED` error as `scanner.list`. Error: `ALREADY_CONNECTED`
+(rescan never replaces a connected session's backend).
 
 ### `scanner.connect`
 `{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo"}}` → `{device: DeviceInfo, status: ScannerStatus}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED`.
