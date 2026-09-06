@@ -185,8 +185,11 @@ evidence in `/Users/rohan/ScanStudio-QA/single-sample-20260906/`):
   `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1` (lab-only); production advertises
   `[4]`. Next session: connect the scanner directly to the Mac with a
   different cable before any further transport work.
-- Held exposure was not reached (frame 1 failed first). The bridge path is
-  unit-tested; hardware validation at 4× is still pending.
+- Held exposure was validated at 4× on the same strip once the scanner was
+  moved to another hub (candidate #6, 20:07–20:12 UTC): frame 1 metered
+  890.92/1781.93/1633.44 µs, frame 2 was captured at exactly those values
+  (driver journal `exposure_override.applied: true`; its own meter would have
+  chosen 1466.67/3650.71/3320.72 µs), both receipts verified, IR metered.
 - Two other findings were fixed on the way: `device.open` and the cold
   `bridge.hello` now have measured deadlines (60 s and 45 s) after both
   exceeded the generic 10 s timeout on this scanner; the multi-sampling
