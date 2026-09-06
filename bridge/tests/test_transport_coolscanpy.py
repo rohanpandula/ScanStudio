@@ -3986,8 +3986,9 @@ def test_confirmed_real_device_eject_needs_no_second_probe(monkeypatch):
 
 
 def _single_sample_driver(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stand in for CoolscanPy 0.7.7's declaration without needing that driver
-    installed: the transport consults this one helper for the accepted set."""
+    """Stand in for CoolscanPy 0.7.7's declaration plus the lab opt-in without
+    needing that driver installed: the transport consults this one helper for
+    the accepted set."""
     monkeypatch.setattr(coolscanpy_transport_module, "supported_samples_per_scan", lambda: (1, 4))
 
 
@@ -4005,12 +4006,19 @@ def _scan(transport: CoolscanPyTransport, slots: list[int], recipe: domain.Captu
 def test_supported_samples_per_scan_never_widens_on_a_declaration_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", raising=False)
-    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
+    monkeypatch.delenv(coolscanpy_transport_module.SINGLE_SAMPLE_ENV_VAR, raising=False)
     monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, 4), raising=False)
+    # Without the lab opt-in the driver's declaration changes nothing.
+    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
+    monkeypatch.setenv(coolscanpy_transport_module.SINGLE_SAMPLE_ENV_VAR, "1")
     has_keyword = "samples_per_scan" in inspect.signature(coolscanpy.Roll.scan_many).parameters
     assert coolscanpy_transport_module.supported_samples_per_scan() == ((1, 4) if has_keyword else (4,))
+    monkeypatch.delattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", raising=False)
+    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
     monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, True, "4"), raising=False)
+    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
+    monkeypatch.setenv(coolscanpy_transport_module.SINGLE_SAMPLE_ENV_VAR, "true")
+    monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, 4), raising=False)
     assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
 
 

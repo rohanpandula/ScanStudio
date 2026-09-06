@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add ``samples_per_scan`` (1 or 4, default 4) to ``Roll.scan``/``Roll.scan_many`` and the batch job. Single-sample mode patches the fine SET_WINDOW multi-read byte (payload[48]) and its GET_WINDOW echo expectation before preflight, mirroring the metering windows' own single-sample value; the frame journal records ``fine_samples_per_scan``. The traced 4-sample capture is byte-for-byte unchanged. Single-sample output has not yet been validated on hardware.
+- Add ``samples_per_scan`` (1 or 4, default 4) to ``Roll.scan``/``Roll.scan_many`` and the batch job. Single-sample mode patches the fine SET_WINDOW multi-read byte (payload[48]) and its GET_WINDOW echo expectation before preflight, mirroring the metering windows' own single-sample value; the frame journal records ``fine_samples_per_scan``. The traced 4-sample capture is byte-for-byte unchanged. Single-sample mode is lab-only: on a live LS-5000 (2026-09-06) the scanner accepted the one-sample window and metered normally, but the first fine READ failed with libusb OVERFLOW and the transport needed a power-cycle, so the 4-sample transaction framing does not carry over; a verified single-sample trace is required before it can be offered to users.
 
 ## 0.7.5 - 2026-09-06
 

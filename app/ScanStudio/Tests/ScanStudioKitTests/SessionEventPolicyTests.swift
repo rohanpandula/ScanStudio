@@ -3125,11 +3125,11 @@ struct SessionEventPolicyTests {
         #expect(MultisamplePassPolicy.coerce(2, into: []) == 2)
     }
 
-    @Test("MultisamplePassPolicy.label/optionsDescription render \"Off\" for 1x and \"N×\" for the rest")
+    @Test("MultisamplePassPolicy.label/optionsDescription render \"1× (off)\" for 1x and \"N×\" for the rest")
     func multisamplePassPolicyLabelsAndDescriptions() {
-        #expect(MultisamplePassPolicy.label(for: 1) == "Off")
+        #expect(MultisamplePassPolicy.label(for: 1) == "1× (off)")
         #expect(MultisamplePassPolicy.label(for: 4) == "4×")
-        #expect(MultisamplePassPolicy.optionsDescription([1, 4]) == "Off, 4×")
+        #expect(MultisamplePassPolicy.optionsDescription([1, 4]) == "1× (off), 4×")
     }
 
     // MARK: - SessionActivitySummary (session-aware sidebar status card)

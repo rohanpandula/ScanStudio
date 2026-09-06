@@ -795,7 +795,10 @@ public final class SessionModel {
     public private(set) var frameVerticalMirrors: [Int: Bool] = [:]
     public var scanResolutionDpi = 4_000
     public var scanBitDepth = 16
-    public var scanMultisamplePasses = 2
+    /// Defaults to the LS-5000's traced 4-sample capture so a device that
+    /// advertises more than one option never silently lands on a lower
+    /// value; the simulator range includes 4 as well.
+    public var scanMultisamplePasses = 4
     public var scanChannels = "rgbi"
     public var scanFilmProcess: FilmProcess = .c41ColorNegative
     /// Process used by the currently previewed real film. A project created
@@ -5337,7 +5340,7 @@ public enum MultisamplePassPolicy {
     }
 
     public static func label(for passes: Int) -> String {
-        passes == 1 ? "Off" : "\(passes)×"
+        passes == 1 ? "1× (off)" : "\(passes)×"
     }
 
     public static func optionsDescription(_ options: [Int]) -> String {

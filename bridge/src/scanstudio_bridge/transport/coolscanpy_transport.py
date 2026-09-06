@@ -298,8 +298,11 @@ class _ScanPhase:
             )
 
 
+SINGLE_SAMPLE_ENV_VAR = "SCANSTUDIO_BRIDGE_SINGLE_SAMPLE"
+
+
 def supported_samples_per_scan() -> tuple[int, ...]:
-    """Fine-scan samples-per-line values the loaded CoolscanPy accepts.
+    """Fine-scan samples-per-line values this bridge advertises and accepts.
 
     CoolscanPy 0.7.7 declares `SUPPORTED_SAMPLES_PER_SCAN == (1, 4)` and
     takes `Roll.scan_many(samples_per_scan=...)`; an older driver has neither
@@ -307,9 +310,20 @@ def supported_samples_per_scan() -> tuple[int, ...]:
     advertises and accepts `(4,)` against it rather than passing a keyword
     the driver would reject. Both conditions are checked so a partial or
     foreign attribute can never widen the accepted set on its own.
+
+    Single-sample capture is additionally gated behind
+    `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1` (lab-only, like the debug recipe
+    gate): on the live LS-5000 (2026-09-06) the scanner accepted the
+    1-sample window and metered normally, but the first fine READ then
+    failed with LIBUSB_ERROR_OVERFLOW and wedged the transport -- the
+    single-sample data phase is framed differently from the traced 4-sample
+    transaction. Until a verified single-sample trace exists, production
+    advertises `(4,)` whatever the driver supports.
     """
 
     traced = domain.FIXED_COLOR_NEGATIVE_RECIPE.multisample_passes
+    if os.environ.get(SINGLE_SAMPLE_ENV_VAR) != "1":
+        return (traced,)
     declared = getattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", None)
     try:
         parameters = inspect.signature(coolscanpy.Roll.scan_many).parameters

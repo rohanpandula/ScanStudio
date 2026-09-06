@@ -159,6 +159,42 @@ Follow-ups recorded from this run, in addition to the two above:
   discovery itself (about 6.5 s of libusb enumeration and inquiry) is still
   worth profiling in CoolscanPy.
 
+### Single-sample and held-exposure attempt (candidates #4 and #5)
+
+A friend's calibration guide asked for a "Pass A" of 1 sample per line with
+auto exposure off and one exposure held for the roll. Both were built the
+same day: CoolscanPy `feat/samples-per-scan` (`Roll.scan_many(samples_per_scan=1|4)`
+patching the fine SET_WINDOW multi-read byte and its GET_WINDOW echo), and a
+bridge that accepts `multisamplePasses` from the driver's declared set and
+`autoExposure: false` as "meter the lowest slot, hold it for the rest"
+through the driver's existing `exposure_override_10ns`.
+
+Live result (candidate #5, commit 5b82b03 with the vendored driver change,
+evidence in `/Users/rohan/ScanStudio-QA/single-sample-20260906/`):
+
+- The scanner accepted the one-sample window (GET_WINDOW echoed samples=1
+  on all four colours) and metered normally with the same exposures as the
+  morning's 4× frame 1. The first fine READ (command 607) then failed with
+  libusb OVERFLOW during its status phase and the transport had to be
+  power-cycled. Single-sample capture is framed differently from the traced
+  4-sample transaction; a verified single-sample USB trace is required.
+  Decision: single-sample stays behind `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1`
+  (lab-only); production advertises `[4]`.
+- Held exposure was not reached (frame 1 failed first). The bridge path is
+  unit-tested; hardware validation at 4× is still pending.
+- Two other findings were fixed on the way: `device.open` and the cold
+  `bridge.hello` now have measured deadlines (60 s and 45 s) after both
+  exceeded the generic 10 s timeout on this scanner; the multi-sampling
+  picker labels one sample as "1× (off)" and the app default is the traced
+  4 so a wider advertised set never lands on a lower value silently.
+- Film handling limited the session: after repeated ejects and reinserts of
+  the short strip, one preview refused with REFEED_REQUIRED (anchor residual
+  up to 7.6 rows) and one batch refused before motion because the fresh
+  frame-table read did not fit the preview within 2 rows. That refusal is
+  reported as "live mapping has fewer than 2 scanner-addressable frame
+  records" (ROLL_MISMATCH) and does not persist which anchor failed; both
+  the wording and the missing evidence are follow-ups.
+
 ## Implementation order and acceptance
 
 1. **Finish the current capture and remove release blockers.** Inspect outputs,
