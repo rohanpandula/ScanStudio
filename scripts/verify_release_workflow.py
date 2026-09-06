@@ -44,7 +44,7 @@ REQUIRED_VERIFICATION_FAMILIES = (
     "app-and-engine",
     "bridge",
     "coolscanpy",
-    "ports-vendor-sync",
+    "supply-chain-policy",
     "package",
     "package-macos-14",
     "updater-integration",
@@ -57,9 +57,6 @@ EXPECTED_RELEASE_NEEDS = {
     "verify": {"authorize"},
     "authorize": set(),
     "release": {"verify"},
-    "windows-resources": {"verify"},
-    "windows": {"windows-resources"},
-    "linux": {"verify"},
     "verification-gate": set(REQUIRED_RELEASE_JOBS),
     "publish": {"authorize", "verify", "verification-gate"},
 }
@@ -209,9 +206,16 @@ def _verify_called_workflow(
         'echo "verified_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"',
         "exact verified SHA output",
     )
-    ports_source = _job_source(source, jobs, "ports-vendor-sync")
+    package = _mapping(jobs["package"], "verification package")
+    if "strategy" in package or _scalar(package["runs-on"], "package runner") != "macos-15":
+        raise ReleaseWorkflowError("verification package must use the single Apple Silicon macos-15 runner")
+    for family in REQUIRED_VERIFICATION_FAMILIES:
+        job = _mapping(jobs[family], family)
+        if "if" in job or "continue-on-error" in job:
+            raise ReleaseWorkflowError(f"required family {family} cannot be conditional or tolerate failure")
+    policy_source = _job_source(source, jobs, "supply-chain-policy")
     _require(
-        ports_source,
+        policy_source,
         "python3 -I -S -B scripts/verify_release_workflow.py",
         "direct release workflow policy invocation",
     )
@@ -263,18 +267,25 @@ def _verify_release_graph(jobs: dict[str, object]) -> None:
     ):
         raise ReleaseWorkflowError("release verification-gate must run with always()")
 
-    release = _mapping(jobs["release"], "release package matrix")
-    strategy = _mapping(release["strategy"], "release strategy")
-    if _scalar(strategy["fail-fast"], "release fail-fast") != "true":
-        raise ReleaseWorkflowError("release matrix must keep fail-fast enabled")
-    matrix = _mapping(strategy["matrix"], "release matrix")
-    if _sequence_values(matrix["arch"], "release matrix architectures") != [
-        "arm64",
-        "x86_64",
-    ]:
-        raise ReleaseWorkflowError(
-            "release native package matrix must be exactly arm64 and x86_64"
-        )
+    release = _mapping(jobs["release"], "release package")
+    if "strategy" in release or _scalar(release["runs-on"], "release runner") != "macos-15":
+        raise ReleaseWorkflowError("release must use the single Apple Silicon macos-15 runner")
+
+    publish = _mapping(jobs["publish"], "publish")
+    downloads = []
+    for node in publish["steps"].value:
+        step = _mapping(node, "publish step")
+        if "uses" in step and _scalar(step["uses"], "publish action").startswith("actions/download-artifact@"):
+            downloads.append(step)
+    if len(downloads) != 1 or "with" not in downloads[0]:
+        raise ReleaseWorkflowError("publish must download exactly one arm64 artifact before provenance verification")
+    inputs = _mapping(downloads[0]["with"], "publish artifact inputs")
+    if set(inputs) != {"name", "path"} or any(
+        _scalar(inputs[key], key) != value for key, value in {
+            "name": "ScanStudio-dmg-arm64", "path": "${{ runner.temp }}/arm64"
+        }.items()
+    ):
+        raise ReleaseWorkflowError("publish must download the same-run arm64 artifact to its provenance root")
 
 
 def _verify_release_commands(source: str, jobs: dict[str, object]) -> None:
@@ -295,18 +306,15 @@ def _verify_release_commands(source: str, jobs: dict[str, object]) -> None:
         ),
     )
 
-    for name in ("release", "windows", "linux"):
-        _require(
-            job_sources[name],
-            "scripts/release_provenance.py emit",
-            f"{name} artifact provenance emission",
-        )
+    _require(job_sources["release"], "scripts/release_provenance.py emit", "release artifact provenance emission")
     publish = job_sources["publish"]
     provenance_step = _step_source(publish, "Verify all exact-run artifact provenance")
-    if provenance_step.count("scripts/release_provenance.py verify") != 4:
+    if provenance_step.count("scripts/release_provenance.py verify") != 1:
         raise ReleaseWorkflowError(
-            "publish provenance must verify exactly four platform receipts"
+            "publish provenance must verify exactly one Apple Silicon receipt"
         )
+    if publish.index("actions/download-artifact@") > publish.index("scripts/release_provenance.py verify"):
+        raise ReleaseWorkflowError("publish artifact download must precede provenance verification")
 
     gate = job_sources["verification-gate"]
     _require_all(

@@ -549,6 +549,17 @@ public final class SessionModel {
     @ObservationIgnored
     private var pendingFrameAlignmentRestore: PendingFrameAlignmentRestore?
 
+    @ObservationIgnored
+    private var projectSnapshotGeneration: UInt64 = 0
+    @ObservationIgnored
+    internal private(set) var projectSnapshotRefreshTask: Task<Void, Never>?
+    @ObservationIgnored
+    internal var readProjectSnapshot: @Sendable (URL) async -> ScanProject? = { url in
+        await Task.detached(priority: .utility) {
+            ProjectSnapshotReader.read(url)
+        }.value
+    }
+
     public private(set) var device: DeviceInfo?
     /// The full device list from the engine's last `scanner.list` response
     /// (simulator plus, when a bridge is configured, the real LS-5000) —
@@ -898,6 +909,23 @@ public final class SessionModel {
     /// The engine's authoritative resume set from the last
     /// `project.pendingFrames` round trip.
     public private(set) var pendingFrames: [Int] = []
+    private var pendingFramesRequestID: UUID?
+    /// Includes the authoritative pending-frame read before scan startup.
+    public private(set) var isResumingBatch = false
+    /// Saved completion is reviewable without granting fresh motion authority.
+    public var requiresFreshPreview: Bool {
+        project != nil && latestCompletedPreviewOperationId == nil
+    }
+    /// Session edits that have not yet reached the active manifest. Capture
+    /// settings have no project-level persistence and are not included here.
+    public var hasUnsavedProjectChanges: Bool {
+        guard let project else { return false }
+        return rollMetadataDraft != project.rollMetadata
+            || outputRecipe != project.recipes
+            || project.frames.contains {
+                desiredFrameGeometry(for: $0.index, persistedFrame: $0) != $0.alignment
+            }
+    }
     public var pendingFrameCount: Int { pendingFrames.count }
     /// How many frames already carry a receipt, from that same
     /// `project.pendingFrames` round trip (`PendingFramesResult.completedCount`)
@@ -1136,7 +1164,8 @@ public final class SessionModel {
     /// the authoritative status count, and a process committed only by the
     /// terminal completion event.
     public var hasCompletePreviewRegistration: Bool {
-        guard !isRestoringFrameAlignments,
+        guard latestCompletedPreviewOperationId != nil,
+              !isRestoringFrameAlignments,
               failedFrameAlignmentRestoreIndices.isEmpty
         else {
             return false
@@ -1186,6 +1215,7 @@ public final class SessionModel {
             isConnected: status?.connected == true,
             hasPreviewedMedia:
                 status?.mediaLoaded == true
+                    && latestCompletedPreviewOperationId != nil
                     && !thumbnails.isEmpty
                     && failedFrameAlignmentRestoreIndices.isEmpty,
             hasOpenProject: project != nil,
@@ -1199,7 +1229,7 @@ public final class SessionModel {
             ),
             transportIsIdle: status?.transport == "idle",
             isAcquiringPreviews: isAcquiringThumbnails,
-            hasActiveJob: isJobActive,
+            hasActiveJob: isJobActive || jobId != nil,
             isAdjustingFrameAlignment: pendingFrameAlignmentAdjustment != nil
         ))
     }
@@ -1485,7 +1515,10 @@ public final class SessionModel {
         }
         let context = PreviewIntentStateMachine.Context(
             hasProject: project != nil,
-            isAcquiring: isAcquiringThumbnails,
+            isAcquiring: isAcquiringThumbnails || isResumingBatch
+                || pendingScanStart != nil || jobId != nil || isJobActive
+                || pendingManualReviewApproval != nil
+                || pendingAttendedScanApproval != nil,
             hasCompleteRegistration: hasCompletePreviewRegistration
         )
         guard previewIntentStateMachine.consume(intent, context: context) else {
@@ -1988,7 +2021,10 @@ public final class SessionModel {
     /// `scan.start`. Preview evidence is checked here, in the model, so a
     /// forgotten or delayed UI confirmation cannot bypass it.
     @discardableResult
-    private func startScanOrRequestManualReview(frames: [Int]) async -> Bool {
+    private func startScanOrRequestManualReview(
+        frames: [Int], resumingBatch: Bool = false
+    ) async -> Bool {
+        guard !isChangingProject, !isResumingBatch || resumingBatch else { return false }
         guard pendingAttendedScanApproval == nil else { return false }
         guard pendingManualReviewApproval == nil else { return false }
         guard pendingScanStart == nil else {
@@ -2746,6 +2782,10 @@ public final class SessionModel {
         if isChangingProject {
             return "Another project action is still in progress. Wait for it to finish and try again."
         }
+        if isResumingBatch || pendingManualReviewApproval != nil
+            || pendingAttendedScanApproval != nil || pendingManualReviewScan != nil {
+            return "A scan action is awaiting completion or confirmation. Finish or cancel it before changing projects."
+        }
         if pendingScanStart != nil || jobId != nil || isJobActive {
             return "A scan is still in progress. Wait for it to finish or stop it before changing projects."
         }
@@ -2764,6 +2804,8 @@ public final class SessionModel {
             lastErrorMessage = reason
             return false
         }
+        pendingFramesRequestID = nil
+        projectSnapshotGeneration &+= 1
         isChangingProject = true
         return true
     }
@@ -2980,45 +3022,68 @@ public final class SessionModel {
 
     /// Refreshes `pendingFrames` from the engine's own authoritative
     /// `project.pendingFrames` answer.
-    public func refreshPendingFrames() async {
-        // The endpoint is project-scoped. A carrier status update must never
-        // turn into a user-visible PROJECT_NOT_FOUND while the Save Roll gate
-        // is intentionally on screen.
-        guard project != nil else {
-            pendingFrames = []
-            completedFrameCount = 0
-            return
+    @discardableResult
+    public func refreshPendingFrames() async -> Bool {
+        guard !isChangingProject, pendingFramesRequestID == nil,
+              let project else { return false }
+        let requestID = UUID()
+        let epoch = connectionEpoch
+        pendingFramesRequestID = requestID
+        defer {
+            if pendingFramesRequestID == requestID { pendingFramesRequestID = nil }
         }
         lastErrorMessage = nil
         do {
-            let result: PendingFramesResult = try await engineClient.request("project.pendingFrames", params: EmptyParams())
-            pendingFrames = result.frames
-            completedFrameCount = result.completedCount
+            let result: PendingFramesResult = try await engineClient.request(
+                "project.pendingFrames", params: EmptyParams()
+            )
+            guard pendingFramesRequestID == requestID,
+                  connectionEpoch == epoch, self.project == project,
+                  !Task.isCancelled else { return false }
+            // A read is descriptive, never permission to overwrite completed
+            // work. Receipts observed by this session remain durable truth.
+            pendingFrames = result.frames.filter {
+                !durableCompletedFrameIndices.contains($0)
+            }
+            completedFrameCount = max(result.completedCount, durableCompletedFrameIndices.count)
+            return true
         } catch {
+            guard pendingFramesRequestID == requestID,
+                  connectionEpoch == epoch, self.project == project,
+                  !Task.isCancelled else { return false }
+            recordOperationFailure(error, operation: "project.pendingFrames")
             lastErrorMessage = Self.describe(error)
+            return false
         }
     }
 
-    /// Resumes a partially-completed project using exactly the engine's own
-    /// pending-frame list — never a stale cached copy, and never
-    /// `selectedFrameIndices` (a client-side, ephemeral selection).
-    /// `refreshPendingFrames()` is always re-queried immediately before
-    /// acting on it, since the whole point is authoritative-from-the-engine
-    /// state; `selectedFrameIndices` is only set FROM the resumed list
-    /// afterward, purely so the rest of the selection-driven UI stays
-    /// visually consistent with what's actually running.
+    /// One explicit resume owns both the authoritative read and scan startup.
+    /// A rejected/cancelled action cannot acquire permission from later state.
     public func resumeBatch() async {
+        guard !Task.isCancelled, !isResumingBatch, !isChangingProject,
+              pendingScanStart == nil, jobId == nil, !isJobActive,
+              pendingManualReviewScan == nil, pendingManualReviewApproval == nil,
+              pendingAttendedScanApproval == nil else { return }
         guard project != nil else {
             lastErrorMessage = ScanReadinessPolicy.Decision.projectRequired.reason
             return
         }
-        await refreshPendingFrames()
+        guard let previewID = latestCompletedPreviewOperationId else {
+            lastErrorMessage = ScanReadinessPolicy.Decision.previewsUnavailable.reason
+            return
+        }
+        isResumingBatch = true
+        defer { isResumingBatch = false }
+        let epoch = connectionEpoch
+        guard await refreshPendingFrames(), !Task.isCancelled,
+              connectionEpoch == epoch,
+              latestCompletedPreviewOperationId == previewID else { return }
         guard !pendingFrames.isEmpty else {
             lastErrorMessage = "Nothing to resume — every frame is already complete or excluded."
             return
         }
         selectedFrameIndices = Set(pendingFrames)
-        _ = await startScanOrRequestManualReview(frames: pendingFrames)
+        _ = await startScanOrRequestManualReview(frames: pendingFrames, resumingBatch: true)
     }
 
     /// Seeds the four output-recipe state groups from a just-created or
@@ -3155,7 +3220,6 @@ public final class SessionModel {
             finishCompletedPreview(frameCount: previewFrameCount)
             return
         }
-        restoreDerivativeTransforms(from: project.frames)
         let targets = project.frames.compactMap { frame -> PersistedFrameAlignmentTarget? in
             guard let alignment = frame.alignment,
                   alignment.offsetRows != 0
@@ -4184,9 +4248,11 @@ public final class SessionModel {
             isAcquiringThumbnails = false
             activeOperationStartedAt = nil
         }
-        frameOrientations.removeAll()
-        frameMirrors.removeAll()
-        frameVerticalMirrors.removeAll()
+        if project == nil {
+            frameOrientations.removeAll()
+            frameMirrors.removeAll()
+            frameVerticalMirrors.removeAll()
+        }
         if !preservingActiveJob {
             bufferedJobEvents.removeAll()
             if let project {
@@ -4222,6 +4288,7 @@ public final class SessionModel {
         frames: [Int] = [],
         isAttendedRetry: Bool = false
     ) {
+        pendingFramesRequestID = nil
         let previouslyCompleted = Set(
             frameStates.compactMap { index, state in
                 state == .completed ? index : nil
@@ -4271,6 +4338,27 @@ public final class SessionModel {
         for event in pending { handle(event: event) }
         // Old unknown-job events can never become relevant after a start.
         bufferedJobEvents.removeAll()
+        refreshDurableProjectSnapshot()
+    }
+
+    /// Job adoption and stop controls always precede storage access. A failed
+    /// read leaves the prior snapshot (and any unsaved warning) intact; a late
+    /// read cannot overwrite a new connection, project action, job, or save.
+    private func refreshDurableProjectSnapshot() {
+        projectSnapshotGeneration &+= 1
+        guard let project, let projectDirectory else { return }
+        let generation = projectSnapshotGeneration
+        let epoch = connectionEpoch
+        let reader = readProjectSnapshot
+        let url = URL(fileURLWithPath: projectDirectory).appendingPathComponent("manifest.json")
+        projectSnapshotRefreshTask = Task { [weak self] in
+            guard let persisted = await reader(url), let self,
+                  self.projectSnapshotGeneration == generation,
+                  self.connectionEpoch == epoch,
+                  self.project == project, persisted.id == project.id
+            else { return }
+            self.project = persisted
+        }
     }
 
     private func eventIsRelevant(_ eventJobId: String, source: EngineEvent) -> Bool {
@@ -4560,15 +4648,12 @@ public final class SessionModel {
         // targets for this frame. Never carry its old ExifTool preview across
         // the new receipt.
         invalidateMetadataPreviewAuthorization(for: payload.frameIndex)
+        pendingFramesRequestID = nil
         receipts.append(payload.receipt)
         durableCompletedFrameIndices.insert(payload.frameIndex)
         frameStates[payload.frameIndex] = .completed
         pendingFrames.removeAll { $0 == payload.frameIndex }
-        completedFrameCount = Set(
-            frameStates.compactMap { index, state in
-                state == .completed ? index : nil
-            }
-        ).count
+        completedFrameCount = durableCompletedFrameIndices.count
         if let smear = payload.receipt.hardwareTelemetry?.transportSmear, smear.verdict != "clean" {
             frameTransportSmearReasons[payload.frameIndex] = smear.reason
         } else {
@@ -4612,6 +4697,14 @@ public final class SessionModel {
         }
         if payload.summary.stopped {
             selectedFrameIndices.subtract(payload.summary.completed)
+            // Preserve review imagery and saved/draft work, but never reuse
+            // interrupted transport registration to authorize another run.
+            latestCompletedPreviewOperationId = nil
+            previewFilmProcess = nil
+            previewIntentStateMachine.resetForExplicitMediaChange()
+            clearPendingManualReviewScan()
+            clearAttendedScanRecovery()
+            manualReviewDecisions.removeAll()
         }
         // Force a terminal jobState from the authoritative completion summary
         // when the terminal `scan.jobState` was absent/out of order (a session
@@ -5015,6 +5108,8 @@ public final class SessionModel {
     /// retries motion, or sends a scanner command.
     private func advanceConnectionEpoch() {
         connectionEpoch &+= 1
+        projectSnapshotGeneration &+= 1
+        pendingFramesRequestID = nil
         latestCompletedPreviewOperationId = nil
         pendingScanStart = nil
         clearPendingManualReviewScan()

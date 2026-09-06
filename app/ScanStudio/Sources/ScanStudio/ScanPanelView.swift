@@ -74,6 +74,7 @@ struct ScanPanelView: View {
                 carrierLoadingActions
             } else {
                 setupActions
+                    .disabled(sessionModel.isResumingBatch)
             }
         }
         .padding(.horizontal, 20)
@@ -95,16 +96,23 @@ struct ScanPanelView: View {
             Button {
                 sessionModel.clearFrameSelection()
             } label: {
-                Label("Clear Selection", systemImage: "trash")
+                Label("Clear Selection", systemImage: "xmark")
             }
             .buttonStyle(.bordered)
             .disabled(!hasSelection)
+            .help("Deselect frames without deleting previews or saved files")
 
             Text(selectionSummary)
                 .font(.system(size: 12))
                 .foregroundStyle(Color.scanStudioSecondaryText)
 
-            if let summary = sessionModel.scanSummary {
+            if sessionModel.isResumingBatch {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Preparing resume…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.scanStudioSecondaryText)
+            } else if let summary = sessionModel.scanSummary {
                 Label(
                     batchSummary(summary),
                     systemImage: summary.stopped ? "pause.circle.fill" : (summary.failed.isEmpty ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
@@ -158,7 +166,6 @@ struct ScanPanelView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
-            .foregroundStyle(.black)
             .disabled(!scanReadiness.isReady)
             .help(scanReadiness.reason ?? "Scan the selected frames")
             .keyboardShortcut(.return, modifiers: .command)
@@ -266,7 +273,7 @@ struct ScanPanelView: View {
                         : "Loading \(sessionModel.carrierDisplayName.lowercased()) · frame \(currentFrame) of \(frameCount)")
                         .font(.system(size: 12, weight: .semibold))
                     Spacer()
-                    Text("\(loadedCount) ready")
+                    Text("\(loadedCount) previews ready")
                         .font(.system(size: 11, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(Color.scanStudioSecondaryText)
@@ -303,8 +310,7 @@ struct ScanPanelView: View {
 
     private var scanButtonLabel: String {
         let count = sessionModel.selectedFrameCount
-        let verb = sessionModel.scanSummary?.stopped == true ? "Resume" : "Scan"
-        return "\(verb) \(count) frame\(count == 1 ? "" : "s")"
+        return "Scan \(count) frame\(count == 1 ? "" : "s")"
     }
 
     private var previewButtonLabel: String {
@@ -313,9 +319,9 @@ struct ScanPanelView: View {
 
     private func batchSummary(_ summary: ScanSummary) -> String {
         if summary.stopped {
-            return "Paused · \(sessionModel.selectedFrameCount) remaining"
+            return "Stopped · \(summary.completed.count) saved"
         }
-        return "Last batch: \(summary.completed.count) completed"
+        return "Last batch: \(summary.completed.count) saved"
     }
 
     /// Issue #76/#24: "Last batch: 0 completed" alone hid the driver's own
@@ -359,7 +365,7 @@ struct ScanPanelView: View {
         switch state {
         case .queued: return "Preparing scan"
         case .scanning: return "Capture in progress"
-        case .stoppingAfterCurrentFrame: return "Pausing after this frame"
+        case .stoppingAfterCurrentFrame: return "Stopping after this frame"
         case .stoppingImmediately: return "Stopping batch"
         case .completed: return "Batch complete"
         case .failed: return "Batch failed"
@@ -415,7 +421,7 @@ private struct SavedProjectRefreshSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Refresh previews?")
                 .font(.headline)
-            Text("This moves the film through the scanner again and replaces the current preview images.")
+            Text("This moves the film through the scanner again and replaces scanner previews. Existing saved captures and processed exports are unchanged.")
                 .font(.footnote)
                 .foregroundStyle(Color.scanStudioSecondaryText)
             HardwareMotionReadinessView()
@@ -430,7 +436,7 @@ private struct SavedProjectRefreshSheet: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!session.hardwareMotionReadiness.allowsMotion)
+                .disabled(session.isResumingBatch || !session.hardwareMotionReadiness.allowsMotion)
                 .help(session.hardwareMotionReadiness.allowsMotion
                     ? "Refresh previews"
                     : session.hardwareMotionReadiness.guidance)

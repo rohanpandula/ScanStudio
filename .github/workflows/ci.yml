@@ -2,6 +2,7 @@ name: Verify
 
 on:
   push:
+    branches: [main]
   pull_request:
   # ScanStudio #104: the Release workflow invokes this workflow directly for
   # the exact tagged commit, making the full verification set a direct,
@@ -16,11 +17,7 @@ on:
 permissions:
   contents: read
 
-# Every push runs the full macOS matrix, so a quickly-superseded commit leaves
-# an obsolete run holding runners ahead of the one that matters. Mirrors
-# ports.yml. Release deliberately keeps cancel-in-progress: false -- a tagged
-# build must never be interrupted -- but nothing consumes a Verify run via
-# workflow_run, so cancelling a superseded one here is safe.
+# Superseded branch verification may be cancelled; tagged release builds finish.
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -41,6 +38,8 @@ jobs:
       - name: Test Swift app and Rust engine
         working-directory: app/ScanStudio
         run: make test
+      - name: Test Apple Silicon packaging policy
+        run: python3 -I -S -B -m unittest discover -s app/ScanStudio/scripts/tests -p 'test_*.py'
 
   bridge:
     name: Bridge tests
@@ -85,10 +84,9 @@ jobs:
         working-directory: coolscanpy
         run: uv run pytest
 
-  ports-vendor-sync:
-    name: Supply-chain and ports vendor policy checks
-    # Stdlib-only policy/unit checks plus the existing diff -rq mirror gate;
-    # no build dependencies or macOS runner are needed.
+  supply-chain-policy:
+    name: Supply-chain policy checks
+    # Stdlib-only policy checks do not need a macOS runner.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -100,44 +98,10 @@ jobs:
         run: python3 -I -S -B scripts/verify_release_workflow.py
       - name: Test supply-chain policy gates
         run: python3 -I -S -B -m unittest discover -s scripts/tests -p 'test_*.py'
-      - name: Test Tauri packaging artifact-lock verifier
-        run: python3 -I -S -B -m unittest discover -s ports/tauri/packaging/tests -p 'test_*.py'
-      - name: Check ports/tauri/vendor mirrors for drift beyond the known baseline
-        run: scripts/check_ports_vendor_sync.sh
 
   package:
-    name: Self-contained package build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runs-on }}
-    # See the bridge job: the relocatable package requires uv's standalone
-    # CPython, not the runner image's framework Python.
-    #
-    # Why package runs on BOTH archs while app-and-engine / bridge / coolscanpy
-    # stay single-arch: those suites are arch-independent logic + tests, and a
-    # full double run doubles billing for no extra coverage. The package gate
-    # is the arch-relevant one -- it proves the bundled app + libusb + CPython
-    # wheels build and pass the relocation-safe bridge check natively on arm64
-    # AND x86_64 on every PR, mirroring the release matrix before a tag exists.
-    #
-    # Only the arm64 leg uploads the ScanStudio-app artifact: package-macos-14
-    # (the OS-floor gate) and updater-integration consume that one arm64 app,
-    # and two matrix legs must not race on the same artifact name. The x86_64
-    # leg still builds + verifies natively; it just has no downstream consumer
-    # yet.
-    strategy:
-      fail-fast: true
-      matrix:
-        arch: [arm64, x86_64]
-        include:
-          - arch: arm64
-            runs-on: macos-15
-            upload-artifact: true
-          # GitHub-hosted Intel labels change over time; per the GitHub-hosted
-          # runners reference the current standard is `macos-15-intel`. Kept in
-          # lockstep with the release.yml matrix -- if it stops resolving, the
-          # conservative fallback is `macos-13`; update BOTH files together.
-          - arch: x86_64
-            runs-on: macos-15-intel
-            upload-artifact: false
+    name: Self-contained package build (arm64)
+    runs-on: macos-15
     env:
       UV_PYTHON_PREFERENCE: only-managed
       UV_PYTHON_CPYTHON_BUILD: "20260718"
@@ -166,11 +130,9 @@ jobs:
         working-directory: app/ScanStudio
         run: make package
       - name: Preserve the exact signed app for the macOS 14 runtime gate
-        if: ${{ matrix.upload-artifact }}
         working-directory: app/ScanStudio/.build
         run: ditto -c -k --sequesterRsrc --keepParent ScanStudio.app ScanStudio-app.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ matrix.upload-artifact }}
         with:
           name: ScanStudio-app
           path: app/ScanStudio/.build/ScanStudio-app.zip
@@ -258,7 +220,7 @@ jobs:
       - app-and-engine
       - bridge
       - coolscanpy
-      - ports-vendor-sync
+      - supply-chain-policy
       - package
       - package-macos-14
       - updater-integration
@@ -273,7 +235,7 @@ jobs:
           test "${{ needs.app-and-engine.result }}" = success
           test "${{ needs.bridge.result }}" = success
           test "${{ needs.coolscanpy.result }}" = success
-          test "${{ needs.ports-vendor-sync.result }}" = success
+          test "${{ needs.supply-chain-policy.result }}" = success
           test "${{ needs.package.result }}" = success
           test "${{ needs.package-macos-14.result }}" = success
           test "${{ needs.updater-integration.result }}" = success

@@ -400,7 +400,7 @@ jobs:
                 SETUP_NODE_ACTION,
                 """          node-version: '22.23.2'
           cache: npm
-          cache-dependency-path: ports/tauri/app/package-lock.json
+          cache-dependency-path: example/package-lock.json
 """,
             ),
         )

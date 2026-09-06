@@ -1,6 +1,6 @@
 # Third-party notices
 
-This file describes the licensing boundary for the public source repository and for any future binary release. It is a notice guide, not legal advice.
+This file describes the licensing boundary for the public source repository and for binary releases. It is a notice guide, not legal advice.
 
 ## Project-owned material
 
@@ -30,7 +30,7 @@ the package check proves a relocated bundled Python process resolves that
 exact app-owned file rather than a Homebrew copy.
 
 The bundle also includes `python-sane` for CoolscanPy's optional plain-scan
-and software-eject paths. Version 2.9.2 is compiled from the exact sdist in the
+path. Version 2.9.2 is compiled from the exact sdist in the
 bridge lock (SHA-256
 `50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe`)
 against a private build-only SANE 1.4.0 link SDK. That SDK is built from the
@@ -39,10 +39,10 @@ upstream release archive with SHA-256
 neither it nor a SANE runtime is distributed. The package retains python-sane's
 permissive `COPYING` text, exact source archive, and rebuild controls under
 `Contents/Resources`. The bundled `_sane` extension expects a compatible host
-`libsane.1.dylib` when one of those optional paths is used. The supported
+`libsane.1.dylib` when that optional path is used. The supported
 LS-5000 color-roll workflow does not require SANE: discovery and connection
 fall back to direct USB when SANE is absent, while status, preview, and color
-capture use direct USB. A missing optional backend must remain a clear
+capture and eject use direct USB. A missing optional backend must remain a clear
 operation failure, never a simulated successful connection.
 
 ## Nikon Coolscan USB identity table (reference)

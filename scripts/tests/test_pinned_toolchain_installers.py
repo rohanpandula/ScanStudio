@@ -25,9 +25,8 @@ def load_installer(name: str) -> ModuleType:
     return module
 
 
-NODE = load_installer("install_pinned_node")
 UV_PYTHON = load_installer("install_pinned_uv_python")
-INSTALLERS = (("node", NODE), ("uv", UV_PYTHON))
+INSTALLERS = (("uv", UV_PYTHON),)
 
 
 class FakeResponse:
@@ -132,16 +131,7 @@ def _platform_details(
         "executable_sha256": executable_sha256,
         "kind": "tar",
     }
-    if installer is NODE:
-        details.update(
-            {
-                "path": "tool/bin",
-                "npm_cli": "tool/lib/npm-cli.js",
-                "node_arch": "unit-test-arch",
-            }
-        )
-    else:
-        details["python_machine"] = "unit-test-arch"
+    details["python_machine"] = "unit-test-arch"
     return details
 
 
@@ -162,41 +152,7 @@ class ArchiveBoundaryTests(unittest.TestCase):
                     with self.assertRaises(installer.InstallError):
                         installer.validated_member_path(name, "tool")
 
-    def test_node_link_targets_remain_inside_the_expected_root(self) -> None:
-        member = NODE.validated_member_path("tool/lib/node", "tool")
-        NODE.validated_link_target(member, "../bin/node", "tool")
-        for target in ("", "/outside", "../../outside", "..\\..\\outside"):
-            with self.subTest(target=target):
-                with self.assertRaises(NODE.InstallError):
-                    NODE.validated_link_target(member, target, "tool")
 
-    def test_node_tar_extracts_its_contained_relative_npm_link(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            archive = root / "fixture.tar.gz"
-            make_tar(
-                archive,
-                [
-                    {
-                        "name": "tool/lib/node_modules/npm/bin/npm-cli.js",
-                        "data": b"console.log('10.9.8')\n",
-                    },
-                    {
-                        "name": "tool/bin/npm",
-                        "kind": tarfile.SYMTYPE,
-                        "linkname": "../lib/node_modules/npm/bin/npm-cli.js",
-                    },
-                ],
-            )
-            destination = root / "destination"
-            destination.mkdir()
-            NODE.extract_tar(archive, destination, "tool")
-            npm = destination / "tool/bin/npm"
-            self.assertTrue(npm.is_symlink())
-            self.assertEqual(
-                npm.readlink().as_posix(), "../lib/node_modules/npm/bin/npm-cli.js"
-            )
-            self.assertEqual(npm.read_bytes(), b"console.log('10.9.8')\n")
 
     def test_tar_traversal_is_rejected_before_extraction(self) -> None:
         for installer_name, installer in INSTALLERS:
@@ -288,9 +244,6 @@ class ArchiveBoundaryTests(unittest.TestCase):
 
     def test_tar_links_and_special_entries_are_rejected(self) -> None:
         cases = (
-            (NODE, tarfile.SYMTYPE, "../../outside"),
-            (NODE, tarfile.LNKTYPE, "tool/file"),
-            (NODE, tarfile.CHRTYPE, ""),
             (UV_PYTHON, tarfile.SYMTYPE, "tool/file"),
             (UV_PYTHON, tarfile.LNKTYPE, "tool/file"),
             (UV_PYTHON, tarfile.CHRTYPE, ""),
@@ -460,24 +413,6 @@ class DownloadBoundaryTests(unittest.TestCase):
                         installer.InstallError, "compressed HTTP transfer"
                     ):
                         self.run_download(installer, response, destination)
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            destination = Path(temporary_directory) / "archive"
-            url = "https://example.invalid/archive"
-            response = fake_response_for(
-                NODE,
-                url,
-                b"payload",
-                content_length="7",
-                final_url="https://cdn.example.invalid/archive",
-            )
-            with mock.patch.object(
-                NODE.urllib.request, "urlopen", return_value=response
-            ):
-                with self.assertRaisesRegex(
-                    NODE.InstallError, "unexpected Node download redirect"
-                ):
-                    NODE.download(url, destination)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             destination = Path(temporary_directory) / "archive"

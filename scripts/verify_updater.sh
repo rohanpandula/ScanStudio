@@ -5,16 +5,9 @@
 #   emit release assets -> resolve pointer -> check -> download -> SHA-256
 #   verify -> snapshot -> swap -> rollback.
 #
-# Phase 02 (02-03): the seeded pointer is arch-keyed — the 01-01 emitter is
-# invoked for the HOST architecture and then a second fake x86_64 entry with a
-# distinct sha is injected, so the pointer carries BOTH architectures exactly
-# as the matrix publish job produces. The script asserts the host entry is
-# present and correct, and the Swift harness (whose arch-selected e2e cases
-# run here) proves the updater selects + installs the HOST architecture's
-# artifact while cross-arch / unsupported-arch cases are rejected. Real Intel
-# (x86_64) bundle execution only happens on the CI x86_64 leg, never here
-# (no Rosetta on this arm64 host — see 02-CONTEXT.md); local proof is
-# host-arch selection + SHA-256 hash integrity, fully offline.
+# The metadata emitter is checked against bytes from the supplied packaged app.
+# The Swift suite separately exercises install, rollback, and cross-architecture
+# rejection using its own offline fixtures. Neither step proves notarization.
 #
 # THIS SCRIPT TOUCHES ONLY TEMP DIRECTORIES. It never writes to /Applications,
 # never mutates this repo, never touches the scanner, and makes no network
@@ -84,25 +77,13 @@ for app in "$current_app" "$new_app"; do
 done
 pass "resolve: current=$current_app new=$new_app"
 
-# ---- Step 2: seed the "release" via the 01-01 emitter (arch-keyed) ---------
-# The emitter's CDN story is irrelevant offline; it only hashes its file
-# argument. The new bundle zipped stands in for the DMG. The pointer is
-# arch-keyed: first emit for the HOST arch, then inject a fake second arch
-# entry (distinct sha) so the pointer carries both archs like the CI matrix
-# publish job.
+# ---- Step 2: check Apple Silicon release metadata against known bytes -----
 host_arch="$(uname -m)"
-case "$host_arch" in
-    arm64)  other_arch="x86_64" ;;
-    x86_64) other_arch="arm64"  ;;
-    *) fail "unsupported host architecture: $host_arch" ;;
-esac
-
-host_zip="$WORK/ScanStudio-$VERSION-macOS-$host_arch.zip"
-other_zip="$WORK/ScanStudio-$VERSION-macOS-$other_arch.zip"
+[[ "$host_arch" == arm64 ]] || fail "Apple Silicon macOS is required"
+# Only hashing is under test here: zip bytes stand in for a DMG. This fixture
+# is never mounted or installed; real DMG verification lives in package_dmg.sh.
+host_zip="$WORK/ScanStudio-$VERSION-macOS-arm64.dmg"
 ditto -c -k --keepParent "$new_app" "$host_zip" || fail "ditto $new_app -> $host_zip"
-other_app="$WORK/other/ScanStudio.app"
-make_fake_app "$other_app" "$VERSION" "intel"
-ditto -c -k --keepParent "$other_app" "$other_zip" || fail "ditto $other_app -> $other_zip"
 
 staging="$WORK/staging"
 if ! "$EMITTER" "$host_zip" "$VERSION" "$staging" "$host_arch" >"$WORK/emit.log" 2>&1; then
@@ -117,23 +98,16 @@ recorded="$(awk '{print $1}' "$staging/SHA256SUMS")"
 [[ "$host_expected" == "$recorded" ]] || fail "SHA256SUMS does not match the seeded host artifact"
 pass "seed: emit_release_assets.sh -> latest.json + SHA256SUMS ($VERSION, host=$host_arch, sha256 $recorded)"
 
-# ---- Step 2b: inject the second arch entry (distinct sha) ------------------
-# Re-invoking the emitter with the SAME version + the OTHER arch merges the
-# entry in (merge-don't-clobber), mirroring the matrix publish job's combined
-# pointer. The two arch entries must describe distinct artifacts.
-if ! "$EMITTER" "$other_zip" "$VERSION" "$staging" "$other_arch" >"$WORK/emit2.log" 2>&1; then
-    cat "$WORK/emit2.log" >&2
-    fail "emit_release_assets.sh (01-01 emitter, other arch)"
-fi
-other_expected="$(shasum -a 256 "$other_zip" | awk '{print $1}')"
-[[ "$host_expected" != "$other_expected" ]] || fail "the two arch entries must have distinct shas"
-grep -q "\"$host_arch\":"  "$staging/latest.json" || fail "latest.json missing host-arch ($host_arch) entry"
-grep -q "\"$other_arch\":" "$staging/latest.json" || fail "latest.json missing other-arch ($other_arch) entry"
-grep -q "ScanStudio-$VERSION-macOS-$host_arch.zip"  "$staging/latest.json" || fail "latest.json host url mismatch"
-grep -q "ScanStudio-$VERSION-macOS-$other_arch.zip" "$staging/latest.json" || fail "latest.json other url mismatch"
-grep -q "$host_expected" "$staging/latest.json"  || fail "latest.json host sha mismatch"
-grep -q "$other_expected" "$staging/latest.json" || fail "latest.json other sha mismatch"
-pass "seed: arch-keyed latest.json carries BOTH $host_arch + $other_arch (host selection asserted)"
+python3 - "$staging/latest.json" "$VERSION" "$host_expected" <<'PYCODE'
+import json, sys
+with open(sys.argv[1]) as handle:
+    pointer = json.load(handle)
+assert set(pointer["architectures"]) == {"arm64"}
+entry = pointer["architectures"]["arm64"]
+assert entry["sha256"] == sys.argv[3]
+assert entry["url"].endswith(f"/ScanStudio-{sys.argv[2]}-macOS-arm64.dmg")
+PYCODE
+pass "seed: latest.json contains only the Apple Silicon artifact"
 
 # ---- Step 3: drive the wired flow in-process (Swift harness) ----------------
 # UpdateFlowIntegrationTests runs pointer -> GitHubUpdateChecker ->

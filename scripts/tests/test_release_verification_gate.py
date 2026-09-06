@@ -38,7 +38,7 @@ class ReleaseVerificationGateTests(unittest.TestCase):
             "app-and-engine",
             "bridge",
             "coolscanpy",
-            "ports-vendor-sync",
+            "supply-chain-policy",
             "package",
             "package-macos-14",
             "updater-integration",

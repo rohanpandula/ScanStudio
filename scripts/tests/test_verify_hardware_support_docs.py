@@ -22,7 +22,7 @@ class HardwareSupportDocsTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         (root / "docs" / "releases").mkdir(parents=True)
-        (root / "ports" / "tauri").mkdir(parents=True)
+        (root / "app" / "ScanStudio").mkdir(parents=True)
         (root / "docs" / "releases" / "v0.7.0-beta.11.md").write_text("old\n")
         (root / "docs" / "releases" / "v0.7.0-beta.12.md").write_text("new\n")
         (root / "docs" / "HARDWARE-SUPPORT.md").write_text(
@@ -31,7 +31,7 @@ class HardwareSupportDocsTests(unittest.TestCase):
             "closed evidence #24\nclosed evidence #26\nissues/101\nissues/104\n"
         )
         (root / "README.md").write_text("See docs/HARDWARE-SUPPORT.md\n")
-        (root / "ports" / "tauri" / "README.md").write_text(
+        (root / "app" / "ScanStudio" / "README.md").write_text(
             "See ../../docs/HARDWARE-SUPPORT.md\n"
         )
         return root

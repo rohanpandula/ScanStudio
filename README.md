@@ -5,8 +5,8 @@
 <img src="assets/scanstudio-ls5000-offline.jpeg" alt="ScanStudio running on macOS with an LS-5000 ED offered by the bridge as a Connect target. No scanner is selected, the status is OFFLINE, the simulator is absent, and no media or preview data is shown." width="1000">
 
 ScanStudio is a free, open-source film-scanning app for Nikon Coolscan
-scanners, built first around the SUPER COOLSCAN 5000 ED (LS-5000). It covers
-the practical Nikon Scan workflow on modern computers: identify the loaded
+scanners on Apple Silicon (M-series) Macs, built first around the SUPER COOLSCAN 5000 ED (LS-5000). It covers
+the practical Nikon Scan workflow on macOS 14 (Sonoma) or newer: identify the loaded
 holder, preview the film, choose frames, set the recipe and outputs, scan, and
 stop safely when needed. When detection cannot find your frames, it works with
 you -- an automatic wider retry, a plain-English explanation of what the film
@@ -34,26 +34,38 @@ tested one are the most useful thing you can send.
 
 ## Platform support
 
-| Platform | Level | Notes |
-| --- | --- | --- |
-| macOS Apple Silicon | **Beta** | Real-scanner validated, including the detection-recovery paths live on real rolls. |
-| macOS Intel | Preview | Built and package-verified in CI; not yet validated with a real scanner. |
-| Windows x64 | Preview | Runs the capture path through WSL2 (Ubuntu 24.04) with usbipd-win for USB pass-through. Raw negative export is not yet supported on this path and refuses up front. |
-| Linux x64 | Preview | AppImage and portable tarball; needs the distribution's SANE/libusb runtime packages and scanner permissions. |
+ScanStudio is **Apple Silicon only** (M-series, arm64), on **macOS 14
+(Sonoma) or newer**. The LS-5000 color-roll workflow is Beta, with real-film
+evidence from one Apple Silicon Mac and one scanner configuration.
 
-macOS needs macOS 14 (Sonoma) or newer. Current macOS release artifacts are Developer ID signed, notarized, and stapled; Windows and Linux artifacts remain unsigned. There is no support or release-schedule promise. The cross-platform source, setup instructions, and live-validation runbooks are in [`ports/tauri`](ports/tauri).
+Intel Macs, Windows, and Linux are retired ScanStudio platforms: no current
+builds, downloads, updates, or ongoing port support. For those systems, see
+[NegPy downloads](https://github.com/marcinz606/NegPy/releases) and the
+[upstream setup and compatibility documentation](https://github.com/marcinz606/NegPy#readme).
+NegPy's [0.55.0 release notes](https://github.com/marcinz606/NegPy/releases/tag/0.55.0)
+introduced Nikon Coolscan scanning through nkscan. As checked on 2026-09-06,
+[NegPy 0.57.0](https://github.com/marcinz606/NegPy/releases/tag/0.57.0) provides
+Intel and Apple Silicon DMGs, a Windows installer, and a Linux AppImage.
+Available downloads do not establish compatibility with your scanner, holder,
+or OS; follow upstream guidance for your setup.
+
+Older ScanStudio assets and [release notes](docs/releases/README.md) preserve
+the platforms and evidence from their release dates. They are historical
+records, not the current support promise.
 
 ## Download
 
-All prerelease packages are published together on the
-[GitHub Releases page](https://github.com/rohanpandula/ScanStudio/releases):
+Get the **Apple Silicon (M-series) Beta** from
+[GitHub Releases](https://github.com/rohanpandula/ScanStudio/releases):
+`ScanStudio-<version>-macOS-arm64.dmg`. Choose this arm64 DMG; older Intel,
+Windows, and Linux assets are historical only.
 
-- Apple Silicon macOS Beta: `ScanStudio-<version>-macOS-arm64.dmg`
-- Intel macOS Preview: `ScanStudio-<version>-macOS-x86_64.dmg`
-- Windows x64 Preview: an installer (recommended on clean systems) and a portable zip for systems with WebView2 already installed
-- Linux x64 Preview: an AppImage and a portable tarball
+Current release DMGs are Developer ID signed, notarized, and stapled. The
+updater uses the arm64 feed entry and verifies the download and publisher
+identity; release provenance must bind the assets to the same run and exact
+tag. See [update verification](docs/AUTO-UPDATE.md). There is no release-schedule
+promise.
 
-Choose the DMG matching your Mac; the in-app updater does this automatically.
 A release DMG contains the app, the GPL hardware bridge and CoolscanPy source
 required for redistribution, and the applicable dependency notices. The
 supported LS-5000 color-roll workflow uses the signed libusb copy inside the
@@ -81,6 +93,19 @@ the app and the package always carry the same driver code.
 - Uses Digital ICE only where a suitable infrared channel is available. For traditional silver black-and-white film, infrared ICE stays disabled and software dust cleanup is a separate option.
 - Records receipts -- including authoritative per-frame timing -- so a finished scan can be reviewed after the job completes.
 
+## Preview, capture, and processed exports
+
+**Scanner preview** reads the film for a contact sheet and frame registration;
+it is not the finished positive. **Capture** acquires the selected frames at
+scan resolution. **Processed exports** render positive TIFF/JPEG files from
+that capture using the job's recipe; an optional Master TIFF remains separate.
+A generated Preview file is a rendered derivative, distinct from the scanner
+preview used to place frames.
+
+Settings apply to **future scans**. Changing a recipe, color style, or output
+setting does not reprocess existing exports or turn the scanner preview into
+a live proof of the finished image. Review the saved outputs after capture.
+
 ## What is a Coolscan?
 
 A Coolscan is a dedicated film scanner. It reads a negative or slide directly
@@ -103,11 +128,15 @@ or rewrite the capture files.
 
 ## Safety and limits
 
+See [Mac acceptance and recovery](docs/MAC-ACCEPTANCE.md) for the packaged
+software gate and attended hardware checks. Simulator acceptance is not
+evidence of a successful real scan.
+
 - Preview establishes the current registration. Preview again after a refeed or ejection.
 - If Capture reports that the film shifted, physically refeed it and acquire a fresh preview; ScanStudio discards the old frame registration so it cannot be retried accidentally.
 - Confirm that the app identifies a real scanner before treating it as hardware. The built-in simulator is for safe workflow exploration only.
 - Keep physical film transport under supervision. Stop and inspect the scanner if the physical state is uncertain.
-- Opening ScanStudio does not move film. Platforms with a hardware-motion gate, including the Windows/WSL preview, require their separately documented owner-session launcher before explicit Preview, Scan, or Eject actions are authorized; ordinary Windows Start-menu and Explorer launches remain unarmed.
+- Opening ScanStudio does not move film. Only explicit Preview, Scan, and Eject actions can move film; developer bridge sessions require the documented hardware authorization.
 - Manual placement caps frames at the scanner's single-pass capture window (38.7 mm); panoramic frames refuse with an explanation instead of silently cropping.
 - Do not post scans, private paths, device serial numbers, or raw capture journals in a public issue.
 

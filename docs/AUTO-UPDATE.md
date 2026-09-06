@@ -1,23 +1,20 @@
 # ScanStudio Auto-Update: Two-Path Strategy
 
-> **DO NOT attempt the Sparkle steps until a Developer ID exists.**
+ScanStudio releases and updates target **Apple Silicon (M-series, arm64)
+only**, on macOS 14 (Sonoma) or newer. Intel macOS, Windows, and Linux are
+retired. Older assets and versioned release notes remain historical records;
+they do not extend the current update promise.
 
-| Path | Status |
-|------|--------|
-| **Path A — custom updater** (shipped mechanism in this repo) | **CHECK-ONLY; INSTALL FAILS CLOSED UNTIL DEVELOPER ID GATE OPENS** |
-| **Path B — Sparkle** | **GATED** on Developer ID; **NOT active** |
+The shipped custom updater verifies both download integrity and independent
+publisher identity. Current release builds are Developer ID signed, notarized,
+and stapled; local/PR builds remain ad-hoc and cannot install updates without
+a valid publisher policy. Sparkle is an unimplemented alternative, not a second
+active update channel. The original Sparkle planning checklist below is retained
+as design history; the Developer ID signing lane has since shipped.
 
-## Why two paths
-
-Release builds are Developer-ID signed, notarized, and stapled as of the
-signing lane (release.yml's DMG job signs the app and DMG, notarizes both,
-and staples both; local/PR-CI builds stay ad-hoc — `codesign -dv` →
-`Signature=adhoc`). The packaged Info.plist stamps
-`ScanStudioUpdateTeamIdentifier`. A checksum supplied by the release server
-is an integrity check, not an independent publisher identity. Path A can
-check and download, and with the signing lane in place the running app and
-update
-are Developer ID signed, securely timestamped, notarized, and stapled.
+Release provenance must bind the arm64 DMG and updater metadata to verification
+from the **same workflow run and exact tag**. Retiring other platforms does not
+relax that requirement or the supported macOS floor.
 
 ## Path A — how it works and its publisher gate
 
@@ -64,22 +61,19 @@ integration gate (01-06), and host-architecture-aware resolution (Phase 02).
   from the supported macOS 14+ range that the current host can run. The install
   core also refuses a candidate that is not newer than the app already at the
   selected destination.
-- **Architecture-aware resolution (Phase 02, shipped):** the updater resolves
-  the newest release for the HOST architecture from the arch-keyed
-  `latest.json` (a single `architectures` mapping with a distinct
-  `url`+`sha256` per `arm64`/`x86_64`) and downloads + verifies only that
-  architecture's DMG. Intel (x86_64) support shipped in Phase 02: each release
-  publishes a `-macOS-arm64.dmg` for Apple Silicon and a `-macOS-x86_64.dmg`
-  for Intel. A missing entry for a host architecture surfaces the typed
-  unsupported-architecture error — never a wrong-arch install. Local
-  verification proves selection + hash integrity offline; the real Intel
-  bundle executes on the CI x86_64 runner.
+- **Architecture-aware resolution:** the arch-keyed `latest.json` retains its
+  `architectures` mapping with an `arm64` URL and SHA-256. Current releases
+  publish only `-macOS-arm64.dmg`. Unsupported hosts or a missing arm64 entry
+  must fail closed; an old x86_64 entry is not a supported update path. The
+  downloaded bundle must match arm64 and the macOS 14+ deployment floor.
+  Historical Intel package/CI results remain evidence of those older releases,
+  not current build or hardware acceptance coverage.
 - **UI (plan 01-05, shipped):** `UpdateSettingsView.swift` +
   `UpdateFlowModel.swift` surface current version, "Check for Updates",
   channel toggle, install/rollback, a 24 h background cadence, and the guard
   that refuses an install while a scan/preview job is active.
 
-## Path B (gated) — unlock checklist
+## Historical Path B proposal — Sparkle checklist
 
 Nothing in this section happens until the gate opens. Each item has a one-line
 **why** and a **where** (how/where it is satisfied). If the Developer ID is
@@ -150,7 +144,8 @@ and the GitHub Releases distribution surface.
 - No Sparkle SPM dependency is added.
 - No `SUFeedURL` is added to the packaged `Info.plist`.
 - No EdDSA keys are generated.
-- No Developer ID signing is configured.
+- No additional signing configuration is introduced for Sparkle; the current
+  custom-updater release lane already uses Developer ID signing.
 - No appcast step is added to `release.yml`.
 
 When a future task needs Path B, start here: this document is the handoff and

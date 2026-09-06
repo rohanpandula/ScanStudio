@@ -11,6 +11,7 @@ private enum SaveRollScanStubError: Error {
 
 private enum SaveRollScanCall: Equatable, Sendable {
     case createProject
+    case stopScan
     case setAlignment(frameIndex: Int, alignment: FrameAlignment?)
     case approve(frameIndex: Int)
     case startScan(frames: [Int])
@@ -61,6 +62,8 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
             ProjectFrame(index: $0, excluded: false, receipts: [])
         }
     )
+    private let persistedDirectory: URL?
+    private let persistScanRecipe: Bool
     private var recordedCalls: [SaveRollScanCall] = []
     private let createError: EngineRequestError?
     private let scanStartError: EngineRequestError?
@@ -71,8 +74,12 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
     init(
         createError: EngineRequestError? = nil,
         scanStartError: EngineRequestError? = nil,
-        suspendFrameAlignment: Bool = false
+        suspendFrameAlignment: Bool = false,
+        persistedDirectory: URL? = nil,
+        persistScanRecipe: Bool = true
     ) {
+        self.persistedDirectory = persistedDirectory
+        self.persistScanRecipe = persistScanRecipe
         self.createError = createError
         self.scanStartError = scanStartError
         remainingSuspendedFrameAlignmentRequests = suspendFrameAlignment ? 1 : 0
@@ -116,9 +123,12 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
         case "project.create":
             recordedCalls.append(.createProject)
             if let createError { throw createError }
+            if let persistedDirectory {
+                try JSONEncoder().encode(project).write(to: persistedDirectory.appendingPathComponent("manifest.json"))
+            }
             value = ProjectCreateResult(
                 project: project,
-                directory: "/tmp/saved-six-frame-roll"
+                directory: persistedDirectory?.path ?? "/tmp/saved-six-frame-roll"
             )
         case "project.setFrameAlignment":
             guard let params = params as? SetFrameAlignmentParams else {
@@ -168,12 +178,25 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
             }
             recordedCalls.append(.approve(frameIndex: params.frameIndex))
             value = EmptyResult()
+        case "scan.stop":
+            recordedCalls.append(.stopScan)
+            value = ScanStopResult(acknowledged: true, mode: "immediate")
         case "scan.start":
             guard let params = params as? ScanStartParams else {
                 throw SaveRollScanStubError.unexpectedParams(method)
             }
             recordedCalls.append(.startScan(frames: params.frames))
             if let scanStartError { throw scanStartError }
+            if let persistedDirectory, persistScanRecipe, let output = params.output {
+                let persisted = ScanProject(
+                    schemaVersion: project.schemaVersion, id: project.id,
+                    name: project.name, carrier: project.carrier,
+                    frameCount: project.frameCount, filmProcess: project.filmProcess,
+                    recipes: output, rollMetadata: project.rollMetadata,
+                    createdAt: project.createdAt, frames: project.frames
+                )
+                try JSONEncoder().encode(persisted).write(to: persistedDirectory.appendingPathComponent("manifest.json"))
+            }
             value = ScanStartResult(jobId: "saved-roll-job")
         default:
             throw SaveRollScanStubError.unexpectedMethod(method)
@@ -196,6 +219,29 @@ private actor SaveRollScanEngineStub: EngineClientProtocol {
     func resumeFrameAlignmentRequest() {
         frameAlignmentContinuation?.resume()
         frameAlignmentContinuation = nil
+    }
+}
+
+private actor HeldProjectSnapshot {
+    private var continuation: CheckedContinuation<ScanProject?, Never>?
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func read() async -> ScanProject? {
+        await withCheckedContinuation {
+            continuation = $0
+            waiter?.resume()
+            waiter = nil
+        }
+    }
+
+    func waitForRead() async {
+        guard continuation == nil else { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func finish(_ project: ScanProject?) {
+        continuation?.resume(returning: project)
+        continuation = nil
     }
 }
 
@@ -238,6 +284,91 @@ struct SaveRollScanFlowTests {
         ))
         model.selectAllFrames()
         return (model, client)
+    }
+
+    @Test("untouched Save and Scan reflects durable recipes, not the stale create snapshot", arguments: [true, false])
+    @MainActor
+    func savedScanRecipeIsNotAnUnsavedEdit(persistRecipe: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = SaveRollScanEngineStub(persistedDirectory: directory, persistScanRecipe: persistRecipe)
+        let (model, _) = await preparedModel(client: client)
+        model.clearFrameSelection()
+        model.toggleFrameSelection(1)
+        #expect(await model.saveRollAndScanSelectedFrames(
+            name: "Untouched six-frame roll", carrier: .strip6,
+            frameCount: 6, filmProcess: .positive
+        ))
+        await model.projectSnapshotRefreshTask?.value
+        #expect(model.hasUnsavedProjectChanges == !persistRecipe)
+        model.handle(event: EngineEvent(name: "scan.completed", rawLine: Data(
+            #"{"event":"scan.completed","payload":{"jobId":"saved-roll-job","summary":{"completed":[1],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
+        )))
+        #expect(model.hasUnsavedProjectChanges == !persistRecipe)
+        if persistRecipe {
+            model.previewMaxLongEdgePx = 640
+            #expect(model.hasUnsavedProjectChanges)
+            model.previewMaxLongEdgePx = 0
+            #expect(!model.hasUnsavedProjectChanges)
+            model.rotateFrame(1, by: 90)
+            #expect(model.hasUnsavedProjectChanges)
+        }
+    }
+
+    @Test("a held manifest read never delays job adoption or Stop and cannot survive retirement", arguments: ["connection", "project", "job", "failure"])
+    @MainActor
+    func snapshotReadIsNonblockingAndScoped(retirement: String) async throws {
+        let (model, client) = await preparedModel()
+        let held = HeldProjectSnapshot()
+        model.readProjectSnapshot = { _ in await held.read() }
+        #expect(await model.saveRollAndScanSelectedFrames(
+            name: "Held snapshot", carrier: .strip6, frameCount: 6, filmProcess: .positive
+        ))
+        await held.waitForRead()
+        #expect(model.jobId == "saved-roll-job")
+        #expect(model.isJobActive)
+        await model.stopImmediately()
+        #expect(await client.calls().last == .stopScan)
+        let original = try #require(model.project)
+        let persisted = ScanProject(
+            schemaVersion: original.schemaVersion, id: original.id, name: original.name,
+            carrier: original.carrier, frameCount: original.frameCount,
+            filmProcess: original.filmProcess, recipes: model.outputRecipe,
+            rollMetadata: original.rollMetadata, createdAt: original.createdAt,
+            frames: original.frames
+        )
+        let refresh = model.projectSnapshotRefreshTask
+        switch retirement {
+        case "connection":
+            model.handle(event: EngineEvent(name: "engine.terminated", rawLine: Data()))
+        case "project":
+            model.handle(event: EngineEvent(name: "scan.completed", rawLine: Data(
+                #"{"event":"scan.completed","payload":{"jobId":"saved-roll-job","summary":{"completed":[],"failed":[],"skipped":[],"stopped":true}}}"#.utf8
+            )))
+            // Even a failed reopen retires a read of the previous snapshot.
+            await model.openProject(directory: "/tmp/reopen")
+        case "job":
+            model.readProjectSnapshot = { _ in nil }
+            model.beginJob(id: "replacement-job")
+        default: break
+        }
+        await held.finish(retirement == "failure" ? nil : persisted)
+        await refresh?.value
+        #expect(model.project == original)
+        #expect(model.hasUnsavedProjectChanges)
+    }
+
+    @Test("manifest snapshot reads reject oversized and malformed data")
+    func snapshotReadIsBounded() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        try Data("invalid".utf8).write(to: url)
+        #expect(ProjectSnapshotReader.read(url) == nil)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(ProjectSnapshotReader.maximumBytes + 1))
+        try handle.close()
+        #expect(ProjectSnapshotReader.read(url) == nil)
     }
 
     @Test("saving a completed six-frame preview starts the original selection exactly once")

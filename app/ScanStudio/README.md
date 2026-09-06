@@ -1,6 +1,6 @@
 # ScanStudio
 
-ScanStudio is a macOS app for scanning 35 mm film with a Nikon Coolscan
+ScanStudio is an Apple Silicon (M-series, arm64) macOS 14+ app for scanning 35 mm film with a Nikon Coolscan
 LS-5000. It keeps the scan workflow in one place: identify the film that is
 loaded, preview the roll, select frames, choose the capture settings, scan,
 and stop safely when needed.
@@ -11,12 +11,20 @@ already includes the CoolscanPy bridge and its direct-USB runtime; source
 builds can instead configure a separate compatible bridge. The app never
 presents the simulator as hardware.
 
-Apple Silicon support is Beta; Intel support is Preview. Real scanning has
+Apple Silicon support is Beta. Intel Macs, Windows, and Linux are retired;
+see [NegPy downloads](https://github.com/marcinz606/NegPy/releases) and its
+[setup and compatibility documentation](https://github.com/marcinz606/NegPy#readme)
+for alternatives, subject to upstream device and OS support. Real scanning has
 been tested on one Apple Silicon Mac and one LS-5000 setup. Treat
 each real scan as a new operation: confirm the detected carrier and the
 preview before starting capture. Real black-and-white fine scanning remains
 blocked rather than pretending that infrared dust removal is available for
 film where it is not appropriate.
+
+See the [hardware evidence matrix](../../docs/HARDWARE-SUPPORT.md) for the
+separate package, enumeration, preview, and capture results.
+[Mac acceptance and recovery](../../docs/MAC-ACCEPTANCE.md) documents the
+packaged software gate separately from attended hardware checks.
 
 ## Use the app
 
@@ -41,6 +49,12 @@ film where it is not appropriate.
 5. **Scan or stop.** Start the selected frames and follow the in-app progress.
    The Stop button asks the current frame to finish safely, then prevents the
    next frame from starting. Eject stays unavailable during active capture.
+
+**Scanner preview, capture, and exports are different stages.** The scanner
+preview establishes frame placement; Capture acquires the selected frames;
+Positive and generated Preview files are processed derivatives of that capture.
+Settings apply to **future scans**. Recipe, color, and output changes do not
+reprocess saved exports or provide a live color proof in the scanner preview.
 
 When a master is retained, a Full Capture Package keeps the master image together with
 the available capture context: per-frame effective settings, receipts,
@@ -71,6 +85,7 @@ ScanStudio (SwiftUI app)  <-- NDJSON over stdin/stdout -->  scanstudio-engine (R
 
 ## Prerequisites
 
+- Apple Silicon (M-series) Mac running macOS 14 or newer
 - Xcode / Swift toolchain (Swift 6, macOS 14+ SDK)
 - Rust via Homebrew (`brew install rust`), or any `cargo` on `PATH`
 

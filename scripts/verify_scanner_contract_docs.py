@@ -14,8 +14,6 @@ CURRENT_DOCS = (
     Path("app/ScanStudio/protocol/PROTOCOL.md"),
     Path("app/ScanStudio/protocol/BRIDGE.md"),
     Path("coolscanpy/README.md"),
-    Path("ports/tauri/runbooks/WINDOWS-LIVE-VALIDATION.md"),
-    Path("ports/tauri/runbooks/LINUX-LIVE-VALIDATION.md"),
 )
 FORBIDDEN = (
     "do not re-read the manifest before writing",

@@ -2,6 +2,12 @@
 # Build the app-owned libusb from pinned source at ScanStudio's macOS floor.
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" \
+    || "${SCANSTUDIO_RELEASE_ARCH:-arm64}" != "arm64" ]]; then
+    print -u2 "ScanStudio packaging requires Apple Silicon (arm64) macOS; Intel/Rosetta and other architecture requests are unsupported."
+    exit 64
+fi
+
 script_dir="${0:A:h}"
 package_root="${script_dir:h}"
 destination="${1:-$package_root/.build/bundled-libusb}"

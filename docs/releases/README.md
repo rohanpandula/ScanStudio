@@ -1,5 +1,16 @@
 # Release notes policy
 
+Current ScanStudio releases target **Apple Silicon (M-series, arm64) only**,
+on macOS 14 (Sonoma) or newer. Intel macOS, Windows, and Linux are retired.
+For those systems, consult [NegPy downloads](https://github.com/marcinz606/NegPy/releases)
+and [upstream compatibility documentation](https://github.com/marcinz606/NegPy#readme).
+
+Existing versioned notes and published assets are historical evidence. Preserve
+their original platform claims, test results, and signing state; do not rewrite
+them to imply that those releases were Apple Silicon only. Their old support
+statements do not extend to current releases. New notes must describe the
+arm64-only scope and distinguish automated checks from real hardware results.
+
 Every ScanStudio release must publish a full changelog. The release body is a
 source-controlled artifact, not text generated from commit subjects or edited
 into GitHub after publication.

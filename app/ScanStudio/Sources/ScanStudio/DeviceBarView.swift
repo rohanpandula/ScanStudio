@@ -107,7 +107,7 @@ struct DeviceBarView: View {
                 .buttonStyle(.bordered)
                 .tint(.scanStudioRed)
                 .controlSize(.small)
-                .disabled(!sessionModel.hardwareMotionReadiness.allowsMotion)
+                .disabled(sessionModel.isResumingBatch || !sessionModel.hardwareMotionReadiness.allowsMotion)
                 .help(
                     !sessionModel.hardwareMotionReadiness.allowsMotion
                         ? sessionModel.hardwareMotionReadiness.guidance
@@ -123,9 +123,10 @@ struct DeviceBarView: View {
                     Button("Eject", role: .destructive) {
                         Task { await sessionModel.eject() }
                     }
+                    .disabled(sessionModel.isResumingBatch)
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("Ejecting releases the film from the scanner. Any frame registration captured this session is destroyed and must be re-established by feeding the film and running a preview again.")
+                    Text("Ejecting releases the film and clears its live scanner registration. Saved captures and processed exports stay on disk. Feed the film and acquire fresh previews before scanning again.")
                 }
             }
         }

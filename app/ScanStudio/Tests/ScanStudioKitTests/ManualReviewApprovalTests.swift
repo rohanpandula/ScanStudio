@@ -692,9 +692,9 @@ struct ManualReviewApprovalTests {
         #expect(model.jobId == "approved-job")
     }
 
-    @Test("a new preview invalidates an in-flight confirmation bound to the old preview")
+    @Test("a pending confirmation refuses a competing preview until its scan finishes")
     @MainActor
-    func replacementPreviewInvalidatesApproval() async {
+    func pendingApprovalRejectsCompetingPreview() async {
         let client = ManualReviewApprovalEngineStub(holdApprovalResponse: true)
         let (model, _) = await preparedModel(client: client)
         let oldPreviewOperation = model.latestCompletedPreviewOperationId
@@ -707,18 +707,18 @@ struct ManualReviewApprovalTests {
         let replacement = await model.requestPreview(
             .refreshSavedProject(token: PreviewIntentToken())
         )
-        #expect(replacement == .started)
-        #expect(model.latestCompletedPreviewOperationId == nil)
+        #expect(replacement == .rejected)
+        #expect(model.latestCompletedPreviewOperationId == oldPreviewOperation)
 
         await client.resumeApprovals()
         await approval.value
 
-        #expect(await client.calls() == [.approve(frameIndex: 3)])
+        #expect(await client.calls() == [.approve(frameIndex: 3), .scanStart(frames: [1, 2, 3])])
         #expect(
             await client.approvedPreviewOperations()
                 == [oldPreviewOperation].compactMap { $0 }
         )
-        #expect(model.jobId == nil)
+        #expect(model.jobId == "approved-job")
     }
 
     @Test("a single-frame scan is also gated by that frame's preview evidence")

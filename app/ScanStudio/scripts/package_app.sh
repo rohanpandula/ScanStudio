@@ -1,6 +1,12 @@
 #!/bin/zsh
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" \
+    || "${SCANSTUDIO_RELEASE_ARCH:-arm64}" != "arm64" ]]; then
+    print -u2 "ScanStudio packaging requires Apple Silicon (arm64) macOS; Intel/Rosetta and other architecture requests are unsupported."
+    exit 64
+fi
+
 script_dir="${0:A:h}"
 package_root="${script_dir:h}"
 output="${1:-$package_root/.build/ScanStudio.app}"
@@ -112,6 +118,10 @@ if [[ "$bridge_sysconfig_prefix" != /* ]]; then
     print -u2 "Refusing to package a Python runtime with a non-absolute sysconfig prefix: '$bridge_sysconfig_prefix'."
     exit 66
 fi
+if [[ "$(lipo -archs "$bridge_runtime_prefix/bin/python3.13")" != "arm64" ]]; then
+    print -u2 "Refusing non-arm64 Python runtime."
+    exit 1
+fi
 if otool -L "$bridge_runtime_prefix/bin/python3.13" | tail -n +2 | grep -qE '/(opt/homebrew|usr/local|Users)/'; then
     print -u2 "Refusing to package Python runtime with machine-absolute linkage. Supply a relocatable CPython 3.13 runtime through SCANSTUDIO_BRIDGE_PYTHON."
     exit 66
@@ -222,8 +232,12 @@ if [[ -z "$libusb_minimum" || "$libusb_minimum" != "$app_minimum" ]]; then
     exit 1
 fi
 app_architectures="$(lipo -archs "$staged_app/Contents/MacOS/ScanStudio")"
+if [[ "$(lipo -archs "$staged_app/Contents/MacOS/scanstudio-engine")" != "arm64" ]]; then
+    print -u2 "Refusing non-arm64 engine."
+    exit 1
+fi
 libusb_architectures="$(lipo -archs "$bundled_libusb")"
-if [[ "$libusb_architectures" != "$app_architectures" ]]; then
+if [[ "$app_architectures" != "arm64" || "$libusb_architectures" != "$app_architectures" ]]; then
     print -u2 "Refusing bundled libusb architecture '$libusb_architectures'; the app is '$app_architectures'."
     exit 1
 fi
@@ -460,7 +474,7 @@ install -m 644 \
 install -m 755 \
     "$script_dir/build_bundled_libusb.sh" \
     "$staged_app/Contents/Resources/CorrespondingSource/libusb/build_bundled_libusb.sh"
-print -r -- $'Rebuild the bundled libusb library on macOS with Apple command-line developer tools:\n\n  SCANSTUDIO_LIBUSB_DEPLOYMENT_TARGET=14.0 \\\n  SCANSTUDIO_LIBUSB_SOURCE_ARCHIVE="$PWD/libusb-1.0.30.tar.bz2" \\\n  ./build_bundled_libusb.sh "$PWD/rebuilt"\n\nThe script verifies the pinned source SHA-256, builds only the shared library with a fixed install prefix, fixes its app-relative install identity, and rejects non-system dependencies or a mismatched deployment target/architecture. The output is rebuilt/libusb-1.0.dylib.\n' \
+print -r -- $'Rebuild the bundled libusb library on Apple Silicon macOS with Apple command-line developer tools:\n\n  SCANSTUDIO_LIBUSB_DEPLOYMENT_TARGET=14.0 \\\n  SCANSTUDIO_LIBUSB_SOURCE_ARCHIVE="$PWD/libusb-1.0.30.tar.bz2" \\\n  ./build_bundled_libusb.sh "$PWD/rebuilt"\n\nThe script verifies the pinned source SHA-256, builds only the shared library with a fixed install prefix, fixes its app-relative install identity, and rejects non-system dependencies or a mismatched deployment target/architecture. The output is rebuilt/libusb-1.0.dylib.\n' \
     > "$staged_app/Contents/Resources/CorrespondingSource/libusb/REBUILD.txt"
 print -r -- $'libusb 1.0.30\nLicense: LGPL-2.1-or-later\nSource: https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2\nSource SHA-256: fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf\nBundled library: Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib\nThe complete pinned source archive, exact build script, and rebuild instructions are under Contents/Resources/CorrespondingSource/libusb.\n' \
     > "$staged_app/Contents/Resources/Licenses/libusb-NOTICE.txt"
@@ -471,7 +485,7 @@ install -m 644 \
 install -m 755 \
     "$script_dir/build_sane_link_sdk.sh" \
     "$staged_app/Contents/Resources/CorrespondingSource/python-sane/build_sane_link_sdk.sh"
-print -r -- $'Rebuild the bundled python-sane extension on macOS with Apple command-line developer tools, exact uv 0.11.30, the ScanStudio bridge/CoolScanPy sibling source tree, and exact CPython 3.13.14:\n\n  SCANSTUDIO_PYTHON_SANE_SOURCE_ARCHIVE="$PWD/python_sane-2.9.2.tar.gz" \\\n  ./build_sane_link_sdk.sh \\\n    "$PWD/rebuilt-sane-link-sdk" "$PWD/rebuilt-python-sane-venv" \\\n    /path/to/scanstudio-bridge /path/to/exact/python3.13\n\nThe script verifies the adjacent source archive SHA-256 (50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe), downloads and verifies sane-backends 1.4.0 for a private build-only link SDK, and targets macOS deployment target 14.0. It proves the SDK-only Mach-O identity, architecture, minimum OS, ABI, dependencies, and lack of RPATH before rewriting the extension to the architecture-specific canonical host libsane.1.dylib path. No SANE runtime library is bundled.\n' \
+print -r -- $'Rebuild the bundled python-sane extension on Apple Silicon macOS with Apple command-line developer tools, exact uv 0.11.30, the ScanStudio bridge/CoolScanPy sibling source tree, and exact CPython 3.13.14:\n\n  SCANSTUDIO_PYTHON_SANE_SOURCE_ARCHIVE="$PWD/python_sane-2.9.2.tar.gz" \\\n  ./build_sane_link_sdk.sh \\\n    "$PWD/rebuilt-sane-link-sdk" "$PWD/rebuilt-python-sane-venv" \\\n    /path/to/scanstudio-bridge /path/to/exact/python3.13\n\nThe script verifies the adjacent source archive SHA-256 (50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe), downloads and verifies sane-backends 1.4.0 for a private build-only link SDK, and targets macOS deployment target 14.0. It proves the SDK-only Mach-O identity, architecture, minimum OS, ABI, dependencies, and lack of RPATH before rewriting the extension to the Apple Silicon canonical host libsane.1.dylib path. No SANE runtime library is bundled.\n' \
     > "$staged_app/Contents/Resources/CorrespondingSource/python-sane/REBUILD.txt"
 print -r -- $'python-sane 2.9.2\nLicense: permissive python-sane license; see the packaged COPYING text\nSource: https://files.pythonhosted.org/packages/45/e9/e8baff69fc2347606c547201204d4b4843c7ad8ecb9164eceee42016eff6/python_sane-2.9.2.tar.gz\nSource SHA-256: 50ab8e0b033cececad26c7231a7254f80ad8fe9ec6b5c25add2493d7e2a07bbe\nThe exact source archive and source-build instructions are under Contents/Resources/CorrespondingSource/python-sane. The package contains only the extension and Python module, never the private SANE link SDK or a SANE runtime.\n' \
     > "$staged_app/Contents/Resources/Licenses/python-sane-NOTICE.txt"
