@@ -3198,6 +3198,11 @@ pub(crate) mod metadata_publish_sys {
     }
 
     pub fn open_regular(parent: &File, name: &OsStr) -> io::Result<File> {
+        // Readers must coexist with publication handles that deny deletion.
+        relative_file(parent, name, false, false, false, false, true)
+    }
+
+    fn open_regular_for_delete(parent: &File, name: &OsStr) -> io::Result<File> {
         relative_file(parent, name, false, false, false, true, true)
     }
 
@@ -3265,8 +3270,8 @@ pub(crate) mod metadata_publish_sys {
         to_directory: &File,
         to_name: &OsStr,
     ) -> io::Result<()> {
-        let source = open_regular(from_directory, from_name)?;
-        let target = open_regular(to_directory, to_name)?;
+        let source = open_regular_for_delete(from_directory, from_name)?;
+        let target = open_regular_for_delete(to_directory, to_name)?;
         let parking = from_name
             .to_str()
             .and_then(|name| name.strip_prefix(".swap-"))
@@ -3319,7 +3324,7 @@ pub(crate) mod metadata_publish_sys {
                 ))
             }
         }
-        let source = open_regular(from_directory, from_name)?;
+        let source = open_regular_for_delete(from_directory, from_name)?;
         rename_handle(&source, to_directory, to_name, false)
     }
 
@@ -3345,7 +3350,7 @@ pub(crate) mod metadata_publish_sys {
         to_directory: &File,
         to_name: &OsStr,
     ) -> io::Result<()> {
-        let source = open_regular(from_directory, from_name)?;
+        let source = open_regular_for_delete(from_directory, from_name)?;
         rename_handle(&source, to_directory, to_name, true)
     }
 
@@ -3371,7 +3376,7 @@ pub(crate) mod metadata_publish_sys {
     }
 
     pub fn unlink(parent: &File, name: &OsStr) -> io::Result<()> {
-        let file = open_regular(parent, name)?;
+        let file = open_regular_for_delete(parent, name)?;
         delete_handle(&file)
     }
 

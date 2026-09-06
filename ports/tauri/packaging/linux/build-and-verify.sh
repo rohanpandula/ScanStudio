@@ -129,6 +129,7 @@ PY
         exit 1
     fi
     npm run sync-engine
+    cargo test --locked --manifest-path ../vendor/engine/Cargo.toml --lib
     npm test
     npx tsc --noEmit
     npm run build
