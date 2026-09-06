@@ -105,7 +105,7 @@ A SubIFD is chosen instead of a fourth main-image `ExtraSample`. TIFF's `ExtraSa
 
 ### Separate infrared TIFF
 
-For either main format, `tiffInfrared=sidecar` writes captured IR to `{main-stem}-ir.tif` in the same destination. The sidecar is classic little-endian TIFF, full-resolution, uncompressed, unsigned 16-bit, one-sample `BlackIsZero`, chunky, Orientation 1, and has the same X/Y resolution and inch unit as the main export. It carries `ImageDescription` identifying the untouched scanner plane and private ASCII tag 65001 with `scanstudio.infrared.linear.uint16.v1`. The main DNG has no `SubIFDs` tag; the main TIFF has the existing RGB-only layout.
+For either main format, `tiffInfrared=sidecar` writes captured IR to `{main-stem}-ir.tif` in the same destination. The sidecar is classic little-endian TIFF, full-resolution, uncompressed, unsigned 16-bit, one-sample `BlackIsZero`, chunky, Orientation 1, and has the same X/Y resolution and inch unit as the main export. It carries `ImageDescription` identifying the untouched scanner plane and private ASCII tag 65010 with `scanstudio.infrared.linear.uint16.v1`. The main DNG has no `SubIFDs` tag; the main TIFF has the existing RGB-only layout.
 
 ## Linear TIFF layout
 
@@ -115,7 +115,7 @@ Both TIFF modes use classic little-endian TIFF, unsigned 16-bit samples, no comp
 - **RGB + IR**: samples are interleaved R,G,B,IR; `PhotometricInterpretation=RGB`, `SamplesPerPixel=4`, `BitsPerSample=16,16,16,16`, and `ExtraSamples=0` for the one IR channel. “Unspecified” is intentional: IR is neither associated nor unassociated alpha.
 - **RGB + separate IR**: the main file is the existing RGB-only layout and the infrared plane uses the separate TIFF contract above.
 
-The four-channel TIFF also carries private tag 65001 with the same infrared marker. Software that only understands RGB may ignore or reject the fourth sample; that is why RGB-only is an explicit alternative rather than a silent fallback.
+The four-channel TIFF also carries private tag 65010 with the same infrared marker. Software that only understands RGB may ignore or reject the fourth sample; that is why RGB-only is an explicit alternative rather than a silent fallback.
 
 ## Fail-closed publication and compatibility
 

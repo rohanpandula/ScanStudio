@@ -2043,7 +2043,8 @@ pub(crate) fn ensure_supported_metadata_filesystem(file: &File) -> std::io::Resu
         )
     };
     if result == 0 {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(error.kind(), format!("GetVolumeInformationByHandleW: {error}")));
     }
     if !windows_metadata_filesystem_name_is_supported(&filesystem_name) {
         let name = String::from_utf16_lossy(&filesystem_name)
@@ -2591,7 +2592,7 @@ pub(crate) mod metadata_publish_sys {
     const FILE_OPEN: u32 = 0x0000_0001;
     const FILE_CREATE: u32 = 0x0000_0002;
     const FILE_NAMES_INFORMATION_CLASS: u32 = 12;
-    const FILE_RENAME_INFO_EX_CLASS: u32 = 22;
+    const FILE_RENAME_INFORMATION_CLASS: u32 = 10;
     const FILE_DISPOSITION_INFO_EX_CLASS: u32 = 21;
     const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
     const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
@@ -2611,8 +2612,8 @@ pub(crate) mod metadata_publish_sys {
     const ACL_SIZE_INFORMATION_CLASS: u32 = 2;
 
     #[repr(C)]
-    struct FileRenameInfoEx {
-        flags: u32,
+    struct FileRenameInformation {
+        replace_if_exists: u8,
         root_directory: Handle,
         file_name_length: u32,
         file_name: [u16; 1],
@@ -2780,6 +2781,13 @@ pub(crate) mod metadata_publish_sys {
 
     #[link(name = "ntdll")]
     extern "system" {
+        fn NtSetInformationFile(
+            file: Handle,
+            io_status_block: *mut IoStatusBlock,
+            information: *mut std::ffi::c_void,
+            information_size: u32,
+            information_class: u32,
+        ) -> i32;
         fn NtCreateFile(
             file: *mut Handle,
             desired_access: u32,
@@ -3158,7 +3166,8 @@ pub(crate) mod metadata_publish_sys {
         };
         if status < 0 {
             let windows_error = unsafe { RtlNtStatusToDosError(status) };
-            return Err(io::Error::from_raw_os_error(windows_error as i32));
+            let error = io::Error::from_raw_os_error(windows_error as i32);
+            return Err(io::Error::new(error.kind(), format!("NtCreateFile metadata entry: {error}")));
         }
         if handle.is_null() || handle as isize == -1 {
             return Err(io::Error::other(
@@ -3189,6 +3198,11 @@ pub(crate) mod metadata_publish_sys {
     }
 
     pub fn open_regular(parent: &File, name: &OsStr) -> io::Result<File> {
+        // Readers must coexist with publication handles that deny deletion.
+        relative_file(parent, name, false, false, false, false, true)
+    }
+
+    fn open_regular_for_delete(parent: &File, name: &OsStr) -> io::Result<File> {
         relative_file(parent, name, false, false, false, true, true)
     }
 
@@ -3196,21 +3210,21 @@ pub(crate) mod metadata_publish_sys {
         relative_file(parent, name, false, false, true, false, false)
     }
 
-    fn rename_handle(
+    pub(crate) fn rename_handle(
         source: &File,
         destination_directory: &File,
         destination_name: &OsStr,
         replace: bool,
     ) -> io::Result<()> {
         let name = component(destination_name)?;
-        let header_size = offset_of!(FileRenameInfoEx, file_name);
+        let header_size = offset_of!(FileRenameInformation, file_name);
         let byte_len = name.len().checked_mul(size_of::<u16>()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Windows rename name is too long",
             )
         })?;
-        let total = header_size.checked_add(byte_len).ok_or_else(|| {
+        let total = size_of::<FileRenameInformation>().checked_add(byte_len).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Windows rename buffer overflow",
@@ -3218,9 +3232,9 @@ pub(crate) mod metadata_publish_sys {
         })?;
         let words = total.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; words];
-        let info = storage.as_mut_ptr().cast::<FileRenameInfoEx>();
+        let info = storage.as_mut_ptr().cast::<FileRenameInformation>();
         unsafe {
-            (*info).flags = u32::from(replace);
+            (*info).replace_if_exists = u8::from(replace);
             (*info).root_directory = destination_directory.as_raw_handle();
             (*info).file_name_length = byte_len as u32;
             std::ptr::copy_nonoverlapping(
@@ -3229,16 +3243,22 @@ pub(crate) mod metadata_publish_sys {
                 byte_len,
             );
         }
-        let result = unsafe {
-            SetFileInformationByHandle(
+        // Use the native handle-relative operation, matching NtCreateFile above.
+        // The Win32 rename wrapper rejects this directory-relative request with
+        // ERROR_INVALID_PARAMETER on supported Windows hosts.
+        let mut status_block = IoStatusBlock { status_or_pointer: 0, information: 0 };
+        let status = unsafe {
+            NtSetInformationFile(
                 source.as_raw_handle(),
-                FILE_RENAME_INFO_EX_CLASS,
+                &mut status_block,
                 info.cast(),
                 total as u32,
+                FILE_RENAME_INFORMATION_CLASS,
             )
         };
-        if result == 0 {
-            Err(io::Error::last_os_error())
+        if status < 0 {
+            let error = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+            Err(io::Error::new(error.kind(), format!("NtSetInformationFile rename: {error}")))
         } else {
             Ok(())
         }
@@ -3250,8 +3270,8 @@ pub(crate) mod metadata_publish_sys {
         to_directory: &File,
         to_name: &OsStr,
     ) -> io::Result<()> {
-        let source = open_regular(from_directory, from_name)?;
-        let target = open_regular(to_directory, to_name)?;
+        let source = open_regular_for_delete(from_directory, from_name)?;
+        let target = open_regular_for_delete(to_directory, to_name)?;
         let parking = from_name
             .to_str()
             .and_then(|name| name.strip_prefix(".swap-"))
@@ -3304,7 +3324,7 @@ pub(crate) mod metadata_publish_sys {
                 ))
             }
         }
-        let source = open_regular(from_directory, from_name)?;
+        let source = open_regular_for_delete(from_directory, from_name)?;
         rename_handle(&source, to_directory, to_name, false)
     }
 
@@ -3330,7 +3350,7 @@ pub(crate) mod metadata_publish_sys {
         to_directory: &File,
         to_name: &OsStr,
     ) -> io::Result<()> {
-        let source = open_regular(from_directory, from_name)?;
+        let source = open_regular_for_delete(from_directory, from_name)?;
         rename_handle(&source, to_directory, to_name, true)
     }
 
@@ -3356,7 +3376,7 @@ pub(crate) mod metadata_publish_sys {
     }
 
     pub fn unlink(parent: &File, name: &OsStr) -> io::Result<()> {
-        let file = open_regular(parent, name)?;
+        let file = open_regular_for_delete(parent, name)?;
         delete_handle(&file)
     }
 
@@ -3485,7 +3505,9 @@ pub(crate) mod metadata_publish_sys {
         // File::sync_all maps to FlushFileBuffers on Windows. Directory
         // capabilities are opened with write access so this ordering barrier
         // is enforced instead of silently assuming a rename is durable.
-        directory.sync_all()
+        directory.sync_all().map_err(|error| {
+            io::Error::new(error.kind(), format!("FlushFileBuffers directory: {error}"))
+        })
     }
 }
 
@@ -7084,7 +7106,12 @@ mod tests {
     fn windows_runner_assigns_and_resumes_a_normal_process() {
         let command =
             std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
-        let command = bind_executable(Path::new(&command)).expect("bind Windows command");
+        // System binaries may have servicing hard links; the executable binder
+        // intentionally requires a unique file identity.
+        let root = temp_root("windows-runner");
+        let executable = root.join("cmd.exe");
+        std::fs::copy(&command, &executable).expect("copy Windows command fixture");
+        let command = bind_executable(&executable).expect("bind Windows command");
         let output = run_bounded_command(
             &command,
             &["/D".into(), "/C".into(), "exit /B 0".into()],
@@ -7093,6 +7120,8 @@ mod tests {
         )
         .expect("run a Job-contained Windows process");
         assert!(output.status.success());
+        drop(command);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

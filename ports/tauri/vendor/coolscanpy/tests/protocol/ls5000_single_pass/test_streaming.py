@@ -65,6 +65,11 @@ def _f6b1_prefixed_counter_train(words: np.ndarray) -> None:
     _counter_train(words[4:], 0xD895)
 
 
+def _ebde_prefixed_counter_train(words: np.ndarray) -> None:
+    words[:4] = (0xEBDE, 0xEBDE, 0xEBDE, 0xD894)
+    _counter_train(words[4:], 0xD895)
+
+
 def _synthetic_full_records(height: int = 3) -> tuple[np.ndarray, np.ndarray]:
     records = (height + 1) // 2
     base = (
@@ -250,6 +255,69 @@ class TestStreamingFrameDecoder:
 
         np.testing.assert_array_equal(offline, decoded)
         assert offline_report["padding_1_3_counter_dialect"] == "f6b1-prefixed"
+
+    def test_ebde_prefixed_stream_matches_offline_decode_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        for record in full:
+            _ebde_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _ebde_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        stream = full.astype(">u2").tobytes()
+        path = tmp_path / "ebde-capture.bin"
+        path.write_bytes(stream)
+        offline, offline_report = decode_full_records(path, height=3)
+
+        decoder = StreamingFrameDecoder(height=3)
+        _feed(decoder, stream, 4_096)
+        decoded, _ = decoder.finish()
+
+        np.testing.assert_array_equal(offline, decoded)
+        assert offline_report["padding_1_3_counter_dialect"] == "ebde-prefixed"
+
+    @pytest.mark.parametrize(
+        "corrupt_word_offset,match",
+        [
+            (110_840 // 2, "padding 1 counter train mismatch"),
+            (110_840 // 2 + 4, "padding 1 counter train mismatch"),
+            (207_096 // 2, "padding 3 counter train mismatch"),
+            (207_872 // 2 - 1, "padding 3 counter train mismatch"),
+        ],
+        ids=["pad1-sentinel", "pad1-train-head", "pad3-sentinel", "pad3-train-tail"],
+    )
+    def test_corrupt_ebde_prefixed_padding_fails_closed(
+        self, corrupt_word_offset: int, match: str
+    ) -> None:
+        _base, full = _synthetic_full_records(height=5)  # 3 records
+        for record in full:
+            _ebde_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+            _ebde_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        full[1, corrupt_word_offset] ^= 1
+        decoder = StreamingFrameDecoder(height=5)
+
+        with pytest.raises(ValueError, match=match):
+            _feed(decoder, full.astype(">u2").tobytes(), 65_535)
+
+    def test_mixed_ebde_and_canonical_padding_dialects_fail_closed(self) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        for record in full:
+            _ebde_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+        decoder = StreamingFrameDecoder(height=3)
+
+        with pytest.raises(ValueError, match="padding 3 counter train mismatch"):
+            _feed(decoder, full.astype(">u2").tobytes(), 65_535)
+
+    def test_cross_record_ebde_dialect_change_fails_closed(self) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        record = full[1]
+        _ebde_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+        _ebde_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        decoder = StreamingFrameDecoder(height=3)
+
+        with pytest.raises(
+            ValueError, match="dialect changed at record 1: canonical -> ebde-prefixed"
+        ):
+            _feed(decoder, full.astype(">u2").tobytes(), 65_535)
 
     @pytest.mark.parametrize(
         "corrupt_word_offset,match",

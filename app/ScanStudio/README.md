@@ -1,6 +1,6 @@
 # ScanStudio
 
-ScanStudio is a macOS alpha for scanning 35 mm film with a Nikon Coolscan
+ScanStudio is a macOS app for scanning 35 mm film with a Nikon Coolscan
 LS-5000. It keeps the scan workflow in one place: identify the film that is
 loaded, preview the roll, select frames, choose the capture settings, scan,
 and stop safely when needed.
@@ -11,7 +11,8 @@ already includes the CoolscanPy bridge and its direct-USB runtime; source
 builds can instead configure a separate compatible bridge. The app never
 presents the simulator as hardware.
 
-This is an alpha. It has been tested on one Mac and one LS-5000 setup. Treat
+Apple Silicon support is Beta; Intel support is Preview. Real scanning has
+been tested on one Apple Silicon Mac and one LS-5000 setup. Treat
 each real scan as a new operation: confirm the detected carrier and the
 preview before starting capture. Real black-and-white fine scanning remains
 blocked rather than pretending that infrared dust removal is available for

@@ -22,6 +22,7 @@ jobs:
     env:
       UV_PYTHON_PREFERENCE: only-managed
       UV_PYTHON_CPYTHON_BUILD: "20260718"
+      SCANSTUDIO_RELEASE_VERSION: 0.0.0-signing-dry-run
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -99,7 +100,8 @@ jobs:
         working-directory: app/ScanStudio
         run: |
           PYBIN="$(/usr/bin/find .build/ScanStudio.app/Contents/Resources -type f -name 'python3.13' -path '*/bin/*' | head -1)"
-          "$PYBIN" -I -c "import ctypes; ctypes.CDLL('.build/ScanStudio.app/Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib'); print('dlopen ok under hardened runtime')"
+          "$PYBIN" -I -B -c "import ctypes; from pathlib import Path; ctypes.CDLL(str(Path('.build/ScanStudio.app/Contents/Frameworks/coolscanpy/_native/libusb-1.0.dylib').resolve())); print('dlopen ok under hardened runtime')"
+          codesign --verify --deep --strict .build/ScanStudio.app
       - name: Build the DMG from the stapled app
         working-directory: app/ScanStudio
         run: ./scripts/package_dmg.sh
@@ -115,6 +117,7 @@ jobs:
         with:
           name: signing-dry-run-dmg
           path: app/ScanStudio/.build/ScanStudio-*-macOS-*.dmg
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 3
       - name: Delete the throwaway signing keychain and key material

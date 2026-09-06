@@ -378,7 +378,7 @@ impl ReservedEvidencePackage {
     pub(crate) fn retire_exact_root_file(
         &self,
         name: &std::ffi::OsStr,
-        expected: &std::fs::File,
+        expected: std::fs::File,
     ) -> Result<(), domain::EngineError> {
         let relative = Path::new(name);
         if relative.components().count() != 1
@@ -391,8 +391,9 @@ impl ReservedEvidencePackage {
                 "exact evidence cleanup requires one normal root-file component",
             ));
         }
-        self.verify_regular_file(relative, expected)?;
-        destination_sys::delete_exact_regular_file(expected)?;
+        self.verify_regular_file(relative, &expected)?;
+        destination_sys::delete_exact_regular_file(&expected)?;
+        drop(expected);
         crate::exiftool::metadata_publish_sys::sync_directory(self.directory_handle()).map_err(
             |error| {
                 output_authority_error(format!(
@@ -1275,7 +1276,6 @@ mod destination_sys {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const DELETE_ACCESS: u32 = 0x0001_0000;
-    const FILE_RENAME_INFO_CLASS: u32 = 3;
     const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
 
     #[link(name = "Kernel32")]
@@ -1286,14 +1286,6 @@ mod destination_sys {
             information: *mut std::ffi::c_void,
             buffer_size: u32,
         ) -> i32;
-    }
-
-    #[repr(C)]
-    struct FileRenameInfoHeader {
-        replace_if_exists: u8,
-        root_directory: *mut std::ffi::c_void,
-        file_name_length: u32,
-        file_name: [u16; 1],
     }
 
     #[repr(C)]
@@ -1625,6 +1617,7 @@ mod destination_sys {
             ));
             let path = held.display_path.join(&candidate);
             match std::fs::OpenOptions::new()
+                .write(true)
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS)
                 .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
@@ -1701,53 +1694,12 @@ mod destination_sys {
         role: &str,
     ) -> Result<(), domain::EngineError> {
         verify_namespace(held)?;
-        let wide: Vec<u16> = final_name.encode_wide().collect();
-        let file_name_offset = std::mem::offset_of!(FileRenameInfoHeader, file_name);
-        let byte_length = wide
-            .len()
-            .checked_mul(std::mem::size_of::<u16>())
-            .ok_or_else(|| output_authority_error("final output leaf is too long"))?;
-        let total = file_name_offset
-            .checked_add(byte_length)
-            .ok_or_else(|| output_authority_error("final output rename buffer is too large"))?;
-        // `Vec<u8>` only guarantees byte alignment; casting its pointer to
-        // FILE_RENAME_INFO would be undefined behaviour on Windows. Back the
-        // variable-sized record with pointer-aligned words while still
-        // passing the exact byte length required by the API.
-        let word = std::mem::size_of::<usize>();
-        let word_count = total
-            .checked_add(word - 1)
-            .ok_or_else(|| output_authority_error("final output rename buffer is too large"))?
-            / word;
-        let mut buffer = vec![0_usize; word_count];
-        let buffer_bytes = buffer.as_mut_ptr().cast::<u8>();
-        let header = buffer_bytes.cast::<FileRenameInfoHeader>();
-        unsafe {
-            std::ptr::write(
-                header,
-                FileRenameInfoHeader {
-                    replace_if_exists: (!create_only) as u8,
-                    root_directory: held.directory.as_raw_handle().cast(),
-                    file_name_length: byte_length as u32,
-                    file_name: [0],
-                },
-            );
-            std::ptr::copy_nonoverlapping(
-                wide.as_ptr().cast::<u8>(),
-                buffer_bytes.add(file_name_offset),
-                byte_length,
-            );
-        }
-        let result = unsafe {
-            SetFileInformationByHandle(
-                temporary_file.as_raw_handle().cast(),
-                FILE_RENAME_INFO_CLASS,
-                buffer_bytes.cast(),
-                total as u32,
-            )
-        };
-        if result == 0 {
-            let error = std::io::Error::last_os_error();
+        if let Err(error) = crate::exiftool::metadata_publish_sys::rename_handle(
+            temporary_file,
+            &held.directory,
+            final_name,
+            !create_only,
+        ) {
             let code = if create_only && error.kind() == std::io::ErrorKind::AlreadyExists {
                 protocol::ErrorCode::ArchiveCollision
             } else {
@@ -2800,6 +2752,9 @@ fn validate_filesystem_output_leaf_collation(
                 ))
             })?;
         }
+        // Windows delete dispositions finish when the last held file closes.
+        // Close our exact probe handles before checking for foreign entries.
+        created.clear();
         crate::exiftool::metadata_publish_sys::sync_directory(&probe).map_err(|error| {
             output_authority_error(format!("sync emptied output-name alias probe: {error}"))
         })?;
@@ -6783,6 +6738,7 @@ fn sync_output_directory(directory: &Path) -> std::io::Result<()> {
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     std::fs::OpenOptions::new()
         .read(true)
+        .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(directory)?
         .sync_all()
@@ -10347,17 +10303,34 @@ mod tests {
         output.preview.enabled = false;
         output.raw_export.enabled = false;
 
-        let error = acquire_job_output_authorities(
+        // NTFS upcase tables vary by volume generation. Derive the expected
+        // answer from actual ordinary Windows file creation on this volume.
+        let first = project.join("Σ_0001.tif");
+        let second = project.join("ς_0001.tif");
+        std::fs::write(&first, b"oracle").unwrap();
+        let oracle = std::fs::OpenOptions::new().write(true).create_new(true).open(&second);
+        let collision = match oracle {
+            Ok(file) => { drop(file); false }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                true
+            }
+        };
+        let result = acquire_job_output_authorities(
             Some(&project),
             &[1],
             &domain::CaptureRecipe::default(),
             &output,
             &std::collections::HashMap::new(),
         )
-        .expect_err("NTFS-upcase aliases must collide before capture");
-
-        assert_eq!(error.code, protocol::ErrorCode::InvalidParams);
-        assert!(error.message.contains("filename collation"), "{error}");
+        ;
+        if collision {
+            let error = result.expect_err("filesystem aliases must collide before capture");
+            assert_eq!(error.code, protocol::ErrorCode::InvalidParams);
+            assert!(error.message.contains("filename collation"), "{error}");
+        } else {
+            result.expect("distinct filesystem names must remain usable");
+        }
         let _ = std::fs::remove_dir_all(&project);
     }
 
@@ -12030,7 +12003,16 @@ mod tests {
 
         let positive = written.positive_path.as_ref().unwrap();
         let displaced = root.join("engine-authored-positive.tif");
-        std::fs::rename(positive, &displaced).unwrap();
+        let renamed = std::fs::rename(positive, &displaced);
+        if cfg!(windows) {
+            assert!(renamed.is_err(), "held Windows output must deny replacement");
+            crate::exiftool::bind_metadata_output_publications(&root, &written.metadata_publications)
+                .expect("denied replacement retains the original binding");
+            drop(written);
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        renamed.unwrap();
         std::fs::write(positive, b"attacker replacement").unwrap();
 
         let error = crate::exiftool::bind_metadata_output_publications(

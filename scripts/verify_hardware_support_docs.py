@@ -49,7 +49,7 @@ def verify_hardware_support_docs(root: Path = REPOSITORY_ROOT) -> None:
         raise HardwareSupportDocsError(f"cannot read {CANONICAL_MATRIX}: {error}") from error
 
     latest = _latest_release_note(root)
-    if f"Current published release: [{latest}]" not in matrix:
+    if f"Latest release notes: [{latest}]" not in matrix:
         raise HardwareSupportDocsError(
             f"{CANONICAL_MATRIX} does not name the newest documented release {latest}"
         )

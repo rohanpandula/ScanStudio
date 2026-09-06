@@ -4831,6 +4831,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("scan.completed event");
             let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            eprintln!("{value}");
             if value["event"] == "scan.completed" {
                 break;
             }

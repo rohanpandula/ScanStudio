@@ -53,7 +53,9 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
-    "packed.py": "856315714e4f7e81f42e1ca93917e4cc0feb03b24915c2ad604302bfdca46f87",
+    # Resealed 2026-08-12 after a complete 2,980-record LS-5000 capture
+    # established the strict EBDE-prefixed padding-counter dialect.
+    "packed.py": "abff893d6ec5ff36aa33be86ef401a28ffbd6054e2279129e8fb88d7f650b435",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "b03b3212d1ff1f8e3ad8ca7b512765ad6a115d4766e3f3eb5a86de3573076d4e",
