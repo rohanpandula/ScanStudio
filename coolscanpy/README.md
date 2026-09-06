@@ -335,7 +335,7 @@ real facade.
 The suite uses synthetic devices, replay fixtures, and substituted transport
 boundaries. Optional dependencies or external archived captures can cause
 explicit skips. Passing tests do not establish attached-scanner compatibility.
-Use [Mac acceptance and recovery](../docs/MAC-ACCEPTANCE.md) for ScanStudio’s
+Use [Mac acceptance and recovery](https://github.com/rohanpandula/ScanStudio/blob/main/docs/MAC-ACCEPTANCE.md) for ScanStudio’s
 separate packaged-software gate and attended hardware evidence.
 
 The canonical release branch is `port/cross-platform`. Standalone development,
@@ -360,7 +360,7 @@ bash scripts/check_coolscanpy_pypi_sync.sh
 
 The gate compares source bytes; equal version strings alone do not pass.
 ScanStudio’s release workflow requires it before signing and publishing the
-app. See [release policy](../docs/releases/README.md). Changes to capture-bundle
+app. See [release policy](https://github.com/rohanpandula/ScanStudio/blob/main/docs/releases/README.md). Changes to capture-bundle
 files also require their integrity checks; `_roll.py` is outside that manifest
 and does not require a bundle reseal.
 

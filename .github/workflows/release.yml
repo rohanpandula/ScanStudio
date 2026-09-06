@@ -77,7 +77,7 @@ jobs:
         # standalone `pip install coolscanpy` users would not have -- version
         # skew between the two makes field reports for the same film
         # incomparable. Content is compared against the exact authenticated
-        # 0.7.1 sdist (version strings are checked second; an unbumped version
+        # pinned sdist (version strings are checked second; an unbumped version
         # with changed code is exactly the failure mode). Publish the matching
         # coolscanpy release from the canonical repo before tagging ScanStudio.
         run: bash scripts/check_coolscanpy_pypi_sync.sh

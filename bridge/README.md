@@ -6,7 +6,7 @@ responses and asynchronous scan events share that connection. It has no GUI.
 
 The released ScanStudio app includes the bridge, its Python runtime, libusb,
 licenses, and corresponding source. App users should follow the
-[ScanStudio installation guide](../README.md) instead of installing a second
+[ScanStudio installation guide](https://github.com/rohanpandula/ScanStudio/blob/main/README.md) instead of installing a second
 bridge. ScanStudio supports Apple Silicon Macs running macOS 14 or newer.
 The standalone [CoolscanPy driver](../coolscanpy/README.md) has its own platform
 and scanner support boundaries.
@@ -23,9 +23,9 @@ Eject does not require SANE or `scanimage`; the optional `scanner` extra is for
 CoolscanPy’s legacy SANE plain-scan path. The Rust engine and native app own
 project persistence, user-facing recovery, and processed output presentation.
 
-Read the [bridge wire protocol](../app/ScanStudio/protocol/BRIDGE.md) for
+Read the [bridge wire protocol](https://github.com/rohanpandula/ScanStudio/blob/main/app/ScanStudio/protocol/BRIDGE.md) for
 methods, events, field names, and errors. The separate
-[app/engine protocol](../app/ScanStudio/protocol/PROTOCOL.md) is not a bridge
+[app/engine protocol](https://github.com/rohanpandula/ScanStudio/blob/main/app/ScanStudio/protocol/PROTOCOL.md) is not a bridge
 connection.
 
 ## Develop and test
@@ -68,7 +68,7 @@ from the driver; the bridge does not issue a second confirmation probe.
 The bridge records session provenance, call/phase outcomes, and anomalies under
 `~/.scanstudio/hw-telemetry/` by default. Capture journals and durable project
 receipts provide different evidence; no single log contains every UI progress
-update. Follow the [Mac acceptance and full-roll guide](../docs/MAC-ACCEPTANCE.md)
+update. Follow the [Mac acceptance and full-roll guide](https://github.com/rohanpandula/ScanStudio/blob/main/docs/MAC-ACCEPTANCE.md)
 for exact paths, continuous observation, stop/reopen/resume, and image checks.
 Preserve live receipts and originals. Monitoring is not an automatic retry loop.
 
