@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import struct
@@ -73,6 +74,11 @@ class _FakeRoll:
         self._fingerprint_sha256 = fingerprint_sha256
         self._scan_results = {slot: list(outcomes) for slot, outcomes in (scan_results or {}).items()}
         self.scan_many_calls: list[tuple[int, ...]] = []
+        # Keyword arguments of each scan_many call, in call order: what the
+        # transport asked the driver for beyond the slot list (samples_per_scan,
+        # exposure_override_10ns), so tests can pin the single-sample and
+        # held-exposure paths without a real Roll.
+        self.scan_many_kwargs: list[dict[str, object]] = []
         self.approve_calls: list[int] = []
         self.attended_approve_calls: list[tuple[int, bool]] = []
         self.spacing_offset_calls: list[tuple[int, int]] = []
@@ -162,6 +168,7 @@ class _FakeRoll:
         slots,
         *,
         on_progress=None,
+        **kwargs,
     ):
         ordered = tuple(slots)
         if not ordered:
@@ -169,6 +176,7 @@ class _FakeRoll:
         if tuple(sorted(set(ordered))) != ordered:
             raise ValueError("batch scanner slots must be unique and strictly increasing")
         self.scan_many_calls.append(ordered)
+        self.scan_many_kwargs.append(dict(kwargs))
         for index, slot in enumerate(ordered):
             if self._safe_stop_requested:
                 raise coolscanpy.SafeStopRequested(
@@ -2832,7 +2840,7 @@ def test_start_scan_writes_meter_sidecar_for_rgb_when_coolscanpy_supplies_it(
     # The production route is fixed RGBI; bypass only that recipe gate so
     # this transport-level test can cover CoolscanPy's independent meter
     # sidecar behavior for an RGB request.
-    monkeypatch.setattr(domain, "validate_capture_recipe", lambda *_a: None)
+    monkeypatch.setattr(domain, "validate_capture_recipe", lambda *_a, **_k: None)
     rgb_recipe = dataclasses.replace(domain.FIXED_COLOR_NEGATIVE_RECIPE, channels=domain.Channels.RGB)
     frames: list[domain.ScanReceipt] = []
 
@@ -3975,3 +3983,106 @@ def test_confirmed_real_device_eject_needs_no_second_probe(monkeypatch):
         assert transport.eject() is True
     finally:
         device.close()
+
+
+def _single_sample_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for CoolscanPy 0.7.7's declaration without needing that driver
+    installed: the transport consults this one helper for the accepted set."""
+    monkeypatch.setattr(coolscanpy_transport_module, "supported_samples_per_scan", lambda: (1, 4))
+
+
+def _scan(transport: CoolscanPyTransport, slots: list[int], recipe: domain.CaptureRecipe, out: Path) -> domain.ScanSummary:
+    return transport.start_scan(
+        slots=slots,
+        recipe=recipe,
+        output=_output(out),
+        on_progress=lambda _p: None,
+        on_retry=lambda *a: None,
+        on_frame=lambda *_a: None,
+    )
+
+
+def test_supported_samples_per_scan_never_widens_on_a_declaration_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", raising=False)
+    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
+    monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, 4), raising=False)
+    has_keyword = "samples_per_scan" in inspect.signature(coolscanpy.Roll.scan_many).parameters
+    assert coolscanpy_transport_module.supported_samples_per_scan() == ((1, 4) if has_keyword else (4,))
+    monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, True, "4"), raising=False)
+    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
+
+
+def test_device_info_reports_the_drivers_samples_per_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
+    transport, _device = _opened_transport(monkeypatch, roll)
+    assert transport.list_devices()[0].capabilities.supported_multisample_passes == (4,)
+    _single_sample_driver(monkeypatch)
+    assert transport.list_devices()[0].capabilities.supported_multisample_passes == (1, 4)
+
+
+def test_start_scan_passes_samples_per_scan_only_when_the_driver_supports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1)],
+        scan_results={1: [_fake_frame(1), _fake_frame(1)]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    single = dataclasses.replace(domain.FIXED_COLOR_NEGATIVE_RECIPE, multisample_passes=1)
+
+    with pytest.raises(BridgeError) as refused:
+        _scan(transport, [1], single, tmp_path / "refused")
+    assert refused.value.code == ErrorCode.INVALID_PARAMS
+    assert "multisamplePasses" in refused.value.message
+    assert roll.scan_many_calls == []
+
+    # An older driver never sees the keyword, even for the traced recipe.
+    summary = _scan(transport, [1], domain.FIXED_COLOR_NEGATIVE_RECIPE, tmp_path / "traced")
+    assert summary.completed == (1,)
+    assert roll.scan_many_kwargs == [{}]
+
+    _single_sample_driver(monkeypatch)
+    summary = _scan(transport, [1], single, tmp_path / "single")
+    assert summary.completed == (1,)
+    assert roll.scan_many_calls == [(1,), (1,)]
+    assert roll.scan_many_kwargs[-1] == {"samples_per_scan": 1}
+
+
+def test_start_scan_holds_the_first_frames_exposure_when_auto_exposure_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """autoExposure false: the lowest requested slot is metered on its own
+    one-frame batch, then its metered RGB exposure (receipt microseconds,
+    100 ticks per microsecond) is forced onto every remaining slot through
+    the driver's exposure_override_10ns; the first batch carries no override."""
+
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1), _fake_thumbnail(2), _fake_thumbnail(3)],
+        scan_results={1: [_fake_frame(1)], 2: [_fake_frame(2)], 3: [_fake_frame(3)]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    held = dataclasses.replace(domain.FIXED_COLOR_NEGATIVE_RECIPE, auto_exposure=False)
+
+    completed_order: list[int] = []
+    summary = transport.start_scan(
+        slots=[3, 1, 2],
+        recipe=held,
+        output=_output(tmp_path / "held"),
+        on_progress=lambda _p: None,
+        on_retry=lambda *a: None,
+        on_frame=lambda slot, _receipt: completed_order.append(slot),
+    )
+
+    assert summary.completed == (1, 2, 3)
+    assert completed_order == [1, 2, 3]
+    assert roll.scan_many_calls == [(1,), (2, 3)]
+    assert roll.scan_many_kwargs == [
+        {},
+        {"exposure_override_10ns": (120_000, 95_000, 140_000)},
+    ]

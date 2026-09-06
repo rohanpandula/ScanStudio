@@ -337,6 +337,45 @@ def test_validate_capture_recipe_rejects_wrong_multisample_passes() -> None:
     assert "multisamplePasses" in excinfo.value.message
 
 
+def test_validate_capture_recipe_accepts_single_sample_only_when_the_device_supports_it() -> None:
+    single = dataclasses.replace(FIXED_COLOR_NEGATIVE_RECIPE, multisample_passes=1)
+    assert (
+        validate_capture_recipe(
+            single, Material.COLOR_NEGATIVE, supported_multisample_passes=(1, 4)
+        )
+        is None
+    )
+    with pytest.raises(BridgeError) as excinfo:
+        validate_capture_recipe(
+            dataclasses.replace(FIXED_COLOR_NEGATIVE_RECIPE, multisample_passes=2),
+            Material.COLOR_NEGATIVE,
+            supported_multisample_passes=(1, 4),
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert "multisamplePasses" in excinfo.value.message
+    # The traced recipe is always accepted, whatever the device advertises.
+    assert (
+        validate_capture_recipe(
+            FIXED_COLOR_NEGATIVE_RECIPE,
+            Material.COLOR_NEGATIVE,
+            supported_multisample_passes=(1, 4),
+        )
+        is None
+    )
+
+
+def test_validate_capture_recipe_accepts_held_exposure_but_not_autofocus_off() -> None:
+    held = dataclasses.replace(FIXED_COLOR_NEGATIVE_RECIPE, auto_exposure=False)
+    assert validate_capture_recipe(held, Material.COLOR_NEGATIVE) is None
+    with pytest.raises(BridgeError) as excinfo:
+        validate_capture_recipe(
+            dataclasses.replace(FIXED_COLOR_NEGATIVE_RECIPE, autofocus=False),
+            Material.COLOR_NEGATIVE,
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_PARAMS
+    assert "autofocus" in excinfo.value.message
+
+
 def test_validate_capture_recipe_rejects_black_and_white_as_not_implemented() -> None:
     with pytest.raises(BridgeError) as excinfo:
         validate_capture_recipe(

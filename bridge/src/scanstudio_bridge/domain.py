@@ -380,13 +380,15 @@ FIXED_COLOR_NEGATIVE_RECIPE = CaptureRecipe(
     auto_exposure=True,
 )
 
+# Fields every colorNegative capture must match exactly. multisample_passes is
+# validated against the opened device's supported set instead (see
+# validate_capture_recipe), and auto_exposure may be True (meter every frame)
+# or False (meter the lowest requested slot, hold it for the rest).
 _FIXED_COLOR_NEGATIVE_FIELDS = (
     "resolution_dpi",
     "bit_depth",
-    "multisample_passes",
     "channels",
     "autofocus",
-    "auto_exposure",
 )
 
 # Plan 10-09: lab-only diagnostic override, env-gated. See
@@ -433,9 +435,21 @@ def _matches_debug_color_negative_recipe(recipe: CaptureRecipe) -> bool:
     )
 
 
-def validate_capture_recipe(recipe: CaptureRecipe, material: Material) -> None:
+def validate_capture_recipe(
+    recipe: CaptureRecipe,
+    material: Material,
+    *,
+    supported_multisample_passes: tuple[int, ...] | None = None,
+) -> None:
     """Raise `BridgeError` when `recipe` doesn't satisfy BRIDGE.md's Recipe
     constraints for `material`; return `None` when it does.
+
+    `supported_multisample_passes` is the opened device's
+    `Capabilities.supported_multisample_passes` -- `(4,)` when omitted, the
+    traced capture every earlier release accepted. `multisample_passes` must
+    be a member of it. `auto_exposure` may be either boolean: `True` meters
+    every frame, `False` meters the lowest requested slot and holds that
+    exposure for the rest of the batch (CoolscanPyTransport.start_scan).
 
     Plan 10-09 debug-recipe gate: when env `SCANSTUDIO_BRIDGE_DEBUG_RECIPE`
     is exactly `"1"`, a `material=colorNegative` recipe ALSO validates
@@ -464,5 +478,25 @@ def validate_capture_recipe(recipe: CaptureRecipe, material: Material) -> None:
                     f"recipe.{wire_field} must be {expected!r} for "
                     f"material=colorNegative, got {actual!r}",
                 )
+        allowed = (
+            tuple(supported_multisample_passes)
+            if supported_multisample_passes
+            else (FIXED_COLOR_NEGATIVE_RECIPE.multisample_passes,)
+        )
+        if (
+            isinstance(recipe.multisample_passes, bool)
+            or recipe.multisample_passes not in allowed
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                f"recipe.multisamplePasses must be one of {list(allowed)} for "
+                f"material=colorNegative, got {recipe.multisample_passes!r}",
+            )
+        if not isinstance(recipe.auto_exposure, bool):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "recipe.autoExposure must be true (meter every frame) or false "
+                f"(hold the first frame's exposure), got {recipe.auto_exposure!r}",
+            )
         return None
     raise BridgeError(ErrorCode.INVALID_PARAMS, f"unknown material: {material!r}")

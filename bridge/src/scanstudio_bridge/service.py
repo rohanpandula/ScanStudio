@@ -337,6 +337,9 @@ class BridgeService:
         self._base_dir = base_dir
         self._hello_received = False
         self._device_open = False
+        # The opened device's capabilities: scan.start validates
+        # recipe.multisamplePasses against its supportedMultisamplePasses.
+        self._opened_capabilities: domain.Capabilities | None = None
         self._preview_material: domain.Material | None = None
         self._last_job: dict | None = None  # {"job_id": str, "terminal": bool, "thread": Thread}
         self._seen_job_ids: set[str] = set()
@@ -577,6 +580,7 @@ class BridgeService:
         device_id = _require_string(params["deviceId"], "deviceId", maximum_length=256)
         device = self._transport.open_device(device_id)
         self._device_open = True
+        self._opened_capabilities = device.capabilities
         status = self._status_snapshot()
         emit("device.status", {"status": to_wire(status)})
         return {"device": to_wire(device), "status": to_wire(status)}
@@ -912,7 +916,15 @@ class BridgeService:
         )
         recipe = from_wire(params["recipe"], domain.CaptureRecipe)
         output = from_wire(params["output"], domain.OutputSpec)
-        domain.validate_capture_recipe(recipe, self._preview_material)
+        domain.validate_capture_recipe(
+            recipe,
+            self._preview_material,
+            supported_multisample_passes=(
+                None
+                if self._opened_capabilities is None
+                else tuple(self._opened_capabilities.supported_multisample_passes)
+            ),
+        )
 
         requested_job_id = params.get("jobId")
         if "jobId" not in params:
