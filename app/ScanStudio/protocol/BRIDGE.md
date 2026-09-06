@@ -1,6 +1,10 @@
 # Scan Studio Bridge Protocol v1
 
-Contract between the external `scanstudio-bridge` sidecar (GPL-3.0, wraps CoolscanPy, lives outside this repo) and its client (Phase 9's `RealLs5000` backend). This is a second, independent NDJSON-over-stdio boundary that mirrors PROTOCOL.md's style — it is not an extension of PROTOCOL.md and the two protocols never share a wire connection. No GPL code exists in this repo; this file is the wire contract only, read by anyone implementing either side without opening a bridge source file.
+Contract between the GPL-3.0-only [`scanstudio-bridge`](../../../bridge/README.md)
+service and the Rust engine’s real LS-5000 backend. The bridge and CoolscanPy
+source are included in this repository and in the packaged app’s corresponding
+source. This is a separate NDJSON-over-stdio boundary from PROTOCOL.md; the
+app/engine and engine/bridge protocols do not share a wire connection.
 
 ## Transport
 
@@ -16,7 +20,7 @@ Contract between the external `scanstudio-bridge` sidecar (GPL-3.0, wraps Coolsc
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `DEVICE_NOT_FOUND`, `DEVICE_BUSY`, `NO_PREVIEW`, `UNKNOWN_JOB`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED`, `ADAPTER_UNSUPPORTED`, `FINGERPRINT_REFUSED`, `MANUAL_REVIEW_REQUIRED`, `REFEED_REQUIRED`, `FILM_FEED_INTERRUPTED`, `ROLL_MISMATCH`, `TRANSPORT_SMEAR_DETECTED`, `GEOMETRY_VALIDATION_ERROR`, `SPLIT_ALIGNMENT_ERROR`, `BATCH_INTEGRITY_ERROR`, `NOT_IMPLEMENTED`, `INTERNAL` — 24 total.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `DEVICE_NOT_FOUND`, `DEVICE_BUSY`, `NO_PREVIEW`, `UNKNOWN_JOB`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED`, `ADAPTER_UNSUPPORTED`, `FINGERPRINT_REFUSED`, `MANUAL_REVIEW_REQUIRED`, `REFEED_REQUIRED`, `FILM_FEED_INTERRUPTED`, `ROLL_MISMATCH`, `TRANSPORT_SMEAR_DETECTED`, `GEOMETRY_VALIDATION_ERROR`, `SPLIT_ALIGNMENT_ERROR`, `BATCH_INTEGRITY_ERROR`, `METER_UNUSABLE`, `METER_CONTROLLER_REFUSED`, `NOT_IMPLEMENTED`, `INTERNAL`.
 
 `recoverable` is `true` only for `HARDWARE_LANE_BUSY`: retrying the identical request once the lane frees can succeed with no other action. Every other code needs a *different* action first — re-arm the latch, call `roll.approve`, physically refeed the strip, power-cycle the transport — so every other code is `recoverable: false`.
 
@@ -38,6 +42,8 @@ Contract between the external `scanstudio-bridge` sidecar (GPL-3.0, wraps Coolsc
 | `GeometryValidationError` | `GEOMETRY_VALIDATION_ERROR` |
 | `SplitAlignmentError` | `SPLIT_ALIGNMENT_ERROR` |
 | `BatchIntegrityError` | `BATCH_INTEGRITY_ERROR` |
+| `MeterUnusableError` | `METER_UNUSABLE` |
+| `MeterControllerRefused` | `METER_CONTROLLER_REFUSED` |
 | `NotImplementedError` | `NOT_IMPLEMENTED` |
 
 ## Methods
@@ -135,7 +141,13 @@ The engine may supply a private, job-owned `output` route when the user has elec
 
 ### `scan.stop`
 
-Stops **between transfers** only (mirrors CoolscanPy's `Roll.safe_stop()`): the in-flight slot always finishes and is reported via `scan.frameCompleted`, the next slot is skipped, no other slots are attempted. There is no `"immediate"` mode — no safe immediate abort exists against real hardware (see "Differences from PROTOCOL.md"). `acknowledged: false` if the job already reached a terminal state.
+Requests a stop **between transfers**. An in-flight slot is allowed to finish
+and is reported via `scan.frameCompleted` if successful; later slots are skipped.
+An acknowledged Stop before worker startup or batch reservation remains latched
+and can finish the job without starting a frame. Driver reservation and retry
+must not erase it. Wait for `scan.completed`; acknowledgement alone is not proof
+that the scanner is idle. There is no `"immediate"` mode. A terminal job returns
+`acknowledged: false`.
 
 ### `device.eject` (MOTION-CAPABLE)
 
@@ -143,7 +155,7 @@ Returns `HARDWARE_LANE_BUSY` while a scan job holds the lane — mirrors PROTOCO
 
 **`{}` means confirmed ejected, never anything less (2026-07-26).** A transport that reports the film did not come out, a capability-gated no-op, or any accepted-without-progress outcome surfaces as a typed error, never as `{}`. This rule exists because an LS-5000 can acknowledge an eject command while the parked mechanism does not actuate.
 
-- `EJECT_FAILED` — the direct-USB unload could not run, returned an unconfirmed result, or the post-unload presence check did not prove the film clear. Eject does not require SANE or `scanimage`. The typed error preserves the underlying refusal; callers must not infer success or auto-retry it.
+- `EJECT_FAILED` — the direct-USB unload could not run, returned an unconfirmed result, or the post-unload presence check did not prove the film clear. Eject does not require SANE or `scanimage`. The driver performs that confirmation; the bridge uses its confirmed result without a second presence probe. The typed error preserves the underlying refusal; callers must not infer success or auto-retry it.
 - `FEEDER_PARKED` — the typed stalled outcome: the driver's traced eject reported accepted-without-confirmed-clear (CoolscanPy `FeederParked`). The film state is unknown-but-likely-inside, the session is left untouched, and a power cycle is the only demonstrated recovery. A client must NEVER auto-retry this (or any) eject outcome — retry decisions belong to the operator at the machine.
 
 SANE remains a host/runtime requirement on lanes that use it for discovery,

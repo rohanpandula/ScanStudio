@@ -1,178 +1,190 @@
-# ScanStudio
+# ScanStudio for macOS
 
-ScanStudio is an Apple Silicon (M-series, arm64) macOS 14+ app for scanning 35 mm film with a Nikon Coolscan
-LS-5000. It keeps the scan workflow in one place: identify the film that is
-loaded, preview the roll, select frames, choose the capture settings, scan,
-and stop safely when needed.
+ScanStudio is a SwiftUI film-scanning app for **Apple Silicon (M-series,
+arm64), macOS 14 (Sonoma) or newer**. Its supported hardware workflow is
+LS-5000 C-41 color-roll scanning in Beta. This guide covers source builds;
+use the [install and scan guide](../../README.md) for the packaged app and
+[GitHub Releases](https://github.com/rohanpandula/ScanStudio/releases) for
+published downloads.
 
-Developer runs without a hardware bridge offer a clearly labeled
-**SIMULATED** LS-5000 for exploring the interface safely. The release DMG
-already includes the CoolscanPy bridge and its direct-USB runtime; source
-builds can instead configure a separate compatible bridge. The app never
-presents the simulator as hardware.
+## Run from source
 
-Apple Silicon support is Beta. Intel Macs, Windows, and Linux are retired;
-see [NegPy downloads](https://github.com/marcinz606/NegPy/releases) and its
-[setup and compatibility documentation](https://github.com/marcinz606/NegPy#readme)
-for alternatives, subject to upstream device and OS support. Real scanning has
-been tested on one Apple Silicon Mac and one LS-5000 setup. Treat
-each real scan as a new operation: confirm the detected carrier and the
-preview before starting capture. Real black-and-white fine scanning remains
-blocked rather than pretending that infrared dust removal is available for
-film where it is not appropriate.
-
-See the [hardware evidence matrix](../../docs/HARDWARE-SUPPORT.md) for the
-separate package, enumeration, preview, and capture results.
-[Mac acceptance and recovery](../../docs/MAC-ACCEPTANCE.md) documents the
-packaged software gate separately from attended hardware checks.
-
-## Use the app
-
-1. **Choose a device.** Connect the simulator for a safe walkthrough, or
-   connect the LS-5000 reported by the bridge.
-2. **Preview the roll.** The app detects the loaded carrier when the scanner
-   reports it, then obtains a preview and a contact sheet. The simulator uses
-   generated previews and labels them accordingly.
-3. **Select the frames to capture.** Choose one or more tiles, review their
-   preview, and adjust orientation, mirroring, crop, or alignment where those
-   controls are available. Rotation and mirroring are saved into the finished
-   Positive/Preview files; the archival Master TIFF and its RGB, IR, and meter
-   capture layers remain untouched. On an already-saved project, a new
-   transform remains a session draft until the next scan starts; existing
-   files are never silently rewritten.
-4. **Set up the scan.** Choose negative or positive handling, film stock,
-   recipe, output formats, naming, and destination. Keep the archival master
-   TIFF, positive TIFF, positive JPEG, or any combination, but retain at
-   least one output. Without a retained master, real capture uses a private
-   temporary workspace only while derivatives render and keeps it only if
-   recovery is needed.
-5. **Scan or stop.** Start the selected frames and follow the in-app progress.
-   The Stop button asks the current frame to finish safely, then prevents the
-   next frame from starting. Eject stays unavailable during active capture.
-
-**Scanner preview, capture, and exports are different stages.** The scanner
-preview establishes frame placement; Capture acquires the selected frames;
-Positive and generated Preview files are processed derivatives of that capture.
-Settings apply to **future scans**. Recipe, color, and output changes do not
-reprocess saved exports or provide a live color proof in the scanner preview.
-
-When a master is retained, a Full Capture Package keeps the master image together with
-the available capture context: per-frame effective settings, receipts,
-checksums, and optional infrared or meter material. Attempt journals are
-included only when the bridge supplies exact journal roots.
-
-For a plain-language guide to the Nikon Scan, Noritsu Lab, and Flextight
-color choices, see [COLOR.md](COLOR.md).
-
-## Architecture
-
-```
-ScanStudio (SwiftUI app)  <-- NDJSON over stdin/stdout -->  scanstudio-engine (Rust subprocess)
-```
-
-- The SwiftUI app (`Sources/ScanStudio`) spawns `scanstudio-engine` as a
-  child process and talks to it exclusively over stdin/stdout, one JSON object
-  per line (NDJSON). It is a projection of the state and capabilities the
-  engine reports.
-- `ScanStudioKit` (`Sources/ScanStudioKit`) contains the wire protocol,
-  engine location and client plumbing, and the observable session state used
-  by the UI.
-- The Rust engine (`engine/`) owns scanner/session state and is the sole
-  implementation of the wire contract.
-- The contract, fixtures, and state machines are documented in
-  [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md). The bridge boundary is
-  documented in [`protocol/BRIDGE.md`](protocol/BRIDGE.md).
-
-## Prerequisites
-
-- Apple Silicon (M-series) Mac running macOS 14 or newer
-- Xcode / Swift toolchain (Swift 6, macOS 14+ SDK)
-- Rust via Homebrew (`brew install rust`), or any `cargo` on `PATH`
-
-## Build, run, test
+Use an Apple Silicon Mac with Swift 6 and the macOS SDK, plus Rust Cargo on
+`PATH`. From the **repository root**:
 
 ```sh
-make run     # builds the engine (release) and launches the app
-make test    # runs both suites: cargo test (engine) + swift test (app)
-make smoke   # scripted end-to-end NDJSON session against the release binary
-make app     # swift build only
-make engine  # cargo build --release only
-make clean   # removes build artifacts for both the engine and the app
+make -C app/ScanStudio run
 ```
 
-`make run` sets `SCANSTUDIO_ENGINE_PATH` to the freshly built release binary.
-Without that variable, `EngineLocator` searches the engine build locations
-relative to the package root and reports a clear in-app error if it cannot
-find one.
-
-### Manual run
+This builds the release engine, sets `SCANSTUDIO_ENGINE_PATH`, and launches
+the SwiftUI app. Without a hardware bridge, choose the clearly labeled
+**SIMULATED** LS-5000 for a software walkthrough. To shorten simulated delays:
 
 ```sh
-SCANSTUDIO_ENGINE_PATH="$(pwd)/engine/target/release/scanstudio-engine" swift run ScanStudio
+SCANSTUDIO_TIMESCALE=0.05 make -C app/ScanStudio run
 ```
 
-### Speeding up the simulator for demos
-
-Set `SCANSTUDIO_TIMESCALE` (default `1.0`) to multiply simulated delays. For
-example, `SCANSTUDIO_TIMESCALE=0.05 make run` provides a fast walkthrough.
-
-## Real hardware: LS-5000 through the CoolscanPy bridge
-
-The real-device backend speaks the NDJSON contract in
-[`protocol/BRIDGE.md`](protocol/BRIDGE.md) to `scanstudio-bridge`, the
-GPL-3.0-only CoolscanPy helper. `make package` includes that helper, a
-relocatable CPython 3.13 runtime, production Python dependencies (including
-`python-sane` 2.9.2 built from its exact locked sdist), a signed app-owned
-libusb built from pinned source for the app's macOS 14 deployment target, and
-visible license/source material inside `ScanStudio.app`. The python-sane C
-extension is compiled against a private, source-pinned SANE 1.4.0 link SDK;
-the packager proves the SDK-only Mach-O identity before rewriting it to the
-architecture's canonical host `libsane.1.dylib` path. The private SDK and SANE
-runtime are never shipped. The app also does not include Nikon software.
-
-The package launcher resolves a bridge in this order: `SCANSTUDIO_BRIDGE_CMD`,
-the user bridge-command file, the bundled helper, then `PATH`. Set
-`SCANSTUDIO_BRIDGE_CMD` to use a different compatible bridge:
+The default timescale is `1.0`. From **app/ScanStudio**, after building the
+engine, the equivalent manual launch is:
 
 ```sh
-SCANSTUDIO_BRIDGE_CMD=/path/to/scanstudio-bridge make run
+SCANSTUDIO_ENGINE_PATH="$PWD/engine/target/release/scanstudio-engine" swift run ScanStudio
 ```
 
-- **Unset or empty:** only the labeled simulator is available.
-- **Working bridge:** the real scanner is offered for connection; while real
-  hardware is available, the simulator is hidden from device choice.
-- **Broken or incompatible bridge:** the engine reports the startup problem
-  and remains simulator-only; it does not create a half-connected device.
+## Test and build scopes
 
-When the packaged launcher selects any working bridge, it automatically
-prepares that app session for film movement. Launch itself performs no scanner
-operation; only explicit Preview, Scan, and Eject actions can move film. Direct
-bridge and developer launches still need to provide the two-part authorization
-described in `protocol/BRIDGE.md`.
+Bridge and driver tests also need `uv` and Python 3.13+. All commands below
+run from the **repository root**:
 
-The supported color-roll path does not require SANE. On a clean Mac, device
-discovery and connection fall back to the app-owned direct-USB route;
-film-status checks, whole-roll preview, and color fine scanning use direct USB
-and the exact signed libusb copy inside the app. A recipient does not need
-Homebrew, SANE, or a Nikon driver for that workflow. If a working host SANE
-installation already exists, discovery may use it, but capture remains direct
-USB. The bridge still includes `python-sane` for its separate plain-scan path;
-that optional path needs a compatible system SANE backend (`brew install
-sane-backends` on the tested Apple Silicon setup). Eject replays the traced
-Unload sequence over direct USB and confirms film absence; it needs neither
-SANE nor `scanimage`. If an unavailable optional path is requested, it fails
-rather than pretending it succeeded; it does not turn a real scanner into the
-simulator.
+```sh
+make test                       # Swift + Rust + bridge + CoolscanPy suites
+make -C app/ScanStudio test      # Swift and Rust only
+make -C app/ScanStudio smoke     # scripted simulator NDJSON session
+make -C app/ScanStudio app       # Swift build only
+make -C app/ScanStudio engine    # cargo build --release only
+make bridge-test                # locked bridge sync, then pytest
+make coolscanpy-test             # driver pytest
+make -C app/ScanStudio launcher-check
+```
 
-Release and CI packaging do not install Homebrew SANE as a build input. Use
-`make sane-link-sdk` only to inspect the create-only private SDK generated from
-the exact sane-backends 1.4.0 archive (SHA-256
-`f99205c903dfe2fb8990f0c531232c9a00ec9c2c66ac7cb0ce50b4af9f407a72`).
-`make package` performs the same source build in private staging, compiles the
-exact python-sane 2.9.2 sdist from the bridge lock, and rejects mismatched
-architecture, macOS 14 minimum, ABI, RPATHs, build paths, extra extensions,
-or accidental SDK/runtime files before signing.
+There is no root `run` target. Root `make test` covers all four components,
+but does not replace the packaging, macOS 14, policy, and updater release gates.
+`make -C app/ScanStudio clean` removes both engine and Swift build artifacts.
 
-The device bar identifies a connected real device as `real` and the simulator
-as `simulated`. Selecting a device is separate from confirming that film is
-present and previewed.
+## Connect real hardware in a source run
+
+From the repository root:
+
+```sh
+make bridge-sync
+SCANSTUDIO_BRIDGE_CMD="$PWD/bridge/.venv/bin/scanstudio-bridge" make -C app/ScanStudio run
+```
+
+Developer sessions must also satisfy the two-part hardware authorization in
+[BRIDGE.md](protocol/BRIDGE.md) before motion. For the normal attended workflow,
+use the packaged app and follow [Mac acceptance and recovery](../../docs/MAC-ACCEPTANCE.md).
+
+The packaged launcher resolves the bridge in this order: `SCANSTUDIO_BRIDGE_CMD`,
+`~/Library/Application Support/ScanStudio/bridge-command`, bundled helper,
+then `PATH`. It prepares session authorization; launch itself does not move
+film. Preview, Scan, and Eject are explicit operations with readiness and
+approval checks. A working bridge offers real hardware and hides the simulator
+when hardware is available. A broken bridge reports its startup error and
+leaves the simulator labeled; failed hardware operations never become
+simulated successes.
+
+## Build a local app or DMG
+
+Packaging requires native arm64 macOS; Intel/Rosetta and other architecture
+requests are rejected. Match CI with Rust **1.97.1**, **uv 0.11.30**, and
+relocatable managed **CPython 3.13.14, build 20260718**. See the
+[pinned installer](../../scripts/install_pinned_uv_python.py) and its
+[CI bootstrap sequence](../../.github/workflows/ci.yml). A Homebrew/framework
+Python is not a relocatable package runtime.
+
+With those tools available, run this **from the repository root**:
+
+```sh
+export UV_PYTHON=3.13.14
+export UV_PYTHON_PREFERENCE=only-managed
+export UV_PYTHON_CPYTHON_BUILD=20260718
+(cd bridge && uv sync --locked --no-dev --no-install-package python-sane)
+make -C app/ScanStudio package
+```
+
+This follows CI's dependency path. It creates
+`app/ScanStudio/.build/ScanStudio.app` and runs the relocated bridge and
+simulator acceptance checks. These commands rerun the existing app's gate or
+build a version-stamped local DMG:
+
+```sh
+make -C app/ScanStudio package-check
+SCANSTUDIO_RELEASE_VERSION=0.7.0-beta.15 make -C app/ScanStudio dmg
+```
+
+`dmg` rebuilds/checks the app, creates
+`app/ScanStudio/.build/ScanStudio-0.7.0-beta.15-macOS-arm64.dmg`, mounts it
+read-only, and checks the app inside. It refuses an existing DMG at that path.
+Local builds default to an ad-hoc app signature; these commands do not notarize
+or publish a release. The [release workflow](../../.github/workflows/release.yml)
+signs, notarizes, and staples both app and DMG after its exact-tag, same-run
+gates. See [release policy](../../docs/releases/README.md).
+
+Root `make package` and `make dmg` first run `bridge-sync-scanner`, asking uv
+to install the scanner extra. The app-directory path above instead lets the
+packager compile locked python-sane 2.9.2 against a private, pinned SANE 1.4.0
+link SDK, without host SANE as a build input. Neither that SDK nor a SANE
+runtime ships. For standalone SDK inspection, use
+`make -C app/ScanStudio sane-link-sdk` (create-only output).
+
+The app bundles its own signed libusb. LS-5000 color-roll status, preview,
+capture, and eject use direct USB; discovery/connection fall back to direct
+USB without SANE. Only the legacy plain-scan path needs a compatible host SANE
+backend. Eject confirms film absence without SANE or `scanimage`.
+
+## Scan, inspect saved files, and recover
+
+Create or open a roll, explicitly preview the film, review frame placement,
+choose outputs and a writable destination, then scan. A saved project does not
+establish physical registration. Recovered/manual boundaries need approval.
+
+Scanner preview locates frames; capture reads them at scan resolution.
+Positive TIFF/JPEG and generated Preview files are processed exports, separate
+from the optional archival Master TIFF. Settings apply to **future scans**:
+recipe, crop, color, and output changes do not rewrite saved files or update
+scanner previews. Rotation/mirroring affect processed exports, leaving the
+Master and its RGB/infrared/meter capture material untouched. Project edits
+can remain drafts until the next scan starts.
+
+Retain a Master TIFF, positive TIFF/JPEG, or both. With no retained master,
+capture uses temporary storage during rendering and preserves it if recovery
+is needed. Optional raw exports include Linear DNG and linear TIFF with
+infrared options. A **Full Capture Package** adds available settings, receipts,
+checksums, and evidence to the master; attempt journals require exact reported
+roots. See [COLOR.md](COLOR.md) for rendering choices.
+
+In **Saved roll**, use **Show Roll Folder in Finder** or **Frame N Saved Files**
+to reveal recorded outputs. Missing files are reported explicitly. Completion
+counts follow receipts; inspect saved images too.
+
+For hardware, choose **Stop after frame**; in the simulator, **Pause after
+frame**. Wait for the batch to stop and preserve files, receipts, and journals.
+Early Stop remains latched through batch setup; eject is unavailable during
+capture. Save failure details with **Save Diagnostic Bundle…**.
+
+Reopen the same roll when safe, follow any refeed instruction, and obtain a
+fresh preview after stopping. Resolve readiness/attendance prompts, then use
+**Resume Batch (N remaining)**. It requires a successful current pending-frame
+read and omits completed/excluded frames. Reconnection alone cannot restore
+film position or authorize a stale selection. Follow the
+[recovery procedure](../../docs/MAC-ACCEPTANCE.md) instead of restarting the
+whole roll or deleting receipts.
+
+Final attended full-roll hardware acceptance for beta.15 is **NOT RUN**. Simulator
+acceptance covers stop, reopen, process interruption, destination refusal,
+resume, and saved-file integrity; it cannot prove physical image quality or
+transport. The [hardware matrix](../../docs/HARDWARE-SUPPORT.md) distinguishes
+LS-5000 evidence from recognition/probing of unsupported models. Real B&W
+fine scanning remains blocked; infrared ICE is unsuitable for silver B&W film.
+
+## Contracts, platforms, and licenses
+
+```text
+SwiftUI app → scanstudio-engine (Rust) → scanstudio-bridge (Python) → CoolscanPy → scanner
+```
+
+The app/engine and engine/bridge each use a separate NDJSON stdin/stdout
+connection. The engine owns scanner/session state; `Sources/ScanStudioKit`
+contains app wire types, client plumbing, and observable state. See
+[PROTOCOL.md](protocol/PROTOCOL.md) and [BRIDGE.md](protocol/BRIDGE.md).
+
+Intel Macs, Windows, and Linux are retired. Consult [NegPy downloads](https://github.com/marcinz606/NegPy/releases)
+and [upstream compatibility guidance](https://github.com/marcinz606/NegPy#readme)
+for those platforms. nkscan is a documentation-only cleanroom reference;
+no implementation code or profiles are copied.
+
+The app/engine are MIT; the separate bridge and CoolscanPy are GPL-3.0-only.
+Packaged apps are mixed-license distributions. Preserve
+`Contents/Resources/Licenses` and `Contents/Resources/CorrespondingSource`,
+including dependency notices and rebuild material. See
+[third-party notices](../../THIRD_PARTY_NOTICES.md).

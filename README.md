@@ -2,166 +2,127 @@
 
 <img src="assets/scanstudio-app-icon.png" alt="ScanStudio app icon" width="128" height="128">
 
-<img src="assets/scanstudio-ls5000-offline.jpeg" alt="ScanStudio running on macOS with an LS-5000 ED offered by the bridge as a Connect target. No scanner is selected, the status is OFFLINE, the simulator is absent, and no media or preview data is shown." width="1000">
+ScanStudio is a free, open-source film-scanning app for **Apple Silicon
+(M-series, arm64) Macs running macOS 14 (Sonoma) or newer**. Its supported
+Beta workflow is C-41 color-roll scanning with the Nikon SUPER COOLSCAN 5000 ED
+(LS-5000): preview the film, choose frames, scan, and review saved images.
 
-ScanStudio is a free, open-source film-scanning app for Nikon Coolscan
-scanners on Apple Silicon (M-series) Macs, built first around the SUPER COOLSCAN 5000 ED (LS-5000). It covers
-the practical Nikon Scan workflow on macOS 14 (Sonoma) or newer: identify the loaded
-holder, preview the film, choose frames, set the recipe and outputs, scan, and
-stop safely when needed. When detection cannot find your frames, it works with
-you -- an automatic wider retry, a plain-English explanation of what the film
-measures, and full manual frame placement -- instead of just refusing.
+## Install and start
 
-The screenshot above is the installed app with an LS-5000 ED detected through
-the bridge and offered as a Connect target: not connected, status OFFLINE,
-simulator absent, no media or preview shown.
+1. Open [GitHub Releases](https://github.com/rohanpandula/ScanStudio/releases)
+   and choose a published Apple Silicon Beta:
+   `ScanStudio-<version>-macOS-arm64.dmg`.
+2. Open the DMG, copy **ScanStudio** to **Applications**, and launch it.
+3. Connect your LS-5000 over USB and select the real scanner in the app.
+   Being listed is discovery evidence; a successful connection and preview
+   are separate steps.
 
-## Scanner compatibility
+The release workflow Developer ID-signs, notarizes, and staples both the app
+and DMG. The app includes the hardware bridge, Python runtime, libusb, license
+notices, and corresponding GPL source. The supported color-roll workflow and
+software eject use direct USB: no Homebrew, SANE, or Nikon driver is required.
+The separate legacy plain-scan path needs a compatible system SANE backend;
+SANE may also be used for discovery when available.
 
-| Scanner | Connection | Status today |
-| --- | --- | --- |
-| SUPER COOLSCAN 5000 ED (LS-5000) | USB | Full workflow. Real-film validated on Apple Silicon macOS (Beta). |
-| Coolscan IV ED (LS-40) / Coolscan V ED (LS-50) | USB | Detected and named, not yet driven. Triage in [#27](https://github.com/rohanpandula/ScanStudio/issues/27). |
-| LS-4000 ED, LS-8000 ED, SUPER COOLSCAN 9000 ED | FireWire | Discovery, identity, and a motion-free probe on modern macOS through the [ASFireWire](https://github.com/mrmidi/ASFireWire) driver. Scanning is not wired up yet; probe output from real hardware is what unlocks it -- see [#28](https://github.com/rohanpandula/ScanStudio/issues/28) and the driver's [FIREWIRE.md](coolscanpy/FIREWIRE.md). |
+Intel Macs, Windows, and Linux are **retired ScanStudio platforms**, with no
+current builds, updates, or port support. NegPy offers an independent
+nkscan-backed Coolscan workflow. Consult [NegPy downloads](https://github.com/marcinz606/NegPy/releases)
+and [upstream setup and compatibility guidance](https://github.com/marcinz606/NegPy#readme)
+for those systems. Check your scanner, holder, and OS against upstream guidance;
+a download alone is not proof of compatibility. Older ScanStudio assets retain
+only the support and evidence recorded at their release dates.
 
-Real scanning has been validated end-to-end on one Apple Silicon Mac and one
-LS-5000. Treat everything else as narrow results rather than a promise for
-every scanner, adapter, computer, or film holder. The hardware bridge can move
-film, so stay nearby and supervise any real job. The canonical [hardware and
-platform evidence matrix](docs/HARDWARE-SUPPORT.md) separates package,
-enumeration, preview, and capture evidence. Reports from setups unlike the
-tested one are the most useful thing you can send.
+<img src="assets/scanstudio-ls5000-offline.jpeg" alt="ScanStudio on macOS with an LS-5000 offered as a Connect target; status OFFLINE, no scanner selected, no simulator or preview shown." width="1000">
 
-## Platform support
+## Scan and find your images
 
-ScanStudio is **Apple Silicon only** (M-series, arm64), on **macOS 14
-(Sonoma) or newer**. The LS-5000 color-roll workflow is Beta, with real-film
-evidence from one Apple Silicon Mac and one scanner configuration.
+1. **Create or open a roll** and choose a writable save folder with enough free
+   space for the selected frames and formats. Confirm the real device and holder.
+2. **Preview** the film. Check frame count, order, and boundaries before capture.
+   Detection can retry with wider limits and offer manual placement; recovered
+   or manually placed frames require your approval. Panoramic frames beyond
+   the 38.7 mm single-pass capture window are refused rather than cropped.
+3. **Choose frames and outputs.** Set the film stock, recipe, orientation,
+   naming, and resolution. Retain a Master TIFF, positive TIFF/JPEG, or both.
+   Optional raw negative exports include Linear DNG and linear TIFF with infrared options.
+4. **Scan** and stay nearby while film moves. Follow the app's progress and any
+   readiness or review prompts.
+5. **Review saved files.** In the inspector's **Saved roll** section, use
+   **Show Roll Folder in Finder** or **Frame N Saved Files** to reveal a
+   recorded output. Missing or moved files are reported explicitly. Completion
+   counts follow saved receipts; inspect the images as well as the count.
 
-Intel Macs, Windows, and Linux are retired ScanStudio platforms: no current
-builds, downloads, updates, or ongoing port support. For those systems, see
-[NegPy downloads](https://github.com/marcinz606/NegPy/releases) and the
-[upstream setup and compatibility documentation](https://github.com/marcinz606/NegPy#readme).
-NegPy's [0.55.0 release notes](https://github.com/marcinz606/NegPy/releases/tag/0.55.0)
-introduced Nikon Coolscan scanning through nkscan. As checked on 2026-09-06,
-[NegPy 0.57.0](https://github.com/marcinz606/NegPy/releases/tag/0.57.0) provides
-Intel and Apple Silicon DMGs, a Windows installer, and a Linux AppImage.
-Available downloads do not establish compatibility with your scanner, holder,
-or OS; follow upstream guidance for your setup.
+Scanner preview establishes frame placement. Capture reads the selected film
+at scan resolution. Positive TIFF/JPEG and generated Preview files are
+processed exports; the optional Master TIFF retains the archival capture.
+Settings apply to **future scans**: changing a recipe, color style, or crop
+does not rewrite existing files or make the scanner preview a live color proof.
+Keep a master if you will need it for later rendering work.
 
-Older ScanStudio assets and [release notes](docs/releases/README.md) preserve
-the platforms and evidence from their release dates. They are historical
-records, not the current support promise.
+The optional **Full Capture Package** adds available settings, receipts,
+checksums, and capture evidence alongside the master. Missing evidence is
+identified; capture files are not rewritten. See the [app guide](app/ScanStudio/README.md)
+and [color guide](app/ScanStudio/COLOR.md) for output and rendering details.
 
-## Download
+## Stop and recover
 
-Get the **Apple Silicon (M-series) Beta** from
-[GitHub Releases](https://github.com/rohanpandula/ScanStudio/releases):
-`ScanStudio-<version>-macOS-arm64.dmg`. Choose this arm64 DMG; older Intel,
-Windows, and Linux assets are historical only.
+- Press **Stop after frame** once and wait for the current frame to finish
+  safely and the batch to report stopped. Eject is unavailable during capture.
+- Preserve the saved roll, completed images, receipts, and attempt journals.
+  For a failure or lost connection, save the technical details or choose
+  **Save Diagnostic Bundle…** before following the app's recovery instructions.
+- Reopen the same roll when safe. A stopped batch needs a fresh preview;
+  refeed first if the app reports shifted or interrupted film. Reconnection
+  alone does not restore film position.
+- Resolve the current readiness and approval prompts, then use **Resume Batch
+  (N remaining)** when enabled. It reads pending frames from the saved project
+  and omits completed and excluded frames. Resolve a disabled action's reason
+  instead of restarting the whole roll or deleting receipts.
 
-Current release DMGs are Developer ID signed, notarized, and stapled. The
-updater uses the arm64 feed entry and verifies the download and publisher
-identity; release provenance must bind the assets to the same run and exact
-tag. See [update verification](docs/AUTO-UPDATE.md). There is no release-schedule
-promise.
+Launching the app does not move film. Preview, Scan, and Eject are explicit
+physical operations. Follow [Mac acceptance and recovery](docs/MAC-ACCEPTANCE.md)
+for attended operation, diagnostics, and the final full-roll acceptance record.
+Simulator stop/reopen/interruption/resume checks do not prove real transport,
+focus, framing, color, or dust-removal quality.
 
-A release DMG contains the app, the GPL hardware bridge and CoolscanPy source
-required for redistribution, and the applicable dependency notices. The
-supported LS-5000 color-roll workflow uses the signed libusb copy inside the
-app, so installing ScanStudio does not require Homebrew, SANE, or a Nikon
-driver. Software eject is likewise direct over USB (the traced unload
-sequence, with typed failures and presence confirmation) and needs no SANE.
-Only the legacy plain-scan path still requires a system SANE backend, which
-also remains how SANE-based discovery lists scanners.
+## Scanner support
 
-For scripting, or for running the FireWire probe without the app, the bundled
-driver is also published on its own:
-[`pip install coolscanpy`](https://pypi.org/project/coolscanpy/). Every
-ScanStudio release ships in lockstep with the matching coolscanpy release --
-the pipeline refuses to build until the exact bundled driver is on PyPI -- so
-the app and the package always carry the same driver code.
+| Scanner | Current scope |
+| --- | --- |
+| LS-5000 / SUPER COOLSCAN 5000 ED, USB | C-41 color-roll workflow in Beta; retained real preview/capture evidence from one Apple Silicon Mac and one scanner configuration. |
+| LS-40 / Coolscan IV ED and LS-50 / Coolscan V ED, USB | Identity recognition only; unsupported for scanning. |
+| LS-4000, LS-8000, LS-9000, FireWire | Discovery and a motion-free driver probe through ASFireWire; unsupported for scanning. See [FireWire guidance](coolscanpy/FIREWIRE.md). |
 
-## What it does
+The [hardware evidence matrix](docs/HARDWARE-SUPPORT.md) separates package,
+discovery, preview, and capture results. Final attended full-roll hardware
+acceptance for beta.15 is **NOT RUN**. Real black-and-white fine scanning
+remains blocked; infrared ICE is unsuitable for traditional silver B&W film.
+The clearly labeled simulator is for software exploration, not hardware evidence.
 
-- Detects the reported carrier and media when the scanner can provide them, keeping simulator and real hardware visibly distinct.
-- Previews the roll or strip, presents a contact sheet, and supports selected-frame or batch scanning with a Stop control.
-- When frame detection fails, retries with wider limits, explains in plain English what the film actually measures (half-frame, narrow gaps, fogged or dense base, blocked film window), and offers manual frame placement -- dragged boundaries flow through the same physical checks as automatic detection, and anything recovered or hand-placed always requires your approval before scanning.
-- Keeps scan settings, film stock, recipes, camera and lens metadata, naming, and save location together.
-- Writes positive TIFF or JPEG outputs, an optional high-bit-depth master TIFF for archival work, and optional raw negative exports: a Linear DNG (one file, untouched 16-bit negative, infrared dust plane embedded as a marked sub-image) or a linear TIFF with the infrared plane as a fourth channel, a sidecar file, or omitted.
-- Renders C-41 color through named styles: **Nikon Scan** (the default -- with matching builder inputs its output replays Nikon's own rendering byte-for-byte) plus experimental alternates (a gentler Noritsu-style look and a Flextight-style look). Styles only change the positive rendering; the archival scan is never touched.
-- Uses Digital ICE only where a suitable infrared channel is available. For traditional silver black-and-white film, infrared ICE stays disabled and software dust cleanup is a separate option.
-- Records receipts -- including authoritative per-frame timing -- so a finished scan can be reviewed after the job completes.
+## Develop and report problems
 
-## Preview, capture, and processed exports
+See [build, test, and packaging instructions](app/ScanStudio/README.md) and
+[release notes and policy](docs/releases/README.md). CoolscanPy is also available for
+scripting as `pip install coolscanpy`; see its [driver guide](coolscanpy/README.md).
+The release pipeline checks the bundled driver against the authenticated PyPI
+source, allowing only explicitly reviewed, hash-pinned differences.
 
-**Scanner preview** reads the film for a contact sheet and frame registration;
-it is not the finished positive. **Capture** acquires the selected frames at
-scan resolution. **Processed exports** render positive TIFF/JPEG files from
-that capture using the job's recipe; an optional Master TIFF remains separate.
-A generated Preview file is a rendered derivative, distinct from the scanner
-preview used to place frames.
+Report problems in [GitHub Issues](https://github.com/rohanpandula/ScanStudio/issues)
+with the app version, Mac/macOS, scanner/holder, failed step, and typed error.
+Review diagnostic bundles before sharing; keep film images, private paths,
+serial numbers, and raw capture journals out of public reports.
 
-Settings apply to **future scans**. Changing a recipe, color style, or output
-setting does not reprocess existing exports or turn the scanner preview into
-a live proof of the finished image. Review the saved outputs after capture.
+## Licenses and references
 
-## What is a Coolscan?
+The app, engine, and documentation are MIT unless a file says otherwise.
+The separate `scanstudio-bridge` process and CoolscanPy are **GPL-3.0-only**.
+A bundle containing them is a mixed-license distribution: preserve its
+licenses, corresponding source, and dependency notices.
 
-A Coolscan is a dedicated film scanner. It reads a negative or slide directly
-instead of photographing it with a camera. The LS-5000 is older hardware, but
-its 4000 dpi film scans and infrared capability on many color films still make
-it useful. ScanStudio supplies a current workflow around that hardware; the
-compatibility table above is the honest statement of what is driven today.
+NegPy is independent upstream software. ScanStudio's nkscan references are
+**documentation-only cleanroom references** to identity and behavioral facts;
+no nkscan implementation code or profiles are copied. ASFireWire is likewise
+an interface reference, with no source vendored. See [third-party notices](THIRD_PARTY_NOTICES.md).
 
-## The 1:1 archive bundle
-
-ScanStudio can create an optional archive bundle for a completed frame. It is
-a record of the capture, not a substitute for the image. Depending on what the
-job actually produced, it can include the separate RGB master, conditional
-infrared and meter or prepass evidence, effective settings and alignment,
-engine and bridge receipts, bridge attempt journals only when their exact
-evidence root is reported, and a manifest with checksums.
-
-The bundle names missing evidence instead of inventing it. It does not replace
-or rewrite the capture files.
-
-## Safety and limits
-
-See [Mac acceptance and recovery](docs/MAC-ACCEPTANCE.md) for the packaged
-software gate and attended hardware checks. Simulator acceptance is not
-evidence of a successful real scan.
-
-- Preview establishes the current registration. Preview again after a refeed or ejection.
-- If Capture reports that the film shifted, physically refeed it and acquire a fresh preview; ScanStudio discards the old frame registration so it cannot be retried accidentally.
-- Confirm that the app identifies a real scanner before treating it as hardware. The built-in simulator is for safe workflow exploration only.
-- Keep physical film transport under supervision. Stop and inspect the scanner if the physical state is uncertain.
-- Opening ScanStudio does not move film. Only explicit Preview, Scan, and Eject actions can move film; developer bridge sessions require the documented hardware authorization.
-- Manual placement caps frames at the scanner's single-pass capture window (38.7 mm); panoramic frames refuse with an explanation instead of silently cropping.
-- Do not post scans, private paths, device serial numbers, or raw capture journals in a public issue.
-
-## Source and feedback
-
-Source: <https://github.com/rohanpandula/ScanStudio>
-
-Issues: <https://github.com/rohanpandula/ScanStudio/issues>
-
-## License boundary
-
-The ScanStudio app, engine, site, and documentation in this repository are
-offered under MIT unless a file says otherwise. Real scanner access uses a
-separate `scanstudio-bridge` program and its CoolscanPy dependency, both
-GPL-3.0-only. The bridge is not part of the MIT-only app boundary.
-
-Any distribution that includes the bridge must keep its GPL-3.0-only license,
-corresponding source, and applicable dependency notices with that
-distribution. Do not describe such a bundle as MIT-only.
-
-Third-party behavioral references (the nkscan identity facts and the
-ASFireWire interface facts) are documented in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); no source code from either
-project is vendored.
-
-ScanStudio is independent software. Nikon, Coolscan, SUPER COOLSCAN, Nikon
-Scan, and Digital ICE are trademarks or registered trademarks of their
-respective owners. No affiliation or endorsement is claimed.
+ScanStudio is not affiliated with Nikon. Nikon, Coolscan, SUPER COOLSCAN,
+Nikon Scan, and Digital ICE belong to their respective trademark owners.

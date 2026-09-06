@@ -12,10 +12,10 @@ level -- every other module stays hardware-library-free.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -105,93 +105,6 @@ from scanstudio_bridge.transport.output_reservation import (
 # absent" -- provenance reporting must never be able to hang bridge
 # startup.
 _GIT_HEAD_SHA_TIMEOUT_SECONDS = 5.0
-
-# `_require_vendor_eject_confirmed`'s settle-and-retry loop calls these two
-# module-level names instead of `time.sleep`/`time.monotonic` directly
-# (2026-08-13 adversarial review of PR #88, P2-5): a test that needs to
-# fake the clock swaps THESE names (`monkeypatch.setattr(<this module>,
-# "_sleep", ...)` / `"_monotonic"`), never the real stdlib `time` module.
-# Mutating the actual `time.sleep`/`time.monotonic` for a test's duration
-# would be process-visible to any other live thread in the same test run
-# (e.g. service.py's scan soft-timeout watchdog, which really does sleep
-# in real time), not just this one call.
-_sleep = time.sleep
-_monotonic = time.monotonic
-
-# LV-2 (2026-08-13 live validation, shortstrip-lab/live-attempts/
-# 20260813-beta8-linux-validation/RESULT.md +
-# vm-logs/eject-nopreview-194010.log): on a real LS-5000, a genuinely
-# successful vendor eject's confirmation probe (Device.film_present(), see
-# _require_vendor_eject_confirmed) can land inside the scanner's
-# post-motion UNIT ATTENTION drain (sense 063f04/062800 before it settles
-# to 023a00) and read back an indeterminate None -- not because the film
-# is still loaded, but because the drain hasn't cleared yet. Motion-free
-# probes ~15-20s later returned a definitive film_present=False.
-#
-# 2026-08-13 adversarial review of PR #88, P1-1: `Device.film_present()`
-# is not a cheap, instantaneous read. It calls coolscanpy's own
-# `coolscanpy.transport.adapter_status.probe_adapter_status()`, which
-# ALREADY drains these same startup unit-attention senses internally --
-# polling for up to its own `_SETTLE_DEADLINE_SECONDS` (10.0s, present
-# since before beta.8) before it gives up and returns None. So a single
-# `film_present()` call that comes back None can itself have already cost
-# up to ~10s of wall time; the original 15.0s OUTER window (sized as if
-# each call were free) bought only about two such calls, ending around
-# ~21s -- barely past RESULT.md's own observed 15-20s clearing, not the
-# "well inside" margin its comment claimed.
-#
-# `_VENDOR_EJECT_CONFIRM_SETTLE_SECONDS` below is total OUTER wall time
-# across every retry, not a per-call budget: each retry can itself cost up
-# to that inner ~10s, so 40.0s budgets roughly four such attempts (worst-
-# case realized time landing a bit past 40s once the triggering attempt's
-# own ~10s is counted -- the same shape as the old 15s/~21s relationship,
-# just with far more headroom): at least 2x RESULT.md's observed 15-20s
-# clearing, and about 4x its own ~10s typical estimate.
-#
-# `SCANSTUDIO_EJECT_CONFIRM_SETTLE_SECS` lets an out-of-process harness
-# drive a shorter window without a rebuild, on the same env-tunable idiom
-# as this bridge's own `service._scan_timeout_seconds` and the engine's
-# own `SCANSTUDIO_EJECT_DEADLINE_SECS`
-# (`real_backend.rs::eject_call_deadline_from_env`, PR #89, not yet
-# merged). That engine-side eject RPC deadline (300s default) wraps this
-# whole bridge call plus everything else the eject path does, and
-# dominates the worst-case end-to-end time even with this window at 40s.
-#
-# A definite True or False verdict at ANY attempt still resolves
-# immediately -- these constants only bound how long a persistently
-# INDETERMINATE probe is retried. That includes the pathological case of a
-# probe that never resolves at all (a permanently wedged interface, a
-# device that always times out): before this settle window existed, that
-# failed EJECT_FAILED instantly; now it burns the full window first. This
-# is a deliberate trade, not an oversight -- still bounded (40s, never
-# unbounded) and still typed EJECT_FAILED, in exchange for no longer
-# misreporting LV-2's transient-drain shape as a failure.
-_VENDOR_EJECT_CONFIRM_SETTLE_ENV_VAR = "SCANSTUDIO_EJECT_CONFIRM_SETTLE_SECS"
-_VENDOR_EJECT_CONFIRM_SETTLE_SECONDS = 40.0
-_VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS = 1.0
-
-
-def _vendor_eject_confirm_settle_seconds() -> float:
-    """`SCANSTUDIO_EJECT_CONFIRM_SETTLE_SECS`, read once per
-    `_require_vendor_eject_confirmed` call -- the same unset-or-unparseable-
-    falls-back-to-default idiom as this bridge's own
-    `service._scan_timeout_seconds`, plus the strictness of the engine's
-    own `real_backend.rs::eject_call_deadline_from_env`
-    (`SCANSTUDIO_EJECT_DEADLINE_SECS`): a non-positive or non-finite value
-    is rejected too, since zero (or a negative, NaN, or infinite value)
-    would either expire before a single probe could return or never
-    expire at all. Never raises."""
-    raw = os.environ.get(_VENDOR_EJECT_CONFIRM_SETTLE_ENV_VAR)
-    if raw is None:
-        return _VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        return _VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
-    if not math.isfinite(value) or value <= 0:
-        return _VENDOR_EJECT_CONFIRM_SETTLE_SECONDS
-    return value
-
 
 # The wire and CoolscanPy enum string VALUES do not match (see BRIDGE.md's
 # Types note) -- never assume they do, always translate explicitly.
@@ -738,6 +651,9 @@ class CoolscanPyTransport:
         self._material: domain.Material | None = None
         self._preview_established = False
         self._scanning = False
+        self._stop_lock = threading.RLock()
+        self._scan_prepared = False
+        self._stop_requested = False
         # Plan 10-09 (attempts-root persistence): the exact `attempts_root`
         # passed to `Device.roll()` below, kept here purely for our own
         # reporting -- service.py reads this (via getattr, since
@@ -760,9 +676,12 @@ class CoolscanPyTransport:
     def _failed_attempt_evidence(
         self, error: IndexDecodeError
     ) -> tuple[dict[str, object] | None, str | None]:
-        info = getattr(self._device, "info", None)
-        capabilities = getattr(info, "capabilities", None)
-        capacity = getattr(capabilities, "adapter_frame_capacity", 40)
+        capabilities = getattr(self._device, "capabilities", None)
+        capacity = getattr(capabilities, "adapter_frame_capacity", None)
+        if capacity is None:
+            # Direct USB has no negotiated holder capacity. Use the existing
+            # 40-anchor diagnostic bound, never as authority for scan motion.
+            capacity = 40
         try:
             return (
                 publish_index_failure(
@@ -784,22 +703,29 @@ class CoolscanPyTransport:
         if self._device is not None:
             raise BridgeError(ErrorCode.ALREADY_CONNECTED, "a device is already open")
         try:
-            opened_device = coolscanpy.open(device_id)
+            # Device exposes capabilities, not DeviceInfo. Resolve the public
+            # discovery record, then open that exact ID (never the alias again).
+            # open() independently revalidates attachment and support.
+            infos = coolscanpy.get_devices()
+            matches = [
+                info for info in infos
+                if isinstance(info, coolscanpy.DeviceInfo)
+                and (info.supported if device_id == "ls5000" else info.id == device_id)
+            ]
+            if len(matches) != 1:
+                raise coolscanpy.DeviceNotFound(
+                    f"expected one attached Coolscan matching {device_id!r}; found {len(matches)}"
+                )
+            info = matches[0]
+            if not info.supported:
+                raise coolscanpy.DeviceNotFound(
+                    f"{info.model} is not a positively identified supported LS-5000"
+                )
+            opened_device = coolscanpy.open(info.id)
         except coolscanpy.DeviceNotFound as exc:
             raise BridgeError(ErrorCode.DEVICE_NOT_FOUND, str(exc)) from exc
         except coolscanpy.DeviceBusy as exc:
             raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
-        info = getattr(opened_device, "info", None)
-        if not isinstance(info, coolscanpy.DeviceInfo) or not info.supported:
-            try:
-                opened_device.close()
-            except Exception:
-                pass
-            model = getattr(info, "model", "unverified scanner identity")
-            raise BridgeError(
-                ErrorCode.DEVICE_NOT_FOUND,
-                f"{model} is not a positively identified supported LS-5000",
-            )
         self._device = opened_device
         self._device_id = info.id
         return _device_info_from_coolscanpy(info)
@@ -1408,6 +1334,12 @@ class CoolscanPyTransport:
 
     # -- scanning -----------------------------------------------------------------
 
+    def prepare_scan(self) -> None:
+        """Arm cancellation at job acceptance, before the worker can be stopped."""
+        with self._stop_lock:
+            self._stop_requested = False
+            self._scan_prepared = True
+
     def start_scan(
         self,
         slots: list[int],
@@ -1445,7 +1377,12 @@ class CoolscanPyTransport:
         # _trim_out_of_table_slots' recovery to exactly one attempt per
         # start_scan call -- see the RollMismatch handler below.
         table_trim_retried = False
-        self._scanning = True
+        with self._stop_lock:
+            # Direct callers have no service acceptance hook. An already
+            # prepared job may have been stopped before this worker entered.
+            if not self._scan_prepared:
+                self.prepare_scan()
+            self._scanning = True
         reservations: OutputReservations | None = None
         try:
             # scan_many requires unique, strictly-increasing slots.
@@ -1494,7 +1431,14 @@ class CoolscanPyTransport:
                 batch_iterator: Iterator[coolscanpy.Frame] | None = None
                 try:
                     with _ScanPhase(on_call):
-                        batch_iterator = self._roll.scan_many(remaining, on_progress=None)
+                        with self._stop_lock:
+                            if self._stop_requested:
+                                raise coolscanpy.SafeStopRequested("scan job stopped before batch reservation")
+                            batch_iterator = self._roll.scan_many(remaining, on_progress=None)
+                            # Real Roll reservation resets its own stop event.
+                            # Preserve a reentrant stop during that call too.
+                            if self._stop_requested:
+                                self._roll.safe_stop()
                         try:
                             for frame in batch_iterator:
                                 slot = frame.slot
@@ -1739,11 +1683,16 @@ class CoolscanPyTransport:
                 reservations.release_unused()
             raise
         finally:
-            self._scanning = False
+            with self._stop_lock:
+                self._scanning = False
+                self._scan_prepared = False
 
     def request_stop(self) -> None:
-        if self._roll is not None:
-            self._roll.safe_stop()
+        with self._stop_lock:
+            if self._scan_prepared:
+                self._stop_requested = True
+                if self._roll is not None:
+                    self._roll.safe_stop()
 
     def eject(self) -> bool:
         if self._device is None:
@@ -1760,11 +1709,8 @@ class CoolscanPyTransport:
             target = roll
         else:
             target = self._device
-        # True whenever the eject that produced `ejected` ran through the
-        # vendor Device route (directly, or as the fallback below) -- that
-        # route reports acceptance, not actuation, so its success must be
-        # confirmed before it is reported (see _require_vendor_eject_confirmed).
-        vendor_route = target is self._device
+        # Both pinned driver routes report confirmed absence, not mere command
+        # acceptance. A second presence probe can only lose that evidence.
         # Roll.eject() with no held reservation raises EjectNotAvailable,
         # which is NOT an EjectFailed subclass. Exported by the pinned
         # coolscanpy since 2026-08-07; still resolved per call so a pin
@@ -1780,7 +1726,7 @@ class CoolscanPyTransport:
         except ImportError as exc:
             raise BridgeError(
                 ErrorCode.EJECT_FAILED,
-                "real eject requires the coolscanpy[scanner] extra and SANE installed -- see README",
+                "a scanner runtime dependency could not load; repair or reinstall the scanner runtime",
             ) from exc
         except coolscanpy.FeederParked as exc:
             # The typed accepted-without-progress outcome
@@ -1806,15 +1752,14 @@ class CoolscanPyTransport:
             # back to the capability-gated vendor eject on Device before
             # giving up. Every fallback outcome keeps the direct device
             # route's typed mapping, and success below still requires a
-            # confirmed ejected=True -- the fallback adds a second attempt,
-            # never a weaker acceptance.
-            vendor_route = True
+            # confirmed ejected=True. Roll sent no eject command, so this
+            # is the first physical eject attempt.
             try:
                 ejected = bool(self._device.eject())
             except ImportError as fallback_exc:
                 raise BridgeError(
                     ErrorCode.EJECT_FAILED,
-                    "real eject requires the coolscanpy[scanner] extra and SANE installed -- see README",
+                    "a scanner runtime dependency could not load; repair or reinstall the scanner runtime",
                 ) from fallback_exc
             except coolscanpy.DeviceBusy as fallback_exc:
                 raise BridgeError(
@@ -1828,8 +1773,6 @@ class CoolscanPyTransport:
                 raise BridgeError(
                     ErrorCode.EJECT_FAILED, str(fallback_exc)
                 ) from fallback_exc
-        if ejected and vendor_route:
-            self._require_vendor_eject_confirmed()
         if not ejected:
             # A capability-gated no-op is NOT an eject: the film is still
             # inside the feeder. Returning success here would be exactly
@@ -1860,72 +1803,3 @@ class CoolscanPyTransport:
         self._material = None
         self._preview_established = False
         return True
-
-    def _require_vendor_eject_confirmed(self) -> None:
-        # The vendor eject reports acceptance, not actuation: the LS-5000
-        # can accept the eject CDB with clean sense and never move
-        # (INCIDENT-20260719-eject-from-park, reconfirmed 2026-07-24 from
-        # the 022b4b wedge). The Roll route confirms actuation through the
-        # worker journal; the Device route must confirm through the
-        # motion-free film-presence probe before any success is reported.
-        # The probe's None means "could not determine" -- per its own
-        # contract it must never be read as film-absent -- so anything
-        # short of a definite False fails closed.
-        #
-        # LV-2 (see _VENDOR_EJECT_CONFIRM_SETTLE_SECONDS above for the full
-        # evidence citation, including why a None call can itself already
-        # cost ~10s): a None straight after the eject call returns can just
-        # be the scanner's post-motion UNIT ATTENTION drain, not a failed
-        # eject. Retry a None verdict with short sleeps up to the bounded
-        # settle window below before giving up. A definite verdict at any
-        # attempt -- True or False -- resolves immediately and is never
-        # retried further: False confirms the eject (below); True is the
-        # accepted-without-progress wedge
-        # (INCIDENT-20260719-eject-from-park) reaching its own typed
-        # outcome, not a draining attention, and burning the rest of the
-        # settle window on a park that will never clear on its own would
-        # only delay reporting it -- this exact shape fired live on the
-        # MA-21 today (vm-logs/ma21-201040.log) and must keep surfacing
-        # FEEDER_PARKED without delay.
-        #
-        # This method holds no lock of its own, and sleeping here is safe
-        # for a structural reason, not a lock-scoping one (2026-08-13
-        # adversarial review of PR #88, P2-1): cli.py's dispatch loop is
-        # single-threaded -- one blocking `for raw_line in sys.stdin` loop
-        # on the main thread, and device.eject is dispatched INLINE via
-        # service.py's `_handle_device_eject` (unlike roll.preview/
-        # scan.start, which run on their own worker thread). No other
-        # request -- device.status included -- can even be READ off stdin,
-        # let alone dispatched, until this whole call returns. (The
-        # caller's HardwareLane also happens not to gate device.status, but
-        # that is incidental, not the reason this is safe: a future
-        # architecture that dispatches requests from a thread pool would
-        # have to re-examine dispatch concurrency itself, not read this
-        # comment as already having done so.)
-        probe = getattr(self._device, "film_present", None)
-        probe_callable = callable(probe)
-        deadline = _monotonic() + _vendor_eject_confirm_settle_seconds()
-        present: bool | None = None
-        while True:
-            if probe_callable:
-                try:
-                    present = probe()
-                except Exception:
-                    present = None
-            if present is True:
-                raise BridgeError(
-                    ErrorCode.FEEDER_PARKED,
-                    "the vendor eject was accepted but the film is still "
-                    "present; the transport did not actuate -- a power cycle "
-                    "is the only demonstrated recovery",
-                )
-            if present is False:
-                return
-            if not probe_callable or _monotonic() >= deadline:
-                break
-            _sleep(_VENDOR_EJECT_CONFIRM_POLL_INTERVAL_SECONDS)
-        raise BridgeError(
-            ErrorCode.EJECT_FAILED,
-            "the vendor eject was accepted but film presence could "
-            "not be confirmed clear; treat the film as still loaded",
-        )
