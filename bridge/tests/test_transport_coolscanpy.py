@@ -4,11 +4,11 @@ API. See BRIDGE.md (nikon-coolscan4-software-archaeology,
 app/ScanStudio/protocol/BRIDGE.md) for the wire-level contract and the
 CoolscanPy-exception-to-error-code rename table this module implements.
 
-Per this task's own instructions, these tests mock the `coolscanpy` module
-boundary directly (`coolscanpy.open`/`coolscanpy.get_devices`, plus
+Most tests mock the `coolscanpy` module boundary directly (`coolscanpy.open`/`coolscanpy.get_devices`, plus
 lightweight fake `Device`/`Roll` doubles implementing only the methods
-`CoolscanPyTransport` calls) -- never coolscanpy's own internal
-adapter/workflow injection seams. No hardware is touched by any test here.
+`CoolscanPyTransport` calls). A real-facade regression also substitutes
+enumeration and service creation while exercising the actual Device/open
+implementation. No hardware is touched.
 """
 
 from __future__ import annotations
@@ -219,7 +219,7 @@ class _FakeDevice:
         info: "coolscanpy.DeviceInfo | None" = None,
     ) -> None:
         self._roll = roll
-        self.info = info or _fake_device_info()
+        self._info = info or _fake_device_info()
         self.eject_effect: object = True
         # The vendor-eject confirmation probe (Device.film_present): None
         # (undetermined) mirrors the pre-probe default; vendor-route eject
@@ -253,7 +253,7 @@ class _FakeDevice:
         # every OTHER test in this file that never touches this attribute.
         self.film_present_settle_clock: "_FakeEjectConfirmClock | None" = None
         self.closed = False
-        self.capabilities = _fake_capabilities()
+        self.capabilities = self._info.capabilities
         # Plan 10-09 (attempts-root persistence): records exactly what
         # CoolscanPyTransport.preview() passed, so a test can assert on it
         # -- mirrors the real Device.roll()'s own attempts_root kwarg.
@@ -812,6 +812,8 @@ def test_open_device_raises_device_not_found(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_open_device_raises_device_busy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [_fake_device_info()])
+
     def _raise_busy(devname: str) -> None:
         raise coolscanpy.DeviceBusy(f"device {devname!r} already open")
 
@@ -839,7 +841,13 @@ def test_open_device_reports_the_exact_identity_validated_by_coolscanpy(
         model="LS-5000 ED",
     )
     device = _FakeDevice(info=info)
-    monkeypatch.setattr(coolscanpy, "open", lambda _device_id: device)
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+
+    def open_exact(device_id):
+        assert device_id == info.id
+        return device
+
+    monkeypatch.setattr(coolscanpy, "open", open_exact)
 
     opened = CoolscanPyTransport().open_device("ls5000")
 
@@ -857,15 +865,14 @@ def test_open_device_refuses_an_unverified_identity_without_synthesizing_ls5000(
         model="Coolscan Mystery Model",
         supported=False,
     )
-    device = _FakeDevice(info=info)
-    monkeypatch.setattr(coolscanpy, "open", lambda _device_id: device)
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+    monkeypatch.setattr(coolscanpy, "open", lambda _: pytest.fail("must refuse before open"))
 
     with pytest.raises(BridgeError) as excinfo:
         CoolscanPyTransport().open_device(info.id)
 
     assert excinfo.value.code == ErrorCode.DEVICE_NOT_FOUND
     assert "Coolscan Mystery Model" in str(excinfo.value)
-    assert device.closed is True
 
 
 # -- preview -----------------------------------------------------------------------
@@ -4120,3 +4127,68 @@ def test_status_adapter_is_none_when_probe_is_absent_or_failing(
     # the defensive callable() check keeps the identity honestly unknown.
     device.adapter_identity = "Mount"
     assert transport.status().adapter is None
+
+
+def test_transport_opens_real_driver_device(monkeypatch):
+    from coolscanpy import _device
+
+    info = _fake_device_info()
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+    monkeypatch.setattr(_device, "get_devices", lambda: [info])
+    monkeypatch.setattr(_device, "_service_factory", lambda: object())
+    transport = CoolscanPyTransport()
+    try:
+        opened = transport.open_device("ls5000")
+        assert isinstance(transport._device, coolscanpy.Device)
+        assert opened.device_id == info.id
+        assert opened.supported is True
+    finally:
+        if transport._device is not None:
+            transport._device.close()
+
+
+@pytest.mark.parametrize("infos", [[], [_fake_device_info(), _fake_device_info("other")]])
+def test_open_alias_requires_one_supported_device(monkeypatch, infos):
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: infos)
+    monkeypatch.setattr(coolscanpy, "open", lambda _: pytest.fail("ambiguous open"))
+    with pytest.raises(BridgeError) as error:
+        CoolscanPyTransport().open_device("ls5000")
+    assert error.value.code == ErrorCode.DEVICE_NOT_FOUND
+
+
+def test_real_open_rechecks_disappeared_device(monkeypatch):
+    from coolscanpy import _device
+
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [_fake_device_info()])
+    monkeypatch.setattr(_device, "get_devices", lambda: [])
+    monkeypatch.setattr(_device, "_service_factory", lambda: pytest.fail("device disappeared"))
+    transport = CoolscanPyTransport()
+    with pytest.raises(BridgeError) as error:
+        transport.open_device(_DEVICE_ID)
+    assert error.value.code == ErrorCode.DEVICE_NOT_FOUND
+    assert transport._device is None
+
+
+def test_failed_preview_evidence_uses_real_device_capacity(monkeypatch):
+    from coolscanpy.protocol.ls5000_single_pass.roll_index import IndexDecodeError
+
+    info = _fake_device_info()
+    info = dataclasses.replace(
+        info, capabilities=dataclasses.replace(info.capabilities, adapter_frame_capacity=6)
+    )
+    device = coolscanpy.Device(info, object())
+    transport = CoolscanPyTransport()
+    transport._device = device
+    capacities = []
+
+    def publish(error, *, base_dir, holder_capacity):
+        capacities.append(holder_capacity)
+        return {"capacity": holder_capacity}
+
+    monkeypatch.setattr(coolscanpy_transport_module, "publish_index_failure", publish)
+    try:
+        evidence, error = transport._failed_attempt_evidence(IndexDecodeError("bad preview"))
+        assert (evidence, error) == ({"capacity": 6}, None)
+        assert capacities == [6]
+    finally:
+        device.close()

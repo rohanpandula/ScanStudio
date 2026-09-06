@@ -760,8 +760,7 @@ class CoolscanPyTransport:
     def _failed_attempt_evidence(
         self, error: IndexDecodeError
     ) -> tuple[dict[str, object] | None, str | None]:
-        info = getattr(self._device, "info", None)
-        capabilities = getattr(info, "capabilities", None)
+        capabilities = getattr(self._device, "capabilities", None)
         capacity = getattr(capabilities, "adapter_frame_capacity", 40)
         try:
             return (
@@ -784,22 +783,29 @@ class CoolscanPyTransport:
         if self._device is not None:
             raise BridgeError(ErrorCode.ALREADY_CONNECTED, "a device is already open")
         try:
-            opened_device = coolscanpy.open(device_id)
+            # Device exposes capabilities, not DeviceInfo. Resolve the public
+            # discovery record, then open that exact ID (never the alias again).
+            # open() independently revalidates attachment and support.
+            infos = coolscanpy.get_devices()
+            matches = [
+                info for info in infos
+                if isinstance(info, coolscanpy.DeviceInfo)
+                and (info.supported if device_id == "ls5000" else info.id == device_id)
+            ]
+            if len(matches) != 1:
+                raise coolscanpy.DeviceNotFound(
+                    f"expected one attached Coolscan matching {device_id!r}; found {len(matches)}"
+                )
+            info = matches[0]
+            if not info.supported:
+                raise coolscanpy.DeviceNotFound(
+                    f"{info.model} is not a positively identified supported LS-5000"
+                )
+            opened_device = coolscanpy.open(info.id)
         except coolscanpy.DeviceNotFound as exc:
             raise BridgeError(ErrorCode.DEVICE_NOT_FOUND, str(exc)) from exc
         except coolscanpy.DeviceBusy as exc:
             raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
-        info = getattr(opened_device, "info", None)
-        if not isinstance(info, coolscanpy.DeviceInfo) or not info.supported:
-            try:
-                opened_device.close()
-            except Exception:
-                pass
-            model = getattr(info, "model", "unverified scanner identity")
-            raise BridgeError(
-                ErrorCode.DEVICE_NOT_FOUND,
-                f"{model} is not a positively identified supported LS-5000",
-            )
         self._device = opened_device
         self._device_id = info.id
         return _device_info_from_coolscanpy(info)
