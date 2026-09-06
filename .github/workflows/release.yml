@@ -56,37 +56,10 @@ jobs:
           python3 -I -S -B scripts/verify_release_workflow.py
 
   release:
-    name: Build and verify ${{ matrix.arch }} DMG
-    # Bounded because this job now waits on two Apple notarization
-    # round-trips (app + DMG) on top of the build itself.
+    name: Build and verify arm64 DMG
     timeout-minutes: 150
     needs: verify
-    # A universal bundle is impossible because the pinned cv2/numpy wheels are
-    # not universal, so each architecture is built natively on its own runner
-    # through the SAME verified `make dmg` path (codesign --deep --strict,
-    # relocation-safe bridge check, SHA-256). If EITHER matrix cell fails,
-    # fail-fast aborts the whole workflow and nothing is published.
-    #
-    # Intel runner label: GitHub-hosted Intel labels change over time. Per the
-    # GitHub-hosted runners reference (docs.github.com, 2026-08) the current
-    # standard Intel label is `macos-15-intel`; hosted-label availability is
-    # NOT exposed through the API (gh api /repos/{owner}/{repo}/actions/runners
-    # only lists self-hosted runners), so it cannot be probed in advance. We
-    # hard-code `macos-15-intel` and let GitHub fail the job loudly if the
-    # label is ever retired or unavailable on this account -- fail-loud is
-    # acceptable for this gate (T-02-01-02). If it stops resolving, the
-    # conservative fallback is the last Intel-only label, `macos-13`; update
-    # BOTH this include and the package matrix in ci.yml together.
-    strategy:
-      fail-fast: true
-      matrix:
-        arch: [arm64, x86_64]
-        include:
-          - arch: arm64
-            runs-on: macos-15
-          - arch: x86_64
-            runs-on: macos-15-intel
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: macos-15
     env:
       # See the package job in ci.yml: the relocatable package requires uv's
       # standalone CPython, not the runner image's framework Python. This is
@@ -241,19 +214,19 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --commit "$GITHUB_SHA" \
             --tag "$GITHUB_REF_NAME" \
-            --output "app/ScanStudio/.build/ScanStudio-macOS-${{ matrix.arch }}.provenance.json" \
-            --artifact "app/ScanStudio/.build/ScanStudio-$RELEASE_VERSION-macOS-${{ matrix.arch }}.dmg" \
+            --output "app/ScanStudio/.build/ScanStudio-macOS-arm64.provenance.json" \
+            --artifact "app/ScanStudio/.build/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
             --artifact app/ScanStudio/.build/SHA256SUMS \
             --artifact app/ScanStudio/.build/latest.json
-      - name: Upload ${{ matrix.arch }} release assets
+      - name: Upload arm64 release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ScanStudio-dmg-${{ matrix.arch }}
+          name: ScanStudio-dmg-arm64
           path: |
-            app/ScanStudio/.build/ScanStudio-${{ env.RELEASE_VERSION }}-macOS-${{ matrix.arch }}.dmg
+            app/ScanStudio/.build/ScanStudio-${{ env.RELEASE_VERSION }}-macOS-arm64.dmg
             app/ScanStudio/.build/SHA256SUMS
             app/ScanStudio/.build/latest.json
-            app/ScanStudio/.build/ScanStudio-macOS-${{ matrix.arch }}.provenance.json
+            app/ScanStudio/.build/ScanStudio-macOS-arm64.provenance.json
           if-no-files-found: error
           retention-days: 1
       - name: Delete the throwaway signing keychain and key material
@@ -266,210 +239,6 @@ jobs:
             security delete-keychain "$KEYCHAIN"
           fi
 
-  windows-resources:
-    name: Assemble Windows offline resources
-    needs: verify
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    env:
-      UV_PYTHON_PREFERENCE: only-managed
-      UV_PYTHON_CPYTHON_BUILD: "20260718"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - name: Install exact Node and Python build toolchains
-        run: |
-          python3 -I -S -B scripts/install_pinned_node.py \
-            --install-root "$RUNNER_TEMP/scanstudio-node"
-          python3 -I -S -B scripts/install_pinned_uv_python.py \
-            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-        with:
-          toolchain: '1.97.1'
-      - name: Verify exact Rust toolchain
-        run: python3 -I -S -B scripts/verify_pinned_rust.py
-      - name: Install authenticated Rust dependency notice generator
-        run: |
-          python3 -I -S -B scripts/install_pinned_cargo_about.py \
-            --install-root "$RUNNER_TEMP/scanstudio-cargo-about"
-      - name: Resolve release version from the tag
-        # Same derivation as the `linux` job (and the `windows` job's pwsh
-        # equivalent): the workflow only runs on `v*` tag pushes, so
-        # stripping the leading "v" from GITHUB_REF_NAME is authoritative.
-        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-      - name: Stamp the release version before assembling Windows resources
-        # Must run BEFORE assemble-staging.sh: assemble-staging.sh byte-copies
-        # src-tauri/Cargo.lock into Licenses/Rust-App-Cargo.lock and
-        # package.json/package-lock.json into Licenses/npm-production/ from
-        # this checkout. This job's staged tree is restored unchanged into
-        # the later `windows` job (which stamps only ITS OWN fresh checkout,
-        # not the resource tree it receives as an artifact), so an unstamped
-        # checkout here means every shipped Windows installer and portable
-        # zip carries a Rust-App-Cargo.lock that still says the checked-in
-        # placeholder "0.3.0" -- mirrors the linux job, which stamps (see
-        # linux/build-and-verify.sh) before calling its own assemble-staging.sh
-        # in the same job.
-        working-directory: ports/tauri
-        run: |
-          python3 -I -S -B packaging/stamp_release_version.py \
-            app/src-tauri/tauri.conf.json \
-            app/package.json \
-            app/src-tauri/Cargo.toml \
-            app/src-tauri/Cargo.lock \
-            "$RELEASE_VERSION"
-      - name: Assemble and verify the WSL2 resource bundle
-        working-directory: ports/tauri
-        env:
-          HOST_PYTHON: python3
-        run: |
-          ./packaging/windows/tests/test-hardware-session-launcher.sh
-          ./packaging/windows/assemble-staging.sh
-          ./packaging/windows/verify-bundle.sh ./packaging/.staging/windows
-          tar -C packaging/.staging -czf "$RUNNER_TEMP/windows-staging.tar.gz" windows
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ScanStudio-windows-staging
-          path: ${{ runner.temp }}/windows-staging.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-
-  windows:
-    name: Build and verify Windows x64 Preview
-    needs: windows-resources
-    runs-on: windows-latest
-    timeout-minutes: 90
-    env:
-      UV_PYTHON_PREFERENCE: only-managed
-      UV_PYTHON_CPYTHON_BUILD: "20260718"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ScanStudio-windows-staging
-          path: ${{ runner.temp }}/windows-staging
-      - name: Restore the exact verified resource tree
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path ports/tauri/packaging/.staging | Out-Null
-          tar -xzf "$env:RUNNER_TEMP/windows-staging/windows-staging.tar.gz" -C ports/tauri/packaging/.staging
-          if ($LASTEXITCODE -ne 0) { throw "Could not restore Windows staging" }
-      - name: Install exact Node and Python build toolchains
-        shell: pwsh
-        run: |
-          python -I -S -B scripts/install_pinned_node.py `
-            --install-root "$env:RUNNER_TEMP\scanstudio-node"
-          if ($LASTEXITCODE -ne 0) { throw "Pinned Node installation failed" }
-          python -I -S -B scripts/install_pinned_uv_python.py `
-            --install-root "$env:RUNNER_TEMP\scanstudio-uv-python"
-          if ($LASTEXITCODE -ne 0) { throw "Pinned uv/Python installation failed" }
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-        with:
-          toolchain: '1.97.1'
-      - name: Verify exact Rust toolchain
-        run: python -I -S -B scripts/verify_pinned_rust.py
-      - name: Resolve release version from the tag
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Build, install, smoke-test, and re-extract both Windows packages
-        shell: pwsh
-        run: |
-          ports/tauri/packaging/windows/build-and-verify.ps1 `
-            -Version "$env:RELEASE_VERSION" `
-            -OutputDir "$env:RUNNER_TEMP/scanstudio-windows-release"
-      - name: Bind Windows artifacts to this workflow run and commit
-        shell: pwsh
-        run: |
-          $root = "$env:RUNNER_TEMP/scanstudio-windows-release"
-          python -I -S -B scripts/release_provenance.py emit `
-            --repository "$env:GITHUB_REPOSITORY" `
-            --run-id "$env:GITHUB_RUN_ID" `
-            --run-attempt "$env:GITHUB_RUN_ATTEMPT" `
-            --commit "$env:GITHUB_SHA" `
-            --tag "$env:GITHUB_REF_NAME" `
-            --output "$root/ScanStudio-Windows-x86_64-preview.provenance.json" `
-            --artifact "$root/ScanStudio-$env:RELEASE_VERSION-Windows-x86_64-preview-setup.exe" `
-            --artifact "$root/ScanStudio-$env:RELEASE_VERSION-Windows-x86_64-preview-portable.zip"
-          if ($LASTEXITCODE -ne 0) { throw "Windows provenance emission failed" }
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ScanStudio-windows-x86_64-preview
-          path: ${{ runner.temp }}/scanstudio-windows-release/*
-          if-no-files-found: error
-          retention-days: 1
-
-  linux:
-    name: Build and verify Linux x64 Preview
-    needs: verify
-    runs-on: ubuntu-22.04
-    container: ubuntu@sha256:0199853f6d6b20b0424f3c5694a72a62764f01e6a771b1eb48a4197848986c7e
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: bash
-    env:
-      UV_PYTHON_PREFERENCE: only-managed
-      UV_PYTHON_CPYTHON_BUILD: "20260718"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - name: Install Linux build and runtime prerequisites
-        run: scripts/install_ubuntu_build_prerequisites.sh
-      - name: Install exact Node and Python build toolchains
-        run: |
-          python3 -I -S -B scripts/install_pinned_node.py \
-            --install-root "$RUNNER_TEMP/scanstudio-node"
-          python3 -I -S -B scripts/install_pinned_uv_python.py \
-            --install-root "$RUNNER_TEMP/scanstudio-uv-python"
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
-        with:
-          toolchain: '1.97.1'
-      - name: Verify exact Rust toolchain
-        run: python3 -I -S -B scripts/verify_pinned_rust.py
-      - name: Install authenticated Rust dependency notice generator
-        run: |
-          python3 -I -S -B scripts/install_pinned_cargo_about.py \
-            --install-root "$RUNNER_TEMP/scanstudio-cargo-about"
-      - name: Resolve release version from the tag
-        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-      - name: Build, extract, smoke-test, and re-extract both Linux packages
-        env:
-          # linuxdeploy is itself an AppImage; running it needs FUSE, which the
-          # ubuntu GitHub runners do not reliably provide. Extract-and-run
-          # removes that dependency so the bundle is deterministic.
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: |
-          ports/tauri/packaging/linux/build-and-verify.sh \
-            "$RELEASE_VERSION" \
-            "$RUNNER_TEMP/scanstudio-linux-release"
-      - name: Bind Linux artifacts to this workflow run and commit
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/scanstudio-linux-release"
-          python3 -I -S -B scripts/release_provenance.py emit \
-            --repository "$GITHUB_REPOSITORY" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --commit "$GITHUB_SHA" \
-            --tag "$GITHUB_REF_NAME" \
-            --output "$root/ScanStudio-Linux-x86_64-preview.provenance.json" \
-            --artifact "$root/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" \
-            --artifact "$root/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ScanStudio-linux-x86_64-preview
-          path: ${{ runner.temp }}/scanstudio-linux-release/*
-          if-no-files-found: error
-          retention-days: 1
-
   verification-gate:
     name: Require every same-run release job to succeed
     if: ${{ always() }}
@@ -477,9 +246,6 @@ jobs:
       - verify
       - authorize
       - release
-      - windows-resources
-      - windows
-      - linux
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
@@ -497,7 +263,7 @@ jobs:
           python3 -I -S -B scripts/verify_required_job_results.py
 
   publish:
-    name: Publish combined Beta and Previews
+    name: Publish Apple Silicon beta
     needs: [authorize, verify, verification-gate]
     runs-on: macos-15
     timeout-minutes: 30
@@ -512,18 +278,6 @@ jobs:
         with:
           name: ScanStudio-dmg-arm64
           path: ${{ runner.temp }}/arm64
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ScanStudio-dmg-x86_64
-          path: ${{ runner.temp }}/x86_64
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ScanStudio-windows-x86_64-preview
-          path: ${{ runner.temp }}/windows
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ScanStudio-linux-x86_64-preview
-          path: ${{ runner.temp }}/linux
       - name: Verify all exact-run artifact provenance
         run: |
           set -euo pipefail
@@ -533,24 +287,6 @@ jobs:
             --tag "$GITHUB_REF_NAME" \
             --receipt "$RUNNER_TEMP/arm64/ScanStudio-macOS-arm64.provenance.json" \
             --artifact-root "$RUNNER_TEMP/arm64"
-          python3 -I -S -B scripts/release_provenance.py verify \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" \
-            --tag "$GITHUB_REF_NAME" \
-            --receipt "$RUNNER_TEMP/x86_64/ScanStudio-macOS-x86_64.provenance.json" \
-            --artifact-root "$RUNNER_TEMP/x86_64"
-          python3 -I -S -B scripts/release_provenance.py verify \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" \
-            --tag "$GITHUB_REF_NAME" \
-            --receipt "$RUNNER_TEMP/windows/ScanStudio-Windows-x86_64-preview.provenance.json" \
-            --artifact-root "$RUNNER_TEMP/windows"
-          python3 -I -S -B scripts/release_provenance.py verify \
-            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" \
-            --tag "$GITHUB_REF_NAME" \
-            --receipt "$RUNNER_TEMP/linux/ScanStudio-Linux-x86_64-preview.provenance.json" \
-            --artifact-root "$RUNNER_TEMP/linux"
       - name: Resolve release version from the tag
         env:
           VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
@@ -572,35 +308,15 @@ jobs:
           python3 -I -S -B scripts/verify_release_notes.py \
             "$RELEASE_NOTES_PATH" "$GITHUB_REF_NAME" "$RELEASE_VERSION"
           echo "RELEASE_NOTES=$RELEASE_NOTES_PATH" >> "$GITHUB_ENV"
-      - name: Stage exactly six packages and generate metadata
+      - name: Stage the Apple Silicon DMG and generate metadata
         run: |
           set -euo pipefail
           mkdir -p "$RELEASE_ASSETS" "$RELEASE_METADATA"
           cp "$RUNNER_TEMP/arm64/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" "$RELEASE_ASSETS/"
-          cp "$RUNNER_TEMP/x86_64/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" "$RELEASE_ASSETS/"
-          cp "$RUNNER_TEMP/windows/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-setup.exe" "$RELEASE_ASSETS/"
-          cp "$RUNNER_TEMP/windows/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-portable.zip" "$RELEASE_ASSETS/"
-          cp "$RUNNER_TEMP/linux/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" "$RELEASE_ASSETS/"
-          cp "$RUNNER_TEMP/linux/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz" "$RELEASE_ASSETS/"
-          test "$(find "$RELEASE_ASSETS" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6
-
+          test "$(find "$RELEASE_ASSETS" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1
           app/ScanStudio/scripts/emit_release_assets.sh \
             "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
             "$RELEASE_VERSION" "$RELEASE_METADATA" arm64
-          app/ScanStudio/scripts/emit_release_assets.sh \
-            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
-            "$RELEASE_VERSION" "$RELEASE_METADATA" x86_64
-
-          (
-            cd "$RELEASE_ASSETS"
-            shasum -a 256 \
-              "ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
-              "ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
-              "ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-setup.exe" \
-              "ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-portable.zip" \
-              "ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" \
-              "ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz"
-          ) > "$RELEASE_METADATA/SHA256SUMS"
       - name: Re-verify all local release assets
         run: |
           set -euo pipefail
@@ -615,11 +331,6 @@ jobs:
           version = sys.argv[3]
           expected = {
               f"ScanStudio-{version}-macOS-arm64.dmg",
-              f"ScanStudio-{version}-macOS-x86_64.dmg",
-              f"ScanStudio-{version}-Windows-x86_64-preview-setup.exe",
-              f"ScanStudio-{version}-Windows-x86_64-preview-portable.zip",
-              f"ScanStudio-{version}-Linux-x86_64-preview.AppImage",
-              f"ScanStudio-{version}-Linux-x86_64-preview-portable.tar.gz",
           }
           actual = {path.name for path in assets.iterdir() if path.is_file()}
           assert actual == expected, (actual, expected)
@@ -641,13 +352,13 @@ jobs:
 
           latest = json.loads((metadata / "latest.json").read_text())
           assert latest["version"] == version
-          assert set(latest["architectures"]) == {"arm64", "x86_64"}
-          for arch in ("arm64", "x86_64"):
+          assert set(latest["architectures"]) == {"arm64"}
+          for arch in ("arm64",):
               name = f"ScanStudio-{version}-macOS-{arch}.dmg"
               entry = latest["architectures"][arch]
               assert entry["url"].endswith("/" + name)
               assert entry["sha256"] == ledger[name]
-          print("six packages, central checksums, and Mac-only updater pointer verified")
+          print("Apple Silicon DMG, checksum, and updater pointer verified")
           PY
       - name: Create and verify a draft GitHub prerelease
         env:
@@ -672,11 +383,6 @@ jobs:
             --title "ScanStudio $RELEASE_VERSION" \
             --notes-file "$RELEASE_NOTES" \
             "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-arm64.dmg" \
-            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-macOS-x86_64.dmg" \
-            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-setup.exe" \
-            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Windows-x86_64-preview-portable.zip" \
-            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview.AppImage" \
-            "$RELEASE_ASSETS/ScanStudio-$RELEASE_VERSION-Linux-x86_64-preview-portable.tar.gz" \
             "$RELEASE_METADATA/SHA256SUMS" \
             "$RELEASE_METADATA/latest.json"
           # A draft release's tag is not attached until publish, so the
@@ -722,7 +428,7 @@ jobs:
               digest = sha256(path)
               assert remote[name]["size"] == path.stat().st_size, name
               assert remote[name].get("digest") == f"sha256:{digest}", name
-          print("draft release has exact tag-bound notes and eight byte-verified assets")
+          print("draft release has exact tag-bound notes and three byte-verified assets")
           PY
       - name: Publish and re-verify the prerelease
         env:
@@ -782,7 +488,7 @@ jobs:
               assert remote[name]["size"] == path.stat().st_size, name
               assert remote[name].get("digest") == f"sha256:{digest}", name
           print(payload["html_url"])
-          print("published prerelease reverified with exact tag-bound notes and eight assets")
+          print("published prerelease reverified with exact tag-bound notes and three assets")
           PY
       - name: Summarize published release
         run: |

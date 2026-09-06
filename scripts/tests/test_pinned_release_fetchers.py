@@ -28,10 +28,7 @@ COOLSCANPY = load(
     "test_pinned_coolscanpy_sdist",
     ROOT / "scripts" / "fetch_pinned_coolscanpy_sdist.py",
 )
-CARGO_ABOUT = load(
-    "test_pinned_cargo_about",
-    ROOT / "scripts" / "install_pinned_cargo_about.py",
-)
+
 
 
 class FakeResponse:
@@ -94,22 +91,6 @@ class DownloadTests(unittest.TestCase):
                             with self.assertRaises(COOLSCANPY.FetchError):
                                 COOLSCANPY.download(path)
 
-    def test_cargo_about_download_accepts_only_exact_bytes(self) -> None:
-        payload = b"authenticated crate"
-        response = FakeResponse(payload, CARGO_ABOUT.ASSET_URL, str(len(payload)))
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "crate"
-            with (
-                mock.patch.object(CARGO_ABOUT, "ASSET_SIZE", len(payload)),
-                mock.patch.object(
-                    CARGO_ABOUT, "ASSET_SHA256", hashlib.sha256(payload).hexdigest()
-                ),
-                mock.patch.object(
-                    CARGO_ABOUT.urllib.request, "urlopen", return_value=response
-                ),
-            ):
-                CARGO_ABOUT.download(path)
-            self.assertEqual(path.read_bytes(), payload)
 
 
 class ArchiveTests(unittest.TestCase):
@@ -120,12 +101,6 @@ class ArchiveTests(unittest.TestCase):
                 COOLSCANPY.member_path,
                 COOLSCANPY.ROOT,
                 COOLSCANPY.FetchError,
-            ),
-            (
-                CARGO_ABOUT,
-                CARGO_ABOUT.member_path,
-                CARGO_ABOUT.ARCHIVE_ROOT,
-                CARGO_ABOUT.InstallError,
             ),
         ):
             for name in ("", f"{root}/../outside", f"{root}\\outside", "/outside"):
@@ -158,34 +133,9 @@ class ArchiveTests(unittest.TestCase):
                 COOLSCANPY.extract(archive, root / "extract")
             self.assertFalse((root / "outside").exists())
 
-    def test_cargo_about_extract_rejects_link_or_special_entry(self) -> None:
-        payload = tar_payload(
-            [
-                (f"{CARGO_ABOUT.ARCHIVE_ROOT}/", None, b""),
-                (
-                    f"{CARGO_ABOUT.ARCHIVE_ROOT}/link",
-                    tarfile.SYMTYPE + b"outside",
-                    b"",
-                ),
-            ]
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            archive = root / "source.crate"
-            archive.write_bytes(payload)
-            with (
-                mock.patch.object(CARGO_ABOUT, "ARCHIVE_ENTRIES", 2),
-                self.assertRaisesRegex(CARGO_ABOUT.InstallError, "link or special"),
-            ):
-                CARGO_ABOUT.extract(archive, root / "extract")
 
 
 class WiringTests(unittest.TestCase):
-    def test_release_workflow_uses_authenticated_cargo_about(self) -> None:
-        for workflow in ("ports.yml", "release.yml"):
-            text = (ROOT / ".github" / "workflows" / workflow).read_text()
-            self.assertNotIn("cargo install --locked --version 0.9.1", text)
-            self.assertIn("scripts/install_pinned_cargo_about.py", text)
 
     def test_coolscanpy_gate_uses_exact_fetcher_not_latest_metadata(self) -> None:
         text = (ROOT / "scripts" / "check_coolscanpy_pypi_sync.sh").read_text()

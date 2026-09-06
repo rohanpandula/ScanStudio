@@ -52,7 +52,7 @@ class ScannerContractDocsTests(unittest.TestCase):
 
     def test_rejects_sane_eject_dependency(self) -> None:
         root = self.fixture()
-        path = root / "ports/tauri/runbooks/WINDOWS-LIVE-VALIDATION.md"
+        path = root / "app/ScanStudio/README.md"
         path.write_text("real eject needs the [scanner] extra plus SANE\n")
         with self.assertRaisesRegex(
             VERIFIER.ScannerContractDocsError, "obsolete contract text"

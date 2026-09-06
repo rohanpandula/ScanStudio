@@ -2,6 +2,12 @@
 # Create and verify the public ScanStudio DMG without touching scanner state.
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" \
+    || "${SCANSTUDIO_RELEASE_ARCH:-arm64}" != "arm64" ]]; then
+    print -u2 "ScanStudio packaging requires Apple Silicon (arm64) macOS; Intel/Rosetta and other architecture requests are unsupported."
+    exit 64
+fi
+
 script_dir="${0:A:h}"
 package_root="${script_dir:h}"
 source_app="${1:-$package_root/.build/ScanStudio.app}"
@@ -22,14 +28,23 @@ release_version="${SCANSTUDIO_RELEASE_VERSION:-$bundle_version-beta.1}"
 release_arch="${SCANSTUDIO_RELEASE_ARCH:-$(uname -m)}"
 output="${2:-$package_root/.build/ScanStudio-$release_version-macOS-$release_arch.dmg}"
 
-if [[ "${output:e}" != "dmg" || "${output:t}" != ScanStudio-*.dmg ]]; then
-    print -u2 "Refusing a DMG output outside the ScanStudio-*.dmg naming contract: $output"
+if [[ "${output:t}" != "ScanStudio-$release_version-macOS-arm64.dmg" ]]; then
+    print -u2 "Refusing a DMG output outside the ScanStudio-<version>-macOS-arm64.dmg naming contract: $output"
     exit 64
 fi
 if [[ -e "$output" ]]; then
     print -u2 "Refusing to overwrite an existing release artifact: $output"
     exit 73
 fi
+
+for binary in "$source_app/Contents/MacOS/ScanStudio" \
+    "$source_app/Contents/MacOS/scanstudio-engine" \
+    "$source_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"; do
+    if [[ "$(lipo -archs "$binary")" != "arm64" ]]; then
+        print -u2 "Refusing non-arm64 release binary: $binary"
+        exit 1
+    fi
+done
 
 codesign --verify --deep --strict "$source_app"
 mkdir -p "${output:h}"

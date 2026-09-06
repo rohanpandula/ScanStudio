@@ -13,9 +13,6 @@ REQUIRED_JOBS = (
     "verify",
     "authorize",
     "release",
-    "windows-resources",
-    "windows",
-    "linux",
 )
 RESULTS_ENVIRONMENT_KEY = "SCANSTUDIO_REQUIRED_JOB_RESULTS"
 

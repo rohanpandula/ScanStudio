@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 struct BatchInspectorView: View {
     @Environment(SessionModel.self) private var sessionModel
+    @State private var missingSavedOutput: String?
     @State private var masterSettingsExpanded = false
     @State private var rawSettingsExpanded = false
     @State private var positiveTiffSettingsExpanded = false
@@ -25,7 +26,7 @@ struct BatchInspectorView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(sessionModel.isJobActive ? "CAPTURE MONITOR" : "BATCH SETTINGS")
+                Text(sessionModel.isJobActive ? "CAPTURE MONITOR" : "NEXT SCAN SETTINGS")
                     .font(.system(size: 11, weight: .semibold))
                     .tracking(0.8)
                 Spacer()
@@ -37,10 +38,12 @@ struct BatchInspectorView: View {
 
             ScrollView {
                 VStack(spacing: 0) {
+                    savedFilesSection
                     if sessionModel.isJobActive {
                         activeInspector
                     } else {
                         setupInspector
+                            .disabled(sessionModel.isResumingBatch)
                     }
                     batchResultSummary
                     hardwareStatusSection
@@ -53,11 +56,72 @@ struct BatchInspectorView: View {
         // project) so `sessionModel.exifToolDetection` is already populated
         // before the user ever opens a frame detail view's ExifTool panel.
         .task { await sessionModel.detectExifTool() }
+        .alert("Saved file unavailable", isPresented: Binding(
+            get: { missingSavedOutput != nil },
+            set: { if !$0 { missingSavedOutput = nil } }
+        )) {
+            Button("OK", role: .cancel) { missingSavedOutput = nil }
+        } message: {
+            Text("The recorded file is no longer at this location. It may have been moved or deleted.\n\(missingSavedOutput ?? "")")
+        }
+    }
+
+    @ViewBuilder
+    private var savedFilesSection: some View {
+        if let directory = sessionModel.projectDirectory {
+            InspectorSection(title: "Saved roll") {
+                InspectorRow(label: "Frames with receipts", value: "\(sessionModel.completedFrameCount)")
+                if sessionModel.hasUnsavedProjectChanges {
+                    Text("Some project edits are not yet saved. Existing image files are unchanged.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.scanStudioAmber)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Button("Show Roll Folder in Finder") {
+                    revealSavedFile(URL(fileURLWithPath: directory))
+                }
+                .controlSize(.small)
+                if let frameIndex = sessionModel.detailFrameIndex ?? sessionModel.frameTransformTargetIndex {
+                    let receipt = sessionModel.receipts.last(where: { $0.frameIndex == frameIndex })
+                        ?? sessionModel.project?.frames.first(where: { $0.index == frameIndex })?.receipts.last
+                    let files = SavedOutputPresentation.files(in: receipt?.outputs)
+                    if !files.isEmpty {
+                        Menu("Frame \(frameIndex) Saved Files") {
+                            ForEach(files) { file in
+                                Button("Show \(file.label) in Finder") {
+                                    revealSavedFile(file.url)
+                                }
+                            }
+                        }
+                        .controlSize(.small)
+                        Text("Latest recorded capture for this frame. Files may have been moved since saving.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.scanStudioSecondaryText)
+                    } else {
+                        Text("No saved output paths recorded for frame \(frameIndex).")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.scanStudioSecondaryText)
+                    }
+                }
+            }
+        }
+    }
+
+    private func revealSavedFile(_ url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            missingSavedOutput = url.path
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     private var setupInspector: some View {
         Group {
             InspectorSection(title: "Scan Settings") {
+                Text("Applies to future scans. Changing these settings does not update scanner previews or existing image files. Frame overrides take precedence.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.scanStudioSecondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
                 InspectorSettingRow(label: "Recipe") {
                     Picker("Recipe", selection: scanRecipePresetBinding) {
                         ForEach(ScanRecipePreset.allCases) { preset in
@@ -298,7 +362,7 @@ struct BatchInspectorView: View {
     }
 
     private var saveOutputsSection: some View {
-        InspectorSection(title: "Save & outputs") {
+        InspectorSection(title: "Outputs for next scan") {
             Label(
                 sessionModel.masterTIFFEnabled
                     ? "Master scans are append-only and are never overwritten."
@@ -431,7 +495,7 @@ struct BatchInspectorView: View {
             }
 
             InspectorToggleRow(label: "Auto crop derived outputs", isOn: autoCropEnabledBinding)
-            Text("Each frame's positive and JPEG are cropped to that frame's own detected image area at scan time. The master TIFF always keeps the full frame, and every crop is recorded in the frame's receipt, so this is reversible by re-rendering.")
+            Text("Crops processed exports at scan time; scanner previews are unchanged. A retained master TIFF keeps the full frame for later re-rendering. Without a retained master, changing the crop may require another scan.")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.scanStudioSecondaryText)
                 .fixedSize(horizontal: false, vertical: true)
@@ -469,7 +533,7 @@ struct BatchInspectorView: View {
                 InspectorRow(label: "Autofocus", value: sessionModel.autofocusEachFrame ? "Each frame" : "Off")
                 InspectorRow(label: "Auto exposure", value: sessionModel.autoExposureEachFrame ? "Each frame" : "Off")
                 InspectorRow(label: "Digital ICE", value: digitalIceSummary)
-                InspectorRow(label: "Saved outputs", value: activeOutputsSummary)
+                InspectorRow(label: "Requested outputs", value: activeOutputsSummary)
             }
 
             InspectorSection(title: histogramSectionTitle) {

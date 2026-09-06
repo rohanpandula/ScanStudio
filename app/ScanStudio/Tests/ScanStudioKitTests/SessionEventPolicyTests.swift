@@ -23,7 +23,36 @@ private actor ProjectFlowEngineStub: EngineClientProtocol {
     nonisolated let events: AsyncStream<EngineEvent>
     var engineVersion: String? = "project-flow-stub"
     private let project: ScanProject
+    private let recoveryDevice = DeviceInfo(
+        deviceId: "sim-recovery", model: "Simulator", kind: "simulated",
+        firmware: "test", connection: "virtual", supported: true, supportedMultisamplePasses: [1, 2, 4]
+    )
     private let suspendProjectOpen: Bool
+    private var pendingContinuation: CheckedContinuation<Void, Never>?
+    private var pendingWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingRequestCount = 0
+    private var scanRequests: [[Int]] = []
+    private var suspendPendingFrames = false
+    private var failPendingFrames = false
+
+    func configurePendingFrames(suspend: Bool = false, fail: Bool = false) {
+        suspendPendingFrames = suspend
+        failPendingFrames = fail
+    }
+
+    func waitForPendingFrames() async {
+        guard pendingContinuation == nil else { return }
+        await withCheckedContinuation { pendingWaiters.append($0) }
+    }
+
+    func resumePendingFrames() {
+        pendingContinuation?.resume()
+        pendingContinuation = nil
+    }
+
+    func recoveryRequests() -> (pending: Int, scans: [[Int]]) {
+        (pendingRequestCount, scanRequests)
+    }
     private var openContinuation: CheckedContinuation<Void, Never>?
 
     init(project: ScanProject, suspendProjectOpen: Bool = false) {
@@ -38,13 +67,42 @@ private actor ProjectFlowEngineStub: EngineClientProtocol {
     ) async throws -> Result {
         let value: any Sendable
         switch method {
-        case "scanner.list": value = ScannerListResult(devices: [])
+        case "scanner.list": value = ScannerListResult(devices: [recoveryDevice])
+        case "scanner.connect":
+            value = ConnectResult(device: recoveryDevice, status: ScannerStatus(
+                connected: true, adapter: nil, mediaLoaded: false, carrier: nil,
+                frameCount: nil, lamp: "stable", transport: "idle", activeJobId: nil
+            ))
         case "project.create": value = ProjectCreateResult(project: project, directory: "/tmp/positive-roll")
         case "project.open":
             if suspendProjectOpen {
                 await withCheckedContinuation { openContinuation = $0 }
             }
             value = ProjectOpenResult(project: project, directory: "/tmp/positive-roll")
+        case "project.pendingFrames":
+            pendingRequestCount += 1
+            if suspendPendingFrames && pendingRequestCount == 1 {
+                await withCheckedContinuation { continuation in
+                    pendingContinuation = continuation
+                    for waiter in pendingWaiters { waiter.resume() }
+                    pendingWaiters.removeAll()
+                }
+            }
+            if failPendingFrames {
+                throw EngineRequestError(code: "RECOVERY_READ_FAILED", message: "fixture read failed", recoverable: true)
+            }
+            value = PendingFramesResult(
+                frames: project.frames.filter { !$0.excluded && $0.receipts.isEmpty }.map(\.index),
+                totalFrames: project.frameCount,
+                completedCount: project.frames.filter { !$0.receipts.isEmpty }.count,
+                excludedCount: project.frames.filter(\.excluded).count
+            )
+        case "scan.start":
+            guard let start = params as? ScanStartParams else {
+                throw ProjectFlowStubError.unexpectedMethod(method)
+            }
+            scanRequests.append(start.frames)
+            value = ScanStartResult(jobId: "recovery-job-\(scanRequests.count)")
         case "sim.loadMedia":
             value = ScannerStatus(
                 connected: true,
@@ -1310,6 +1368,152 @@ struct SessionEventPolicyTests {
                 )
             )
         )
+    }
+
+    @MainActor
+    private func prepareRecoveryModel(_ client: ProjectFlowEngineStub) async -> SessionModel {
+        let model = SessionModel(engineClient: client)
+        await model.connect()
+        await model.openProject(directory: "/tmp/recovery")
+        await model.loadCarrier(.strip6)
+        let token = PreviewIntentToken()
+        #expect(await model.requestPreview(.refreshSavedProject(token: token)) == .started)
+        establishCompletedPreview(frameCount: 6, operationID: token.id.uuidString, on: model)
+        #expect(model.scanReadiness(for: [1]).isReady)
+        return model
+    }
+
+    @Test("recovery refuses cached pending frames when the authoritative read fails")
+    @MainActor
+    func recoveryReadFailureNeverStartsCachedFrames() async throws {
+        let client = ProjectFlowEngineStub(project: try projectLifecycleFixture(id: "recovery", completedFrames: [4]))
+        let model = await prepareRecoveryModel(client)
+        await client.configurePendingFrames(fail: true)
+        await model.resumeBatch()
+        #expect(await client.recoveryRequests().scans.isEmpty)
+        #expect(model.lastErrorMessage?.contains("RECOVERY_READ_FAILED") == true)
+        #expect(model.pendingFrames == [1, 2, 3, 5, 6])
+    }
+
+    @Test("recovery rejects duplicate resume and competing scan while the pending read is held")
+    @MainActor
+    func recoveryPendingReadOwnsResume() async throws {
+        let client = ProjectFlowEngineStub(project: try projectLifecycleFixture(id: "recovery", completedFrames: [4]))
+        let model = await prepareRecoveryModel(client)
+        await client.configurePendingFrames(suspend: true)
+        let resume = Task { await model.resumeBatch() }
+        await client.waitForPendingFrames()
+        #expect(model.isResumingBatch)
+        await model.resumeBatch()
+        await model.scanSingleFrame(1)
+        #expect(await client.recoveryRequests().pending == 1)
+        #expect(await client.recoveryRequests().scans.isEmpty)
+        await client.resumePendingFrames()
+        await resume.value
+        #expect(await client.recoveryRequests().scans == [[1, 2, 3, 5, 6]])
+        #expect(!model.isResumingBatch)
+    }
+
+    @Test("recovery pending read cannot overwrite a reopened snapshot of the same project")
+    @MainActor
+    func recoveryReadCannotCrossProjectReopen() async throws {
+        let client = ProjectFlowEngineStub(project: try projectLifecycleFixture(id: "recovery", completedFrames: [4]))
+        let model = await prepareRecoveryModel(client)
+        await client.configurePendingFrames(suspend: true)
+        let refresh = Task { await model.refreshPendingFrames() }
+        await client.waitForPendingFrames()
+        await model.openProject(directory: "/tmp/recovery")
+        model.beginJob(id: "new-job", frames: [1])
+        model.handle(event: try completedFrameEvent(jobId: "new-job", frameIndex: 1))
+        await client.resumePendingFrames()
+        await refresh.value
+        #expect(model.pendingFrames == [2, 3, 5, 6])
+        #expect(model.completedFrameCount == 2)
+        #expect(model.latestCompletedPreviewOperationId == nil)
+        #expect(await client.recoveryRequests().scans.isEmpty)
+    }
+
+    @Test("recovery counts durable receipts while another completed frame is being rescanned")
+    @MainActor
+    func recoveryReceiptCountIgnoresTemporaryRescanState() async throws {
+        let client = ProjectFlowEngineStub(project: try projectLifecycleFixture(id: "recovery", completedFrames: [4, 5]))
+        let model = await prepareRecoveryModel(client)
+        model.beginJob(id: "new-job", frames: [1, 4, 5])
+        model.handle(event: try completedFrameEvent(jobId: "new-job", frameIndex: 1))
+        #expect(model.completedFrameCount == 3)
+        model.handle(event: EngineEvent(name: "engine.terminated", rawLine: Data()))
+        #expect(model.frameStates == [1: .completed, 4: .completed, 5: .completed])
+        #expect(model.pendingFrames == [2, 3, 6])
+        #expect(model.latestCompletedPreviewOperationId == nil)
+        #expect(model.jobId == nil)
+        await model.resumeBatch()
+        #expect(await client.recoveryRequests().scans.isEmpty)
+    }
+
+    @Test("recovery of a stopped batch requires a new preview and an explicit resume")
+    @MainActor
+    func recoveryStoppedBatchNeedsFreshPreview() async throws {
+        let client = ProjectFlowEngineStub(project: try projectLifecycleFixture(id: "recovery", completedFrames: [4]))
+        let model = await prepareRecoveryModel(client)
+        model.beginJob(id: "stopped-job", frames: [1, 2])
+        model.handle(event: EngineEvent(name: "scan.completed", rawLine: Data(
+            #"{"event":"scan.completed","payload":{"jobId":"stopped-job","summary":{"completed":[],"failed":[],"skipped":[],"stopped":true}}}"#.utf8
+        )))
+        #expect(model.latestCompletedPreviewOperationId == nil)
+        #expect(model.requiresFreshPreview)
+        #expect(!model.hasCompletePreviewRegistration)
+        #expect(!model.scanReadiness(for: [1]).isReady)
+        await model.resumeBatch()
+        #expect(await client.recoveryRequests().scans.isEmpty)
+        let token = PreviewIntentToken()
+        #expect(await model.requestPreview(.refreshSavedProject(token: token)) == .started)
+        establishCompletedPreview(frameCount: 6, operationID: token.id.uuidString, on: model)
+        #expect(await client.recoveryRequests().scans.isEmpty)
+        await model.resumeBatch()
+        #expect(await client.recoveryRequests().scans == [[1, 2, 3, 5, 6]])
+    }
+
+    @Test("recovery keeps unsaved project transforms across engine loss and a fresh preview")
+    @MainActor
+    func recoveryPreservesUnsavedProjectTransforms() async throws {
+        let client = ProjectFlowEngineStub(project: try projectLifecycleFixture(id: "recovery", completedFrames: [4]))
+        let model = await prepareRecoveryModel(client)
+        model.rotateFrame(1, by: 90)
+        model.toggleFrameMirror(1)
+        model.rollMetadataDraft = MetadataSet(notes: "Unsaved notes")
+        #expect(model.hasUnsavedProjectChanges)
+        model.handle(event: EngineEvent(name: "engine.terminated", rawLine: Data()))
+        #expect(model.frameOrientation(1) == 90)
+        #expect(model.frameMirror(1))
+        #expect(model.rollMetadataDraft.notes == "Unsaved notes")
+        #expect(model.hasUnsavedProjectChanges)
+        await model.connect()
+        await model.loadCarrier(.strip6)
+        let token = PreviewIntentToken()
+        #expect(await model.requestPreview(.refreshSavedProject(token: token)) == .started)
+        establishCompletedPreview(frameCount: 6, operationID: token.id.uuidString, on: model)
+        #expect(model.frameOrientation(1) == 90)
+        #expect(model.frameMirror(1))
+        #expect(await client.recoveryRequests().scans.isEmpty)
+    }
+
+    @Test("recovery cancellation and engine loss retire a pending resume", arguments: [true, false])
+    @MainActor
+    func recoveryResumeRequiresCurrentAuthorization(cancel: Bool) async throws {
+        let client = ProjectFlowEngineStub(project: try projectLifecycleFixture(id: "recovery", completedFrames: [4]))
+        let model = await prepareRecoveryModel(client)
+        await client.configurePendingFrames(suspend: true)
+        let resume = Task { await model.resumeBatch() }
+        await client.waitForPendingFrames()
+        if cancel {
+            resume.cancel()
+        } else {
+            model.handle(event: EngineEvent(name: "engine.terminated", rawLine: Data()))
+        }
+        await client.resumePendingFrames()
+        await resume.value
+        #expect(await client.recoveryRequests().scans.isEmpty)
+        #expect(model.completedFrameCount == 1)
     }
 
     @Test("Save Roll preserves the selected frames from its completed preview")

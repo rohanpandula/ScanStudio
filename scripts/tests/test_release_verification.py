@@ -270,6 +270,34 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_repository_release_workflow_passes_structural_policy(self) -> None:
         WORKFLOW.verify_release_workflow(self.source)
 
+    def test_publish_download_must_supply_the_same_run_provenance_root(self) -> None:
+        download = (
+            "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0\n"
+            "        with:\n"
+            "          name: ScanStudio-dmg-arm64\n"
+            "          path: ${{ runner.temp }}/arm64\n"
+        )
+        self.assertIn(download, self.source)
+        self.assert_rejected(self.source.replace(download, "", 1), "download")
+        self.assert_rejected(
+            self.source.replace(download, download.replace("/arm64", "/x86_64"), 1), "download"
+        )
+
+    def test_package_gates_cannot_restore_intel_or_tolerate_failure(self) -> None:
+        self.assert_rejected(
+            self.source.replace("runs-on: macos-15", "runs-on: macos-15-intel", 1),
+            "Apple Silicon",
+        )
+        for original, replacement in (
+            ("name: Self-contained package build (arm64)",
+             "name: Self-contained package build (arm64)\n    strategy: {matrix: {arch: [arm64, x86_64]}}"),
+            ("name: App and engine tests", "name: App and engine tests\n    continue-on-error: true"),
+        ):
+            with self.subTest(replacement=replacement), self.assertRaises(WORKFLOW.ReleaseWorkflowError):
+                WORKFLOW.verify_release_workflow(
+                    self.source, self.verification_source.replace(original, replacement, 1)
+                )
+
     def test_called_verify_workflow_cannot_drop_a_family_or_policy_check(self) -> None:
         without_family = self.verification_source.replace(
             "      - updater-integration\n", "", 1
@@ -293,7 +321,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assert_rejected(
             self.source.replace(
                 "needs: [authorize, verify, verification-gate]",
-                "needs: [release, windows, linux]",
+                "needs: [release]",
                 1,
             ),
             "publish needs",
@@ -303,7 +331,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             "always",
         )
         self.assert_rejected(
-            self.source.replace("      - linux\n", "", 1),
+            self.source.replace("      - release\n", "", 1),
             "verification-gate needs",
         )
 

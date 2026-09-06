@@ -12,8 +12,8 @@ import unittest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 VERIFIER = REPOSITORY_ROOT / "scripts" / "verify_coolscanpy_source.py"
-VENDORED_SOURCE = REPOSITORY_ROOT / "ports" / "tauri" / "vendor" / "coolscanpy"
-with (VENDORED_SOURCE / "pyproject.toml").open("rb") as _pyproject_handle:
+CANONICAL_SOURCE = REPOSITORY_ROOT / "coolscanpy"
+with (CANONICAL_SOURCE / "pyproject.toml").open("rb") as _pyproject_handle:
     PROJECT_VERSION = tomllib.load(_pyproject_handle)["project"]["version"]
 
 
@@ -35,14 +35,14 @@ class VerifyCoolscanPySourceTests(unittest.TestCase):
             text=True,
         )
 
-    def test_exact_vendored_source_passes(self) -> None:
-        completed = self.run_verifier(VENDORED_SOURCE)
+    def test_exact_canonical_source_passes(self) -> None:
+        completed = self.run_verifier(CANONICAL_SOURCE)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_one_byte_source_mutation_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             source = Path(temporary_directory) / "coolscanpy"
-            shutil.copytree(VENDORED_SOURCE, source)
+            shutil.copytree(CANONICAL_SOURCE, source, ignore=shutil.ignore_patterns(".venv", "__pycache__", ".pytest_cache", ".git"))
             usb_backend = (
                 source
                 / "src"
@@ -79,7 +79,7 @@ class VerifyCoolscanPySourceTests(unittest.TestCase):
             )
 
             completed = self.run_verifier(
-                VENDORED_SOURCE,
+                CANONICAL_SOURCE,
                 "--metadata-root",
                 str(metadata_root),
                 "--provenance",
@@ -94,7 +94,7 @@ class VerifyCoolscanPySourceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             completed = self.run_verifier(
-                VENDORED_SOURCE,
+                CANONICAL_SOURCE,
                 "--metadata-root",
                 str(metadata_root),
                 "--provenance",

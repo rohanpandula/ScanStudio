@@ -3,6 +3,12 @@
 # The SDK is never a runtime dependency and must never be copied into the app.
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" \
+    || "${SCANSTUDIO_RELEASE_ARCH:-arm64}" != "arm64" ]]; then
+    print -u2 "ScanStudio packaging requires Apple Silicon (arm64) macOS; Intel/Rosetta and other architecture requests are unsupported."
+    exit 64
+fi
+
 script_dir="${0:A:h}"
 package_root="${script_dir:h}"
 repository_root="${package_root:h:h}"
@@ -153,17 +159,7 @@ if [[ -z "$binding_destination" && "$#" -ne 1 ]]; then
 fi
 
 host_arch="$(uname -m)"
-case "$host_arch" in
-    arm64)
-        host_sane_path="/opt/homebrew/opt/sane-backends/lib/libsane.1.dylib"
-        ;;
-    x86_64)
-        host_sane_path="/usr/local/opt/sane-backends/lib/libsane.1.dylib"
-        ;;
-    *)
-        die "unsupported macOS build architecture: $host_arch"
-        ;;
-esac
+host_sane_path="/opt/homebrew/opt/sane-backends/lib/libsane.1.dylib"
 sentinel_install_name="/__ScanStudio_SANE_Link_SDK_ONLY_${sane_version//./_}_${host_arch}__/libsane.1.dylib"
 
 require_new_directory "SANE link SDK destination" "$sdk_destination"

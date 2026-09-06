@@ -61,8 +61,8 @@ tmp/
 
 # Vendor software, local secrets, and packaging staging
 /vendor/
-/ports/tauri/vendor/engine/target/
-/ports/tauri/packaging/.staging/
+# Retired app ports may leave local build caches in existing checkouts.
+/ports/
 *.exe
 *.dll
 *.sys

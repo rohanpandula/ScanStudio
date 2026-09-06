@@ -1,5 +1,0 @@
-{
-  "identifier": "default",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "os:default"]
-}

@@ -5,6 +5,12 @@
 # directly must remain disarmed.
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" \
+    || "${SCANSTUDIO_RELEASE_ARCH:-arm64}" != "arm64" ]]; then
+    print -u2 "ScanStudio packaging requires Apple Silicon (arm64) macOS; Intel/Rosetta and other architecture requests are unsupported."
+    exit 64
+fi
+
 script_dir="${0:A:h}"
 package_root="${script_dir:h}"
 source_app="${1:-$package_root/.build/ScanStudio.app}"
@@ -13,6 +19,15 @@ if [[ ! -x "$source_app/Contents/MacOS/scanstudio-bridge" ]]; then
     print -u2 "Packaged bridge check requires a packaged app with Contents/MacOS/scanstudio-bridge: $source_app"
     exit 66
 fi
+
+for binary in "$source_app/Contents/MacOS/ScanStudio" \
+    "$source_app/Contents/MacOS/scanstudio-engine" \
+    "$source_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"; do
+    if [[ "$(lipo -archs "$binary")" != "arm64" ]]; then
+        print -u2 "Packaged bridge check requires arm64 binaries: $binary"
+        exit 1
+    fi
+done
 
 workdir="$(mktemp -d)"
 cleanup() { rm -rf "$workdir"; }
@@ -75,7 +90,7 @@ if [[ -z "$libusb_minimum" || "$libusb_minimum" != "$app_minimum" ]]; then
 fi
 app_architectures="$(lipo -archs "$relocated_app/Contents/MacOS/ScanStudio")"
 libusb_architectures="$(lipo -archs "$bundled_libusb")"
-if [[ "$libusb_architectures" != "$app_architectures" ]]; then
+if [[ "$app_architectures" != "arm64" || "$libusb_architectures" != "$app_architectures" ]]; then
     print -u2 "packaged bridge check failed: bundled libusb architecture '$libusb_architectures' does not match app '$app_architectures'"
     exit 1
 fi
@@ -88,18 +103,7 @@ if (( ${#python_sane_extensions} != 1 || ${#python_sane_dist_info} != 1 )); then
     exit 1
 fi
 python_sane_extension="${python_sane_extensions[1]}"
-case "$app_architectures" in
-    arm64)
-        python_sane_host_path="/opt/homebrew/opt/sane-backends/lib/libsane.1.dylib"
-        ;;
-    x86_64)
-        python_sane_host_path="/usr/local/opt/sane-backends/lib/libsane.1.dylib"
-        ;;
-    *)
-        print -u2 "packaged bridge check failed: unsupported app architecture '$app_architectures' for python-sane"
-        exit 1
-        ;;
-esac
+python_sane_host_path="/opt/homebrew/opt/sane-backends/lib/libsane.1.dylib"
 python_sane_minimum="$(vtool -show-build "$python_sane_extension" | awk '$1 == "minos" { print $2; exit }')"
 if [[ "$(lipo -archs "$python_sane_extension")" != "$app_architectures" \
     || "$python_sane_minimum" != "$app_minimum" ]]; then
@@ -528,6 +532,9 @@ if [[ -e "$workdir/engine isolated bridge base/hw-motion-armed" ]]; then
     print -u2 "packaged bridge check failed: engine handshake created an armed latch"
     exit 1
 fi
+# Exercise saved image decoding and interrupted-batch recovery using this exact
+# relocated engine and Python runtime. The acceptance process is simulator-only.
+"$runtime_python" -I -B "$package_root/../../scripts/verify_mac_acceptance.py" "$relocated_app"
 if find "$relocated_app" \( -name '__pycache__' -o -name '*.pyc' \) -print -quit | grep -q .; then
     print -u2 "packaged bridge check failed: bridge execution wrote bytecode into the signed app"
     exit 1

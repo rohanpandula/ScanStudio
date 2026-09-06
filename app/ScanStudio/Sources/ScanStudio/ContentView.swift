@@ -157,6 +157,7 @@ struct ContentView: View {
                                 .transition(.opacity)
                         }
                     }
+                    .disabled(sessionModel.isResumingBatch)
                     .frame(minWidth: 680, maxWidth: .infinity, maxHeight: .infinity)
                     .animation(.easeOut(duration: 0.22), value: sessionModel.isAcquiringThumbnails)
                 }
@@ -1060,7 +1061,7 @@ private struct PreProjectPreviewWorkspaceView: View {
 
     private var calloutCopy: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("\(sessionModel.thumbnailCount) previews ready · \(sessionModel.selectedFrameCount) selected")
+            Text("\(sessionModel.thumbnailCount) scanner previews · \(sessionModel.selectedFrameCount) selected")
                 .font(.system(size: 15, weight: .semibold))
             Text(calloutGuidance)
                 .font(.system(size: 11))
@@ -1084,7 +1085,7 @@ private struct PreProjectPreviewWorkspaceView: View {
         if unresolvedReviewCount > 1 {
             return "\(unresolvedReviewCount) selected frames need boundary checks. Save now; those reviews open next, before any scan starts."
         }
-        return "Save once to name this roll and start scanning the selected frames."
+        return "These are scanner previews, not saved captures. Name and save the roll, then scan the selected frames."
     }
 
     private var calloutActions: some View {
@@ -1183,11 +1184,13 @@ private struct PreviewGateWorkspaceView: View {
                 .foregroundStyle(Color.scanStudioAmber)
             Text(sessionModel.device?.kind == "real" && sessionModel.project == nil ? "Preview the film first" : "Preview the film")
                 .font(.system(size: 19, weight: .semibold))
-            Text(sessionModel.device?.kind == "real" && sessionModel.project == nil
-                ? "Read the frame previews to detect the actual frame count before saving the roll."
-                : "Read the frame previews before choosing frames to scan.")
+            Text(sessionModel.project != nil
+                ? "The saved roll is open. Acquire fresh scanner previews to register the loaded film before scanning again. Saved files remain available in the inspector."
+                : "Acquire scanner previews to find frames and check boundaries. Save the roll before capturing full-resolution images.")
                 .font(.system(size: 13))
                 .foregroundStyle(Color.scanStudioSecondaryText)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 520)
             HardwareMotionReadinessView()
                 .frame(maxWidth: 520)
             if let project = sessionModel.project {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify a CoolscanPy source snapshot without importing its dependency graph.
 
-The cross-platform packages intentionally ship CoolscanPy source.  This gate
+ScanStudio packages the canonical CoolscanPy source. This gate
 loads only the stdlib-only capture-bundle modules, binds their resource reads
 to the supplied source tree, and verifies the exact bytes that will ship.  It
 also requires one version across pyproject.toml, uv.lock, optional generated

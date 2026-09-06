@@ -10,7 +10,7 @@ import sys
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_MATRIX = Path("docs/HARDWARE-SUPPORT.md")
-LIVE_GUIDES = (Path("README.md"), Path("ports/tauri/README.md"))
+LIVE_GUIDES = (Path("README.md"), Path("app/ScanStudio/README.md"))
 OBSOLETE_LIVE_PHRASES = (
     "v0.3.0-beta.1",
     "v0.3.0-beta.2",
