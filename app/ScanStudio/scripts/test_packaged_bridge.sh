@@ -166,6 +166,7 @@ output="$workdir/bridge.ndjson"
 bridge="$relocated_app/Contents/MacOS/scanstudio-bridge"
 engine="$relocated_app/Contents/MacOS/scanstudio-engine"
 runtime_python="$relocated_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"
+"$runtime_python" -I -S -B "$package_root/../../scripts/smoke_project_persistence.py" "$engine"
 runtime_sysconfig="$relocated_app/Contents/Resources/BridgeRuntime/python/lib/python3.13/_sysconfigdata__darwin_darwin.py"
 coolscanpy_pyproject="$relocated_app/Contents/Resources/CorrespondingSource/coolscanpy/pyproject.toml"
 if [[ ! -f "$runtime_sysconfig" || -L "$runtime_sysconfig" ]] \

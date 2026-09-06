@@ -714,6 +714,11 @@ function Invoke-EngineSmoke {
         throw "Expected exactly one engine sidecar under $Tree, found $($engines.Count): $engines"
     }
 
+    # Exercise filesystem operations in both the installed and portable builds
+    # (#100); a hello/list handshake never touches project persistence.
+    & python -I -S -B (Join-Path $portRoot '..\..\scripts\smoke_project_persistence.py') $engines[0].FullName
+    if ($LASTEXITCODE -ne 0) { throw 'Packaged engine project persistence failed' }
+
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $engines[0].FullName
     $startInfo.UseShellExecute = $false
