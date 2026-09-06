@@ -40,6 +40,9 @@ jobs:
           cargo build --locked --manifest-path ports/tauri/vendor/engine/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I -S -B scripts/smoke_project_persistence.py ports/tauri/vendor/engine/target/debug/scanstudio-engine.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path ports/tauri/vendor/engine/Cargo.toml --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   windows-resources:
     name: Assemble Windows offline resources
