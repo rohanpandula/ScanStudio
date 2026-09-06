@@ -96,7 +96,63 @@ The re-run with candidate #2 (this fix set) is recorded below as it happens.
 
 ### Candidate #2 run
 
-Pending.
+Candidate #2 was a Developer ID-signed local package of commit `7b8dbe0`
+(this fix set minus the later presentation-only batch-summary change).
+
+- **Cold launch reproduced the startup timeout** (17:36:07–17:36:22 UTC):
+  the first bridge handshake exceeded the engine's 10 s deadline and the app
+  showed "Scanner discovery failed … bridge call timed out". "Look Again"
+  spawned a second bridge that listed the scanner 5 s later. Candidate #1's
+  first launch had failed the same way, silently. The cause of the slow first
+  handshake (first-run validation of a freshly signed bundle, cold Python
+  imports, or the scanner right after power-on) is not yet measured.
+- **Connect, preview:** connected at 17:37:58; explicit preview 17:38:37–
+  17:38:56 (19.4 s), six frames; boundaries for frames 1 and 6 reviewed and
+  accepted at zero offset.
+- **Capture:** batch started 17:42:33 with all six slots on the held
+  reservation. Frames 1–5 completed in 148.8, 186.9, 187.0, 186.1 and 187.5 s
+  (4 passes, 4000 ppi, 16-bit, RGB + infrared, ICE Legacy). Each archive TIFF
+  is 5959×3946 16-bit RGB (141,085,556 bytes) with a 16-bit infrared TIFF
+  (47,028,684 bytes) and a 281×425 four-channel meter TIFF; positive TIFFs are
+  5959×3946 16-bit and preview JPEGs 8-bit. All fifteen receipt bindings
+  matched SHA-256, byte length, inode and volume.
+- **Frame 6 refused** at 17:58:24 by the driver's bounded exposure-meter
+  controller: `meter pass 3 final controller refused: nonconverged`. The
+  metering window's central signal sat at the 65535 ceiling through three
+  passes (R 90000 → 76500 → 65025 raw 10 ns, the bounded 0.85 ratio each
+  time); the final update of 0.150 exceeded the 0.050 limit. The worker
+  released the scanner cleanly (`unit_released: true`, transport idle) and
+  no retry was attempted. The driver wrapped the refusal as `RollMismatch`,
+  the engine surfaced INTERNAL/ROLL_MISMATCH, and the app showed "Failed: 06"
+  with no reason while offering Resume and Retry; fixed in this PR at the
+  presentation layer (batch summary and footer show the reason for any
+  failed frame; the "controller refused" phrase keeps the exposure
+  guidance).
+- **Images (subjective, no reference):** frames 1–5 are complete scenes
+  matching their previews, sharp on the subject at 100%, with a strong
+  magenta/blue cast from the default blind render, clipped sky highlights in
+  frame 2, and visible dust specks at 100% with ICE Legacy on frame 1.
+  Orientation is as scanned (rotated, mirrored text); no per-frame rotation
+  or mirror was applied.
+
+Evidence: `/Users/rohan/ScanStudio-QA/short-strip-20260906/candidate-2/`
+(signature, hashes, log snapshots at preview start, capture start, frame-6
+failure and completion, inspection crops) and the roll under
+`~/ScanStudio Projects/qa-short-strip-20260906-c41-run2-proj-18d2cc3a47016f10`.
+
+Follow-ups recorded from this run, in addition to the two above:
+
+- The meter controller's three bounded passes at a 0.85 ratio can only cut
+  exposure by about 39% from the seed; a frame whose window is saturated
+  beyond that is always refused. Evaluate more passes or a wider first step
+  when linearity is confirmed, and carrying the previous frame's result as
+  the seed for an explicitly locked roll (step 5 below) — in CoolscanPy,
+  with a fixture from this frame's meter evidence.
+- CoolscanPy reports the meter refusal as `RollMismatch`; it should carry
+  `MeterControllerRefused` so no phrase matching is needed downstream.
+- Measure the cold bridge handshake on a freshly signed bundle before
+  changing the 10 s deadline; two cold launches failed it, two warm rescans
+  took about 5 s.
 
 ## Implementation order and acceptance
 

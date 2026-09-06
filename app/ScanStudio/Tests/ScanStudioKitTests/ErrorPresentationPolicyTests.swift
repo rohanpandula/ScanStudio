@@ -21,6 +21,20 @@ struct ErrorPresentationPolicyTests {
         #expect(presentation.technicalDetails == rawMessage)
     }
 
+    @Test("a meter controller refusal wrapped as ROLL_MISMATCH keeps its exposure guidance")
+    func meterControllerRefusalWrappedAsRollMismatch() {
+        let rawMessage = "INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH): "
+            + "SynchronizedProtocolError: meter pass 3 final controller refused: nonconverged"
+
+        let presentation = ErrorPresentationPolicy.make(lastErrorMessage: rawMessage)
+
+        #expect(presentation.title == "Exposure control stopped safely")
+        #expect(presentation.guidance.contains("will not retry automatically"))
+        #expect(presentation.technicalDetails == rawMessage)
+        #expect(presentation.canPlaceFramesManually == false)
+        #expect(presentation.canApproveEveryFrameAndScan == false)
+    }
+
     @Test("medium-not-present during batch positioning is a clear feed interruption")
     func filmFeedInterrupted() {
         let rawMessage = "FILM_FEED_INTERRUPTED: bridge scan.frameFailed "

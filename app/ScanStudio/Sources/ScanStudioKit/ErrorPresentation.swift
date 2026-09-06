@@ -280,6 +280,7 @@ public enum ErrorPresentationPolicy {
             ?? filmTransportSlipCopy(in: lastErrorMessage)
             ?? unattendedBindingConfidenceCopy(in: lastErrorMessage)
             ?? previewReadinessTimeoutCopy(in: lastErrorMessage)
+            ?? meterControllerRefusalCopy(in: lastErrorMessage)
             ?? knownCopy.first {
                 $0.code != ScanFailureCode.attendedBindingRequired
                     && containsCode($0.code, in: normalizedMessage)
@@ -428,6 +429,20 @@ public enum ErrorPresentationPolicy {
                 + "binding requires. Refeeding the strip or previewing it again may raise "
                 + "that confidence."
         )
+    }
+
+    /// The driver's bounded exposure-meter controller refusal. CoolscanPy's
+    /// batch worker raises it wrapped in a generic `RollMismatch`, so it
+    /// reaches the app as `INTERNAL: bridge scan.frameFailed (ROLL_MISMATCH):
+    /// SynchronizedProtocolError: meter pass 3 final controller refused:
+    /// nonconverged` and never carries the METER_CONTROLLER_REFUSED code
+    /// (live LS-5000 QA, 2026-09-06, frame 6 of a six-frame strip). The
+    /// phrase is unique to the worker's `_raise_meter_controller_refusal`.
+    private static func meterControllerRefusalCopy(in message: String) -> Copy? {
+        guard message.range(of: "controller refused", options: .caseInsensitive) != nil else {
+            return nil
+        }
+        return knownCopy.first { $0.code == "METER_CONTROLLER_REFUSED" }
     }
 
     private static func previewReadinessTimeoutCopy(in message: String) -> Copy? {

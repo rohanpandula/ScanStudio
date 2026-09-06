@@ -15,7 +15,7 @@ Latest release notes: [v0.7.0-beta.15](releases/v0.7.0-beta.15.md).
 
 | Host and scanner | Package built | Device enumerated | Preview exercised | One-frame capture validated | Support / next evidence |
 | --- | --- | --- | --- | --- | --- |
-| Apple Silicon macOS + LS-5000 USB | Yes | Yes | Yes | Yes, on one Mac/scanner configuration | **Beta.** More firmware, adapter, macOS, and media diversity is human-owned in [#23](https://github.com/rohanpandula/ScanStudio/issues/23). |
+| Apple Silicon macOS + LS-5000 USB | Yes | Yes | Yes | Yes, on one Mac/scanner configuration; five of six frames of a C-41 short strip on the 2026-09-06 beta.15 candidate (firmware 1.03, SA-30), the sixth refused by the exposure-meter controller | **Beta.** Full-roll attended run still pending. More firmware, adapter, macOS, and media diversity is human-owned in [#23](https://github.com/rohanpandula/ScanStudio/issues/23). |
 | LS-40 / Coolscan IV and LS-50 / Coolscan V USB | Packages contain identity recognition only | No retained packaged-app field result | No | No | **Unsupported for scanning.** Identification evidence is requested in [#27](https://github.com/rohanpandula/ScanStudio/issues/27). |
 | LS-4000, LS-8000, and LS-9000 FireWire | No scanning package | Yes, discovery and a motion-free probe on modern macOS | No | No | **Unsupported for scanning.** Driver-probe evidence and the remaining hardware work are tracked in [#28](https://github.com/rohanpandula/ScanStudio/issues/28). |
 
