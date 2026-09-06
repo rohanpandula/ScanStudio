@@ -150,9 +150,14 @@ Follow-ups recorded from this run, in addition to the two above:
   with a fixture from this frame's meter evidence.
 - CoolscanPy reports the meter refusal as `RollMismatch`; it should carry
   `MeterControllerRefused` so no phrase matching is needed downstream.
-- Measure the cold bridge handshake on a freshly signed bundle before
-  changing the 10 s deadline; two cold launches failed it, two warm rescans
-  took about 5 s.
+- Measured later the same day: cold handshakes exceeded 10 s on three of
+  five first launches of freshly signed bundles (warm respawns about 5 s),
+  and `device.open` took about 8 s on three connects and over 10 s on two
+  connects right after film was re-fed (standalone: discovery 6.5 s + open
+  5.6 s). The engine now bounds `bridge.hello` at 45 s and `device.open` at
+  60 s instead of the generic 10 s control-plane timeout; the slow
+  discovery itself (about 6.5 s of libusb enumeration and inquiry) is still
+  worth profiling in CoolscanPy.
 
 ## Implementation order and acceptance
 

@@ -19,6 +19,10 @@ use crate::sim::SimulatedLs5000;
 /// whenever `SCANSTUDIO_BRIDGE_CMD` is configured (`Backends::from_env` is
 /// the only place this constant is used).
 const DEFAULT_BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Test-visible alias so `real_backend`'s deadline tests can pin their bounds
+/// against the one generic control-plane timeout.
+#[cfg(test)]
+pub(crate) const DEFAULT_BRIDGE_TIMEOUT_FOR_TESTS: std::time::Duration = DEFAULT_BRIDGE_TIMEOUT;
 
 /// In-memory tracking of whichever project is currently "open" in the
 /// engine (the one most recently created or opened). Every request is
