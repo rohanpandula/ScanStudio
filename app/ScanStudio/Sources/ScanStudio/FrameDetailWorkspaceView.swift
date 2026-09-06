@@ -267,74 +267,72 @@ struct FrameDetailWorkspaceView: View {
         let mirrored = sessionModel.frameMirror(frameIndex)
         let verticallyMirrored = sessionModel.frameVerticalMirror(frameIndex)
 
-        return VStack(alignment: .leading, spacing: 6) {
-            viewingModeSwitcher
-            orientationControls
-
-            // `ZStack`, not `Group`: `Group`'s multiple children are NOT
-            // overlaid — inside this VStack, a second simultaneous Group
-            // child would become a separate row rather than a layer on top
-            // of the image. This ZStack keeps every modifier below chained
-            // after it exactly as before, so the defect markers inherit the
-            // SAME scaleEffect/offset the image gets and never drift off
-            // the image on pinch-zoom/pan.
-            ZStack {
-                // Preview of the persisted derivative rotation
-                // (`SessionModel.rotateFrame`).
-                // The image and the defect markers rotate together by the same
-                // angle about the same center: marker coordinates are defined
-                // in the UNROTATED frame (DefectOverlayCanvas, DefectMapView.swift),
-                // so the overlay gets the identical rotationEffect below to stay
-                // registered to the now-rotated pixels.
-                Group {
-                    if let realImage {
-                        Image(nsImage: realImage)
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        SimulatedFrameImage(frameIndex: frameIndex, isAvailable: isAvailable)
-                    }
-                }
-                .scaleEffect(
-                    x: mirrored ? -1 : 1,
-                    y: verticallyMirrored ? -1 : 1
-                )
-                .rotationEffect(.degrees(Double(orientationDegrees)))
-                if viewingMode == .defectMap {
-                    defectMapOverlayContent(
-                        orientationDegrees: orientationDegrees,
-                        mirrored: mirrored,
-                        verticallyMirrored: verticallyMirrored
-                    )
+        // `ZStack`, not `Group`: `Group`'s multiple children are NOT
+        // overlaid — inside this VStack, a second simultaneous Group
+        // child would become a separate row rather than a layer on top
+        // of the image. This ZStack keeps every modifier below chained
+        // after it exactly as before, so the defect markers inherit the
+        // SAME scaleEffect/offset the image gets and never drift off
+        // the image on pinch-zoom/pan.
+        let previewImage = ZStack {
+            // Preview of the persisted derivative rotation
+            // (`SessionModel.rotateFrame`).
+            // The image and the defect markers rotate together by the same
+            // angle about the same center: marker coordinates are defined
+            // in the UNROTATED frame (DefectOverlayCanvas, DefectMapView.swift),
+            // so the overlay gets the identical rotationEffect below to stay
+            // registered to the now-rotated pixels.
+            Group {
+                if let realImage {
+                    Image(nsImage: realImage)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    SimulatedFrameImage(frameIndex: frameIndex, isAvailable: isAvailable)
                 }
             }
-            .scaleEffect(zoomState.scale)
-            .offset(zoomState.panOffset)
-            // Swap to portrait (2:3) at 90/270 so the rotated frame fits instead
-            // of being clipped to the landscape box (rotationEffect does not
-            // resize layout bounds).
-            .aspectRatio(
-                FrameOrientation.displayAspectRatio(orientationDegrees),
-                contentMode: .fit
+            .scaleEffect(
+                x: mirrored ? -1 : 1,
+                y: verticallyMirrored ? -1 : 1
             )
-            .frame(maxWidth: .infinity, minHeight: 360, maxHeight: 480)
-            .background {
-                GeometryReader { geometry in
-                    Color.clear
-                        .onAppear { zoomState.updateViewportSize(geometry.size) }
-                        .onChange(of: geometry.size) { _, size in
-                            zoomState.updateViewportSize(size)
-                        }
-                }
+            .rotationEffect(.degrees(Double(orientationDegrees)))
+            if viewingMode == .defectMap {
+                defectMapOverlayContent(
+                    orientationDegrees: orientationDegrees,
+                    mirrored: mirrored,
+                    verticallyMirrored: verticallyMirrored
+                )
             }
-            .background(.black)
-            .clipShape(RoundedRectangle(cornerRadius: 5))
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.12)))
-            // Keep the preview's changing description scoped to the image
-            // before adding interactive overlays. Applying this label after
-            // `zoomControls` causes SwiftUI to replace each button's own
-            // accessible name with the preview description.
-            .accessibilityLabel(previewAccessibilityLabel(usesRealImage: realImage != nil))
+        }
+        .scaleEffect(zoomState.scale)
+        .offset(zoomState.panOffset)
+        // Swap to portrait (2:3) at 90/270 so the rotated frame fits instead
+        // of being clipped to the landscape box (rotationEffect does not
+        // resize layout bounds).
+        .aspectRatio(
+            FrameOrientation.displayAspectRatio(orientationDegrees),
+            contentMode: .fit
+        )
+        .frame(maxWidth: .infinity, minHeight: 360, maxHeight: 480)
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { zoomState.updateViewportSize(geometry.size) }
+                    .onChange(of: geometry.size) { _, size in
+                        zoomState.updateViewportSize(size)
+                    }
+            }
+        }
+        .background(.black)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.12)))
+        // Keep the preview's changing description scoped to the image
+        // before adding interactive overlays. Applying this label after
+        // `zoomControls` causes SwiftUI to replace each button's own
+        // accessible name with the preview description.
+        .accessibilityLabel(previewAccessibilityLabel(usesRealImage: realImage != nil))
+
+        let accessiblePreview = previewImage
             .accessibilityHint("Zoom in, then use the arrow keys while the preview is focused to pan.")
             .focusable()
             .focused($isPreviewFocused)
@@ -358,6 +356,8 @@ struct FrameDetailWorkspaceView: View {
                     .stroke(isPreviewFocused ? Color.scanStudioCyan : .clear, lineWidth: 2)
                     .allowsHitTesting(false)
             }
+
+        let decoratedPreview = accessiblePreview
             .overlay(alignment: .topTrailing) { zoomControls }
             .overlay(alignment: .bottomLeading) {
                 if viewingMode == .defectMap {
@@ -408,6 +408,11 @@ struct FrameDetailWorkspaceView: View {
             }
             .contentShape(Rectangle())
             .gesture(SimultaneousGesture(magnifyGesture, panGesture))
+
+        return VStack(alignment: .leading, spacing: 6) {
+            viewingModeSwitcher
+            orientationControls
+            decoratedPreview
 
             if FrameAlignmentAvailabilityPolicy.isVisible(
                 deviceKind: sessionModel.device?.kind
