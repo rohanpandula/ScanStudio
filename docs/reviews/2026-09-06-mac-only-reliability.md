@@ -32,6 +32,19 @@ separate `codex/mac-only-reliability` checkout.
   artifact download. The download is restored before provenance verification;
   policy tests reject a missing, duplicate, wrong-root, or cross-run download.
 
+## Real-driver integration follow-up
+
+GitHub #111 revealed that the bridge expected `Device.info`, which only its
+fake exposed. Beta.14 publication was cancelled before any release assets were
+published. The beta.15 follow-up uses public discovery and exact-ID open, and
+adds a regression through the real driver facade with hardware dispatch blocked.
+
+The follow-up review also covers acknowledged Stop before worker startup,
+Stop around lazy batch reservation, held-child cleanup before first iteration,
+unknown direct-USB diagnostic capacity, and confirmed eject without a second
+presence probe. Matching driver fixes are released through canonical CoolscanPy
+before ScanStudio publication; the PyPI parity gate is retained.
+
 ## Verification boundaries
 
 The canonical engine suite, Swift suites, root policy tests, packaging guards,

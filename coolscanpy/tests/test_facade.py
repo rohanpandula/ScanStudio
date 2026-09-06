@@ -3853,7 +3853,7 @@ class TestRollScanMany:
             roll.close()
 
             assert list(iterator) == []
-            assert events == ["preview-hold-ready"]
+            assert events == ["preview-hold-ready", "hold-ack-release"]
         finally:
             roll.close()
             dev.close()
@@ -6186,3 +6186,126 @@ def test_thumbnail_from_slot_carries_partial_through_to_the_public_thumbnail() -
 
     assert partial_thumbnail.partial is True
     assert full_thumbnail.partial is None
+
+
+@pytest.mark.parametrize("ending", ["stop", "iterator-close", "roll-close", "abandon"])
+def test_unstarted_batch_releases_held_child(fake_service_factory, tmp_path, ending):
+    events = []
+    dev = _open_device(fake_service_factory)
+    roll, _ = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+    try:
+        roll.preview()
+        if roll.needs_approval(1):
+            roll.approve(1)
+        held = roll._held_session
+        iterator = roll.scan_many([1])
+        if ending == "stop":
+            roll.safe_stop()
+            with pytest.raises(coolscanpy.SafeStopRequested):
+                next(iterator)
+            iterator.close()
+        elif ending == "iterator-close":
+            iterator.close()
+        elif ending == "roll-close":
+            roll.close()
+        else:
+            del iterator
+            gc.collect()
+        assert events == ["preview-hold-ready", "hold-ack-release"]
+        assert held.process.poll() is not None
+        assert not dev._lock.locked()
+        roll.close()
+        assert events.count("hold-ack-release") == 1
+    finally:
+        roll.close()
+        dev.close()
+
+
+def test_failed_batch_reservation_retains_held_child(fake_service_factory, tmp_path):
+    events = []
+    dev = _open_device(fake_service_factory)
+    roll, _ = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+    try:
+        roll.preview()
+        if roll.needs_approval(1):
+            roll.approve(1)
+        held = roll._held_session
+        dev._acquire_io_lock("competing operation")
+        try:
+            with pytest.raises(coolscanpy.DeviceBusy):
+                roll.scan_many([1])
+        finally:
+            dev._release_io_lock()
+        assert roll._held_session is held
+        roll.close()
+        assert events == ["preview-hold-ready", "hold-ack-release"]
+    finally:
+        roll.close()
+        dev.close()
+
+
+@pytest.mark.parametrize("ending", ["stop", "close"])
+@pytest.mark.parametrize("teardown_raises", [False, True])
+def test_unstarted_batch_retains_ownership_when_teardown_is_uncertain(
+    fake_service_factory, tmp_path, monkeypatch, ending, teardown_raises
+):
+    events = []
+    dev = _open_device(fake_service_factory)
+    roll, _ = _make_roll(tmp_path, dev, batch_spawner=_success_spawner(events))
+    roll.preview()
+    if roll.needs_approval(1):
+        roll.approve(1)
+    held = roll._held_session
+    iterator = roll.scan_many([1])
+    with monkeypatch.context() as patch:
+        def uncertain_teardown(*a, **k):
+            if teardown_raises:
+                raise RuntimeError("cleanup failed")
+            return False
+        patch.setattr(roll._adapter, "teardown_held_session", uncertain_teardown)
+        with pytest.raises(coolscanpy.DeviceBusy, match="shutdown was not confirmed"):
+            if ending == "stop":
+                roll.safe_stop()
+                next(iterator)
+            else:
+                iterator.close()
+        with pytest.raises(coolscanpy.DeviceBusy):
+            roll.close()
+        with pytest.raises(coolscanpy.DeviceBusy):
+            dev.close()
+        with pytest.raises(coolscanpy.DeviceBusy):
+            roll.scan_many([1])
+        assert roll._pending_held_session is held
+        assert dev._lock.locked()
+        assert roll._attempts_root.is_dir()
+    # Test-only resolution of the deliberately retained ownership token.
+    assert roll._adapter.teardown_held_session(held, error=RuntimeError("test cleanup"))
+    iterator._ownership_uncertain = False
+    iterator.close()
+    roll.close()
+    dev.close()
+
+
+def test_unstarted_batch_preserves_evidence_after_nonclean_confirmed_exit(
+    fake_service_factory, tmp_path, monkeypatch
+):
+    dev = _open_device(fake_service_factory)
+    roll, _ = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]), attempts_root=None)
+    try:
+        roll.preview()
+        if roll.needs_approval(1):
+            roll.approve(1)
+        teardown = roll._adapter.teardown_held_session
+        def nonclean_exit(*args, **kwargs):
+            assert teardown(*args, **kwargs)
+            return False
+        monkeypatch.setattr(roll._adapter, "teardown_held_session", nonclean_exit)
+        iterator = roll.scan_many([1])
+        iterator.close()
+        assert not dev._lock.locked()
+        roll.close()
+        assert roll._attempts_root.is_dir()
+        assert roll._evidence_preservation_reason is not None
+    finally:
+        roll.close()
+        dev.close()

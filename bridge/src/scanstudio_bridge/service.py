@@ -944,6 +944,11 @@ class BridgeService:
         self._lane_held = True
         self._motion_op_active = True
 
+        # The real transport must arm its job stop latch before the worker
+        # starts: scan.stop/shutdown can arrive before start_scan() enters.
+        prepare_scan = getattr(self._transport, "prepare_scan", None)
+        if callable(prepare_scan):
+            prepare_scan()
         self._seen_job_ids.add(job_id)
         job_record: dict = {"job_id": job_id, "terminal": False}
         self._last_job = job_record

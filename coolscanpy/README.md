@@ -1,406 +1,379 @@
-# coolscanpy
+# CoolscanPy
 
-coolscanpy is a direct-USB acquisition library for Nikon Coolscan film
-scanners. It exposes a python-sane-style API: open a device, read and set
-typed options, call `scan()` and get back an array. On top of that plain
-surface it adds a roll-feeder extension for whole-roll workflows. A roll can
-be previewed across all 40 addressable slots, each frame's transport spacing
-adjusted individually, then batch-scanned in one continuous reservation.
+CoolscanPy 0.7.6 is a standalone Python acquisition library for the Nikon
+Super Coolscan 5000 ED (LS-5000). Its main path previews a strip or roll,
+binds reviewed frame positions to that insertion, and captures color-negative
+frames over direct USB. It returns scanner-linear pixels and acquisition
+evidence for an application to save, repair, and render.
 
-Each scanned frame comes back as:
-- scanner-linear RGB (4000 dpi, 16-bit)
-- an aligned infrared plane
-- the 285 dpi RGBI meter pass the scanner captured for auto-exposure (see
-  `Frame.meter_rgbi`)
-- an in-memory receipt with exposure, clipping, focus, and transport-smear
-  telemetry
+There is no GUI. The package does not require ScanStudio or NegPy, and its
+public API does not depend on either application.
 
-## Status
+This directory is ScanStudio’s pinned driver source, with explicitly reviewed
+app integrations. Its release gate compares package source with the published
+canonical driver and pins both sides of each intentional difference. For the
+standalone repository, use [rohanpandula/coolscanpy](https://github.com/rohanpandula/coolscanpy/tree/port/cross-platform).
 
-This code was extracted from a working NegPy integration branch. On real
-hardware, an LS-5000 running firmware 1.03 with an SA-21 roll feeder
-converted to SA-30 wiring, that integration produced full-roll previews and
-4000 dpi 16-bit RGBI captures with receipts, and those captures fed the
-downstream dust-repair pipeline.
+## Scope and support
 
-The current source tree collects 911 hardware-free tests covering the
-transport protocol, roll engine, capture finalization, receipt assembly, and
-public facade against synthetic fixtures and replay data. CI runs that suite
-and Ruff on Ubuntu and macOS with Python 3.13 and 3.14. Windows is not in the
-CI matrix and has not run the direct-USB transport against real hardware.
+| Area | Contract in 0.7.6 |
+| --- | --- |
+| Scanner | LS-5000. Other recognized Coolscan models can appear in discovery with `supported=False`; `open()` refuses them. |
+| Roll adapter | Strip-feeder identities `6Strip` and `36Strip` are accepted. A positively identified mount adapter is refused by the roll path. This allowlist is not a hardware-validation matrix. |
+| Color negatives | `Material.COLOR_NEGATIVE`: direct-USB preview, review, batch fine capture, infrared, meter pass, and receipts. |
+| Black-and-white negatives | Preview and approval are available. Roll fine capture is not wired; `Roll.scan()` and `scan_many()` raise `NotImplementedError`. |
+| Fine-capture format | LS-5000 single-pass 4000 dpi, 16-bit RGBI acquisition. This is a fixed capture contract, not arbitrary resolution or scanner support. |
+| Plain `Device.scan()` | A separate, SANE-backed array API requiring the optional `scanner` extra and host SANE support. |
+| Platforms | Hardware-free CI runs on Ubuntu and macOS with Python 3.13 and 3.14. Windows has no CI or validated transport claim; concurrency tests assume POSIX locking. |
 
-Live validation ran on 2026-07-18 with the packaged wheel installed into a
-clean environment against a powered LS-5000, with no SANE installed: USB
-enumeration, `open()`, option introspection, and a full roll preview of a
-6-slot strip. The transport index read cleanly, slots 1 through 4 came
-back aligned with no manual spacing offset, slot 5 was flagged for manual
-review near the strip end, and slot 6 was correctly reported as a 2-row
-trailing sliver rather than a frame. That run exposed one real bug, fixed
-in 0.1.1: roll fingerprinting rejected strips with a trailing sliver.
+Tests use synthetic devices and protocol replays. They do not establish
+compatibility with every firmware or feeder modification. No live-scanner
+validation is claimed for 0.7.6; [CHANGELOG.md](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/CHANGELOG.md) records earlier changes.
 
-The 0.1.3 short-strip fixes allow preview and fine scanning of strips shorter
-than a full roll. The current source also accepts the normal end-of-roll case
-where a fresh transport table has fewer usable records than the reviewed
-preview; it still refuses a count above the reviewed table, a mismatched visual
-fingerprint, or a requested slot that is no longer addressable.
-
-The 285 dpi meter pass is now surfaced on every frame. The scanner already
-captures three of these per frame during auto-exposure; the third (settled
-exposure) is decoded and attached to the `Frame`. Downstream tools that
-need a dual-capture (prepass + main) can use it directly. See the
-[downstream pipeline](#downstream-pipeline) section.
-
-C-41 fine scans expose RGB to Nikon Scan's rendering intent by default.
-The auto-exposure loop still converges exactly as before, but the commanded
-fine-scan RGB exposures are now a guarded Nikon-like target derived from
-the settled meter pass. Live v3 validation used fine-scan fractions
-R 0.950337, G 0.987481, and B 0.983639. Across three matched physical
-frames, the Nikon-referenced full-scale channel biases were R +0.823…+2.086
-%, G +0.146…+1.033 %, and B -0.391…+0.822 %, with a 0.9129 % mean absolute
-bias. Under the explicitly defined complement statistic (100 % minus mean
-absolute full-scale channel bias), that is 99.0871 % average full-scale
-RGB-channel agreement. Mean 8x8-smoothed ΔE00 improved from 2.8469 to
-2.1413 (-24.8 %). These figures describe this three-frame validation set;
-they are neither a byte-identity claim nor a universal perceptual-accuracy
-percentage. Highlights are capped at a reviewed q99.99 threshold and the
-device exposure bounds, both journaled; infrared metering is unchanged; and
-each frame's journal carries an `active_exposure_authority` record binding
-the active solve, the guarded candidate, and the exact commanded contract,
-so the receipt trail proves which numbers reached the scanner and why.
-
-For the proven LS-5000 full-record geometry, fine-scan decoding now starts
-while the raw capture is still arriving. This is an advisory fast path: the
-raw capture remains the oracle, and an absent, slow, malformed, or failed
-streaming sidecar falls back to the normal offline decode without interrupting
-or blocking the scanner read. Set `COOLSCANPY_CAPTURE_STREAMING=0` to disable
-this optimization. The streaming path is covered by hardware-free tests; no
-additional live-hardware claim is made for it here.
-
-Coverage is uneven by material. `Material.COLOR_NEGATIVE` scans through a
-direct-USB single-pass path and is implemented end to end, preview through
-receipt. `Material.BLACK_AND_WHITE_NEGATIVE` previews and approves
-correctly, but its fine-scan path routes through SANE and that route is not
-yet wired into the roll batch engine; calling `scan()` or `scan_many()` on
-a black-and-white roll raises `NotImplementedError` with a message
-explaining the gap.
-
-## Downstream pipeline
-
-coolscanpy gets the raw data off the scanner. Three other projects turn it
-into a finished image:
-
-**[digital-fauxice](https://github.com/rohanpandula/digital-fauxice)** —
-infrared dust and scratch repair. A byte-exact, from-scratch
-reimplementation of Digital ICE (the Nikon/Applied Science Fiction process
-that uses the IR channel to find defects and reconstruct the RGB underneath).
-Validated against Nikon's own output: 68 million 16-bit values per frame,
-zero mismatches. It takes the 4000 dpi RGBI main scan plus the 285 dpi
-meter pass as its prepass, and produces the same repaired output Nikon
-would have. An optional hybrid mode routes the worst damage (where the
-exact repair leaves visible scars) to a LaMa inpainting model, disclosed
-and bounded. The meter pass coolscanpy now surfaces on `Frame` is exactly
-what fauxice's input contract expects — same physical frame, same focus,
-same transport position, captured milliseconds before the fine scan.
-
-**[cool-colors](https://github.com/rohanpandula/cool-colors)** — C-41
-color inversion. Turns the scanner-linear negative into a positive,
-reproducing Nikon Scan 4's CMS-off color pipeline bit-for-bit (the
-per-frame inversion LUT, fixed tone curve, and gamma 2.2). With a
-captured per-frame builder LUT, output matches Nikon Scan byte-for-byte.
-Without it, a principled density inversion (film-base estimation, log
-inversion, normalization) gets you a natural positive from any C-41 scan.
-
-**[NegPy](https://github.com/marcinz606/NegPy)** — the desktop
-application that ties capture, repair, and inversion together behind a
-GUI. It consumes coolscanpy as an optional scanner backend, digital-fauxice
-as an optional IR repair engine, and runs its own inversion pipeline for
-the final print rendering.
-
-The pipeline in order: coolscanpy captures → fauxice repairs dust →
-cool-colors (or NegPy) inverts to a positive. Each step is optional and
-independently installable.
+Version 0.7.6 fixes held-session cleanup before batch iteration and retains
+ownership when child shutdown is uncertain; see [cleanup contracts](#reservation-stop-and-cleanup-contracts).
 
 ## Install
 
-```
-pip install coolscanpy
-```
+Use Python 3.13 or later in a virtual environment:
 
-coolscanpy requires Python 3.13 or later. To use the current checkout rather
-than an index release, install it in editable mode:
-
-```
-python -m pip install -e .
+```sh
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install 'coolscanpy==0.7.6'
 ```
 
-The base install covers `get_devices()`, `open()`, `Device.eject()`, and the
-roll preview, registration, and color-capture operations under
-`Device.roll()`. None of those needs SANE. `get_devices()`/`open()` fall back
-to direct USB enumeration when python-sane is not installed, the roll-feeder
-capture extension talks to the scanner over raw USB in a separate process
-regardless, and `Device.eject()` (and `Roll.eject()`, which delegates to it)
-replays the scanner's own traced unload sequence over that same raw-USB
-transport.
+Direct USB requires a host libusb 1.0 runtime that PyUSB can load. Typical
+package-manager commands are:
 
-Standalone/source installs still need a host libusb shared library for PyUSB.
-On macOS, install it with `brew install libusb`. ScanStudio's release DMG is a
-separate distribution shape that includes and pins its own signed libusb, so
-ScanStudio users do not need that Homebrew installation for color-roll work.
+```sh
+# macOS, with Homebrew
+brew install libusb
 
-SANE is needed only for the plain `Device.scan()` path:
-
-```
-pip install "coolscanpy[scanner]"
+# Debian / Ubuntu
+sudo apt install libusb-1.0-0
 ```
 
-On macOS, that build needs sane-backends' headers, and Homebrew does not put
-them on the default include path:
+The process needs USB access permission and exclusive interface ownership.
+Close competing scanner applications and resolve surviving workers before
+opening a replacement session. Frozen applications must bundle libusb; see
+the [loader contract](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py).
 
+Discovery, the color roll workflow, presence probing, and `Device.eject()`
+use the base installation. SANE is not required for those paths.
+
+### Optional SANE path
+
+Install the extra only when using the plain `Device.scan()` API or the
+SANE-based diagnostic workflows:
+
+```sh
+python -m pip install 'coolscanpy[scanner]==0.7.6'
 ```
+
+Building `python-sane` requires host SANE headers. On macOS:
+
+```sh
 brew install sane-backends
-CPPFLAGS="-I$(brew --prefix)/include" LDFLAGS="-L$(brew --prefix)/lib" pip install "coolscanpy[scanner]"
+CPPFLAGS="-I$(brew --prefix)/include" \
+LDFLAGS="-L$(brew --prefix)/lib" \
+python -m pip install 'coolscanpy[scanner]==0.7.6'
 ```
 
-On Linux, `sudo apt install libsane-dev` before the plain `pip install`
-above is usually enough.
+On Debian / Ubuntu, install `libsane-dev` before installing the extra.
+The extra does not expand scanner support or enable black-and-white roll capture.
 
-## Quickstart
-
-Plain scan, the python-sane-shaped path:
+## Discover and open a device
 
 ```python
 import coolscanpy
 
-dev = coolscanpy.open("ls5000")
-print(dev.option_names)
-print(dev["resolution"].constraint)
+for info in coolscanpy.get_devices():
+    print(info.id, info.model, info.supported, info.capabilities)
 
-dev.resolution = 4000
-dev.depth = 16
-rgb = dev.scan()  # uint16, shape (H, W, 3)
-dev.close()
+with coolscanpy.open("ls5000") as device:
+    print(device.capabilities)
+    print(device.option_names)
 ```
 
-Roll workflow:
+`get_devices()` returns `DeviceInfo` objects. It tries SANE enumeration and
+falls back to direct USB when SANE is unavailable, fails, or finds no
+Coolscan. There is no network transport. The `"ls5000"` alias requires one
+supported attached scanner; use an exact discovery ID to disambiguate.
+`open()` rechecks discovery and support.
+
+Read identity from the discovery result and capabilities from
+`device.capabilities`; there is no public `device.info` property. USB-only
+capabilities are conservative: an unknown `adapter_frame_capacity` can be
+`None`, and `can_eject=False` is not a gate on the direct-USB `eject()` method.
+
+## Preview, review, and scan color negatives
+
+The following interactive example writes preview TIFFs for review, asks for
+an explicit slot selection, and saves the selected frames. It performs real
+scanner I/O when run with a connected scanner. Use a new output directory
+for each insertion; the retained attempt directory contains the acquisition
+journals and intermediate evidence.
 
 ```python
-import coolscanpy
+from contextlib import closing
+from pathlib import Path
 
-with coolscanpy.open("ls5000") as dev:
-    with dev.roll(material=coolscanpy.Material.COLOR_NEGATIVE) as roll:
+import coolscanpy
+import tifffile
+
+output = Path("roll-capture").resolve()
+output.mkdir()  # Refuse to overwrite an earlier capture directory.
+
+with coolscanpy.open("ls5000") as device:
+    with device.roll(
+        material=coolscanpy.Material.COLOR_NEGATIVE,
+        attempts_root=output / "attempts",
+    ) as roll:
         thumbnails = roll.preview()
+        for thumbnail in thumbnails:
+            tifffile.imwrite(
+                output / f"preview-{thumbnail.slot:02d}.tif", thumbnail.image
+            )
+            print(thumbnail.slot, thumbnail.needs_approval, thumbnail.warnings)
 
-        for thumb in thumbnails:
-            if thumb.needs_approval:
-                roll.approve(thumb.slot)
+        selected = [
+            int(slot) for slot in input(
+                "Inspect the saved previews, then enter approved slots (e.g. 1,2): "
+            ).split(",")
+        ]
+        for slot in selected:
+            if roll.attended_binding_available:
+                roll.approve(slot, attended=True)
+            elif roll.needs_approval(slot):
+                roll.approve(slot)
 
-        selected = [thumb.slot for thumb in thumbnails[:36]]
-        for frame in roll.scan_many(selected, eject_after=True):
-            print(frame.slot, frame.rgb.shape, frame.receipt.transport_smear.verdict)
-            # The 285 dpi RGBI meter pass, if present:
-            if frame.meter_rgbi is not None:
-                print("  prepass for fauxice:", frame.meter_rgbi.shape)
+        try:
+            with closing(roll.scan_many(selected, eject_after=True)) as frames:
+                for frame in frames:
+                    tifffile.imwrite(output / f"frame-{frame.slot:02d}-rgb.tif", frame.rgb)
+                    if frame.ir is not None:
+                        tifffile.imwrite(output / f"frame-{frame.slot:02d}-ir.tif", frame.ir)
+                    print(frame.slot, frame.receipt.transport_smear.verdict)
+        except coolscanpy.SafeStopRequested:
+            print("Stopped after completing the frame already in flight.")
 ```
 
-`roll.scan_many()` opens one continuous transport reservation for the whole
-list of slots and yields a `Frame` as each completes. `roll.scan(slot)` is
-sugar for scanning one slot. Calling `roll.safe_stop()` from another thread
-lets the frame in flight finish normally; the next one raises
-`SafeStopRequested` instead of starting. The `preview()` call above leaves
-its reservation open, which is why this `scan_many()` resumes it directly
-instead of needing a refeed -- and, left to run without `eject_after`, a
-*further* `scan_many()`/`scan()` call would resume it again, any number of
-times, on the same feed; see Safety model below for the exact scope of that
-hold.
+`preview()` performs a whole-roll transport read at approximately 97 dpi.
+Its optional `slots` argument filters thumbnails, not the hardware read.
+Up to 40 slots can be represented; inspect warnings and partial crops rather
+than assuming all are complete, scanner-addressable frames.
 
-`eject_after=True` ends the batch, once the last requested slot's frame is
-finalized, by replaying the scanner's own traced end-of-session eject
-sequence -- still inside this batch's original reservation -- before
-releasing, instead of the plain release every batch without it already
-performs when it was never holding anything. Leave it off (the default) and
-a batch that resumed a held reservation keeps that same reservation held
-afterward too -- the strip stays parked inside for a later
-`preview()`/`scan_many()`/`scan()` on the same feed, or an explicit
-`roll.eject()` -- rather than releasing. The other way to eject is
-`roll.eject()`, for the "I'm not scanning anything else on this roll" case:
-valid whenever a reservation is currently held, whether that is `preview()`'s
-own (before the first `scan_many()`/`scan()` consumes it) or a later batch's
-(before the next one, or an explicit `release()`). Either path raises
-`FeederParked` instead of completing if the traced sequence does not finish
-as expected -- most often a suspected transport wedge, for which a power
-cycle is the only demonstrated recovery.
+A new preview replaces the fingerprint and clears approvals. To adjust a
+boundary, use `set_spacing_offset(slot, offset_rows)` in native preview rows;
+it returns a re-cropped thumbnail and invalidates that slot's approval.
+`spacing_offset(slot)` reads the offset. Review the changed crop before
+approving again.
 
-Both `scan_many()` and `scan()` also accept an `exposure_override_10ns=(red,
-green, blue)` keyword: raw 10 ns hardware exposure ticks that replace the AE
-meter's own proposal for every frame in the batch, without changing what the
-meter itself measures.
+When `attended_binding_available` is true, automatic detection has medium
+confidence: use `approve(slot, attended=True)` for **every requested slot**,
+not just flagged slots. Low-confidence detection is not rescued by this
+approval. Approvals bind to the reviewed content and geometry, not to a
+permanent slot number.
 
-For live diagnostics or acceptance runs, pass an absolute caller-owned
-directory as `dev.roll(attempts_root=...)`. Preview rasters, transport tables,
-journals, and capture scratch written there survive `Roll.close()` for offline
-verification. Omitting it retains the self-cleaning temporary default.
+`scan_many()` reserves its lazy iterator before returning it. It freezes the
+selected slots, approvals, and reviewed session against concurrent mutation.
+Fully consume the iterator, or explicitly close it with `contextlib.closing`
+as above. `scan(slot)` is the one-slot convenience API.
 
-## Hardware support
+### Frames and evidence
 
-Tested: Nikon Super Coolscan 5000 ED (LS-5000), firmware 1.03, with an SA-21
-roll feeder wired for SA-30 compatibility.
+A color-roll `Frame` contains scanner-linear `rgb`, an `ir` plane and
+`ir_validity` mask, the settled 285 dpi `meter_rgbi` pass, and a `receipt`
+with exposure, clipping, focus, transport-smear, and artifact evidence.
+Optional evidence fields must be checked before use. RGB and infrared use
+the package's Nikon Scan storage orientation; the meter has its own
+acquisition geometry. `frame.prepare_digital_ice()` validates and returns
+the scanner-native inputs for a repair call, or refuses incomplete evidence.
 
-Untested: every other Coolscan model, and any roll feeder other than the
-SA-21/SA-30 configuration above. Platforms: the suite runs on Linux and
-macOS in CI. Windows is untested; the transport layer has never run there
-and the concurrency tests assume POSIX file-lock semantics. The code does not assume LS-5000-only
-behavior where the protocol is generic, but nothing beyond the one
-combination above has run against real film. Reports and pull requests
-against other bodies are welcome, and an LS-50 test is particularly wanted:
-its transport and optics differ from the LS-5000, and none of those
-differences are covered here yet.
+Pixels are not inverted or rendered for display. Clipping is informational;
+stopped-transport smear can refuse a frame. The guarded color-negative
+exposure solve records its commanded authority rather than promising color
+equivalence with another scanner application.
 
-On the tested LS-5000/SA-21, startup `READ(0x8f)` can return a complete
-self-declared shorter frame-table envelope with the observed `022b4b`
-data-underrun status. coolscanpy accepts that status only when the envelope is
-valid and shorter than the requested 40-slot maximum. The observed exact
-37-record canonical prefix is also bound to a matching shorter preview window
-and read allocation; the canonical 40-record path is unchanged. Every other
-short count, changed record prefix, malformed envelope, full-length underrun,
-or differently failed response still refuses before motion. The later live
-`0x8e` index and preview independently validate roll identity and frame
-addressability before any fine scan. If the live transport table has already
-entered its terminal `0x81xx`/`0x83xx` suffix, affected trailing slots remain
-visible for review but are deliberately not scanner-addressable on that
-insertion.
+Both scan methods accept `exposure_override_10ns=(red, green, blue)`:
+validated per-channel fine-exposure ticks, each 10 ns, independent of the
+meter measurements. Advanced contracts live alongside the implementation:
 
-Strips shorter than a full roll work for preview and, as of 0.1.3, for fine
-scanning too. A preview traversal parks a short strip at the transport
-end-stop. `preview()` keeps its reservation open, and every
-`scan_many()`/`scan()` call afterward -- not just the first -- resumes it
-directly instead of re-reading the index, so the ordinary preview-then-scan
-sequence no longer needs a refeed for that reason, on a short strip or a
-full roll. `RefeedRequired` still applies if a held reservation cannot be
-resumed (the scanner may have auto-ejected, or the held child died), if
-`release()` was called first, or to a batch on a feed that was never held
-in the first place: pull the strip out, reinsert it until the feeder grips,
-and run the batch again. Treat that refeed as a new registration.
+| Contract | Reference |
+| --- | --- |
+| Frame arrays, receipts, density ownership and repair inputs | [Public types](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/types.py) |
+| Validated manual placement and restored preview state | [Preview sessions](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/roll/preview_session.py), [Roll API](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/_roll.py) |
+| Short-strip geometry, terminal slots and fingerprint validation | [Transport index](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/protocol/ls5000_single_pass/roll_index.py) |
+| Capture resource and implementation hashes | [Bundle integrity](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/protocol/ls5000_single_pass/bundle.py) |
+| Strict EBDE padding validation and streaming/offline parity | [Packed decoder](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/protocol/ls5000_single_pass/packed.py) |
+| Streaming artifact validation and raw-capture fallback | [Capture finalization](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/capture/single_pass_workflow.py) |
 
-The converted SA-21 can park or eject a strip after an uncharacterized idle
-interval. Start the intended capture promptly after feeding. A transport-index
-stall or refusal is a stop condition: preserve the evidence, establish the
-physical media state, and do not retry the same insertion.
+Concurrent decoding is advisory: invalid or unavailable derived data falls
+back to the retained raw capture. `COOLSCANPY_CAPTURE_STREAMING=0` disables
+that optimization. It does not disable acquisition integrity checks.
 
-## Relationship to NegPy
+## Reservation, stop, and cleanup contracts
 
-coolscanpy is a dependency, the way NegPy already consumes python-sane or
-gphoto2. It does not import NegPy, and NegPy does not depend on it by
-default. A caller wires it in behind whatever extension seam their own
-application already uses for other scanner backends: open a device, run one
-roll to completion, close it.
+A successful preview leaves a child holding the scanner reservation. A
+batch resumes it without another frame-table traversal. A resumed batch
+that completes without stop or `eject_after=True` keeps the session held for
+the next batch. Without a held session, a batch starts a fresh reservation
+and releases it at completion. Repeating `preview()` supersedes the old hold
+and registration.
 
-## How this compares to SANE
+Use these operations according to the state you own:
 
-SANE's `coolscan3` backend is the mature, general route to these scanners:
-one API across many models, a daemon ecosystem, and a working eject. NegPy
-consumes it happily. coolscanpy exists for the narrower job SANE's frame
-API cannot express: archival capture with evidence. The honest split:
+| Operation | Meaning |
+| --- | --- |
+| `roll.safe_stop()` | Stop the current batch between frames. It does not abort a frame already being captured. The consumer receives completed frames followed by `SafeStopRequested`. |
+| Iterator `close()` | Stop and drain an active batch, or clean up an unstarted reservation, before relinquishing its ownership. |
+| `roll.release()` | Give up a still-held session between batches. This is not an eject. |
+| `roll.eject()` | Replay the held-session eject sequence within the existing reservation. Raises `EjectNotAvailable` when there is no held session. |
+| `scan_many(..., eject_after=True)` | Eject after the final requested frame. A safe stop takes priority and releases without ejecting. |
+| `roll.close()` | Close owned work and release the Roll reservation. Unconfirmed worker shutdown raises `DeviceBusy` and retains ownership. |
+| `device.eject()` | Direct-USB unload when the caller has no capture child owning the interface. It confirms absence before returning success; an already-empty transport is a no-op success. |
 
-| Capability | coolscanpy | SANE `coolscan3` |
-|---|---|---|
-| Single-pass 4000 dpi 16-bit RGBI contract | yes, fixed protocol | partial — RGB + separate IR handling, backend-dependent |
-| 285 dpi meter-pass surfaced per frame (`Frame.meter_rgbi`) | yes | no |
-| Density-calibration payloads exposed with hashes | yes | no |
-| Per-frame receipt telemetry (exposure vectors, clipping, focus, transport smear) | yes | no |
-| Per-frame + session journals on disk | yes | no |
-| Hash-pinned capture bundle provenance | yes | no |
-| Roll batch under one reservation with fingerprint identity checks | yes | no — per-frame `--frame n` |
-| Whole-roll preview with per-slot review states | yes | no |
-| Eject | direct-USB traced Unload plus presence confirmation | yes |
-| Scanner model breadth | one tested body (LS-5000/SA-30 wiring) | many Coolscan models |
-| Years in production | extracted 2026 | decades |
+Stop state is batch-scoped: creating a new batch resets the Roll stop event.
+An application that acknowledges cancellation for a larger job must keep
+its own job stop state across preparation, reservation, and retries. It
+must serialize that state with reservation and avoid starting another batch
+after acknowledging the stop. A pre-reservation call to `safe_stop()` alone
+does not cancel a future batch.
 
-They compose rather than compete: the direct-USB path owns color-roll capture,
-its evidence chain, and eject. A live LS-5000 color-roll preview, capture, and
-eject requires no SANE; discovery may use SANE when present, and the legacy
-plain-scan path still requires it.
+In 0.7.6, stopping before the first `next()`, closing an unstarted iterator,
+closing its Roll, or abandoning that iterator tears down its pending held
+child. A reservation failure leaves the original hold available for cleanup.
+If child exit cannot be confirmed, another batch or device close must not
+silently acquire ownership. The retained `DeviceBusy` state is a recovery
+condition, not an instruction to retry in a loop. Closing from an active
+progress callback is also refused; request a stop and let the owning caller
+complete cleanup instead.
 
-## Safety model
+`attempts_root` should be an absolute caller-owned directory when evidence
+must survive. Without it, CoolscanPy uses temporary storage that normal
+close removes; uncertain cleanup and other evidence-preserving failures
+retain it. Keep attempt journals and raw data until a failure is understood.
 
-A roll batch takes one reservation over the physical transport for its whole
-scan_many() call, not one per frame, and releases it exactly once on close.
-Requesting a safe stop never interrupts the frame currently being read; only
-the next one is affected.
+### Recovery
 
-`preview()` keeps its own reservation open rather than releasing
-immediately, so every `scan_many()`/`scan()` call that follows resumes it
-directly instead of reacquiring the transport, with no refeed needed, even
-on hardware that parks between reads. This is not limited to the first
-batch after a preview: a batch that completes without `eject_after=True`
-keeps the same reservation held for the next one too -- same child process,
-same reservation, same retained frame table, matching the vendor's own
-traced session shape (one `RESERVE_UNIT` from feed to eject, any number of
-fine scans in between, no repeated frame-table read, no intermediate
-`RELEASE_UNIT`) -- so a whole roll can be scanned across as many
-`scan_many()`/`scan()` calls as the caller wants without a refeed between
-them. `release()` gives up a still-held reservation explicitly at any point
-between batches, reverting to a fresh reservation on the next scan; calling
-`preview()` again always supersedes whatever reservation the one before it
-was holding, whether that was `preview()`'s own or a batch's. A cold batch
--- no preceding `preview()`, or one whose hold was already
-released/ejected/never established -- opens its own fresh reservation
-exactly as every batch always has, and can still raise `RefeedRequired` if
-the transport has parked by then; a batch resuming a held reservation whose
-child died in the meantime (auto-eject, crash) raises the same
-`RefeedRequired` rather than assuming the reservation is still good.
+| Result | What the caller should do |
+| --- | --- |
+| `ManualReviewRequired` | Review the current crop and geometry, then approve the requested slot. |
+| `FingerprintRefused` / `RollMismatch` | Do not capture using stale geometry; establish the media state and registration. |
+| `RefeedRequired` | The held reservation is unavailable. Treat a physical refeed as a new registration and preview again. |
+| `TransportIndexRefused` / `MeterControllerRefused` | Retain the typed failure evidence and investigate before retrying. |
+| `DeviceBusy` during shutdown | Keep ownership and evidence intact until the worker's state is resolved. |
+| `FeederParked` / `EjectFailed` | Establish whether film is still gripped; follow the reported physical remedy rather than automatically repeating unload. |
 
-Ejecting -- `scan_many(..., eject_after=True)` or `roll.eject()` on a
-still-held reservation -- replays the scanner's own traced end-of-session
-sequence inside the reservation already held, the same session shape a
-normal scan already uses, rather than releasing first and re-reserving to
-eject afterward. Every reply is checked against that trace; any deviation
-stops before another motion command is sent and raises `FeederParked`
-instead of reporting success, since a mid-motion failure with film still
-inside is exactly the case a power cycle, not a retry, is the documented
-recovery for. `EjectNotAvailable` is raised instead if nothing is currently
-held to eject -- no `preview()` has run yet, or the hold was already
-consumed by a `scan_many()`/`scan()` call that ended it with
-`eject_after=True`, or was released/ejected explicitly.
+`device.film_present()` returns `True`, `False`, or `None`. Unknown is not
+absent, and present is not proof that motion is safe. `Device.eject()` already
+confirms absence; a second presence probe should not turn its successful
+return into an error. A transport-index stall is a stop condition: preserve
+the attempt and do not repeatedly retry the same insertion.
 
-Before the first fine scan of a batch, the roll's fingerprint (bound at the
-last preview) is checked against a fresh read of the transport. If the
-comparison doesn't match, `FingerprintRefused` is raised instead of scanning
-under the wrong geometry. Separately, a slot whose transport origin was not
-confidently automatic must be approved against its current thumbnail before
-it can be fine-scanned; scanning an unapproved flagged slot raises
-`ManualReviewRequired`.
+For exact exception payloads and held-child teardown behavior, see
+[exceptions](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/exceptions.py) and the
+[capture process adapter](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/src/coolscanpy/protocol/ls5000_single_pass/capture_process.py).
 
-Every returned frame carries transport-smear and clipping telemetry.
-Clipping is informational and never gates a capture. An abnormal repeated
-tail from a stopped transport does gate: that frame is refused rather than
-returned with smeared rows.
+## Plain scan and diagnostic commands
 
-The concurrent decoder used for proven full-record captures is deliberately
-non-authoritative. It submits work without blocking the USB loop, has a
-bounded completion wait, and records its terminal state in the frame journal.
-Finalization consumes its derived artifact only after revalidating its schema,
-raw-stream binding, hash, NPY layout, and file identities; otherwise it decodes
-the retained raw stream offline.
+With the optional SANE installation, the python-sane-shaped path returns
+an array directly:
 
-## What this package is not
+```python
+import coolscanpy
 
-There is no GUI. The RGB comes back scanner-linear and unmodified; color
-inversion and print rendering belong to the application above this library
-(see [cool-colors](https://github.com/rohanpandula/cool-colors) for a
-standalone C-41 inverter, or
-[NegPy](https://github.com/marcinz606/NegPy) for the full desktop app).
-The infrared plane comes back raw as well, and both arrays are stored in
-Nikon Scan's own orientation rather than the scanner's native portrait
-readout, so `frame.rgb`/`frame.ir` line up with what Nikon Scan renders for
-the same frame with no extra rotation downstream. Turning the infrared
-plane into a defect mask and healing the dust it reveals is the job of
-[digital-fauxice](https://github.com/rohanpandula/digital-fauxice), which
-consumes this package's RGBI output directly — the `Frame.meter_rgbi`
-field is the 285 dpi prepass its input contract requires.
+with coolscanpy.open("ls5000") as device:
+    print(device["resolution"].constraint)
+    device.resolution = 4000
+    device.depth = 16
+    rgb = device.scan()
+    print(rgb.shape, rgb.dtype)
+```
 
-## License
+Plain scan options describe that path. They do not change the color-roll
+engine's fixed acquisition contract. `Device.cancel()` is the plain-scan
+cancellation API; use `Roll.safe_stop()` for a roll batch.
 
-GPL-3.0-only. The code began life on a fork branch of
-[NegPy](https://github.com/marcinz606/NegPy), marcinz606's film-negative
-processing application, and is republished here as a standalone package
-under the same license.
+Installed command entry points and diagnostic modules expose their own help:
+
+```sh
+coolscanpy-roll-scan --help
+coolscanpy-practical-parity --help
+python -m coolscanpy.cli.vpd_dump --help
+python -m coolscanpy.cli.perforation_probe --help
+python -m coolscanpy.cli.unload_timer --help
+python -m coolscanpy.cli.wedge_recovery --help
+```
+
+`coolscanpy-roll-scan` is a separate plan/registration workflow, with
+`prepare`, `status`, `approve`, `fine`, `full-negative`, and `forward-roll`
+commands; it is not a CLI wrapper for the `Roll` example above. Its live
+commands require `--live` and `NEGPY_ROLL_LIVE=YES`.
+`coolscanpy-practical-parity` uses SANE and requires `--live` for capture;
+its default probe can still contact hardware. The diagnostic modules also
+have different motion contracts: VPD, perforation, and unload-timer probes
+are read-only; wedge recovery can command motion. Read their help before
+invoking them on a scanner.
+
+## Develop and test in ScanStudio
+
+From the ScanStudio repository root, use its pinned **uv 0.11.30** toolchain:
+
+```sh
+(cd coolscanpy && uv sync --locked --dev --python 3.13)
+(cd coolscanpy && uv run --locked pytest -q)
+make bridge-test
+```
+
+The bridge lockfile uses this checkout-local source. Run its integration tests
+when changing the Device/Roll API as well as the driver’s own tests; a fake
+that exposes a nonexistent property cannot establish compatibility with the
+real facade.
+
+The suite uses synthetic devices, replay fixtures, and substituted transport
+boundaries. Optional dependencies or external archived captures can cause
+explicit skips. Passing tests do not establish attached-scanner compatibility.
+Use [Mac acceptance and recovery](../docs/MAC-ACCEPTANCE.md) for ScanStudio’s
+separate packaged-software gate and attended hardware evidence.
+
+The canonical release branch is `port/cross-platform`. Standalone development,
+locked builds, linting, and trusted publishing are documented in the
+[canonical README](https://github.com/rohanpandula/coolscanpy/blob/port/cross-platform/README.md).
+The canonical project’s build settings and release workflow are separate from
+this vendored directory’s packaging configuration.
+
+### Releasing a driver change
+
+1. Review and test the canonical driver change, preserving ScanStudio-specific
+   differences rather than copying the entire vendored package over upstream.
+2. Merge the green canonical PR and publish the matching version through its
+   existing [trusted publishing workflow](https://github.com/rohanpandula/coolscanpy/blob/port/cross-platform/.github/workflows/publish.yml).
+3. Update ScanStudio’s project/lockfile version and authenticated sdist pins.
+   Re-review and pin both sides of any intentional source differences.
+4. Run the parity gate from the ScanStudio repository root:
+
+```sh
+bash scripts/check_coolscanpy_pypi_sync.sh
+```
+
+The gate compares source bytes; equal version strings alone do not pass.
+ScanStudio’s release workflow requires it before signing and publishing the
+app. See [release policy](../docs/releases/README.md). Changes to capture-bundle
+files also require their integrity checks; `_roll.py` is outside that manifest
+and does not require a bundle reseal.
+
+## Downstream processing and license
+
+Applications can consume CoolscanPy as an acquisition dependency:
+[digital-fauxice](https://github.com/rohanpandula/digital-fauxice) handles
+infrared-guided repair, [cool-colors](https://github.com/rohanpandula/cool-colors)
+handles color-negative rendering, and
+[NegPy](https://github.com/marcinz606/NegPy) provides a desktop processing
+application. These are separate projects; installing CoolscanPy does not
+install them or assert equivalence between their rendered output and a
+particular scanner application.
+
+CoolscanPy originated in a NegPy fork and is distributed independently under
+[GPL-3.0-only](https://github.com/rohanpandula/coolscanpy/blob/v0.7.6/LICENSE).

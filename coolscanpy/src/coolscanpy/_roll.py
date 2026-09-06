@@ -202,12 +202,10 @@ class _OwnedRollBatchIterator(Iterator[Frame]):
         finally:
             try:
                 if terminal:
-                    self._release_roll_once()
+                    self._finish_definite_close()
             finally:
                 with self._condition:
                     self._executing_thread = None
-                    if terminal:
-                        self._closed = True
                     self._condition.notify_all()
 
     def close(self) -> None:
@@ -281,7 +279,13 @@ class _OwnedRollBatchIterator(Iterator[Frame]):
 
         try:
             self._release_roll_once()
-        finally:
+        except _BatchWorkerStillActive:
+            self._mark_ownership_uncertain()
+            with self._condition:
+                self._closing_thread = None
+                self._condition.notify_all()
+            raise
+        else:
             with self._condition:
                 self._closed = True
                 self._closing_thread = None
@@ -296,8 +300,9 @@ class _OwnedRollBatchIterator(Iterator[Frame]):
         with self._condition:
             if self._released:
                 return
-            self._released = True
         self._roll._batch_finished(self)
+        with self._condition:
+            self._released = True
 
     def __del__(self) -> None:
         # Roll keeps only a weak reference, so abandoning a temporary iterator
@@ -359,6 +364,9 @@ class Roll:
         # Also None if released/ejected (by release()/eject()/close(), or
         # eject_after=True) or if no preview() has run yet.
         self._held_session: HeldPreviewSession | None = None
+        # Owned by the lazy batch until its worker actually dispatches it.
+        # An unstarted generator cannot run cleanup on close().
+        self._pending_held_session: HeldPreviewSession | None = None
         # When set, close() keeps self._attempts_root on disk instead of
         # deleting it: the journal/preview/table evidence in there is what
         # explains a refused preview or a held child that could not be
@@ -1227,7 +1235,6 @@ class Roll:
             # same lock as everything else above, rather than lazily
             # inside the generator below.
             held = self._held_session
-            self._held_session = None
             iterator = self._scan_many(
                 batch_request,
                 ordered_slots,
@@ -1236,7 +1243,10 @@ class Roll:
                 eject_after,
                 held,
             )
-            return self._reserve_batch_locked(iterator)
+            owned = self._reserve_batch_locked(iterator)
+            self._pending_held_session = held
+            self._held_session = None
+            return owned
 
     def _scan_many(
         self,
@@ -1359,6 +1369,8 @@ class Roll:
         def run_batch() -> None:
             try:
                 try:
+                    with self._state_condition:
+                        self._pending_held_session = None
                     if held is not None and held.usable:
                         result = adapter.resume_held_session(
                             held, batch_request, frame_handler=frame_handler
@@ -1693,6 +1705,23 @@ class Roll:
         with self._state_condition:
             if self._active_batch_id != id(batch):
                 return
+            pending = self._pending_held_session
+        if pending is not None and pending.usable:
+            error = SafeStopRequested("batch ended before dispatching its held session")
+            try:
+                clean = self._ensure_adapter().teardown_held_session(pending, error=error)
+                exited = pending.process.poll() is not None
+            except BaseException as cleanup_error:
+                clean = exited = False
+                error.add_note(f"held-session teardown failed: {cleanup_error}")
+            if not clean or not exited:
+                self._preserve_evidence(str(error))
+            if not exited:
+                raise _BatchWorkerStillActive(
+                    "held child shutdown was not confirmed; USB ownership is retained"
+                ) from error
+        with self._state_condition:
+            self._pending_held_session = None
             self._active_batch = None
             self._uncertain_batch = None
             self._active_batch_id = None
