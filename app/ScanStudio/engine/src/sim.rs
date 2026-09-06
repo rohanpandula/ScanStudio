@@ -1976,7 +1976,18 @@ mod tests {
         )
         .unwrap();
         let positive = written.positive_path.as_ref().unwrap();
-        std::fs::rename(positive, root.join("engine-positive.tif")).unwrap();
+        let renamed = std::fs::rename(positive, root.join("engine-positive.tif"));
+        if cfg!(windows) {
+            assert!(renamed.is_err(), "held Windows output must deny replacement");
+            build_receipt(
+                "job-binding-replacement", 1, 1000, &recipe, &processing, &output,
+                DEVICE_ID, &written, Some(&project_root),
+            ).expect("denied replacement retains valid receipt evidence");
+            drop((written, project_root));
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        renamed.unwrap();
         std::fs::write(positive, b"unrelated replacement").unwrap();
 
         let error = build_receipt(
@@ -2606,6 +2617,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(30))
                 .expect("scan.completed event");
             let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            eprintln!("{value}");
             if value["event"] == "scan.completed" {
                 break;
             }
@@ -2691,6 +2703,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(30))
                 .expect("scan.completed event");
             let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            eprintln!("{value}");
             if value["event"] == "scan.frameState" && value["payload"]["frameIndex"] == 1 {
                 match value["payload"]["state"].as_str() {
                     Some("completed") => {

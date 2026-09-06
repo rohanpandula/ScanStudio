@@ -811,7 +811,7 @@ fn create_package_file(
 fn cleanup_staged_manifest(
     package: &crate::render::ReservedEvidencePackage,
     temporary_name: &std::ffi::OsStr,
-    staged: &std::fs::File,
+    staged: std::fs::File,
 ) -> Result<(), String> {
     package
         .retire_exact_root_file(temporary_name, staged)
@@ -820,7 +820,7 @@ fn cleanup_staged_manifest(
 
 fn rollback_committed_manifest(
     package: &crate::render::ReservedEvidencePackage,
-    manifest_file: &std::fs::File,
+    manifest_file: std::fs::File,
 ) -> Result<(), String> {
     package
         .retire_exact_root_file(std::ffi::OsStr::new("manifest.json"), manifest_file)
@@ -878,7 +878,7 @@ where
         Ok(())
     })();
     if let Err(error) = staged {
-        return match cleanup_staged_manifest(package, &temporary_name, &manifest_file) {
+        return match cleanup_staged_manifest(package, &temporary_name, manifest_file) {
             Ok(()) => Err(error),
             Err(cleanup) => Err(format!(
                 "{error}; HOLD: staged evidence manifest cleanup could not be proven: {cleanup}"
@@ -893,7 +893,7 @@ where
         std::ffi::OsStr::new("manifest.json"),
     ) {
         let primary = format!("create-only authoritative evidence manifest commit: {error}");
-        return match cleanup_staged_manifest(package, &temporary_name, &manifest_file) {
+        return match cleanup_staged_manifest(package, &temporary_name, manifest_file) {
             Ok(()) => Err(primary),
             Err(cleanup) => Err(format!(
                 "{primary}; HOLD: staged evidence manifest cleanup could not be proven: {cleanup}"
@@ -919,7 +919,7 @@ where
     })();
     match post_commit {
         Ok(()) => Ok(()),
-        Err(primary) => match rollback_committed_manifest(package, &manifest_file) {
+        Err(primary) => match rollback_committed_manifest(package, manifest_file) {
             Ok(()) => Err(format!(
                 "{primary}; authoritative manifest was rolled back and completion was not reported"
             )),
@@ -1042,7 +1042,7 @@ where
     Ok((
         FileDigest {
             path: source.display().to_string(),
-            package_path: destination.to_string_lossy().to_string(),
+            package_path: destination.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"),
             sha256: source_hash,
         },
         PackageFileProof {
@@ -1504,7 +1504,7 @@ mod tests {
         })
         .expect_err("post-commit ambiguity must never return successful completion");
         assert!(error.contains("ordering ambiguity"));
-        assert!(error.contains("rolled back"));
+        assert!(error.contains("rolled back"), "{error}");
         assert!(!package.final_path().join("manifest.json").exists());
 
         let _ = std::fs::remove_dir_all(root);

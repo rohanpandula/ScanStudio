@@ -815,6 +815,7 @@ try {
     }
     npm run sync-engine
     Invoke-EngineSmoke -Tree (Join-Path $appRoot 'src-tauri\binaries')
+    cargo test --locked --manifest-path ..\vendor\engine\Cargo.toml --lib
     npm test
     npx tsc --noEmit
     npm run build

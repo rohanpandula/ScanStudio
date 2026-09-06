@@ -1452,6 +1452,7 @@ mod private_workspace_sys {
     ) -> io::Result<std::fs::File> {
         let marker_path = root_path.join(marker_name);
         let mut file = std::fs::OpenOptions::new()
+            .write(true)
             .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS)
             .create_new(true)
             .share_mode(FILE_SHARE_READ)
@@ -8785,6 +8786,17 @@ mod tests {
         drop(working);
         std::fs::remove_dir_all(workspace_root).unwrap();
         std::fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_workspace_creates_and_verifies_its_marker() {
+        let working = PrivateCaptureWorkingDirectory::create().expect("create Windows workspace");
+        working.verify_namespace().expect("verify held workspace authority");
+        let root = working.root.clone();
+        assert!(std::fs::metadata(root.join(PRIVATE_CAPTURE_MARKER)).unwrap().len() > 0);
+        drop(working);
+        std::fs::remove_dir_all(root).expect("remove private test workspace");
     }
 
     #[cfg(unix)]

@@ -378,7 +378,7 @@ impl ReservedEvidencePackage {
     pub(crate) fn retire_exact_root_file(
         &self,
         name: &std::ffi::OsStr,
-        expected: &std::fs::File,
+        expected: std::fs::File,
     ) -> Result<(), domain::EngineError> {
         let relative = Path::new(name);
         if relative.components().count() != 1
@@ -391,8 +391,9 @@ impl ReservedEvidencePackage {
                 "exact evidence cleanup requires one normal root-file component",
             ));
         }
-        self.verify_regular_file(relative, expected)?;
-        destination_sys::delete_exact_regular_file(expected)?;
+        self.verify_regular_file(relative, &expected)?;
+        destination_sys::delete_exact_regular_file(&expected)?;
+        drop(expected);
         crate::exiftool::metadata_publish_sys::sync_directory(self.directory_handle()).map_err(
             |error| {
                 output_authority_error(format!(
@@ -10302,17 +10303,34 @@ mod tests {
         output.preview.enabled = false;
         output.raw_export.enabled = false;
 
-        let error = acquire_job_output_authorities(
+        // NTFS upcase tables vary by volume generation. Derive the expected
+        // answer from actual ordinary Windows file creation on this volume.
+        let first = project.join("Σ_0001.tif");
+        let second = project.join("ς_0001.tif");
+        std::fs::write(&first, b"oracle").unwrap();
+        let oracle = std::fs::OpenOptions::new().write(true).create_new(true).open(&second);
+        let collision = match oracle {
+            Ok(file) => { drop(file); false }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                true
+            }
+        };
+        let result = acquire_job_output_authorities(
             Some(&project),
             &[1],
             &domain::CaptureRecipe::default(),
             &output,
             &std::collections::HashMap::new(),
         )
-        .expect_err("NTFS-upcase aliases must collide before capture");
-
-        assert_eq!(error.code, protocol::ErrorCode::InvalidParams);
-        assert!(error.message.contains("filename collation"), "{error}");
+        ;
+        if collision {
+            let error = result.expect_err("filesystem aliases must collide before capture");
+            assert_eq!(error.code, protocol::ErrorCode::InvalidParams);
+            assert!(error.message.contains("filename collation"), "{error}");
+        } else {
+            result.expect("distinct filesystem names must remain usable");
+        }
         let _ = std::fs::remove_dir_all(&project);
     }
 
@@ -11985,7 +12003,16 @@ mod tests {
 
         let positive = written.positive_path.as_ref().unwrap();
         let displaced = root.join("engine-authored-positive.tif");
-        std::fs::rename(positive, &displaced).unwrap();
+        let renamed = std::fs::rename(positive, &displaced);
+        if cfg!(windows) {
+            assert!(renamed.is_err(), "held Windows output must deny replacement");
+            crate::exiftool::bind_metadata_output_publications(&root, &written.metadata_publications)
+                .expect("denied replacement retains the original binding");
+            drop(written);
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        renamed.unwrap();
         std::fs::write(positive, b"attacker replacement").unwrap();
 
         let error = crate::exiftool::bind_metadata_output_publications(
