@@ -2592,7 +2592,7 @@ pub(crate) mod metadata_publish_sys {
     const FILE_OPEN: u32 = 0x0000_0001;
     const FILE_CREATE: u32 = 0x0000_0002;
     const FILE_NAMES_INFORMATION_CLASS: u32 = 12;
-    const FILE_RENAME_INFO_EX_CLASS: u32 = 22;
+    const FILE_RENAME_INFORMATION_CLASS: u32 = 10;
     const FILE_DISPOSITION_INFO_EX_CLASS: u32 = 21;
     const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
     const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
@@ -2612,8 +2612,8 @@ pub(crate) mod metadata_publish_sys {
     const ACL_SIZE_INFORMATION_CLASS: u32 = 2;
 
     #[repr(C)]
-    struct FileRenameInfoEx {
-        flags: u32,
+    struct FileRenameInformation {
+        replace_if_exists: u8,
         root_directory: Handle,
         file_name_length: u32,
         file_name: [u16; 1],
@@ -2781,6 +2781,13 @@ pub(crate) mod metadata_publish_sys {
 
     #[link(name = "ntdll")]
     extern "system" {
+        fn NtSetInformationFile(
+            file: Handle,
+            io_status_block: *mut IoStatusBlock,
+            information: *mut std::ffi::c_void,
+            information_size: u32,
+            information_class: u32,
+        ) -> i32;
         fn NtCreateFile(
             file: *mut Handle,
             desired_access: u32,
@@ -3205,14 +3212,14 @@ pub(crate) mod metadata_publish_sys {
         replace: bool,
     ) -> io::Result<()> {
         let name = component(destination_name)?;
-        let header_size = offset_of!(FileRenameInfoEx, file_name);
+        let header_size = offset_of!(FileRenameInformation, file_name);
         let byte_len = name.len().checked_mul(size_of::<u16>()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Windows rename name is too long",
             )
         })?;
-        let total = header_size.checked_add(byte_len).ok_or_else(|| {
+        let total = size_of::<FileRenameInformation>().checked_add(byte_len).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Windows rename buffer overflow",
@@ -3220,9 +3227,9 @@ pub(crate) mod metadata_publish_sys {
         })?;
         let words = total.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; words];
-        let info = storage.as_mut_ptr().cast::<FileRenameInfoEx>();
+        let info = storage.as_mut_ptr().cast::<FileRenameInformation>();
         unsafe {
-            (*info).flags = u32::from(replace);
+            (*info).replace_if_exists = u8::from(replace);
             (*info).root_directory = destination_directory.as_raw_handle();
             (*info).file_name_length = byte_len as u32;
             std::ptr::copy_nonoverlapping(
@@ -3231,17 +3238,22 @@ pub(crate) mod metadata_publish_sys {
                 byte_len,
             );
         }
-        let result = unsafe {
-            SetFileInformationByHandle(
+        // Use the native handle-relative operation, matching NtCreateFile above.
+        // The Win32 rename wrapper rejects this directory-relative request with
+        // ERROR_INVALID_PARAMETER on supported Windows hosts.
+        let mut status_block = IoStatusBlock { status_or_pointer: 0, information: 0 };
+        let status = unsafe {
+            NtSetInformationFile(
                 source.as_raw_handle(),
-                FILE_RENAME_INFO_EX_CLASS,
+                &mut status_block,
                 info.cast(),
                 total as u32,
+                FILE_RENAME_INFORMATION_CLASS,
             )
         };
-        if result == 0 {
-            let error = io::Error::last_os_error();
-            Err(io::Error::new(error.kind(), format!("SetFileInformationByHandle rename: {error}")))
+        if status < 0 {
+            let error = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+            Err(io::Error::new(error.kind(), format!("NtSetInformationFile rename: {error}")))
         } else {
             Ok(())
         }

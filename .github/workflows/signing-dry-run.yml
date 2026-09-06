@@ -117,6 +117,7 @@ jobs:
         with:
           name: signing-dry-run-dmg
           path: app/ScanStudio/.build/ScanStudio-*-macOS-*.dmg
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 3
       - name: Delete the throwaway signing keychain and key material
