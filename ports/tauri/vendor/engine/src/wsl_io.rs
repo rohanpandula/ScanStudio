@@ -242,10 +242,8 @@ fn sidecar_path(rgb: &str, label: &str) -> Result<String, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("capture path has no parent: {rgb:?}"))?;
-    Ok(parent
-        .join(format!("{stem}_{label}.tif"))
-        .to_string_lossy()
-        .to_string())
+    // These names belong to Linux even when this engine runs on Windows.
+    Ok(format!("{}/{stem}_{label}.tif", parent.display()))
 }
 
 pub fn validate_staged_receipt_paths(

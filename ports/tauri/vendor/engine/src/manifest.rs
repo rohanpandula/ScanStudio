@@ -1787,6 +1787,9 @@ mod tests {
             let dir = temp_project_dir();
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(MANIFEST_FILE_NAME), corruption).unwrap();
+            // Windows keeps its transaction-lock inode for all later opens.
+            #[cfg(windows)]
+            fs::write(dir.join(".scanstudio-manifest.lock"), b"").unwrap();
 
             let before = snapshot_regular_files(&dir);
             let err = create_project(

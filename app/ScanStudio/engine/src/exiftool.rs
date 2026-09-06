@@ -3205,7 +3205,7 @@ pub(crate) mod metadata_publish_sys {
         relative_file(parent, name, false, false, true, false, false)
     }
 
-    fn rename_handle(
+    pub(crate) fn rename_handle(
         source: &File,
         destination_directory: &File,
         destination_name: &OsStr,
@@ -7101,7 +7101,12 @@ mod tests {
     fn windows_runner_assigns_and_resumes_a_normal_process() {
         let command =
             std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
-        let command = bind_executable(Path::new(&command)).expect("bind Windows command");
+        // System binaries may have servicing hard links; the executable binder
+        // intentionally requires a unique file identity.
+        let root = temp_root("windows-runner");
+        let executable = root.join("cmd.exe");
+        std::fs::copy(&command, &executable).expect("copy Windows command fixture");
+        let command = bind_executable(&executable).expect("bind Windows command");
         let output = run_bounded_command(
             &command,
             &["/D".into(), "/C".into(), "exit /B 0".into()],
@@ -7110,6 +7115,8 @@ mod tests {
         )
         .expect("run a Job-contained Windows process");
         assert!(output.status.success());
+        drop(command);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

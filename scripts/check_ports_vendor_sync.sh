@@ -296,7 +296,7 @@ EOF
 check_pair "protocol" "app/ScanStudio/protocol" "ports/tauri/vendor/protocol" "55577442d8b6a23ddcd3cc191ebf41a8258004047bc075511a241fa72adb0b65" <<'EOF'
 EOF
 
-check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "228c9c43e13a1e817cfb7e7c84f501d14b9e6af89d659ce2a1c828ec2474ca56" <<'EOF'
+check_pair "engine" "app/ScanStudio/engine" "ports/tauri/vendor/engine" "8bc07be47b3396d32f518b1fd7e89746492cefdbad086a0b931ee76efbecffab" <<'EOF'
 Files app/ScanStudio/engine/Cargo.lock and ports/tauri/vendor/engine/Cargo.lock differ
 Files app/ScanStudio/engine/Cargo.toml and ports/tauri/vendor/engine/Cargo.toml differ
 Files app/ScanStudio/engine/src/evidence_package.rs and ports/tauri/vendor/engine/src/evidence_package.rs differ
