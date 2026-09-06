@@ -131,7 +131,7 @@ struct UpdateSettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.scanStudioAmber)
-                    .foregroundStyle(.black)
+                    .amberProminentLabel()
                     .disabled(model.jobActive)
                     .help(model.jobActive
                         ? "Relaunch is disabled while a scan is active."
@@ -147,7 +147,7 @@ struct UpdateSettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.scanStudioAmber)
-                    .foregroundStyle(.black)
+                    .amberProminentLabel()
                     .disabled(model.jobActive)
                     .help(model.jobActive
                         ? "Install is disabled while a scan is active."

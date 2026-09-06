@@ -128,7 +128,7 @@ struct FrameAlignmentControl: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.scanStudioAmber)
-                    .foregroundStyle(.black)
+                    .amberProminentLabel()
                     .disabled(isUpdating)
                     .help(
                         "Restore this frame’s chosen scanner position and save it to the current roll."

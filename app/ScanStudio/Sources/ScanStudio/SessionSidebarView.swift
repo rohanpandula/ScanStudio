@@ -107,7 +107,7 @@ struct SessionSidebarView: View {
                             .frame(maxWidth: .infinity)
                             .foregroundStyle(Color.scanStudioSecondaryText)
                         Button("Look Again") {
-                            Task { await sessionModel.refreshAvailableDevices() }
+                            Task { await sessionModel.refreshAvailableDevices(rescan: true) }
                         }
                         .buttonStyle(.borderless)
                         .font(.system(size: 11))

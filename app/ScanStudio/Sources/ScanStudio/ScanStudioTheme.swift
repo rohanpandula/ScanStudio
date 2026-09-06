@@ -30,6 +30,32 @@ enum ScanStudioMetrics {
     static let minimumInteractiveTarget: CGFloat = 40
 }
 
+/// Label color for the app's amber `.borderedProminent` buttons. The amber
+/// fill needs a black label for contrast, but macOS drops the tint on a
+/// disabled button and in an inactive window, leaving a gray fill where a
+/// forced black label is unreadable in dark appearance (live QA, 2026-09-06:
+/// "Use Frame Anyway" after acceptance and the Connect card). Fall back to
+/// the system label color whenever the fill is not actually amber.
+private struct AmberProminentLabel: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    func body(content: Content) -> some View {
+        content.foregroundStyle(
+            isEnabled && controlActiveState != .inactive
+                ? AnyShapeStyle(Color.black)
+                : AnyShapeStyle(.primary)
+        )
+    }
+}
+
+extension View {
+    /// Pair with `.buttonStyle(.borderedProminent).tint(.scanStudioAmber)`.
+    func amberProminentLabel() -> some View {
+        modifier(AmberProminentLabel())
+    }
+}
+
 struct ScanStudioDivider: View {
     var body: some View {
         Rectangle()

@@ -660,7 +660,7 @@ private struct ManualReviewFrameSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.scanStudioAmber)
-                .foregroundStyle(.black)
+                .amberProminentLabel()
                 .disabled(!reviewIsCurrent || decision == .useFrameAnyway)
             }
 

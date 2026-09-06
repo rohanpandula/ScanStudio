@@ -1793,7 +1793,7 @@ struct FrameDetailWorkspaceView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
-            .foregroundStyle(.black)
+            .amberProminentLabel()
             .disabled(!frameScanReadiness.isReady)
             .help(frameScanReadiness.reason ?? "Scan this frame")
             if let reason = frameScanReadiness.reason {

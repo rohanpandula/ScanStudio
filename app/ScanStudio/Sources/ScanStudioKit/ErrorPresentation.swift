@@ -164,6 +164,12 @@ public enum ErrorPresentationPolicy {
 
     private static let knownCopy: [Copy] = [
         Copy(
+            code: "BRIDGE_STARTUP_FAILED",
+            title: "Scanner discovery failed",
+            guidance: "Check that the scanner is powered on and connected, then choose Look Again. "
+                + "If discovery keeps failing, quit and reopen ScanStudio, then report the issue with the technical details."
+        ),
+        Copy(
             code: "CAPTURE_WORKER_BOOTSTRAP_FAILED",
             title: "ScanStudio’s scanning components need repair",
             guidance: "The scanner was not moved. Update or reinstall ScanStudio, then try again."
@@ -198,7 +204,9 @@ public enum ErrorPresentationPolicy {
         Copy(
             code: "NOT_CONNECTED",
             title: "Scanner connection was lost",
-            guidance: "Reconnect ScanStudio to the scanner, then try again. You do not need to power-cycle it."
+            guidance: "Reconnect ScanStudio to the scanner, then try again. "
+                + "If the last failure asked for a scanner power-cycle, do that first. "
+                + "If reconnecting keeps failing, quit and reopen ScanStudio."
         ),
         Copy(
             code: "NO_MEDIA",

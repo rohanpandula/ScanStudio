@@ -323,7 +323,7 @@ private struct ManualReviewScanSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.scanStudioAmber)
-                .foregroundStyle(.black)
+                .amberProminentLabel()
                 .disabled(isApproving)
                 .keyboardShortcut(.defaultAction)
             }
@@ -890,7 +890,7 @@ private struct DeviceConnectionWorkspaceView: View {
             case .noDevices:
                 Text("No scanner found")
                     .font(.system(size: 19, weight: .semibold))
-                Button("Look Again") { Task { await sessionModel.refreshAvailableDevices() } }
+                Button("Look Again") { Task { await sessionModel.refreshAvailableDevices(rescan: true) } }
                     .buttonStyle(.bordered)
             case .unsupported(let devices):
                 VStack(spacing: 8) {
@@ -977,7 +977,7 @@ private struct DeviceConnectionWorkspaceView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
-            .foregroundStyle(.black)
+            .amberProminentLabel()
         }
         .padding(16)
         .background(Color.scanStudioRaised, in: RoundedRectangle(cornerRadius: ScanStudioMetrics.cardCornerRadius))
@@ -1103,7 +1103,7 @@ private struct PreProjectPreviewWorkspaceView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
-            .foregroundStyle(.black)
+            .amberProminentLabel()
             .controlSize(.regular)
             .disabled(sessionModel.selectedFrameCount == 0)
             .help(
@@ -1217,7 +1217,7 @@ private struct PreviewGateWorkspaceView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
-            .foregroundStyle(.black)
+            .amberProminentLabel()
             .disabled(
                 sessionModel.status?.transport != "idle"
                     || !sessionModel.hardwareMotionReadiness.allowsMotion
@@ -1341,7 +1341,7 @@ private struct ProjectRegistrationMismatchWorkspaceView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
-            .foregroundStyle(.black)
+            .amberProminentLabel()
             .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

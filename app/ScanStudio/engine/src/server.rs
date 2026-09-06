@@ -158,8 +158,8 @@ enum ActiveDevice {
 
 /// Backend registry/router: replaces the single hardcoded
 /// `Arc<SimulatedLs5000>` `run()` used to hold directly. `scanner.list`
-/// always reports the simulator, plus the real device when
-/// `SCANSTUDIO_BRIDGE_CMD` is configured and started successfully;
+/// reports the simulator, plus the real device when configured successfully.
+/// A configured bridge's startup failure is an error, not simulator mode;
 /// `scanner.connect` decides — from the requested device id alone, never
 /// from any other client input — which backend every subsequent request
 /// routes through.
@@ -171,40 +171,34 @@ struct Backends {
     /// re-attempt the real-backend startup that `from_env` performs exactly
     /// once. None when `SCANSTUDIO_BRIDGE_CMD` is unset/empty.
     bridge_cmd: Option<String>,
+    /// Retained until an explicit rescan succeeds; listing never retries hardware.
+    startup_error: Option<EngineError>,
 }
 
 impl Backends {
     /// Reads `SCANSTUDIO_BRIDGE_CMD` — the ONLY place in the engine this
-    /// environment variable is read. Unset/empty AND configured-but-broken
-    /// both resolve to the identical `real: None` sim-only state,
-    /// deliberately a superset of the literal "not configured" fallback: a
-    /// broken configuration must degrade exactly like no configuration,
-    /// never crash engine startup or leave a half-working device entry
-    /// (T-09-11).
+    /// environment variable is read. Unset/empty enables simulator-only mode.
+    /// A failed configured bridge leaves the engine alive, but discovery
+    /// reports the failure until the user explicitly retries.
     fn from_env() -> Self {
-        let sim = Arc::new(SimulatedLs5000::new());
         let bridge_cmd = match std::env::var("SCANSTUDIO_BRIDGE_CMD") {
             Ok(cmd) if !cmd.trim().is_empty() => Some(cmd),
             _ => None,
         };
-        let real = match &bridge_cmd {
-            Some(cmd) => match RealLs5000::new(cmd, DEFAULT_BRIDGE_TIMEOUT) {
-                Ok(backend) => Some(Arc::new(backend)),
-                Err(err) => {
-                    eprintln!(
-                        "scanstudio-engine: SCANSTUDIO_BRIDGE_CMD configured ('{cmd}') but the real backend could not start ({err}); falling back to simulator-only scanner.list"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-        Backends {
-            sim,
-            real,
+        Self::from_bridge_cmd(bridge_cmd)
+    }
+
+    fn from_bridge_cmd(bridge_cmd: Option<String>) -> Self {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
             active: None,
             bridge_cmd,
-        }
+            startup_error: None,
+        };
+        // rescan retains the failure for scanner.list; engine.hello still works.
+        let _ = backends.rescan(None);
+        backends
     }
 
     /// `scanner.rescan`: one deliberate re-attempt of the real-backend
@@ -214,8 +208,7 @@ impl Backends {
     /// out, and the real device stays invisible until a full app restart.
     /// Idempotent by construction -- an already-running real backend and an
     /// unconfigured `SCANSTUDIO_BRIDGE_CMD` both return the current list
-    /// unchanged -- and a failed re-attempt degrades to the same sim-only
-    /// list as `from_env` (T-09-11), never an error. Refused while any
+    /// unchanged. A failed re-attempt remains visible to the client. Refused while any
     /// device is connected so an active session's backend can never be
     /// replaced underneath it (same invariant as T-09-12).
     fn rescan(
@@ -246,26 +239,36 @@ impl Backends {
                     Ok(backend) => {
                         backend.set_client_build(client_build.map(str::to_string));
                         self.real = Some(Arc::new(backend));
+                        self.startup_error = None;
                     }
                     Err(err) => {
-                        eprintln!(
-                            "scanstudio-engine: scanner.rescan could not start the real backend ({err}); the device list stays simulator-only"
-                        );
+                        let error = EngineError::new(
+                            ErrorCode::Internal,
+                            format!(
+                                "BRIDGE_STARTUP_FAILED: scanner discovery could not start: {err}"
+                            ),
+                        )
+                        .with_recoverable(true);
+                        eprintln!("scanstudio-engine: {error}");
+                        self.startup_error = Some(error);
                     }
                 }
             }
         }
-        Ok(self.list_devices())
+        self.list_devices()
     }
 
     /// `scanner.list`: the simulator always, plus the real device only if
     /// `SCANSTUDIO_BRIDGE_CMD` was configured and started successfully.
-    fn list_devices(&self) -> Vec<domain::DeviceInfo> {
+    fn list_devices(&self) -> Result<Vec<domain::DeviceInfo>, EngineError> {
+        if let Some(error) = &self.startup_error {
+            return Err(error.clone());
+        }
         let mut v = vec![self.sim.device_info()];
         if let Some(real) = &self.real {
             v.push(real.device_info());
         }
-        v
+        Ok(v)
     }
 
     fn set_client_build(&self, client_build: Option<String>) {
@@ -1050,7 +1053,7 @@ fn handle_request(
             })
         }
         "scanner.list" => to_json(&protocol::ScannerListResult {
-            devices: backends.list_devices(),
+            devices: backends.list_devices()?,
         }),
         "scanner.rescan" => to_json(&protocol::ScannerListResult {
             devices: backends.rescan(project_state.client_build.as_deref())?,
@@ -2146,6 +2149,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let devices = backends
             .rescan(None)
@@ -2155,17 +2159,20 @@ mod tests {
     }
 
     #[test]
-    fn rescan_with_a_broken_bridge_cmd_degrades_to_sim_only_like_startup() {
+    fn rescan_with_a_broken_bridge_cmd_reports_startup_failure() {
         let mut backends = Backends {
             sim: Arc::new(SimulatedLs5000::new()),
             real: None,
             active: None,
             bridge_cmd: Some("/nonexistent-wv2-rescan-bridge-cmd".to_string()),
+            startup_error: None,
         };
-        let devices = backends
+        let error = backends
             .rescan(None)
-            .expect("a broken bridge cmd must degrade exactly like from_env, never error");
-        assert_eq!(devices.len(), 1, "{devices:#?}");
+            .expect_err("a configured bridge failure must be visible to the client");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.message.contains("BRIDGE_STARTUP_FAILED"));
+        assert!(error.message.contains("bridge spawn/handshake failed"));
         assert!(backends.real.is_none());
     }
 
@@ -2176,6 +2183,7 @@ mod tests {
             real: None,
             active: Some(ActiveDevice::Sim),
             bridge_cmd: None,
+            startup_error: None,
         };
         let error = backends
             .rescan(None)
@@ -2190,6 +2198,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2245,6 +2254,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2301,6 +2311,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let request = Request {
@@ -2323,6 +2334,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2391,6 +2403,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2439,6 +2452,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2520,6 +2534,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2591,6 +2606,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2611,6 +2627,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2653,6 +2670,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2712,6 +2730,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2782,6 +2801,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2864,6 +2884,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2908,6 +2929,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2964,6 +2986,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -2997,6 +3020,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3040,6 +3064,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default(); // no project ever opened
@@ -3060,6 +3085,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3097,6 +3123,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3151,6 +3178,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3206,6 +3234,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3256,6 +3285,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3353,6 +3383,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3395,6 +3426,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default(); // no project.create call
@@ -3420,6 +3452,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3534,6 +3567,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3671,6 +3705,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3740,6 +3775,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3796,6 +3832,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3860,6 +3897,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3920,6 +3958,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -3987,6 +4026,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4096,6 +4136,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4242,6 +4283,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4399,6 +4441,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4429,6 +4472,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4530,6 +4574,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4605,6 +4650,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4663,6 +4709,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let directory = temp_test_dir("all-off-effective-override");
@@ -4720,6 +4767,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4756,6 +4804,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4948,6 +4997,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -4991,6 +5041,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();
@@ -5090,6 +5141,7 @@ mod tests {
             real: None,
             active: None,
             bridge_cmd: None,
+            startup_error: None,
         };
         let (tx, _rx) = mpsc::channel();
         let mut project_state = ProjectState::default();

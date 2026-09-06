@@ -785,7 +785,23 @@ impl BridgeClient {
             self.restart();
         }
         if self.is_healthy() {
-            Ok(())
+            return Ok(());
+        }
+        // `restart()` replaces only a child the OS has proven exited. A child
+        // still running after a timed-out call stays quarantined because it
+        // may own an in-flight USB transaction; it is never killed or
+        // replaced from here. Name that state honestly instead of reporting
+        // an exit that did not happen (live LS-5000 QA, 2026-09-06: a
+        // FEEDER_PARKED batch failure left the bridge busy past the request
+        // timeout, and every later Connect reported "exited unexpectedly"
+        // while the process was visibly alive).
+        let still_running = matches!(self.child.lock().unwrap().try_wait(), Ok(None));
+        if still_running {
+            Err(BridgeCallError::Io(
+                "bridge process is still running but stopped answering after a timed-out call; \
+                 it stays quarantined until it exits, so quit and reopen ScanStudio to recover"
+                    .to_string(),
+            ))
         } else {
             Err(BridgeCallError::ProcessExited)
         }

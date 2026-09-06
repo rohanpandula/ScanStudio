@@ -147,7 +147,9 @@ struct ErrorPresentationPolicyTests {
             (
                 "NOT_CONNECTED: no scanner session",
                 "Scanner connection was lost",
-                "Reconnect ScanStudio to the scanner, then try again. You do not need to power-cycle it."
+                "Reconnect ScanStudio to the scanner, then try again. "
+                    + "If the last failure asked for a scanner power-cycle, do that first. "
+                    + "If reconnecting keeps failing, quit and reopen ScanStudio."
             ),
             (
                 "NO_MEDIA: no film detected",

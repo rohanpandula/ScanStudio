@@ -363,7 +363,7 @@ struct ManualFramePlacementView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.scanStudioAmber)
-            .foregroundStyle(.black)
+            .amberProminentLabel()
             .disabled(!canConfirm)
             .help("Use these boundaries to scan the resulting frames")
             .keyboardShortcut(.defaultAction)

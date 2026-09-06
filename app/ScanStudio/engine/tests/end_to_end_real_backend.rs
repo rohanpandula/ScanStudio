@@ -2,8 +2,10 @@
 //! (Plan 09-04) dispatches through the correct backend based on
 //! `SCANSTUDIO_BRIDGE_CMD`: unset means sim-only (byte-identical to
 //! pre-Phase-9 behavior), a working bridge command adds the real device and
-//! makes it connectable, and a broken command degrades to the identical
-//! sim-only shape rather than crashing or half-registering a device.
+//! makes it connectable, and a broken command keeps the engine alive but
+//! reports a typed `BRIDGE_STARTUP_FAILED` discovery error until an explicit
+//! `scanner.rescan` succeeds -- never a silent simulator-only list and never
+//! a crash or a half-registered device.
 //!
 //! Mirrors `end_to_end_sim.rs`'s approach exactly (D-9d): real stdio pipes
 //! against the actual compiled binary, no in-process shortcuts. `send`,
@@ -1888,11 +1890,14 @@ fn real_device_listed_and_connectable_when_bridge_cmd_set() {
 }
 
 /// With `SCANSTUDIO_BRIDGE_CMD` pointing at a broken or nonexistent
-/// command, the engine still starts cleanly and behaves exactly like the
-/// unset case — graceful degradation, never a crash or a half-broken
-/// device entry.
+/// command, the engine still starts cleanly (`engine.hello` works), but
+/// discovery reports the startup failure as a typed, recoverable error
+/// instead of silently listing only the simulator (live LS-5000 QA,
+/// 2026-09-06: a cold first launch showed "simulator only" with the USB
+/// scanner attached and no hint why). `scanner.rescan` is the one
+/// deliberate retry; while it keeps failing the error stays visible.
 #[test]
-fn graceful_fallback_when_bridge_cmd_points_at_broken_command() {
+fn broken_bridge_cmd_reports_startup_failure_until_rescan_succeeds() {
     let bin = env!("CARGO_BIN_EXE_scanstudio-engine");
     let mut child = Command::new(bin)
         .env("SCANSTUDIO_BRIDGE_CMD", "/definitely/does/not/exist/xyz")
@@ -1932,22 +1937,38 @@ fn graceful_fallback_when_bridge_cmd_points_at_broken_command() {
 
     send(&mut stdin, 2, "scanner.list", json!({}));
     let list_resp = recv_response_for(&rx, 2, |_| {});
+    let list_error = list_resp
+        .get("error")
+        .unwrap_or_else(|| panic!("a broken SCANSTUDIO_BRIDGE_CMD must surface as a scanner.list error, not a simulator-only list: {list_resp:?}"));
+    assert_eq!(list_error["code"], json!("INTERNAL"), "{list_resp:?}");
+    assert_eq!(list_error["recoverable"], json!(true), "{list_resp:?}");
+    let list_message = list_error["message"].as_str().unwrap_or("");
     assert!(
-        list_resp.get("error").is_none(),
-        "scanner.list failed: {list_resp:?}"
+        list_message.contains("BRIDGE_STARTUP_FAILED"),
+        "the error must carry the typed startup-failure marker: {list_resp:?}"
     );
-    let devices = list_resp["result"]["devices"]
-        .as_array()
-        .expect("devices must be an array");
-    assert_eq!(
-        devices.len(),
-        1,
-        "a broken SCANSTUDIO_BRIDGE_CMD must degrade exactly like no configuration — one simulated device, never a crash or a half-working entry: {devices:?}"
+    assert!(
+        list_message.contains("bridge spawn/handshake failed"),
+        "the error must retain the actual cause: {list_resp:?}"
     );
-    assert_eq!(devices[0]["kind"], json!("simulated"));
 
-    send(&mut stdin, 3, "engine.shutdown", json!({}));
-    let shutdown_resp = recv_response_for(&rx, 3, |_| {});
+    // The explicit retry against the same broken command fails the same
+    // way -- visibly, never by degrading to a simulator-only list.
+    send(&mut stdin, 3, "scanner.rescan", json!({}));
+    let rescan_resp = recv_response_for(&rx, 3, |_| {});
+    let rescan_error = rescan_resp.get("error").unwrap_or_else(|| {
+        panic!("scanner.rescan against a broken command must still fail visibly: {rescan_resp:?}")
+    });
+    assert!(
+        rescan_error["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("BRIDGE_STARTUP_FAILED"),
+        "{rescan_resp:?}"
+    );
+
+    send(&mut stdin, 4, "engine.shutdown", json!({}));
+    let shutdown_resp = recv_response_for(&rx, 4, |_| {});
     assert!(
         shutdown_resp.get("error").is_none(),
         "shutdown failed: {shutdown_resp:?}"
