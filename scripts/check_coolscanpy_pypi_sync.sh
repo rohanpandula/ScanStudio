@@ -6,7 +6,7 @@
 # debugging confusion the instrumented-refusal work exists to prevent
 # (owner policy, 2026-08-08: "keep them in sync so there's no delta").
 #
-# Mechanics: download the exact authenticated coolscanpy 0.7.4 sdist and compare its
+# Mechanics: download the exact authenticated coolscanpy 0.7.5 sdist and compare its
 # src/coolscanpy tree byte-for-byte against this repo's vendored
 # coolscanpy/src/coolscanpy. Version strings are NOT trusted as the primary
 # signal (an unbumped version with changed code is precisely the failure
@@ -30,19 +30,19 @@ VENDORED_DIR="coolscanpy/src/coolscanpy"
 # Re-pin: shasum -a 256 <both files>, update the entry in the same change
 # that alters the file.
 KNOWN_VENDORED_DIVERGENCE=(
-  # required scanner_identity + capture-timing feature; re-pinned for 0.7.4
+  # required scanner_identity + capture-timing feature; re-pinned for 0.7.5
   # (meter-controller refusal + transport-failure witness landed upstream)
   "protocol/ls5000_single_pass/worker.py|773d9915cf68fd5f6d0937a3f26cdee488f257a584ff8bfe4950b33b96678777|22ba191b7f9d313d80aeec195db648bc686f631849145b620851d0961dcbc5cf"
-  # LeadingFrameClippedError + confident-clear-film gate; re-pinned for 0.7.4
+  # LeadingFrameClippedError + confident-clear-film gate; re-pinned for 0.7.5
   # (failure witness replay landed upstream)
   "protocol/ls5000_single_pass/roll_index.py|c99c54a434d0d53e94e51ed503f0289709b5f20365e16606f365264a617c8b17|38013a1e942c3d1d1798ca0e718fb7ccdc3bc605277ca729e9891fa53bcde311"
   # its export surface for the class above
   "protocol/ls5000_single_pass/__init__.py|ce8aa97b707f5ef83f96128b378722191f7280bd41c1f3acbb04c75e3ea7523e|1f0f324034a95e2c8ca772ce52a78a800b0bf215d3ae4ec77422b08b1376856c"
-  # pins differ because the two files above differ; re-pinned for 0.7.4
-  "protocol/ls5000_single_pass/bundle.py|7167c9cd7cbc50d1d641b3847fc1f71e6d37a06d6d8c4d90f2199443d1d5e812|a3a3e7bd307806c6c1b022dac59295525a3d8644e8059069864180fedb40167f"
+  # pins differ because the two files above differ; re-pinned for 0.7.5
+  "protocol/ls5000_single_pass/bundle.py|538dced76ea84c12d9c73c566da6a79955a717ca4a6a7d6b1857aeca02dbc9f6|b6e983319feaa37fbe67263fccc317c7844d81280986a34d15fed0d43b397175"
   # packaged-app libusb resolution (app bundles its own signed binary)
   "protocol/ls5000_single_pass/usb_backend.py|afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62|666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1"
-  # capture-timing receipt fields (started_at/duration); re-pinned for 0.7.4
+  # capture-timing receipt fields (started_at/duration); re-pinned for 0.7.5
   "_roll.py|29903307ce3c0e6f76785b437857450de1d35783fc01c2df9705f03f94fa3df3|61850c5da59b625dd1ce5dc854fe5be01a5a4f687c81fad0f589c9b1c865d094"
   "capture/single_pass_workflow.py|a5a01b15ff50df9a6f78d1c2c4f39d10548e7651cf3365e8698d479b633b5914|c8d93dce3c7de3b585c2d051b7d09054802a130797c590c97b36b78889def15c"
   "types.py|1343c93c03ade64f0927602fe8e8e25353bada6b1b8a919ce9084c5cbcb321de|f853b8dde9c4a6c3b7ce96195d320c7ba9c88839019bed9ce55fe444ea08e54a"
@@ -51,12 +51,12 @@ KNOWN_VENDORED_DIVERGENCE=(
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-echo "fetching authenticated coolscanpy 0.7.4 source from PyPI..."
+echo "fetching authenticated coolscanpy 0.7.5 source from PyPI..."
 published_root="$(python3 -I -S -B scripts/fetch_pinned_coolscanpy_sdist.py \
   --destination "$workdir/published")"
 published_src="$published_root/src/coolscanpy"
 test -d "$published_src"
-pypi_version="0.7.4"
+pypi_version="0.7.5"
 
 printf '%s\n' "${KNOWN_VENDORED_DIVERGENCE[@]}" > "$workdir/exemptions"
 if PUBLISHED_SRC="$published_src" VENDORED_DIR="$VENDORED_DIR" \

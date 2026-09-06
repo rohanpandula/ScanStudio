@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.7.5 - 2026-09-06
+
+- Accept the observed EBDE-prefixed LS-5000 padding counter dialect only when the entire padding block matches its exact counter train. Offline and streaming decoding retain strict corruption rejection and identical sample output.
+
 ## 0.7.4 - 2026-08-23
 
 - Linear DNG and raw-export infrared markers moved from private tag

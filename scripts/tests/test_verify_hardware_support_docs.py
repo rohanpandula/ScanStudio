@@ -26,7 +26,7 @@ class HardwareSupportDocsTests(unittest.TestCase):
         (root / "docs" / "releases" / "v0.7.0-beta.11.md").write_text("old\n")
         (root / "docs" / "releases" / "v0.7.0-beta.12.md").write_text("new\n")
         (root / "docs" / "HARDWARE-SUPPORT.md").write_text(
-            "Current published release: [v0.7.0-beta.12]\n"
+            "Latest release notes: [v0.7.0-beta.12]\n"
             "Package built | Device enumerated | Preview exercised | One-frame capture validated\n"
             "closed evidence #24\nclosed evidence #26\nissues/101\nissues/104\n"
         )

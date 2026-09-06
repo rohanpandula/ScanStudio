@@ -4,7 +4,7 @@ This is the canonical ScanStudio hardware-support matrix. It records what the
 project has actually observed at four separate boundaries; a built package or
 an enumerated USB device is not evidence that preview or capture works.
 
-Current published release: [v0.7.0-beta.12](releases/v0.7.0-beta.12.md).
+Latest release notes: [v0.7.0-beta.13](releases/v0.7.0-beta.13.md).
 
 | Host and scanner | Package built | Device enumerated | Preview exercised | One-frame capture validated | Support / next evidence |
 | --- | --- | --- | --- | --- | --- |
