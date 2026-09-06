@@ -99,11 +99,11 @@ build a version-stamped local DMG:
 
 ```sh
 make -C app/ScanStudio package-check
-SCANSTUDIO_RELEASE_VERSION=0.7.0-beta.15 make -C app/ScanStudio dmg
+SCANSTUDIO_RELEASE_VERSION=0.7.0-beta.16 make -C app/ScanStudio dmg
 ```
 
 `dmg` rebuilds/checks the app, creates
-`app/ScanStudio/.build/ScanStudio-0.7.0-beta.15-macOS-arm64.dmg`, mounts it
+`app/ScanStudio/.build/ScanStudio-0.7.0-beta.16-macOS-arm64.dmg`, mounts it
 read-only, and checks the app inside. It refuses an existing DMG at that path.
 Local builds default to an ad-hoc app signature; these commands do not notarize
 or publish a release. The [release workflow](../../.github/workflows/release.yml)
@@ -160,7 +160,7 @@ film position or authorize a stale selection. Follow the
 [recovery procedure](../../docs/MAC-ACCEPTANCE.md) instead of restarting the
 whole roll or deleting receipts.
 
-Final attended full-roll hardware acceptance for beta.15 is **NOT RUN**. Simulator
+Final attended full-roll hardware acceptance for beta.16 is **NOT RUN**. Simulator
 acceptance covers stop, reopen, process interruption, destination refusal,
 resume, and saved-file integrity; it cannot prove physical image quality or
 transport. The [hardware matrix](../../docs/HARDWARE-SUPPORT.md) distinguishes

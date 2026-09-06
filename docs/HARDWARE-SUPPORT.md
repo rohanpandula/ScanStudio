@@ -11,7 +11,7 @@ use [NegPy downloads](https://github.com/marcinz606/NegPy/releases) and
 [upstream compatibility guidance](https://github.com/marcinz606/NegPy#readme),
 without assuming a download guarantees scanner support.
 
-Latest release notes: [v0.7.0-beta.15](releases/v0.7.0-beta.15.md).
+Latest release notes: [v0.7.0-beta.16](releases/v0.7.0-beta.16.md).
 
 | Host and scanner | Package built | Device enumerated | Preview exercised | One-frame capture validated | Support / next evidence |
 | --- | --- | --- | --- | --- | --- |

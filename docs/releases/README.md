@@ -1,8 +1,8 @@
 # ScanStudio releases
 
-[v0.7.0-beta.15 release notes](v0.7.0-beta.15.md) describe the Mac-only
-release scope, scanner connection and Stop/recovery changes, saved-output
-controls, and validation evidence.
+[v0.7.0-beta.16 release notes](v0.7.0-beta.16.md) describe held exposure,
+the multi-sampling contract, measured bridge deadlines, the CoolscanPy 0.7.7
+sync, and the hardware evidence behind them.
 
 Use the [GitHub Releases listing](https://github.com/rohanpandula/ScanStudio/releases)
 to find published downloads. A versioned notes file or locally built DMG does
@@ -21,7 +21,7 @@ The supported LS-5000 C-41 color-roll workflow remains Beta, with limited
 retained hardware evidence. LS-40/LS-50 identity recognition and FireWire
 probing are not scanning support. Refer to the [hardware matrix](../HARDWARE-SUPPORT.md)
 and [Mac acceptance and recovery](../MAC-ACCEPTANCE.md) when describing results.
-Final attended full-roll hardware acceptance for beta.15 is **NOT RUN**.
+Final attended full-roll hardware acceptance for beta.16 is **NOT RUN**.
 Software checks cannot establish real focus, framing, color, dust repair, or
 physical stop/resume behavior.
 
@@ -58,11 +58,11 @@ claims are true. The verifier requires a regular non-symlink UTF-8 file,
 LF line endings with a final newline, and a size of 1–128 KiB. It rejects
 placeholder tokens, wrong titles/paths, and mismatched tags or versions.
 
-From the **repository root**, for beta.15:
+From the **repository root**, for beta.16:
 
 ```sh
 python3 -I -S -B scripts/verify_release_notes.py \
-  docs/releases/v0.7.0-beta.15.md v0.7.0-beta.15 0.7.0-beta.15
+  docs/releases/v0.7.0-beta.16.md v0.7.0-beta.16 0.7.0-beta.16
 python3 -I -S -B scripts/verify_hardware_support_docs.py
 python3 -I -S -B scripts/verify_scanner_contract_docs.py
 python3 -I -S -B scripts/verify_release_workflow.py
