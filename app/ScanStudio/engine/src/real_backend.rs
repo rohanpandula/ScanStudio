@@ -112,6 +112,14 @@ const DEVICE_OPEN_CALL_DEADLINE: Duration = Duration::from_secs(60);
 /// longer bound costs nothing when the bridge is healthy and only delays
 /// the failure report when it is not.
 const HELLO_CALL_DEADLINE: Duration = Duration::from_secs(45);
+/// Deadline for the `device.list` that follows the handshake on startup and
+/// on `scanner.rescan`. Measured on the live LS-5000 (2026-09-06): the
+/// driver's discovery alone took 6.5 s standalone, and one cold launch's
+/// `device.list` exceeded the generic 10 s timeout after a handshake that
+/// itself fit inside its own bound, leaving "Look Again" as the only way
+/// forward. Enumeration touches the bus but moves nothing, so a longer
+/// bound only delays the report of a genuinely dead bridge.
+const DEVICE_LIST_CALL_DEADLINE: Duration = Duration::from_secs(30);
 /// Appended to the session-ownership-lost detail when a `device.eject`
 /// request crossed a broken bridge boundary. The physical fact an operator
 /// needs is the one the generic transport-failure text cannot carry: the
@@ -2671,7 +2679,7 @@ impl RealLs5000 {
             })?;
 
         let devices_value = bridge
-            .call("device.list", serde_json::json!({}))
+            .call_with_deadline("device.list", serde_json::json!({}), DEVICE_LIST_CALL_DEADLINE)
             .map_err(map_bridge_error)?;
         let devices_result: BridgeDeviceListResult = serde_json::from_value(devices_value)
             .map_err(|err| {
@@ -8149,6 +8157,8 @@ mod tests {
         let generic = crate::server::DEFAULT_BRIDGE_TIMEOUT_FOR_TESTS;
         assert!(DEVICE_OPEN_CALL_DEADLINE > generic);
         assert!(HELLO_CALL_DEADLINE > generic);
+        assert!(DEVICE_LIST_CALL_DEADLINE > generic);
+        assert_eq!(DEVICE_LIST_CALL_DEADLINE, Duration::from_secs(30));
         assert!(DEVICE_OPEN_CALL_DEADLINE >= PREVIEW_FILM_PROBE_DEADLINE);
         assert_eq!(DEVICE_OPEN_CALL_DEADLINE, Duration::from_secs(60));
         assert_eq!(HELLO_CALL_DEADLINE, Duration::from_secs(45));

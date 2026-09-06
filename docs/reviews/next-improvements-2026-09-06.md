@@ -176,10 +176,15 @@ evidence in `/Users/rohan/ScanStudio-QA/single-sample-20260906/`):
   on all four colours) and metered normally with the same exposures as the
   morning's 4× frame 1. The first fine READ (command 607) then failed with
   libusb OVERFLOW during its status phase and the transport had to be
-  power-cycled. Single-sample capture is framed differently from the traced
-  4-sample transaction; a verified single-sample USB trace is required.
-  Decision: single-sample stays behind `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1`
-  (lab-only); production advertises `[4]`.
+  power-cycled. Twenty minutes later, after another power-cycle, an ordinary
+  4× preview failed the same way on command 122 (a plain bulk read), so the
+  USB link itself was unreliable in this session (the scanner sits behind an
+  Anker USB-C hub) and the single-sample result is inconclusive rather than
+  a proven protocol mismatch. A verified single-sample capture on a reliable
+  link is required either way. Decision: single-sample stays behind
+  `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1` (lab-only); production advertises
+  `[4]`. Next session: connect the scanner directly to the Mac with a
+  different cable before any further transport work.
 - Held exposure was not reached (frame 1 failed first). The bridge path is
   unit-tested; hardware validation at 4× is still pending.
 - Two other findings were fixed on the way: `device.open` and the cold
