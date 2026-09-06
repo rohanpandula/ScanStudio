@@ -767,3 +767,19 @@ describe("ContactSheet", () => {
     expect(screen.queryByTestId("preview-complete")).toBeNull();
   });
 });
+
+
+it("exposes keyboard selection state for each frame", async () => {
+  const fixture = contactFixture();
+  await fixture.store.loadMedia("roll36");
+  mocks.sessionStore = fixture.store;
+  const user = userEvent.setup();
+  render(<ContactSheet />);
+  const tile = screen.getByTestId("contact-tile-1");
+  expect(tile).toHaveAttribute("aria-pressed", "false");
+  act(() => tile.focus());
+  await user.keyboard(" ");
+  expect(tile).toHaveAttribute("aria-pressed", "true");
+  await user.keyboard(" ");
+  expect(tile).toHaveAttribute("aria-pressed", "false");
+});

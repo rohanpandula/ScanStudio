@@ -14,6 +14,7 @@ let cachedStore: unknown = null;
 let cachedSnapshot: Readonly<SessionState> | null = null;
 
 function stableSubscribe(listener: () => void): () => void {
+  cachedSnapshot = null;
   const unsubscribe = sessionStore.subscribe(() => {
     cachedSnapshot = null;
     listener();
@@ -92,6 +93,8 @@ function App() {
           )}
           {workspace.kind === "capture" && (
             <CaptureWorkflowView
+              key={state.project?.id ?? "no-project"}
+              onBack={() => setWorkspace({ kind: "contact" })}
               selectedFrames={selectedFrames}
               onRequestConnect={() => setWorkspace({ kind: "contact" })}
               onOpenFrameDetail={(frameIndex) => setWorkspace({ kind: "frame-detail", frameIndex })}

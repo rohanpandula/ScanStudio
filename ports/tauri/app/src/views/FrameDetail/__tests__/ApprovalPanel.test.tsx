@@ -182,3 +182,17 @@ describe("ApprovalPanel", () => {
     expect(items.map((item) => item.textContent)).toEqual(warnings);
   });
 });
+
+
+it("refreshes approval after a same-store remount with missed notifications", async () => {
+  const fixture = await approvalFixture();
+  previewThumbnail(fixture, 2, { brightness: 0.5, needsApproval: true });
+  mocks.sessionStore = fixture.store;
+  const view = render(<ApprovalPanel frameIndex={2} />);
+  expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+  view.unmount();
+  await fixture.store.approveFrame(2);
+  render(<ApprovalPanel frameIndex={2} />);
+  expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+  expect(screen.queryByTestId("approval-needs-badge")).toBeNull();
+});

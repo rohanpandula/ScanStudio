@@ -22,6 +22,7 @@ let cachedStore: unknown = null;
 let cachedSnapshot: Readonly<SessionState> | null = null;
 
 function stableSubscribe(listener: () => void): () => void {
+  cachedSnapshot = null;
   const unsubscribe = sessionStore.subscribe(() => {
     cachedSnapshot = null;
     listener();
@@ -143,29 +144,38 @@ export default function FrameDetailView({
       .catch(() => setDefectResult(null));
   }, [frameIndex, defectRecipeKey]);
 
+  const header = (
+    <header className={styles.header}>
+      <h2 className={styles.heading}>Frame {frameIndex}</h2>
+      {onClose !== undefined && (
+        <button
+          type="button"
+          className={styles.controlButton}
+          data-testid="frame-detail-close"
+          onClick={onClose}
+        >
+          Close
+        </button>
+      )}
+    </header>
+  );
+
   if (thumbnail === undefined) {
     return (
       <div className={styles.frameDetail} data-testid="frame-detail-loading">
-        <p className={styles.loadingText}>Loading preview for frame {frameIndex}…</p>
+        {header}
+        <p className={styles.loadingText} role="status">
+          {state.previewOutcome === "active"
+            ? `Loading preview for frame ${frameIndex}…`
+            : `No preview for frame ${frameIndex}. Close this view and choose Preview from the film view.`}
+        </p>
       </div>
     );
   }
 
   return (
     <div className={styles.frameDetail} data-testid="frame-detail-view">
-      <header className={styles.header}>
-        <h2 className={styles.heading}>Frame {frameIndex}</h2>
-        {onClose !== undefined && (
-          <button
-            type="button"
-            className={styles.controlButton}
-            data-testid="frame-detail-close"
-            onClick={onClose}
-          >
-            Close
-          </button>
-        )}
-      </header>
+      {header}
       <div className={styles.previewStack} data-testid="preview-stack">
         <ZoomPanViewer
           imagePath={thumbnail.imagePath}

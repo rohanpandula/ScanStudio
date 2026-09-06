@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../../session";
-import type { ResolvedCaptureRecipe } from "../../session/store/session";
+import { sessionOperationBusy, type ResolvedCaptureRecipe } from "../../session/store/session";
 import type {
   OutputRecipe,
-  PendingFramesResult,
   ProcessingRecipe,
 } from "../../session/wire/types";
 import ScanSetupView from "../ScanSetup/ScanSetupView";
@@ -43,17 +42,18 @@ const TERMINAL_JOB_STATES = ["completed", "stopped", "failed"];
 export interface CaptureWorkflowViewProps {
   selectedFrames: number[];
   onRequestConnect: () => void;
+  onBack?: () => void;
   onOpenFrameDetail?: (frameIndex: number) => void;
 }
 
 export default function CaptureWorkflowView({
   selectedFrames,
   onRequestConnect,
+  onBack,
   onOpenFrameDetail,
 }: CaptureWorkflowViewProps) {
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [pending, setPending] = useState<PendingFramesResult | null>(null);
   const [lastRecipes, setLastRecipes] = useState<
     | { capture: ResolvedCaptureRecipe; processing?: ProcessingRecipe; output?: OutputRecipe }
     | undefined
@@ -71,44 +71,42 @@ export default function CaptureWorkflowView({
     [],
   );
 
-  // After a terminal job, surface the pending-frames panel with the engine's
-  // authoritative remaining set.
   useEffect(() => {
-    if (!jobTerminal) return;
-    void sessionStore
-      .pendingFrames()
-      .then((result) => setPending(result))
-      .catch(() => setPending(null));
-  }, [jobTerminal]);
-
-  // A job already active in the store (e.g. restored session) drives the run
-  // view directly.
-  useEffect(() => {
-    if (state.jobId !== null && state.jobState !== null && !jobTerminal) {
+    if (state.jobId === null) {
+      setActiveJobId(null);
+      setLastRecipes(undefined);
+    } else if (state.jobState !== null && !TERMINAL_JOB_STATES.includes(state.jobState)) {
       setActiveJobId(state.jobId);
     }
-  }, [state.jobId, state.jobState, jobTerminal]);
+  }, [state.jobId, state.jobState]);
+
+  const back = onBack === undefined ? null : (
+    <button
+      type="button"
+      className={styles.controlButton}
+      disabled={sessionOperationBusy(state)}
+      onClick={() => {
+        if (!sessionOperationBusy(sessionStore.getState())) onBack();
+      }}
+    >
+      Back to film
+    </button>
+  );
 
   // Once a job has started, keep the run panel mounted (even at a terminal
   // state — the terminal summary drives the skipped badging and the pending
   // panel appears beneath it).
-  if (activeJobId !== null) {
+  if (activeJobId !== null && activeJobId === state.jobId) {
     return (
       <div className={styles.shell} data-testid="capture-workflow-run">
-        <ScanRunView jobId={activeJobId} />
-        {jobTerminal && pending !== null && pending.frames.length > 0 && (
+        {back}
+        <ScanRunView key={`run-${activeJobId}`} jobId={activeJobId} />
+        {jobTerminal && (
           <PendingFramesPanel
+            key={`pending-${activeJobId}`}
             recipes={lastRecipes}
-            onResumed={(jobId) => {
-              setActiveJobId(jobId);
-              setPending(null);
-            }}
+            onResumed={setActiveJobId}
           />
-        )}
-        {jobTerminal && pending !== null && pending.frames.length === 0 && (
-          <p className={styles.doneNote} data-testid="capture-workflow-done">
-            All frames captured.
-          </p>
         )}
       </div>
     );
@@ -116,6 +114,7 @@ export default function CaptureWorkflowView({
 
   return (
     <div className={styles.shell} data-testid="capture-workflow-view">
+      {back}
       <ScanSetupView
         selectedFrames={selectedFrames}
         onScanStarted={onScanStarted}
@@ -125,7 +124,7 @@ export default function CaptureWorkflowView({
         type="button"
         className={styles.controlButton}
         data-testid="open-frame-detail"
-        disabled={selectedFrames.length !== 1}
+        disabled={selectedFrames.length !== 1 || sessionOperationBusy(state)}
         onClick={() => {
           if (onOpenFrameDetail !== undefined && selectedFrames.length === 1) {
             onOpenFrameDetail(selectedFrames[0]);

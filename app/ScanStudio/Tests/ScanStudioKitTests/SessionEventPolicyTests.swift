@@ -23,9 +23,12 @@ private actor ProjectFlowEngineStub: EngineClientProtocol {
     nonisolated let events: AsyncStream<EngineEvent>
     var engineVersion: String? = "project-flow-stub"
     private let project: ScanProject
+    private let suspendProjectOpen: Bool
+    private var openContinuation: CheckedContinuation<Void, Never>?
 
-    init(project: ScanProject) {
+    init(project: ScanProject, suspendProjectOpen: Bool = false) {
         self.project = project
+        self.suspendProjectOpen = suspendProjectOpen
         self.events = AsyncStream { _ in }
     }
 
@@ -37,7 +40,11 @@ private actor ProjectFlowEngineStub: EngineClientProtocol {
         switch method {
         case "scanner.list": value = ScannerListResult(devices: [])
         case "project.create": value = ProjectCreateResult(project: project, directory: "/tmp/positive-roll")
-        case "project.open": value = ProjectOpenResult(project: project, directory: "/tmp/positive-roll")
+        case "project.open":
+            if suspendProjectOpen {
+                await withCheckedContinuation { openContinuation = $0 }
+            }
+            value = ProjectOpenResult(project: project, directory: "/tmp/positive-roll")
         case "sim.loadMedia":
             value = ScannerStatus(
                 connected: true,
@@ -61,6 +68,12 @@ private actor ProjectFlowEngineStub: EngineClientProtocol {
         }
         return result
     }
+    func isOpenSuspended() -> Bool { openContinuation != nil }
+    func resumeOpen() {
+        openContinuation?.resume()
+        openContinuation = nil
+    }
+
 }
 
 private actor SequencedProjectFlowEngineStub: EngineClientProtocol {
@@ -1163,6 +1176,43 @@ struct SessionEventPolicyTests {
             createdAt: "2026-07-27T21:36:49Z",
             frames: [ProjectFrame(index: 1, excluded: false, receipts: [])]
         )
+    }
+
+    @Test("project changes cannot discard an active preview", arguments: [false, true])
+    @MainActor
+    func projectChangeDuringPreviewIsRefused(create: Bool) async throws {
+        let project = try projectLifecycleFixture(id: "preview-in-flight", completedFrames: [])
+        let model = SessionModel(engineClient: ProjectFlowEngineStub(project: project))
+        await model.loadCarrier(.strip6)
+        #expect(await model.requestPreview(.initial(token: PreviewIntentToken())) == .started)
+        #expect(model.isAcquiringThumbnails)
+        if create {
+            await model.createProject(name: "Other roll", carrier: .strip6,
+                                      frameCount: 6, filmProcess: .c41ColorNegative)
+        } else {
+            await model.openProject(directory: "/tmp/other-roll")
+        }
+        #expect(model.project == nil)
+        #expect(model.isAcquiringThumbnails)
+        #expect(model.lastErrorMessage?.contains("preview") == true)
+    }
+
+    @Test("preview cannot start while an existing project is opening")
+    @MainActor
+    func previewDuringProjectOpenIsRefused() async throws {
+        let project = try projectLifecycleFixture(id: "opening-project", completedFrames: [])
+        let client = ProjectFlowEngineStub(project: project, suspendProjectOpen: true)
+        let model = SessionModel(engineClient: client)
+        await model.loadCarrier(.strip6)
+        let opening = Task { await model.openProject(directory: "/tmp/opening-project") }
+        while !(await client.isOpenSuspended()) { await Task.yield() }
+        #expect(model.isChangingProject)
+        #expect(await model.requestPreview(.initial(token: PreviewIntentToken())) == .rejected)
+        #expect(!model.isAcquiringThumbnails)
+        await client.resumeOpen()
+        await opening.value
+        #expect(model.project?.id == "opening-project")
+        #expect(!model.isChangingProject)
     }
 
     private func projectLifecycleFixture(

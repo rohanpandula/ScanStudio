@@ -5,21 +5,69 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(SessionModel.self) private var sessionModel
+    @State private var isShowingSidebar = false
+    @State private var isShowingProjectLauncher = false
 
     private var hasCompletePreviewRegistration: Bool {
         sessionModel.hasCompletePreviewRegistration
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        GeometryReader { geometry in
+            workspace(size: geometry.size)
+        }
+        .background(Color.scanStudioWorkspace)
+        .foregroundStyle(Color.scanStudioPrimaryText)
+        .preferredColorScheme(.dark)
+        .frame(minWidth: 980, minHeight: 640)
+        .sheet(isPresented: $isShowingProjectLauncher) {
+            ProjectLauncherView(session: sessionModel)
+        }
+        .sheet(item: manualReviewRequestBinding) { request in
+            ManualReviewScanSheet(request: request)
+        }
+        .sheet(item: manualPlacementStripBinding) { strip in
+            ManualFramePlacementSheet(strip: strip)
+        }
+        .focusedSceneValue(
+            \.scanStudioFrameIndex,
+            sessionModel.frameTransformTargetIndex
+        )
+    }
+
+    private func workspace(size: CGSize) -> some View {
+        // Keep the 680-point workspace and 292-point inspector readable.
+        // The project sidebar moves to a popover when all three cannot fit.
+        let showsSidebar = size.width >= 248 + 680 + 292 + 2
+        return VStack(spacing: 0) {
             DeviceBarView()
             Rectangle().fill(Color.scanStudioDivider).frame(height: 1)
 
-            HStack(spacing: 0) {
-                SessionSidebarView()
-                    .frame(width: 248)
+            if !showsSidebar {
+                HStack {
+                    Button {
+                        isShowingSidebar = true
+                    } label: {
+                        Label("Project & Scanner", systemImage: "sidebar.left")
+                    }
+                    .popover(isPresented: $isShowingSidebar) {
+                        SessionSidebarView(onManageProjects: showProjectLauncher)
+                            .frame(width: 248, height: min(560, size.height))
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 6)
+                .background(Color.scanStudioSidebar)
+            }
 
-                ScanStudioDivider()
+            HStack(spacing: 0) {
+                if showsSidebar {
+                    SessionSidebarView(onManageProjects: showProjectLauncher)
+                        .frame(width: 248)
+
+                    ScanStudioDivider()
+                }
 
                 VStack(spacing: 0) {
                     if let presentation = sessionModel.errorPresentation {
@@ -123,23 +171,21 @@ struct ContentView: View {
 
             if ScanPanelVisibilityPolicy.isVisible(hasOpenProject: sessionModel.project != nil) {
                 Rectangle().fill(Color.scanStudioDivider).frame(height: 1)
-                ScanPanelView()
+                ScrollView(.horizontal) {
+                    ScanPanelView()
+                        .frame(minWidth: size.width)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .frame(height: 86)
+                .background(Color.scanStudioSidebar)
             }
         }
-        .background(Color.scanStudioWorkspace)
-        .foregroundStyle(Color.scanStudioPrimaryText)
-        .preferredColorScheme(.dark)
-        .frame(minWidth: 1_220, minHeight: 760)
-        .sheet(item: manualReviewRequestBinding) { request in
-            ManualReviewScanSheet(request: request)
-        }
-        .sheet(item: manualPlacementStripBinding) { strip in
-            ManualFramePlacementSheet(strip: strip)
-        }
-        .focusedSceneValue(
-            \.scanStudioFrameIndex,
-            sessionModel.frameTransformTargetIndex
-        )
+    }
+
+    private func showProjectLauncher() {
+        // Present from the window, never from the compact sidebar popover.
+        isShowingSidebar = false
+        isShowingProjectLauncher = true
     }
 
     private var manualReviewRequestBinding: Binding<ManualReviewScanRequest?> {

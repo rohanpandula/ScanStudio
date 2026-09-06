@@ -280,3 +280,16 @@ describe("SpacingOffsetControl", () => {
     );
   });
 });
+
+
+it("refreshes the confirmed offset after a same-store remount with missed notifications", async () => {
+  const fixture = await offsetFixture();
+  previewThumbnail(fixture, 2, { brightness: 0.5, spacingOffset: 0 });
+  mocks.sessionStore = fixture.store;
+  const view = render(<SpacingOffsetControl frameIndex={2} />);
+  expect(screen.getByTestId("spacing-offset-input")).toHaveValue(0);
+  view.unmount();
+  await fixture.store.setSpacingOffset(2, 25);
+  render(<SpacingOffsetControl frameIndex={2} />);
+  expect(screen.getByTestId("spacing-offset-input")).toHaveValue(25);
+});

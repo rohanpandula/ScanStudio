@@ -1479,6 +1479,10 @@ public final class SessionModel {
     /// token owned by that concrete UI presentation.
     @discardableResult
     public func requestPreview(_ intent: PreviewIntent) async -> PreviewRequestOutcome {
+        guard !isChangingProject else {
+            lastErrorMessage = "Wait for the project to finish opening or saving before previewing the film."
+            return .rejected
+        }
         let context = PreviewIntentStateMachine.Context(
             hasProject: project != nil,
             isAcquiring: isAcquiringThumbnails,
@@ -2736,23 +2740,28 @@ public final class SessionModel {
         activeOperationStartedAt = nil
     }
 
+    /// Shared by project actions and their controls so a disabled action explains
+    /// the same conflict the model enforces, including a preview still in flight.
+    public var projectChangeDisabledReason: String? {
+        if isChangingProject {
+            return "Another project action is still in progress. Wait for it to finish and try again."
+        }
+        if pendingScanStart != nil || jobId != nil || isJobActive {
+            return "A scan is still in progress. Wait for it to finish or stop it before changing projects."
+        }
+        if pendingFrameAlignmentAdjustment != nil || pendingFrameAlignmentRestore != nil
+            || isRestoringFrameAlignments {
+            return "A frame alignment is still in progress. Wait for it to finish before changing projects."
+        }
+        if isAcquiringThumbnails {
+            return "Wait for the current preview to finish before changing projects."
+        }
+        return nil
+    }
+
     private func beginProjectLifecycleChange() -> Bool {
-        guard !isChangingProject else {
-            lastErrorMessage =
-                "Another project action is still in progress. Wait for it to finish and try again."
-            return false
-        }
-        guard pendingScanStart == nil, jobId == nil, !isJobActive else {
-            lastErrorMessage =
-                "A scan is still in progress. Wait for it to finish or stop it before changing projects."
-            return false
-        }
-        guard pendingFrameAlignmentAdjustment == nil,
-              pendingFrameAlignmentRestore == nil,
-              !isRestoringFrameAlignments
-        else {
-            lastErrorMessage =
-                "A frame alignment is still in progress. Wait for it to finish before changing projects."
+        if let reason = projectChangeDisabledReason {
+            lastErrorMessage = reason
             return false
         }
         isChangingProject = true

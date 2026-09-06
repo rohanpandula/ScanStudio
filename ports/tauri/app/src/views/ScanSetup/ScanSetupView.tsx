@@ -39,6 +39,7 @@ function stableGetSnapshot(): ReturnType<typeof sessionStore.getState> {
   return cachedSnapshot;
 }
 function stableSubscribe(listener: () => void): () => void {
+  cachedSnapshot = null;
   const unsubscribe = sessionStore.subscribe(() => {
     cachedSnapshot = null;
     listener();

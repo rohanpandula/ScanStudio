@@ -41,7 +41,10 @@ struct ScanStudioApp: App {
             }
             .launchUpdateOfferAlert(appDelegate.updateFlowModel)
         }
-        .defaultSize(width: 1_500, height: 920)
+        .defaultSize(
+            width: min(1_500, NSScreen.main?.visibleFrame.width ?? 1_500),
+            height: min(920, (NSScreen.main?.visibleFrame.height ?? 948) - 28)
+        )
         .windowResizability(.contentMinSize)
         .commands {
             if case .ready(_, let model) = appDelegate.launchState {
