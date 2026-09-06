@@ -3449,6 +3449,34 @@ class TestRollScanMany:
             roll.close()
             dev.close()
 
+    def test_scan_many_carries_samples_per_scan_into_the_batch_job(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        """The public surface for single-sample mode: samples_per_scan=1 is
+        validated before any hardware I/O and written into the batch job
+        the child worker reads; the default stays the traced 4."""
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+            roll.release()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(ValueError, match="samples_per_scan"):
+                list(roll.scan_many([1], samples_per_scan=2))
+
+            frames = list(roll.scan_many([1], samples_per_scan=1))
+
+            assert len(frames) == 1
+            jobs = sorted(tmp_path.rglob("batch-job.json"), key=lambda p: p.stat().st_mtime)
+            assert jobs, "scan_many wrote no batch job"
+            job = json.loads(jobs[-1].read_text(encoding="utf-8"))
+            assert job["samples_per_scan"] == 1
+        finally:
+            roll.close()
+            dev.close()
+
     def test_scan_many_applies_exposure_override_on_the_cold_path(
         self, fake_service_factory, tmp_path: Path
     ) -> None:

@@ -502,6 +502,11 @@ class _BatchTerminalReceiptObserved(Exception):
     """The child published a terminal session receipt before ``poll()`` noticed."""
 
 
+
+# The fine-scan samples-per-line values a batch may command. 4 is the traced
+# default; 1 is the single-sample mode (see CaptureBatchRequest.samples_per_scan).
+SUPPORTED_SAMPLES_PER_SCAN: tuple[int, ...] = (1, 4)
+
 @dataclass(frozen=True)
 class ReviewedRollFingerprint:
     """Exact reviewed artifacts plus a reread-tolerant physical-roll signature."""
@@ -1201,6 +1206,13 @@ class CaptureBatchRequest:
     # this from its own reviewed session rather than accepting it from a
     # caller.
     manual_boundary_rows: tuple[int, ...] | None = None
+    # Samples per fine-scan line: 4 is the traced Nikon Scan default and the
+    # only value every earlier release ever commanded; 1 patches the fine
+    # SET_WINDOW multi-read byte to a single sample (the same field the
+    # metering windows already use at 1) for a faster, noisier capture.
+    # Validated against SUPPORTED_SAMPLES_PER_SCAN; carried to the batch child
+    # through the batch job exactly like exposure_override_10ns.
+    samples_per_scan: int = 4
 
     def __post_init__(self) -> None:
         if not isinstance(self.frames, tuple):
@@ -1225,6 +1237,15 @@ class CaptureBatchRequest:
             or not 1 <= self.expected_usb_address <= 127
         ):
             raise ValueError("batch expected USB address must be an integer in 1..127")
+        if (
+            isinstance(self.samples_per_scan, bool)
+            or not isinstance(self.samples_per_scan, int)
+            or self.samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN
+        ):
+            raise ValueError(
+                "samples_per_scan must be one of "
+                f"{SUPPORTED_SAMPLES_PER_SCAN}, got {self.samples_per_scan!r}"
+            )
         for frame in self.frames:
             approval = frame.manual_review_approval
             if (
@@ -3736,6 +3757,7 @@ class CaptureProcessAdapter:
             "parent_ack_required_after_every_frame": True,
             "release_once_after_last_frame": True,
             "reviewed_roll_fingerprint": request.reviewed_fingerprint.to_payload(),
+            "samples_per_scan": request.samples_per_scan,
             "schema_version": 3,
             "session_id": session_id,
             "session_contract": "one-process-one-reservation",

@@ -28,6 +28,10 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-06 (samples_per_scan): capture_process.py and
+    # worker.py gained the 1|4 samples-per-scan batch parameter that patches
+    # the fine SET_WINDOW multi-read byte and its GET_WINDOW echo before
+    # preflight; 4 remains a verified byte-for-byte no-op.
     # Resealed 2026-08-22 (ScanStudio #16): manual_frames.py gained an
     # honest direct_fraction on its RollDetection construction;
     # roll_index.py gained the degraded-gap-evidence confidence tier, the
@@ -48,8 +52,8 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
     # Resealed 2026-08-11: capture descendants remain in the bridge-owned
     # process group and inherit its exclusive process-ownership fence.
-    "capture_process.py": "c4d234c02bcabf5d10c83b9ef9f071c591546c2447ca004610cc0e0c804a3944",
-    "worker.py": "773d9915cf68fd5f6d0937a3f26cdee488f257a584ff8bfe4950b33b96678777",
+    "capture_process.py": "1d81b94ed76e3a1e3704f60915d21b3bad2d510fe124cd0033de81fde4101b26",
+    "worker.py": "5d2317465e78cb99ed460169601879491829579b34337a2d625dd5d7c3bdefb1",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",

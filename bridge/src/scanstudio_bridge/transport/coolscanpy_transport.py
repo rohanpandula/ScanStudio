@@ -11,6 +11,7 @@ level -- every other module stays hardware-library-free.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -297,6 +298,62 @@ class _ScanPhase:
             )
 
 
+SINGLE_SAMPLE_ENV_VAR = "SCANSTUDIO_BRIDGE_SINGLE_SAMPLE"
+
+
+def supported_samples_per_scan() -> tuple[int, ...]:
+    """Fine-scan samples-per-line values this bridge advertises and accepts.
+
+    CoolscanPy 0.7.7 declares `SUPPORTED_SAMPLES_PER_SCAN == (1, 4)` and
+    takes `Roll.scan_many(samples_per_scan=...)`; an older driver has neither
+    and only ever commands the traced 4-sample capture, so the bridge
+    advertises and accepts `(4,)` against it rather than passing a keyword
+    the driver would reject. Both conditions are checked so a partial or
+    foreign attribute can never widen the accepted set on its own.
+
+    Single-sample capture is additionally gated behind
+    `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1` (lab-only, like the debug recipe
+    gate): on the live LS-5000 (2026-09-06) the scanner accepted the
+    1-sample window and metered normally, but the first fine READ then
+    failed with LIBUSB_ERROR_OVERFLOW and wedged the transport -- the
+    single-sample data phase is framed differently from the traced 4-sample
+    transaction. Until a verified single-sample trace exists, production
+    advertises `(4,)` whatever the driver supports.
+    """
+
+    traced = domain.FIXED_COLOR_NEGATIVE_RECIPE.multisample_passes
+    if os.environ.get(SINGLE_SAMPLE_ENV_VAR) != "1":
+        return (traced,)
+    declared = getattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", None)
+    try:
+        parameters = inspect.signature(coolscanpy.Roll.scan_many).parameters
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        parameters = {}
+    if (
+        "samples_per_scan" not in parameters
+        or not isinstance(declared, tuple)
+        or traced not in declared
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in declared
+        )
+    ):
+        return (traced,)
+    return tuple(sorted(set(declared)))
+
+
+def _held_exposure_ticks(exposure: coolscanpy.ExposureVector) -> tuple[int, int, int]:
+    """The metered RGB exposure of a completed frame as raw 10 ns ticks, the
+    unit `Roll.scan_many(exposure_override_10ns=...)` takes (receipts carry
+    microseconds: 1 us == 100 ticks)."""
+
+    return (
+        int(round(exposure.red_exposure_us * 100.0)),
+        int(round(exposure.green_exposure_us * 100.0)),
+        int(round(exposure.blue_exposure_us * 100.0)),
+    )
+
+
 def _capabilities_from_coolscanpy(caps: coolscanpy.Capabilities) -> domain.Capabilities:
     return domain.Capabilities(
         ir_channel=caps.ir_channel,
@@ -309,11 +366,11 @@ def _capabilities_from_coolscanpy(caps: coolscanpy.Capabilities) -> domain.Capab
         registered_geometry=caps.registered_geometry,
         can_eject=caps.can_eject,
         # Bridge-derived, not read from `caps` -- CoolscanPy's own
-        # Capabilities has no such field. Fixed to the one wired recipe's
-        # multisample_passes (see BRIDGE.md's Recipe constraints) rather
-        # than a bare literal, so there is exactly one source of truth for
-        # "4" in this codebase.
-        supported_multisample_passes=(domain.FIXED_COLOR_NEGATIVE_RECIPE.multisample_passes,),
+        # Capabilities has no such field. Device-sourced from what the loaded
+        # driver accepts (see BRIDGE.md's Recipe constraints): (4,) for a
+        # driver that only commands the traced capture, (1, 4) once
+        # single-sample mode exists.
+        supported_multisample_passes=supported_samples_per_scan(),
     )
 
 
@@ -1363,7 +1420,20 @@ class CoolscanPyTransport:
             raise BridgeError(
                 ErrorCode.NO_PREVIEW, "scan.start requires a completed roll.preview first"
             )
-        domain.validate_capture_recipe(recipe, self._material)
+        samples_supported = supported_samples_per_scan()
+        domain.validate_capture_recipe(
+            recipe, self._material, supported_multisample_passes=samples_supported
+        )
+        scan_kwargs: dict[str, object] = {}
+        if len(samples_supported) > 1:
+            # Only a driver that declared single-sample support takes the
+            # keyword; the traced default is byte-identical either way.
+            scan_kwargs["samples_per_scan"] = recipe.multisample_passes
+        # autoExposure false: meter the lowest requested slot on its own
+        # batch, then hold its metered RGB exposure for every other slot
+        # through CoolscanPy's exposure_override_10ns (IR stays metered).
+        hold_exposure = not recipe.auto_exposure
+        held_ticks: tuple[int, int, int] | None = None
 
         total = len(slots)
         completed: list[int] = []
@@ -1434,7 +1504,17 @@ class CoolscanPyTransport:
                         with self._stop_lock:
                             if self._stop_requested:
                                 raise coolscanpy.SafeStopRequested("scan job stopped before batch reservation")
-                            batch_iterator = self._roll.scan_many(remaining, on_progress=None)
+                            batch_slots = (
+                                remaining[:1]
+                                if hold_exposure and held_ticks is None
+                                else remaining
+                            )
+                            batch_kwargs = dict(scan_kwargs)
+                            if held_ticks is not None:
+                                batch_kwargs["exposure_override_10ns"] = held_ticks
+                            batch_iterator = self._roll.scan_many(
+                                batch_slots, on_progress=None, **batch_kwargs
+                            )
                             # Real Roll reservation resets its own stop event.
                             # Preserve a reentrant stop during that call too.
                             if self._stop_requested:
@@ -1535,6 +1615,8 @@ class CoolscanPyTransport:
                                 on_frame(slot, receipt)
                                 completed.append(slot)
                                 remaining.remove(slot)
+                                if hold_exposure and held_ticks is None:
+                                    held_ticks = _held_exposure_ticks(frame.receipt.exposure)
                         except coolscanpy.TransportSmearDetected as exc:
                             # scan_many processes slots in order; the first
                             # remaining slot is the one that failed. The bridge

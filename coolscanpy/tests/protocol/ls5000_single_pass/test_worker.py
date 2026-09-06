@@ -1481,6 +1481,7 @@ def test_batch_job_loader_binds_ordered_frame_paths_and_parent_ack_contract(
                 "expected_usb_bus": 1,
                 "exposure_override_10ns": None,
                 "manual_boundary_rows": None,
+                "samples_per_scan": 4,
                 "frames": [
                     {
                         "ack": "frame-017/parent-ack.json",
@@ -1535,6 +1536,7 @@ def _one_frame_job_payload(
     *,
     exposure_override_10ns: object,
     manual_boundary_rows: object = None,
+    samples_per_scan: object = 4,
 ) -> dict[str, object]:
     return {
         "apply_all_boundary_offsets_before_first_frame": True,
@@ -1544,6 +1546,7 @@ def _one_frame_job_payload(
         "expected_usb_address": 2,
         "exposure_override_10ns": exposure_override_10ns,
         "manual_boundary_rows": manual_boundary_rows,
+        "samples_per_scan": samples_per_scan,
         "frames": [
             {
                 "ack": "frame-001/parent-ack.json",
@@ -1583,6 +1586,145 @@ def test_batch_job_loader_parses_a_valid_exposure_override(tmp_path: Path) -> No
     )
 
     assert job.exposure_override_10ns == (97_482, 195_597, 180_705)
+
+
+def test_batch_job_loader_parses_samples_per_scan(tmp_path: Path) -> None:
+    """samples_per_scan rides the same untrusted-JSON choke point as
+    exposure_override_10ns: 4 is the traced default, 1 the single-sample
+    mode, and both must survive the batch-job.json round trip verbatim."""
+
+    for requested in (4, 1):
+        job_path = tmp_path / f"batch-job-{requested}.json"
+        job_path.write_text(
+            json.dumps(
+                _one_frame_job_payload(
+                    _reviewed_fingerprint(),
+                    exposure_override_10ns=None,
+                    samples_per_scan=requested,
+                )
+            ),
+            encoding="utf-8",
+        )
+        job = load_validated_batch_job(
+            job_path,
+            expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+            expected_plan_sha256="a" * 64,
+            expected_continuation_sha256="b" * 64,
+        )
+        assert job.samples_per_scan == requested
+
+
+@pytest.mark.parametrize("bad", [0, 2, 8, True, "4", 4.0, None])
+def test_batch_job_loader_refuses_unsupported_samples_per_scan(
+    tmp_path: Path, bad: object
+) -> None:
+    job_path = tmp_path / "batch-job.json"
+    job_path.write_text(
+        json.dumps(
+            _one_frame_job_payload(
+                _reviewed_fingerprint(),
+                exposure_override_10ns=None,
+                samples_per_scan=bad,
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(worker_module.ProtocolError, match="samples_per_scan"):
+        load_validated_batch_job(
+            job_path,
+            expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+            expected_plan_sha256="a" * 64,
+            expected_continuation_sha256="b" * 64,
+        )
+
+
+def _fine_window_entries(plan: list[dict]) -> tuple[dict[int, bytes], dict[int, bytes]]:
+    sets = {
+        sequence: bytes.fromhex(worker_module._entry(plan, sequence)["data_out"])
+        for sequence in worker_module.DYNAMIC_WINDOW_GROUPS[-1]
+    }
+    gets = {
+        sequence: bytes.fromhex(
+            worker_module._entry(plan, sequence)["expected_data_in"]
+        )
+        for sequence in worker_module.FINE_GET_WINDOW_SEQUENCES
+    }
+    return sets, gets
+
+
+def test_patch_samples_contract_rewrites_only_the_fine_multiread_byte() -> None:
+    """Single-sample mode is exactly one byte per fine window: payload[48]'s
+    high nibble (samples-1) drops from 3 to 0 on all four SET_WINDOW
+    commands and their GET_WINDOW echo expectations; every other byte,
+    including the exposure the metering contract patches later, is
+    untouched. The live readback validator then accepts the single-sample
+    echo only when told to expect it."""
+
+    plan = [dict(entry) for entry in load_canonical_plan()]
+    sets_before, gets_before = _fine_window_entries(plan)
+    assert {payload[48] for payload in sets_before.values()} == {0x30}
+    assert {payload[48] for payload in gets_before.values()} == {0x30}
+
+    worker_module._patch_samples_contract(
+        plan,
+        worker_module.DYNAMIC_WINDOW_GROUPS[-1],
+        worker_module.FINE_GET_WINDOW_SEQUENCES,
+        1,
+    )
+
+    sets_after, gets_after = _fine_window_entries(plan)
+    for before, after in (
+        (sets_before, sets_after),
+        (gets_before, gets_after),
+    ):
+        for sequence, original in before.items():
+            patched = after[sequence]
+            assert patched[48] == 0x00
+            assert patched[:48] == original[:48]
+            assert patched[49:] == original[49:]
+    payloads = [gets_after[sequence] for sequence in worker_module.FINE_GET_WINDOW_SEQUENCES]
+    origin = decode_window_block(payloads[0])["upper_left_y"]
+    decoded = worker_module._validate_live_fine_windows(
+        payloads,
+        expected_origin=origin,
+        expected_samples_per_scan=1,
+    )
+    assert [window["samples_per_scan_minus1_nibble"] for window in decoded] == [0, 0, 0, 0]
+    with pytest.raises(worker_module.SynchronizedProtocolError, match="multiread_byte"):
+        worker_module._validate_live_fine_windows(payloads, expected_origin=origin)
+
+
+def test_patch_samples_contract_at_the_traced_value_changes_nothing() -> None:
+    plan = [dict(entry) for entry in load_canonical_plan()]
+    sets_before, gets_before = _fine_window_entries(plan)
+
+    worker_module._patch_samples_contract(
+        plan,
+        worker_module.DYNAMIC_WINDOW_GROUPS[-1],
+        worker_module.FINE_GET_WINDOW_SEQUENCES,
+        4,
+    )
+
+    assert _fine_window_entries(plan) == (sets_before, gets_before)
+    payloads = [gets_before[sequence] for sequence in worker_module.FINE_GET_WINDOW_SEQUENCES]
+    origin = decode_window_block(payloads[0])["upper_left_y"]
+    worker_module._validate_live_fine_windows(payloads, expected_origin=origin)
+    with pytest.raises(worker_module.SynchronizedProtocolError, match="multiread_byte"):
+        worker_module._validate_live_fine_windows(
+            payloads, expected_origin=origin, expected_samples_per_scan=1
+        )
+
+
+@pytest.mark.parametrize("bad", [0, 2, 8, 16])
+def test_patch_samples_contract_refuses_unsupported_values(bad: int) -> None:
+    plan = [dict(entry) for entry in load_canonical_plan()]
+    with pytest.raises(worker_module.ProtocolError, match="samples_per_scan"):
+        worker_module._patch_samples_contract(
+            plan,
+            worker_module.DYNAMIC_WINDOW_GROUPS[-1],
+            worker_module.FINE_GET_WINDOW_SEQUENCES,
+            bad,
+        )
 
 
 def test_batch_job_loader_parses_valid_manual_boundary_rows(tmp_path: Path) -> None:
@@ -2468,6 +2610,7 @@ def test_batch_cli_dry_run_validates_one_session_without_single_frame_flags(
                 "expected_usb_bus": 1,
                 "exposure_override_10ns": None,
                 "manual_boundary_rows": None,
+                "samples_per_scan": 4,
                 "frames": [
                     {
                         "ack": "frame-017/parent-ack.json",
@@ -6630,6 +6773,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
             "expected_usb_address": 2,
             "exposure_override_10ns": None,
             "manual_boundary_rows": None,
+            "samples_per_scan": 4,
             "frames": [
                 {
                     "ack": f"frame-{frame.slot:03d}/parent-ack.json",
@@ -7157,6 +7301,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
             "expected_usb_address": 2,
             "exposure_override_10ns": None,
             "manual_boundary_rows": None,
+            "samples_per_scan": 4,
             "frames": [
                 {
                     "ack": f"frame-{frame.slot:03d}/parent-ack.json",

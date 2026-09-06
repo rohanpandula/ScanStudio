@@ -594,6 +594,7 @@ def test_batch_request_is_one_immutable_ordered_full_capture_unit() -> None:
 
 def _one_frame_batch_request(
     exposure_override_10ns: object = None,
+    samples_per_scan: object = 4,
 ) -> capture.CaptureBatchRequest:
     return capture.CaptureBatchRequest(
         frames=(
@@ -607,7 +608,23 @@ def _one_frame_batch_request(
         expected_usb_bus=1,
         expected_usb_address=2,
         exposure_override_10ns=exposure_override_10ns,
+        samples_per_scan=samples_per_scan,
     )
+
+
+def test_batch_request_samples_per_scan_defaults_to_the_traced_four() -> None:
+    assert _one_frame_batch_request().samples_per_scan == 4
+    assert capture.SUPPORTED_SAMPLES_PER_SCAN == (1, 4)
+
+
+def test_batch_request_accepts_single_sample_mode() -> None:
+    assert _one_frame_batch_request(samples_per_scan=1).samples_per_scan == 1
+
+
+@pytest.mark.parametrize("bad", [0, 2, 8, True, "4", 4.0, None])
+def test_batch_request_refuses_unsupported_samples_per_scan(bad: object) -> None:
+    with pytest.raises(ValueError, match="samples_per_scan"):
+        _one_frame_batch_request(samples_per_scan=bad)
 
 
 def test_batch_request_exposure_override_defaults_to_none_and_is_byte_identical() -> None:
@@ -936,6 +953,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "expected_usb_bus": 1,
         "exposure_override_10ns": None,
         "manual_boundary_rows": None,
+        "samples_per_scan": 4,
         "frames": [
             {
                 "ack": "frame-017/parent-ack.json",

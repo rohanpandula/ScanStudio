@@ -95,6 +95,31 @@ const EJECT_CALL_DEADLINE: Duration = Duration::from_secs(300);
 /// and immediately asks to preview must never lose the session to the
 /// probe; a genuinely dead transport still surfaces, just on this bound.
 const PREVIEW_FILM_PROBE_DEADLINE: Duration = Duration::from_secs(30);
+/// Deadline for `device.open` on an explicit connect. Measured on the live
+/// LS-5000 (2026-09-06): three connects completed in about 8 s, and two
+/// more -- both right after film had been re-fed, while the driver drained
+/// the adapter's medium-change attention -- exceeded the generic 10 s
+/// control-plane timeout. That expiry quarantines the bridge and every
+/// later Connect fails until the app is reopened, so opening the device
+/// gets the same kind of physical bound `PREVIEW_FILM_PROBE_DEADLINE` gives
+/// the pre-preview probe. A bridge that never answers still surfaces here.
+const DEVICE_OPEN_CALL_DEADLINE: Duration = Duration::from_secs(60);
+/// Deadline for the `bridge.hello` handshake of a freshly spawned bridge.
+/// Measured on the same day: the first launch of a freshly signed bundle
+/// took the handshake past 10 s on three of five cold starts (Python and
+/// its native extensions loading for the first time), while every warm
+/// respawn answered in about 5 s. The handshake touches no hardware, so a
+/// longer bound costs nothing when the bridge is healthy and only delays
+/// the failure report when it is not.
+const HELLO_CALL_DEADLINE: Duration = Duration::from_secs(45);
+/// Deadline for the `device.list` that follows the handshake on startup and
+/// on `scanner.rescan`. Measured on the live LS-5000 (2026-09-06): the
+/// driver's discovery alone took 6.5 s standalone, and one cold launch's
+/// `device.list` exceeded the generic 10 s timeout after a handshake that
+/// itself fit inside its own bound, leaving "Look Again" as the only way
+/// forward. Enumeration touches the bus but moves nothing, so a longer
+/// bound only delays the report of a genuinely dead bridge.
+const DEVICE_LIST_CALL_DEADLINE: Duration = Duration::from_secs(30);
 /// Appended to the session-ownership-lost detail when a `device.eject`
 /// request crossed a broken bridge boundary. The physical fact an operator
 /// needs is the one the generic transport-failure text cannot carry: the
@@ -493,7 +518,11 @@ impl BridgeClient {
         // would orphan another child contending for the same physical
         // scanner (WV round 2, second review).
         let handshake = (|| -> Result<BridgeHelloResult, BridgeCallError> {
-            let result_value = client.call("bridge.hello", hello_request_params())?;
+            let result_value = client.call_with_deadline(
+                "bridge.hello",
+                hello_request_params(),
+                HELLO_CALL_DEADLINE,
+            )?;
             let result: BridgeHelloResult = serde_json::from_value(result_value).map_err(|err| {
                 BridgeCallError::Io(format!("malformed bridge.hello result: {err}"))
             })?;
@@ -715,7 +744,7 @@ impl BridgeClient {
         );
         self.alive.store(true, Ordering::Release);
 
-        match self.call("bridge.hello", hello_request_params()) {
+        match self.call_with_deadline("bridge.hello", hello_request_params(), HELLO_CALL_DEADLINE) {
             Ok(value) => match serde_json::from_value::<BridgeHelloResult>(value) {
                 Ok(result) if result.protocol_version == 1 => {
                     *self.hello_info.lock().unwrap() = result;
@@ -2650,7 +2679,7 @@ impl RealLs5000 {
             })?;
 
         let devices_value = bridge
-            .call("device.list", serde_json::json!({}))
+            .call_with_deadline("device.list", serde_json::json!({}), DEVICE_LIST_CALL_DEADLINE)
             .map_err(map_bridge_error)?;
         let devices_result: BridgeDeviceListResult = serde_json::from_value(devices_value)
             .map_err(|err| {
@@ -3889,7 +3918,11 @@ impl ScannerBackend for RealLs5000 {
             })?;
         let result_value = self
             .bridge
-            .call("device.open", serde_json::json!({ "deviceId": device_id }))
+            .call_with_deadline(
+                "device.open",
+                serde_json::json!({ "deviceId": device_id }),
+                DEVICE_OPEN_CALL_DEADLINE,
+            )
             .map_err(|error| match error {
                 bridge_error @ BridgeCallError::BridgeError { .. } => {
                     map_bridge_error(bridge_error)
@@ -8114,6 +8147,23 @@ mod tests {
     /// an eject slower than the shipped ceiling, so every way it can be
     /// wrong must land on the safe default rather than on a bound too short
     /// to let the bridge answer.
+    /// The two physical-bound deadlines added from the 2026-09-06 live
+    /// measurements must stay strictly above the generic 10 s control-plane
+    /// timeout they exist to bypass, and the open bound must exceed the
+    /// pre-preview probe's (opening drains the same medium-change attention
+    /// and then some), or they silently regress to the quarantine hazard.
+    #[test]
+    fn open_and_hello_deadlines_exceed_the_generic_control_plane_timeout() {
+        let generic = crate::server::DEFAULT_BRIDGE_TIMEOUT_FOR_TESTS;
+        assert!(DEVICE_OPEN_CALL_DEADLINE > generic);
+        assert!(HELLO_CALL_DEADLINE > generic);
+        assert!(DEVICE_LIST_CALL_DEADLINE > generic);
+        assert_eq!(DEVICE_LIST_CALL_DEADLINE, Duration::from_secs(30));
+        assert!(DEVICE_OPEN_CALL_DEADLINE >= PREVIEW_FILM_PROBE_DEADLINE);
+        assert_eq!(DEVICE_OPEN_CALL_DEADLINE, Duration::from_secs(60));
+        assert_eq!(HELLO_CALL_DEADLINE, Duration::from_secs(45));
+    }
+
     #[test]
     fn eject_call_deadline_env_parsing_falls_back_on_everything_but_a_positive_whole_number() {
         assert_eq!(

@@ -150,9 +150,58 @@ Follow-ups recorded from this run, in addition to the two above:
   with a fixture from this frame's meter evidence.
 - CoolscanPy reports the meter refusal as `RollMismatch`; it should carry
   `MeterControllerRefused` so no phrase matching is needed downstream.
-- Measure the cold bridge handshake on a freshly signed bundle before
-  changing the 10 s deadline; two cold launches failed it, two warm rescans
-  took about 5 s.
+- Measured later the same day: cold handshakes exceeded 10 s on three of
+  five first launches of freshly signed bundles (warm respawns about 5 s),
+  and `device.open` took about 8 s on three connects and over 10 s on two
+  connects right after film was re-fed (standalone: discovery 6.5 s + open
+  5.6 s). The engine now bounds `bridge.hello` at 45 s and `device.open` at
+  60 s instead of the generic 10 s control-plane timeout; the slow
+  discovery itself (about 6.5 s of libusb enumeration and inquiry) is still
+  worth profiling in CoolscanPy.
+
+### Single-sample and held-exposure attempt (candidates #4 and #5)
+
+A friend's calibration guide asked for a "Pass A" of 1 sample per line with
+auto exposure off and one exposure held for the roll. Both were built the
+same day: CoolscanPy `feat/samples-per-scan` (`Roll.scan_many(samples_per_scan=1|4)`
+patching the fine SET_WINDOW multi-read byte and its GET_WINDOW echo), and a
+bridge that accepts `multisamplePasses` from the driver's declared set and
+`autoExposure: false` as "meter the lowest slot, hold it for the rest"
+through the driver's existing `exposure_override_10ns`.
+
+Live result (candidate #5, commit 5b82b03 with the vendored driver change,
+evidence in `/Users/rohan/ScanStudio-QA/single-sample-20260906/`):
+
+- The scanner accepted the one-sample window (GET_WINDOW echoed samples=1
+  on all four colours) and metered normally with the same exposures as the
+  morning's 4× frame 1. The first fine READ (command 607) then failed with
+  libusb OVERFLOW during its status phase and the transport had to be
+  power-cycled. Twenty minutes later, after another power-cycle, an ordinary
+  4× preview failed the same way on command 122 (a plain bulk read), so the
+  USB link itself was unreliable in this session (the scanner sits behind an
+  Anker USB-C hub) and the single-sample result is inconclusive rather than
+  a proven protocol mismatch. A verified single-sample capture on a reliable
+  link is required either way. Decision: single-sample stays behind
+  `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1` (lab-only); production advertises
+  `[4]`. Next session: connect the scanner directly to the Mac with a
+  different cable before any further transport work.
+- Held exposure was validated at 4× on the same strip once the scanner was
+  moved to another hub (candidate #6, 20:07–20:12 UTC): frame 1 metered
+  890.92/1781.93/1633.44 µs, frame 2 was captured at exactly those values
+  (driver journal `exposure_override.applied: true`; its own meter would have
+  chosen 1466.67/3650.71/3320.72 µs), both receipts verified, IR metered.
+- Two other findings were fixed on the way: `device.open` and the cold
+  `bridge.hello` now have measured deadlines (60 s and 45 s) after both
+  exceeded the generic 10 s timeout on this scanner; the multi-sampling
+  picker labels one sample as "1× (off)" and the app default is the traced
+  4 so a wider advertised set never lands on a lower value silently.
+- Film handling limited the session: after repeated ejects and reinserts of
+  the short strip, one preview refused with REFEED_REQUIRED (anchor residual
+  up to 7.6 rows) and one batch refused before motion because the fresh
+  frame-table read did not fit the preview within 2 rows. That refusal is
+  reported as "live mapping has fewer than 2 scanner-addressable frame
+  records" (ROLL_MISMATCH) and does not persist which anchor failed; both
+  the wording and the missing evidence are follow-ups.
 
 ## Implementation order and acceptance
 

@@ -184,6 +184,9 @@ DRAINED_SCAN_READ_SEQUENCES = (
 )
 FINE_NATIVE_WIDTH = 3_946
 FINE_NATIVE_HEIGHT = 5_959
+# Fine SET_WINDOW multi-read byte (payload[48]): high nibble = samples-1.
+SUPPORTED_SAMPLES_PER_SCAN = (1, 4)
+TRACED_SAMPLES_PER_SCAN = 4
 EXPECTED_PREVIEW_BYTES = 6_250_496
 PREVIEW_READ_MAX_BYTES = 131_072
 VARIABLE_FRAME_TABLE_SEQUENCE = 64
@@ -550,6 +553,10 @@ class LiveBatchJob:
     # this untrusted job JSON, for _derive_live_batch_selections to replay
     # fresh against this call's own live re-read bytes.
     manual_boundary_rows: tuple[int, ...] | None = None
+    # See capture_process.CaptureBatchRequest.samples_per_scan. Parsed from the
+    # untrusted job JSON by load_validated_batch_job; 4 keeps every traced
+    # byte, 1 patches the fine SET_WINDOW multi-read byte before preflight.
+    samples_per_scan: int = TRACED_SAMPLES_PER_SCAN
 
     @property
     def selected_slots(self) -> tuple[int, ...]:
@@ -2066,6 +2073,7 @@ def load_validated_batch_job(
         "frames",
         "manual_boundary_rows",
         "reviewed_roll_fingerprint",
+        "samples_per_scan",
         "session_id",
     }
     if set(payload) != expected_keys:
@@ -2104,6 +2112,16 @@ def load_validated_batch_job(
                 )
             parsed_ticks.append(raw)
         exposure_override_10ns = (parsed_ticks[0], parsed_ticks[1], parsed_ticks[2])
+    samples_per_scan = payload.get("samples_per_scan")
+    if (
+        isinstance(samples_per_scan, bool)
+        or not isinstance(samples_per_scan, int)
+        or samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN
+    ):
+        raise ProtocolError(
+            "batch job samples_per_scan must be one of "
+            f"{SUPPORTED_SAMPLES_PER_SCAN}, got {samples_per_scan!r}"
+        )
     # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): same
     # defense-in-depth stance as exposure_override_10ns above -- the worker
     # subprocess trusts nothing it reads from this job file, even though
@@ -2257,6 +2275,7 @@ def load_validated_batch_job(
         job_sha256=actual_job_sha256,
         exposure_override_10ns=exposure_override_10ns,
         manual_boundary_rows=manual_boundary_rows,
+        samples_per_scan=samples_per_scan,
     )
 
 
@@ -3087,6 +3106,98 @@ def _patched_window_exposure(
     return patched
 
 
+def _batch_samples_per_scan(batch_job: LiveBatchJob | None) -> int:
+    """The fine-scan samples per line this attempt commands (4 outside a batch)."""
+
+    return TRACED_SAMPLES_PER_SCAN if batch_job is None else batch_job.samples_per_scan
+
+
+def _patched_window_samples(
+    payload: bytes,
+    *,
+    expected_color: int,
+    samples_per_scan: int,
+    sequence: int,
+) -> bytes:
+    if (
+        isinstance(samples_per_scan, bool)
+        or not isinstance(samples_per_scan, int)
+        or samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN
+    ):
+        raise ProtocolError(
+            f"command {sequence}: samples_per_scan {samples_per_scan!r} is not "
+            f"one of {SUPPORTED_SAMPLES_PER_SCAN}"
+        )
+    decoded = decode_window_block(payload)
+    if decoded is None or decoded["color_id"] != expected_color:
+        raise ProtocolError(
+            f"command {sequence}: expected window color {expected_color}"
+        )
+    if decoded["multiread_byte"] != (TRACED_SAMPLES_PER_SCAN - 1) << 4:
+        raise ProtocolError(
+            f"command {sequence}: fine window multi-read byte "
+            f"0x{decoded['multiread_byte']:02x} is not the traced "
+            f"{TRACED_SAMPLES_PER_SCAN}-sample value"
+        )
+    mutable = bytearray(payload)
+    mutable[48] = (samples_per_scan - 1) << 4
+    patched = bytes(mutable)
+    verified = decode_window_block(patched)
+    if (
+        verified is None
+        or verified["color_id"] != expected_color
+        or verified["samples_per_scan_minus1_nibble"] != samples_per_scan - 1
+        or verified["multiread_byte"] != (samples_per_scan - 1) << 4
+    ):
+        raise ProtocolError(f"command {sequence}: samples patch did not verify")
+    return patched
+
+
+def _patch_samples_contract(
+    plan: list[dict],
+    set_sequences: tuple[int, ...],
+    get_sequences: tuple[int, ...],
+    samples_per_scan: int,
+) -> None:
+    """Atomically patch the fine SET group's samples byte and its GET echo.
+
+    At the traced 4 samples this is a verified no-op on every byte; at 1 the
+    high nibble of payload[48] drops from 3 to 0 on all four colors, and the
+    matching GET_WINDOW echo expectations change identically so the live
+    readback check (_validate_live_fine_windows) still compares against what
+    was actually commanded.
+    """
+
+    if len(set_sequences) != len(WIRE_METER_COLORS) or len(get_sequences) != len(
+        WIRE_METER_COLORS
+    ):
+        raise ProtocolError("samples contract must contain four SET and GET windows")
+    patched_sets: list[tuple[dict, str]] = []
+    patched_gets: list[tuple[dict, str]] = []
+    for sequence, color in zip(set_sequences, WIRE_METER_COLORS, strict=True):
+        entry = _entry(plan, sequence)
+        patched = _patched_window_samples(
+            bytes.fromhex(entry.get("data_out", "")),
+            expected_color=color,
+            samples_per_scan=samples_per_scan,
+            sequence=sequence,
+        )
+        patched_sets.append((entry, patched.hex()))
+    for sequence, color in zip(get_sequences, WIRE_METER_COLORS, strict=True):
+        entry = _entry(plan, sequence)
+        patched = _patched_window_samples(
+            bytes.fromhex(entry.get("expected_data_in", "")),
+            expected_color=color,
+            samples_per_scan=samples_per_scan,
+            sequence=sequence,
+        )
+        patched_gets.append((entry, patched.hex()))
+    for entry, payload in patched_sets:
+        entry["data_out"] = payload
+    for entry, payload in patched_gets:
+        entry["expected_data_in"] = payload
+
+
 def _patch_exposure_contract(
     plan: list[dict],
     set_sequences: tuple[int, ...],
@@ -3351,7 +3462,18 @@ def _validate_live_fine_windows(
     *,
     expected_origin: int,
     expected_exposures: dict[int, int] | None = None,
+    expected_samples_per_scan: int = TRACED_SAMPLES_PER_SCAN,
 ) -> list[WindowBlock]:
+    if (
+        isinstance(expected_samples_per_scan, bool)
+        or not isinstance(expected_samples_per_scan, int)
+        or expected_samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN
+    ):
+        raise ProtocolError(
+            f"expected samples_per_scan {expected_samples_per_scan!r} is not one "
+            f"of {SUPPORTED_SAMPLES_PER_SCAN}"
+        )
+    expected_multiread_byte = (expected_samples_per_scan - 1) << 4
     if len(payloads) != 4:
         raise SynchronizedProtocolError("fine GET_WINDOW responses are incomplete")
     decoded: list[WindowBlock] = []
@@ -3370,12 +3492,12 @@ def _validate_live_fine_windows(
             ("upper_left_y", window["upper_left_y"], expected_origin),
             ("width", window["width"], 3946),
             ("height", window["height"], 5959),
-            ("multiread_byte", window["multiread_byte"], 0x30),
+            ("multiread_byte", window["multiread_byte"], expected_multiread_byte),
             ("avg_negpos_byte", window["avg_negpos_byte"], 0x00),
             (
                 "samples_per_scan_minus1_nibble",
                 window["samples_per_scan_minus1_nibble"],
-                3,
+                expected_samples_per_scan - 1,
             ),
             ("scanning_kind_byte", window["scanning_kind_byte"], 0x01),
             ("scanning_mode_byte", window["scanning_mode_byte"], 0x10),
@@ -4927,6 +5049,7 @@ def _run_live_continuation_frame(
                         ],
                         expected_origin=selection.selected.native_origin,
                         expected_exposures=final_wire_exposures,
+                        expected_samples_per_scan=_batch_samples_per_scan(batch_job),
                     )
                     journal["fine_set_windows_preflight"] = [
                         {
@@ -5146,6 +5269,15 @@ def _run_live_continuation_frame(
                                 FINE_GET_WINDOW_SEQUENCES,
                                 fine_controller_exposures,
                             )
+                            _patch_samples_contract(
+                                active_plan,
+                                DYNAMIC_WINDOW_GROUPS[-1],
+                                FINE_GET_WINDOW_SEQUENCES,
+                                _batch_samples_per_scan(batch_job),
+                            )
+                            journal["fine_samples_per_scan"] = _batch_samples_per_scan(
+                                batch_job
+                            )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
@@ -5243,6 +5375,7 @@ def _run_live_continuation_frame(
                 fine_window_payloads,
                 expected_origin=selection.selected.native_origin,
                 expected_exposures=expected_exposures,
+                expected_samples_per_scan=_batch_samples_per_scan(batch_job),
             )
             journal["fine_windows"] = [
                 {
@@ -5821,6 +5954,7 @@ def run_live_capture(
                         ],
                         expected_origin=live_selection.selected.native_origin,
                         expected_exposures=final_wire_exposures,
+                        expected_samples_per_scan=_batch_samples_per_scan(batch_job),
                     )
                     journal["fine_set_windows_preflight"] = [
                         {
@@ -6822,6 +6956,15 @@ def run_live_capture(
                                 FINE_GET_WINDOW_SEQUENCES,
                                 fine_controller_exposures,
                             )
+                            _patch_samples_contract(
+                                active_plan,
+                                DYNAMIC_WINDOW_GROUPS[-1],
+                                FINE_GET_WINDOW_SEQUENCES,
+                                _batch_samples_per_scan(batch_job),
+                            )
+                            journal["fine_samples_per_scan"] = _batch_samples_per_scan(
+                                batch_job
+                            )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
@@ -6944,6 +7087,7 @@ def run_live_capture(
                     fine_window_payloads,
                     expected_origin=fine_origin,
                     expected_exposures=expected_exposures,
+                    expected_samples_per_scan=_batch_samples_per_scan(batch_job),
                 )
             journal["fine_windows"] = [
                 {

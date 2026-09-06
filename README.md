@@ -95,7 +95,7 @@ focus, framing, color, or dust-removal quality.
 
 The [hardware evidence matrix](docs/HARDWARE-SUPPORT.md) separates package,
 discovery, preview, and capture results. Final attended full-roll hardware
-acceptance for beta.15 is **NOT RUN**. Real black-and-white fine scanning
+acceptance for beta.16 is **NOT RUN**. Real black-and-white fine scanning
 remains blocked; infrared ICE is unsuitable for traditional silver B&W film.
 The clearly labeled simulator is for software exploration, not hardware evidence.
 

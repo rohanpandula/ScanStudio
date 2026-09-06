@@ -531,7 +531,10 @@ struct BatchInspectorView: View {
                 InspectorRow(label: "Bit depth", value: "\(sessionModel.scanBitDepth)-bit")
                 InspectorRow(label: "Channels", value: sessionModel.scanChannels.uppercased())
                 InspectorRow(label: "Autofocus", value: sessionModel.autofocusEachFrame ? "Each frame" : "Off")
-                InspectorRow(label: "Auto exposure", value: sessionModel.autoExposureEachFrame ? "Each frame" : "Off")
+                InspectorRow(
+                    label: "Auto exposure",
+                    value: sessionModel.autoExposureEachFrame ? "Each frame" : "Held from first frame"
+                )
                 InspectorRow(label: "Digital ICE", value: digitalIceSummary)
                 InspectorRow(label: "Requested outputs", value: activeOutputsSummary)
             }
@@ -822,11 +825,14 @@ struct BatchInspectorView: View {
     }
 
     private var perFrameAutomationExplanation: String {
-        switch sessionModel.selectedFrameCount {
+        let automation: String = switch sessionModel.selectedFrameCount {
         case 0: "Runs before each frame you select."
         case 1: "Runs before the selected single scan."
         default: "Runs independently before every selected frame in the batch."
         }
+        guard !sessionModel.autoExposureEachFrame else { return automation }
+        return automation
+            + " With auto exposure off, the lowest selected frame is metered first and its exposure is held for the rest of the batch; infrared is always metered."
     }
 
     private var iceModeExplanation: String {

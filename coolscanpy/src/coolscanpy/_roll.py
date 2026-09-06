@@ -69,6 +69,7 @@ from coolscanpy.exceptions import (
     TransportSmearDetected,
 )
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    SUPPORTED_SAMPLES_PER_SCAN,
     BatchAckAction,
     CaptureBatchProcessError,
     CaptureBatchRequest,
@@ -1017,11 +1018,14 @@ class Roll:
         slot: int,
         *,
         exposure_override_10ns: tuple[int, int, int] | None = None,
+        samples_per_scan: int = 4,
     ) -> Frame:
         """Fine-scan one slot. Sugar for ``next(iter(scan_many([slot])))``."""
 
         iterator = self.scan_many(
-            [slot], exposure_override_10ns=exposure_override_10ns
+            [slot],
+            exposure_override_10ns=exposure_override_10ns,
+            samples_per_scan=samples_per_scan,
         )
         try:
             return next(iterator)
@@ -1037,6 +1041,7 @@ class Roll:
         on_progress: ProgressCallback | None = None,
         exposure_override_10ns: tuple[int, int, int] | None = None,
         eject_after: bool = False,
+        samples_per_scan: int = 4,
     ) -> Iterator[Frame]:
         """One continuous transport reservation for the whole ordered
         ``slots`` list, yielding a Frame as each completes.
@@ -1086,6 +1091,14 @@ class Roll:
         ``GeneratorExit`` -- it never leaves the worker blocked writing a
         finished frame to a queue nobody is reading.
 
+        ``samples_per_scan`` selects the fine scan's samples per line: ``4``
+        (the default) commands every traced byte unchanged; ``1`` patches the
+        fine SET_WINDOW multi-read byte to a single sample, the same value the
+        metering windows already use, for a faster and noisier capture. The
+        frame journal records the commanded value as ``fine_samples_per_scan``
+        and the scanner's echoed fine windows under ``fine_windows``. Any
+        other value is a ``ValueError`` before any hardware I/O.
+
         ``exposure_override_10ns``, when given, is a ``(red, green, blue)``
         tuple of raw 10ns hardware exposure ticks (the same unit as
         ``exposures_raw_10ns``/``wire_colors_raw_10ns`` elsewhere in this
@@ -1122,6 +1135,7 @@ class Roll:
                     "batch scanner slots must be unique and strictly increasing"
                 )
         _validate_exposure_override_10ns(exposure_override_10ns)
+        _validate_samples_per_scan(samples_per_scan)
 
         with self._state_condition:
             approvals = dict(self._approvals)
@@ -1202,6 +1216,7 @@ class Roll:
                 expected_usb_bus=topology[0],
                 expected_usb_address=topology[1],
                 exposure_override_10ns=exposure_override_10ns,
+                samples_per_scan=samples_per_scan,
                 # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the same
                 # computation RollPreviewSession.to_json() already uses to
                 # decide whether ITS OWN provenance is a manual session's
@@ -1979,6 +1994,20 @@ def _receipt_duration_ms(capture: dict[str, Any]) -> int | None:
     if value < 0 or value > ((1 << 64) - 1):
         return None
     return value
+
+
+def _validate_samples_per_scan(samples_per_scan: object) -> None:
+    """``samples_per_scan`` must be one of :data:`SUPPORTED_SAMPLES_PER_SCAN`."""
+
+    if (
+        isinstance(samples_per_scan, bool)
+        or not isinstance(samples_per_scan, int)
+        or samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN
+    ):
+        raise ValueError(
+            f"samples_per_scan must be one of {SUPPORTED_SAMPLES_PER_SCAN}, "
+            f"got {samples_per_scan!r}"
+        )
 
 
 def _validate_exposure_override_10ns(
