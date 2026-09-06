@@ -28,13 +28,12 @@ $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\
 $pinnedToolsInstaller = Join-Path $portRoot 'packaging\install_pinned_tauri_tools.py'
 $cargoTarget = Join-Path $appRoot 'src-tauri\target'
 $tauriToolsRoot = Join-Path $cargoTarget '.tauri'
-# 2026-08-24: Microsoft rotated the fwlink 2124701 delivery GUID again
-# (previous: 22ced09c-d6bd-4427-a658-f1dc48f3a440); re-verified via the
-# official fwlink redirect before re-pinning. Moves in lockstep with
-# install_pinned_tauri_tools.py.
-$webViewGuid = '89620190-81af-46a2-bb59-6228918a312e'
+# 2026-09-06: verified the current official fwlink 2124701 redirect.
+# Moves in lockstep with install_pinned_tauri_tools.py; verify Microsoft
+# Authenticode before the bundler or installer consumes these pinned bytes.
+$webViewGuid = 'a8f5ad97-0b01-41e5-9245-e8fc9ba9b311'
 $webViewFileName = 'MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
-$webViewSha256 = '358a11cff88ce519301c3b60bcefe848f922688ab0a333fc0f18ddf83bb3b4f3'
+$webViewSha256 = 'e7fa35755196ad9223596ef021a1ce6799509142eaa40ba35f634026be50b831'
 $nsisPluginSha256 = '5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709'
 $pinnedWebView = Join-Path $tauriToolsRoot "x64\$webViewGuid\$webViewFileName"
 $pinnedMakensis = Join-Path $tauriToolsRoot 'NSIS\makensis.exe'

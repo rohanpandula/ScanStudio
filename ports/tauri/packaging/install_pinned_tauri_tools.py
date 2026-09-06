@@ -116,16 +116,10 @@ NSIS_PLUGIN = {
     "sha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",
 }
 
-# 2026-08-24: Microsoft rotated the fwlink 2124701 delivery GUID again
-# (previous: 22ced09c-d6bd-4427-a658-f1dc48f3a440, itself a 2026-08-23
-# rotation of eb04ea38-69c8-4b86-b65b-fd4c8469ae59, itself a 2026-08-14
-# rotation of e4dd9b83-b7e3-4d17-8d7c-e14cdd7c3a51); Tauri's bundler
-# resolved the new GUID during the eleven-issue PR's Windows package job,
-# ignored the pinned copy staged under the old path, downloaded a fresh
-# installer into its own cache directory, and the pin gate failed closed
-# on the unexpected directory exactly as designed. New artifact
-# re-verified via the official fwlink redirect before re-pinning.
-WEBVIEW2_GUID = "89620190-81af-46a2-bb59-6228918a312e"
+# 2026-09-06: verified the official fwlink 2124701 redirect and repinned its
+# current installer. Tauri resolves that redirect to choose its cache path;
+# an unexpected rotation must still fail the exact-tree and Authenticode gates.
+WEBVIEW2_GUID = "a8f5ad97-0b01-41e5-9245-e8fc9ba9b311"
 WEBVIEW2_ASSET = {
     "name": "MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
     "url": (
@@ -133,8 +127,8 @@ WEBVIEW2_ASSET = {
         "filestreamingservice/files/"
         f"{WEBVIEW2_GUID}/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
     ),
-    "size": 213_044_432,
-    "sha256": "358a11cff88ce519301c3b60bcefe848f922688ab0a333fc0f18ddf83bb3b4f3",
+    "size": 258_614_480,
+    "sha256": "e7fa35755196ad9223596ef021a1ce6799509142eaa40ba35f634026be50b831",
 }
 
 WINDOWS_RESERVED_NAMES = {
