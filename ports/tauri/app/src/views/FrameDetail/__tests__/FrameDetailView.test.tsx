@@ -211,3 +211,31 @@ describe("FrameDetailView", () => {
     expect(screen.getByTestId("defect-marker-7")).toBeInTheDocument();
   });
 });
+
+
+it("keeps Close available for missing previews without requesting hardware motion", async () => {
+  const fixture = await detailFixture();
+  mocks.sessionStore = fixture.store;
+  const onClose = vi.fn();
+  const user = userEvent.setup();
+  const before = fixture.calls.filter(c => c.method === "scanner.acquireThumbnails").length;
+  render(<FrameDetailView frameIndex={5} onClose={onClose} />);
+  await user.click(screen.getByRole("button", { name: "Close" }));
+  expect(onClose).toHaveBeenCalledOnce();
+  expect(fixture.calls.filter(c => c.method === "scanner.acquireThumbnails")).toHaveLength(before);
+});
+
+
+it("does not call a failed preview loading while its operation token awaits completion", async () => {
+  const fixture = await detailFixture();
+  mocks.sessionStore = fixture.store;
+  render(<FrameDetailView frameIndex={5} onClose={() => undefined} />);
+  expect(screen.getByRole("status")).toHaveTextContent("Loading preview for frame 5");
+  act(() => fixture.emitEvent({
+    event: "scanner.thumbnailsFailed",
+    payload: { operationId: fixture.operationId, code: "FEED_JAM", message: "Film did not advance" },
+  }));
+  expect(fixture.store.getState().activeOperationId).toBe(fixture.operationId);
+  expect(screen.getByRole("status")).toHaveTextContent("No preview for frame 5");
+  expect(screen.getByRole("button", { name: "Close" })).toBeEnabled();
+});

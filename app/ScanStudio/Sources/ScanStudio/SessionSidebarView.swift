@@ -3,7 +3,7 @@ import SwiftUI
 
 struct SessionSidebarView: View {
     @Environment(SessionModel.self) private var sessionModel
-    @State private var isShowingProjectLauncher = false
+    let onManageProjects: () -> Void
 
     private var isConnected: Bool { sessionModel.status?.connected == true }
     private var isRealDevice: Bool { sessionModel.device?.kind == "real" }
@@ -27,9 +27,6 @@ struct SessionSidebarView: View {
 
         }
         .background(Color.scanStudioSidebar)
-        .sheet(isPresented: $isShowingProjectLauncher) {
-            ProjectLauncherView(session: sessionModel)
-        }
     }
 
     private var projectSection: some View {
@@ -47,22 +44,25 @@ struct SessionSidebarView: View {
                 SidebarRow(icon: "camera.filters", title: "Film process", trailing: project.filmProcess.rawValue)
 
                 Button("Switch Project…") {
-                    isShowingProjectLauncher = true
+                    onManageProjects()
                 }
                 .buttonStyle(.borderless)
                 .font(.system(size: 11))
                 .foregroundStyle(Color.scanStudioSecondaryText)
-                .disabled(sessionModel.isJobActive || sessionModel.jobId != nil)
+                .disabled(sessionModel.projectChangeDisabledReason != nil)
+                .help(sessionModel.projectChangeDisabledReason ?? "Open or save a project")
                 .padding(.leading, 30)
             } else {
                 Button {
-                    isShowingProjectLauncher = true
+                    onManageProjects()
                 } label: {
                     Label("New / Open Project…", systemImage: "folder.badge.plus")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.scanStudioAmber)
+                .disabled(sessionModel.projectChangeDisabledReason != nil)
+                .help(sessionModel.projectChangeDisabledReason ?? "Open or save a project")
             }
         }
     }

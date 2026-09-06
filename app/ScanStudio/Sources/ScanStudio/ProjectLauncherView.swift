@@ -35,6 +35,7 @@ struct ProjectLauncherView: View {
     @State private var createAttemptError: LauncherAttemptError?
     @State private var openRecentAttemptError: LauncherAttemptError?
     @State private var isSubmitting = false
+    @State private var isLoadingRecentProjects = true
 
     init(
         session: SessionModel,
@@ -62,15 +63,33 @@ struct ProjectLauncherView: View {
                 .labelsHidden()
                 .padding([.horizontal, .top])
                 .accessibilityLabel("Project launcher tab")
+                .disabled(isSubmitting)
 
                 Group {
                     if selectedTab == .newProject {
-                        newProjectForm
+                        if registeredPreviewFrameCount == nil {
+                            ContentUnavailableView(
+                                "Preview a roll first",
+                                systemImage: "photo.stack",
+                                description: Text("Return to the film workspace, connect your scanner, and acquire previews. Then save the roll as a new project.")
+                            )
+                        } else {
+                            newProjectForm
+                        }
                     } else {
                         openRecentSection
                     }
                 }
             }
+            Divider()
+                .padding(.top, 12)
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isSubmitting)
+            }
+            .padding(.top, 12)
         }
         .frame(width: 420, height: 460)
         .padding(20)
@@ -172,6 +191,7 @@ struct ProjectLauncherView: View {
                           let previewProcess = session.previewFilmProcess,
                           registeredPreviewFrameCount != nil
                     else { return }
+                    guard !isSubmitting else { return }
                     createAttemptError = nil
                     isSubmitting = true
                     let completed: Bool
@@ -227,6 +247,7 @@ struct ProjectLauncherView: View {
             .keyboardShortcut(.defaultAction)
         }
         .padding(.top, 12)
+        .disabled(isSubmitting)
     }
 
     private var registeredPreviewFrameCount: Int? {
@@ -279,8 +300,8 @@ struct ProjectLauncherView: View {
     }
 
     private var disabledReason: String? {
-        if session.isJobActive || session.jobId != nil {
-            return "Finish or stop the current scan before changing projects."
+        if let reason = session.projectChangeDisabledReason {
+            return reason
         }
         if purpose == .saveRollAndScan, selectedFrameCount == 0 {
             return "Select at least one frame before saving and scanning."
@@ -294,12 +315,21 @@ struct ProjectLauncherView: View {
 
     private var openRecentSection: some View {
         Group {
-            if session.recentProjects.isEmpty {
-                ContentUnavailableView("No projects yet", systemImage: "tray")
+            if isLoadingRecentProjects {
+                ProgressView("Loading projects…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if session.recentProjects.isEmpty {
+                ContentUnavailableView(
+                    openRecentAttemptError == nil ? "No projects yet" : "Couldn’t load projects",
+                    systemImage: "tray"
+                )
             } else {
                 List(session.recentProjects) { summary in
                     Button {
                         Task {
+                            guard !isSubmitting else { return }
+                            isSubmitting = true
+                            defer { isSubmitting = false }
                             openRecentAttemptError = nil
                             await session.openProject(directory: summary.directory)
                             if session.lastErrorMessage == nil {
@@ -320,8 +350,17 @@ struct ProjectLauncherView: View {
                         recentProjectRow(summary)
                     }
                     .buttonStyle(.plain)
-                    .disabled(session.isJobActive || session.jobId != nil)
+                    .disabled(isSubmitting || session.projectChangeDisabledReason != nil)
                 }
+            }
+
+            if isSubmitting {
+                ProgressView("Opening project…")
+            } else if let reason = session.projectChangeDisabledReason {
+                Text(reason)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.scanStudioSecondaryText)
+                    .padding(.horizontal)
             }
 
             if let error = openRecentAttemptError {
@@ -334,20 +373,39 @@ struct ProjectLauncherView: View {
                     .foregroundStyle(Color.scanStudioRed)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal)
+                Button("Reload Projects") {
+                    Task { await loadRecentProjects() }
+                }
+                .disabled(isSubmitting || isLoadingRecentProjects)
             }
         }
-        .task { await session.refreshRecentProjects() }
+        .task { await loadRecentProjects() }
+    }
+
+    private func loadRecentProjects() async {
+        isLoadingRecentProjects = true
+        openRecentAttemptError = nil
+        await session.refreshRecentProjects()
+        if let error = session.errorPresentation {
+            openRecentAttemptError = LauncherAttemptError(title: error.title, guidance: error.guidance)
+        }
+        isLoadingRecentProjects = false
     }
 
     private func recentProjectRow(_ summary: ProjectSummary) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(summary.name)
                 .font(.system(size: 12, weight: .semibold))
-            Text("\(summary.carrier.displayName) · \(summary.filmProcess.rawValue) · \(summary.createdAt)")
+            Text("\(summary.carrier.displayName) · \(filmProcessLabel(summary.filmProcess)) · \(projectDate(summary.createdAt))")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.scanStudioSecondaryText)
         }
         .padding(.vertical, 2)
+    }
+
+    private func projectDate(_ value: String) -> String {
+        guard let date = ISO8601DateFormatter().date(from: value) else { return value }
+        return date.formatted(date: .abbreviated, time: .shortened)
     }
 
     private func framePluralized(_ count: Int) -> String {

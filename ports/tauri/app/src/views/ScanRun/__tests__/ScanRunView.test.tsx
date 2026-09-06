@@ -10,6 +10,7 @@ import {
 import { createScriptedTransport } from "../../../session/testing/harness";
 import type { DeviceInfo, EngineError, ScanProject } from "../../../session/wire/types";
 import ScanRunView from "../ScanRunView";
+import PendingFramesPanel from "../PendingFramesPanel";
 import { captureDurationLabel } from "../ScanRunView";
 
 afterEach(cleanup);
@@ -345,17 +346,19 @@ describe("ScanRunView", () => {
     expect(screen.getByTestId("frame-row-3").textContent).not.toContain("failed");
   });
 
-  it("calls pendingFrames and loads remaining frames from the exact returned set", async () => {
+  it("shows a remaining-frame lookup failure and allows a visible retry", async () => {
     const fixture = await runFixture();
     mocks.sessionStore = fixture.store;
+    const pending = vi.spyOn(fixture.store, "pendingFrames")
+      .mockRejectedValueOnce(new Error("Project is unavailable"))
+      .mockResolvedValueOnce({frames:[3,4],totalFrames:36,completedCount:2,excludedCount:0});
     const user = userEvent.setup();
-    render(<ScanRunView jobId="job-1" onResume={vi.fn()} />);
-    await act(async () => {
-      await user.click(screen.getByTestId("refresh-pending"));
-    });
-    const pendingCall = fixture.calls.find((c) => c.method === "project.pendingFrames");
-    expect(pendingCall).toBeDefined();
-    expect(fixture.store.getState().jobId).toBe("job-1");
+    render(<PendingFramesPanel />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Project is unavailable");
+    await user.click(screen.getByRole("button", {name:"Check remaining frames"}));
+    expect(await screen.findByRole("button", {name:"Scan remaining (2)"})).toBeEnabled();
+    expect(pending).toHaveBeenCalledTimes(2);
+    expect(fixture.calls.filter(c => c.method === "scan.start")).toHaveLength(1);
   });
 
   it("counts scanned frames rather than receipt file types and surfaces alpha.11 provenance", async () => {
@@ -461,4 +464,58 @@ describe("ScanRunView", () => {
     expect(fixture.calls.filter((call) => call.method === "roll.approve")).toHaveLength(5);
     expect(fixture.calls.filter((call) => call.method === "scan.start")).toHaveLength(2);
   });
+});
+
+
+it("reports a rejected stop and allows an acknowledged retry", async () => {
+  const fixture = await runFixture();
+  mocks.sessionStore = fixture.store;
+  const stop = vi.spyOn(fixture.store, "stopJob")
+    .mockRejectedValueOnce({code:"SCANNER_BUSY",message:"Transport unavailable",recoverable:true})
+    .mockResolvedValueOnce({acknowledged:true,mode:"afterCurrentFrame"});
+  const user = userEvent.setup();
+  render(<ScanRunView jobId="job-1" />);
+  await user.click(screen.getByTestId("stop-after-current"));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Transport unavailable");
+  expect(screen.getByTestId("stop-after-current")).toBeEnabled();
+  await user.click(screen.getByTestId("stop-after-current"));
+  expect(await screen.findByRole("status")).toHaveTextContent("Stop request acknowledged");
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(stop).toHaveBeenCalledTimes(2);
+  expect(stop).toHaveBeenLastCalledWith("job-1", "afterCurrentFrame");
+});
+
+
+it("keeps Stop pending until the request settles and prevents duplicate requests", async () => {
+  const fixture = await runFixture();
+  mocks.sessionStore = fixture.store;
+  let resolveStop!: (result: {acknowledged: boolean; mode: "afterCurrentFrame"}) => void;
+  const stop = vi.spyOn(fixture.store, "stopJob").mockImplementation(() =>
+    new Promise((resolve) => { resolveStop = resolve; }),
+  );
+  const user = userEvent.setup();
+  render(<ScanRunView jobId="job-1" />);
+  const button = screen.getByTestId("stop-after-current");
+  await user.click(button);
+  expect(screen.getByRole("status")).toHaveTextContent("Sending stop request");
+  expect(button).toBeDisabled();
+  await user.click(button);
+  expect(stop).toHaveBeenCalledOnce();
+  await act(async () => { resolveStop({acknowledged: true, mode: "afterCurrentFrame"}); });
+  expect(screen.getByRole("status")).toHaveTextContent("Stop request acknowledged");
+});
+
+
+it("refreshes progress after a same-store remount with missed notifications", async () => {
+  const fixture = await runFixture();
+  mocks.sessionStore = fixture.store;
+  const view = render(<ScanRunView jobId="job-1" />);
+  expect(screen.queryByTestId("scan-run-progress")).toBeNull();
+  view.unmount();
+  fixture.emitEvent({
+    event: "scan.progress",
+    payload: { jobId: "job-1", frameIndex: 1, jobPercent: 75, etaSeconds: 4 },
+  });
+  render(<ScanRunView jobId="job-1" />);
+  expect(screen.getByTestId("scan-run-job-percent")).toHaveTextContent("75%");
 });

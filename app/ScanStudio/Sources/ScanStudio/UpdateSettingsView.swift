@@ -117,7 +117,7 @@ struct UpdateSettingsView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Label("Update available: \(candidate.version.raw)", systemImage: "arrow.down.circle.fill")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color.scanStudioAmber)
+                    .foregroundStyle(.primary)
 
                 if model.pendingInstallURL != nil {
                     // The prominent next action once install() has already

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ResolvedCaptureRecipe } from "../../session/store/session";
 import type {
   CaptureRecipe,
@@ -26,18 +26,24 @@ export default function PendingFramesPanel({ onResumed, recipes }: PendingFrames
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = async (): Promise<void> => {
+  const [refreshCount, setRefreshCount] = useState(0);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setChecking(true);
     setError(null);
-    try {
-      const result = await sessionStore.pendingFrames();
-      setPending(result);
-    } catch (reason) {
-      setError((reason as { message?: string })?.message ?? "failed to load pending frames");
-    }
-  };
+    void sessionStore.pendingFrames()
+      .then((result) => { if (!cancelled) setPending(result); })
+      .catch((reason) => {
+        if (!cancelled) setError(reason?.message ?? "Failed to load remaining frames. Try checking again.");
+      })
+      .finally(() => { if (!cancelled) setChecking(false); });
+    return () => { cancelled = true; };
+  }, [refreshCount]);
 
   const resume = async (): Promise<void> => {
-    if (pending === null || pending.frames.length === 0) return;
+    if (pending === null || pending.frames.length === 0 || checking || busy || error !== null) return;
     setError(null);
     setBusy(true);
     try {
@@ -70,16 +76,20 @@ export default function PendingFramesPanel({ onResumed, recipes }: PendingFrames
       <div className={styles.pendingRow}>
         <div className={styles.pendingStats} data-testid="pending-frames-stats">
           {pending === null
-            ? "No pending-frames data loaded."
+            ? checking ? "Checking remaining frames…" : "Remaining frames unavailable."
             : `${pending.frames.length} of ${pending.totalFrames} pending · ${pending.completedCount} complete · ${pending.excludedCount} excluded`}
         </div>
         <button
           type="button"
           className={styles.controlButton}
           data-testid="load-pending-frames"
-          onClick={() => void refresh()}
+          disabled={checking || busy}
+          onClick={() => {
+            setChecking(true);
+            setRefreshCount((count) => count + 1);
+          }}
         >
-          Load pending
+          {checking ? "Checking…" : "Check remaining frames"}
         </button>
       </div>
       {pending !== null && pending.frames.length > 0 && (
@@ -87,14 +97,19 @@ export default function PendingFramesPanel({ onResumed, recipes }: PendingFrames
           type="button"
           className={styles.resumeButton}
           data-testid="scan-remaining"
-          disabled={busy}
+          disabled={busy || checking || error !== null}
           onClick={() => void resume()}
         >
           Scan remaining ({pending.frames.length})
         </button>
       )}
+      {pending !== null && pending.frames.length === 0 && !checking && error === null && (
+        <p className={styles.hint} role="status" data-testid="capture-workflow-done">
+          {pending.completedCount === pending.totalFrames ? "All frames captured." : "No frames remaining."}
+        </p>
+      )}
       {error !== null && (
-        <p className={styles.hint} data-testid="pending-frames-error">
+        <p className={styles.hint} role="alert" data-testid="pending-frames-error">
           {error}
         </p>
       )}

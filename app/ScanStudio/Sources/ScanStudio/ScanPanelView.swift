@@ -214,10 +214,14 @@ struct ScanPanelView: View {
             Button {
                 Task { await sessionModel.stopAfterCurrentFrame() }
             } label: {
-                Label("Pause after frame", systemImage: "pause.circle")
+                Label(
+                    sessionModel.device?.kind == "real" ? "Stop after frame" : "Pause after frame",
+                    systemImage: "pause.circle"
+                )
             }
             .buttonStyle(.bordered)
             .disabled(sessionModel.jobState == .stoppingAfterCurrentFrame || sessionModel.jobState == .stoppingImmediately)
+            .help("Finish the current frame, then stop the batch. Remaining frames can be resumed later.")
 
             Button {
                 Task { await sessionModel.skipCurrentFrame() }
@@ -228,14 +232,18 @@ struct ScanPanelView: View {
             .disabled(sessionModel.jobState == .stoppingAfterCurrentFrame || sessionModel.jobState == .stoppingImmediately || sessionModel.device?.kind == "real")
             .help(skipFrameHelpText)
 
-            Button(role: .destructive) {
-                Task { await sessionModel.stopImmediately() }
-            } label: {
-                Label("Stop Scan", systemImage: "stop.circle.fill")
+            // Real hardware always stops after the current frame; an immediate
+            // stop control would promise an abort the scanner cannot perform.
+            if sessionModel.device?.kind == "simulated" {
+                Button(role: .destructive) {
+                    Task { await sessionModel.stopImmediately() }
+                } label: {
+                    Label("Stop Scan", systemImage: "stop.circle.fill")
+                }
+                .buttonStyle(.bordered)
+                .tint(.scanStudioRed)
+                .disabled(sessionModel.jobState == .stoppingImmediately)
             }
-            .buttonStyle(.bordered)
-            .tint(.scanStudioRed)
-            .disabled(sessionModel.jobState == .stoppingImmediately)
         }
     }
 

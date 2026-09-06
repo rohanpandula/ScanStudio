@@ -138,6 +138,9 @@ describe("App release surfaces", () => {
           return { result: { project: PROJECT, directory: "/tmp/app-real" } };
         }
         if (method === "scan.start") return { result: { jobId: "job-real-1" } };
+        if (method === "project.pendingFrames") {
+          return {result: {frames: [], totalFrames: 36, completedCount: 36, excludedCount: 0}};
+        }
         if (method === "scan.stop") {
           return { result: { acknowledged: true, mode: "afterCurrentFrame" } };
         }
@@ -172,10 +175,27 @@ describe("App release surfaces", () => {
     const scanStartCall = calls.find((call) => call.method === "scan.start");
     expect((scanStartCall?.params.recipe as { multisamplePasses?: number })?.multisamplePasses).toBe(4);
     const setup = screen.getByTestId("windows-setup-action");
+    const back = screen.getByRole("button", { name: "Back to film" });
+    expect(back).toBeDisabled();
+    await user.click(back);
+    expect(calls.filter((call) => call.method === "scan.start")).toHaveLength(1);
+    expect(calls.filter((call) => call.method === "scan.stop")).toHaveLength(0);
     expect(setup).toBeDisabled();
     await user.click(setup);
     expect(screen.queryByTestId("setup-checker")).toBeNull();
     expect(screen.getByTestId("stop-after-current")).toBeVisible();
+    act(() => {
+      handle.emitEvent({
+        event: "scan.completed",
+        payload: {jobId: "job-real-1", summary: {completed: [1], failed: [], skipped: [], stopped: false}},
+      });
+    });
+    await user.click(screen.getByRole("button", {name: "Back to film"}));
+    expect(screen.getByTestId("contact-grid")).toBeInTheDocument();
+    await user.click(screen.getByTestId("capture-action"));
+    expect(screen.getByTestId("scan-setup-view")).toBeInTheDocument();
+    expect(calls.filter((call) => call.method === "scan.start")).toHaveLength(1);
+    expect(calls.filter((call) => call.method === "scan.stop")).toHaveLength(0);
   });
 
   it("leaves Windows setup if a real-hardware job becomes active while setup is open", async () => {
@@ -312,5 +332,9 @@ describe("App shell reachability (06-03 Task 2)", () => {
     const captureButton = await screen.findByTestId("capture-action");
     await user.click(captureButton);
     expect(await screen.findByTestId("capture-workflow-view")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Back to film" }));
+    expect(screen.getByTestId("contact-grid")).toBeInTheDocument();
+    expect(store.getState().selectedFrameIndices).toHaveLength(36);
+    expect(parseCalls.filter((call) => ["scan.start", "scan.stop"].includes(call.method))).toEqual([]);
   });
 });

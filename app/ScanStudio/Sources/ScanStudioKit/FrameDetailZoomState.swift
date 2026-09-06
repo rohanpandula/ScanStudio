@@ -12,6 +12,7 @@ public struct FrameDetailZoomState: Equatable, Sendable {
 
     private var steadyScale: CGFloat = minimumScale
     private var steadyPanOffset: CGSize = .zero
+    private var viewportSize: CGSize = .zero
 
     public init() {}
 
@@ -27,10 +28,12 @@ public struct FrameDetailZoomState: Equatable, Sendable {
         if scale == Self.minimumScale {
             reset()
         }
+        constrainPan()
     }
 
     public mutating func updateMagnification(_ gestureScale: CGFloat) {
         scale = Self.clamp(steadyScale * gestureScale)
+        constrainPan()
     }
 
     public mutating func finishMagnification() {
@@ -42,10 +45,22 @@ public struct FrameDetailZoomState: Equatable, Sendable {
 
     public mutating func updatePan(translation: CGSize) {
         guard scale > Self.minimumScale else { return }
-        panOffset = CGSize(
+        panOffset = boundedPan(CGSize(
             width: steadyPanOffset.width + translation.width,
             height: steadyPanOffset.height + translation.height
-        )
+        ))
+    }
+
+    public mutating func updateViewportSize(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite else { return }
+        viewportSize = CGSize(width: max(0, size.width), height: max(0, size.height))
+        constrainPan()
+    }
+
+    /// Discrete movement shared by keyboard and accessibility actions.
+    public mutating func pan(by delta: CGSize) {
+        updatePan(translation: delta)
+        finishPan()
     }
 
     public mutating func finishPan() {
@@ -61,5 +76,19 @@ public struct FrameDetailZoomState: Equatable, Sendable {
 
     private static func clamp(_ scale: CGFloat) -> CGFloat {
         min(Self.maximumScale, max(Self.minimumScale, scale))
+    }
+
+    private func boundedPan(_ offset: CGSize) -> CGSize {
+        let horizontalLimit = viewportSize.width * (scale - 1) / 2
+        let verticalLimit = viewportSize.height * (scale - 1) / 2
+        return CGSize(
+            width: min(horizontalLimit, max(-horizontalLimit, offset.width)),
+            height: min(verticalLimit, max(-verticalLimit, offset.height))
+        )
+    }
+
+    private mutating func constrainPan() {
+        panOffset = boundedPan(panOffset)
+        steadyPanOffset = boundedPan(steadyPanOffset)
     }
 }

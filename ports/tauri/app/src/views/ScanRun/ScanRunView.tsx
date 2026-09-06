@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSyncExternalStore } from "react";
 import { sessionStore, type SessionState } from "../../session";
-import type { JobState, PendingFramesResult } from "../../session/wire/types";
+import type { JobState } from "../../session/wire/types";
 import type { StopMode } from "../../session/store/session";
 import type { EngineError, FrameState } from "../../session/wire/types";
 import type { ScanReceipt } from "../../session/wire/types";
@@ -11,6 +11,7 @@ let cachedStore: unknown = null;
 let cachedSnapshot: Readonly<SessionState> | null = null;
 
 function stableSubscribe(listener: () => void): () => void {
+  cachedSnapshot = null;
   const unsubscribe = sessionStore.subscribe(() => {
     cachedSnapshot = null;
     listener();
@@ -34,7 +35,6 @@ const TICKER_LIMIT = 200;
 
 export interface ScanRunViewProps {
   jobId: string;
-  onResume?: (pending: PendingFramesResult) => void;
 }
 
 interface ProgressTick {
@@ -75,7 +75,7 @@ function receiptDetails(receipt: ScanReceipt): string[] {
   return details;
 }
 
-export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
+export default function ScanRunView({ jobId }: ScanRunViewProps) {
   const state = useSyncExternalStore(stableSubscribe, stableGetSnapshot);
   const jobState = state.jobState;
   const frameIndices = useMemo(
@@ -99,6 +99,9 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
   // only when simulated).
   const supportsImmediateStop = state.connection.device?.kind === "simulated";
   const mediaLoaded = state.connection.connected && state.connection.status?.mediaLoaded === true;
+  const [stopPending, setStopPending] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
+  const [stopAcknowledged, setStopAcknowledged] = useState(false);
   const [ejectPending, setEjectPending] = useState(false);
   const [ejectResult, setEjectResult] = useState<"succeeded" | EngineError | null>(null);
   const [recoveryActionError, setRecoveryActionError] = useState<string | null>(null);
@@ -146,12 +149,19 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
   }, [frameIndices, state.frameStates, state.frameErrors]);
 
   const stop = async (mode: StopMode): Promise<void> => {
-    await sessionStore.stopJob(jobId, mode);
-  };
-
-  const loadPending = async (): Promise<void> => {
-    const pending = await sessionStore.pendingFrames();
-    if (onResume !== undefined) onResume(pending);
+    if (stopPending || !jobActive) return;
+    setStopPending(true);
+    setStopError(null);
+    setStopAcknowledged(false);
+    try {
+      const result = await sessionStore.stopJob(jobId, mode);
+      if (!result.acknowledged) throw new Error("Stop was not acknowledged. Try again.");
+      setStopAcknowledged(true);
+    } catch (reason) {
+      setStopError((reason as { message?: string })?.message ?? "Stop request failed. Try again.");
+    } finally {
+      setStopPending(false);
+    }
   };
 
   const retryWithAttendedApproval = async (): Promise<void> => {
@@ -246,11 +256,14 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
       )}
 
       <div className={styles.controls}>
+        {stopPending && <p role="status">Sending stop request…</p>}
+        {stopError !== null && <p className={styles.frameError} role="alert">{stopError}</p>}
+        {!stopPending && stopAcknowledged && <p role="status">Stop request acknowledged.</p>}
         <button
           type="button"
           className={styles.primaryButton}
           data-testid="stop-after-current"
-          disabled={!jobActive}
+          disabled={!jobActive || stopPending}
           onClick={() => void stop("afterCurrentFrame")}
         >
           Stop after current frame
@@ -263,7 +276,7 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
             type="button"
             className={styles.dangerButton}
             data-testid="stop-now"
-            disabled={!jobActive}
+            disabled={!jobActive || stopPending}
             onClick={() => void stop("immediate")}
           >
             Stop now
@@ -288,14 +301,6 @@ export default function ScanRunView({ jobId, onResume }: ScanRunViewProps) {
             {ejectResult.code} — {ejectResult.message}
           </p>
         )}
-        <button
-          type="button"
-          className={styles.controlButton}
-          data-testid="refresh-pending"
-          onClick={() => void loadPending()}
-        >
-          Check remaining frames
-        </button>
       </div>
 
       <div className={styles.frameTable} data-testid="scan-run-frames">

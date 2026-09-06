@@ -298,3 +298,25 @@ describe("CaptureWorkflowView gates", () => {
     expect(screen.getByTestId("scan-run-ticker-list").textContent).toContain("FEED_JAM");
   });
 });
+
+
+it("loads remaining frames once, refreshes visibly, and clears the run on project creation", async () => {
+  const fixture = await gatesFixture();
+  completePreview(fixture, {1:false,2:false,3:false});
+  mocks.sessionStore = fixture.store;
+  const user = userEvent.setup();
+  render(<CaptureWorkflowView selectedFrames={[1,2,3]} onRequestConnect={() => undefined} />);
+  await user.click(screen.getByTestId("start-scan"));
+  act(() => fixture.emitEvent({event:"scan.completed",payload:{jobId:"job-1",summary:{completed:[1],failed:[],skipped:[2,3],stopped:true}}}));
+  expect(await screen.findByRole("button", {name:"Scan remaining (2)"})).toBeEnabled();
+  expect(fixture.calls.filter(c => c.method === "project.pendingFrames")).toHaveLength(1);
+  vi.spyOn(fixture.store, "pendingFrames").mockResolvedValue({frames:[],totalFrames:36,completedCount:36,excludedCount:0});
+  await user.click(screen.getByRole("button", {name:"Check remaining frames"}));
+  expect(await screen.findByText("All frames captured.")).toBeInTheDocument();
+  expect(screen.queryByRole("button", {name:/Scan remaining/})).toBeNull();
+  await act(async () => { await fixture.store.createProject("Gate Roll","roll36",36,"c41ColorNegative"); });
+  expect(screen.queryByTestId("scan-run-view")).toBeNull();
+  expect(screen.getByTestId("scan-setup-view")).toBeInTheDocument();
+  expect(fixture.calls.filter(c => c.method === "scan.start")).toHaveLength(1);
+  expect(fixture.calls.filter(c => c.method === "scan.stop")).toHaveLength(0);
+});

@@ -20,13 +20,14 @@ struct FrameDetailWorkspaceView: View {
     @Environment(SessionModel.self) private var sessionModel
 
     @State private var zoomState = FrameDetailZoomState()
+    @FocusState private var isPreviewFocused: Bool
 
     /// Deliberately NOT reset inside `.task(id: frameIndex)` — unlike
     /// `zoomScale`/`panOffset` (a per-image viewport that must reset), a
     /// reviewer switching frames via the filmstrip while inspecting defects
     /// across a whole roll should stay in Defect Map mode; resetting it
     /// every frame would make batch defect review unusable.
-    @State private var viewingMode: FrameViewingMode = .finalPositive
+    @State private var viewingMode: FrameViewingMode = .scannerPreview
     @State private var overlayOpacity: Double = 0.7
 
     /// Filter-chip state (DEF-02) — also NOT reset per frame, same
@@ -168,8 +169,14 @@ struct FrameDetailWorkspaceView: View {
                         defectMapControlsSection
                     }
                     filmstripSection
-                    overridesSection
-                    exifToolPanel
+                    if sessionModel.project != nil {
+                        overridesSection
+                        exifToolPanel
+                    } else {
+                        Text("Save the roll to analyze defects or edit per-frame output settings and metadata.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.scanStudioSecondaryText)
+                    }
                 }
                 .padding(20)
             }
@@ -188,7 +195,7 @@ struct FrameDetailWorkspaceView: View {
             selectedDefectID = nil
             metadataPreviewFrameIndex = nil
             metadataApplyResult = nil
-            if sessionModel.frameDefects[frameIndex] == nil {
+            if sessionModel.project != nil, sessionModel.frameDefects[frameIndex] == nil {
                 await sessionModel.analyzeFrameDefects(frameIndex)
             }
         }
@@ -260,65 +267,97 @@ struct FrameDetailWorkspaceView: View {
         let mirrored = sessionModel.frameMirror(frameIndex)
         let verticallyMirrored = sessionModel.frameVerticalMirror(frameIndex)
 
-        return VStack(alignment: .leading, spacing: 6) {
-            viewingModeSwitcher
-            orientationControls
-
-            // `ZStack`, not `Group`: `Group`'s multiple children are NOT
-            // overlaid — inside this VStack, a second simultaneous Group
-            // child would become a separate row rather than a layer on top
-            // of the image. This ZStack keeps every modifier below chained
-            // after it exactly as before, so the defect markers inherit the
-            // SAME scaleEffect/offset the image gets and never drift off
-            // the image on pinch-zoom/pan.
-            ZStack {
-                // Preview of the persisted derivative rotation
-                // (`SessionModel.rotateFrame`).
-                // The image and the defect markers rotate together by the same
-                // angle about the same center: marker coordinates are defined
-                // in the UNROTATED frame (DefectOverlayCanvas, DefectMapView.swift),
-                // so the overlay gets the identical rotationEffect below to stay
-                // registered to the now-rotated pixels.
-                Group {
-                    if let realImage {
-                        Image(nsImage: realImage)
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        SimulatedFrameImage(frameIndex: frameIndex, isAvailable: isAvailable)
-                    }
-                }
-                .scaleEffect(
-                    x: mirrored ? -1 : 1,
-                    y: verticallyMirrored ? -1 : 1
-                )
-                .rotationEffect(.degrees(Double(orientationDegrees)))
-                if viewingMode == .defectMap {
-                    defectMapOverlayContent(
-                        orientationDegrees: orientationDegrees,
-                        mirrored: mirrored,
-                        verticallyMirrored: verticallyMirrored
-                    )
+        // `ZStack`, not `Group`: `Group`'s multiple children are NOT
+        // overlaid — inside this VStack, a second simultaneous Group
+        // child would become a separate row rather than a layer on top
+        // of the image. This ZStack keeps every modifier below chained
+        // after it exactly as before, so the defect markers inherit the
+        // SAME scaleEffect/offset the image gets and never drift off
+        // the image on pinch-zoom/pan.
+        let previewImage = ZStack {
+            // Preview of the persisted derivative rotation
+            // (`SessionModel.rotateFrame`).
+            // The image and the defect markers rotate together by the same
+            // angle about the same center: marker coordinates are defined
+            // in the UNROTATED frame (DefectOverlayCanvas, DefectMapView.swift),
+            // so the overlay gets the identical rotationEffect below to stay
+            // registered to the now-rotated pixels.
+            Group {
+                if let realImage {
+                    Image(nsImage: realImage)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    SimulatedFrameImage(frameIndex: frameIndex, isAvailable: isAvailable)
                 }
             }
-            .scaleEffect(zoomState.scale)
-            .offset(zoomState.panOffset)
-            // Swap to portrait (2:3) at 90/270 so the rotated frame fits instead
-            // of being clipped to the landscape box (rotationEffect does not
-            // resize layout bounds).
-            .aspectRatio(
-                FrameOrientation.displayAspectRatio(orientationDegrees),
-                contentMode: .fit
+            .scaleEffect(
+                x: mirrored ? -1 : 1,
+                y: verticallyMirrored ? -1 : 1
             )
-            .frame(maxWidth: .infinity, minHeight: 360, maxHeight: 480)
-            .background(.black)
-            .clipShape(RoundedRectangle(cornerRadius: 5))
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.12)))
-            // Keep the preview's changing description scoped to the image
-            // before adding interactive overlays. Applying this label after
-            // `zoomControls` causes SwiftUI to replace each button's own
-            // accessible name with the preview description.
-            .accessibilityLabel(previewAccessibilityLabel(usesRealImage: realImage != nil))
+            .rotationEffect(.degrees(Double(orientationDegrees)))
+            if viewingMode == .defectMap {
+                defectMapOverlayContent(
+                    orientationDegrees: orientationDegrees,
+                    mirrored: mirrored,
+                    verticallyMirrored: verticallyMirrored
+                )
+            }
+        }
+        .scaleEffect(zoomState.scale)
+        .offset(zoomState.panOffset)
+        // Swap to portrait (2:3) at 90/270 so the rotated frame fits instead
+        // of being clipped to the landscape box (rotationEffect does not
+        // resize layout bounds).
+        .aspectRatio(
+            FrameOrientation.displayAspectRatio(orientationDegrees),
+            contentMode: .fit
+        )
+        .frame(maxWidth: .infinity, minHeight: 360, maxHeight: 480)
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { zoomState.updateViewportSize(geometry.size) }
+                    .onChange(of: geometry.size) { _, size in
+                        zoomState.updateViewportSize(size)
+                    }
+            }
+        }
+        .background(.black)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.12)))
+        // Keep the preview's changing description scoped to the image
+        // before adding interactive overlays. Applying this label after
+        // `zoomControls` causes SwiftUI to replace each button's own
+        // accessible name with the preview description.
+        .accessibilityLabel(previewAccessibilityLabel(usesRealImage: realImage != nil))
+
+        let accessiblePreview = previewImage
+            .accessibilityHint("Zoom in, then use the arrow keys while the preview is focused to pan.")
+            .focusable()
+            .focused($isPreviewFocused)
+            .onTapGesture { isPreviewFocused = true }
+            .onMoveCommand { direction in
+                guard isPreviewFocused, !zoomState.isFitted else { return }
+                switch direction {
+                case .left: zoomState.pan(by: CGSize(width: 40, height: 0))
+                case .right: zoomState.pan(by: CGSize(width: -40, height: 0))
+                case .up: zoomState.pan(by: CGSize(width: 0, height: 40))
+                case .down: zoomState.pan(by: CGSize(width: 0, height: -40))
+                @unknown default: break
+                }
+            }
+            .accessibilityAction(named: "Pan Left") { zoomState.pan(by: CGSize(width: 40, height: 0)) }
+            .accessibilityAction(named: "Pan Right") { zoomState.pan(by: CGSize(width: -40, height: 0)) }
+            .accessibilityAction(named: "Pan Up") { zoomState.pan(by: CGSize(width: 0, height: 40)) }
+            .accessibilityAction(named: "Pan Down") { zoomState.pan(by: CGSize(width: 0, height: -40)) }
+            .overlay {
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(isPreviewFocused ? Color.scanStudioCyan : .clear, lineWidth: 2)
+                    .allowsHitTesting(false)
+            }
+
+        let decoratedPreview = accessiblePreview
             .overlay(alignment: .topTrailing) { zoomControls }
             .overlay(alignment: .bottomLeading) {
                 if viewingMode == .defectMap {
@@ -370,6 +409,11 @@ struct FrameDetailWorkspaceView: View {
             .contentShape(Rectangle())
             .gesture(SimultaneousGesture(magnifyGesture, panGesture))
 
+        return VStack(alignment: .leading, spacing: 6) {
+            viewingModeSwitcher
+            orientationControls
+            decoratedPreview
+
             if FrameAlignmentAvailabilityPolicy.isVisible(
                 deviceKind: sessionModel.device?.kind
             ) {
@@ -389,11 +433,7 @@ struct FrameDetailWorkspaceView: View {
         }
     }
 
-    /// Final/Before Repair/Defect Map (DEF-01) — exactly one mode is ever
-    /// shown, no 50/50 comparison. Segmented style matches the mode-picker
-    /// precedent this app already establishes (`BatchInspectorView`'s
-    /// Digital ICE mode picker, this file's own `processingEditorRows`
-    /// Digital ICE mode picker).
+    /// Both modes use the scanner preview; Defect Map adds the analysis overlay.
     private var viewingModeSwitcher: some View {
         Picker("Viewing mode", selection: $viewingMode) {
             ForEach(FrameViewingMode.allCases, id: \.self) { mode in
@@ -403,6 +443,8 @@ struct FrameDetailWorkspaceView: View {
         .pickerStyle(.segmented)
         .labelsHidden()
         .controlSize(.small)
+        .disabled(sessionModel.project == nil)
+        .help(sessionModel.project == nil ? "Save the roll to analyze and view defects." : "Choose the scanner preview or defect overlay.")
     }
 
     private var orientationControls: some View {
@@ -542,16 +584,8 @@ struct FrameDetailWorkspaceView: View {
         }
     }
 
-    /// `beforeRepair` gets its own honest caption (see this plan's
-    /// `scope_decision`: no pixel pipeline in this codebase currently
-    /// produces a genuinely different before/after-ICE buffer for any
-    /// frame); `finalPositive`/`defectMap` keep the existing real/simulated
-    /// caption unchanged.
     private func previewCaption(usesRealImage: Bool) -> String {
-        if viewingMode == .beforeRepair {
-            return "Before-repair view: Digital ICE correction is not yet applied to any rendered output in this build — shown identically to Final."
-        }
-        return usesRealImage
+        usesRealImage
             ? "Real scanner preview tile · zoom and pan"
             : "Simulated preview crop, the same source imagery shown throughout Scan Studio · zoom and pan"
     }

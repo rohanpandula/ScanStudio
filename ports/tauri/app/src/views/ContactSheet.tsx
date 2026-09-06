@@ -19,6 +19,7 @@ let cachedStore: unknown = null;
 let cachedSnapshot: Readonly<SessionState> | null = null;
 
 function stableSubscribe(listener: () => void): () => void {
+  cachedSnapshot = null;
   const unsubscribe = sessionStore.subscribe(() => {
     cachedSnapshot = null;
     listener();
@@ -589,6 +590,7 @@ export default function ContactSheet({ onInspectFrame, onCapture }: ContactSheet
                 key={frameIndex}
                 type="button"
                 className={tileClass}
+                aria-pressed={selected}
                 data-testid={`contact-tile-${frameIndex}`}
                 data-rotation={derivativeTransform.rotationDegrees}
                 data-horizontal-mirror={derivativeTransform.horizontalMirror}

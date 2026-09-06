@@ -2,18 +2,13 @@ import AppKit
 import ScanStudioKit
 import SwiftUI
 
-/// The three switchable modes `FrameDetailWorkspaceView`'s large preview
-/// offers (DEF-01). Exactly one is ever shown at a time — no 50/50
-/// comparison. `Final` and `Before Repair` render the identical image (see
-/// `FrameDetailWorkspaceView`'s own scope note); `Defect Map` is the only
-/// mode that visibly differs, via `DefectOverlayCanvas`.
+/// The scanner preview, with an optional defect overlay.
 enum FrameViewingMode: String, CaseIterable {
-    case finalPositive, beforeRepair, defectMap
+    case scannerPreview, defectMap
 
     var label: String {
         switch self {
-        case .finalPositive: "Final"
-        case .beforeRepair: "Before Repair"
+        case .scannerPreview: "Scanner Preview"
         case .defectMap: "Defect Map"
         }
     }
