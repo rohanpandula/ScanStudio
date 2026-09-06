@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add ``samples_per_scan`` (1 or 4, default 4) to ``Roll.scan``/``Roll.scan_many`` and the batch job. Single-sample mode patches the fine SET_WINDOW multi-read byte (payload[48]) and its GET_WINDOW echo expectation before preflight, mirroring the metering windows' own single-sample value; the frame journal records ``fine_samples_per_scan``. The traced 4-sample capture is byte-for-byte unchanged. Single-sample output has not yet been validated on hardware.
+
 ## 0.7.5 - 2026-09-06
 
 - Accept the observed EBDE-prefixed LS-5000 padding counter dialect only when the entire padding block matches its exact counter train. Offline and streaming decoding retain strict corruption rejection and identical sample output.

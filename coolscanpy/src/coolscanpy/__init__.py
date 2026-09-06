@@ -31,6 +31,9 @@ except PackageNotFoundError:  # pragma: no cover - direct source-tree import
 
 from coolscanpy._device import Device, get_devices, open
 from coolscanpy._roll import Roll
+from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    SUPPORTED_SAMPLES_PER_SCAN,
+)
 from coolscanpy.exceptions import (
     AdapterUnsupported,
     BatchIntegrityError,
@@ -95,6 +98,7 @@ __all__ = [
     "DigitalIceAcquisitionEvidence",
     # roll extension
     "Roll",
+    "SUPPORTED_SAMPLES_PER_SCAN",
     "Material",
     "Thumbnail",
     "Frame",
