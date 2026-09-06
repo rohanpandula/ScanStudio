@@ -2043,7 +2043,8 @@ pub(crate) fn ensure_supported_metadata_filesystem(file: &File) -> std::io::Resu
         )
     };
     if result == 0 {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(error.kind(), format!("GetVolumeInformationByHandleW: {error}")));
     }
     if !windows_metadata_filesystem_name_is_supported(&filesystem_name) {
         let name = String::from_utf16_lossy(&filesystem_name)
@@ -3158,7 +3159,8 @@ pub(crate) mod metadata_publish_sys {
         };
         if status < 0 {
             let windows_error = unsafe { RtlNtStatusToDosError(status) };
-            return Err(io::Error::from_raw_os_error(windows_error as i32));
+            let error = io::Error::from_raw_os_error(windows_error as i32);
+            return Err(io::Error::new(error.kind(), format!("NtCreateFile metadata entry: {error}")));
         }
         if handle.is_null() || handle as isize == -1 {
             return Err(io::Error::other(
@@ -3238,7 +3240,8 @@ pub(crate) mod metadata_publish_sys {
             )
         };
         if result == 0 {
-            Err(io::Error::last_os_error())
+            let error = io::Error::last_os_error();
+            Err(io::Error::new(error.kind(), format!("SetFileInformationByHandle rename: {error}")))
         } else {
             Ok(())
         }
@@ -3485,7 +3488,9 @@ pub(crate) mod metadata_publish_sys {
         // File::sync_all maps to FlushFileBuffers on Windows. Directory
         // capabilities are opened with write access so this ordering barrier
         // is enforced instead of silently assuming a rename is durable.
-        directory.sync_all()
+        directory.sync_all().map_err(|error| {
+            io::Error::new(error.kind(), format!("FlushFileBuffers directory: {error}"))
+        })
     }
 }
 
