@@ -37,8 +37,8 @@ LINUX_ASSETS = (
     {
         "name": "AppRun-x86_64",
         "url": (
-            "https://api.github.com/repos/tauri-apps/binary-releases/"
-            "releases/assets/274691722"
+            "https://github.com/tauri-apps/binary-releases/"
+            "releases/download/apprun-old/AppRun-x86_64"
         ),
         "size": 31_552,
         "sha256": "f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f",
@@ -46,8 +46,8 @@ LINUX_ASSETS = (
     {
         "name": "linuxdeploy-x86_64.AppImage",
         "url": (
-            "https://api.github.com/repos/tauri-apps/binary-releases/"
-            "releases/assets/182515537"
+            "https://github.com/tauri-apps/binary-releases/"
+            "releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage"
         ),
         "size": 13_264_064,
         "sha256": "e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef",
@@ -81,19 +81,20 @@ LINUX_ASSETS = (
     {
         "name": "linuxdeploy-plugin-appimage.AppImage",
         "url": (
-            "https://api.github.com/repos/linuxdeploy/"
-            "linuxdeploy-plugin-appimage/releases/assets/497460911"
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/"
+            "releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-x86_64.AppImage"
         ),
-        "size": 16_484_856,
-        "sha256": "a45d3e227bc7f397e9cf6bfa4c9507494efa2293357b6e86690a3de2ca992e79",
+        # Use a versioned release: continuous assets are deleted on replacement.
+        "size": 15_889_136,
+        "sha256": "992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3",
     },
 )
 
 NSIS_ARCHIVE = {
     "name": "nsis-3.11.zip",
     "url": (
-        "https://api.github.com/repos/tauri-apps/binary-releases/"
-        "releases/assets/317051073"
+        "https://github.com/tauri-apps/binary-releases/"
+        "releases/download/nsis-3.11/nsis-3.11.zip"
     ),
     "size": 2_361_546,
     "sha256": "c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1",
@@ -108,8 +109,8 @@ NSIS_BASE_TREE_SHA256 = (
 NSIS_PLUGIN = {
     "name": "nsis_tauri_utils.dll",
     "url": (
-        "https://api.github.com/repos/tauri-apps/nsis-tauri-utils/"
-        "releases/assets/345882097"
+        "https://github.com/tauri-apps/nsis-tauri-utils/"
+        "releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll"
     ),
     "size": 34_304,
     "sha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",

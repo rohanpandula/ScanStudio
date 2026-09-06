@@ -814,6 +814,7 @@ try {
         throw "Unexpected Tauri CLI version: $tauriCliVersion"
     }
     npm run sync-engine
+    Invoke-EngineSmoke -Tree (Join-Path $appRoot 'src-tauri\binaries')
     npm test
     npx tsc --noEmit
     npm run build
