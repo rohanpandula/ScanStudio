@@ -256,12 +256,35 @@ public actor ControlChannelServer {
     public var isListening: Bool { listenDescriptor >= 0 }
 
     /// Binds and listens at `path`, in this exact order: validate the path,
-    /// prepare its directory, refuse if a live host already owns the path
-    /// (D-03), reclaim a stale path, then `socket`/`bind`/`chmod`/`listen`.
-    /// Every failure path closes any descriptor it opened before throwing.
+    /// prepare its directory, acquire the WR-02 bind-time lock, refuse if a
+    /// live host already owns the path (D-03), reclaim a stale path, then
+    /// `socket`/`bind`/`chmod`/`listen`. Every failure path closes any
+    /// descriptor it opened before throwing.
+    ///
+    /// WR-02: the probe -> unlink -> bind sequence below has no atomicity
+    /// of its own -- two processes racing `start(path:)` within the same
+    /// narrow window could both observe `probeIsLive == false` (neither
+    /// has bound yet), both `unlink` (harmless when nothing exists), and
+    /// both attempt `bind()`; whichever binds first is live, but the
+    /// second one's own `unlink` (issued before it ever tried to bind)
+    /// could delete the first one's just-bound socket file, and the
+    /// second's own subsequent `bind()` then succeeds too -- both report
+    /// success, silently violating "a live probe refuses start" for the
+    /// pair. An exclusive, non-blocking advisory `flock` on `<path>.lock`
+    /// serializes this whole critical section across processes: whichever
+    /// starter wins the lock proceeds exactly as before; the loser is
+    /// refused immediately with the same `EADDRINUSE`-shaped error a
+    /// live-probe refusal already uses, never left to race the winner for
+    /// `unlink`/`bind` itself. This is a bind-time serializer only, held
+    /// just for the duration of this call (released via `defer` on every
+    /// exit path) -- it is never a liveness signal; liveness is, and
+    /// remains, connect+hello only (documented in `CONTROL.md`).
     public func start(path: String) throws {
         try ControlSocketPath.validate(path)
         try ControlSocketPath.prepareDirectory(for: path)
+        let lockFD = try Self.acquireBindLock(forSocketPath: path)
+        defer { Self.releaseBindLock(lockFD) }
+
         if ControlSocketDialer.probeIsLive(path: path) {
             throw ControlSocketError(
                 context: "start(\(path)): another host is already listening at this path",
@@ -283,6 +306,39 @@ public actor ControlChannelServer {
         listenDescriptor = fd
         boundPath = path
         armAcceptSource(fd: fd)
+    }
+
+    /// Opens (creating if absent) `<path>.lock` at `0600` and takes an
+    /// exclusive, non-blocking `flock` on it. The lock file is never
+    /// `unlink`ed -- only released, via `close()` in `releaseBindLock` --
+    /// so every future starter for the same socket path locks the same
+    /// inode, never a since-deleted-and-recreated one (unlinking a lock
+    /// file while another process might still be opening it is a classic
+    /// way to make two "exclusive" locks refer to two different files).
+    /// Failure to take the lock is reported with the identical
+    /// `EADDRINUSE` shape `probeIsLive` already uses, so a caller cannot
+    /// distinguish "lost the bind-time race" from "a live host already
+    /// owns this path" -- both mean the same thing to `start(path:)`'s
+    /// own caller: this attempt did not win the path.
+    private static func acquireBindLock(forSocketPath path: String) throws -> Int32 {
+        let lockPath = path + ".lock"
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else {
+            throw ControlSocketError(context: "open(\(lockPath))", errnoValue: errno)
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            throw ControlSocketError(
+                context: "start(\(path)): another host is already starting at this path (lock \(lockPath) held)",
+                errnoValue: EADDRINUSE
+            )
+        }
+        return fd
+    }
+
+    private static func releaseBindLock(_ fd: Int32) {
+        flock(fd, LOCK_UN)
+        close(fd)
     }
 
     private func bindListenAndChmod(fd: Int32, path: String) throws {

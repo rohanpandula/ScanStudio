@@ -335,6 +335,65 @@ struct ControlChannelServerTests {
     }
 
     @MainActor
+    @Test("WR-02: two servers starting concurrently at the same path -- exactly one binds, the other is refused EADDRINUSE, never both")
+    func concurrentStartersAtSamePathOnlyOneWins() async throws {
+        let path = shortSocketPath("concurrent-start")
+        defer { removeSocketDirectory(for: path) }
+        // Pre-created so both starters' own `prepareDirectory` calls find it
+        // already present and skip `mkdir()` entirely -- `prepareDirectory`
+        // has its own separate, pre-existing check-then-`mkdir()` TOCTOU
+        // (unrelated to WR-02, out of this fix's scope) that two genuinely
+        // concurrent first-ever starts at a brand-new directory can hit,
+        // observed directly while developing this test (`mkdir` racing to
+        // `EEXIST`). Sidestepped here so this test stays focused on WR-02's
+        // own bind-time lock, not a different, already-there directory race.
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+
+        let serverA = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        let serverB = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+
+        // Fired as two independent, concurrently-running Tasks (not two
+        // sequential `await`s) -- `serverA`/`serverB` are two distinct
+        // actor instances, so nothing about Swift's own actor isolation
+        // serializes them relative to each other; only WR-02's own
+        // bind-time `flock` does. Whichever of the two wins that lock
+        // proceeds through probe -> unlink -> bind exactly as before; the
+        // loser is refused immediately (still holding the lock) or, if it
+        // only reaches the lock after the winner has already finished
+        // binding and released it, is refused by the pre-existing
+        // live-probe check instead -- either path yields the same
+        // EADDRINUSE shape, so the outcome is deterministic regardless of
+        // exactly how the two Tasks happen to interleave.
+        func attemptStart(_ server: ControlChannelServer) async -> Result<Void, Error> {
+            do {
+                try await server.start(path: path)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        async let outcomeA = attemptStart(serverA)
+        async let outcomeB = attemptStart(serverB)
+        let outcomes = await [outcomeA, outcomeB]
+
+        let successCount = outcomes.filter { if case .success = $0 { return true } else { return false } }.count
+        #expect(successCount == 1, "exactly one of two concurrent starters at the same path must bind, never zero or both")
+
+        let refusals = outcomes.compactMap { outcome -> ControlSocketError? in
+            guard case .failure(let error) = outcome else { return nil }
+            return error as? ControlSocketError
+        }
+        #expect(refusals.count == 1)
+        #expect(refusals.first?.errnoValue == EADDRINUSE)
+
+        await serverA.stop()
+        await serverB.stop()
+    }
+
+    @MainActor
     @Test("simulateHostCrash() leaves the file on disk but probeIsLive sees it as dead, and a successor reclaims it")
     func crashedSocketIsReclaimed() async throws {
         let path = shortSocketPath("crash")
