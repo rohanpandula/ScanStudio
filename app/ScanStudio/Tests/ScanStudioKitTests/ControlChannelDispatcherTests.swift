@@ -399,4 +399,156 @@ struct ControlChannelDispatcherTests {
         #expect(refusal?.code == ControlErrorCode.gateRefused.rawValue)
         #expect(refusal?.gate == ControlGate.refeedRequired.rawValue)
     }
+
+    // MARK: Read-only aggregates (Task 2)
+
+    @Test("Case names for hardwareMotionReadiness/scanReadiness are derived by plain String(describing:)")
+    func readinessCaseNamesAreStable() {
+        #expect(String(describing: HardwareMotionReadiness.ready) == "ready")
+        #expect(String(describing: ScanReadinessPolicy.Decision.hardwareMotionNotReady) == "hardwareMotionNotReady")
+    }
+
+    @Test(".status mirrors device, scanner status, and the live readiness case names")
+    @MainActor
+    func statusMirrorsSessionState() async {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.status(id: 14))
+        guard case .success(let id, let result) = response, case .status(let status) = result else {
+            Issue.record("expected a status success result")
+            return
+        }
+        #expect(id == 14)
+        #expect(status.device == model.device)
+        #expect(status.scanner == model.status)
+        #expect(status.mutatingOperationInFlight == model.mutatingOperationInFlight)
+        #expect(status.hardwareMotionReadiness == String(describing: model.hardwareMotionReadiness))
+        #expect(status.scanReadiness == String(describing: model.scanReadiness(for: model.selectedFrames)))
+    }
+
+    @Test("Repeated status calls never touch the engine and return identical payloads")
+    @MainActor
+    func statusIsPureAndRepeatable() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let baseline = await stub.requestCount
+
+        var results: [ControlStatusResult] = []
+        for i in 0..<10 {
+            let response = await dispatcher.handle(.status(id: UInt64(i)))
+            guard case .success(_, let result) = response, case .status(let status) = result else {
+                Issue.record("expected a status success result")
+                continue
+            }
+            results.append(status)
+        }
+
+        #expect(await stub.requestCount == baseline)
+        #expect(results.count == 10)
+        #expect(results.allSatisfy { $0 == results[0] })
+    }
+
+    @Test(".framesList against a model with no open project returns an empty frames array, not an error")
+    @MainActor
+    func framesListWithNoProjectIsEmpty() async {
+        let (_, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.framesList(id: 15))
+        guard case .success(_, let result) = response, case .framesList(let framesList) = result else {
+            Issue.record("expected a framesList success result")
+            return
+        }
+        #expect(framesList.frames.isEmpty)
+    }
+
+    @Test("A ControlFrameSummary strips hardware-diagnostic detail -- only the bare error code crosses the wire")
+    @MainActor
+    func framesListStripsDiagnosticDetailFromFrameErrors() async throws {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.openProject(directory: "/tmp/control-dispatcher-test")
+        model.jobId = "job-diagnostic-detail-test"
+        model.handle(event: EngineEvent(
+            name: "scan.frameState",
+            rawLine: Data(
+                #"""
+                {"event":"scan.frameState","payload":{"jobId":"job-diagnostic-detail-test","frameIndex":1,"state":"failed","attempt":1,"error":{"code":"FEED_JAM","message":"jam","recoverable":true,"evidence":{"schemaVersion":1,"evidenceId":"ev-1","operationId":"op-1","sessionEpoch":"1"}}}}
+                """#.utf8
+            )
+        ))
+        #expect(model.frameErrors[1]?.evidence != nil)
+
+        let response = await dispatcher.handle(.framesList(id: 16))
+        guard case .success(_, let result) = response, case .framesList(let framesList) = result else {
+            Issue.record("expected a framesList success result")
+            return
+        }
+        let encoded = try JSONEncoder().encode(framesList)
+        let json = String(data: encoded, encoding: .utf8) ?? ""
+        #expect(!json.contains("evidence"))
+        #expect(framesList.frames.first { $0.index == 1 }?.errorCode == "FEED_JAM")
+    }
+
+    @Test(".settingsGet and .outputsGet mirror the live capture/processing/output recipes")
+    @MainActor
+    func settingsAndOutputsGetMirrorCurrentRecipes() async {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        model.scanResolutionDpi = 2_000
+
+        let settingsResponse = await dispatcher.handle(.settingsGet(id: 17))
+        guard case .success(_, let settingsResult) = settingsResponse, case .settings(let settings) = settingsResult else {
+            Issue.record("expected a settings success result")
+            return
+        }
+        #expect(settings.capture == model.captureRecipe)
+        #expect(settings.processing == model.processingRecipe)
+
+        let outputsResponse = await dispatcher.handle(.outputsGet(id: 18))
+        guard case .success(_, let outputsResult) = outputsResponse, case .outputs(let outputs) = outputsResult else {
+            Issue.record("expected an outputs success result")
+            return
+        }
+        #expect(outputs.outputs == model.outputRecipe)
+    }
+
+    @Test(".jobGet reports job state and receipt count without leaking receipt paths")
+    @MainActor
+    func jobGetReportsCounts() async {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        model.jobId = "job-get-test"
+
+        let response = await dispatcher.handle(.jobGet(id: 19))
+        guard case .success(_, let result) = response, case .job(let job) = result else {
+            Issue.record("expected a job success result")
+            return
+        }
+        #expect(job.jobId == "job-get-test")
+        #expect(job.completedFrameCount == model.completedFrameCount)
+        #expect(job.pendingFrameCount == model.pendingFrameCount)
+        #expect(job.receiptCount == model.receipts.count)
+    }
+
+    @Test("The five read-only aggregates never touch the engine, before or after")
+    @MainActor
+    func readOnlyAggregatesNeverTouchEngine() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.openProject(directory: "/tmp/control-dispatcher-test")
+
+        let requests: [ControlRequest] = [
+            .status(id: 20), .framesList(id: 21), .settingsGet(id: 22), .outputsGet(id: 23), .jobGet(id: 24),
+        ]
+        for request in requests {
+            let before = await stub.requestCount
+            let response = await dispatcher.handle(request)
+            let after = await stub.requestCount
+            #expect(after == before)
+            guard case .success = response else {
+                Issue.record("\(request.methodName) unexpectedly failed: \(response)")
+                continue
+            }
+        }
+    }
 }

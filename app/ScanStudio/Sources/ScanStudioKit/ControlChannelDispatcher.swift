@@ -417,9 +417,8 @@ public final class ControlChannelDispatcher {
         switch request {
         case .hello:
             preconditionFailure("`.hello` is intercepted in handle(_:) before reaching route(_:).")
-        case .status:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .status(let id):
+            return .success(id: id, result: .status(buildStatusResult()))
         case .scannerList:
             // Plan 05/06 replaces this arm
             return placeholder(request)
@@ -435,9 +434,8 @@ public final class ControlChannelDispatcher {
         case .previewAcquire:
             // Plan 05/06 replaces this arm
             return placeholder(request)
-        case .framesList:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .framesList(let id):
+            return .success(id: id, result: .framesList(buildFramesListResult()))
         case .framesInclude:
             // Plan 05/06 replaces this arm
             return placeholder(request)
@@ -447,15 +445,16 @@ public final class ControlChannelDispatcher {
         case .reviewApprove:
             // Plan 05/06 replaces this arm
             return placeholder(request)
-        case .settingsGet:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .settingsGet(let id):
+            return .success(id: id, result: .settings(ControlSettingsResult(
+                capture: sessionModel.captureRecipe,
+                processing: sessionModel.processingRecipe
+            )))
         case .settingsSet:
             // Plan 05/06 replaces this arm
             return placeholder(request)
-        case .outputsGet:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .outputsGet(let id):
+            return .success(id: id, result: .outputs(ControlOutputsResult(outputs: sessionModel.outputRecipe)))
         case .outputsSet:
             // Plan 05/06 replaces this arm
             return placeholder(request)
@@ -486,9 +485,8 @@ public final class ControlChannelDispatcher {
         case .eventsSubscribe:
             // Plan 05/06 replaces this arm
             return placeholder(request)
-        case .jobGet:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .jobGet(let id):
+            return .success(id: id, result: .job(buildJobResult()))
         }
     }
 
@@ -545,6 +543,101 @@ public final class ControlChannelDispatcher {
             message: "Hardware motion is not ready (\(String(describing: readiness))): \(readiness.guidance)",
             guidance: readiness.guidance,
             gate: .hardwareMotion
+        )
+    }
+
+    // MARK: Read-only aggregates
+    //
+    // CTRL-03: no builder in this section may contain `await` or reach
+    // `sessionModel`'s engine boundary -- every field comes from a
+    // `SessionModel` public property. This is what makes a repeated
+    // read-only call provably inert: it never reconnects, never re-arms
+    // discovery, and never changes scanner or engine state.
+
+    /// Built from `SessionModel` public state only; also the exact tracked
+    /// read `subscribeToEvents()` observes (Task 3), so the set of
+    /// properties this snapshot reports is exactly the set whose change
+    /// wakes a subscriber -- one aggregate, no separate list to keep in
+    /// sync. `hardwareMotionReadiness`/`scanReadiness` cross the wire as
+    /// their case names (via `String(describing:)`, the same conversion
+    /// for both) rather than leaking either enum itself.
+    private func buildStatusResult() -> ControlStatusResult {
+        let motion = sessionModel.hardwareMotionReadiness
+        let readiness = sessionModel.scanReadiness(for: sessionModel.selectedFrames)
+        return ControlStatusResult(
+            device: sessionModel.device,
+            scanner: sessionModel.status,
+            projectName: sessionModel.project?.name,
+            projectDirectory: sessionModel.projectDirectory,
+            jobId: sessionModel.jobId,
+            jobState: sessionModel.jobState,
+            refeedRequired: sessionModel.refeedRequired,
+            hardwareMotionReadiness: String(describing: motion),
+            motionAllowed: motion.allowsMotion,
+            motionGuidance: motion.guidance,
+            mutatingOperationInFlight: sessionModel.mutatingOperationInFlight,
+            selectedFrames: sessionModel.selectedFrames,
+            scanReadiness: String(describing: readiness),
+            scanReadinessReason: readiness.reason,
+            lastErrorMessage: sessionModel.lastErrorMessage
+        )
+    }
+
+    /// One `ControlFrameSummary` per frame of the open project -- an empty
+    /// array when no project is open (a legitimate readable state, never an
+    /// error). `errorCode` copies only the bare failure code string; T-01-05
+    /// forbids copying any richer hardware-diagnostic payload alongside it.
+    private func buildFramesListResult() -> ControlFramesListResult {
+        let frames = (sessionModel.project?.frames ?? []).map { frame -> ControlFrameSummary in
+            let index = frame.index
+            return ControlFrameSummary(
+                index: index,
+                excluded: sessionModel.excludedFrameIndices.contains(index),
+                selected: sessionModel.selectedFrameIndices.contains(index),
+                hasThumbnail: sessionModel.thumbnails[index] != nil,
+                state: sessionModel.frameStates[index]?.rawValue,
+                manualReviewDecision: sessionModel.manualReviewDecisions[index].map(Self.manualReviewDecisionName),
+                errorCode: sessionModel.frameErrors[index]?.code
+            )
+        }
+        return ControlFramesListResult(frames: frames, selectedFrames: sessionModel.selectedFrames)
+    }
+
+    private static func manualReviewDecisionName(_ decision: ManualReviewDecision) -> String {
+        switch decision {
+        case .useFrameAnyway: "useFrameAnyway"
+        case .dontScan: "dontScan"
+        }
+    }
+
+    /// `receiptCount` rather than the receipts themselves: a receipt carries
+    /// output file paths, and `job.get` is a status call, not an export.
+    private func buildJobResult() -> ControlJobResult {
+        let frameErrorCodes = Dictionary(
+            uniqueKeysWithValues: sessionModel.frameErrors.map { (String($0.key), $0.value.code) }
+        )
+        return ControlJobResult(
+            jobId: sessionModel.jobId,
+            jobState: sessionModel.jobState,
+            progress: sessionModel.progress.map(Self.mapScanProgress),
+            completedFrameCount: sessionModel.completedFrameCount,
+            pendingFrameCount: sessionModel.pendingFrameCount,
+            receiptCount: sessionModel.receipts.count,
+            frameErrorCodes: frameErrorCodes
+        )
+    }
+
+    private static func mapScanProgress(_ progress: SessionModel.ScanProgress) -> ControlScanProgress {
+        ControlScanProgress(
+            jobId: progress.jobId,
+            frameIndex: progress.frameIndex,
+            frameOrdinal: progress.frameOrdinal,
+            totalFrames: progress.totalFrames,
+            pass: progress.pass,
+            totalPasses: progress.totalPasses,
+            framePercent: progress.framePercent,
+            jobPercent: progress.jobPercent,
+            etaSeconds: progress.etaSeconds
         )
     }
 
