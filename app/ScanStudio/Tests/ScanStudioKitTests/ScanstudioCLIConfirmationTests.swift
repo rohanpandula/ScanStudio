@@ -198,6 +198,90 @@ private struct ConfirmationHost {
     }
 }
 
+/// Connects, opens the one-frame project fixture, fakes a media-loaded
+/// status, completes a preview with a plain (not `needsApproval`)
+/// thumbnail, and selects frame 1 -- reaching `scanReadiness(for: [1])
+/// .isReady == true` without ever pausing on manual review. Mirrors
+/// `ControlChannelMotionRoutingTests.swift`'s identical
+/// `prepareMotionRoutingScanReadiness` helper (private to that file, so
+/// this is its own copy, not a shared import).
+@MainActor
+@discardableResult
+private func prepareConfirmationScanReadiness(_ model: SessionModel) async -> Bool {
+    await model.connect(deviceId: confirmationDevice.deviceId)
+    await model.openProject(directory: confirmationProjectDirectory)
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.refreshSavedProject(token: token)) == .started else { return false }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnail",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":1,"thumbnail":{"brightness":0.5,"tint":0.0}}}
+            """#.utf8
+        )
+    ))
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":1}}
+            """#.utf8
+        )
+    ))
+    model.toggleFrameSelection(1)
+    return model.scanReadiness(for: [1]).isReady
+}
+
+/// Feeds a synthetic `scan.jobState` event directly to `model` -- the same
+/// out-of-band-mutation technique `ControlChannelMotionRoutingTests.swift`
+/// uses throughout (`model.handle(event:)`), which the dispatcher's own
+/// observation-tracking subscription reacts to identically regardless of
+/// whether the mutation came from a real engine event or a test.
+@MainActor
+private func driveConfirmationJobState(_ model: SessionModel, jobId: String, state: String) {
+    model.handle(event: EngineEvent(
+        name: "scan.jobState",
+        rawLine: Data(#"{"event":"scan.jobState","payload":{"jobId":"\#(jobId)","state":"\#(state)"}}"#.utf8)
+    ))
+}
+
+/// Feeds a synthetic `scan.frameState` failure so `job.get`'s
+/// `frameErrorCodes` has a real entry to assert on, mirroring OUT-03's own
+/// `FEED_JAM` fixture (`ControlRecoverablePassthroughTests.swift`).
+@MainActor
+private func driveConfirmationFrameFailure(_ model: SessionModel, jobId: String, frameIndex: Int) {
+    model.handle(event: EngineEvent(
+        name: "scan.frameState",
+        rawLine: Data(
+            #"""
+            {"event":"scan.frameState","payload":{"jobId":"\#(jobId)","frameIndex":\#(frameIndex),"state":"failed","attempt":1,"error":{"code":"FEED_JAM","message":"film jammed mid-feed","recoverable":true}}}
+            """#.utf8
+        )
+    ))
+}
+
+/// Bounded polling for "the host's dispatch of the caller's own
+/// scan.start/scan.resume request has completed" -- a real subprocess plus
+/// a real socket round trip is a different timing domain than an
+/// in-process actor hop, so this bound is generous; the suite's own
+/// `.timeLimit` is the backstop, never an arbitrary sleep in the test
+/// itself (matches this plan's own note that a stalled `--wait` is caught
+/// by the suite's time limit, not a fixed delay).
+@MainActor
+private func waitForConfirmationJobToBegin(_ model: SessionModel) async {
+    for _ in 0..<20_000 where model.jobId == nil {
+        await Task.yield()
+    }
+}
+
 private enum ConfirmationCLILocator {
     struct LocateError: Error, CustomStringConvertible {
         let description: String
@@ -382,5 +466,199 @@ struct ScanstudioCLIConfirmationTests {
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let error = try #require(object["error"] as? [String: Any])
         #expect(error["code"] as? String == "HOST_UNREACHABLE")
+    }
+
+    // MARK: Task 2 -- scan / stop / resume and the --wait terminal-state observer
+
+    @Test("scan without --confirm-motion exits 77 with CONFIRMATION_REQUIRED, and the host's fake engine recorded zero new requests")
+    func scanWithoutConfirmMotionExitsConfirmationRequired() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-unconfirmed")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let before = await host.stub.requestCounts
+
+        let result = try await runConfirmationCLI(["scan"], socketPath: host.socketPath)
+        #expect(result.exitCode == 77)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "CONFIRMATION_REQUIRED")
+
+        let after = await host.stub.requestCounts
+        #expect(before == after)
+
+        await host.server.stop()
+    }
+
+    @Test("resume without --confirm-motion exits 77 with CONFIRMATION_REQUIRED, and the host's fake engine recorded zero new requests")
+    func resumeWithoutConfirmMotionExitsConfirmationRequired() async throws {
+        let host = try await ConfirmationHost.start(label: "resume-unconfirmed")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let before = await host.stub.requestCounts
+
+        let result = try await runConfirmationCLI(["resume"], socketPath: host.socketPath)
+        #expect(result.exitCode == 77)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "CONFIRMATION_REQUIRED")
+
+        let after = await host.stub.requestCounts
+        #expect(before == after)
+
+        await host.server.stop()
+    }
+
+    @Test("scan --confirm-motion without --wait against a ready host exits 0 and the result carries a jobId")
+    func scanConfirmedWithoutWaitReturnsJobId() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-nowait")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+
+        let result = try await runConfirmationCLI(["scan", "--confirm-motion"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["jobId"] as? String == ConfirmationEngineStub.jobId)
+
+        await host.server.stop()
+    }
+
+    @Test("scan --confirm-motion --wait driven to completed exits 0 and the result carries jobState completed and receiptCount")
+    func scanWaitDrivenToCompletedExitsZero() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-wait-completed")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+
+        async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
+        await waitForConfirmationJobToBegin(host.model)
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "scanning")
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "completed")
+
+        let result = try await outcome
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["jobState"] as? String == "completed")
+        #expect(resultObject["receiptCount"] is Int)
+
+        await host.server.stop()
+    }
+
+    @Test("scan --confirm-motion --wait driven to failed exits 65 and the result carries frameErrorCodes")
+    func scanWaitDrivenToFailedExitsEngineOrGateError() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-wait-failed")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+
+        async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
+        await waitForConfirmationJobToBegin(host.model)
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "scanning")
+        await driveConfirmationFrameFailure(host.model, jobId: ConfirmationEngineStub.jobId, frameIndex: 1)
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "failed")
+
+        let result = try await outcome
+        #expect(result.exitCode == 65)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["jobState"] as? String == "failed")
+        let frameErrorCodes = try #require(resultObject["frameErrorCodes"] as? [String: String])
+        #expect(frameErrorCodes["1"] == "FEED_JAM")
+
+        await host.server.stop()
+    }
+
+    @Test("scan --confirm-motion --wait driven to stopped exits 0")
+    func scanWaitDrivenToStoppedExitsZero() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-wait-stopped")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+
+        async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
+        await waitForConfirmationJobToBegin(host.model)
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "scanning")
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "stopped")
+
+        let result = try await outcome
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["jobState"] as? String == "stopped")
+
+        await host.server.stop()
+    }
+
+    @Test("scan --confirm-motion --wait whose host is shut down mid-wait exits 69 rather than hanging")
+    func scanWaitHostGoneMidWaitExitsHostUnreachable() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-wait-host-gone")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+
+        async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
+        await waitForConfirmationJobToBegin(host.model)
+        await host.server.stop()
+
+        let result = try await outcome
+        #expect(result.exitCode == 69)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "HOST_UNREACHABLE")
+    }
+
+    @Test("stop with no active job exits with the host's GATE_REFUSED code and prints its message verbatim")
+    func stopWithNoActiveJobExitsGateRefused() async throws {
+        let host = try await ConfirmationHost.start(label: "stop-no-job")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+
+        let result = try await runConfirmationCLI(["stop"], socketPath: host.socketPath)
+        #expect(result.exitCode != 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "GATE_REFUSED")
+        #expect((error["message"] as? String)?.contains("no job is active") == true)
+
+        await host.server.stop()
+    }
+
+    @Test("stop --immediate against an active job sends mode immediate, recorded verbatim by the fake engine")
+    func stopImmediateSendsImmediateMode() async throws {
+        let host = try await ConfirmationHost.start(label: "stop-immediate")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+
+        let startResult = try await runConfirmationCLI(["scan", "--confirm-motion"], socketPath: host.socketPath)
+        #expect(startResult.exitCode == 0)
+
+        let stopResult = try await runConfirmationCLI(["stop", "--immediate"], socketPath: host.socketPath)
+        #expect(stopResult.exitCode == 0)
+        let recordedModes = await host.stub.recordedScanStopModes
+        #expect(recordedModes == ["immediate"])
+
+        await host.server.stop()
+    }
+
+    @Test("SAFE-02: a recoverable FEED_JAM thrown from scan.start exits non-zero and reaches stdout as \"recoverable\": true, with exactly one scan.start request recorded")
+    func scanRecoverableEngineErrorIsReportedNotRetried() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-recoverable")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+        await host.stub.failNext("scan.start", with: EngineRequestError(
+            code: "FEED_JAM", message: "film jammed mid-feed", recoverable: true
+        ))
+
+        let result = try await runConfirmationCLI(["scan", "--confirm-motion"], socketPath: host.socketPath)
+        #expect(result.exitCode == 65)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "FEED_JAM")
+        #expect(error["recoverable"] as? Bool == true)
+        let startCount = await host.stub.requestCounts["scan.start"]
+        #expect(startCount == 1)
+
+        await host.server.stop()
     }
 }

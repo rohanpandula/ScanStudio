@@ -151,6 +151,188 @@ struct Eject: AsyncParsableCommand {
     }
 }
 
+/// `scan --confirm-motion [--wait]` -> `scan.start` (CLI-08). Pre-checks
+/// `scanReadiness(for: selectedFrames)` host-side -- this command owns only
+/// the parse-time confirmation layer.
+struct Scan: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "scan",
+        abstract: "Start scanning the selected frames. Requires --confirm-motion."
+    )
+
+    @OptionGroup var options: GlobalOptions
+
+    @Flag(name: .customLong("confirm-motion"), help: "Required: this command starts a scan.")
+    var confirmMotion = false
+
+    @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
+    var wait = false
+
+    mutating func validate() throws {
+        guard confirmMotion else {
+            let payload = ControlErrorPayload(
+                .confirmationRequired,
+                message: "\"scan\" requires --confirm-motion.",
+                guidance: "Confirm scanner motion is authorized, then retry with --confirm-motion."
+            )
+            let text = try ControlCLIOutput.renderError(command: "scan.start", payload: payload, human: options.human)
+            print(text, terminator: "")
+            throw ExitCode(77)
+        }
+    }
+
+    func run() async throws {
+        try await MotionStartRunner.run(
+            command: "scan.start",
+            method: "scan.start",
+            params: ScanStartWireParams(motionConfirmed: true),
+            options: options,
+            wait: wait
+        )
+    }
+}
+
+/// `stop [--immediate]` -> `scan.stop` (CLI-09). No confirmation flag --
+/// stopping never starts motion. Absent `--immediate`, `mode` is omitted
+/// entirely so the host applies its own documented stop-mode default
+/// (`ControlScanStopParams` already carries a public initializer -- Plan
+/// 02-01's one params struct with no confirmation field -- so this command
+/// needs no wire mirror).
+struct Stop: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "stop",
+        abstract: "Stop the active scan job."
+    )
+
+    @OptionGroup var options: GlobalOptions
+
+    @Flag(name: .customLong("immediate"), help: "Stop immediately rather than after the current frame completes.")
+    var immediate = false
+
+    func run() async throws {
+        try await CommandRunner.run(
+            command: "scan.stop",
+            method: "scan.stop",
+            params: ControlScanStopParams(mode: immediate ? "immediate" : nil),
+            options: options
+        )
+    }
+}
+
+/// `resume --confirm-motion [--wait]` -> `scan.resume` (CLI-09). Routes to
+/// `resumeBatch()`, which only ever touches the engine's pending frames.
+struct Resume: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "resume",
+        abstract: "Resume the batch's pending frames. Requires --confirm-motion."
+    )
+
+    @OptionGroup var options: GlobalOptions
+
+    @Flag(name: .customLong("confirm-motion"), help: "Required: this command starts a scan.")
+    var confirmMotion = false
+
+    @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
+    var wait = false
+
+    mutating func validate() throws {
+        guard confirmMotion else {
+            let payload = ControlErrorPayload(
+                .confirmationRequired,
+                message: "\"resume\" requires --confirm-motion.",
+                guidance: "Confirm scanner motion is authorized, then retry with --confirm-motion."
+            )
+            let text = try ControlCLIOutput.renderError(command: "scan.resume", payload: payload, human: options.human)
+            print(text, terminator: "")
+            throw ExitCode(77)
+        }
+    }
+
+    func run() async throws {
+        try await MotionStartRunner.run(
+            command: "scan.resume",
+            method: "scan.resume",
+            params: ScanResumeWireParams(motionConfirmed: true),
+            options: options,
+            wait: wait
+        )
+    }
+}
+
+/// The D-13 `--wait` interleaving shared identically by `Scan`/`Resume`:
+/// subscribe, send the caller's own start request, then either return the
+/// job id immediately or hand off to `JobWaiter` for the terminal outcome.
+/// SAFE-02: sends exactly the caller's one start request plus, only when
+/// waiting, `JobWaiter`'s own two calls -- nothing here re-issues anything.
+private enum MotionStartRunner {
+    static func run<Params: Encodable & Sendable>(
+        command: String,
+        method: String,
+        params: Params,
+        options: GlobalOptions,
+        wait: Bool
+    ) async throws {
+        let client = try await CommandRunner.openConnection(command: command, options: options)
+
+        var preStartJobId: String?
+        if wait {
+            do {
+                preStartJobId = try await JobWaiter.subscribe(client: client)
+            } catch {
+                try await CommandRunner.fail(command: command, options: options, client: client, error: error)
+            }
+        }
+
+        let startResponse = try await CommandRunner.request(
+            command: command, method: method, params: params, options: options, client: client
+        )
+        guard case .result = startResponse else {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: startResponse)
+            return
+        }
+
+        guard wait else {
+            let jobResponse = try await CommandRunner.requestWithoutParams(
+                command: command, method: "job.get", options: options, client: client
+            )
+            try await CommandRunner.finish(command: command, options: options, client: client, response: jobResponse)
+            return
+        }
+
+        do {
+            guard let terminalResponse = try await JobWaiter.waitForTerminalOutcome(
+                client: client, preStartJobId: preStartJobId
+            ) else {
+                await client.shutdown()
+                let payload = ControlErrorPayload(
+                    code: ControlCLIErrorCode.hostUnreachable.rawValue,
+                    message: "\"\(command)\" was waiting on the job's event stream, but the control host went away.",
+                    recoverable: false
+                )
+                let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human)
+                print(text, terminator: "")
+                throw ExitCode(ControlCLIExitCode.noHostReachable.rawValue)
+            }
+            guard case .result(let data) = terminalResponse else {
+                try await CommandRunner.finish(command: command, options: options, client: client, response: terminalResponse)
+                return
+            }
+            let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+            let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human)
+            print(text, terminator: "")
+            await client.shutdown()
+            let finalState = (try? JSONDecoder().decode(ControlJobResult.self, from: data))?.jobState
+            if finalState == .failed {
+                throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
+            }
+        } catch let exitCode as ExitCode {
+            throw exitCode
+        } catch {
+            try await CommandRunner.fail(command: command, options: options, client: client, error: error)
+        }
+    }
+}
+
 // MARK: - Wire mirrors
 
 // `ControlPreviewAcquireParams`/`ControlReviewApproveParams`/
@@ -174,5 +356,13 @@ private struct ReviewApproveWireParams: Encodable {
 }
 
 private struct ScannerEjectWireParams: Encodable {
+    let motionConfirmed: Bool
+}
+
+private struct ScanStartWireParams: Encodable {
+    let motionConfirmed: Bool
+}
+
+private struct ScanResumeWireParams: Encodable {
     let motionConfirmed: Bool
 }
