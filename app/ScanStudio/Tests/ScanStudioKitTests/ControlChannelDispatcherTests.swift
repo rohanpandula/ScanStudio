@@ -193,6 +193,46 @@ private func expectFailure(_ response: ControlResponse, id expectedId: UInt64, c
     #expect(error.code == expectedCode.rawValue)
 }
 
+/// Mirrors `DeviceConnectionLifecycleTests.swift`'s
+/// `prepareConnectionLifecycleScanReadiness`, with the one frame's thumbnail
+/// carrying `needsApproval`/`warnings` instead of a plain `brightness`/`tint`
+/// preview tile -- the minimal live path to a scan attempt that pauses on
+/// `pendingManualReviewScan` rather than reaching `scan.start`.
+@MainActor
+private func driveModelToPendingManualReview(_ model: SessionModel) async -> Bool {
+    await model.openProject(directory: "/tmp/control-dispatcher-test")
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.refreshSavedProject(token: token)) == .started else { return false }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnail",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":1,"thumbnail":{"needsApproval":true,"warnings":["ambiguous-boundary"]}}}
+            """#.utf8
+        )
+    ))
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":1}}
+            """#.utf8
+        )
+    ))
+    model.toggleFrameSelection(1)
+    guard model.scanReadiness(for: [1]).isReady else { return false }
+    await model.startMockScan()
+    return model.pendingManualReviewScan != nil
+}
+
 @Suite("Control channel dispatcher")
 struct ControlChannelDispatcherTests {
     // MARK: Hello / schema version gate
@@ -400,6 +440,17 @@ struct ControlChannelDispatcherTests {
         #expect(refusal?.gate == ControlGate.refeedRequired.rawValue)
     }
 
+    @Test("gateRefusal(scanReadiness:) falls through to the manualReviewPending source once a scan pauses on it")
+    @MainActor
+    func gateRefusalManualReviewPendingSource() async {
+        let (model, _, dispatcher) = await makeDispatcher()
+        #expect(await driveModelToPendingManualReview(model))
+
+        let refusal = dispatcher.gateRefusal(scanReadiness: nil)
+        #expect(refusal?.code == ControlErrorCode.gateRefused.rawValue)
+        #expect(refusal?.gate == ControlGate.manualReviewPending.rawValue)
+    }
+
     // MARK: Read-only aggregates (Task 2)
 
     @Test("Case names for hardwareMotionReadiness/scanReadiness are derived by plain String(describing:)")
@@ -550,5 +601,84 @@ struct ControlChannelDispatcherTests {
                 continue
             }
         }
+    }
+
+    // MARK: Event stream (Task 3)
+
+    @Test("subscribeToEvents yields a control.snapshot element first, before any state change")
+    @MainActor
+    func subscribeYieldsSnapshotFirst() async throws {
+        let (_, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        var iterator = dispatcher.subscribeToEvents().makeAsyncIterator()
+        guard let first = await iterator.next() else {
+            Issue.record("expected a snapshot element")
+            return
+        }
+        let envelope = try JSONDecoder().decode(ControlEventEnvelopeProbe<ControlStatusResult>.self, from: first)
+        #expect(envelope.event == "control.snapshot")
+    }
+
+    @Test("subscribeToEvents yields control.changed after a SessionModel state change")
+    @MainActor
+    func subscribeYieldsChangedAfterStateChange() async throws {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        var iterator = dispatcher.subscribeToEvents().makeAsyncIterator()
+        _ = await iterator.next() // consume the initial snapshot
+
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-30","mediaLoaded":true,"carrier":"roll36","frameCount":36,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+                """#.utf8
+            )
+        ))
+
+        guard let changed = await iterator.next() else {
+            Issue.record("expected a control.changed element")
+            return
+        }
+        let envelope = try JSONDecoder().decode(ControlEventEnvelopeProbe<ControlStatusResult>.self, from: changed)
+        #expect(envelope.event == "control.changed")
+        #expect(envelope.payload.scanner?.connected == true)
+        #expect(model.status?.connected == true)
+    }
+
+    @Test("Two independent subscribers each receive their own snapshot")
+    @MainActor
+    func twoSubscribersEachGetOwnSnapshot() async throws {
+        let (_, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        var iteratorA = dispatcher.subscribeToEvents().makeAsyncIterator()
+        var iteratorB = dispatcher.subscribeToEvents().makeAsyncIterator()
+        guard let firstA = await iteratorA.next(), let firstB = await iteratorB.next() else {
+            Issue.record("expected a snapshot on both streams")
+            return
+        }
+        let envelopeA = try JSONDecoder().decode(ControlEventEnvelopeProbe<ControlStatusResult>.self, from: firstA)
+        let envelopeB = try JSONDecoder().decode(ControlEventEnvelopeProbe<ControlStatusResult>.self, from: firstB)
+        #expect(envelopeA.event == "control.snapshot")
+        #expect(envelopeB.event == "control.snapshot")
+    }
+
+    @Test("events.subscribe's response snapshot matches a concurrent status call")
+    @MainActor
+    func eventsSubscribeResponseMatchesStatus() async {
+        let (_, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let subscribeResponse = await dispatcher.handle(.eventsSubscribe(id: 25))
+        let statusResponse = await dispatcher.handle(.status(id: 26))
+        guard case .success(_, let subscribeResult) = subscribeResponse,
+              case .eventsSubscribe(let subscribed) = subscribeResult,
+              case .success(_, let statusResult) = statusResponse,
+              case .status(let status) = statusResult
+        else {
+            Issue.record("expected success results from both events.subscribe and status")
+            return
+        }
+        #expect(subscribed.subscribed == true)
+        #expect(subscribed.snapshot == status)
     }
 }

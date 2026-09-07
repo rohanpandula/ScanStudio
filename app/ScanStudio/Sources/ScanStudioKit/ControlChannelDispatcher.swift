@@ -228,6 +228,11 @@ public final class ControlChannelDispatcher {
 
     private let sessionModel: SessionModel
     private var greeted = false
+    /// Subscriptions `subscribeToEvents()` still owns. `onTermination`
+    /// removes a subscription's id here so a dropped subscriber's observer
+    /// chain stops re-arming instead of running for the process lifetime
+    /// (T-01-15).
+    private var activeEventSubscriptions: Set<UUID> = []
 
     public init(sessionModel: SessionModel) {
         self.sessionModel = sessionModel
@@ -482,9 +487,11 @@ public final class ControlChannelDispatcher {
         case .diagnosticsExport:
             // Plan 05/06 replaces this arm
             return placeholder(request)
-        case .eventsSubscribe:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .eventsSubscribe(let id):
+            return .success(id: id, result: .eventsSubscribe(ControlEventsSubscribeResult(
+                subscribed: true,
+                snapshot: buildStatusResult()
+            )))
         case .jobGet(let id):
             return .success(id: id, result: .job(buildJobResult()))
         }
@@ -639,6 +646,64 @@ public final class ControlChannelDispatcher {
             jobPercent: progress.jobPercent,
             etaSeconds: progress.etaSeconds
         )
+    }
+
+    // MARK: Event stream
+    //
+    // Phase 1 scope: this is the in-process snapshot-plus-change contract
+    // only. Transport fan-out, per-event filtering, and the full
+    // per-property event vocabulary are CTRL-04, Phase 2's job.
+
+    /// Each element is an encoded `control.snapshot`/`control.changed`
+    /// event. The first element yielded is always the current snapshot,
+    /// before any state change; every element after that is a fresh
+    /// snapshot following a `SessionModel` change. This deliberately never
+    /// reads the engine client's own unsolicited-event stream --
+    /// `SessionModel.init` already owns that stream's one consumer, and a
+    /// second reader would race it rather than mirror it.
+    public func subscribeToEvents() -> AsyncStream<Data> {
+        let subscriptionId = UUID()
+        activeEventSubscriptions.insert(subscriptionId)
+        return AsyncStream { continuation in
+            if let data = Self.encodedEvent(name: Self.snapshotEventName, snapshot: buildStatusResult()) {
+                continuation.yield(data)
+            }
+            armEventObservation(subscriptionId: subscriptionId, continuation: continuation)
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.activeEventSubscriptions.remove(subscriptionId)
+                }
+            }
+        }
+    }
+
+    private static let snapshotEventName = "control.snapshot"
+    private static let changedEventName = "control.changed"
+
+    /// Recursive re-arm, copied from `AppDelegate.bindJobActivity`'s
+    /// `withObservationTracking { } onChange: { }` shape
+    /// (`ScanStudioApp.swift`): the tracked read is `buildStatusResult()`,
+    /// the exact same aggregate `.status` answers, so the observed property
+    /// set and the reported snapshot never drift apart. `onChange` runs on
+    /// an arbitrary, non-isolated context, hence the `Task { @MainActor }`
+    /// hop before touching `self` or yielding again.
+    private func armEventObservation(subscriptionId: UUID, continuation: AsyncStream<Data>.Continuation) {
+        guard activeEventSubscriptions.contains(subscriptionId) else { return }
+        withObservationTracking {
+            _ = buildStatusResult()
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeEventSubscriptions.contains(subscriptionId) else { return }
+                if let data = Self.encodedEvent(name: Self.changedEventName, snapshot: self.buildStatusResult()) {
+                    continuation.yield(data)
+                }
+                self.armEventObservation(subscriptionId: subscriptionId, continuation: continuation)
+            }
+        }
+    }
+
+    private static func encodedEvent(name: String, snapshot: ControlStatusResult) -> Data? {
+        try? JSONEncoder().encode(ControlEventEnvelope(event: name, payload: snapshot))
     }
 
     // MARK: Line-based entry point
