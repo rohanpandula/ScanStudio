@@ -575,6 +575,37 @@ public final class SessionModel {
     /// state and to reject overlapping button presses.
     public private(set) var isConnectingDevice = false
     public private(set) var isRefreshingScannerStatus = false
+    /// The single explicit signal naming whichever mutating operation (if
+    /// any) is currently in flight. `nil` when idle; otherwise the D-05
+    /// command name of the operation currently running (for example
+    /// `"scanner.eject"`). This is the one signal the control channel's
+    /// dispatcher checks before routing a new mutating request, translating
+    /// a non-nil value into `CONTROLLER_BUSY`; the GUI reads this exact same
+    /// property, so there is no separate lock subsystem. It deliberately
+    /// duplicates none of the per-operation flags above (`isConnectingDevice`,
+    /// `isResumingBatch`, etc.) -- those stay because each drives its own
+    /// progress affordance; this one only answers "is any mutation in
+    /// flight right now."
+    public private(set) var mutatingOperationInFlight: String?
+    /// Saves and returns the previous value of `mutatingOperationInFlight`,
+    /// then assigns `name` -- but only when no mutating operation is already
+    /// in flight. `connect()` calls `await refreshAvailableDevices()`
+    /// internally (below): if the nested call's own name unconditionally
+    /// overwrote this property, `mutatingOperationInFlight` would read
+    /// `"scanner.list"` instead of `"scanner.connect"` for the whole
+    /// duration of that nested await, hiding the outer operation's identity
+    /// while it is still very much in flight. Restoring `previous` via
+    /// `defer` at every call site regardless keeps all 14 call sites
+    /// identical and keeps a genuinely standalone call (no outer operation
+    /// running) reporting its own name correctly. Do not "simplify" the
+    /// `if previous == nil` check away.
+    private func beginMutatingOperation(_ name: String) -> String? {
+        let previous = mutatingOperationInFlight
+        if previous == nil {
+            mutatingOperationInFlight = name
+        }
+        return previous
+    }
     public private(set) var status: ScannerStatus?
     public private(set) var engineVersion: String?
     public private(set) var thumbnails: [Int: Thumbnail] = [:]
@@ -1281,6 +1312,8 @@ public final class SessionModel {
     /// `connect(deviceId:)` if `availableDevices` is still empty when a
     /// specific device is requested.
     public func refreshAvailableDevices(rescan: Bool = false) async {
+        let previous = beginMutatingOperation(rescan ? "scanner.rescan" : "scanner.list")
+        defer { mutatingOperationInFlight = previous }
         deviceDiscoveryRequestsInFlight += 1
         isDiscoveringDevices = true
         defer {
@@ -1377,6 +1410,8 @@ public final class SessionModel {
         guard !Task.isCancelled, !isConnectingDevice else { return }
         isConnectingDevice = true
         defer { isConnectingDevice = false }
+        let previous = beginMutatingOperation("scanner.connect")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         do {
             let targetDeviceId: String
@@ -1448,6 +1483,8 @@ public final class SessionModel {
     }
 
     public func disconnect() async {
+        let previous = beginMutatingOperation("scanner.disconnect")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         recordDiagnostic(
             event: "device.disconnect.requested",
@@ -1537,6 +1574,8 @@ public final class SessionModel {
             lastErrorMessage = hardwareMotionReadiness.guidance
             return .rejected
         }
+        let previous = beginMutatingOperation("preview.acquire")
+        defer { mutatingOperationInFlight = previous }
         // Only an admitted traversal that passed its synchronous movement
         // preflight replaces the current preview evidence. A rejected
         // "Preview Again" must leave its still-visible Review buttons and
@@ -1630,6 +1669,8 @@ public final class SessionModel {
     /// Starts a batch for the selected frames using the editable capture
     /// recipe currently shown in the Batch Settings inspector.
     public func startMockScan() async {
+        let previous = beginMutatingOperation("scan.start")
+        defer { mutatingOperationInFlight = previous }
         _ = await startScanOrRequestManualReview(frames: selectedFrames)
     }
 
@@ -1801,6 +1842,8 @@ public final class SessionModel {
         else {
             return
         }
+        let previous = beginMutatingOperation("review.approve")
+        defer { mutatingOperationInFlight = previous }
         _ = await approveManualReviewAndStart(authorization)
     }
 
@@ -2250,6 +2293,8 @@ public final class SessionModel {
     public func stopAfterCurrentFrame() async {
         lastErrorMessage = nil
         guard let jobId else { return }
+        let previous = beginMutatingOperation("scan.stop")
+        defer { mutatingOperationInFlight = previous }
         do {
             let params = ScanStopParams(jobId: jobId, mode: "afterCurrentFrame")
             let _: ScanStopResult = try await engineClient.request("scan.stop", params: params)
@@ -2264,6 +2309,8 @@ public final class SessionModel {
     public func stopImmediately() async {
         lastErrorMessage = nil
         guard let jobId else { return }
+        let previous = beginMutatingOperation("scan.stop")
+        defer { mutatingOperationInFlight = previous }
         do {
             let params = ScanStopParams(jobId: jobId, mode: "immediate")
             let _: ScanStopResult = try await engineClient.request("scan.stop", params: params)
@@ -2299,6 +2346,8 @@ public final class SessionModel {
             lastErrorMessage = hardwareMotionReadiness.guidance
             return
         }
+        let previous = beginMutatingOperation("scanner.eject")
+        defer { mutatingOperationInFlight = previous }
         do {
             let _: EmptyResult = try await engineClient.request("scanner.eject", params: EmptyParams())
             refeedRequired = false
@@ -2655,6 +2704,8 @@ public final class SessionModel {
             return false
         }
 
+        let previous = beginMutatingOperation("roll.save")
+        defer { mutatingOperationInFlight = previous }
         await createProject(
             name: name,
             carrier: carrier,
@@ -2735,6 +2786,8 @@ public final class SessionModel {
     public func openProject(directory: String) async {
         guard beginProjectLifecycleChange() else { return }
         defer { isChangingProject = false }
+        let previous = beginMutatingOperation("roll.open")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         do {
             let params = ProjectOpenParams(directory: directory)
@@ -2820,6 +2873,8 @@ public final class SessionModel {
     /// projects root. An empty list on success is still a valid,
     /// displayable state.
     public func refreshRecentProjects() async {
+        let previous = beginMutatingOperation("roll.list")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         do {
             let params = ProjectListParams(directory: nil)
@@ -2834,6 +2889,8 @@ public final class SessionModel {
     /// Every dependent computed property (`excludedFrameIndices`,
     /// `isFrameExcluded`) re-derives from the fresh `project` this sets.
     public func setFrameExcluded(_ frameIndex: Int, excluded: Bool) async {
+        let previous = beginMutatingOperation(excluded ? "frames.exclude" : "frames.include")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         do {
             let params = SetFrameExcludedParams(frameIndex: frameIndex, excluded: excluded)
@@ -3080,6 +3137,8 @@ public final class SessionModel {
         }
         isResumingBatch = true
         defer { isResumingBatch = false }
+        let previous = beginMutatingOperation("scan.resume")
+        defer { mutatingOperationInFlight = previous }
         let epoch = connectionEpoch
         guard await refreshPendingFrames(), !Task.isCancelled,
               connectionEpoch == epoch,
