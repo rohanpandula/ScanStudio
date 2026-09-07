@@ -14,10 +14,12 @@ struct ScanstudioCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "scanstudio-cli",
         abstract: "Drives a running ScanStudio app over its local control socket.",
-        // Task 2 appends Frames/Diagnostics; Task 3 appends
-        // Settings/Outputs/Roll; plan 02-06 appends the motion commands
-        // (scan/stop/resume/eject).
-        subcommands: [Connect.self, Disconnect.self, Rescan.self, Status.self]
+        // Task 3 appends Settings/Outputs/Roll; plan 02-06 appends the
+        // motion commands (scan/stop/resume/eject).
+        subcommands: [
+            Connect.self, Disconnect.self, Rescan.self, Status.self,
+            Frames.self, Diagnostics.self
+        ]
     )
 }
 

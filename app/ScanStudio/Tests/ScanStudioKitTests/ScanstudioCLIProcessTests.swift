@@ -315,4 +315,93 @@ struct ScanstudioCLIProcessTests {
 
         await host.server.stop()
     }
+
+    // MARK: Task 2 -- frames list/include/exclude, and diagnostics export
+
+    @Test("frames include with a malformed range exits 64 with INVALID_RANGE, and the host's stub recorded zero new requests")
+    func framesIncludeMalformedRangeExitsInvalidRangeBeforeAnyRequest() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-malformed")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let before = await host.stub.requestCounts
+
+        let result = try runCLI(["frames", "include", "5-2"], socketPath: host.socketPath)
+        #expect(result.exitCode == 64)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "INVALID_RANGE")
+
+        let after = await host.stub.requestCounts
+        #expect(before == after)
+
+        await host.server.stop()
+    }
+
+    @Test("frames list against a host with an open project fixture exits 0 and the JSON result carries a frames array")
+    func framesListReturnsFramesArray() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-list")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.model.openProject(directory: cliProcessProjectDirectory)
+
+        let result = try runCLI(["frames", "list"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["frames"] is [Any])
+
+        await host.server.stop()
+    }
+
+    @Test("frames exclude with a valid index exits 0 and the fake engine saw exactly one project.setFrameExcluded")
+    func framesExcludeValidIndexReachesEngineOnce() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-exclude")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.model.openProject(directory: cliProcessProjectDirectory)
+
+        let result = try runCLI(["frames", "exclude", "1"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let excludeCount = await host.stub.requestCounts["project.setFrameExcluded"]
+        #expect(excludeCount == 1)
+
+        await host.server.stop()
+    }
+
+    @Test("frames include spanning one valid and one out-of-range index reports the host's refusal verbatim with an applied array naming the valid index")
+    func framesIncludePartialRangeReportsAppliedIndices() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-partial")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.model.openProject(directory: cliProcessProjectDirectory)
+
+        let result = try runCLI(["frames", "include", "1-2"], socketPath: host.socketPath)
+        #expect(result.exitCode == 64)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "INVALID_PARAMS")
+        #expect((error["message"] as? String)?.isEmpty == false)
+        #expect(error["recoverable"] as? Bool == false)
+        let applied = try #require(object["applied"] as? [Int])
+        #expect(applied == [1])
+
+        await host.server.stop()
+    }
+
+    @Test("diagnostics export writes into the given temp directory and reports its path and entries")
+    func diagnosticsExportWritesIntoTempDirectory() async throws {
+        let host = try await CLIProcessHost.start(label: "diagnostics")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let tempDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("ss-cli-diag-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let result = try runCLI(["diagnostics", "export", "--to", tempDirectory.path], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        let path = try #require(resultObject["path"] as? String)
+        #expect(resultObject["entries"] is [Any])
+        #expect(FileManager.default.fileExists(atPath: path))
+        let contents = try FileManager.default.contentsOfDirectory(atPath: tempDirectory.path)
+        #expect(contents == [(path as NSString).lastPathComponent])
+
+        await host.server.stop()
+    }
 }
