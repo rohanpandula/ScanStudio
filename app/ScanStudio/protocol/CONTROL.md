@@ -8,9 +8,21 @@ Contract for the local control channel that lets a CLI, a script, or an agent dr
   - **Request** (caller → dispatcher): `{"id": <u64>, "method": "<name>", "params": {…}}`.
   - **Response** (dispatcher → caller): `{"id": <u64>, "result": {…}}` or `{"id": <u64>, "error": {"code": "<CODE>", "message": "<human text>", "recoverable": <bool>, "guidance": "<text>", "gate": "<name>"}}`. Every request gets exactly one response.
   - **Event** (dispatcher → caller, unsolicited): `{"event": "<name>", "payload": {…}}`. Events may interleave with responses.
-- The concrete socket transport (Unix-domain socket path, permissions, stale-socket handling) is Phase 2's decision and is deliberately unspecified here.
 - In Phase 1 the dispatcher is in-process and transport-agnostic by construction (D-06): it accepts a decoded request value and returns an encodable response value, so Phase 2's socket server and any in-process test harness call the same API.
 - JSON field names are camelCase on the wire, matching `ControlWireProtocol.swift`'s property names one-to-one.
+- **Socket path.** The default is `~/.scanstudio/control.sock` (`ControlSocketPath.defaultPath()`); `scanstudio-cli --socket <path>` overrides it for any command.
+- **Permissions are asserted, never trusted to `umask`.** The containing directory (`~/.scanstudio/`) is `chmod`'d to `0700` on every server start, and the socket itself is `chmod`'d to `0600` immediately after `bind` — both re-asserted every start, even if the directory already existed with some other mode.
+- **`sun_path` bound.** A path that would not fit in the platform's `sockaddr_un.sun_path` in under 104 bytes including the NUL terminator is refused before any socket call.
+- **Symlink refusal.** A path that `lstat` reports as an existing symlink is refused rather than bound through — a pre-placed symlink at the socket path is attacker-influenceable state, and following it would bind somewhere other than the intended path.
+- **Probe-then-reclaim, in this exact order,** on every `start(path:)`: validate the path → prepare (and `chmod`) its directory → **probe** by dialing the path (`connect(2)`) → if the probe succeeds, refuse to start (another host already owns the path) → only once the probe fails with `ENOENT` or `ECONNREFUSED` — proof nothing live owns the path — does the server `unlink` it → `socket`/`bind`/`chmod`/`listen`. A stale socket left behind by a crash is therefore detected by a **failed connect**, never by `stat`: a crashed process's socket file is still present on disk and would satisfy any existence check, but only dialing it proves whether anything is actually listening.
+- **Per-connection line bound.** A request line exceeding 1 MiB before a newline is refused with `INVALID_PARAMS`, and the connection is closed immediately after that refusal is written — never kept open past an oversized line.
+- **Bounded outbound queue.** Each connection's outbound queue (responses and events not yet written) holds at most 256 entries. Responses are never dropped; only event lines (`control.snapshot`/`control.changed`) may be, drop-oldest, if a slow subscriber falls behind. A drop is never silent: the next event line on that connection is preceded by a `control.dropped` event naming how many were lost since the last notice. CLI-side handling of `control.dropped` (surfacing it to the operator, re-fetching a snapshot) is not built in Phase 2 — see OPS-10.
+
+## Trust model
+
+Filesystem permissions are the entire authentication boundary. Any process running as the same local user that owns `~/.scanstudio/control.sock` can open it and drive the scanner — the channel has no login, no token, and no per-caller identity beyond "same UID as the app." This is an accepted, deliberate consequence of a local-only, single-user design (PROJECT.md: "the channel is local-only; remote control adds an auth surface the app does not need for its purpose"). The socket's `0700`/`0600` modes keep a different local user out; they say nothing about which process owned by *this* user is asking, and that is intentional — a fresh agent, a script, and the GUI's own owner are all meant to be able to reach it.
+
+`getpeereid()` — reading the connecting peer's UID/GID off the accepted socket and refusing anything that does not match the server's own UID — is available hardening on macOS that Phase 2 deliberately did not add. It would not change the trust model for the scenario this milestone is built for (multiple agents or scripts all running as the same local user); Phase 2's threat register treats same-user-any-process as the accepted baseline, not a gap left open by omission. A later phase could add it as defence in depth against a same-user sandboxed or lower-privilege process that should not reach the socket.
 
 ## Versioning
 
@@ -126,8 +138,53 @@ Every code below is channel-level (D-03) unless marked "passthrough", meaning th
 
 Exactly one mutating operation runs at a time (D-07). A second mutating or motion-capable command arriving while one is already in flight is refused with `CONTROLLER_BUSY`, naming the in-flight operation. The channel never queues a refused request, never retries it automatically, and never re-issues a physical operation on its own (D-09) — a refusal is returned once, and the caller decides whether to try again.
 
+## Exit codes
+
+`scanstudio-cli` follows `sysexits.h`-style conventions (D-10). Exactly one function, `ControlCLIExitCode.forErrorCode(_:)`, decides a process exit value from an error `code` string; no command computes one inline except the parse-time `--confirm-motion`/`--film-loaded` gates below, whose value is fixed by D-11 rather than looked up.
+
+| Exit | Meaning | Triggered by |
+|------|---------|--------------|
+| 0 | Success | |
+| 64 | Usage / validation | ArgumentParser's own usage errors; channel `INVALID_PARAMS`; CLI-originated `INVALID_RANGE` (a malformed CUPS frame range, rejected before any connection opens) |
+| 65 | Typed engine or gate error | `GATE_REFUSED`, and every other engine- or bridge-passthrough code this repository does not individually enumerate — the documented default, not a fallback for an unhandled case; also a `--wait`ed job whose terminal state is `failed` |
+| 69 | No host reachable | `HOST_UNREACHABLE` — the control socket could not be dialed at the given (or default) path |
+| 70 | Internal error | Channel `UNKNOWN_COMMAND`; CLI-originated `INTERNAL` (an unexpected condition after a request already succeeded, for example a response that failed to decode) |
+| 75 | Busy / conflict | `CONTROLLER_BUSY` |
+| 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
+| 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
+
+`--wait`'s own exit code is decided the same way, from the job's final aggregate rather than a second table: `completed` and `stopped` both exit 0 (the job reached a terminal state without error — a caller who asked to stop gets a clean exit, not a failure), `failed` exits 65.
+
+## Command-line mapping
+
+One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen groups). "Confirmation flag" is the CLI's own parse-time gate (D-11); "—" means the subcommand carries no motion and needs none. Every row additionally carries the read-only baseline (`0, 65, 69, 70, 75`) or the confirmation-gated baseline (`0, 65, 69, 70, 75, 77`); a "+" column notes any exit code a row can reach beyond that baseline.
+
+| Subcommand | Channel method(s) | Confirmation flag | Exit codes |
+|---|---|---|---|
+| `connect [--device <id>]` | `scanner.connect` | — | 0, 65, 69, 70, 75 |
+| `disconnect` | `scanner.disconnect` | — | 0, 65, 69, 70, 75 |
+| `rescan` | `scanner.rescan` | — | 0, 65, 69, 70, 75 |
+| `status [--job <id>]` | `status`, or `job.get` when `--job` is given | — | 0, 65 (`JOB_NOT_FOUND` when `--job` names an id that does not match the tracked job), 69, 70 |
+| `preview --film-loaded [--intent …] [--film-process …]` | `preview.acquire` | `--film-loaded` | 0, 64 (`--intent replaceFilmProcess` with no `--film-process`, or an unrecognized `--intent`), 65, 69, 70, 75, 77 |
+| `frames list` / `frames include <range>` / `frames exclude <range>` | `frames.list` / `frames.include` / `frames.exclude` | — | 0, 64 (a malformed CUPS range is refused client-side, D-12), 65, 69, 70, 75 |
+| `review approve --confirm-motion` | `review.approve` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
+| `settings get` / `settings set […]` | `settings.get` / `settings.set` | — | 0, 65, 69, 70, 75 |
+| `outputs get` / `outputs set […]` | `outputs.get` / `outputs.set` | — | 0, 65, 69, 70, 75 |
+| `roll save --name … --carrier … --frame-count … --film-process … --confirm-motion` / `roll open <directory>` / `roll list` | `roll.save` / `roll.open` / `roll.list` | `--confirm-motion` (`save` only) | 0, 65, 69, 70, 75, 77 (`save`); 0, 65, 69, 70, 75 (`open`/`list`) |
+| `scan --confirm-motion [--wait]` | `scan.start` | `--confirm-motion` | 0, 65 (also a `--wait`ed `failed` terminal state), 69, 70, 75, 77 |
+| `stop [--immediate]` | `scan.stop` | — (stopping never starts motion) | 0, 65 (`GATE_REFUSED` when no job is active), 69, 70, 75 |
+| `resume --confirm-motion [--wait]` | `scan.resume` | `--confirm-motion` | 0, 65 (also a `--wait`ed `failed` terminal state), 69, 70, 75, 77 |
+| `eject --confirm-motion` | `scanner.eject` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
+| `diagnostics export --to <dir>` | `diagnostics.export` | — | 0, 64 (`directory` is relative, contains `..`, or does not exist), 69, 70 |
+| `events --follow` | `events.subscribe`, then every subsequent event on that connection | — | 0, 64 (`--follow` omitted), 69, 70 |
+
+Two facts about this table a reader will otherwise get wrong:
+
+- **`scanner.list` has no subcommand in Phase 2.** Device discovery is `rescan` (`scanner.rescan`); the currently connected device, if any, is reported by `status`, not by a listing command. A caller that wants "what's out there" calls `rescan`; a caller that wants "what am I connected to" calls `status`.
+- **`roll save` is motion-confirmed at both layers, and the two layers are independent, not redundant.** The wire's own `roll.save` params carry `motionConfirmed`, refused with `CONFIRMATION_REQUIRED` before any `SessionModel` call if it is absent or `false` — closed at the wire by plan 02-01 Task 3 (`ControlRollSaveParams.motionConfirmed`), which is why threat register entry **T-02-27 is closed**, not merely accepted. The CLI *additionally* requires `--confirm-motion` at parse time, before any connection opens — a tightening beyond D-08's literal `roll save --name` tree added by plan 02-05, mirroring `review.approve`'s identical precedent from Phase 1. The residual asymmetry, recorded here as a decision rather than a discovered surprise: `motionConfirmed` is a caller-supplied boolean like any other field, so a raw-socket caller bypassing the CLI entirely still decides its own value — the wire gate proves the field was sent as `true`, not that a human confirmed anything. The CLI's `--confirm-motion` flag is a second, independent gate at the layer a human or script most often touches; neither layer substitutes for the other.
+
 ## Not yet implemented
 
 Recorded here so both gaps stay visible in the spec, not only in a plan:
 
-- **Attended-scan-recovery approval** (`SessionModel.approveEveryFrameAndScan()`, the path behind `ContentView.swift`'s attended-retry banner) has no D-05 command name yet. It approves every frame in the roll against a different confirmation contract than `review.approve`'s single-boundary approval and needs its own command; this is Phase 2 / CLI-05 work.
+- **Attended-scan-recovery approval** (`SessionModel.approveEveryFrameAndScan()`, the path behind `ContentView.swift`'s attended-retry banner) has no channel command yet. It approves every frame in the roll against a different confirmation contract than `review.approve`'s single-boundary approval and needs its own command; D-08's command tree does not include it, so this work is carried past Phase 2 to a later phase.
