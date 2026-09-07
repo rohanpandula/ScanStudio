@@ -409,4 +409,37 @@ struct ControlChannelClientTests {
 
         await server.stop()
     }
+
+    // MARK: Task 3 -- the non-fatal property `AppDelegate` relies on
+
+    @Test("A second start() at a live path throws while the first server keeps serving a real client")
+    func secondStartAtLivePathThrowsWhileFirstServerKeepsServing() async throws {
+        let path = shortSocketPath("live-owner")
+        defer { removeSocketDirectory(for: path) }
+
+        // The exact condition `AppDelegate.init()`'s fire-and-forget start
+        // swallows (D-05/T-02-17), exercised at the layer where it is
+        // testable: a second server started at a path the first already
+        // owns must throw, and the first server must keep serving real
+        // clients regardless.
+        let server1 = ControlChannelServer(sessionModel: await makeIdleModel(ControlClientEngineStub()))
+        try await server1.start(path: path)
+
+        let server2 = ControlChannelServer(sessionModel: await makeIdleModel(ControlClientEngineStub()))
+        do {
+            try await server2.start(path: path)
+            Issue.record("expected the second start() to throw while the first is live")
+        } catch let error as ControlSocketError {
+            #expect(error.errnoValue == EADDRINUSE)
+        }
+
+        let client = try await ControlChannelClient.open(path: path, clientName: "test")
+        guard case .result = try await client.requestWithoutParams(method: "status") else {
+            Issue.record("expected the first server to still answer status after the second server's failed start")
+            return
+        }
+
+        await client.shutdown()
+        await server1.stop()
+    }
 }

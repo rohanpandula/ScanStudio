@@ -172,6 +172,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let updateFlowModel: UpdateFlowModel
     /// Cancellable handle for the rolling 24 h background check task.
     private var backgroundUpdateTask: Task<Void, Never>?
+    /// D-05: the running app's control-channel server. Deliberately *not*
+    /// a `LaunchState` case -- a socket start failure must leave the GUI
+    /// fully functional, never flipping `launchState` to its failed case.
+    /// `nil` when `launchState` never reached `.ready` (no `SessionModel`
+    /// to serve).
+    private var controlServer: ControlChannelServer?
 
     override init() {
         do {
@@ -198,6 +204,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // stays false -- with no connected scanner there is nothing to guard.
         if case .ready(_, let session) = launchState {
             Self.bindJobActivity(of: session, into: updateFlowModel)
+
+            // D-05/CTRL-01/T-02-17: the running app owns the control socket
+            // alongside `EngineClient`/`SessionModel`, started the same way
+            // (constructed unconditionally, started via a fire-and-forget
+            // `Task`). Every error `start(path:)` can throw is caught right
+            // here and only logged -- never rethrown, never a forced crash,
+            // never touches `launchState` -- so a socket problem can never
+            // block the GUI from launching. A live socket already owned by
+            // another running host is an expected, non-fatal outcome (D-03);
+            // this delegate never touches the socket path directly (no
+            // filesystem probe, no path removal) -- a socket left behind by
+            // a crash is reclaimed entirely by `ControlChannelServer`'s own
+            // probe-then-reclaim (plan 02-02).
+            let server = ControlChannelServer(sessionModel: session)
+            controlServer = server
+            Task {
+                do {
+                    try await server.start(path: ControlSocketPath.defaultPath())
+                } catch {
+                    NSLog("control.server.failed: %@", AppDelegate.describe(error))
+                }
+            }
         }
     }
 
@@ -225,8 +253,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         backgroundUpdateTask?.cancel()
         guard case .ready(let client, _) = launchState else { return }
+        // D-05: the control server joins the same bounded wait the engine
+        // client's own teardown already uses -- one detached task, one
+        // semaphore, no extended deadline. Read onto a local `let` first
+        // (rather than capturing `self`) so the detached task only closes
+        // over `Sendable` actor references, matching `client` below.
+        let server = controlServer
         let finished = DispatchSemaphore(value: 0)
         Task.detached {
+            await server?.stop()
             await client.terminate()
             finished.signal()
         }
