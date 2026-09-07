@@ -614,12 +614,89 @@ struct ControlChannelMotionRoutingTests {
         #expect(await stub.recordedMethods.isEmpty)
     }
 
-    @Test("scanner.eject with confirmation and motion ready reaches exactly one scanner.eject request")
+    // CR-02: `scanner.eject` while disconnected, mid-job, or mid-transport-
+    // activity used to reach the engine unchallenged -- the dispatcher's own
+    // pre-check now calls `DeviceBarEjectPolicy.canOffer`, the identical
+    // function `DeviceBarView.canOfferEject` gates the GUI's Eject button
+    // on, fed the same live `SessionModel` state.
+
+    @Test("scanner.eject while disconnected is refused with GATE_REFUSED before any engine call")
     @MainActor
-    func ejectWithMotionReadySucceeds() async {
+    func ejectWhileDisconnectedIsRefused() async {
         let (_, stub, dispatcher) = await makeDispatcher()
         await greet(dispatcher)
         let response = await dispatcher.handle(.scannerEject(id: 3, params: ControlScannerEjectParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 3)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scanner.eject while a job is active is refused with GATE_REFUSED before any engine call")
+    @MainActor
+    func ejectWhileJobActiveIsRefused() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.connect(deviceId: motionRoutingDevice.deviceId)
+        model.beginJob(id: "motion-routing-eject-job-active")
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.scannerEject(id: 4, params: ControlScannerEjectParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 4)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scanner.eject while the transport is not idle is refused with GATE_REFUSED before any engine call")
+    @MainActor
+    func ejectWhileTransportNotIdleIsRefused() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.connect(deviceId: motionRoutingDevice.deviceId)
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"busy","activeJobId":null,"filmPresent":null,"motionArmed":true}}}
+                """#.utf8
+            )
+        ))
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.scannerEject(id: 5, params: ControlScannerEjectParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 5)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scanner.eject in the incident case (filmPresent: true, mediaLoaded: false) succeeds, reaching exactly one scanner.eject request")
+    @MainActor
+    func ejectInIncidentCaseSucceeds() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.connect(deviceId: motionRoutingDevice.deviceId)
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-30","mediaLoaded":false,"carrier":"roll36","frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+                """#.utf8
+            )
+        ))
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.scannerEject(id: 6, params: ControlScannerEjectParams(motionConfirmed: true)))
         guard case .success = response else {
             Issue.record("expected scanner.eject to succeed, got \(response)")
             return

@@ -652,12 +652,38 @@ public final class ControlChannelDispatcher {
                 return .failure(id: id, error: gateRefusal(motionReadiness: sessionModel.hardwareMotionReadiness)
                     ?? ControlErrorPayload(.gateRefused, message: "Hardware motion is not ready.", gate: .hardwareMotion))
             }
-            // `SessionModel.eject()` re-checks `hardwareMotionReadiness`
-            // internally and keeps its own guard -- this is D-08's defence
-            // in depth, not redundancy: this pre-check gives the caller a
-            // typed refusal, and the model's own guard is what makes the
-            // gate impossible to bypass from any caller, including a future
-            // one that forgets to pre-check here.
+            // CR-02: the GUI's Eject button is only ever rendered when
+            // `DeviceBarView.canOfferEject` is true -- the identical
+            // `DeviceBarEjectPolicy.canOffer` call below, fed the same
+            // isConnected/transportIsIdle/isJobActive/mediaLoaded/
+            // filmPresent/refeedRequired inputs `DeviceBarView` reads off
+            // `SessionModel`. Previously this arm (and `eject()` itself)
+            // checked only `hardwareMotionReadiness.allowsMotion`, so a
+            // caller could eject while disconnected, mid-job, or mid-
+            // transport-activity -- states the GUI never even offers the
+            // button for.
+            guard DeviceBarEjectPolicy.canOffer(
+                isConnected: sessionModel.status?.connected == true,
+                transportIsIdle: (sessionModel.status?.transport ?? "idle") == "idle" && !sessionModel.isAcquiringThumbnails,
+                isJobActive: sessionModel.isJobActive,
+                mediaLoaded: sessionModel.status?.mediaLoaded == true,
+                filmPresent: sessionModel.status?.filmPresent,
+                refeedRequired: sessionModel.refeedRequired,
+                lastErrorMessage: sessionModel.lastErrorMessage
+            ) else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .gateRefused,
+                    message: "\"scanner.eject\" was refused: the scanner must be connected, idle, and not mid-job, with film to release.",
+                    guidance: "Connect the scanner and wait for the current job or transport activity to finish before ejecting."
+                ))
+            }
+            // `SessionModel.eject()` re-checks `hardwareMotionReadiness` and
+            // this identical `DeviceBarEjectPolicy.canOffer` gate internally
+            // -- this is D-08's defence in depth, not redundancy: this
+            // pre-check gives the caller a typed refusal, and the model's
+            // own guard is what makes the gate impossible to bypass from
+            // any caller, including a future one that forgets to pre-check
+            // here.
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.eject()
             return outcome(id: id, errorMessageBefore: errorMessageBefore)

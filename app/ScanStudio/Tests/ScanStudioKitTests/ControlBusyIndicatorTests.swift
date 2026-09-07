@@ -186,6 +186,36 @@ private func makeIdleModel(
     return model
 }
 
+/// CR-02: `eject()` now also gates on `DeviceBarEjectPolicy.canOffer`
+/// (connected, transport idle, no active job, film to release), not only
+/// `hardwareMotionReadiness` -- a fresh disconnected model (what
+/// `makeIdleModel` alone produces) no longer reaches the engine's
+/// `scanner.eject` at all. Connects with a fixture device already in
+/// `availableDevices` (skipping `connect()`'s nested `refreshAvailableDevices`
+/// branch, irrelevant here), then injects a synthetic `scanner.status`
+/// event carrying `filmPresent: true` -- the minimal eject-offerable state
+/// -- so the busy-flag tests below still exercise a genuinely in-flight
+/// `scanner.eject` request.
+@MainActor
+private func makeEjectableModel(_ stub: BusyIndicatorEngineStub) async -> SessionModel {
+    let model = await makeIdleModel(stub, initialDevices: [busyIndicatorDevice])
+    let connectOperation = Task { @MainActor in
+        await model.connect(deviceId: busyIndicatorDevice.deviceId)
+    }
+    await stub.waitForConnectRequestCount(1)
+    await stub.succeedConnect()
+    await connectOperation.value
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    return model
+}
+
 @Suite("Control busy indicator")
 struct ControlBusyIndicatorTests {
     @Test("Idle state has no mutating operation in flight once initial discovery settles")
@@ -200,7 +230,7 @@ struct ControlBusyIndicatorTests {
     @MainActor
     func flagSpansEjectAndClearsOnSuccess() async {
         let stub = BusyIndicatorEngineStub()
-        let model = await makeIdleModel(stub)
+        let model = await makeEjectableModel(stub)
 
         let operation = Task { @MainActor in
             await model.eject()
@@ -217,7 +247,7 @@ struct ControlBusyIndicatorTests {
     @MainActor
     func flagClearsOnEjectFailure() async {
         let stub = BusyIndicatorEngineStub()
-        let model = await makeIdleModel(stub)
+        let model = await makeEjectableModel(stub)
 
         let operation = Task { @MainActor in
             await model.eject()

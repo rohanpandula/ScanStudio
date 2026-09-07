@@ -2393,9 +2393,31 @@ public final class SessionModel {
     /// banner via `describe`). Never retried from the app — the incident
     /// contract puts retry decisions with the operator at the machine.
     public func eject() async {
+        let lastErrorMessageBeforeEject = lastErrorMessage
         lastErrorMessage = nil
         guard hardwareMotionReadiness.allowsMotion else {
             lastErrorMessage = hardwareMotionReadiness.guidance
+            return
+        }
+        // CR-02: mirrors `DeviceBarView.canOfferEject` verbatim -- the exact
+        // `DeviceBarEjectPolicy.canOffer` call the GUI's own Eject button
+        // gates on, fed this method's own live state. D-08 defence in
+        // depth: `ControlChannelDispatcher`'s `.scannerEject` arm runs the
+        // identical check first, but this guard is what makes the gate
+        // impossible to bypass from any caller, dispatcher or otherwise.
+        // Previously this method only re-checked `hardwareMotionReadiness`,
+        // so a disconnected, mid-job, or mid-transport-activity eject
+        // reached the engine unchallenged.
+        guard DeviceBarEjectPolicy.canOffer(
+            isConnected: status?.connected == true,
+            transportIsIdle: (status?.transport ?? "idle") == "idle" && !isAcquiringThumbnails,
+            isJobActive: isJobActive,
+            mediaLoaded: status?.mediaLoaded == true,
+            filmPresent: status?.filmPresent,
+            refeedRequired: refeedRequired,
+            lastErrorMessage: lastErrorMessageBeforeEject
+        ) else {
+            lastErrorMessage = "Eject is not available: the scanner must be connected, idle, and not mid-job, with film to release."
             return
         }
         let previous = beginMutatingOperation("scanner.eject")

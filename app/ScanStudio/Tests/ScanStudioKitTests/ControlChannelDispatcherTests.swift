@@ -372,6 +372,22 @@ struct ControlChannelDispatcherTests {
     func mutatingCommandRefusedWhileBusy() async {
         let (model, stub, dispatcher) = await makeDispatcher()
         await greet(dispatcher)
+        // CR-02: `eject()` now also gates on `DeviceBarEjectPolicy.canOffer`
+        // (connected, transport idle, no active job, film to release), not
+        // only `hardwareMotionReadiness` -- a fresh disconnected model no
+        // longer reaches the engine's `scanner.eject` at all. Establish the
+        // same eject-offerable state `ControlChannelMotionRoutingTests.swift`
+        // uses so this busy-preamble proof still exercises a genuinely
+        // in-flight eject.
+        await model.connect(deviceId: controlDispatcherDevice.deviceId)
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+                """#.utf8
+            )
+        ))
 
         let ejectOperation = Task { @MainActor in
             await model.eject()
