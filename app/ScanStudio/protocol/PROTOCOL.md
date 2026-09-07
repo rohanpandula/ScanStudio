@@ -16,7 +16,7 @@ Contract between the SwiftUI app and the `scanstudio-engine` subprocess. This fi
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `PROJECT_ALREADY_EXISTS`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `PROJECT_ALREADY_EXISTS`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`, `EJECT_FAILED`, `FEEDER_PARKED`.
 
 `recoverable` is `true` only for faults where retrying the same operation can succeed (`FEED_JAM`). All others are `false`.
 
@@ -57,6 +57,9 @@ current list unchanged. A failed re-attempt returns the same recoverable
 
 ### `scanner.status`
 `{}` → `ScannerStatus`. Error: `NOT_CONNECTED`.
+
+### `scanner.eject`
+`{}` → `{}` and emits `scanner.status` with `filmPresent` and `mediaLoaded` cleared. There is no preview or roll-session precondition — a device that has only been opened (never previewed) can still be ejected; this is the contract that keeps a scanner-held roll releasable even when a preview never registered it (2026-09-07 incident: `roll.preview` failed with the film already pulled in, and the only way out was ejecting a device that had never completed a preview). The operation requires hardware motion to be armed. Errors: `NOT_CONNECTED`, `SCANNER_BUSY` (transport operation active), `HW_MOTION_NOT_ARMED`, `EJECT_FAILED` (the eject could not complete), `FEEDER_PARKED` (eject accepted without confirmed clear; power cycle required).
 
 ### `sim.loadMedia`
 `{carrier: "roll36"|"strip6"|"mounted"}` → `ScannerStatus`, and emits `scanner.status`. Simulator-only affordance (a real backend detects media; that is why the method lives under `sim.`). Frame counts: roll36 → 36, strip6 → 6, mounted → 1. Errors: `NOT_CONNECTED`, `SCANNER_BUSY`.
