@@ -138,6 +138,23 @@ private func removeSocketDirectory(for path: String) {
     try? FileManager.default.removeItem(atPath: directory)
 }
 
+/// A synthetic `scanner.status` event that flips `filmPresent` -- used to
+/// provoke a `SessionModel` change deterministically, mirroring
+/// `ControlChannelServerTests.filmPresenceChangedEvent`/
+/// `ControlBusyIndicatorTests.makeEjectableModel`'s idiom of injecting a
+/// raw event directly via `SessionModel.handle(event:)` rather than
+/// routing it through the engine stub.
+private func filmPresenceChangedEvent(filmPresent: Bool) -> EngineEvent {
+    EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":\#(filmPresent),"motionArmed":true}}}
+            """#.utf8
+        )
+    )
+}
+
 @Suite("Control channel client", .timeLimit(.minutes(1)))
 struct ControlChannelClientTests {
     // MARK: Task 1 -- dial, hello, id-matched request/response
@@ -269,6 +286,126 @@ struct ControlChannelClientTests {
         } catch let error as ControlChannelClientError {
             #expect(error == .connectionClosed)
         }
+
+        await server.stop()
+    }
+
+    // MARK: Task 2 -- client-side event routing over a live connection
+
+    @Test("After events.subscribe, the first element of events() decodes as a control.snapshot carrying a ControlStatusResult")
+    func firstEventElementIsControlSnapshot() async throws {
+        let path = shortSocketPath("snapshot")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlClientEngineStub()))
+        try await server.start(path: path)
+
+        let client = try await ControlChannelClient.open(path: path, clientName: "test")
+        guard case .result = try await client.requestWithoutParams(method: "events.subscribe") else {
+            Issue.record("expected events.subscribe to succeed")
+            return
+        }
+
+        var iterator = await client.events().makeAsyncIterator()
+        guard let firstLine = await iterator.next() else {
+            Issue.record("expected at least one event line")
+            return
+        }
+        let envelope = try JSONDecoder().decode(EventEnvelope<ControlStatusResult>.self, from: firstLine)
+        #expect(envelope.event == "control.snapshot")
+        #expect(ControlChannelClient.decodeStatusSnapshot(fromEventLine: firstLine) != nil)
+
+        await client.shutdown()
+        await server.stop()
+    }
+
+    @Test("A SessionModel mutation after a subscription produces a control.changed element on the same connection")
+    func subscriptionSeesControlChangedAfterMutation() async throws {
+        let path = shortSocketPath("changed")
+        defer { removeSocketDirectory(for: path) }
+        let model = await makeIdleModel(ControlClientEngineStub())
+        let server = ControlChannelServer(sessionModel: model)
+        try await server.start(path: path)
+
+        let client = try await ControlChannelClient.open(path: path, clientName: "test")
+        _ = try await client.requestWithoutParams(method: "events.subscribe")
+
+        var iterator = await client.events().makeAsyncIterator()
+        _ = await iterator.next() // the initial control.snapshot
+
+        await model.handle(event: filmPresenceChangedEvent(filmPresent: true))
+
+        guard let changedLine = await iterator.next() else {
+            Issue.record("expected a control.changed event line")
+            return
+        }
+        let envelope = try JSONDecoder().decode(EventEnvelope<ControlStatusResult>.self, from: changedLine)
+        #expect(envelope.event == "control.changed")
+
+        await client.shutdown()
+        await server.stop()
+    }
+
+    @Test("decodeStatusSnapshot returns nil for a control.dropped line")
+    func decodeStatusSnapshotReturnsNilForDroppedNotice() {
+        let line = Data(#"{"event":"control.dropped","payload":{"droppedEvents":3}}"#.utf8)
+        #expect(ControlChannelClient.decodeStatusSnapshot(fromEventLine: line) == nil)
+    }
+
+    @Test("A connection that never subscribed produces no events, while a status request on it still round-trips")
+    func nonSubscribedConnectionProducesNoEvents() async throws {
+        let path = shortSocketPath("nosub")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlClientEngineStub()))
+        try await server.start(path: path)
+
+        let client = try await ControlChannelClient.open(path: path, clientName: "test")
+        guard case .result = try await client.requestWithoutParams(method: "status") else {
+            Issue.record("expected status to round-trip on a connection that never subscribed")
+            return
+        }
+
+        // Nothing was ever subscribed on this connection, so nothing was
+        // ever queued into its event stream; shutdown() finishes that
+        // (empty) stream immediately rather than leaving the loop below
+        // waiting forever for an element that will never arrive.
+        await client.shutdown()
+        var receivedCount = 0
+        for await _ in await client.events() {
+            receivedCount += 1
+        }
+        #expect(receivedCount == 0)
+
+        await server.stop()
+    }
+
+    @Test("shutdown() finishes the stream so a for await loop over events() terminates")
+    func shutdownTerminatesForAwaitLoopOverEvents() async throws {
+        let path = shortSocketPath("terminate")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlClientEngineStub()))
+        try await server.start(path: path)
+
+        let client = try await ControlChannelClient.open(path: path, clientName: "test")
+        _ = try await client.requestWithoutParams(method: "events.subscribe")
+        let stream = await client.events()
+
+        // Consumes the initial control.snapshot, then loops awaiting a
+        // second element that never arrives on its own -- the loop only
+        // ends because `shutdown()` (below) finishes the stream, proving a
+        // real `for await` consumer does not hang once the connection
+        // closes.
+        let drain = Task { () -> Int in
+            var iterator = stream.makeAsyncIterator()
+            _ = await iterator.next()
+            var extraElementCount = 0
+            while await iterator.next() != nil {
+                extraElementCount += 1
+            }
+            return extraElementCount
+        }
+        await client.shutdown()
+        let extraElementsAfterSnapshot = await drain.value
+        #expect(extraElementsAfterSnapshot == 0)
 
         await server.stop()
     }
