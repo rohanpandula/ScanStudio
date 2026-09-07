@@ -70,6 +70,9 @@ Every code below is channel-level (D-03) unless marked "passthrough", meaning th
 ### `scanner.rescan`
 `{}` → `{devices: [DeviceInfo]}`. Routes to `refreshAvailableDevices(rescan: true)` — one deliberate re-attempt of the real backend's startup. Errors: `CONTROLLER_BUSY`; passthrough (`ALREADY_CONNECTED`).
 
+### `scanner.refresh`
+`{}` → `{scanner?: ScannerStatus}`. `scanner.refresh` routes to `refreshScannerStatus()` — the same method `HardwareMotionReadinessView`'s own refresh button calls, and the same live re-read `status --refresh` (see Command-line mapping) issues before reporting a snapshot. Non-motion: it re-reads live scanner state over the existing `scanner.status` request; it never moves film, and it carries no confirmation flag because there is nothing to confirm. `scanner` is `nil` only when the refresh discovers the session was lost — `refreshScannerStatus()`'s existing `invalidateConnection` path already clears `device`/`status` on `connected: false` (D-16), and that is reported through the model's own subsequent state, not synthesized by this command. Errors: `CONTROLLER_BUSY`; passthrough.
+
 ### `scanner.connect`
 `{deviceId?: string}` → `{}`. Routes to `connect(deviceId:)`. An absent `deviceId` lets `DeviceSelectionPolicy` resolve the target, exactly like the GUI's no-argument connect. Emits `scanner.status`. Poll `status` afterward for the connected `device`. Errors: `CONTROLLER_BUSY`; `GATE_REFUSED` with no `gate` (an unknown device id — an app-level precondition, not a physical gate); passthrough (`UNKNOWN_DEVICE`, `ALREADY_CONNECTED`).
 
@@ -140,6 +143,8 @@ Every code below is channel-level (D-03) unless marked "passthrough", meaning th
 
 `status`, `frames.list`, `settings.get`, `outputs.get`, and `job.get` are answered entirely from in-memory `SessionModel` state and issue no engine request (CTRL-03). Repeating any of them never reconnects, never re-arms discovery, and never changes scanner or engine state — a caller can poll them freely.
 
+**`scanner.refresh` is deliberately excluded from this list.** OUT-04 forbids a read-only command from probing hardware, and `scanner.refresh` is exactly that probe: it issues a live `scanner.status` request to the engine. It exists as a separately named, opt-in command precisely so that exclusion holds — `status` alone, with or without `--job`, never probes; a caller must ask for `scanner.refresh` (or `status --refresh`) by name to get one.
+
 ## Arbitration
 
 Exactly one mutating operation runs at a time (D-07). A second mutating or motion-capable command arriving while one is already in flight is refused with `CONTROLLER_BUSY`, naming the in-flight operation. The channel never queues a refused request, never retries it automatically, and never re-issues a physical operation on its own (D-09) — a refusal is returned once, and the caller decides whether to try again.
@@ -170,7 +175,7 @@ One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen group
 | `connect [--device <id>]` | `scanner.connect` | — | 0, 65, 69, 70, 75 |
 | `disconnect` | `scanner.disconnect` | — | 0, 65, 69, 70, 75 |
 | `rescan` | `scanner.rescan` | — | 0, 65, 69, 70, 75 |
-| `status [--job <id>]` | `status`, or `job.get` when `--job` is given | — | 0, 65 (`JOB_NOT_FOUND` when `--job` names an id that does not match the tracked job), 69, 70 |
+| `status [--refresh] [--job <id>]` | `scanner.refresh` first when `--refresh` is given, then `status`, or `job.get` when `--job` is given | — | 0, 65 (`JOB_NOT_FOUND` when `--job` names an id that does not match the tracked job), 69, 70, 75 |
 | `preview --film-loaded [--intent …] [--film-process …]` | `preview.acquire` | `--film-loaded` | 0, 64 (`--intent replaceFilmProcess` with no `--film-process`, an unrecognized `--intent`, or an unrecognized `--film-process` value — refused client-side at parse time since WR-05, matching `roll save --film-process`'s own validation, rather than round-tripping to the host for the same 64), 65, 69, 70, 75, 77 |
 | `frames list` / `frames select <range>\|--all\|--none` / `frames include <range>` / `frames exclude <range>` | `frames.list` / `frames.select` / `frames.include` / `frames.exclude` | — | 0, 64 (a malformed CUPS range, or not exactly one of the range argument/`--all`/`--none` for `select`, both refused client-side, D-12), 65, 69, 70, 75 |
 | `review approve --confirm-motion` | `review.approve` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |

@@ -68,8 +68,32 @@ struct Status: AsyncParsableCommand {
     @Option(name: .customLong("job"), help: "Report this job id's status instead of the full session snapshot.")
     var job: String?
 
+    /// D-11: the one read-only-shaped flag that is not side-effect-free --
+    /// it asks the scanner for its current state (`scanner.refresh`) before
+    /// reporting. Still moves nothing: `scanner.refresh` is non-motion,
+    /// exactly like the `status` command it augments.
+    @Flag(name: .customLong("refresh"), help: "Ask the scanner for its live state (scanner.refresh) before reporting status. Not side-effect-free: it probes the scanner over the wire rather than reading only in-memory state. Moves nothing.")
+    var refresh = false
+
     func run() async throws {
         let client = try await CommandRunner.openConnection(command: "status", options: options)
+        if refresh {
+            let refreshResponse = try await CommandRunner.requestWithoutParams(
+                command: "status",
+                method: "scanner.refresh",
+                options: options,
+                client: client
+            )
+            // A refresh failure is rendered and exited on immediately --
+            // never swallowed, and never followed by a snapshot that would
+            // hide it. A success is discarded here; the snapshot below
+            // reports the now-current state, exactly as `--job` does after
+            // a plain `status`.
+            if case .failure = refreshResponse {
+                try await CommandRunner.finish(command: "status", options: options, client: client, response: refreshResponse)
+                return
+            }
+        }
         guard let job else {
             let response = try await CommandRunner.requestWithoutParams(command: "status", method: "status", options: options, client: client)
             try await CommandRunner.finish(command: "status", options: options, client: client, response: response)

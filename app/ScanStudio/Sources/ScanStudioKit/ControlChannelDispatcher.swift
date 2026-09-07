@@ -40,6 +40,7 @@ public enum ControlRequest: Sendable {
     case status(id: UInt64)
     case scannerList(id: UInt64)
     case scannerRescan(id: UInt64)
+    case scannerRefresh(id: UInt64)
     case scannerConnect(id: UInt64, params: ControlScannerConnectParams)
     case scannerDisconnect(id: UInt64)
     case previewAcquire(id: UInt64, params: ControlPreviewAcquireParams)
@@ -71,6 +72,7 @@ extension ControlRequest {
         case .status(let id): id
         case .scannerList(let id): id
         case .scannerRescan(let id): id
+        case .scannerRefresh(let id): id
         case .scannerConnect(let id, _): id
         case .scannerDisconnect(let id): id
         case .previewAcquire(let id, _): id
@@ -103,6 +105,7 @@ extension ControlRequest {
         case .status: "status"
         case .scannerList: "scanner.list"
         case .scannerRescan: "scanner.rescan"
+        case .scannerRefresh: "scanner.refresh"
         case .scannerConnect: "scanner.connect"
         case .scannerDisconnect: "scanner.disconnect"
         case .previewAcquire: "preview.acquire"
@@ -136,7 +139,7 @@ extension ControlRequest {
     /// specific check; this flag is what routes them through it).
     public var isMutating: Bool {
         switch self {
-        case .scannerList, .scannerRescan, .scannerConnect, .scannerDisconnect,
+        case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect,
              .previewAcquire, .framesSelect, .framesInclude, .framesExclude, .reviewApprove,
              .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList,
              .scanStart, .scanStop, .scanResume, .scannerEject:
@@ -163,6 +166,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case settings(ControlSettingsResult)
     case outputs(ControlOutputsResult)
     case scannerList(ControlScannerListResult)
+    case scannerRefresh(ControlScannerRefreshResult)
     case rollList(ControlRollListResult)
     case rollSave(ControlRollSaveResult)
     case previewAcquire(ControlPreviewAcquireResult)
@@ -180,6 +184,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .settings(let value): try container.encode(value)
         case .outputs(let value): try container.encode(value)
         case .scannerList(let value): try container.encode(value)
+        case .scannerRefresh(let value): try container.encode(value)
         case .rollList(let value): try container.encode(value)
         case .rollSave(let value): try container.encode(value)
         case .previewAcquire(let value): try container.encode(value)
@@ -288,6 +293,7 @@ public final class ControlChannelDispatcher {
         case "status": return decoded(EmptyParams.self) { id, _ in .status(id: id) }
         case "scanner.list": return decoded(EmptyParams.self) { id, _ in .scannerList(id: id) }
         case "scanner.rescan": return decoded(EmptyParams.self) { id, _ in .scannerRescan(id: id) }
+        case "scanner.refresh": return decoded(EmptyParams.self) { id, _ in .scannerRefresh(id: id) }
         case "scanner.connect": return decoded(ControlScannerConnectParams.self) { .scannerConnect(id: $0, params: $1) }
         case "scanner.disconnect": return decoded(EmptyParams.self) { id, _ in .scannerDisconnect(id: id) }
         case "preview.acquire": return decoded(ControlPreviewAcquireParams.self) { .previewAcquire(id: $0, params: $1) }
@@ -464,6 +470,16 @@ public final class ControlChannelDispatcher {
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.refreshAvailableDevices(rescan: true)
             return scannerListResponse(id: id, errorMessageBefore: errorMessageBefore)
+        case .scannerRefresh(let id):
+            // D-11: a live, non-motion status re-read through the exact
+            // method `HardwareMotionReadinessView`'s own refresh button
+            // calls -- no second status path. `refreshScannerStatus()`
+            // already handles a lost session via `invalidateConnection`
+            // (SessionModel.swift), so a `nil` `scanner` here is an honest
+            // "the refresh found nothing," not a decode gap.
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.refreshScannerStatus()
+            return scannerRefreshResponse(id: id, errorMessageBefore: errorMessageBefore)
         case .scannerConnect(let id, let params):
             // A `nil` `deviceId` is legitimate: it means "let
             // `DeviceSelectionPolicy` resolve the target", the same as the
@@ -825,6 +841,21 @@ public final class ControlChannelDispatcher {
         case .success:
             return .success(id: id, result: .scannerList(
                 ControlScannerListResult(devices: sessionModel.availableDevices)
+            ))
+        case .failure(let failureId, let error):
+            return .failure(id: failureId, error: error)
+        }
+    }
+
+    /// Shared by `.scannerRefresh` after it has already called
+    /// `refreshScannerStatus()` -- same success/failure split as
+    /// `scannerListResponse` above, wrapping the model's post-refresh
+    /// `status` (D-11) instead of `availableDevices`.
+    private func scannerRefreshResponse(id: UInt64, errorMessageBefore: String?) -> ControlResponse {
+        switch outcome(id: id, errorMessageBefore: errorMessageBefore) {
+        case .success:
+            return .success(id: id, result: .scannerRefresh(
+                ControlScannerRefreshResult(scanner: sessionModel.status)
             ))
         case .failure(let failureId, let error):
             return .failure(id: failureId, error: error)

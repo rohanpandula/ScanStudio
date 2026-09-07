@@ -103,6 +103,23 @@ private actor ControlDispatcherEngineStub: EngineClientProtocol {
                     motionArmed: true
                 )
             ), as: Result.self)
+        case "scanner.status":
+            // Deliberately distinct from `scanner.connect`'s own status
+            // above (mediaLoaded/carrier/frameCount/filmPresent all
+            // differ) -- proves a `scanner.refresh` test observes a fresh
+            // read, not an echoed, unchanged snapshot.
+            return try cast(ScannerStatus(
+                connected: true,
+                adapter: "SA-21",
+                mediaLoaded: true,
+                carrier: "mounted",
+                frameCount: 6,
+                lamp: "stable",
+                transport: "idle",
+                activeJobId: nil,
+                filmPresent: true,
+                motionArmed: true
+            ), as: Result.self)
         case "scanner.acquireThumbnails":
             return try cast(AcquireThumbnailsAck(accepted: true, frames: []), as: Result.self)
         case "project.open":
@@ -182,6 +199,15 @@ private func greet(_ dispatcher: ControlChannelDispatcher) async -> ControlRespo
 private struct ControlEventEnvelopeProbe<Payload: Decodable>: Decodable {
     let event: String
     let payload: Payload
+}
+
+/// `ControlResponseEnvelope` (`ControlWireProtocol.swift`) is encode-only
+/// like `ControlEventEnvelopeProbe`'s own production twin above -- this is
+/// the same idiom, a `Decodable` mirror for reading a success envelope
+/// back in a `handleLine(_:)`-driven test.
+private struct ControlResponseEnvelopeProbe<Result: Decodable>: Decodable {
+    let id: UInt64
+    let result: Result
 }
 
 private func expectFailure(_ response: ControlResponse, id expectedId: UInt64, code expectedCode: ControlErrorCode) {
@@ -413,6 +439,85 @@ struct ControlChannelDispatcherTests {
         await stub.succeedEject()
         await ejectOperation.value
         #expect(model.mutatingOperationInFlight == nil)
+    }
+
+    // MARK: scanner.refresh (D-11)
+
+    @Test("scanner.refresh returns the engine's fresh status, distinct from the pre-refresh snapshot")
+    @MainActor
+    func scannerRefreshReturnsFreshStatus() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.connect(deviceId: controlDispatcherDevice.deviceId)
+        let beforeStatus = model.status
+        let requestCountBefore = await stub.requestCount
+
+        let response = await dispatcher.handle(.scannerRefresh(id: 42))
+
+        guard case .success(let id, .scannerRefresh(let result)) = response else {
+            Issue.record("expected a scannerRefresh success, got \(response)")
+            return
+        }
+        #expect(id == 42)
+        #expect(result.scanner != beforeStatus)
+        #expect(result.scanner?.mediaLoaded == true)
+        #expect(result.scanner?.frameCount == 6)
+        #expect(model.status == result.scanner)
+        // Proves the refresh actually reached the engine (not an echoed
+        // cached value): exactly one new request beyond whatever connect
+        // already made.
+        #expect(await stub.requestCount == requestCountBefore + 1)
+    }
+
+    @Test("scanner.refresh while another mutating operation is in flight is refused CONTROLLER_BUSY")
+    @MainActor
+    func scannerRefreshRefusedWhileBusy() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.connect(deviceId: controlDispatcherDevice.deviceId)
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+                """#.utf8
+            )
+        ))
+
+        let ejectOperation = Task { @MainActor in
+            await model.eject()
+        }
+        await stub.waitForEjectRequestCount(1)
+        #expect(model.mutatingOperationInFlight == "scanner.eject")
+
+        let response = await dispatcher.handle(.scannerRefresh(id: 100))
+        expectFailure(response, id: 100, code: .controllerBusy)
+
+        await stub.succeedEject()
+        await ejectOperation.value
+        #expect(model.mutatingOperationInFlight == nil)
+    }
+
+    @Test("scanner.refresh ignores an extraneous motionConfirmed field and never requires confirmation")
+    @MainActor
+    func scannerRefreshIgnoresMotionConfirmedField() async {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.connect(deviceId: controlDispatcherDevice.deviceId)
+
+        let line = Data(#"{"id":7,"method":"scanner.refresh","params":{"motionConfirmed":true}}"#.utf8)
+        let responseData = await dispatcher.handleLine(line)
+        let envelope = try? JSONDecoder().decode(
+            ControlResponseEnvelopeProbe<ControlScannerRefreshResult>.self,
+            from: responseData
+        )
+        #expect(envelope?.id == 7)
+        #expect(envelope?.result.scanner?.connected == true)
+
+        // Never CONFIRMATION_REQUIRED, regardless of what params carried --
+        // scanner.refresh has no confirmation gate to trip.
+        let errorEnvelope = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: responseData)
+        #expect(errorEnvelope == nil)
     }
 
     // MARK: GATE_REFUSED normalization

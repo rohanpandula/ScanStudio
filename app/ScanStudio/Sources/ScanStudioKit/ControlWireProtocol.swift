@@ -639,6 +639,18 @@ public struct ControlScannerListResult: Codable, Equatable, Sendable {
     }
 }
 
+/// `scanner.refresh`'s result (D-11). `scanner` is optional, not forced:
+/// `refreshScannerStatus()` legitimately leaves `SessionModel.status` `nil`
+/// when the live refresh discovers the session was lost -- reporting `null`
+/// is the honest answer for that case, not a decode failure.
+public struct ControlScannerRefreshResult: Codable, Equatable, Sendable {
+    public let scanner: ScannerStatus?
+
+    public init(scanner: ScannerStatus?) {
+        self.scanner = scanner
+    }
+}
+
 public struct ControlRollListResult: Codable, Equatable, Sendable {
     public let projects: [ControlProjectSummary]
 
