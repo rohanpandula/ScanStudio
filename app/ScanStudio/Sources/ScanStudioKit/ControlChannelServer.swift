@@ -391,21 +391,52 @@ public actor ControlChannelServer {
     /// Enforces D-04's byte bound at the buffer level -- before framing,
     /// not only inside `decode(_:)` -- so a peer that never sends a newline
     /// is refused and closed instead of buffered to exhaustion (T-02-08).
+    ///
+    /// WR-01: the bound is checked two ways, neither of which is the raw
+    /// incoming chunk size alone (the original bug: `LineFramer.feed` can
+    /// extract several complete lines from one chunk, and a single `read()`
+    /// that happens to contain many small, complete, well-formed lines
+    /// whose combined raw bytes exceed the bound must never be refused --
+    /// no individual line came anywhere close to it).
+    ///
+    /// Checking only the post-framing *residual*, on its own, has its own
+    /// bug (found writing this fix's own regression test, which took 55s
+    /// on the *existing* single-oversized-line test instead of refusing
+    /// immediately): a line that itself exceeds the bound but happens to
+    /// receive its closing newline in the same chunk that completes it
+    /// gets fully *consumed* by that chunk's framing, so the residual
+    /// arithmetic (`pending + chunk - consumed`) drops back to ~0 and never
+    /// reflects that the line it just consumed was itself too long -- the
+    /// guard would silently let the entire oversized line buffer to
+    /// completion before `decode(_:)`'s own, separate bound ever catches
+    /// it, defeating the whole point of a *buffer-level* bound (T-02-08).
+    ///
+    /// So: every individually-completed line's own length is checked
+    /// first (catches a line that is itself oversized, regardless of how
+    /// many chunks it arrived across or what completed it); only then is
+    /// the still-unterminated residual -- the tail this chunk leaves
+    /// buffered with no newline yet -- checked against the same bound
+    /// (catches a not-yet-terminated line that has already grown too big
+    /// before it ever completes, the original, still-correct case this
+    /// guard has always covered).
     private func feed(fd: Int32, chunk: Data) async {
         guard var framer = framers[fd], let dispatcher = dispatchers[fd] else { return }
-        let totalPending = (pendingLineBytes[fd] ?? 0) + chunk.count
-        guard totalPending <= ControlChannelDispatcher.maxRequestLineBytes else {
+        let lines = framer.feed(chunk)
+        framers[fd] = framer
+        guard !lines.contains(where: { $0.utf8.count > ControlChannelDispatcher.maxRequestLineBytes }) else {
             await refuseOversizedLine(fd: fd)
             return
         }
-
-        let lines = framer.feed(chunk)
-        framers[fd] = framer
         // Bytes consumed by the lines just extracted (content + the
         // stripped newline byte each); whatever remains is this
         // connection's new unterminated-partial-line residue.
         let consumed = lines.reduce(0) { $0 + $1.utf8.count + 1 }
-        pendingLineBytes[fd] = max(0, totalPending - consumed)
+        let totalPending = max(0, (pendingLineBytes[fd] ?? 0) + chunk.count - consumed)
+        guard totalPending <= ControlChannelDispatcher.maxRequestLineBytes else {
+            await refuseOversizedLine(fd: fd)
+            return
+        }
+        pendingLineBytes[fd] = totalPending
 
         for line in lines {
             await processLine(fd: fd, dispatcher: dispatcher, line: line)

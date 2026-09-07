@@ -510,6 +510,7 @@ struct ControlChannelServerTests {
         // send is an expected side effect of that race, not a test
         // failure -- the refusal line read below is the actual proof, and
         // the server always writes it before it closes.
+        let start = Date()
         try? await client.send(oversized)
 
         guard let line = await client.readLine() else {
@@ -522,6 +523,81 @@ struct ControlChannelServerTests {
         }
         #expect(error.error.code == ControlErrorCode.invalidParams.rawValue)
         #expect(await client.readLine() == nil)
+        // WR-01 fix regression guard: an earlier draft of the fix checked
+        // only the post-framing residual, which "forgets" that a line
+        // which just completed was itself oversized once its bytes are
+        // subtracted out as consumed -- the guard silently stopped
+        // refusing early, the whole ~1 MiB line buffered to completion
+        // before decode(_:)'s own separate bound finally caught it, and
+        // the `readLine() == nil` check above only passed because the
+        // client's own 55s receive timeout elapsed with the connection
+        // never actually closed (T-02-08's entire point defeated, but
+        // silently -- this test still reported green). A tight wall-clock
+        // bound turns any recurrence into a fast, loud failure instead.
+        #expect(Date().timeIntervalSince(start) < 5.0, "must be refused and closed promptly, not only after a client-side receive timeout")
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("WR-01: many small, complete lines whose combined bytes exceed maxRequestLineBytes stay open, and every one is answered")
+    func manySmallLinesExceedingTotalBytesStayOpen() async throws {
+        let path = shortSocketPath("many-small-lines")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try await client.send(#"{"id":0,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        _ = await client.readLine() // hello response
+
+        // This machine's own `net.local.stream.recvspace` (confirmed via
+        // `sysctl`, and directly via a debug probe against `feed(fd:chunk:)`
+        // during this test's own development) caps a single `availableData`
+        // read at 8,192 bytes -- nowhere near the 1 MiB bound, so a literal
+        // single chunk exceeding it cannot be constructed through a real
+        // loopback socket here. Sending many small requests back-to-back
+        // without draining also risks a *separate*, pre-existing hazard
+        // this suite does not otherwise exercise: `availableData` firing
+        // several times in quick succession spawns one independent
+        // `Task { feed(...) }` per firing, and nothing serializes those
+        // Tasks relative to each other before they reach the shared
+        // `framers[fd]`/`pendingLineBytes[fd]` state, which (observed
+        // directly while developing this test) can corrupt framing under
+        // enough concurrent volume -- a real finding, but a different one,
+        // out of WR-01's own scope. Sending fully sequentially (one request
+        // round-tripped to completion before the next is sent) keeps
+        // exactly one `feed()` call in flight at a time, sidestepping that
+        // hazard entirely, while still proving WR-01's own claim: many
+        // small, complete lines whose bytes sum well past the 1 MiB bound
+        // over the connection's lifetime must never be refused, since
+        // `pendingLineBytes` is the *current unterminated residual*, never
+        // a running total of everything ever sent.
+        let padding = String(repeating: "a", count: 8_000)
+        let requestCount = 150
+        var totalBytesSent = 0
+        for id in 1...requestCount {
+            let line = #"{"id":\#(id),"method":"status","params":{"padding":"\#(padding)"}}"#
+            totalBytesSent += line.utf8.count + 1
+            try await client.send(line)
+            guard let responseLine = await client.readLine() else {
+                Issue.record("connection closed early at request \(id) of \(requestCount)")
+                return
+            }
+            guard let sniff = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(responseLine.utf8)) else {
+                Issue.record("expected a decodable response envelope, got: \(responseLine)")
+                return
+            }
+            #expect(sniff.id == UInt64(id))
+            #expect(
+                (try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(responseLine.utf8))) == nil,
+                "request \(id) must not be refused"
+            )
+        }
+        #expect(
+            totalBytesSent > ControlChannelDispatcher.maxRequestLineBytes,
+            "test setup must actually exceed the bound in cumulative bytes sent"
+        )
 
         client.close()
         await server.stop()
