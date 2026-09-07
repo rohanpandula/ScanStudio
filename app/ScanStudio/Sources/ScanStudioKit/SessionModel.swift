@@ -1931,6 +1931,16 @@ public final class SessionModel {
                 approvingFrameIndex = nil
             }
         }
+        // CR-01: this attended-recovery approval was the one D-07 mutating
+        // flow that never set the busy indicator, so a dispatcher-routed
+        // `scan.start` arriving while it ran saw no change and reported a
+        // typed success for a request that started nothing. Same two-line
+        // set/defer-restore pattern as the other 14 call sites: once this is
+        // in flight, `handle(_:)`'s own generic busy preamble now refuses
+        // every mutating command -- `scan.start` included -- with
+        // `CONTROLLER_BUSY` before ever routing to a `SessionModel` call.
+        let previous = beginMutatingOperation("review.approve.attended")
+        defer { mutatingOperationInFlight = previous }
 
         for frameIndex in authorization.frames {
             approvingFrameIndex = frameIndex

@@ -430,4 +430,58 @@ struct AttendedScanRecoveryTests {
             .scanStart(frames: [1, 2]),
         ])
     }
+
+    @Test("CR-01: scan.start is refused CONTROLLER_BUSY, not a silent typed success, while an attended-scan-recovery approval is in flight")
+    @MainActor
+    func scanStartIsRefusedWhileAttendedApprovalInFlight() async {
+        let client = AttendedRecoveryEngineStub(holdFirstApproval: true)
+        let (model, _) = await preparedModel(client: client)
+        let dispatcher = ControlChannelDispatcher(sessionModel: model)
+        _ = await dispatcher.handle(.hello(
+            id: 0,
+            params: ControlHelloParams(schemaVersion: ControlSchema.version, clientName: "attended-recovery-tests")
+        ))
+
+        await model.startMockScan()
+        for frameIndex in 1...2 {
+            emitFailure(
+                model,
+                frameIndex: frameIndex,
+                code: ScanFailureCode.attendedBindingRequired,
+                message: "typed refusal"
+            )
+        }
+        emitCompletion(model, completed: [], failed: [1, 2])
+        #expect(model.canApproveEveryFrameAndScan)
+
+        // `approveEveryFrameAndScan()` now sets the D-07 busy indicator, so
+        // the dispatcher's own generic preamble refuses `scan.start` before
+        // ever routing to `SessionModel` -- not a typed success for a
+        // request that started nothing (the exact bug CR-01 reports).
+        let approval = Task { @MainActor in
+            await model.approveEveryFrameAndScan()
+        }
+        await client.waitForApproval()
+        #expect(model.mutatingOperationInFlight == "review.approve.attended")
+
+        let response = await dispatcher.handle(.scanStart(id: 99, params: ControlScanStartParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected CONTROLLER_BUSY, got \(response)")
+            await client.resumeApproval()
+            _ = await approval.value
+            return
+        }
+        #expect(id == 99)
+        #expect(error.code == ControlErrorCode.controllerBusy.rawValue)
+        // Zero engine requests beyond the two already recorded before this
+        // dispatch (the original scan.start and the held first approval) --
+        // the refusal never reached `SessionModel`, let alone the engine.
+        #expect(await client.calls() == [
+            .scanStart(frames: [1, 2]),
+            .approve(frameIndex: 1, attended: true),
+        ])
+
+        await client.resumeApproval()
+        #expect(await approval.value)
+    }
 }
