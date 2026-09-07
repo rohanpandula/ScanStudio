@@ -43,17 +43,32 @@ enum JobWaiter {
     /// to report, not a hang). Sends nothing else in between: no snapshot
     /// polling, no timer, no re-issue of anything.
     ///
+    /// Once this job's real id has been observed on *any* earlier snapshot
+    /// (`observedJobId`), a later terminal `jobState` can only belong to
+    /// that same job under D-07's "exactly one mutating operation at a
+    /// time" arbitration -- even if that later snapshot's own `jobId` has
+    /// already gone back to `nil`. This closes CR-01:
+    /// `SessionModel.applyCompleted` clears `jobId` in the same synchronous
+    /// update that first reaches a terminal `jobState`, so the snapshot
+    /// carrying both "jobId still set" and "jobState terminal" together is
+    /// never actually emitted as its own event -- only `observedJobId` lets
+    /// this loop recognize the terminal snapshot that follows.
+    ///
     /// No timeout in this phase (`--timeout` is Phase 6, AUTO-01) -- a real
     /// scan can run for as long as the film takes.
     static func waitForTerminalOutcome(
         client: ControlChannelClient,
         preStartJobId: String?
     ) async throws -> ControlClientResponse? {
+        var observedJobId: String?
         for await line in await client.events() {
             guard let snapshot = ControlChannelClient.decodeStatusSnapshot(fromEventLine: line) else {
                 continue
             }
-            guard let jobId = snapshot.jobId, jobId != preStartJobId else { continue }
+            if let jobId = snapshot.jobId, jobId != preStartJobId {
+                observedJobId = jobId
+            }
+            guard observedJobId != nil else { continue }
             guard let jobState = snapshot.jobState, jobState.isTerminal else { continue }
             return try await client.requestWithoutParams(method: "job.get")
         }

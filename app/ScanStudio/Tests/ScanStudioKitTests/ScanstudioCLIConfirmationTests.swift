@@ -328,6 +328,44 @@ private struct ConfirmationCLIResult {
     let stderr: String
 }
 
+/// Thrown when a CLI subprocess spawned by `runConfirmationCLI` does not
+/// exit within its bound. CR-01: this file's own `--wait` tests can now
+/// drive `SessionModel.applyCompleted` (not just `applyJobState`), which is
+/// exactly the code path that used to leave `JobWaiter.waitForTerminalOutcome`
+/// hanging forever -- and this suite's `.timeLimit(.minutes(1))` trait does
+/// NOT bound that hang, because the blocking `Process`/`Pipe` read below runs
+/// on a raw `DispatchQueue.global` thread outside structured concurrency, not
+/// as a cancellable `Task`. Mirrors `ControlSocketEndToEndTests.swift`'s
+/// `runE2ECLI`/`E2ESubprocessTimeoutError` precedent so a future regression
+/// in this area fails fast at the unit-test tier instead of only being
+/// caught (as a flaky timeout) by the slower, opt-in E2E suite.
+private struct ConfirmationSubprocessTimeoutError: Error, CustomStringConvertible {
+    let arguments: [String]
+    let timeoutSeconds: Double
+    var description: String {
+        "step `scanstudio-cli \(arguments.joined(separator: " "))` did not exit within "
+            + "\(Int(timeoutSeconds))s -- killed. See `runConfirmationCLI`'s doc comment."
+    }
+}
+
+/// See `ControlSocketEndToEndTests.swift`'s identical `SingleResumeGuard` --
+/// duplicated per-file rather than shared, matching this suite's own
+/// established precedent of copying (not importing) test-only helpers
+/// across files (`runCLI`/`runConfirmationCLI`/`runE2ECLI` are three
+/// independent copies of the same shape already).
+private final class ConfirmationSingleResumeGuard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func tryClaim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
 /// Runs the real built binary with `arguments` plus `--socket socketPath`,
 /// returning its exit status, stdout, and stderr. The blocking `Process`
 /// spawn/read/wait sequence runs on a dedicated background queue via a
@@ -339,34 +377,58 @@ private struct ConfirmationCLIResult {
 /// actor/`@MainActor` hops concurrently, the pool is exhausted and every
 /// connection -- including the one this very call is waiting on -- stops
 /// making progress.
-private func runConfirmationCLI(_ arguments: [String], socketPath: String) async throws -> ConfirmationCLIResult {
+///
+/// A second, independent GCD timer races the same continuation
+/// (`ConfirmationSingleResumeGuard` ensures exactly one resume): if the
+/// subprocess has not exited within `timeoutSeconds`, it is killed and
+/// `ConfirmationSubprocessTimeoutError` is thrown. 60s mirrors `runE2ECLI`'s
+/// own wide margin -- every real step in this suite completes in well under
+/// a second.
+private func runConfirmationCLI(
+    _ arguments: [String],
+    socketPath: String,
+    timeoutSeconds: Double = 60
+) async throws -> ConfirmationCLIResult {
     let binary = try ConfirmationCLILocator.resolve()
     let allArguments = arguments + ["--socket", socketPath]
+    let process = Process()
+    process.executableURL = binary
+    process.arguments = allArguments
+
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+
+    let resumeGuard = ConfirmationSingleResumeGuard()
+
     return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ConfirmationCLIResult, Error>) in
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let process = Process()
-                process.executableURL = binary
-                process.arguments = allArguments
-
-                let stdoutPipe = Pipe()
-                let stderrPipe = Pipe()
-                process.standardOutput = stdoutPipe
-                process.standardError = stderrPipe
-
                 try process.run()
                 let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
                 let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-
+                guard resumeGuard.tryClaim() else { return }
                 continuation.resume(returning: ConfirmationCLIResult(
                     exitCode: process.terminationStatus,
                     stdout: String(data: stdoutData, encoding: .utf8) ?? "",
                     stderr: String(data: stderrData, encoding: .utf8) ?? ""
                 ))
             } catch {
+                guard resumeGuard.tryClaim() else { return }
                 continuation.resume(throwing: error)
             }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds) {
+            guard resumeGuard.tryClaim() else { return }
+            if process.isRunning {
+                process.terminate()
+            }
+            continuation.resume(throwing: ConfirmationSubprocessTimeoutError(
+                arguments: arguments,
+                timeoutSeconds: timeoutSeconds
+            ))
         }
     }
 }
@@ -702,6 +764,39 @@ struct ScanstudioCLIConfirmationTests {
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let resultObject = try #require(object["result"] as? [String: Any])
         #expect(resultObject["jobState"] as? String == "stopped")
+
+        await host.server.stop()
+    }
+
+    @Test("CR-01: scan --confirm-motion --wait driven to completed via a synthetic scan.completed event (which clears jobId in the same update that reaches a terminal jobState, unlike scan.jobState) still exits 0 rather than hanging")
+    func scanWaitDrivenToCompletedViaScanCompletedEventExitsZero() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-wait-completed-event")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let ready = await prepareConfirmationScanReadiness(host.model)
+        #expect(ready)
+
+        async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
+        await waitForConfirmationJobToBegin(host.model)
+        // Unlike driveConfirmationJobState (SessionModel.applyJobState, which
+        // only ever touches jobState), this drives SessionModel.applyCompleted
+        // -- the handler that clears jobId to nil in the same synchronous
+        // update that first resolves jobState to a terminal value (CR-01).
+        // Without JobWaiter's observedJobId fix, this hangs until the
+        // suite's own .timeLimit(.minutes(1)) kills it.
+        await host.model.handle(event: EngineEvent(
+            name: "scan.completed",
+            rawLine: Data(
+                #"""
+                {"event":"scan.completed","payload":{"jobId":"\#(ConfirmationEngineStub.jobId)","summary":{"completed":[1],"failed":[],"skipped":[],"stopped":false}}}
+                """#.utf8
+            )
+        ))
+
+        let result = try await outcome
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["jobState"] as? String == "completed")
 
         await host.server.stop()
     }
