@@ -12,8 +12,8 @@ import ScanStudioKit
 struct Frames: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "frames",
-        abstract: "List, include, or exclude project frames.",
-        subcommands: [List.self, Include.self, Exclude.self]
+        abstract: "List, select, include, or exclude project frames.",
+        subcommands: [List.self, Select.self, Include.self, Exclude.self]
     )
 
     /// `frames list` -> `frames.list`: one request, no state change.
@@ -24,6 +24,72 @@ struct Frames: AsyncParsableCommand {
 
         func run() async throws {
             try await CommandRunner.runWithoutParams(command: "frames.list", method: "frames.list", options: options)
+        }
+    }
+
+    /// `frames select <ranges> | --all | --none` -> `frames.select` (CR-02):
+    /// the pre-project bulk selection command that unblocks a cold
+    /// `connect -> preview -> select -> save` CLI-only session -- see
+    /// `ControlFramesSelectParams`'s own doc comment. Not a motion command
+    /// -- no confirmation flag. Exactly one of the range argument, `--all`,
+    /// or `--none` is required; that shape is validated here, before any
+    /// connection opens, mirroring `Include`/`Exclude`'s own D-12 range
+    /// parse-time gate.
+    struct Select: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "select",
+            abstract: "Select frames before a project exists: a CUPS-syntax range (e.g. 1-6), or --all, or --none."
+        )
+
+        @OptionGroup var options: GlobalOptions
+
+        @Argument(help: "A CUPS-syntax frame range, e.g. \"1-6\". Omit when using --all or --none.")
+        var ranges: String?
+
+        @Flag(name: .customLong("all"), help: "Select every previewed frame.")
+        var all = false
+
+        @Flag(name: .customLong("none"), help: "Clear the selection.")
+        var none = false
+
+        private var parsedIndices: [Int] = []
+
+        mutating func validate() throws {
+            guard [ranges != nil, all, none].filter({ $0 }).count == 1 else {
+                let payload = ControlErrorPayload(
+                    code: ControlCLIErrorCode.invalidRange.rawValue,
+                    message: "\"frames select\" requires exactly one of a range argument, --all, or --none.",
+                    recoverable: false
+                )
+                let text = try ControlCLIOutput.renderError(command: "frames.select", payload: payload, human: options.human)
+                print(text, terminator: "")
+                throw ExitCode(64)
+            }
+            guard let ranges else { return }
+            do {
+                parsedIndices = try ControlFrameRangeParser.parse(ranges)
+            } catch let error as ControlFrameRangeError {
+                let payload = ControlErrorPayload(
+                    code: ControlCLIErrorCode.invalidRange.rawValue,
+                    message: error.message,
+                    recoverable: false
+                )
+                let text = try ControlCLIOutput.renderError(command: "frames.select", payload: payload, human: options.human)
+                print(text, terminator: "")
+                throw ExitCode(64)
+            }
+        }
+
+        func run() async throws {
+            let params: ControlFramesSelectParams
+            if all {
+                params = ControlFramesSelectParams(all: true)
+            } else if none {
+                params = ControlFramesSelectParams(none: true)
+            } else {
+                params = ControlFramesSelectParams(indices: parsedIndices)
+            }
+            try await CommandRunner.run(command: "frames.select", method: "frames.select", params: params, options: options)
         }
     }
 

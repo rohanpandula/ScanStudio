@@ -3965,6 +3965,36 @@ public final class SessionModel {
         selectedFrameIndices.removeAll()
     }
 
+    /// D-05 `frames.select`'s `indices` arm (CR-02): the one public
+    /// selection entry point that can run *before* a project exists, so a
+    /// pure CLI/attach-mode caller (no GUI ever driven) has a wire-level
+    /// path to a non-empty `selectedFrameIndices` -- `roll.save`'s own
+    /// precondition -- ahead of `roll.save` creating the project
+    /// `frames.include`/`frames.exclude` then require. Validates every
+    /// requested index against the *previewed* frame count
+    /// (`status.frameCount`), never a project's own frame list, since none
+    /// exists yet. Returns `false` (no mutation at all -- never a partial
+    /// selection) if a project already exists, no preview has completed, or
+    /// any index falls outside `1...frameCount`, so the dispatcher can
+    /// report one typed refusal without guessing which condition failed.
+    @discardableResult
+    public func setFrameSelection(_ indices: [Int]) -> Bool {
+        guard project == nil else { return false }
+        guard let frameCount = status?.frameCount, frameCount > 0 else { return false }
+        let validRange = 1...frameCount
+        guard indices.allSatisfy(validRange.contains) else { return false }
+        let reviewSkippedFrames = Set(
+            manualReviewDecisions.compactMap { frameIndex, decision in
+                decision == .dontScan ? frameIndex : nil
+            }
+        )
+        selectedFrameIndices = Set(indices).subtracting(reviewSkippedFrames)
+        if focusedFrameIndex == nil || !validFrameIndices.contains(focusedFrameIndex ?? -1) {
+            focusedFrameIndex = selectedFrameIndices.min()
+        }
+        return true
+    }
+
     /// Inverting flips every non-excluded frame's selection state; an
     /// already-selected excluded frame stays selected (inversion never
     /// silently drops a frame the user explicitly selected).

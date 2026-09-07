@@ -11,15 +11,18 @@
 # (app/ScanStudio/Tests/ScanStudioKitTests/ControlSocketEndToEndTests.swift).
 #
 # Order actually run vs. D-17c: D-17c's literal shape is "... -> save ->
-# scan --wait -> ...". This suite runs connect -> preview -> save (which
-# itself starts a job) -> stop -> frames list/exclude/include -> re-preview
-# -> resume --wait -> scan --wait -> eject -> diagnostics -> events, with
-# two required deviations from D-17c's literal order, both recorded in full
-# in that file's own header: frames list/exclude/include move to after
-# save (they need an open project, which a preview alone never creates),
-# and a re-preview is inserted between stop and resume (a stopped job
-# clears its own preview registration by design). Coverage, not order, is
-# the contract either way.
+# scan --wait -> ...". This suite runs connect -> preview -> frames select
+# --all -> save (which itself starts a job) -> stop -> frames list/exclude/
+# include -> re-preview -> resume --wait -> scan --wait -> eject ->
+# diagnostics -> events, with two required deviations from D-17c's literal
+# order, both recorded in full in that file's own header: frames list/
+# exclude/include move to after save (they need an open project, which a
+# preview alone never creates), and a re-preview is inserted between stop
+# and resume (a stopped job clears its own preview registration by design).
+# `frames select --all` (CR-02, a code-review fix) runs right after preview
+# so a pure CLI-only session can populate the selection `save` requires
+# without any host-side bridge. Coverage, not order, is the contract either
+# way.
 # What this does NOT prove: no real hardware, no packaging, no signing, no
 # notarization, no GUI. `scripts/verify_mac_acceptance.py` and
 # `scripts/verify_updater.sh` cover other parts of the acceptance surface.

@@ -36,31 +36,26 @@
 // AFTER `roll save`, against the project `roll save` just created, which is
 // the only order the shipped code actually supports.
 //
-// A second, more consequential finding: `SessionModel.selectedFrameIndices`
-// (what `roll.save`/`scan.start` actually schedule) starts empty and is
+// A second finding, now CLOSED (CR-02, code-review fix): at the time this
+// suite was first written, `SessionModel.selectedFrameIndices` (what
+// `roll.save`/`scan.start` actually schedule) started empty and was
 // populated ONLY by GUI-only interactive methods (`selectFrame`,
 // `toggleFrameSelection`, `selectAllFrames`, `invertFrameSelection`) --
 // `scanner.thumbnail`'s event handler fills `thumbnails`, never
-// `selectedFrameIndices`. There is no D-08 channel command that selects a
+// `selectedFrameIndices`. There was no D-08 channel command that selected a
 // frame before a project exists (`frames.include`/`frames.exclude` need the
 // project `roll.save` itself is waiting on a selection to create). A pure
-// CLI-only caller therefore has no way to make `roll save`'s selection
-// non-empty in Phase 2 as shipped. This is not a bug this plan's
-// `files_modified` can fix (no Commands/ file, no ControlWireProtocol.swift,
-// no ControlChannelDispatcher.swift here), and it is not a source change --
-// per this plan's own `<interfaces>`, "the suite's host may need to reach
-// them through EngineClient directly at setup time" already grants exactly
-// this kind of setup-time host access (the same allowance `sim.loadMedia`
-// setup already relies on). This suite's host therefore calls
-// `SessionModel.selectAllFrames()` directly, once, immediately after the
-// preview it drove through the real CLI completes -- exactly what a human
-// operator's contact-sheet view does automatically, and exactly the
-// counterpart to loading the simulated carrier. **This is recorded here as
-// a genuine phase-scope finding**: Phase 2's D-08 command tree has no
-// channel-level frame-selection command, so an attach-mode CLI caller with
-// no GUI ever rendered cannot drive a roll from a cold start without this
-// same bridge. Worth a `frames select`/`frames select-all` command in a
-// later phase; out of scope to add here.
+// CLI-only caller therefore had no way to make `roll save`'s selection
+// non-empty, and this suite's own host bridged the gap by calling
+// `SessionModel.selectAllFrames()` directly on the host process -- a
+// capability no real external CLI operator or agent has. The fix: a new
+// `frames.select` channel command (`ControlFramesSelectParams`, routed by
+// `ControlChannelDispatcher` to `SessionModel.setFrameSelection(_:)` /
+// `selectAllFrames()` / `clearFrameSelection()`) and its CLI counterpart
+// `frames select <ranges> | --all | --none`. This suite now drives frame
+// selection through the real CLI and socket (`frames select --all`, right
+// after the preview it drove through the real CLI completes), exactly like
+// every other step -- the host-side bridge below is gone.
 //
 // A third finding: `SessionModel`'s default capture recipe is 4000 DPI (the
 // real scanner's native resolution) -- a real, CPU-bound full-resolution
@@ -116,11 +111,12 @@
 // was still missing.
 //
 // Coverage, not order, is otherwise exactly the plan's suggested shape:
-// connect -> status -> preview -> settings/outputs get -> roll save (starts
-// job A) -> stop -> frames list/exclude/include -> roll list -> re-preview
-// -> resume --wait (drains what `stop` left pending) -> scan --wait (a
-// genuine re-scan of the now-fully-receipted selection) -> eject ->
-// diagnostics export -> events --follow, plus the two negative paths.
+// connect -> status -> preview -> frames select --all (CR-02) -> settings/
+// outputs get -> roll save (starts job A) -> stop -> frames list/exclude/
+// include -> roll list -> re-preview -> resume --wait (drains what `stop`
+// left pending) -> scan --wait (a genuine re-scan of the now-fully-receipted
+// selection) -> eject -> diagnostics export -> events --follow, plus the two
+// negative paths.
 
 import Foundation
 import Testing
@@ -634,14 +630,19 @@ struct ControlSocketEndToEndTests {
             let previewCompleted = await host.waitUntilPreviewComplete()
             #expect(previewCompleted, "preview did not reach scanner.thumbnailsComplete within the bound")
 
-            // -- Frame selection setup: see this file's header comment --
-            // no D-08 command can select a frame before a project exists.
-            // Reached directly on the host, mirroring the contact sheet's
-            // own default-select-all behaviour a real operator gets for
-            // free from the GUI.
-            await host.model.selectAllFrames()
+            // -- frames select --all: CR-02's fix. `frames.select` lets a
+            // pure CLI-only caller populate SessionModel.selectedFrameIndices
+            // over the real socket, before any project exists -- see this
+            // file's header comment (second finding, now closed) and
+            // `ControlFramesSelectParams`'s own doc comment. Mirrors the
+            // contact sheet's default Select All behaviour a real operator
+            // gets for free from the GUI, reached here through the real CLI
+            // subprocess and socket, not the host process's SessionModel
+            // directly.
+            let selectAllResult = try await step(["frames", "select", "--all"])
+            #expect(selectAllResult.exitCode == 0, Comment(rawValue: selectAllResult.context))
             let selectedFrameCount = await host.model.selectedFrames.count
-            #expect(selectedFrameCount == 6, "selectAllFrames did not select all 6 previewed frames")
+            #expect(selectedFrameCount == 6, "frames select --all did not select all 6 previewed frames")
 
             // -- settings / outputs (read-only) --
             let settingsResult = try await step(["settings", "get"])

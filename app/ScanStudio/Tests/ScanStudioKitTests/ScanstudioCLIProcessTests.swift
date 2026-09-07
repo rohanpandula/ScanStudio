@@ -423,6 +423,105 @@ struct ScanstudioCLIProcessTests {
         await host.server.stop()
     }
 
+    @Test("frames select with no range/--all/--none exits 64 client-side with INVALID_RANGE, and the host's stub recorded zero new requests")
+    func framesSelectWithNoSelectorExitsInvalidRangeBeforeAnyRequest() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-select-none-given")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let before = await host.stub.requestCounts
+
+        let result = try await runCLI(["frames", "select"], socketPath: host.socketPath)
+        #expect(result.exitCode == 64)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "INVALID_RANGE")
+
+        let after = await host.stub.requestCounts
+        #expect(before == after)
+
+        await host.server.stop()
+    }
+
+    @Test("frames select --all --none (both given) exits 64 client-side with INVALID_RANGE, and the host's stub recorded zero new requests")
+    func framesSelectWithBothAllAndNoneExitsInvalidRangeBeforeAnyRequest() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-select-both-given")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let before = await host.stub.requestCounts
+
+        let result = try await runCLI(["frames", "select", "--all", "--none"], socketPath: host.socketPath)
+        #expect(result.exitCode == 64)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "INVALID_RANGE")
+
+        let after = await host.stub.requestCounts
+        #expect(before == after)
+
+        await host.server.stop()
+    }
+
+    @Test("CR-02: frames select --all reaches the host over the real socket and selects every previewed frame before any project exists")
+    func framesSelectAllReachesHostBeforeProjectExists() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-select-all")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        // A completed preview's own `scanner.status` event -- frames.select
+        // validates indices against `status.frameCount`, never a project's
+        // frame list, since none exists yet (that's the whole point of this
+        // command). No project is opened in this test.
+        await host.model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":6,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+                """#.utf8
+            )
+        ))
+        let projectBeforeSelect = await host.model.project
+        #expect(projectBeforeSelect == nil)
+
+        let result = try await runCLI(["frames", "select", "--all"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let selected = await host.model.selectedFrames
+        #expect(selected == [1, 2, 3, 4, 5, 6])
+
+        await host.server.stop()
+    }
+
+    @Test("CR-02: frames select <range> reaches the host over the real socket and selects exactly that subset")
+    func framesSelectRangeReachesHostBeforeProjectExists() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-select-range")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":6,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+                """#.utf8
+            )
+        ))
+
+        let result = try await runCLI(["frames", "select", "2-3"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let selected = await host.model.selectedFrames
+        #expect(selected == [2, 3])
+
+        await host.server.stop()
+    }
+
+    @Test("CR-02: frames select --all after a project already exists is refused with the host's own GATE_REFUSED")
+    func framesSelectAfterProjectExistsIsGateRefused() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-select-post-project")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.model.openProject(directory: cliProcessProjectDirectory)
+
+        let result = try await runCLI(["frames", "select", "--all"], socketPath: host.socketPath)
+        #expect(result.exitCode == 65)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "GATE_REFUSED")
+
+        await host.server.stop()
+    }
+
     @Test("diagnostics export writes into the given temp directory and reports its path and entries")
     func diagnosticsExportWritesIntoTempDirectory() async throws {
         let host = try await CLIProcessHost.start(label: "diagnostics")

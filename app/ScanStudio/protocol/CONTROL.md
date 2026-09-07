@@ -79,6 +79,9 @@ Every code below is channel-level (D-03) unless marked "passthrough", meaning th
 ### `frames.list`
 `{}` → `{frames: [{index: number, excluded: boolean, selected: boolean, hasThumbnail: boolean, state?: string, manualReviewDecision?: "useFrameAnyway"|"dontScan", errorCode?: string}], selectedFrames: [number]}`. Built from `SessionModel` state only — no engine request. `errorCode` carries only the bare failure code string, never a full error payload or any hardware-diagnostic detail (T-01-05). Errors: none.
 
+### `frames.select`
+`{indices?: [number], all?: boolean, none?: boolean}` → `{}`. **Exactly one of `indices`/`all`/`none` must be present** — any other combination is refused with `INVALID_PARAMS` before any `SessionModel` call. Not a motion command — no confirmation flag. The bulk, *pre-project* counterpart to `frames.include`/`frames.exclude`: routes to `setFrameSelection(_:)` (the `indices` arm, validated against the *previewed* frame count, `status.frameCount` — there is no project yet for this arm to validate membership against), `selectAllFrames()` (the `all` arm), or `clearFrameSelection()` (the `none` arm) — the same three GUI selection actions the contact sheet's own toolbar offers. Exists so a pure CLI/attach-mode caller (no GUI ever driven) can populate `selectedFrameIndices` — `roll.save`'s own "select at least one frame" precondition — from a cold session, closing the gap `roll.save`'s own refusal message otherwise leaves unsatisfiable through any documented command. Refused once a project already exists (`GATE_REFUSED`, no gate — use `frames.include`/`frames.exclude` to refine the selection instead) or while a job is active or a resume is in flight (`CONTROLLER_BUSY`, mirroring `settings.set`/`outputs.set`'s identical rule — none of the three have a busy flag of their own). Errors: `INVALID_PARAMS` (not exactly one of `indices`/`all`/`none`; an `indices` entry outside the previewed frame range; no preview has completed yet); `GATE_REFUSED` with no `gate` (a project already exists); `CONTROLLER_BUSY`.
+
 ### `frames.include`
 `{frameIndex: number}` → `{}`. Validates `frameIndex` against the open project's actual frame indices, then routes to `setFrameExcluded(_:excluded: false)`. Errors: `INVALID_PARAMS` (no project open, or `frameIndex` is not one of the project's frame indices); `CONTROLLER_BUSY`; passthrough.
 
@@ -166,7 +169,7 @@ One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen group
 | `rescan` | `scanner.rescan` | — | 0, 65, 69, 70, 75 |
 | `status [--job <id>]` | `status`, or `job.get` when `--job` is given | — | 0, 65 (`JOB_NOT_FOUND` when `--job` names an id that does not match the tracked job), 69, 70 |
 | `preview --film-loaded [--intent …] [--film-process …]` | `preview.acquire` | `--film-loaded` | 0, 64 (`--intent replaceFilmProcess` with no `--film-process`, or an unrecognized `--intent`), 65, 69, 70, 75, 77 |
-| `frames list` / `frames include <range>` / `frames exclude <range>` | `frames.list` / `frames.include` / `frames.exclude` | — | 0, 64 (a malformed CUPS range is refused client-side, D-12), 65, 69, 70, 75 |
+| `frames list` / `frames select <range>\|--all\|--none` / `frames include <range>` / `frames exclude <range>` | `frames.list` / `frames.select` / `frames.include` / `frames.exclude` | — | 0, 64 (a malformed CUPS range, or not exactly one of the range argument/`--all`/`--none` for `select`, both refused client-side, D-12), 65, 69, 70, 75 |
 | `review approve --confirm-motion` | `review.approve` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
 | `settings get` / `settings set […]` | `settings.get` / `settings.set` | — | 0, 65, 69, 70, 75 |
 | `outputs get` / `outputs set […]` | `outputs.get` / `outputs.set` | — | 0, 65, 69, 70, 75 |

@@ -44,6 +44,7 @@ public enum ControlRequest: Sendable {
     case scannerDisconnect(id: UInt64)
     case previewAcquire(id: UInt64, params: ControlPreviewAcquireParams)
     case framesList(id: UInt64)
+    case framesSelect(id: UInt64, params: ControlFramesSelectParams)
     case framesInclude(id: UInt64, params: ControlFrameSelectionParams)
     case framesExclude(id: UInt64, params: ControlFrameSelectionParams)
     case reviewApprove(id: UInt64, params: ControlReviewApproveParams)
@@ -74,6 +75,7 @@ extension ControlRequest {
         case .scannerDisconnect(let id): id
         case .previewAcquire(let id, _): id
         case .framesList(let id): id
+        case .framesSelect(let id, _): id
         case .framesInclude(let id, _): id
         case .framesExclude(let id, _): id
         case .reviewApprove(let id, _): id
@@ -105,6 +107,7 @@ extension ControlRequest {
         case .scannerDisconnect: "scanner.disconnect"
         case .previewAcquire: "preview.acquire"
         case .framesList: "frames.list"
+        case .framesSelect: "frames.select"
         case .framesInclude: "frames.include"
         case .framesExclude: "frames.exclude"
         case .reviewApprove: "review.approve"
@@ -134,7 +137,7 @@ extension ControlRequest {
     public var isMutating: Bool {
         switch self {
         case .scannerList, .scannerRescan, .scannerConnect, .scannerDisconnect,
-             .previewAcquire, .framesInclude, .framesExclude, .reviewApprove,
+             .previewAcquire, .framesSelect, .framesInclude, .framesExclude, .reviewApprove,
              .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList,
              .scanStart, .scanStop, .scanResume, .scannerEject:
             true
@@ -289,6 +292,7 @@ public final class ControlChannelDispatcher {
         case "scanner.disconnect": return decoded(EmptyParams.self) { id, _ in .scannerDisconnect(id: id) }
         case "preview.acquire": return decoded(ControlPreviewAcquireParams.self) { .previewAcquire(id: $0, params: $1) }
         case "frames.list": return decoded(EmptyParams.self) { id, _ in .framesList(id: id) }
+        case "frames.select": return decoded(ControlFramesSelectParams.self) { .framesSelect(id: $0, params: $1) }
         case "frames.include": return decoded(ControlFrameSelectionParams.self) { .framesInclude(id: $0, params: $1) }
         case "frames.exclude": return decoded(ControlFrameSelectionParams.self) { .framesExclude(id: $0, params: $1) }
         case "review.approve": return decoded(ControlReviewApproveParams.self) { .reviewApprove(id: $0, params: $1) }
@@ -493,6 +497,45 @@ public final class ControlChannelDispatcher {
             )))
         case .framesList(let id):
             return .success(id: id, result: .framesList(buildFramesListResult()))
+        case .framesSelect(let id, let params):
+            // CR-02: unblocks the cold-start `connect -> preview -> save`
+            // flow for a caller with no GUI ever driven -- see
+            // `SessionModel.setFrameSelection(_:)`'s own doc comment. Shape
+            // first (exactly one of the three), then the two typed
+            // refusals a caller can hit, then apply.
+            let chosen = [params.indices != nil, params.all == true, params.none == true].filter { $0 }.count
+            guard chosen == 1 else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "\"frames.select\" requires exactly one of indices, all, or none."
+                ))
+            }
+            if let refusal = jobActiveBusyRefusal(method: "frames.select") {
+                return .failure(id: id, error: refusal)
+            }
+            guard sessionModel.project == nil else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .gateRefused,
+                    message: "\"frames.select\" was refused: a project already exists.",
+                    guidance: "Refine the selection per-frame with frames.include/frames.exclude once a project is open."
+                ))
+            }
+            if let indices = params.indices {
+                if let error = validatedFrameSelectionIndices(indices, method: "frames.select") {
+                    return .failure(id: id, error: error)
+                }
+                guard sessionModel.setFrameSelection(indices) else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "\"frames.select\" could not apply the requested selection."
+                    ))
+                }
+            } else if params.all == true {
+                sessionModel.selectAllFrames()
+            } else {
+                sessionModel.clearFrameSelection()
+            }
+            return .success(id: id, result: .empty(ControlEmptyResult()))
         case .framesInclude(let id, let params):
             if let error = validatedFrameIndex(params.frameIndex, method: request.methodName) {
                 return .failure(id: id, error: error)
@@ -536,7 +579,7 @@ public final class ControlChannelDispatcher {
                 processing: sessionModel.processingRecipe
             )))
         case .settingsSet(let id, let params):
-            if let refusal = settingsOutputsBusyRefusal(method: "settings.set") {
+            if let refusal = jobActiveBusyRefusal(method: "settings.set") {
                 return .failure(id: id, error: refusal)
             }
             // No individual settings field is written from the dispatcher --
@@ -546,7 +589,7 @@ public final class ControlChannelDispatcher {
         case .outputsGet(let id):
             return .success(id: id, result: .outputs(ControlOutputsResult(outputs: sessionModel.outputRecipe)))
         case .outputsSet(let id, let params):
-            if let refusal = settingsOutputsBusyRefusal(method: "outputs.set") {
+            if let refusal = jobActiveBusyRefusal(method: "outputs.set") {
                 return .failure(id: id, error: refusal)
             }
             // Delegates to the same private `applyRecipes(_:)` path
@@ -871,7 +914,32 @@ public final class ControlChannelDispatcher {
         )
     }
 
-    // MARK: Frame selection validation (frames.include / frames.exclude)
+    // MARK: Frame selection validation (frames.select / frames.include / frames.exclude)
+
+    /// CR-02: `frames.select`'s `indices` arm has no project to validate
+    /// membership against (that's the whole point of this command -- it
+    /// exists to run *before* one exists), so it validates against the
+    /// *previewed* frame count instead, mirroring `SessionModel
+    /// .setFrameSelection(_:)`'s own check. Returns the same `INVALID_PARAMS`
+    /// shape `validatedFrameIndex` below returns for the post-project case,
+    /// naming every offending index at once rather than only the first.
+    private func validatedFrameSelectionIndices(_ indices: [Int], method: String) -> ControlErrorPayload? {
+        guard let frameCount = sessionModel.status?.frameCount, frameCount > 0 else {
+            return ControlErrorPayload(
+                .invalidParams,
+                message: "\"\(method)\" requires a completed preview before frames can be selected."
+            )
+        }
+        let validRange = 1...frameCount
+        let outOfRange = indices.filter { !validRange.contains($0) }
+        guard outOfRange.isEmpty else {
+            return ControlErrorPayload(
+                .invalidParams,
+                message: "\"\(method)\" indices \(outOfRange) are outside the previewed frame range 1...\(frameCount)."
+            )
+        }
+        return nil
+    }
 
     /// D-04: `frames.include`/`frames.exclude` share one frame-index check
     /// -- no project open, or an index that is not one of the open
@@ -899,18 +967,21 @@ public final class ControlChannelDispatcher {
         return nil
     }
 
-    // MARK: Settings / outputs busy guard (settings.set / outputs.set)
+    // MARK: Job-active busy guard (settings.set / outputs.set / frames.select)
 
-    /// `applySettingsRecipes(capture:processing:)`/`applyOutputRecipe(_:)`
-    /// are both synchronous (Plan 03) and hold no busy flag of their own,
-    /// so the preamble's `mutatingOperationInFlight` check in `handle(_:)`
-    /// cannot see a running job for either command. Mirrors
-    /// `BatchInspectorView.swift` lines 42-47, where `setupInspector`
+    /// `applySettingsRecipes(capture:processing:)`/`applyOutputRecipe(_:)`/
+    /// `frames.select`'s selection mutators are all synchronous and hold no
+    /// busy flag of their own, so the preamble's `mutatingOperationInFlight`
+    /// check in `handle(_:)` cannot see a running job for any of them.
+    /// Mirrors `BatchInspectorView.swift` lines 42-47, where `setupInspector`
     /// (the settings editors) is rendered only while `!sessionModel
     /// .isJobActive` and is `.disabled(sessionModel.isResumingBatch)` when
     /// it is rendered -- a control caller must meet the same bar the GUI
-    /// enforces by not rendering the control at all.
-    private func settingsOutputsBusyRefusal(method: String) -> ControlErrorPayload? {
+    /// enforces by not rendering the control at all. `frames.select` reuses
+    /// this exact rule (CR-02): a caller must not be able to replace the
+    /// selection while a job is active or a resume is in flight, mirroring
+    /// how the GUI's own thumbnail grid selection is unavailable then too.
+    private func jobActiveBusyRefusal(method: String) -> ControlErrorPayload? {
         guard sessionModel.isJobActive || sessionModel.isResumingBatch else { return nil }
         let inFlight = sessionModel.jobId ?? "a resume in progress"
         return ControlErrorPayload(

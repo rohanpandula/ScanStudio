@@ -261,6 +261,27 @@ public struct ControlFrameSelectionParams: Codable, Equatable, Sendable {
     }
 }
 
+/// `frames.select` (CR-02): bulk, pre-project frame selection, so a
+/// socket-only caller can populate `SessionModel.selectedFrameIndices`
+/// before any project exists -- unblocking `roll.save`'s own "select at
+/// least one frame" precondition for a cold CLI/attach-mode session that
+/// never drives a GUI. Exactly one of `indices`/`all`/`none` must be
+/// present; the dispatcher refuses `INVALID_PARAMS` otherwise. Not a
+/// motion command -- no confirmation field. Once a project exists, this
+/// command is refused (`GATE_REFUSED`, no gate) in favor of
+/// `frames.include`/`frames.exclude`'s per-frame refinement.
+public struct ControlFramesSelectParams: Codable, Equatable, Sendable {
+    public let indices: [Int]?
+    public let all: Bool?
+    public let none: Bool?
+
+    public init(indices: [Int]? = nil, all: Bool? = nil, none: Bool? = nil) {
+        self.indices = indices
+        self.all = all
+        self.none = none
+    }
+}
+
 /// `mode` is `"afterCurrentFrame"` (the absent-key default) or
 /// `"immediate"` — no other value is accepted.
 public struct ControlScanStopParams: Codable, Equatable, Sendable {

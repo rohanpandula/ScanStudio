@@ -373,6 +373,47 @@ private func prepareForResumeBatchReadiness(_ model: SessionModel) async -> Bool
     return true
 }
 
+/// Connects and completes a pre-project, six-frame preview (`.initial`)
+/// with six plain thumbnails, selecting nothing -- the cold-start state
+/// `frames.select` (CR-02) exists to escape: a preview has completed, but
+/// no project exists yet and `selectedFrameIndices` is still empty. Six
+/// frames (not one, like `prepareForRollSaveReadiness`) so an `indices`
+/// selection can be a meaningful strict subset, distinguishable from `all`,
+/// and an out-of-range index (7) is a real, reachable case.
+@MainActor
+private func prepareColdSixFramePreview(_ model: SessionModel) async -> Bool {
+    await model.connect(deviceId: projectRoutingDevice.deviceId)
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":6,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.initial(token: token)) == .started else { return false }
+    for frameIndex in 1...6 {
+        model.handle(event: EngineEvent(
+            name: "scanner.thumbnail",
+            rawLine: Data(
+                #"""
+                {"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":\#(frameIndex),"thumbnail":{"brightness":0.5,"tint":0.0}}}
+                """#.utf8
+            )
+        ))
+    }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":6}}
+            """#.utf8
+        )
+    ))
+    return model.project == nil
+}
+
 // WR-02: `wait*` helpers here are built on `withCheckedContinuation`, which
 // never resumes on its own -- a routing regression used to hang the suite
 // instead of failing fast. `.timeLimit` is Swift Testing's suite-level bound
@@ -453,6 +494,119 @@ struct ControlChannelProjectRoutingTests {
 
         let response = await dispatcher.handle(.framesExclude(id: 2, params: ControlFrameSelectionParams(frameIndex: 5)))
         expectFailure(response, id: 2, code: .invalidParams)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    // MARK: frames.select (CR-02)
+
+    @Test("frames.select with indices selects exactly that subset on a cold, pre-project preview")
+    @MainActor
+    func framesSelectIndicesSelectsSubset() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let ready = await prepareColdSixFramePreview(model)
+        #expect(ready)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams(indices: [2, 4])))
+        guard case .success = response else {
+            Issue.record("expected frames.select to succeed, got \(response)")
+            return
+        }
+        #expect(model.selectedFrames == [2, 4])
+        #expect(await stub.recordedMethods.isEmpty, "frames.select must never reach the engine")
+    }
+
+    @Test("frames.select --all selects every previewed frame on a cold, pre-project preview")
+    @MainActor
+    func framesSelectAllSelectsEveryPreviewedFrame() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let ready = await prepareColdSixFramePreview(model)
+        #expect(ready)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams(all: true)))
+        guard case .success = response else {
+            Issue.record("expected frames.select to succeed, got \(response)")
+            return
+        }
+        #expect(model.selectedFrames == [1, 2, 3, 4, 5, 6])
+    }
+
+    @Test("frames.select --none clears an existing selection")
+    @MainActor
+    func framesSelectNoneClearsSelection() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let ready = await prepareColdSixFramePreview(model)
+        #expect(ready)
+        model.setFrameSelection([1, 2, 3])
+        #expect(model.selectedFrames == [1, 2, 3])
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams(none: true)))
+        guard case .success = response else {
+            Issue.record("expected frames.select to succeed, got \(response)")
+            return
+        }
+        #expect(model.selectedFrames.isEmpty)
+    }
+
+    @Test("frames.select with none of indices/all/none present is refused with INVALID_PARAMS")
+    @MainActor
+    func framesSelectWithNoSelectorIsInvalid() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let ready = await prepareColdSixFramePreview(model)
+        #expect(ready)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams()))
+        expectFailure(response, id: 1, code: .invalidParams)
+        #expect(model.selectedFrames.isEmpty, "an invalid request must never mutate the selection")
+    }
+
+    @Test("frames.select with more than one of indices/all/none present is refused with INVALID_PARAMS")
+    @MainActor
+    func framesSelectWithMultipleSelectorsIsInvalid() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let ready = await prepareColdSixFramePreview(model)
+        #expect(ready)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams(all: true, none: true)))
+        expectFailure(response, id: 1, code: .invalidParams)
+    }
+
+    @Test("frames.select with an index outside the previewed frame range is refused with INVALID_PARAMS, mutating nothing")
+    @MainActor
+    func framesSelectOutOfRangeIndexIsInvalid() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let ready = await prepareColdSixFramePreview(model)
+        #expect(ready)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams(indices: [3, 7])))
+        expectFailure(response, id: 1, code: .invalidParams)
+        #expect(model.selectedFrames.isEmpty, "a partially-valid indices array must never be partially applied")
+    }
+
+    @Test("frames.select is refused with GATE_REFUSED (no gate) once a project already exists")
+    @MainActor
+    func framesSelectAfterProjectExistsIsGateRefused() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await model.openProject(directory: projectRoutingProjectDirectory)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams(all: true)))
+        expectFailure(response, id: 1, code: .gateRefused)
+        if case .failure(_, let error) = response {
+            #expect(error.gate == nil, "a project-already-exists refusal is an app-level precondition, not a physical gate")
+        }
         #expect(await stub.recordedMethods.isEmpty)
     }
 
