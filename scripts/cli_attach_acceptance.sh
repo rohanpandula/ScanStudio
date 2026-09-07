@@ -4,37 +4,38 @@
 #
 # What this proves: the real `scanstudio-cli` binary drives a real,
 # in-process host bound to the real `scanstudio-engine` binary end to end
-# against the simulator device `sim-ls5000-0`, over the real control
-# socket -- connect, status, preview, frame selection, settings/outputs,
-# save, stop, resume, scan, eject, diagnostics export, and events --follow,
-# plus the CONFIRMATION_REQUIRED and HOST_UNREACHABLE negative paths. This
-# is `ControlSocketEndToEndTests` (app/ScanStudio/Tests/ScanStudioKitTests/
-# ControlSocketEndToEndTests.swift), which that file documents in full.
+# against `sim-ls5000-0` over the real control socket -- connect, status,
+# preview, frame selection, settings/outputs, save, stop, resume, scan,
+# eject, diagnostics export, events --follow, plus the CONFIRMATION_REQUIRED
+# and HOST_UNREACHABLE negative paths. This is `ControlSocketEndToEndTests`
+# (app/ScanStudio/Tests/ScanStudioKitTests/ControlSocketEndToEndTests.swift).
 #
+# Order actually run vs. D-17c: D-17c's literal shape is "... -> save ->
+# scan --wait -> ...". This suite runs connect -> preview -> save (which
+# itself starts a job) -> stop -> frames list/exclude/include -> re-preview
+# -> resume --wait -> scan --wait -> eject -> diagnostics -> events, with
+# two required deviations from D-17c's literal order, both recorded in full
+# in that file's own header: frames list/exclude/include move to after
+# save (they need an open project, which a preview alone never creates),
+# and a re-preview is inserted between stop and resume (a stopped job
+# clears its own preview registration by design). Coverage, not order, is
+# the contract either way.
 # What this does NOT prove: no real hardware, no packaging, no signing, no
 # notarization, no GUI. `scripts/verify_mac_acceptance.py` and
-# `scripts/verify_updater.sh` cover other parts of the acceptance surface;
-# this script is the CLI-attach-mode gate specifically.
+# `scripts/verify_updater.sh` cover other parts of the acceptance surface.
 #
-# This script touches only its own $WORK temp directory and the two build
-# trees it owns (app/ScanStudio/engine/target, app/ScanStudio/.build). It
-# never touches a real scanner, `~/.scanstudio/`, or `~/ScanStudio Projects`
-# -- ControlSocketEndToEndTests.swift's own in-process host does that
-# isolation (a short /tmp socket, an overridden HOME for the real engine
-# subprocess it spawns).
+# Touches only its own $WORK temp directory and the two build trees it owns
+# (engine/target, .build). Never a real scanner, `~/.scanstudio/`, or
+# `~/ScanStudio Projects` -- the suite's own in-process host isolates that
+# (a short /tmp socket, an overridden HOME for the engine subprocess).
 #
 # Environment overrides:
 #   HOST_MODE   which host the suite drives its CLI subprocesses against.
-#               Defaults to "in-process", the only value Phase 2
-#               implements. Phase 3 adds "headless" (a host process with no
-#               GUI); Phase 4 adds "bundle" (the packaged, signed app).
-#               Passed through to the suite via the identically-named
-#               environment variable it reads
-#               (ControlSocketEndToEndTests.swift's own `EndToEndHost
-#               .start()`).
+#               Defaults to "in-process" (Phase 2's only value; Phase 3
+#               adds "headless", Phase 4 "bundle"). Read by the suite
+#               itself via the identically-named variable.
 #
-# Exit code is nonzero on any failure; a green run ends with
-#   VERIFY_CLI_ATTACH OK
+# Exit code is nonzero on any failure; a green run ends with VERIFY_CLI_ATTACH OK.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
