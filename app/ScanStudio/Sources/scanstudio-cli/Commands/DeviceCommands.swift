@@ -77,32 +77,19 @@ struct Status: AsyncParsableCommand {
 
     func run() async throws {
         let client = try await CommandRunner.openConnection(command: "status", options: options)
+        var reconnected = false
         if refresh {
-            let refreshResponse = try await CommandRunner.requestWithoutParams(
-                command: "status",
-                method: "scanner.refresh",
-                options: options,
-                client: client
-            )
-            // A refresh failure is rendered and exited on immediately --
-            // never swallowed, and never followed by a snapshot that would
-            // hide it. A success is discarded here; the snapshot below
-            // reports the now-current state, exactly as `--job` does after
-            // a plain `status`.
-            if case .failure = refreshResponse {
-                try await CommandRunner.finish(command: "status", options: options, client: client, response: refreshResponse)
-                return
-            }
+            reconnected = try await refreshOrReconnect(client: client)
         }
         guard let job else {
             let response = try await CommandRunner.requestWithoutParams(command: "status", method: "status", options: options, client: client)
-            try await CommandRunner.finish(command: "status", options: options, client: client, response: response)
+            try await finishStatus(client: client, response: response, reconnected: reconnected)
             return
         }
 
         let response = try await CommandRunner.requestWithoutParams(command: "status", method: "job.get", options: options, client: client)
         guard case .result(let data) = response else {
-            try await CommandRunner.finish(command: "status", options: options, client: client, response: response)
+            try await finishStatus(client: client, response: response, reconnected: reconnected)
             return
         }
 
@@ -125,6 +112,73 @@ struct Status: AsyncParsableCommand {
             try await CommandRunner.finish(command: "status", options: options, client: client, response: .failure(payload))
             return
         }
-        try await CommandRunner.finish(command: "status", options: options, client: client, response: response)
+        try await finishStatus(client: client, response: response, reconnected: reconnected)
+    }
+
+    /// D-16: the one permitted automatic reconnection in this whole tool.
+    /// Sends `scanner.refresh`; only when that answer is a `.failure` whose
+    /// `code` is `NOT_CONNECTED` does it send exactly one `scanner.connect`
+    /// (no explicit device -- `DeviceSelectionPolicy` resolves it, same as
+    /// a bare `connect`) followed by exactly one more `scanner.refresh`, on
+    /// the same connection. `reconnectAttempted` is a plain `Bool`, not a
+    /// counter: there is no loop and no second attempt at anything. A
+    /// failure at any step -- the first refresh with a code other than
+    /// `NOT_CONNECTED`, the reconnect's own `scanner.connect`, or the
+    /// second refresh -- is rendered and exited on immediately by
+    /// `CommandRunner.finish`, which always throws for a `.failure`
+    /// response; the `return false` after each such call is never reached.
+    private func refreshOrReconnect(client: ControlChannelClient) async throws -> Bool {
+        let firstRefresh = try await CommandRunner.requestWithoutParams(
+            command: "status", method: "scanner.refresh", options: options, client: client
+        )
+        guard case .failure(let payload) = firstRefresh else {
+            return false
+        }
+        guard payload.code == "NOT_CONNECTED" else {
+            try await CommandRunner.finish(command: "status", options: options, client: client, response: firstRefresh)
+            return false
+        }
+
+        let connectResponse = try await CommandRunner.request(
+            command: "status",
+            method: "scanner.connect",
+            params: ControlScannerConnectParams(),
+            options: options,
+            client: client
+        )
+        guard case .result = connectResponse else {
+            try await CommandRunner.finish(command: "status", options: options, client: client, response: connectResponse)
+            return false
+        }
+
+        let secondRefresh = try await CommandRunner.requestWithoutParams(
+            command: "status", method: "scanner.refresh", options: options, client: client
+        )
+        guard case .result = secondRefresh else {
+            try await CommandRunner.finish(command: "status", options: options, client: client, response: secondRefresh)
+            return false
+        }
+        return true
+    }
+
+    /// Renders `response`'s success exactly as `CommandRunner.finish`
+    /// always has, except that a `reconnected: true` key is merged into the
+    /// result object first when the one permitted automatic reconnection
+    /// above actually ran -- the same "merge one key into the object"
+    /// technique `renderFrameSelectionRefusal` (`FrameCommands.swift`) uses
+    /// for a refusal, applied here to a success so a script can see a
+    /// reconnection happened rather than inferring it from timing. A
+    /// `.failure` (or a call with `reconnected == false`) is untouched:
+    /// `reconnected` is never merged into an error body.
+    private func finishStatus(client: ControlChannelClient, response: ControlClientResponse, reconnected: Bool) async throws {
+        guard reconnected, case .result(let data) = response else {
+            try await CommandRunner.finish(command: "status", options: options, client: client, response: response)
+            return
+        }
+        var object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+        object["reconnected"] = true
+        let text = try ControlCLIOutput.renderResult(command: "status", resultJSON: object, human: options.human)
+        print(text, terminator: "")
+        await client.shutdown()
     }
 }

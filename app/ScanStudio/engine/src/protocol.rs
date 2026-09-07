@@ -281,6 +281,14 @@ pub struct ScannerStatus {
 pub struct ConnectResult {
     pub device: domain::DeviceInfo,
     pub status: ScannerStatus,
+    /// D-16: `true` only when `Backends::connect` short-circuited a
+    /// same-device reconnect without calling either backend's own
+    /// `connect` -- device/status are then read from the already-active
+    /// backend's own `device_info()`/`status()`, never re-derived from a
+    /// fresh bridge round trip. `#[serde(default)]` so an older engine's
+    /// wire payload (which never sent this key) still decodes as `false`.
+    #[serde(default)]
+    pub already_connected: bool,
 }
 
 // ---------------------------------------------------------------------

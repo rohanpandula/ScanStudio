@@ -67,7 +67,7 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | `scan.stop` | `{jobId: string}` | `{acknowledged: bool}` | `UNKNOWN_JOB` |
 | `device.eject` | `{}` | `{}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED` |
 
-`device.list` always reflects a fresh device enumeration (no caching). `device.open` emits a `device.status` event on success, same as `device.close`. `device.status` returns the bridge's current session state; it never triggers hardware I/O.
+`device.list` always reflects a fresh device enumeration (no caching). `device.open` emits a `device.status` event on success, same as `device.close`. **`device.status` performs one motion-free liveness inquiry** (D-16) — CoolScanPy's own `film_present()` query, the same call this method has always made to populate `filmPresent`, not a new SCSI command. A `DeviceBusy` failure of that inquiry keeps `connected: true` (`filmPresent: null` — the device is still there, just momentarily unable to answer). Any other failure is classified as a lost session and reported as `connected: false`, `previewEstablished: false`, `slotCount: null`, `filmPresent: null` — the driver defines no session-lost exception type of its own, so this boundary is where the distinction is made.
 
 ### `bridge.hello`
 
@@ -392,7 +392,7 @@ CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanRece
 
 ## Events
 
-- `device.status` `{status: DeviceStatus}` — on any connection/session state change.
+- `device.status` `{status: DeviceStatus}` — on any connection/session state change, including `status.connected: false` when a `device.status` request's own motion-free liveness inquiry discovers the session was lost (D-16).
 - `roll.thumbnail` `{slot: number, thumbnail: Thumbnail}` — one per detected slot during `roll.preview`.
 - `roll.previewComplete` `{count: number, fingerprint: string}` — terminates a `roll.preview` sequence; `fingerprint` is the roll's bound identity, later compared against a fresh read at scan time (`FINGERPRINT_REFUSED` on mismatch).
 - `scan.progress` `{jobId: string, slot: number, ordinal: number, totalSlots: number, fraction: number, message: string}` — periodic, while a slot is actively transferring.

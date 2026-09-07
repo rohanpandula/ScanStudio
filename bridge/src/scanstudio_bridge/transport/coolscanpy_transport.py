@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -25,6 +26,7 @@ from typing import Callable, Iterator
 import coolscanpy
 import numpy as np
 import tifffile
+from coolscanpy.exceptions import DeviceBusy
 
 # `Roll.preview()`'s public taxonomy (coolscanpy.FeederParked and its
 # siblings, exported at the package's top level) is not the whole story --
@@ -791,16 +793,38 @@ class CoolscanPyTransport:
         if self._device is None:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
         # The bundled CoolScanPy supplies a motion-free tri-state
-        # `film_present()` query. Keep the defensive getattr/callable and
-        # fail-soft exception boundary so an older dependency, an active
-        # capture's DeviceBusy, or a misbehaving probe reports unknown rather
-        # than raising from status() or fabricating a true/false reading.
+        # `film_present()` query -- D-16 reuses this exact call as its own
+        # liveness inquiry; no new SCSI command, no new transport traversal.
+        # `DeviceBusy` (coolscanpy/src/coolscanpy/exceptions.py -- the
+        # driver's only "still connected but can't answer right now" case;
+        # it defines no session-lost type at all) keeps today's behaviour
+        # exactly: film_present unknown, connected=True below. Any other
+        # exception means the session itself is gone, classified here at
+        # this boundary since the driver draws no such distinction itself --
+        # matched on exception type, never a message string.
         film_present_attr = getattr(self._device, "film_present", None)
         if callable(film_present_attr):
             try:
                 film_present = film_present_attr()
-            except Exception:
+            except DeviceBusy:
                 film_present = None
+            except Exception as exc:
+                print(
+                    f"scanstudio-bridge: coolscanpy transport: motion-free liveness "
+                    f"inquiry failed ({type(exc).__name__}); reporting session lost",
+                    file=sys.stderr,
+                )
+                return domain.DeviceStatus(
+                    connected=False,
+                    device_id=self._device_id,
+                    preview_established=False,
+                    slot_count=None,
+                    active_job_id=None,
+                    lane_held=False,
+                    motion_armed=False,
+                    film_present=None,
+                    adapter=None,
+                )
         else:
             film_present = None
         # A completed preview records coordinates from an earlier traversal;

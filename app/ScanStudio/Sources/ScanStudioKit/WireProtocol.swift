@@ -384,6 +384,35 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
 public struct ConnectResult: Decodable, Sendable {
     public let device: DeviceInfo
     public let status: ScannerStatus
+    /// D-16: `true` only when the engine's same-device short circuit
+    /// answered a re-issued connect without calling either backend's own
+    /// `connect` -- device/status are then read from the already-active
+    /// backend, never a fresh bridge round trip. A custom `init(from:)`
+    /// defaults this to `false` so an older engine's payload (which never
+    /// sent this key) still decodes.
+    public let alreadyConnected: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case device, status, alreadyConnected
+    }
+
+    /// A default of `false` (not a second, forced-unwrap-avoiding branch)
+    /// keeps every existing two-argument `ConnectResult(device:status:)`
+    /// call site in this test suite compiling unchanged -- adding
+    /// `init(from:)` below suppresses Swift's synthesized memberwise init,
+    /// so this explicit one takes its place.
+    public init(device: DeviceInfo, status: ScannerStatus, alreadyConnected: Bool = false) {
+        self.device = device
+        self.status = status
+        self.alreadyConnected = alreadyConnected
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        device = try container.decode(DeviceInfo.self, forKey: .device)
+        status = try container.decode(ScannerStatus.self, forKey: .status)
+        alreadyConnected = try container.decodeIfPresent(Bool.self, forKey: .alreadyConnected) ?? false
+    }
 }
 
 // MARK: - sim.loadMedia

@@ -561,6 +561,19 @@ public final class SessionModel {
     }
 
     public private(set) var device: DeviceInfo?
+    /// D-16: the last device id a successful `connect(deviceId:)` resolved
+    /// to, kept even after `disconnect()`/`invalidateConnection` clear
+    /// `device`/`status` -- its whole purpose is to survive a lost session
+    /// so `status --refresh`'s one permitted automatic reconnection knows
+    /// where to go. Never cleared by this model; only ever overwritten by
+    /// a later successful connect.
+    public private(set) var lastConnectedDeviceId: String?
+    /// D-16: `true` only for the connect that just completed, when the
+    /// engine reported `alreadyConnected: true` (a same-device reconnect
+    /// that reached no backend). Cleared at the top of every
+    /// `connect(deviceId:)` call so a stale `true` never survives past the
+    /// connect it described.
+    public private(set) var lastConnectAlreadyConnected = false
     /// The full device list from the engine's last `scanner.list` response
     /// (simulator plus, when a bridge is configured, the real LS-5000) —
     /// what `SessionSidebarView`'s device picker renders. Refreshed once
@@ -1479,6 +1492,10 @@ public final class SessionModel {
         let previous = beginMutatingOperation("scanner.connect")
         defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
+        // D-16: cleared at the top of every connect so a stale `true` from
+        // a previous, unrelated connect never survives past the call it
+        // described -- only this call's own outcome may set it again.
+        lastConnectAlreadyConnected = false
         do {
             let targetDeviceId: String
             if let deviceId {
@@ -1528,6 +1545,10 @@ public final class SessionModel {
             device = result.device
             status = result.status
             refeedRequired = false
+            // D-16: survives disconnect/invalidateConnection by design --
+            // see the property's own doc comment.
+            lastConnectedDeviceId = targetDeviceId
+            lastConnectAlreadyConnected = result.alreadyConnected
             engineVersion = await engineClient.engineVersion
             coerceMultisamplePassesForConnectedDevice()
             recordDiagnostic(

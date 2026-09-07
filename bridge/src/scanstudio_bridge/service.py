@@ -388,6 +388,14 @@ class BridgeService:
                 preview_established=False,
                 slot_count=None,
             )
+        if not status.connected:
+            # D-16: the transport's own motion-free liveness inquiry
+            # already classified this session as lost (see
+            # CoolscanPyTransport.status()). A lost session is a stronger
+            # reason to retire preview material than a mere film-absence
+            # reading -- there is no device left to trust any cached
+            # registration against.
+            self._preview_material = None
         return dataclasses.replace(
             status,
             active_job_id=(

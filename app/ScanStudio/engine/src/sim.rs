@@ -679,6 +679,7 @@ impl ScannerBackend for SimulatedLs5000 {
         Ok(ConnectResult {
             device: self.device.clone(),
             status,
+            already_connected: false,
         })
     }
 

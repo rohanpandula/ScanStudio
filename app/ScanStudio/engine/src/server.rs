@@ -285,6 +285,16 @@ impl Backends {
     /// backend without an intervening `scanner.disconnect` (T-09-12) —
     /// closing the state-confusion risk of one engine session appearing
     /// simultaneously "connected" to both sim and real.
+    ///
+    /// D-16: a same-device reconnect is idempotent. It returns the current
+    /// `device_info()`/`status()` from the already-active backend with
+    /// `already_connected: true`, **without calling either backend's own
+    /// `connect`** -- the safety property this exists for: a re-issued
+    /// connect performs no bridge round trip, so it can never re-arm,
+    /// re-open, or move anything, and no `ConnectOptions` (including
+    /// `faultInjection`/`timeScale`) is ever re-applied to an
+    /// already-open session. A *different* device id while one is active
+    /// still refuses `AlreadyConnected`, unchanged from before this plan.
     fn connect(
         &mut self,
         device_id: &str,
@@ -301,6 +311,16 @@ impl Backends {
                     "another device is already connected; disconnect first",
                 ));
             }
+            let device = match active {
+                ActiveDevice::Sim => self.sim.device_info(),
+                ActiveDevice::Real => self.real.as_ref().unwrap().device_info(),
+            };
+            let status = self.status()?;
+            return Ok(protocol::ConnectResult {
+                device,
+                status,
+                already_connected: true,
+            });
         }
 
         if device_id == self.sim.device_info().device_id {
@@ -2193,6 +2213,60 @@ mod tests {
             .rescan(None)
             .expect_err("rescan must refuse while connected");
         assert_eq!(error.code, ErrorCode::AlreadyConnected);
+    }
+
+    #[test]
+    fn connect_to_the_already_connected_device_is_idempotent_and_reaches_no_backend() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let device_id = backends.sim.device_info().device_id.clone();
+        let options = protocol::ConnectOptions::default();
+
+        let first = backends
+            .connect(&device_id, &options)
+            .expect("first connect");
+        assert!(!first.already_connected);
+        assert_eq!(backends.active, Some(ActiveDevice::Sim));
+
+        // D-16: a second connect to the same, already-active device
+        // succeeds with `already_connected: true` and leaves `active`
+        // unchanged -- it must not fall through to `sim.connect`, which
+        // would otherwise refuse with `AlreadyConnected` (sim.rs's own
+        // `double_connect_is_rejected` test proves that refusal is still
+        // reachable when `sim.connect` is called directly).
+        let second = backends
+            .connect(&device_id, &options)
+            .expect("re-issued connect to the same device must succeed");
+        assert!(second.already_connected);
+        assert_eq!(backends.active, Some(ActiveDevice::Sim));
+        assert_eq!(second.device, first.device);
+    }
+
+    #[test]
+    fn connect_to_a_different_device_while_connected_still_refuses_already_connected() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let device_id = backends.sim.device_info().device_id.clone();
+        let options = protocol::ConnectOptions::default();
+        backends
+            .connect(&device_id, &options)
+            .expect("first connect");
+
+        let error = backends
+            .connect("not-the-connected-device", &options)
+            .expect_err("a different device id must still be refused while one is active");
+        assert_eq!(error.code, ErrorCode::AlreadyConnected);
+        assert_eq!(backends.active, Some(ActiveDevice::Sim));
     }
 
     #[test]

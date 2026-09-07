@@ -25,17 +25,25 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
     private let holdStatusResponse: Bool
     private var statusMediaLoadedResponses: [Bool]
     private var statusFilmPresentResponses: [Bool?]
+    /// D-16: lets a test drive `refreshScannerStatus()` into the honest
+    /// lost-session branch (`invalidateConnection`) by answering
+    /// `scanner.status` with `connected: false`. Defaults to always `true`
+    /// so every pre-existing test in this file (none of which sets this
+    /// parameter) is unaffected.
+    private var statusConnectedResponses: [Bool]
     private var statusContinuation: CheckedContinuation<Void, Never>?
     private var statusWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         holdStatusResponse: Bool = false,
         statusMediaLoadedResponses: [Bool] = [false],
-        statusFilmPresentResponses: [Bool?] = [true]
+        statusFilmPresentResponses: [Bool?] = [true],
+        statusConnectedResponses: [Bool] = [true]
     ) {
         self.holdStatusResponse = holdStatusResponse
         self.statusMediaLoadedResponses = statusMediaLoadedResponses
         self.statusFilmPresentResponses = statusFilmPresentResponses
+        self.statusConnectedResponses = statusConnectedResponses
     }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
@@ -67,7 +75,11 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
             let filmPresent: Bool? = statusFilmPresentResponses.isEmpty
                 ? true
                 : statusFilmPresentResponses.removeFirst()
+            let connected = statusConnectedResponses.isEmpty
+                ? true
+                : statusConnectedResponses.removeFirst()
             value = status(
+                connected: connected,
                 motionArmed: true,
                 mediaLoaded: mediaLoaded,
                 filmPresent: filmPresent
@@ -114,12 +126,13 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
     }
 
     private func status(
+        connected: Bool = true,
         motionArmed: Bool,
         mediaLoaded: Bool = false,
         filmPresent: Bool? = true
     ) -> ScannerStatus {
         ScannerStatus(
-            connected: true,
+            connected: connected,
             adapter: "SA-30",
             mediaLoaded: mediaLoaded,
             carrier: mediaLoaded ? "strip" : nil,
@@ -381,5 +394,30 @@ struct ScannerStatusRefreshTests {
         #expect(model.status?.filmPresent == nil)
         #expect(model.thumbnails[1] != nil)
         #expect(model.selectedFrameIndices == [1])
+    }
+
+    @Test("a connected: false status refresh clears the session via the existing invalidateConnection path, and lastConnectedDeviceId survives it")
+    @MainActor
+    func sessionLossRefreshInvalidatesConnectionButKeepsLastConnectedDeviceId() async {
+        // D-16: a lost scanner session is reported, not polled for. This
+        // proves the D-16 mechanism relies on behaviour that already
+        // shipped in Phase 1 -- `refreshScannerStatus()`'s own
+        // `connected == false` branch -- and that the new
+        // `lastConnectedDeviceId` property is deliberately NOT cleared by
+        // that same path, so a later reconnect (the CLI's one permitted
+        // automatic reconnection) knows where to go.
+        let client = ScannerStatusRefreshEngineStub(statusConnectedResponses: [false])
+        let model = SessionModel(engineClient: client)
+        await model.connect(deviceId: "real-ls5000-status-test")
+        #expect(model.device != nil)
+        #expect(model.status?.connected == true)
+        #expect(model.lastConnectedDeviceId == "real-ls5000-status-test")
+        #expect(model.lastConnectAlreadyConnected == false)
+
+        await model.refreshScannerStatus()
+
+        #expect(model.device == nil)
+        #expect(model.status == nil)
+        #expect(model.lastConnectedDeviceId == "real-ls5000-status-test")
     }
 }

@@ -503,6 +503,61 @@ def test_no_film_status_retires_service_preview_gate(
     assert excinfo.value.code == ErrorCode.NO_PREVIEW
 
 
+def test_device_status_reports_session_lost_and_retires_service_preview_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-16: a transport-reported lost session (`connected: false`, from
+    `CoolscanPyTransport.status()`'s own liveness-inquiry classification)
+    must retire cached preview material exactly as a fresh no-film verdict
+    does above -- there is no device left to trust any cached registration
+    against, and `scan.start` must be refused `NO_PREVIEW` rather than
+    reusing coordinates from a session that no longer exists."""
+
+    class _SessionLostAfterPreviewTransport(_StubTransport):
+        def status(self) -> domain.DeviceStatus:
+            return domain.DeviceStatus(
+                connected=False,
+                device_id=None,
+                preview_established=False,
+                slot_count=None,
+                active_job_id=None,
+                lane_held=False,
+                motion_armed=False,
+                film_present=None,
+            )
+
+    transport = _SessionLostAfterPreviewTransport(preview_thumbnails=1)
+    svc = _opened_service(tmp_path, transport)
+    _arm(monkeypatch, tmp_path)
+    emit = _RecordingEmit()
+    svc.dispatch(
+        {"id": 2, "method": "roll.preview", "params": {"material": "colorNegative"}}, emit
+    )
+    _wait_for_preview_complete_and_lane_free(svc, emit)
+
+    status = svc.dispatch({"id": 3, "method": "device.status"}, emit)
+    assert status["connected"] is False
+
+    with pytest.raises(BridgeError) as excinfo:
+        svc.dispatch(
+            {
+                "id": 4,
+                "method": "scan.start",
+                "params": {
+                    "slots": [1],
+                    "recipe": _wire_recipe(),
+                    "output": {
+                        "destination": str(tmp_path / "out"),
+                        "filenameTemplate": "frame-####.tif",
+                    },
+                },
+            },
+            emit,
+        )
+    assert excinfo.value.code == ErrorCode.NO_PREVIEW
+
+
 def test_device_close_emits_connected_false_status(tmp_path: Path) -> None:
     svc = _opened_service(tmp_path)
     emit = _RecordingEmit()

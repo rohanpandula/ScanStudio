@@ -167,6 +167,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case outputs(ControlOutputsResult)
     case scannerList(ControlScannerListResult)
     case scannerRefresh(ControlScannerRefreshResult)
+    case scannerConnect(ControlScannerConnectResult)
     case rollList(ControlRollListResult)
     case rollSave(ControlRollSaveResult)
     case previewAcquire(ControlPreviewAcquireResult)
@@ -185,6 +186,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .outputs(let value): try container.encode(value)
         case .scannerList(let value): try container.encode(value)
         case .scannerRefresh(let value): try container.encode(value)
+        case .scannerConnect(let value): try container.encode(value)
         case .rollList(let value): try container.encode(value)
         case .rollSave(let value): try container.encode(value)
         case .previewAcquire(let value): try container.encode(value)
@@ -486,7 +488,17 @@ public final class ControlChannelDispatcher {
             // GUI's own no-argument connect.
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.connect(deviceId: params.deviceId)
-            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+            switch outcome(id: id, errorMessageBefore: errorMessageBefore) {
+            case .success:
+                // D-16: `alreadyConnected` reflects this exact connect's
+                // own outcome (`SessionModel.connect` clears it at the top
+                // of every call), never a stale value from an earlier one.
+                return .success(id: id, result: .scannerConnect(
+                    ControlScannerConnectResult(alreadyConnected: sessionModel.lastConnectAlreadyConnected)
+                ))
+            case .failure(let failureId, let error):
+                return .failure(id: failureId, error: error)
+            }
         case .scannerDisconnect(let id):
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.disconnect()

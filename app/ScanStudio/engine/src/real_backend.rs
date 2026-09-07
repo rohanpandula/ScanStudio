@@ -3948,6 +3948,7 @@ impl ScannerBackend for RealLs5000 {
         Ok(ConnectResult {
             device: self.device_info(),
             status: map_status(&result.status, self.detected_holder()),
+            already_connected: false,
         })
     }
 

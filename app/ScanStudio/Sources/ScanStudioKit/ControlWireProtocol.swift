@@ -651,6 +651,19 @@ public struct ControlScannerRefreshResult: Codable, Equatable, Sendable {
     }
 }
 
+/// `scanner.connect`'s CLI-visible idempotency signal (D-16). `true` only
+/// when the engine's same-device short circuit answered without calling
+/// either backend's own `connect` -- mirrors `SessionModel
+/// .lastConnectAlreadyConnected`, itself sourced from `WireProtocol.swift`'s
+/// `ConnectResult.alreadyConnected`.
+public struct ControlScannerConnectResult: Codable, Equatable, Sendable {
+    public let alreadyConnected: Bool
+
+    public init(alreadyConnected: Bool) {
+        self.alreadyConnected = alreadyConnected
+    }
+}
+
 public struct ControlRollListResult: Codable, Equatable, Sendable {
     public let projects: [ControlProjectSummary]
 

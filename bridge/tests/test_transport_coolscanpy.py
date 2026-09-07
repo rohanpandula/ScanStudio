@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 import tifffile
 
+from coolscanpy.exceptions import DeviceBusy
 from coolscanpy.protocol.ls5000_single_pass import roll_index as _roll_index_module
 from coolscanpy.protocol.ls5000_single_pass.density import (
     DensityCalibration,
@@ -721,17 +722,62 @@ def test_status_forwards_coolscanpy_film_present_tristate(
     assert transport.status().film_present is verdict
 
 
-def test_status_degrades_a_film_present_probe_failure_to_unknown(
+def test_status_degrades_a_device_busy_film_present_probe_to_unknown_while_staying_connected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # D-16: `DeviceBusy` (the driver's only "still connected but can't
+    # answer right now" case) keeps today's behaviour exactly -- unknown
+    # film presence, connected stays true. Previously this test raised a
+    # bare `RuntimeError`, which -- before this plan -- was indistinguishable
+    # from `DeviceBusy` at this boundary; now that the two are classified
+    # differently (below), this test is retargeted at the one exception type
+    # its own name/docstring actually describes.
     transport, device = _opened_transport(monkeypatch, _FakeRoll())
 
     def fail() -> bool:
-        raise RuntimeError("USB claim conflict")
+        raise DeviceBusy("USB claim conflict")
 
     device.film_present = fail  # type: ignore[attr-defined]
 
-    assert transport.status().film_present is None
+    status = transport.status()
+    assert status.film_present is None
+    assert status.connected is True
+
+
+def test_status_reports_session_lost_when_film_present_probe_raises_a_non_busy_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D-16: coolscanpy defines no session-lost exception type of its own
+    # (DeviceBusy is the only "still connected" failure) -- any other
+    # exception from this motion-free liveness inquiry is classified here,
+    # at the bridge boundary, as a lost session rather than an unknown film
+    # reading. A generic OSError (matching the plan's own example) proves
+    # the classification is by exception type, never a message string.
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+
+    def fail() -> bool:
+        raise OSError("device vanished from the USB bus")
+
+    device.film_present = fail  # type: ignore[attr-defined]
+
+    status = transport.status()
+    assert status.connected is False
+    assert status.preview_established is False
+    assert status.slot_count is None
+    assert status.film_present is None
+
+
+def test_status_reports_connected_true_for_a_healthy_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The unchanged path: no exception at all is still connected=True,
+    # exactly as every pre-D-16 status() call was.
+    transport, device = _opened_transport(monkeypatch, _FakeRoll())
+    device.film_present = lambda: True  # type: ignore[attr-defined]
+
+    status = transport.status()
+    assert status.connected is True
+    assert status.film_present is True
 
 
 def test_status_invalidates_preview_when_fresh_probe_reports_no_film(

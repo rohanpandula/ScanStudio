@@ -50,7 +50,7 @@ current list unchanged. A failed re-attempt returns the same recoverable
 (rescan never replaces a connected session's backend).
 
 ### `scanner.connect`
-`{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo"}}` → `{device: DeviceInfo, status: ScannerStatus}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED`.
+`{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo"}}` → `{device: DeviceInfo, status: ScannerStatus, alreadyConnected: boolean}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. **D-16:** re-connecting the device that is already connected is a success, reports `alreadyConnected: true`, and reaches no backend (no `sim.connect`/`real.connect` call, so no `ConnectOptions` is ever re-applied to the already-open session); a fresh connect reports `alreadyConnected: false`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED` (a *different* device while one is already connected).
 
 ### `scanner.disconnect`
 `{}` → `{}` and emits `scanner.status` with `connected: false`. Errors: `NOT_CONNECTED`, `SCANNER_BUSY` (transport operation active).
