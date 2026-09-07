@@ -1129,6 +1129,48 @@ public final class SessionModel {
         )
     }
 
+    /// Applies both settings recipes at once -- the D-04 fallback entry
+    /// point `settings.set` routes to; no single `SessionModel` setter
+    /// existed for these ten plain properties before this method existed.
+    ///
+    /// A get-then-set round trip through this method is **not** the
+    /// identity for every field: `processingRecipe`'s getter above reports
+    /// `digitalIceEnabled` gated on `scanChannels == "rgbi" &&
+    /// scanFilmProcess != .bwNegative`, and `softwareDustRemovalBw` gated on
+    /// `scanFilmProcess == .bwNegative`. This method writes the raw stored
+    /// intent the caller asked for; the getter continues to report the
+    /// effective value given whatever channels/process are current when it
+    /// is next read. That asymmetry is this class's existing behaviour,
+    /// unchanged by this plan -- it is documented here, not "fixed."
+    public func applySettingsRecipes(capture: CaptureRecipe, processing: ProcessingRecipe) {
+        scanResolutionDpi = capture.resolutionDpi
+        scanBitDepth = capture.bitDepth
+        scanMultisamplePasses = capture.multisamplePasses
+        scanChannels = capture.channels
+        scanFilmProcess = processing.filmProcess
+        autofocusEachFrame = processing.autofocusEachFrame
+        autoExposureEachFrame = processing.autoExposureEachFrame
+        digitalIceEnabled = processing.digitalIceEnabled
+        digitalIceMode = processing.digitalIceMode
+        softwareDustRemovalBw = processing.softwareDustRemovalBw
+    }
+
+    /// Applies a full output recipe via the exact path the GUI already
+    /// takes when opening a project (`openProject(directory:)` calls the
+    /// private `applyRecipes(_:)` below). This is the D-04 fallback entry
+    /// point `outputs.set` routes to -- it delegates rather than
+    /// duplicating `applyRecipes`'s ~30 assignments, so `outputs.set` can
+    /// never drift from what "open a project" already does.
+    ///
+    /// `applyRecipes` deliberately resets the per-session organization
+    /// fields (`saveLocation`, `saveEachOutputInOwnFolder`, and the four
+    /// folder-name fields) before applying the recipe. That is existing
+    /// behaviour a control caller inherits here, not a new side effect this
+    /// method introduces.
+    public func applyOutputRecipe(_ recipe: OutputRecipe) {
+        applyRecipes(recipe)
+    }
+
     public var scanRecipePreset: ScanRecipePreset {
         let values = ScanRecipeValues(
             resolutionDpi: scanResolutionDpi,
