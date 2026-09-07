@@ -42,6 +42,59 @@ private let motionRoutingRealDevice = DeviceInfo(
     supported: true, supportedMultisamplePasses: [4]
 )
 
+/// The directory a `scan.resume`-with-no-pending-frames test opens instead
+/// of `motionRoutingProjectDirectory` -- routes the stub's `project.open`
+/// case to `motionRoutingProject(includeFrames: false)` below.
+private let motionRoutingProjectDirectory = "/tmp/motion-routing-test"
+private let motionRoutingEmptyProjectDirectory = "/tmp/motion-routing-test-no-frames"
+
+/// A minimal project fixture (Task 3) whose one frame has no draft
+/// alignment or rotation, so `startMockScan()`'s
+/// `persistFrameGeometryBeforeScan` step is a no-op and never issues an
+/// unscripted `project.setFrameAlignment` request -- confirmed by reading
+/// `desiredFrameGeometry(for:persistedFrame:)` and mirroring
+/// `ControlChannelDispatcherTests.swift`'s own `controlDispatcherProject()`.
+/// `includeFrames: false` keeps `frameCount: 1` (so `projectMediaMismatch`
+/// still matches the previewed carrier/frame count) but declares zero
+/// `ProjectFrame` entries, so `restoreProjectProgress` -- called
+/// synchronously from `openProject` -- computes `pendingFrames == []`
+/// immediately, exactly the input a `scan.resume` "nothing pending" test
+/// needs; `selectedFrames`-driven tests are unaffected since they never
+/// read `pendingFrames`.
+private func motionRoutingProject(frameIndex: Int = 1, includeFrames: Bool = true) -> ScanProject {
+    ScanProject(
+        schemaVersion: 1,
+        id: "motion-routing-project",
+        name: "Motion routing test",
+        carrier: .mounted,
+        frameCount: 1,
+        filmProcess: .c41ColorNegative,
+        recipes: OutputRecipe(
+            archive: ArchiveRecipe(
+                filenameTemplate: "Archive_####",
+                destination: "/tmp/motion-routing/archive"
+            ),
+            positive: PositiveRecipe(
+                enabled: true,
+                fileFormat: .tiff,
+                colorProfile: .adobeRgb1998,
+                filenameTemplate: "Positive_####",
+                destination: "/tmp/motion-routing/positive"
+            ),
+            preview: PreviewRecipe(
+                enabled: true,
+                fileFormat: .jpeg,
+                maxLongEdgePx: 1_024,
+                filenameTemplate: "Preview_####",
+                destination: "/tmp/motion-routing/preview"
+            )
+        ),
+        rollMetadata: MetadataSet(),
+        createdAt: "2026-09-07T00:00:00Z",
+        frames: includeFrames ? [ProjectFrame(index: frameIndex, excluded: false, receipts: [])] : []
+    )
+}
+
 /// Fake engine modelled on `ConnectionLifecycleEngineStub`
 /// (`DeviceConnectionLifecycleTests.swift`) and `ControlDispatcherEngineStub`
 /// (`ControlChannelDispatcherTests.swift`). Rather than one dedicated
@@ -63,6 +116,11 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
     /// state side effect.
     private(set) var recordedMethods: [String] = []
     private(set) var requestCounts: [String: Int] = [:]
+    /// The `mode` argument of every `scan.stop` request, in order -- the
+    /// only way to tell `stopAfterCurrentFrame()` and `stopImmediately()`
+    /// apart from this stub's point of view, since both call the identical
+    /// `"scan.stop"` engine method (Task 3).
+    private(set) var recordedScanStopModes: [String] = []
 
     private var heldMethods: Set<String> = []
     private var openGates: Set<String> = []
@@ -75,6 +133,7 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
     func clearLog() {
         recordedMethods.removeAll()
         requestCounts.removeAll()
+        recordedScanStopModes.removeAll()
     }
 
     /// Gates every subsequent request for `method` until `release(_:)` is
@@ -127,6 +186,21 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
             return try cast(EmptyResult(), as: Result.self)
         case "scanner.acquireThumbnails":
             return try cast(AcquireThumbnailsAck(accepted: true, frames: []), as: Result.self)
+        case "project.open":
+            let requestedDirectory = (params as? ProjectOpenParams)?.directory ?? motionRoutingProjectDirectory
+            let openedProject = requestedDirectory == motionRoutingEmptyProjectDirectory
+                ? motionRoutingProject(includeFrames: false)
+                : motionRoutingProject()
+            return try cast(
+                ProjectOpenResult(project: openedProject, directory: requestedDirectory),
+                as: Result.self
+            )
+        case "scan.start":
+            return try cast(ScanStartResult(jobId: "motion-routing-job"), as: Result.self)
+        case "scan.stop":
+            let stopMode = (params as? ScanStopParams)?.mode ?? "afterCurrentFrame"
+            recordedScanStopModes.append(stopMode)
+            return try cast(ScanStopResult(acknowledged: true, mode: stopMode), as: Result.self)
         default:
             throw MotionRoutingStubError.unexpectedMethod(method)
         }
@@ -189,6 +263,70 @@ private func expectFailure(_ response: ControlResponse, id expectedId: UInt64, c
     }
     #expect(id == expectedId)
     #expect(error.code == expectedCode.rawValue)
+}
+
+/// Mirrors `DeviceConnectionLifecycleTests.swift`'s
+/// `prepareConnectionLifecycleScanReadiness` and
+/// `ControlChannelDispatcherTests.swift`'s `driveModelToPendingManualReview`
+/// (Task 3): connects, opens a project, fakes a media-loaded status,
+/// completes a preview with a plain (not `needsApproval`) thumbnail, and
+/// selects frame 1 -- reaching `scanReadiness(for: [1]).isReady == true`
+/// without ever pausing on manual review. The `connect(deviceId:)` call is
+/// required, not cosmetic: `dispatchScanStart`'s own
+/// `scanStartRequestIsCurrent` guard additionally checks
+/// `diagnosticUIConnected` (`device != nil && status?.connected == true`),
+/// and only `connect(deviceId:)` sets `device` -- a synthetic
+/// `scanner.status` event alone sets `status` but never `device`, so
+/// without this call `dispatchScanStart` would silently return `nil`
+/// (RESEARCH Pitfall 1) rather than ever reaching `scan.start`. Passing
+/// `motionRoutingEmptyProjectDirectory` opens a project with zero
+/// `ProjectFrame` entries, so `pendingFrames` (set synchronously by
+/// `openProject`'s own `restoreProjectProgress`) is `[]` -- what a
+/// `scan.resume` "nothing pending" test needs; `selectedFrames`-driven
+/// tests are unaffected since they never read `pendingFrames`.
+@MainActor
+private func prepareMotionRoutingScanReadiness(
+    _ model: SessionModel, directory: String = motionRoutingProjectDirectory
+) async -> Bool {
+    await model.connect(deviceId: motionRoutingDevice.deviceId)
+    await model.openProject(directory: directory)
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.refreshSavedProject(token: token)) == .started else { return false }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnail",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":1,"thumbnail":{"brightness":0.5,"tint":0.0}}}
+            """#.utf8
+        )
+    ))
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":1}}
+            """#.utf8
+        )
+    ))
+    guard directory != motionRoutingEmptyProjectDirectory else {
+        // This project declares no frames at all, so frame 1 is not a
+        // structurally valid target (`validFrameIndices` is empty) --
+        // `scanReadiness(for: [1])` would read `.targetRequired` for the
+        // wrong reason. The caller only needs the connected/previewed
+        // preconditions established above, with `pendingFrames` left at
+        // its structural `[]`; the preview having started is proof enough.
+        return true
+    }
+    model.toggleFrameSelection(1)
+    return model.scanReadiness(for: [1]).isReady
 }
 
 /// Connects to the fake "real" device fixture, then injects a synthetic
@@ -487,5 +625,155 @@ struct ControlChannelMotionRoutingTests {
             return
         }
         #expect(await stub.recordedMethods == ["scanner.eject"])
+    }
+
+    // MARK: scan.start (Task 3)
+
+    @Test("scan.start without motionConfirmed is refused with CONFIRMATION_REQUIRED before any engine call")
+    @MainActor
+    func scanStartWithoutConfirmationIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.scanStart(id: 1, params: ControlScanStartParams(motionConfirmed: nil)))
+        expectFailure(response, id: 1, code: .confirmationRequired)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scan.start with confirmation on a not-scan-ready model is refused with GATE_REFUSED naming the readiness reason")
+    @MainActor
+    func scanStartNotReadyIsRefused() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let decision = model.scanReadiness(for: model.selectedFrames)
+        #expect(!decision.isReady)
+
+        let response = await dispatcher.handle(.scanStart(id: 2, params: ControlScanStartParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 2)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(error.gate == ControlGate.scanReadiness.rawValue)
+        #expect(error.guidance == decision.reason)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scan.start routes to startMockScan(), reaches scan.start, and refuses a concurrent second request")
+    @MainActor
+    func scanStartRoutesAndRefusesConcurrentSecondRequest() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        #expect(await prepareMotionRoutingScanReadiness(model))
+        await stub.clearLog()
+        await stub.hold("scan.start")
+
+        let first = Task { @MainActor in
+            await dispatcher.handle(.scanStart(id: 3, params: ControlScanStartParams(motionConfirmed: true)))
+        }
+        await stub.waitForRequestCount("scan.start", 1)
+        #expect(model.mutatingOperationInFlight == "scan.start")
+        #expect(await stub.recordedMethods == ["scan.start"])
+
+        let busyResponse = await dispatcher.handle(.scanStart(id: 4, params: ControlScanStartParams(motionConfirmed: true)))
+        expectFailure(busyResponse, id: 4, code: .controllerBusy)
+        #expect(await stub.requestCounts["scan.start"] == 1)
+
+        await stub.release("scan.start")
+        let firstResponse = await first.value
+        guard case .success = firstResponse else {
+            Issue.record("expected scan.start to succeed, got \(firstResponse)")
+            return
+        }
+        #expect(model.mutatingOperationInFlight == nil)
+    }
+
+    // MARK: scan.stop (Task 3)
+
+    @Test("scan.stop with mode absent reaches stopAfterCurrentFrame while mode: \"immediate\" reaches stopImmediately")
+    @MainActor
+    func scanStopRoutesByMode() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        model.beginJob(id: "motion-routing-job-1")
+        await stub.clearLog()
+
+        let afterCurrentResponse = await dispatcher.handle(.scanStop(id: 1, params: ControlScanStopParams(mode: nil)))
+        guard case .success = afterCurrentResponse else {
+            Issue.record("expected scan.stop (afterCurrentFrame) to succeed, got \(afterCurrentResponse)")
+            return
+        }
+        #expect(await stub.recordedMethods == ["scan.stop"])
+        #expect(await stub.recordedScanStopModes == ["afterCurrentFrame"])
+
+        model.beginJob(id: "motion-routing-job-2")
+        await stub.clearLog()
+        let immediateResponse = await dispatcher.handle(.scanStop(id: 2, params: ControlScanStopParams(mode: "immediate")))
+        guard case .success = immediateResponse else {
+            Issue.record("expected scan.stop (immediate) to succeed, got \(immediateResponse)")
+            return
+        }
+        #expect(await stub.recordedMethods == ["scan.stop"])
+        #expect(await stub.recordedScanStopModes == ["immediate"])
+    }
+
+    @Test("scan.stop with an unrecognized mode is refused with INVALID_PARAMS before any engine call")
+    @MainActor
+    func scanStopUnknownModeIsInvalid() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        model.beginJob(id: "motion-routing-job")
+        await stub.clearLog()
+        let response = await dispatcher.handle(.scanStop(id: 3, params: ControlScanStopParams(mode: "sideways")))
+        expectFailure(response, id: 3, code: .invalidParams)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scan.stop with no active job is refused with GATE_REFUSED, not a silent success")
+    @MainActor
+    func scanStopWithNoActiveJobIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.scanStop(id: 4, params: ControlScanStopParams(mode: nil)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 4)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    // MARK: scan.resume (Task 3)
+
+    @Test("scan.resume without motionConfirmed is refused with CONFIRMATION_REQUIRED before any engine call")
+    @MainActor
+    func scanResumeWithoutConfirmationIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.scanResume(id: 1, params: ControlScanResumeParams(motionConfirmed: nil)))
+        expectFailure(response, id: 1, code: .confirmationRequired)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scan.resume when pendingFrames is empty is refused with GATE_REFUSED naming .targetRequired")
+    @MainActor
+    func scanResumeWithNoPendingFramesIsRefused() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        #expect(await prepareMotionRoutingScanReadiness(model, directory: motionRoutingEmptyProjectDirectory))
+        #expect(model.pendingFrames.isEmpty)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.scanResume(id: 2, params: ControlScanResumeParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 2)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(error.gate == ControlGate.scanReadiness.rawValue)
+        #expect(error.guidance == ScanReadinessPolicy.Decision.targetRequired.reason)
+        #expect(await stub.recordedMethods.isEmpty)
     }
 }

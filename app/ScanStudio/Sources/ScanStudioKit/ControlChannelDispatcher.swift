@@ -517,15 +517,72 @@ public final class ControlChannelDispatcher {
         case .rollList:
             // Plan 05/06 replaces this arm
             return placeholder(request)
-        case .scanStart:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .scanStop:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .scanResume:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .scanStart(let id, _):
+            // Confirmation already checked in the preamble. This is
+            // verbatim the expression `ScanPanelView.swift` computes for
+            // its own Scan button's `.disabled` binding.
+            let decision = sessionModel.scanReadiness(for: sessionModel.selectedFrames)
+            if let refusal = gateRefusal(scanReadiness: decision) {
+                return .failure(id: id, error: refusal)
+            }
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            // RESEARCH Pitfall 4: `startMockScan()` is the real GUI Scan
+            // button entry point for both real and simulated devices. Route
+            // here and nowhere else -- a second "real" scan-start method
+            // would duplicate its manual-review branching, exactly what
+            // D-04 forbids.
+            await sessionModel.startMockScan()
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+        case .scanStop(let id, let params):
+            let mode: String
+            switch params.mode ?? "afterCurrentFrame" {
+            case "afterCurrentFrame", "immediate":
+                mode = params.mode ?? "afterCurrentFrame"
+            default:
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "Unknown scan.stop mode \"\(params.mode ?? "")\"."
+                ))
+            }
+            // `stopAfterCurrentFrame()`/`stopImmediately()` both return
+            // silently from a `guard let jobId` when no job is active (a
+            // data precondition, not a reentrancy guard) -- pre-checking
+            // here is RESEARCH Pitfall 1's silent-no-op-to-typed-refusal
+            // translation, so "nothing to stop" is never indistinguishable
+            // from "stopped".
+            guard sessionModel.jobId != nil else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .gateRefused,
+                    message: "\"scan.stop\" was refused: no job is active.",
+                    guidance: "There is no active job to stop."
+                ))
+            }
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            if mode == "immediate" {
+                await sessionModel.stopImmediately()
+            } else {
+                await sessionModel.stopAfterCurrentFrame()
+            }
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+        case .scanResume(let id, _):
+            // Confirmation already checked. Mirrors `ScanPanelView.swift`'s
+            // own Resume Batch `.disabled` binding.
+            let decision = sessionModel.scanReadiness(for: sessionModel.pendingFrames)
+            if let refusal = gateRefusal(scanReadiness: decision) {
+                return .failure(id: id, error: refusal)
+            }
+            // `resumeBatch()`'s own guard additionally reads three
+            // `private var` flags (`pendingScanStart`,
+            // `pendingManualReviewApproval`, `pendingAttendedScanApproval`)
+            // this dispatcher cannot see and must not attempt to read
+            // (RESEARCH: architecturally invisible outside
+            // SessionModel.swift) -- this pre-check plus that inner guard
+            // is the complete story; a silent no-op from the inner guard is
+            // reported as success, and the caller can distinguish it via
+            // `job.get`.
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.resumeBatch()
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
         case .scannerEject(let id, _):
             // The confirmation check already ran in the preamble above.
             guard sessionModel.hardwareMotionReadiness.allowsMotion else {
