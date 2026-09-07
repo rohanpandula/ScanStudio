@@ -658,6 +658,23 @@ def test_device_eject_success_clears_preview_material_so_scan_start_is_no_previe
     assert excinfo.value.code == ErrorCode.NO_PREVIEW
 
 
+def test_device_eject_succeeds_without_a_preceding_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EJECT-03: `_handle_device_eject` has no preview/roll-session
+    precondition -- a device that has only been opened (never previewed)
+    must still eject successfully. This is the exact confirmed-absence
+    contract the 2026-09-07 incident needed: the preview request had
+    failed with the film already pulled in, so the operator's only way
+    out was an eject with no preview ever having registered. This test
+    deliberately never dispatches a preview request before ejecting --
+    that omission is the point of the test; do not add one."""
+    svc = _opened_service(tmp_path)  # device.open only -- no preview dispatch
+    _arm(monkeypatch, tmp_path)
+    result = svc.dispatch({"id": 2, "method": "device.eject"}, _RecordingEmit())
+    assert result == {}
+
+
 # -- roll.preview: SAFE-02 gate ------------------------------------------------------
 
 

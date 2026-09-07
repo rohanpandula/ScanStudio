@@ -150,4 +150,37 @@ struct DeviceBarMediaPolicyTests {
             }
         }
     }
+
+    @Test("the card never says film is loaded while Eject is unavailable (EJECT-04)")
+    func cardNeverClaimsLoadedWhileEjectIsUnavailable() {
+        // HardwareFilmStatus (the readiness card's wording) and
+        // DeviceBarEjectPolicy (the Eject gate) both read the same live
+        // `filmPresent` sensor value from `sessionModel.status?.filmPresent`
+        // (DeviceBarView.swift, HardwareMotionReadinessView.swift). This test
+        // ties them to that one signal so they cannot drift apart again the
+        // way they did in the 2026-09-07 incident, where the card read "Film
+        // is loaded" and no Eject affordance was offered.
+        let filmPresentValues: [Bool?] = [true, false, nil]
+        for filmPresent in filmPresentValues {
+            let filmStatus = HardwareFilmStatus.evaluate(
+                isConnected: true,
+                isRealDevice: true,
+                mediaLoaded: false,
+                filmPresent: filmPresent
+            )
+            let canOffer = DeviceBarEjectPolicy.canOffer(
+                isConnected: true,
+                transportIsIdle: true,
+                isJobActive: false,
+                mediaLoaded: false,
+                filmPresent: filmPresent,
+                refeedRequired: false,
+                lastErrorMessage: nil
+            )
+            #expect(
+                filmStatus != .loaded || canOffer,
+                "filmPresent: \(String(describing: filmPresent)) — card says \(filmStatus) but canOffer is \(canOffer)"
+            )
+        }
+    }
 }
