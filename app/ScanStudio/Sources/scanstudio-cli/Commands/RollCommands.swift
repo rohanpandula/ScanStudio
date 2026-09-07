@@ -79,7 +79,7 @@ struct Roll: AsyncParsableCommand {
             try await CommandRunner.run(
                 command: "roll.save",
                 method: "roll.save",
-                params: RollSaveWireParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: true),
+                params: ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: true),
                 options: options
             )
         }
@@ -114,21 +114,7 @@ struct Roll: AsyncParsableCommand {
     }
 }
 
-/// `ControlRollSaveParams` (ScanStudioKit/ControlWireProtocol.swift) drops
-/// its own public initializer -- like every confirmation-bearing params
-/// struct, it declares only the compiler's memberwise one, which is
-/// `internal` and therefore invisible across this plain `import
-/// ScanStudioKit` module boundary (only `@testable import` sees it). This
-/// mirror is this file's own encode-direction twin, matching
-/// `ControlWireProtocol.swift`'s own documented rationale for
-/// `ControlScanProgress`/`ControlProjectSummary`: rather than retrofitting
-/// a public initializer onto a type owned elsewhere, a small local mirror
-/// with the identical field names (so its synthesized `Encodable`
-/// produces byte-identical wire JSON) is the correct fix here.
-private struct RollSaveWireParams: Encodable {
-    let name: String
-    let carrier: SimulatedFilmCarrier
-    let frameCount: Int
-    let filmProcess: FilmProcess
-    let motionConfirmed: Bool
-}
+// WR-05: the hand-duplicated `RollSaveWireParams` mirror that used to live
+// here is gone -- `ControlWireProtocol.swift`'s own canonical
+// `ControlRollSaveParams` now has an explicit `public init`, so `Save
+// .run()` above constructs it directly.

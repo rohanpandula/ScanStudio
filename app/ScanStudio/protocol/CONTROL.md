@@ -171,7 +171,7 @@ One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen group
 | `disconnect` | `scanner.disconnect` | — | 0, 65, 69, 70, 75 |
 | `rescan` | `scanner.rescan` | — | 0, 65, 69, 70, 75 |
 | `status [--job <id>]` | `status`, or `job.get` when `--job` is given | — | 0, 65 (`JOB_NOT_FOUND` when `--job` names an id that does not match the tracked job), 69, 70 |
-| `preview --film-loaded [--intent …] [--film-process …]` | `preview.acquire` | `--film-loaded` | 0, 64 (`--intent replaceFilmProcess` with no `--film-process`, or an unrecognized `--intent`), 65, 69, 70, 75, 77 |
+| `preview --film-loaded [--intent …] [--film-process …]` | `preview.acquire` | `--film-loaded` | 0, 64 (`--intent replaceFilmProcess` with no `--film-process`, an unrecognized `--intent`, or an unrecognized `--film-process` value — refused client-side at parse time since WR-05, matching `roll save --film-process`'s own validation, rather than round-tripping to the host for the same 64), 65, 69, 70, 75, 77 |
 | `frames list` / `frames select <range>\|--all\|--none` / `frames include <range>` / `frames exclude <range>` | `frames.list` / `frames.select` / `frames.include` / `frames.exclude` | — | 0, 64 (a malformed CUPS range, or not exactly one of the range argument/`--all`/`--none` for `select`, both refused client-side, D-12), 65, 69, 70, 75 |
 | `review approve --confirm-motion` | `review.approve` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
 | `settings get` / `settings set […]` | `settings.get` / `settings.set` | — | 0, 65, 69, 70, 75 |

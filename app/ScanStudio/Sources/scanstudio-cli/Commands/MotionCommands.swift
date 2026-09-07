@@ -34,8 +34,23 @@ struct Preview: AsyncParsableCommand {
     @Option(name: .customLong("intent"), help: "initial | replaceFilmProcess | refreshSavedProject. Defaults to initial.")
     var intent: String?
 
-    @Option(name: .customLong("film-process"), help: "Required when --intent replaceFilmProcess is given. Passed through unvalidated -- the host reports an unrecognized value.")
-    var filmProcess: String?
+    /// WR-05: constructing the canonical `ControlPreviewAcquireParams`
+    /// directly (its `filmProcess` field is `FilmProcess?`, not a bare
+    /// `String?`) requires a real `FilmProcess` value here, so this is now
+    /// validated at parse time via the same `transform:` pattern
+    /// `RollCommands.swift`'s `--film-process`/`--carrier` already use --
+    /// a tightening from the previous "passed through unvalidated, the
+    /// host reports an unrecognized value" behavior, not a regression: an
+    /// invalid value now fails client-side (ArgumentParser's own usage
+    /// error, exit 64) before any connection opens, instead of round-
+    /// tripping to the host first for the identical exit code.
+    @Option(name: .customLong("film-process"), help: "Required when --intent replaceFilmProcess is given: positive, c41ColorNegative, bwNegative, or kodachrome.", transform: {
+        guard let value = FilmProcess(rawValue: $0) else {
+            throw ValidationError("film-process must be one of: \(FilmProcess.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return value
+    })
+    var filmProcess: FilmProcess?
 
     mutating func validate() throws {
         guard filmLoaded else {
@@ -54,7 +69,7 @@ struct Preview: AsyncParsableCommand {
         try await CommandRunner.run(
             command: "preview.acquire",
             method: "preview.acquire",
-            params: PreviewAcquireWireParams(filmLoadedConfirmed: true, intent: intent, filmProcess: filmProcess),
+            params: ControlPreviewAcquireParams(filmLoadedConfirmed: true, intent: intent, filmProcess: filmProcess),
             options: options
         )
     }
@@ -97,7 +112,7 @@ struct ReviewApprove: AsyncParsableCommand {
         try await CommandRunner.run(
             command: "review.approve",
             method: "review.approve",
-            params: ReviewApproveWireParams(motionConfirmed: true),
+            params: ControlReviewApproveParams(motionConfirmed: true),
             options: options
         )
     }
@@ -145,7 +160,7 @@ struct Eject: AsyncParsableCommand {
         try await CommandRunner.run(
             command: "scanner.eject",
             method: "scanner.eject",
-            params: ScannerEjectWireParams(motionConfirmed: true),
+            params: ControlScannerEjectParams(motionConfirmed: true),
             options: options
         )
     }
@@ -185,7 +200,7 @@ struct Scan: AsyncParsableCommand {
         try await MotionStartRunner.run(
             command: "scan.start",
             method: "scan.start",
-            params: ScanStartWireParams(motionConfirmed: true),
+            params: ControlScanStartParams(motionConfirmed: true),
             options: options,
             wait: wait
         )
@@ -252,7 +267,7 @@ struct Resume: AsyncParsableCommand {
         try await MotionStartRunner.run(
             command: "scan.resume",
             method: "scan.resume",
-            params: ScanResumeWireParams(motionConfirmed: true),
+            params: ControlScanResumeParams(motionConfirmed: true),
             options: options,
             wait: wait
         )
@@ -333,36 +348,11 @@ private enum MotionStartRunner {
     }
 }
 
-// MARK: - Wire mirrors
-
+// WR-05: the hand-duplicated wire-mirror structs that used to live here
+// (`PreviewAcquireWireParams`/`ReviewApproveWireParams`/
+// `ScannerEjectWireParams`/`ScanStartWireParams`/`ScanResumeWireParams`)
+// are gone -- `ControlWireProtocol.swift`'s own canonical
 // `ControlPreviewAcquireParams`/`ControlReviewApproveParams`/
-// `ControlScannerEjectParams` (ScanStudioKit/ControlWireProtocol.swift) each
-// drop their own public initializer -- like every confirmation-bearing
-// params struct (Plan 02-01's precedent), leaving only the compiler's
-// memberwise one, which is `internal` and therefore invisible across this
-// plain `import ScanStudioKit` module boundary. These mirrors are this
-// file's own encode-direction twins, matching `RollCommands.swift`'s
-// identical `RollSaveWireParams` precedent: same field names, so the
-// synthesized `Encodable` conformance produces byte-identical wire JSON.
-
-private struct PreviewAcquireWireParams: Encodable {
-    let filmLoadedConfirmed: Bool
-    let intent: String?
-    let filmProcess: String?
-}
-
-private struct ReviewApproveWireParams: Encodable {
-    let motionConfirmed: Bool
-}
-
-private struct ScannerEjectWireParams: Encodable {
-    let motionConfirmed: Bool
-}
-
-private struct ScanStartWireParams: Encodable {
-    let motionConfirmed: Bool
-}
-
-private struct ScanResumeWireParams: Encodable {
-    let motionConfirmed: Bool
-}
+// `ControlScannerEjectParams`/`ControlScanStartParams`/
+// `ControlScanResumeParams` now each have an explicit `public init`, so
+// every `run()` above constructs the canonical type directly.

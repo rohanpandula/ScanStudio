@@ -206,13 +206,20 @@ public struct ControlHelloResult: Codable, Equatable, Sendable {
 // error, never treated as an invalid-params failure, and no field default
 // may mean "confirmed". Declaring each flag as an optional satisfies both:
 // an absent wire key decodes to `nil`, and the dispatcher treats anything
-// other than an explicit `true` as unconfirmed. These five structs are
-// decoded, never hand-constructed outside tests, so — like
-// `WireProtocol.swift`'s own decode-only leaf types (`ProjectSummary`,
-// `WireSniff`) — they declare no custom initializer; the compiler's own
-// memberwise one (visible to `ScanStudioKitTests` via `@testable import`)
-// is sufficient, and guarantees every field must be supplied explicitly
-// rather than silently defaulting.
+// other than an explicit `true` as unconfirmed.
+//
+// WR-05: these five structs previously declared no custom initializer, on
+// the theory that they are "decoded, never hand-constructed outside
+// tests" -- relying on the compiler's own memberwise one, `internal` and
+// therefore invisible outside `@testable import`. In practice the CLI
+// target (a plain `import ScanStudioKit`, never `@testable`) does need to
+// *construct* these to send requests, and hand-duplicated a private
+// mirror struct per command in `Commands/*.swift` instead, matching field
+// names by hand with no compile-time or test-level check that they stayed
+// in sync with these canonical types (a future rename/add/remove here
+// would compile cleanly on both sides independently). Each now has an
+// explicit `public init`, so the CLI encodes these canonical types
+// directly -- the mirrors are gone.
 
 public struct ControlPreviewAcquireParams: Codable, Equatable, Sendable {
     public let filmLoadedConfirmed: Bool?
@@ -220,18 +227,36 @@ public struct ControlPreviewAcquireParams: Codable, Equatable, Sendable {
     /// an absent key means `"initial"`.
     public let intent: String?
     public let filmProcess: FilmProcess?
+
+    public init(filmLoadedConfirmed: Bool?, intent: String? = nil, filmProcess: FilmProcess? = nil) {
+        self.filmLoadedConfirmed = filmLoadedConfirmed
+        self.intent = intent
+        self.filmProcess = filmProcess
+    }
 }
 
 public struct ControlScanStartParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
+
+    public init(motionConfirmed: Bool?) {
+        self.motionConfirmed = motionConfirmed
+    }
 }
 
 public struct ControlScanResumeParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
+
+    public init(motionConfirmed: Bool?) {
+        self.motionConfirmed = motionConfirmed
+    }
 }
 
 public struct ControlScannerEjectParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
+
+    public init(motionConfirmed: Bool?) {
+        self.motionConfirmed = motionConfirmed
+    }
 }
 
 /// Carries a confirmation flag because it routes to
@@ -239,6 +264,10 @@ public struct ControlScannerEjectParams: Codable, Equatable, Sendable {
 /// scan — the method name alone does not advertise the motion.
 public struct ControlReviewApproveParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
+
+    public init(motionConfirmed: Bool?) {
+        self.motionConfirmed = motionConfirmed
+    }
 }
 
 // MARK: - Remaining params
@@ -297,15 +326,23 @@ public struct ControlScanStopParams: Codable, Equatable, Sendable {
 /// which creates the project and immediately starts the scan of the
 /// selected frames -- the method name alone does not advertise that. `nil`
 /// and `false` both mean unconfirmed, exactly like `ControlScanStartParams`.
-/// No custom initializer, matching the five confirmation-bearing params
-/// above: the compiler's own memberwise one (visible to
-/// `ScanStudioKitTests` via `@testable import`) is sufficient.
+/// WR-05: has an explicit `public init`, matching the five confirmation-
+/// bearing params above, so the CLI can construct this canonical type
+/// directly instead of hand-duplicating a private mirror struct.
 public struct ControlRollSaveParams: Codable, Equatable, Sendable {
     public let name: String
     public let carrier: SimulatedFilmCarrier
     public let frameCount: Int
     public let filmProcess: FilmProcess
     public let motionConfirmed: Bool?
+
+    public init(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess, motionConfirmed: Bool?) {
+        self.name = name
+        self.carrier = carrier
+        self.frameCount = frameCount
+        self.filmProcess = filmProcess
+        self.motionConfirmed = motionConfirmed
+    }
 }
 
 public struct ControlRollOpenParams: Codable, Equatable, Sendable {
