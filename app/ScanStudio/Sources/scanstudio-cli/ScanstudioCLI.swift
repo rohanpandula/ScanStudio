@@ -40,4 +40,16 @@ struct GlobalOptions: ParsableArguments {
         help: "Path to the control socket. Defaults to the app's standard control socket path."
     )
     var socketPath: String?
+
+    /// D-17: suppresses `--wait`'s stderr progress lines (`scan`, `resume`,
+    /// `roll save`). A global flag so a caller never has to remember which
+    /// specific subcommands print progress -- every command carries it,
+    /// even the ones `--wait` does not apply to, where it is simply unused.
+    /// stdout is unaffected either way: it is always exactly one JSON
+    /// object.
+    @Flag(
+        name: .customLong("quiet"),
+        help: "Suppress --wait's stderr progress lines. stdout is unaffected -- always exactly one JSON object."
+    )
+    var quiet = false
 }

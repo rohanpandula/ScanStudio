@@ -495,6 +495,17 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     public let projectDirectory: String?
     public let jobId: String?
     public let jobState: JobState?
+    /// D-17: additive. `control.changed`'s snapshot previously carried
+    /// `jobId`/`jobState` but not live progress, leaving `--wait`'s stderr
+    /// progress sink with no way to observe it without an extra `job.get`
+    /// poll (forbidden by SAFE-02's "exactly one subscribe, one final
+    /// fetch" contract). Populating it here -- the same `mapScanProgress`
+    /// `job.get`'s own result already uses -- makes it observable from
+    /// bytes a subscriber already receives, at no new request cost. `nil`
+    /// when no job is active; omitted from the wire entirely then
+    /// (`encodeIfPresent`), so an older client parsing this envelope is
+    /// unaffected.
+    public let progress: ControlScanProgress?
     public let refeedRequired: Bool
     public let hardwareMotionReadiness: String
     public let motionAllowed: Bool
@@ -513,6 +524,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         projectDirectory: String? = nil,
         jobId: String? = nil,
         jobState: JobState? = nil,
+        progress: ControlScanProgress? = nil,
         refeedRequired: Bool,
         hardwareMotionReadiness: String,
         motionAllowed: Bool,
@@ -530,6 +542,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.projectDirectory = projectDirectory
         self.jobId = jobId
         self.jobState = jobState
+        self.progress = progress
         self.refeedRequired = refeedRequired
         self.hardwareMotionReadiness = hardwareMotionReadiness
         self.motionAllowed = motionAllowed

@@ -202,7 +202,8 @@ struct Scan: AsyncParsableCommand {
             method: "scan.start",
             params: ControlScanStartParams(motionConfirmed: true),
             options: options,
-            wait: wait
+            wait: wait,
+            quiet: options.quiet
         )
     }
 }
@@ -269,23 +270,29 @@ struct Resume: AsyncParsableCommand {
             method: "scan.resume",
             params: ControlScanResumeParams(motionConfirmed: true),
             options: options,
-            wait: wait
+            wait: wait,
+            quiet: options.quiet
         )
     }
 }
 
-/// The D-13 `--wait` interleaving shared identically by `Scan`/`Resume`:
-/// subscribe, send the caller's own start request, then either return the
-/// job id immediately or hand off to `JobWaiter` for the terminal outcome.
-/// SAFE-02: sends exactly the caller's one start request plus, only when
-/// waiting, `JobWaiter`'s own two calls -- nothing here re-issues anything.
-private enum MotionStartRunner {
+/// The D-13 `--wait` interleaving shared identically by `Scan`/`Resume`, and
+/// (D-17) `Roll.Save` (`RollCommands.swift`) -- three commands now, not two,
+/// hence `internal` rather than `private`: subscribe, send the caller's own
+/// start request, then either return the job id immediately or hand off to
+/// `JobWaiter` for the terminal outcome. SAFE-02: sends exactly the
+/// caller's one start request plus, only when waiting, `JobWaiter`'s own
+/// two calls -- nothing here re-issues anything, and `quiet` only ever
+/// suppresses a stderr write that `JobWaiter` itself never performs (see
+/// its own header).
+enum MotionStartRunner {
     static func run<Params: Encodable & Sendable>(
         command: String,
         method: String,
         params: Params,
         options: GlobalOptions,
-        wait: Bool
+        wait: Bool,
+        quiet: Bool
     ) async throws {
         let client = try await CommandRunner.openConnection(command: command, options: options)
 
@@ -314,9 +321,22 @@ private enum MotionStartRunner {
             return
         }
 
+        // stdout stays exactly one JSON object (D-09/D-17) -- progress is
+        // written only to stderr, never here, and only unless --quiet.
+        let onProgress: (@Sendable (ControlScanProgress) -> Void)?
+        if quiet {
+            onProgress = nil
+        } else {
+            onProgress = { (progress: ControlScanProgress) in
+                FileHandle.standardError.write(Data((ControlProgressLine.render(progress) + "\n").utf8))
+            }
+        }
+
         do {
             guard let terminalResponse = try await JobWaiter.waitForTerminalOutcome(
-                client: client, preStartJobId: preStartJobId
+                client: client,
+                preStartJobId: preStartJobId,
+                onProgress: onProgress
             ) else {
                 await client.shutdown()
                 let payload = ControlErrorPayload(

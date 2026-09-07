@@ -5737,6 +5737,20 @@ fn compute_frame_ordinal(completed: &[u32], failed: &[u32], total_frames: u32) -
     (resolved + 1).min(total_frames.max(1))
 }
 
+/// D-17: a measured `etaSeconds` -- the mean of this job's own completed
+/// frame durations (`durations_ms`, one sample per resolved frame, pushed
+/// by every `emit_frame_progress` call site) times the number of frames
+/// still remaining. `0.0` before the first frame resolves (no samples
+/// yet) or once nothing remains -- never a fabricated estimate, and never
+/// extrapolated from another job's timing.
+fn eta_seconds_from_samples(durations_ms: &[u64], frames_remaining: usize) -> f64 {
+    if durations_ms.is_empty() || frames_remaining == 0 {
+        return 0.0;
+    }
+    let mean_ms = durations_ms.iter().sum::<u64>() as f64 / durations_ms.len() as f64;
+    mean_ms / 1000.0 * frames_remaining as f64
+}
+
 fn reconcile_derivative_failures(
     mut completed: Vec<u32>,
     mut failed: Vec<u32>,
@@ -7040,7 +7054,11 @@ fn run_real_scan_job_inner(
     // scan.progress, which never comes. `frame_index` names whichever
     // slot is now the newest one in flight (falling back to the
     // most-recently-resolved slot once nothing remains).
-    let emit_frame_progress = |completed: &[u32], failed: &[u32], remaining: &[u32]| {
+    // `durations_ms` is a parameter, not a captured variable, precisely so
+    // this closure need not borrow the enclosing loop's own
+    // `frame_durations_ms` (declared below, alongside `idle_samples`) —
+    // every call site passes its own up-to-date slice explicitly.
+    let emit_frame_progress = |completed: &[u32], failed: &[u32], remaining: &[u32], durations_ms: &[u64]| {
         let frame_index = remaining
             .first()
             .copied()
@@ -7059,12 +7077,15 @@ fn run_real_scan_job_inner(
                 total_passes: recipe.multisample_passes,
                 // The frame this event now names just started (or, at
                 // job end, nothing remains) — never a fabricated
-                // sub-frame fraction. Mirrors eta_seconds' own "honest
-                // unknown" convention elsewhere in this function.
+                // sub-frame fraction.
                 frame_percent: 0.0,
                 job_percent: (completed.len() + failed.len()) as f64 * 100.0
                     / total_frames.max(1) as f64,
-                eta_seconds: 0.0,
+                // D-17: measured from this job's own resolved-frame
+                // durations (mean × frames remaining); 0.0 only before the
+                // first frame resolves, never extrapolated from another
+                // job.
+                eta_seconds: eta_seconds_from_samples(durations_ms, remaining.len()),
             },
         );
     };
@@ -7083,6 +7104,14 @@ fn run_real_scan_job_inner(
     let mut idle_samples: Vec<FrameIdleSample> = Vec::new();
     let mut last_resolved_at: Option<Instant> = None;
     let mut last_progress_slot: Option<u32> = None;
+    // D-17: one duration sample per resolved frame (pushed at each of the
+    // four frame-resolution sites below, immediately before
+    // `last_resolved_at` is reassigned), feeding `eta_seconds_from_samples`.
+    // `job_started_at` stands in for `last_resolved_at` only for the very
+    // first frame, so it contributes a real sample too instead of being
+    // silently skipped.
+    let mut frame_durations_ms: Vec<u64> = Vec::new();
+    let job_started_at = Instant::now();
 
     loop {
         // Never wait past the still-open silence window in one poll — this
@@ -7159,14 +7188,18 @@ fn run_real_scan_job_inner(
                                 total_passes: recipe.multisample_passes,
                                 frame_percent: progress.fraction * 100.0,
                                 // BRIDGE.md's ScanProgress has no per-pass
-                                // or ETA telemetry — pass/total_passes
-                                // echo the request's own recipe rather
-                                // than a real per-pass count, and
-                                // eta_seconds: 0.0 below is an honest
-                                // "unknown", never a fabricated estimate.
+                                // telemetry -- pass/total_passes echo the
+                                // request's own recipe rather than a real
+                                // per-pass count. eta_seconds (D-17) is
+                                // measured from this job's own
+                                // already-resolved frame durations, the
+                                // same as emit_frame_progress computes --
+                                // this event does not itself resolve a
+                                // frame, so it reads the samples gathered
+                                // so far rather than pushing a new one.
                                 job_percent: (completed.len() + failed.len()) as f64 * 100.0
                                     / total_frames.max(1) as f64,
-                                eta_seconds: 0.0,
+                                eta_seconds: eta_seconds_from_samples(&frame_durations_ms, remaining.len()),
                             },
                         );
                     }
@@ -7323,7 +7356,16 @@ fn run_real_scan_job_inner(
                                 derivative_failed.push(frame_completed.slot);
                             }
                             sync_progress(&completed, &failed);
-                            emit_frame_progress(&completed, &failed, &remaining);
+                            // D-17: pushed BEFORE last_resolved_at is
+                            // reassigned below, so this frame's own
+                            // duration is included in the ETA
+                            // emit_frame_progress computes for it.
+                            frame_durations_ms.push(
+                                event_arrived_at
+                                    .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                    .as_millis() as u64,
+                            );
+                            emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                             last_resolved_at = Some(event_arrived_at);
                             continue;
                         }
@@ -7679,7 +7721,16 @@ fn run_real_scan_job_inner(
                             }
                         }
                         sync_progress(&completed, &failed);
-                        emit_frame_progress(&completed, &failed, &remaining);
+                        // D-17: pushed BEFORE last_resolved_at is
+                        // reassigned below, so this frame's own duration
+                        // is included in the ETA emit_frame_progress
+                        // computes for it.
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "hardware.anomaly" => {
@@ -7756,7 +7807,16 @@ fn run_real_scan_job_inner(
                             }
                         }
                         sync_progress(&completed, &failed);
-                        emit_frame_progress(&completed, &failed, &remaining);
+                        // D-17: pushed BEFORE last_resolved_at is
+                        // reassigned below, so this frame's own duration
+                        // is included in the ETA emit_frame_progress
+                        // computes for it.
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.frameFailed" => {
@@ -7815,7 +7875,16 @@ fn run_real_scan_job_inner(
                             }
                         }
                         sync_progress(&completed, &failed);
-                        emit_frame_progress(&completed, &failed, &remaining);
+                        // D-17: pushed BEFORE last_resolved_at is
+                        // reassigned below, so this frame's own duration
+                        // is included in the ETA emit_frame_progress
+                        // computes for it.
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.error" => {
@@ -8142,6 +8211,27 @@ mod tests {
             engine_receipt: json!({"frameIndex": frame_index}),
             attempts_root: None,
         }
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_is_zero_with_no_samples() {
+        assert_eq!(eta_seconds_from_samples(&[], 5), 0.0);
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_one_sample_times_frames_remaining() {
+        assert_eq!(eta_seconds_from_samples(&[10_000], 3), 30.0);
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_averages_mixed_samples() {
+        // mean(10_000, 20_000, 30_000) = 20_000ms = 20s; 2 remaining -> 40.0
+        assert_eq!(eta_seconds_from_samples(&[10_000, 20_000, 30_000], 2), 40.0);
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_is_zero_when_nothing_remains() {
+        assert_eq!(eta_seconds_from_samples(&[10_000], 0), 0.0);
     }
 
     /// `SCANSTUDIO_EJECT_DEADLINE_SECS` is the operator's escape hatch for

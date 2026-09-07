@@ -300,3 +300,40 @@ public enum ControlFrameRangeParser {
         return value
     }
 }
+
+// MARK: - Progress line (D-17)
+
+/// Pure, unit-testable stderr progress-line formatter for `--wait`
+/// (`scan`/`resume`/`roll save`, `MotionCommands.swift`/`RollCommands.swift`).
+/// Kept in `ScanStudioKit` for the same reason as this file's other
+/// helpers: a normal `ScanStudioKitTests` home, no new package surface.
+public enum ControlProgressLine {
+    /// `frame <frameOrdinal>/<totalFrames> pass <pass>/<totalPasses> eta
+    /// <duration>` -- the literal shape D-17 specifies (for example
+    /// `frame 3/36 pass 1/4 eta 1h52m`).
+    public static func render(_ progress: ControlScanProgress) -> String {
+        "frame \(progress.frameOrdinal)/\(progress.totalFrames) pass \(progress.pass)/\(progress.totalPasses) eta \(renderDuration(progress.etaSeconds))"
+    }
+
+    /// `<h>h<mm>m` at or above an hour, `<m>m<ss>s` at or above a minute,
+    /// `<s>s` below a minute, and the literal `unknown` for a
+    /// non-positive or non-finite value. Never fabricates: the engine's
+    /// `eta_seconds_from_samples` (D-17) returns exactly `0.0` before the
+    /// first frame of a job resolves, and `unknown` is what that
+    /// "nothing measured yet" state renders as here, never a misleading
+    /// `0s`.
+    public static func renderDuration(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "unknown" }
+        let totalSeconds = Int(seconds.rounded())
+        let hours = totalSeconds / 3_600
+        let minutes = (totalSeconds % 3_600) / 60
+        let secs = totalSeconds % 60
+        if hours > 0 {
+            return "\(hours)h\(String(format: "%02d", minutes))m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m\(String(format: "%02d", secs))s"
+        }
+        return "\(secs)s"
+    }
+}

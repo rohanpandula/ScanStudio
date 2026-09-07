@@ -287,4 +287,56 @@ struct ControlCLISupportTests {
     func rejectsOneIndexPastTheCeiling() {
         #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("1-1001") }
     }
+
+    // MARK: - ControlProgressLine (D-17)
+
+    private static func progress(etaSeconds: Double) -> ControlScanProgress {
+        ControlScanProgress(
+            jobId: "job-1",
+            frameIndex: 3,
+            frameOrdinal: 3,
+            totalFrames: 36,
+            pass: 1,
+            totalPasses: 4,
+            framePercent: 50.0,
+            jobPercent: 8.0,
+            etaSeconds: etaSeconds
+        )
+    }
+
+    @Test("render produces the literal 'frame 3/36 pass 1/4 eta 1h52m' shape")
+    func renderProducesTheDocumentedLiteralShape() {
+        // 1h52m == 6_720s (1*3600 + 52*60); an exact minute boundary keeps
+        // the assertion unambiguous about rounding.
+        let line = ControlProgressLine.render(Self.progress(etaSeconds: 6_720))
+        #expect(line == "frame 3/36 pass 1/4 eta 1h52m")
+    }
+
+    @Test("renderDuration formats at or above an hour as <h>h<mm>m, minutes zero-padded")
+    func renderDurationHourTier() {
+        #expect(ControlProgressLine.renderDuration(6_720) == "1h52m")
+        // 1h00m05s rounds down to the hour tier's own shape (no seconds
+        // component at this tier) with zero-padded single-digit minutes.
+        #expect(ControlProgressLine.renderDuration(3_605) == "1h00m")
+    }
+
+    @Test("renderDuration formats at or above a minute as <m>m<ss>s, seconds zero-padded")
+    func renderDurationMinuteTier() {
+        #expect(ControlProgressLine.renderDuration(65) == "1m05s")
+        #expect(ControlProgressLine.renderDuration(59.9) == "1m00s")
+    }
+
+    @Test("renderDuration formats below a minute as <s>s")
+    func renderDurationSecondTier() {
+        #expect(ControlProgressLine.renderDuration(1) == "1s")
+        #expect(ControlProgressLine.renderDuration(59) == "59s")
+    }
+
+    @Test("renderDuration never fabricates a duration: zero, negative, NaN, and infinite all render 'unknown'")
+    func renderDurationNeverFabricates() {
+        #expect(ControlProgressLine.renderDuration(0) == "unknown")
+        #expect(ControlProgressLine.renderDuration(-1) == "unknown")
+        #expect(ControlProgressLine.renderDuration(.nan) == "unknown")
+        #expect(ControlProgressLine.renderDuration(.infinity) == "unknown")
+    }
 }

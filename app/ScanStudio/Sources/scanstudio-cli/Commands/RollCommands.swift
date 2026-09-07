@@ -62,6 +62,9 @@ struct Roll: AsyncParsableCommand {
         @Flag(name: .customLong("confirm-motion"), help: "Required: this command starts a scan.")
         var confirmMotion = false
 
+        @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
+        var wait = false
+
         mutating func validate() throws {
             guard confirmMotion else {
                 let payload = ControlErrorPayload(
@@ -75,12 +78,37 @@ struct Roll: AsyncParsableCommand {
             }
         }
 
+        /// D-17: `roll save --wait` runs through the same `MotionStartRunner`
+        /// body `scan --wait`/`resume --wait` use -- same subscribe-first
+        /// ordering, same `JobWaiter`, same terminal-state exit codes, no
+        /// second wait implementation. Without `--wait`, `roll save` keeps
+        /// its original single-request `CommandRunner.run` path unchanged:
+        /// `MotionStartRunner`'s own `!wait` branch renders `job.get`'s
+        /// aggregate instead of the start request's own result (the right
+        /// call for `scan.start`/`scan.resume`, whose own result is an
+        /// uninteresting `{}`) -- but `roll.save`'s own result
+        /// (`{saved, projectName, projectDirectory}`) is the useful,
+        /// documented body this command has always returned, and routing
+        /// it through that branch would silently replace it with an
+        /// unrelated `job.get` shape. `roll save` without `--wait`
+        /// therefore never needs `JobWaiter` at all.
         func run() async throws {
-            try await CommandRunner.run(
+            guard wait else {
+                try await CommandRunner.run(
+                    command: "roll.save",
+                    method: "roll.save",
+                    params: ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: true),
+                    options: options
+                )
+                return
+            }
+            try await MotionStartRunner.run(
                 command: "roll.save",
                 method: "roll.save",
                 params: ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: true),
-                options: options
+                options: options,
+                wait: wait,
+                quiet: options.quiet
             )
         }
     }

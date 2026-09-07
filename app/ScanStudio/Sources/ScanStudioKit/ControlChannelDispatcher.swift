@@ -1080,6 +1080,12 @@ public final class ControlChannelDispatcher {
             projectDirectory: sessionModel.projectDirectory,
             jobId: sessionModel.jobId,
             jobState: sessionModel.jobState,
+            // D-17: reading sessionModel.progress here (not only in
+            // buildJobResult() below) is what makes withObservationTracking
+            // re-emit control.changed on a progress-only update, and what
+            // gives JobWaiter's stderr progress sink something to read
+            // without a second job.get request.
+            progress: sessionModel.progress.map(Self.mapScanProgress),
             refeedRequired: sessionModel.refeedRequired,
             hardwareMotionReadiness: String(describing: motion),
             motionAllowed: motion.allowsMotion,
