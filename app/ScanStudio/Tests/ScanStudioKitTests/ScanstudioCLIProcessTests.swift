@@ -70,6 +70,21 @@ private func cliProcessProject(frameIndex: Int = 1) -> ScanProject {
 
 private let cliProcessProjectDirectory = "/tmp/cli-process-test-project"
 
+/// `roll.list`'s scripted `project.list` response -- `ProjectSummary` is
+/// `Decodable`-only with no custom `public init`, so the compiler's
+/// synthesized `internal` memberwise initializer is what this fixture
+/// uses, visible via `@testable import` (mirrors
+/// `ControlChannelProjectRoutingTests.swift`'s identical fixture).
+private let cliProcessRecentProject = ProjectSummary(
+    id: "cli-process-recent",
+    name: "Recent roll",
+    carrier: .mounted,
+    frameCount: 1,
+    filmProcess: .c41ColorNegative,
+    createdAt: "2026-09-01T00:00:00Z",
+    directory: "/tmp/cli-process/recent"
+)
+
 /// Fake engine covering every wire method a process test in this file
 /// drives, modelled on `ControlChannelProjectRoutingTests.swift`'s
 /// `ProjectRoutingEngineStub`. `scanner.list`/`scanner.rescan` auto-
@@ -108,6 +123,8 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
                 recordedFrameExclusionFlags.append(excludedParams.excluded)
             }
             return try cast(SetFrameResult(project: cliProcessProject()), as: Result.self)
+        case "project.list":
+            return try cast(ProjectListResult(projects: [cliProcessRecentProject]), as: Result.self)
         default:
             throw CLIProcessStubError.unexpectedMethod(method)
         }
@@ -206,31 +223,53 @@ private struct CLIProcessResult {
 
 /// Runs the real built binary with `arguments` plus `--socket socketPath`
 /// (when given), and returns its exit status, stdout, and stderr.
-private func runCLI(_ arguments: [String], socketPath: String?) throws -> CLIProcessResult {
+///
+/// The actual blocking `Process` spawn/read/wait sequence runs on a
+/// dedicated background queue via a continuation -- never inline on
+/// Swift's cooperative thread pool. This mirrors
+/// `ControlChannelServer.write(fd:bytes:)`'s own pattern and, more to the
+/// point, is the identical fix plan 02-02's `ControlChannelServerTests.swift`
+/// needed for the same reason: blocking I/O called directly inside an
+/// `async` test function occupies a cooperative-pool thread for the whole
+/// blocking duration, and with several tests' hosts all needing
+/// actor/`@MainActor` hops concurrently, the pool is exhausted and every
+/// connection -- including the one this very call is waiting on -- stops
+/// making progress until the blocked call gives up. A hang reproduced
+/// directly during this suite's own development confirmed it.
+private func runCLI(_ arguments: [String], socketPath: String?) async throws -> CLIProcessResult {
     let binary = try CLIProcessLocator.resolve()
-    let process = Process()
-    process.executableURL = binary
-    var allArguments = arguments
-    if let socketPath {
-        allArguments += ["--socket", socketPath]
+    let allArguments: [String] = if let socketPath {
+        arguments + ["--socket", socketPath]
+    } else {
+        arguments
     }
-    process.arguments = allArguments
+    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CLIProcessResult, Error>) in
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let process = Process()
+                process.executableURL = binary
+                process.arguments = allArguments
 
-    let stdoutPipe = Pipe()
-    let stderrPipe = Pipe()
-    process.standardOutput = stdoutPipe
-    process.standardError = stderrPipe
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
 
-    try process.run()
-    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
+                try process.run()
+                let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
 
-    return CLIProcessResult(
-        exitCode: process.terminationStatus,
-        stdout: String(data: stdoutData, encoding: .utf8) ?? "",
-        stderr: String(data: stderrData, encoding: .utf8) ?? ""
-    )
+                continuation.resume(returning: CLIProcessResult(
+                    exitCode: process.terminationStatus,
+                    stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+                    stderr: String(data: stderrData, encoding: .utf8) ?? ""
+                ))
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
 }
 
 @Suite("scanstudio-cli process", .timeLimit(.minutes(1)))
@@ -238,21 +277,21 @@ struct ScanstudioCLIProcessTests {
     // MARK: Task 1 -- the shared runner, and connect/disconnect/rescan/status
 
     @Test("--help exits 0")
-    func rootHelpExitsZero() throws {
-        let result = try runCLI(["--help"], socketPath: shortSocketPath("root-help"))
+    func rootHelpExitsZero() async throws {
+        let result = try await runCLI(["--help"], socketPath: shortSocketPath("root-help"))
         #expect(result.exitCode == 0)
     }
 
     @Test("status --help exits 0 and mentions --job")
-    func statusHelpExitsZeroAndMentionsJob() throws {
-        let result = try runCLI(["status", "--help"], socketPath: shortSocketPath("status-help"))
+    func statusHelpExitsZeroAndMentionsJob() async throws {
+        let result = try await runCLI(["status", "--help"], socketPath: shortSocketPath("status-help"))
         #expect(result.exitCode == 0)
         #expect(result.stdout.contains("--job"))
     }
 
     @Test("status with --socket pointing at a path with no listener exits 69 with a HOST_UNREACHABLE JSON body")
-    func statusAgainstMissingListenerExitsHostUnreachable() throws {
-        let result = try runCLI(["status"], socketPath: shortSocketPath("no-listener"))
+    func statusAgainstMissingListenerExitsHostUnreachable() async throws {
+        let result = try await runCLI(["status"], socketPath: shortSocketPath("no-listener"))
         #expect(result.exitCode == 69)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let error = try #require(object["error"] as? [String: Any])
@@ -264,7 +303,7 @@ struct ScanstudioCLIProcessTests {
         let host = try await CLIProcessHost.start(label: "status-json")
         defer { removeSocketDirectory(for: host.socketPath) }
 
-        let result = try runCLI(["status"], socketPath: host.socketPath)
+        let result = try await runCLI(["status"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         #expect(object["schemaVersion"] as? Int == ControlSchema.version)
@@ -280,7 +319,7 @@ struct ScanstudioCLIProcessTests {
         let host = try await CLIProcessHost.start(label: "status-human")
         defer { removeSocketDirectory(for: host.socketPath) }
 
-        let result = try runCLI(["status", "--human"], socketPath: host.socketPath)
+        let result = try await runCLI(["status", "--human"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
         #expect(result.stdout.contains("{") == false)
 
@@ -292,7 +331,7 @@ struct ScanstudioCLIProcessTests {
         let host = try await CLIProcessHost.start(label: "connect")
         defer { removeSocketDirectory(for: host.socketPath) }
 
-        let result = try runCLI(["connect", "--device", cliProcessDevice.deviceId], socketPath: host.socketPath)
+        let result = try await runCLI(["connect", "--device", cliProcessDevice.deviceId], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
         let connectCount = await host.stub.requestCounts["scanner.connect"]
         #expect(connectCount == 1)
@@ -307,7 +346,7 @@ struct ScanstudioCLIProcessTests {
 
         let before = await host.stub.requestCounts
         for _ in 0..<3 {
-            let result = try runCLI(["status"], socketPath: host.socketPath)
+            let result = try await runCLI(["status"], socketPath: host.socketPath)
             #expect(result.exitCode == 0)
         }
         let after = await host.stub.requestCounts
@@ -324,7 +363,7 @@ struct ScanstudioCLIProcessTests {
         defer { removeSocketDirectory(for: host.socketPath) }
         let before = await host.stub.requestCounts
 
-        let result = try runCLI(["frames", "include", "5-2"], socketPath: host.socketPath)
+        let result = try await runCLI(["frames", "include", "5-2"], socketPath: host.socketPath)
         #expect(result.exitCode == 64)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let error = try #require(object["error"] as? [String: Any])
@@ -342,7 +381,7 @@ struct ScanstudioCLIProcessTests {
         defer { removeSocketDirectory(for: host.socketPath) }
         await host.model.openProject(directory: cliProcessProjectDirectory)
 
-        let result = try runCLI(["frames", "list"], socketPath: host.socketPath)
+        let result = try await runCLI(["frames", "list"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let resultObject = try #require(object["result"] as? [String: Any])
@@ -357,7 +396,7 @@ struct ScanstudioCLIProcessTests {
         defer { removeSocketDirectory(for: host.socketPath) }
         await host.model.openProject(directory: cliProcessProjectDirectory)
 
-        let result = try runCLI(["frames", "exclude", "1"], socketPath: host.socketPath)
+        let result = try await runCLI(["frames", "exclude", "1"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
         let excludeCount = await host.stub.requestCounts["project.setFrameExcluded"]
         #expect(excludeCount == 1)
@@ -371,7 +410,7 @@ struct ScanstudioCLIProcessTests {
         defer { removeSocketDirectory(for: host.socketPath) }
         await host.model.openProject(directory: cliProcessProjectDirectory)
 
-        let result = try runCLI(["frames", "include", "1-2"], socketPath: host.socketPath)
+        let result = try await runCLI(["frames", "include", "1-2"], socketPath: host.socketPath)
         #expect(result.exitCode == 64)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let error = try #require(object["error"] as? [String: Any])
@@ -392,7 +431,7 @@ struct ScanstudioCLIProcessTests {
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let result = try runCLI(["diagnostics", "export", "--to", tempDirectory.path], socketPath: host.socketPath)
+        let result = try await runCLI(["diagnostics", "export", "--to", tempDirectory.path], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let resultObject = try #require(object["result"] as? [String: Any])
@@ -401,6 +440,144 @@ struct ScanstudioCLIProcessTests {
         #expect(FileManager.default.fileExists(atPath: path))
         let contents = try FileManager.default.contentsOfDirectory(atPath: tempDirectory.path)
         #expect(contents == [(path as NSString).lastPathComponent])
+
+        await host.server.stop()
+    }
+
+    // MARK: Task 3 -- settings get/set, outputs get/set, roll save/open/list
+
+    @Test("settings get exits 0 and its result carries capture and processing")
+    func settingsGetReturnsCaptureAndProcessing() async throws {
+        let host = try await CLIProcessHost.start(label: "settings-get")
+        defer { removeSocketDirectory(for: host.socketPath) }
+
+        let result = try await runCLI(["settings", "get"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["capture"] is [String: Any])
+        #expect(resultObject["processing"] is [String: Any])
+
+        await host.server.stop()
+    }
+
+    @Test("settings set --resolution overwrites only resolutionDpi, proving read-modify-write not a wholesale overwrite")
+    func settingsSetOverwritesOnlyResolution() async throws {
+        let host = try await CLIProcessHost.start(label: "settings-set")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let before = await host.model.captureRecipe
+
+        let result = try await runCLI(["settings", "set", "--resolution", "4000"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+
+        let after = await host.model.captureRecipe
+        let expected = CaptureRecipe(
+            resolutionDpi: 4_000,
+            bitDepth: before.bitDepth,
+            multisamplePasses: before.multisamplePasses,
+            channels: before.channels
+        )
+        #expect(after == expected)
+
+        await host.server.stop()
+    }
+
+    @Test("outputs get exits 0 and its result carries outputs")
+    func outputsGetReturnsOutputs() async throws {
+        let host = try await CLIProcessHost.start(label: "outputs-get")
+        defer { removeSocketDirectory(for: host.socketPath) }
+
+        let result = try await runCLI(["outputs", "get"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["outputs"] is [String: Any])
+
+        await host.server.stop()
+    }
+
+    @Test("outputs set --preview-destination changes only that field")
+    func outputsSetChangesOnlyPreviewDestination() async throws {
+        let host = try await CLIProcessHost.start(label: "outputs-set")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let before = await host.model.outputRecipe
+        let newDestination = "/tmp/cli-process-outputs-set-preview"
+
+        let result = try await runCLI(["outputs", "set", "--preview-destination", newDestination], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+
+        let after = await host.model.outputRecipe
+        let expected = OutputRecipe(
+            archive: before.archive,
+            rawExport: before.rawExport,
+            positive: before.positive,
+            preview: PreviewRecipe(
+                enabled: before.preview.enabled,
+                fileFormat: before.preview.fileFormat,
+                maxLongEdgePx: before.preview.maxLongEdgePx,
+                filenameTemplate: before.preview.filenameTemplate,
+                destination: newDestination
+            ),
+            autoCrop: before.autoCrop,
+            c41Render: before.c41Render
+        )
+        #expect(after == expected)
+
+        await host.server.stop()
+    }
+
+    @Test("roll save without --confirm-motion exits 77 with CONFIRMATION_REQUIRED, and the host's stub recorded zero new requests")
+    func rollSaveWithoutConfirmMotionExitsConfirmationRequired() async throws {
+        let host = try await CLIProcessHost.start(label: "roll-save-unconfirmed")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let before = await host.stub.requestCounts
+
+        let result = try await runCLI(
+            ["roll", "save", "--name", "x", "--carrier", "roll36", "--frame-count", "36", "--film-process", "c41ColorNegative"],
+            socketPath: host.socketPath
+        )
+        #expect(result.exitCode == 77)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "CONFIRMATION_REQUIRED")
+
+        let after = await host.stub.requestCounts
+        #expect(before == after)
+
+        await host.server.stop()
+    }
+
+    @Test("roll save --confirm-motion against a host with no selected frames exits with the host's own typed refusal printed verbatim")
+    func rollSaveConfirmedWithNoSelectedFramesReportsHostRefusal() async throws {
+        let host = try await CLIProcessHost.start(label: "roll-save-no-frames")
+        defer { removeSocketDirectory(for: host.socketPath) }
+
+        let result = try await runCLI(
+            [
+                "roll", "save", "--name", "x", "--carrier", "roll36", "--frame-count", "36",
+                "--film-process", "c41ColorNegative", "--confirm-motion"
+            ],
+            socketPath: host.socketPath
+        )
+        #expect(result.exitCode != 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "GATE_REFUSED")
+        #expect((error["message"] as? String)?.contains("Select at least one frame") == true)
+
+        await host.server.stop()
+    }
+
+    @Test("roll list exits 0 and its result carries a projects array")
+    func rollListReturnsProjectsArray() async throws {
+        let host = try await CLIProcessHost.start(label: "roll-list")
+        defer { removeSocketDirectory(for: host.socketPath) }
+
+        let result = try await runCLI(["roll", "list"], socketPath: host.socketPath)
+        #expect(result.exitCode == 0)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["projects"] is [Any])
 
         await host.server.stop()
     }
