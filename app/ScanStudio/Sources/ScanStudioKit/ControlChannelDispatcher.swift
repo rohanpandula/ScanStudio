@@ -1097,6 +1097,11 @@ public final class ControlChannelDispatcher {
             projectDirectory: sessionModel.projectDirectory,
             jobId: sessionModel.jobId,
             jobState: sessionModel.jobState,
+            // D-15: the only wire-visible proof a preview finished, before
+            // a project exists. Same source `frames.list`'s own
+            // pre-project branch and every preview-completion gate in this
+            // file already read.
+            previewComplete: sessionModel.latestCompletedPreviewOperationId != nil,
             // D-17: reading sessionModel.progress here (not only in
             // buildJobResult() below) is what makes withObservationTracking
             // re-emit control.changed on a progress-only update, and what

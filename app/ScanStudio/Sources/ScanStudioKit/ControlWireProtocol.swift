@@ -495,6 +495,14 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     public let projectDirectory: String?
     public let jobId: String?
     public let jobState: JobState?
+    /// D-15: additive. `true` once the most recent preview operation has
+    /// reached `scanner.thumbnailsComplete` (mirrors
+    /// `SessionModel.latestCompletedPreviewOperationId != nil` verbatim).
+    /// Before a project exists this is the **only** wire-visible proof a
+    /// preview finished -- `scanReadiness` reports `projectRequired` at
+    /// that point regardless, so it cannot stand in for this. Defaults to
+    /// `false` so every existing construction site keeps compiling.
+    public let previewComplete: Bool
     /// D-17: additive. `control.changed`'s snapshot previously carried
     /// `jobId`/`jobState` but not live progress, leaving `--wait`'s stderr
     /// progress sink with no way to observe it without an extra `job.get`
@@ -529,6 +537,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         projectDirectory: String? = nil,
         jobId: String? = nil,
         jobState: JobState? = nil,
+        previewComplete: Bool = false,
         progress: ControlScanProgress? = nil,
         refeedRequired: Bool,
         hardwareMotionReadiness: String,
@@ -548,6 +557,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.projectDirectory = projectDirectory
         self.jobId = jobId
         self.jobState = jobState
+        self.previewComplete = previewComplete
         self.progress = progress
         self.refeedRequired = refeedRequired
         self.hardwareMotionReadiness = hardwareMotionReadiness

@@ -314,9 +314,7 @@ private func runSkipBlank(threshold: Double, options: GlobalOptions) async throw
         throw ExitCode(64)
     }
 
-    let skipped = framesList.frames.filter { ($0.blankConfidence ?? -1) >= threshold }
-    let skippedIndices = Set(skipped.map(\.index))
-    let kept = framesList.frames.filter { !skippedIndices.contains($0.index) }.map(\.index)
+    let (kept, skipped) = SkipBlankSelection.select(from: framesList.frames, threshold: threshold)
 
     guard !kept.isEmpty else {
         await client.shutdown()

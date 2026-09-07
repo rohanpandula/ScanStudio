@@ -8,7 +8,11 @@ struct Roll: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "roll",
         abstract: "Save, open, or list rolls (projects).",
-        subcommands: [Save.self, Open.self, List.self]
+        // Run (D-15/HEAD-09, Commands/RunCommands.swift) lives in its own
+        // file -- it composes Save's own request shape plus five other
+        // already-shipped commands into one unattended walk, so it earns a
+        // file of its own rather than crowding this one.
+        subcommands: [Save.self, Open.self, List.self, Run.self]
     )
 
     /// `roll save` -> `roll.save`.

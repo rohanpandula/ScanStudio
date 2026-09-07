@@ -327,6 +327,177 @@ public enum ManualReviewAutoApproval {
     }
 }
 
+// MARK: - Skip-blank selection (D-12/D-15)
+
+/// The pure "which previewed frames does `--skip-blank` keep vs. skip" rule
+/// behind both `frames select --skip-blank` (`FrameCommands.swift`) and
+/// `roll run --skip-blank` (`RunCommands.swift`), factored out here so the
+/// two commands compute the identical decision from one place rather than
+/// two copies that could drift (D-15's own reuse requirement). A frame
+/// with no `blankConfidence` at all is always kept: an unscored frame is
+/// never skipped on the strength of a hint that does not exist.
+public enum SkipBlankSelection {
+    /// `kept` is every frame index whose `blankConfidence` is below
+    /// `threshold` (or absent); `skipped` is the full summary of every
+    /// other frame, so a caller can report the score that skipped it.
+    public static func select(
+        from frames: [ControlFrameSummary],
+        threshold: Double
+    ) -> (kept: [Int], skipped: [ControlFrameSummary]) {
+        let skipped = frames.filter { ($0.blankConfidence ?? -1) >= threshold }
+        let skippedIndices = Set(skipped.map(\.index))
+        let kept = frames.filter { !skippedIndices.contains($0.index) }.map(\.index)
+        return (kept, skipped)
+    }
+}
+
+// MARK: - Run receipt (D-15/HEAD-09)
+
+/// The durable, per-step record `roll run` (`RunCommands.swift`) builds as
+/// it walks D-15's composed sequence -- pure and `Codable` so its shape is
+/// provable from `RollRunReceiptTests.swift` with no subprocess and no
+/// socket. `roll run` prints exactly one of these on stdout and, when a
+/// project directory was reached, writes exactly one new copy beside the
+/// manifest (`write(toProjectDirectory:timestamp:)`) -- it never opens,
+/// reads, or rewrites a manifest, receipt, journal, or original (SAFE-03).
+public struct ControlRunReceipt: Codable, Equatable, Sendable {
+    /// One step of the walk: one wire request (or, for `previewComplete`,
+    /// one bounded local read of the event stream this run already
+    /// subscribed to -- no request of its own). `exitCode`/`outcome`
+    /// mirror the CLI's own D-10 exit-code table for that step alone,
+    /// never the run's overall result.
+    public struct Step: Codable, Equatable, Sendable {
+        public let step: String
+        public let command: String
+        public let exitCode: Int32
+        public let outcome: String
+        public let startedAt: String
+        public let endedAt: String
+
+        public init(step: String, command: String, exitCode: Int32, outcome: String, startedAt: String, endedAt: String) {
+            self.step = step
+            self.command = command
+            self.exitCode = exitCode
+            self.outcome = outcome
+            self.startedAt = startedAt
+            self.endedAt = endedAt
+        }
+    }
+
+    /// Mirrors the subset of `roll.save`'s own result this receipt needs --
+    /// never a second copy of `ControlProjectSummary`'s full shape.
+    public struct Project: Codable, Equatable, Sendable {
+        public let name: String?
+        public let directory: String?
+
+        public init(name: String? = nil, directory: String? = nil) {
+            self.name = name
+            self.directory = directory
+        }
+    }
+
+    public struct Frames: Codable, Equatable, Sendable {
+        public var selected: [Int]
+        public var skipped: [Int]
+        public var autoApproved: [Int]
+
+        public init(selected: [Int] = [], skipped: [Int] = [], autoApproved: [Int] = []) {
+            self.selected = selected
+            self.skipped = skipped
+            self.autoApproved = autoApproved
+        }
+    }
+
+    public private(set) var steps: [Step] = []
+    public var project: Project?
+    public var jobId: String?
+    public var jobState: String?
+    public var frames = Frames()
+    /// Set only after a successful `write(toProjectDirectory:timestamp:)`
+    /// -- omitted from the wire (via `encodeIfPresent`) when no write was
+    /// attempted or the write failed, so a caller can tell "no project
+    /// directory yet" and "write failed" apart from "here is the file."
+    public var receiptPath: String?
+
+    public init() {}
+
+    /// Appends one step. Never mutates an existing entry -- the walk is
+    /// append-only, matching SAFE-02's "one attempt per step" invariant.
+    public mutating func record(step: String, command: String, exitCode: Int32, outcome: String, startedAt: String, endedAt: String) {
+        steps.append(Step(step: step, command: command, exitCode: exitCode, outcome: outcome, startedAt: startedAt, endedAt: endedAt))
+    }
+
+    /// ISO-8601 with fractional seconds, always UTC -- never a
+    /// locale-dependent description. A fresh formatter per call, matching
+    /// this codebase's own established `ISO8601DateFormatter` idiom
+    /// (`SessionModel.swift`, `ControlChannelDispatcher.swift`) rather than
+    /// sharing one mutable instance across calls.
+    public static func isoTimestamp(_ date: Date = Date()) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    /// `.sortedKeys` so two encodes of an identical receipt render
+    /// byte-identically (OUT-01) -- the same stability guarantee
+    /// `ControlCLIOutput.renderResult` already gives every other command's
+    /// output.
+    public func encodedJSON() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(self)
+    }
+
+    /// Refuses to overwrite anything (SAFE-03): missing directory or an
+    /// existing file at the computed path each throw this typed error --
+    /// never an overwrite, never a guess at what already occupies the
+    /// name.
+    public enum WriteError: Error, Equatable, Sendable {
+        case directoryMissing(String)
+        case fileAlreadyExists(String)
+    }
+
+    /// Writes `cli-run-<yyyyMMdd'T'HHmmss'Z'>.json` into
+    /// `directory` (the project directory beside `manifest.json`, never
+    /// inside it) and returns the written path. `directory` must already
+    /// exist; the filename itself must not -- both refuse via `WriteError`
+    /// rather than silently overwriting.
+    ///
+    /// The actual write uses `.withoutOverwriting` alone, never combined
+    /// with `.atomic` -- on this Foundation, `Data.write(to:options:)`
+    /// treats `[.withoutOverwriting, .atomic]` together as a programmer
+    /// error and traps (`Fatal error: withoutOverwriting is not supported
+    /// with atomic`), found by this file's own `writeRefusesToOverwrite`
+    /// test. `.withoutOverwriting` alone is `O_EXCL`-backed -- the
+    /// existence check and the file's creation happen as one indivisible
+    /// kernel operation, which is the exact TOCTOU-proof guarantee SAFE-03
+    /// needs (never an overwrite); `.atomic`'s own benefit (no torn file
+    /// if the process dies mid-write) does not apply to a receipt, which
+    /// is neither a manifest nor a journal.
+    public func write(toProjectDirectory directory: String, timestamp: Date = Date()) throws -> String {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw WriteError.directoryMissing(directory)
+        }
+        let filenameFormatter = DateFormatter()
+        filenameFormatter.locale = Locale(identifier: "en_US_POSIX")
+        filenameFormatter.timeZone = TimeZone(identifier: "UTC")
+        filenameFormatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        let filename = "cli-run-\(filenameFormatter.string(from: timestamp)).json"
+        let url = URL(fileURLWithPath: directory).appendingPathComponent(filename)
+        guard !FileManager.default.fileExists(atPath: url.path) else {
+            throw WriteError.fileAlreadyExists(url.path)
+        }
+        let data = try encodedJSON()
+        do {
+            try data.write(to: url, options: [.withoutOverwriting])
+        } catch let error as CocoaError where error.code == .fileWriteFileExists {
+            throw WriteError.fileAlreadyExists(url.path)
+        }
+        return url.path
+    }
+}
+
 // MARK: - Progress line (D-17)
 
 /// Pure, unit-testable stderr progress-line formatter for `--wait`
