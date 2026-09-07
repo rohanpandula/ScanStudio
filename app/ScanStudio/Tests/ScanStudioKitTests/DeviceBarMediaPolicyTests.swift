@@ -94,4 +94,60 @@ struct DeviceBarMediaPolicyTests {
             lastErrorMessage: "REFEED_REQUIRED: eject or refeed the strip"
         ))
     }
+
+    @Test("a physically-present, never-yet-previewed film offers Eject (incident 2026-09-07)")
+    func filmPresentWithNoPreviewYetOffersEject() {
+        #expect(DeviceBarEjectPolicy.canOffer(
+            isConnected: true,
+            transportIsIdle: true,
+            isJobActive: false,
+            mediaLoaded: false,
+            filmPresent: true,
+            refeedRequired: false,
+            lastErrorMessage: nil
+        ))
+    }
+
+    @Test("the eject gate matches its own rule for every filmPresent × mediaLoaded × refeedRequired × isConnected × transportIsIdle × isJobActive combination (D-11a)")
+    func ejectGateMatrixMatchesRuleForEveryCombination() {
+        let filmPresentValues: [Bool?] = [true, false, nil]
+        let boolValues = [true, false]
+        for filmPresent in filmPresentValues {
+            for mediaLoaded in boolValues {
+                for refeedRequired in boolValues {
+                    for isConnected in boolValues {
+                        for transportIsIdle in boolValues {
+                            for isJobActive in boolValues {
+                                // The oracle states the rule independently of `canOffer`'s body:
+                                // readiness (connected, idle transport, no active job) AND a
+                                // sensor that has not confirmed absence AND (already-previewed
+                                // OR a legacy refeed OR a live present reading on its own).
+                                let expected = isConnected && transportIsIdle && !isJobActive
+                                    && filmPresent != false
+                                    && (mediaLoaded || refeedRequired || filmPresent == true)
+                                let actual = DeviceBarEjectPolicy.canOffer(
+                                    isConnected: isConnected,
+                                    transportIsIdle: transportIsIdle,
+                                    isJobActive: isJobActive,
+                                    mediaLoaded: mediaLoaded,
+                                    filmPresent: filmPresent,
+                                    refeedRequired: refeedRequired,
+                                    lastErrorMessage: nil
+                                )
+                                #expect(
+                                    actual == expected,
+                                    """
+                                    isConnected: \(isConnected), transportIsIdle: \(transportIsIdle), \
+                                    isJobActive: \(isJobActive), mediaLoaded: \(mediaLoaded), \
+                                    filmPresent: \(String(describing: filmPresent)), \
+                                    refeedRequired: \(refeedRequired) — expected \(expected), got \(actual)
+                                    """
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
