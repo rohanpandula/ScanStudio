@@ -777,18 +777,20 @@ public final class ControlChannelDispatcher {
     /// one of the four physical gates (`ControlGate`); an absent `gate`
     /// means an app-level precondition. Plan 06 and Phase 2 keep this rule.
     ///
-    /// ponytail: `recoverable` is always `false` here, because `SessionModel`
-    /// retains only `Self.describe`'s rendered string, not the engine's
-    /// typed `EngineRequestError.recoverable` flag. Upgrade path: have
-    /// `SessionModel` retain the typed error payload instead of only its
-    /// rendered message (Phase 2 / OUT-03).
+    /// `recoverable` is now the engine's own flag, read off
+    /// `sessionModel.lastEngineError` (OUT-03) -- the code-match guard below
+    /// is what stops a stale retained payload from being misattributed to a
+    /// textually similar later failure.
     private func outcome(id: UInt64, errorMessageBefore: String?) -> ControlResponse {
         guard let message = sessionModel.lastErrorMessage, message != errorMessageBefore else {
             return .success(id: id, result: .empty(ControlEmptyResult()))
         }
         if let prefix = Self.parseEngineCodePrefix(message) {
+            let recoverable = sessionModel.lastEngineError?.code == prefix.code
+                ? sessionModel.lastEngineError?.recoverable ?? false
+                : false
             return .failure(id: id, error: ControlErrorPayload(
-                code: prefix.code, message: prefix.remainder, recoverable: false
+                code: prefix.code, message: prefix.remainder, recoverable: recoverable
             ))
         }
         return .failure(id: id, error: ControlErrorPayload(.gateRefused, message: message, guidance: message))

@@ -35,7 +35,7 @@ When a failure originates in the engine or the bridge instead of the channel its
 
 A `GATE_REFUSED` body additionally carries `gate`, naming which gate refused (one of `hardwareMotionReadiness`, `scanReadiness`, `refeedRequired`, `manualReviewPending`), and `guidance`, the same operator-facing explanation the GUI would show next to a disabled action.
 
-Every channel-level code above is `recoverable: false` — a refusal always requires the caller to change something (confirm, wait, resolve the gate) before retrying, never to retry the identical request unchanged. Channel error bodies never carry hardware diagnostic detail; a policy refusal exposes only `code`, `message`, `recoverable`, `guidance`, and `gate`.
+Every channel-level code above is `recoverable: false` — a refusal always requires the caller to change something (confirm, wait, resolve the gate) before retrying, never to retry the identical request unchanged; an engine- or bridge-originated code instead carries the engine's own `recoverable` flag verbatim, exactly as it does for `code` itself. Channel error bodies never carry hardware diagnostic detail; a policy refusal exposes only `code`, `message`, `recoverable`, `guidance`, and `gate`.
 
 ## Methods
 
@@ -131,4 +131,3 @@ Exactly one mutating operation runs at a time (D-07). A second mutating or motio
 Recorded here so both gaps stay visible in the spec, not only in a plan:
 
 - **Attended-scan-recovery approval** (`SessionModel.approveEveryFrameAndScan()`, the path behind `ContentView.swift`'s attended-retry banner) has no D-05 command name yet. It approves every frame in the roll against a different confirmation contract than `review.approve`'s single-boundary approval and needs its own command; this is Phase 2 / CLI-05 work.
-- **`ControlErrorPayload.recoverable`** is currently always `false` on every operation-failure path this channel produces from its own `outcome` translation (`ControlChannelDispatcher.outcome(id:errorMessageBefore:)`), because `SessionModel` retains only the rendered failure message, not the engine's typed `recoverable` flag. An engine- or bridge-originated failure's own `code` still passes through verbatim; only the boolean is flattened. The upgrade path is having `SessionModel` retain the typed error payload instead of only its rendered string (Phase 2 / OUT-03).
