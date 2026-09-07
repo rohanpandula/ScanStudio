@@ -52,18 +52,44 @@ struct Frames: AsyncParsableCommand {
         @Flag(name: .customLong("none"), help: "Clear the selection.")
         var none = false
 
+        /// D-12/HEAD-06: selects previewed frames whose `blankConfidence`
+        /// is below `--blank-threshold` (default
+        /// `BlankFrameHint.defaultSkipThreshold`). A frame with no
+        /// `blankConfidence` at all (no decodable raster) is always kept --
+        /// an unscored frame is never skipped on the strength of a hint
+        /// that does not exist.
+        @Flag(name: .customLong("skip-blank"), help: "Select previewed frames whose blank-frame confidence is below the threshold, printing what it skipped and why.")
+        var skipBlank = false
+
+        @Option(name: .customLong("blank-threshold"), help: "0..1, only with --skip-blank. Defaults to 0.8.")
+        var blankThreshold: Double?
+
         private var parsedIndices: [Int] = []
+        private var resolvedBlankThreshold = BlankFrameHint.defaultSkipThreshold
 
         mutating func validate() throws {
-            guard [ranges != nil, all, none].filter({ $0 }).count == 1 else {
+            guard [ranges != nil, all, none, skipBlank].filter({ $0 }).count == 1 else {
                 let payload = ControlErrorPayload(
                     code: ControlCLIErrorCode.invalidRange.rawValue,
-                    message: "\"frames select\" requires exactly one of a range argument, --all, or --none.",
+                    message: "\"frames select\" requires exactly one of a range argument, --all, --none, or --skip-blank.",
                     recoverable: false
                 )
                 let text = try ControlCLIOutput.renderError(command: "frames.select", payload: payload, human: options.human)
                 print(text, terminator: "")
                 throw ExitCode(64)
+            }
+            if let blankThreshold {
+                guard skipBlank, (0...1).contains(blankThreshold) else {
+                    let payload = ControlErrorPayload(
+                        code: ControlCLIErrorCode.invalidRange.rawValue,
+                        message: "--blank-threshold requires --skip-blank and must be within 0...1, got \(blankThreshold).",
+                        recoverable: false
+                    )
+                    let text = try ControlCLIOutput.renderError(command: "frames.select", payload: payload, human: options.human)
+                    print(text, terminator: "")
+                    throw ExitCode(64)
+                }
+                resolvedBlankThreshold = blankThreshold
             }
             guard let ranges else { return }
             do {
@@ -81,15 +107,19 @@ struct Frames: AsyncParsableCommand {
         }
 
         func run() async throws {
-            let params: ControlFramesSelectParams
-            if all {
-                params = ControlFramesSelectParams(all: true)
-            } else if none {
-                params = ControlFramesSelectParams(none: true)
-            } else {
-                params = ControlFramesSelectParams(indices: parsedIndices)
+            guard skipBlank else {
+                let params: ControlFramesSelectParams
+                if all {
+                    params = ControlFramesSelectParams(all: true)
+                } else if none {
+                    params = ControlFramesSelectParams(none: true)
+                } else {
+                    params = ControlFramesSelectParams(indices: parsedIndices)
+                }
+                try await CommandRunner.run(command: "frames.select", method: "frames.select", params: params, options: options)
+                return
             }
-            try await CommandRunner.run(command: "frames.select", method: "frames.select", params: params, options: options)
+            try await runSkipBlank(threshold: resolvedBlankThreshold, options: options)
         }
     }
 
@@ -238,6 +268,107 @@ private func renderFrameSelectionRefusal(
         return base
     }
     object["applied"] = applied
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    return (String(data: data, encoding: .utf8) ?? base) + "\n"
+}
+
+/// `--skip-blank`'s own request sequence (D-12/HEAD-06): `frames.list`
+/// first, decoded as `ControlFramesListResult`; then, on the same
+/// connection, `frames.select` with the computed indices. The selection
+/// rule is literal: a frame is *kept* when it has no `blankConfidence` at
+/// all (an unscored frame is never skipped on the strength of a hint that
+/// does not exist) or its `blankConfidence` is below `threshold`; every
+/// other frame is *skipped*. An empty `frames.list` or an all-skipped
+/// result both refuse with a CLI-originated INVALID_RANGE-class payload,
+/// exit 64 -- silently selecting nothing would look like success
+/// (T-03-30). On success, `skipped` (index + score, the same one this
+/// command prints before sending `frames.select`) is merged into the
+/// rendered `frames.select` result so stdout stays exactly one JSON object
+/// (D-09).
+private func runSkipBlank(threshold: Double, options: GlobalOptions) async throws {
+    let command = "frames.select"
+    let client = try await CommandRunner.openConnection(command: command, options: options)
+    let listResponse = try await CommandRunner.requestWithoutParams(
+        command: command, method: "frames.list", options: options, client: client
+    )
+    guard case .result(let listData) = listResponse else {
+        try await CommandRunner.finish(command: command, options: options, client: client, response: listResponse)
+        return
+    }
+    guard let framesList = try? JSONDecoder().decode(ControlFramesListResult.self, from: listData) else {
+        try await CommandRunner.fail(
+            command: command,
+            options: options,
+            client: client,
+            error: ControlChannelClientError.malformedResponse
+        )
+    }
+
+    guard !framesList.frames.isEmpty else {
+        await client.shutdown()
+        try renderSkipBlankRefusal(
+            command: command,
+            message: "\"frames select --skip-blank\" found no previewed frames -- no preview has completed yet.",
+            options: options
+        )
+        throw ExitCode(64)
+    }
+
+    let skipped = framesList.frames.filter { ($0.blankConfidence ?? -1) >= threshold }
+    let skippedIndices = Set(skipped.map(\.index))
+    let kept = framesList.frames.filter { !skippedIndices.contains($0.index) }.map(\.index)
+
+    guard !kept.isEmpty else {
+        await client.shutdown()
+        let highestScore = skipped.compactMap(\.blankConfidence).max() ?? 0
+        try renderSkipBlankRefusal(
+            command: command,
+            message: "\"frames select --skip-blank\" would select no frames: every previewed frame scored at or above the \(threshold) threshold (highest \(highestScore)).",
+            options: options
+        )
+        throw ExitCode(64)
+    }
+
+    let selectResponse = try await CommandRunner.request(
+        command: command,
+        method: "frames.select",
+        params: ControlFramesSelectParams(indices: kept),
+        options: options,
+        client: client
+    )
+    switch selectResponse {
+    case .result(let data):
+        let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+        let base = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human)
+        print(try mergeSkippedIntoRenderedOutput(base, skipped: skipped, human: options.human), terminator: "")
+        await client.shutdown()
+    case .failure(let payload):
+        let base = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human)
+        print(try mergeSkippedIntoRenderedOutput(base, skipped: skipped, human: options.human), terminator: "")
+        await client.shutdown()
+        throw ExitCode(ControlCLIExitCode.forErrorCode(payload.code).rawValue)
+    }
+}
+
+private func renderSkipBlankRefusal(command: String, message: String, options: GlobalOptions) throws {
+    let payload = ControlErrorPayload(code: ControlCLIErrorCode.invalidRange.rawValue, message: message, recoverable: false)
+    let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human)
+    print(text, terminator: "")
+}
+
+/// Same re-parse/re-serialize-with-`.sortedKeys` technique
+/// `renderFrameSelectionRefusal` established for `applied`, generalized to
+/// `--skip-blank`'s own `skipped: [{index, blankConfidence}]` array so
+/// stdout stays exactly one JSON object either way.
+private func mergeSkippedIntoRenderedOutput(_ base: String, skipped: [ControlFrameSummary], human: Bool) throws -> String {
+    guard !human else {
+        let lines = skipped.map { "  - \($0.index) (\($0.blankConfidence ?? 0))" }.joined(separator: "\n")
+        return base + "skipped:\n" + lines + "\n"
+    }
+    guard var object = try JSONSerialization.jsonObject(with: Data(base.utf8)) as? [String: Any] else {
+        return base
+    }
+    object["skipped"] = skipped.map { ["index": $0.index, "blankConfidence": $0.blankConfidence ?? 0] }
     let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     return (String(data: data, encoding: .utf8) ?? base) + "\n"
 }

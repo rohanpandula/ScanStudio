@@ -301,6 +301,32 @@ public enum ControlFrameRangeParser {
     }
 }
 
+// MARK: - Manual-review auto-approve predicate (D-14)
+
+/// The pure "should this pending review auto-approve" decision behind
+/// `roll save --auto-approve` (`RollCommands.swift`), factored out here --
+/// not into the `scanstudio-cli` executable target -- so it is directly
+/// unit-testable from `ScanStudioKitTests`: that target depends only on
+/// `ScanStudioKit` (`Package.swift`), never on the CLI executable target,
+/// the same reason this file's other CLI-adjacent pure helpers
+/// (`ControlProgressLine`, `ControlFrameRangeParser`) live here instead of
+/// alongside the commands that call them.
+public enum ManualReviewAutoApproval {
+    /// Approves only when `frames` is non-empty and **every** frame's
+    /// `contentConfidence` is non-`nil` and at or above
+    /// `BlankFrameHint.defaultSkipThreshold` -- a single `nil` or a single
+    /// lower score refuses the whole batch (SAFE-02: no partial
+    /// auto-approval, and never a second attempt at a different threshold).
+    /// Threshold value is the same `0.8` `frames select --skip-blank`
+    /// defaults to, for the same underlying reason (D-14), but is read
+    /// from `BlankFrameHint` directly rather than duplicated here.
+    public static func shouldAutoApprove(_ frames: [ControlManualReviewFrame]) -> Bool {
+        !frames.isEmpty && frames.allSatisfy {
+            ($0.contentConfidence ?? -1) >= BlankFrameHint.defaultSkipThreshold
+        }
+    }
+}
+
 // MARK: - Progress line (D-17)
 
 /// Pure, unit-testable stderr progress-line formatter for `--wait`
