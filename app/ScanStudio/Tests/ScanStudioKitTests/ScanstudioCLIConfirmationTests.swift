@@ -268,17 +268,29 @@ private func driveConfirmationFrameFailure(_ model: SessionModel, jobId: String,
     ))
 }
 
-/// Bounded polling for "the host's dispatch of the caller's own
-/// scan.start/scan.resume request has completed" -- a real subprocess plus
-/// a real socket round trip is a different timing domain than an
-/// in-process actor hop, so this bound is generous; the suite's own
-/// `.timeLimit` is the backstop, never an arbitrary sleep in the test
-/// itself (matches this plan's own note that a stalled `--wait` is caught
-/// by the suite's time limit, not a fixed delay).
+/// Waits for "the host's dispatch of the caller's own scan.start/
+/// scan.resume request has completed" -- i.e. `SessionModel.beginJob(id:)`
+/// has run and `model.jobId` is set.
+///
+/// This must not give up early: `SessionModel.eventIsRelevant(_:source:)`
+/// only buffers an out-of-order job event while `dispatchScanStart`'s own
+/// `pendingScanStart` marker is still set; once `dispatchScanStart` returns
+/// and clears it, an event for a job that has not yet called `beginJob`
+/// is silently dropped (`eventIsRelevant` returns `false`, no buffering).
+/// If this helper gave up before `beginJob` actually ran, a caller that
+/// then drove `scanning`/`completed` anyway would have those events
+/// dropped, and the *real* `beginJob` running later would overwrite
+/// `jobState` back to `.queued` -- permanently orphaning the subprocess's
+/// `--wait`, since nothing would ever drive it to a terminal state again.
+/// A real subprocess plus a real socket round trip is also a different
+/// timing domain than an in-process actor hop, and under this suite's own
+/// concurrent test load a pure `Task.yield()` loop was observed to
+/// exhaust its budget before `beginJob` ran -- hence the real sleep
+/// between checks here, not just a yield.
 @MainActor
 private func waitForConfirmationJobToBegin(_ model: SessionModel) async {
-    for _ in 0..<20_000 where model.jobId == nil {
-        await Task.yield()
+    for _ in 0..<11_000 where model.jobId == nil {
+        try? await Task.sleep(nanoseconds: 5_000_000)
     }
 }
 
@@ -356,6 +368,111 @@ private func runConfirmationCLI(_ arguments: [String], socketPath: String) async
                 continuation.resume(throwing: error)
             }
         }
+    }
+}
+
+/// Thread-safe append-only line buffer fed by
+/// `ConfirmationEventsFollower`'s background reader thread and polled by
+/// the async test side -- a plain lock-protected class rather than an
+/// actor, so the reader thread's synchronous, strictly-ordered appends
+/// never risk being reordered by independently-scheduled `Task` hops onto
+/// an actor's mailbox.
+private final class ConfirmationLineBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    private var finished = false
+
+    func append(_ line: String) {
+        lock.lock()
+        lines.append(line)
+        lock.unlock()
+    }
+
+    func markFinished() {
+        lock.lock()
+        finished = true
+        lock.unlock()
+    }
+
+    func snapshot() -> (lines: [String], finished: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (lines, finished)
+    }
+}
+
+/// Runs `scanstudio-cli events --follow` as a genuine subprocess and
+/// collects its stdout, one NDJSON line at a time -- the streaming
+/// counterpart to `runConfirmationCLI`, which waits for a process to exit
+/// (this one never does, until the host closes or the test terminates it).
+/// The blocking `Process`/`Pipe` read loop runs on a dedicated background
+/// queue, mirroring `runConfirmationCLI`'s own rationale for keeping
+/// blocking I/O off Swift's cooperative thread pool.
+private final class ConfirmationEventsFollower: @unchecked Sendable {
+    private let process: Process
+    private let buffer = ConfirmationLineBuffer()
+
+    init(socketPath: String) throws {
+        let binary = try ConfirmationCLILocator.resolve()
+        let process = Process()
+        process.executableURL = binary
+        process.arguments = ["events", "--follow", "--socket", socketPath]
+        let stdoutPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = Pipe()
+        self.process = process
+
+        let readHandle = stdoutPipe.fileHandleForReading
+        let buffer = self.buffer
+        DispatchQueue.global(qos: .userInitiated).async {
+            var pending = Data()
+            while true {
+                let chunk = readHandle.availableData
+                if chunk.isEmpty { break } // EOF: the process exited or the pipe closed
+                pending.append(chunk)
+                while let newlineIndex = pending.firstIndex(of: 0x0A) {
+                    let lineData = pending[..<newlineIndex]
+                    pending.removeSubrange(...newlineIndex)
+                    if let line = String(data: lineData, encoding: .utf8) {
+                        buffer.append(line)
+                    }
+                }
+            }
+            buffer.markFinished()
+        }
+
+        try process.run()
+    }
+
+    /// Polls until some collected line's decoded JSON satisfies
+    /// `predicate`, the stream ends, or a generous bound elapses -- the
+    /// suite's own `.timeLimit` is the ultimate backstop. Unlike an
+    /// in-process actor hop (where yielding alone lets the other side make
+    /// progress, since both sides compete for the same actor queue), the
+    /// data this polls for is written by a genuinely separate OS thread
+    /// reading a real subprocess's pipe -- a pure `Task.yield()` loop can
+    /// spin through its whole budget in microseconds without ever giving
+    /// that thread a real scheduling slice, so this sleeps briefly between
+    /// checks. Re-scans everything collected so far on each poll, which is
+    /// cheap at this suite's line counts.
+    func waitForLine(matching predicate: ([String: Any]) -> Bool) async -> [String: Any]? {
+        for _ in 0..<2_000 {
+            let (lines, finished) = buffer.snapshot()
+            for line in lines {
+                if let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                   predicate(object) {
+                    return object
+                }
+            }
+            if finished { return nil }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return nil
+    }
+
+    func terminate() {
+        process.terminate()
+        process.waitUntilExit()
     }
 }
 
@@ -660,5 +777,107 @@ struct ScanstudioCLIConfirmationTests {
         #expect(startCount == 1)
 
         await host.server.stop()
+    }
+
+    // MARK: Task 3 -- events --follow and the SAFE-04 refusal-observability proof
+
+    @Test("events without --follow exits 64")
+    func eventsWithoutFollowExitsUsageError() async throws {
+        let result = try await runConfirmationCLI(["events"], socketPath: confirmationSocketPath("events-no-follow"))
+        #expect(result.exitCode == 64)
+    }
+
+    @Test("events --follow prints a first line whose parsed JSON carries schemaVersion, command == \"events\", and a control.snapshot payload")
+    func eventsFollowFirstLineCarriesSnapshot() async throws {
+        let host = try await ConfirmationHost.start(label: "events-first-line")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let follower = try ConfirmationEventsFollower(socketPath: host.socketPath)
+        defer { follower.terminate() }
+
+        let firstLine = await follower.waitForLine { _ in true }
+        let object = try #require(firstLine)
+        #expect(object["schemaVersion"] as? Int == ControlSchema.version)
+        #expect(object["command"] as? String == "events")
+        let event = try #require(object["event"] as? [String: Any])
+        #expect(event["event"] as? String == "control.snapshot")
+        #expect(event["payload"] is [String: Any])
+
+        await host.server.stop()
+    }
+
+    @Test("driving a SessionModel mutation on the host produces a follower line whose event is control.changed")
+    func eventsFollowObservesControlChangedAfterMutation() async throws {
+        let host = try await ConfirmationHost.start(label: "events-changed")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let follower = try ConfirmationEventsFollower(socketPath: host.socketPath)
+        defer { follower.terminate() }
+
+        // Wait for the first line so the follower's own events.subscribe has
+        // definitely landed before the mutation below -- otherwise the
+        // mutated state could race into the follower's very first snapshot
+        // instead of arriving as its own separate control.changed line.
+        _ = await follower.waitForLine { _ in true }
+        await host.model.connect(deviceId: confirmationDevice.deviceId)
+
+        let changed = await follower.waitForLine { object in
+            (object["event"] as? [String: Any])?["event"] as? String == "control.changed"
+        }
+        #expect(changed != nil)
+
+        await host.server.stop()
+    }
+
+    @Test("""
+    SAFE-04: with events --follow running as a subprocess, a second process's refused command (roll save with no \
+    frames selected) produces all three of: the second process's own exit code and error body, and a follower line \
+    whose event is control.changed reflecting the refusal
+    """)
+    func eventsFollowObservesRefusalFromSecondProcess() async throws {
+        let host = try await ConfirmationHost.start(label: "events-safe04")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        let follower = try ConfirmationEventsFollower(socketPath: host.socketPath)
+        defer { follower.terminate() }
+        _ = await follower.waitForLine { _ in true }
+
+        // "roll save --confirm-motion" reaches the wire (confirmed at both
+        // the CLI's own parse-time gate and, since --confirm-motion is
+        // given, the wire's motionConfirmed field) but is refused by the
+        // host for an unrelated precondition -- no frames are selected.
+        // Unlike scan.start's own scanReadiness pre-check (which returns
+        // before ever touching SessionModel), saveRollAndScanSelectedFrames
+        // is always called and sets lastErrorMessage itself before
+        // refusing, so this refusal -- unlike scan's -- is a genuine
+        // SessionModel mutation a follower can observe as control.changed.
+        let refused = try await runConfirmationCLI(
+            ["roll", "save", "--name", "x", "--carrier", "roll36", "--frame-count", "36", "--film-process", "c41ColorNegative", "--confirm-motion"],
+            socketPath: host.socketPath
+        )
+        #expect(refused.exitCode != 0)
+        let refusedObject = try #require(JSONSerialization.jsonObject(with: Data(refused.stdout.utf8)) as? [String: Any])
+        let refusedError = try #require(refusedObject["error"] as? [String: Any])
+        #expect(refusedError["code"] as? String == "GATE_REFUSED")
+
+        let changed = await follower.waitForLine { object in
+            guard let event = object["event"] as? [String: Any],
+                  event["event"] as? String == "control.changed",
+                  let payload = event["payload"] as? [String: Any]
+            else { return false }
+            return (payload["lastErrorMessage"] as? String)?.contains("Select at least one frame") == true
+        }
+        #expect(changed != nil)
+
+        await host.server.stop()
+    }
+
+    @Test("root --help lists all sixteen D-08 command groups")
+    func rootHelpListsAllCommandGroups() async throws {
+        let result = try await runConfirmationCLI(["--help"], socketPath: confirmationSocketPath("root-help"))
+        #expect(result.exitCode == 0)
+        for group in [
+            "connect", "disconnect", "rescan", "status", "preview", "frames", "review",
+            "settings", "outputs", "roll", "scan", "stop", "resume", "eject", "diagnostics", "events"
+        ] {
+            #expect(result.stdout.contains(group), "expected --help to list \(group)")
+        }
     }
 }
