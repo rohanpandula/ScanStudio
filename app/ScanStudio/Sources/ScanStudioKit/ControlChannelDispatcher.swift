@@ -424,18 +424,25 @@ public final class ControlChannelDispatcher {
             preconditionFailure("`.hello` is intercepted in handle(_:) before reaching route(_:).")
         case .status(let id):
             return .success(id: id, result: .status(buildStatusResult()))
-        case .scannerList:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .scannerRescan:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .scannerConnect:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .scannerDisconnect:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .scannerList(let id):
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.refreshAvailableDevices(rescan: false)
+            return scannerListResponse(id: id, errorMessageBefore: errorMessageBefore)
+        case .scannerRescan(let id):
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.refreshAvailableDevices(rescan: true)
+            return scannerListResponse(id: id, errorMessageBefore: errorMessageBefore)
+        case .scannerConnect(let id, let params):
+            // A `nil` `deviceId` is legitimate: it means "let
+            // `DeviceSelectionPolicy` resolve the target", the same as the
+            // GUI's own no-argument connect.
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.connect(deviceId: params.deviceId)
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+        case .scannerDisconnect(let id):
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.disconnect()
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
         case .previewAcquire:
             // Plan 05/06 replaces this arm
             return placeholder(request)
@@ -502,6 +509,76 @@ public final class ControlChannelDispatcher {
             .unknownCommand,
             message: "\"\(request.methodName)\" is not yet routed by this dispatcher build."
         ))
+    }
+
+    // MARK: Device discovery (scanner.list / scanner.rescan)
+
+    /// Shared by `.scannerList`/`.scannerRescan` after each has already
+    /// called its own literal `refreshAvailableDevices(rescan:)` -- the two
+    /// commands share one method call and differ only in that argument
+    /// (mirroring the GUI exactly, D-04); this only wraps the outcome.
+    private func scannerListResponse(id: UInt64, errorMessageBefore: String?) -> ControlResponse {
+        switch outcome(id: id, errorMessageBefore: errorMessageBefore) {
+        case .success:
+            return .success(id: id, result: .scannerList(
+                ControlScannerListResult(devices: sessionModel.availableDevices)
+            ))
+        case .failure(let failureId, let error):
+            return .failure(id: failureId, error: error)
+        }
+    }
+
+    // MARK: Outcome translation (shared by every mutating arm, Plans 05/06)
+
+    /// Turns "what happened during the routed call" into a typed response.
+    /// Compares `sessionModel.lastErrorMessage` against the value captured
+    /// immediately before the call -- never inferred from a return value or
+    /// an unchanged state (RESEARCH Pitfall 1: pre-check, then call, then
+    /// compare). Unchanged means success; a new, non-nil message means the
+    /// call reported a failure through the model's existing
+    /// `lastErrorMessage`/`Self.describe` path.
+    ///
+    /// A message with a leading `"CODE: "` engine-shaped prefix (the exact
+    /// form `SessionModel.describe` writes for an `EngineRequestError`)
+    /// recovers that code verbatim per D-03. Anything else is an app-level
+    /// precondition refusal (for example "This roll is already saved.")
+    /// reported as `GATE_REFUSED` with no `gate` -- a present `gate` names
+    /// one of the four physical gates (`ControlGate`); an absent `gate`
+    /// means an app-level precondition. Plan 06 and Phase 2 keep this rule.
+    ///
+    /// ponytail: `recoverable` is always `false` here, because `SessionModel`
+    /// retains only `Self.describe`'s rendered string, not the engine's
+    /// typed `EngineRequestError.recoverable` flag. Upgrade path: have
+    /// `SessionModel` retain the typed error payload instead of only its
+    /// rendered message (Phase 2 / OUT-03).
+    private func outcome(id: UInt64, errorMessageBefore: String?) -> ControlResponse {
+        guard let message = sessionModel.lastErrorMessage, message != errorMessageBefore else {
+            return .success(id: id, result: .empty(ControlEmptyResult()))
+        }
+        if let prefix = Self.parseEngineCodePrefix(message) {
+            return .failure(id: id, error: ControlErrorPayload(
+                code: prefix.code, message: prefix.remainder, recoverable: false
+            ))
+        }
+        return .failure(id: id, error: ControlErrorPayload(.gateRefused, message: message, guidance: message))
+    }
+
+    /// Recovers a leading `[A-Z][A-Z0-9_]*` run followed by `": "` -- the
+    /// exact shape `SessionModel.describe(_:)` writes for an
+    /// `EngineRequestError` (`"\(code): \(message)"`, see
+    /// `WireProtocol.swift`). `nonisolated`, like `decode(_:)` above: a pure
+    /// string parse with no `SessionModel` in scope. Not `private` so a unit
+    /// test can exercise the parse directly, independent of driving
+    /// `SessionModel` into a failure state.
+    nonisolated static func parseEngineCodePrefix(_ message: String) -> (code: String, remainder: String)? {
+        guard let colonRange = message.range(of: ": ") else { return nil }
+        let candidate = message[message.startIndex..<colonRange.lowerBound]
+        guard let first = candidate.first, first.isUppercase, first.isLetter,
+              candidate.allSatisfy({ ($0.isUppercase && $0.isLetter) || $0.isNumber || $0 == "_" })
+        else {
+            return nil
+        }
+        return (String(candidate), String(message[colonRange.upperBound...]))
     }
 
     // MARK: GATE_REFUSED normalization
