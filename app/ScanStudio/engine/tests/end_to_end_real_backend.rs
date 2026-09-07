@@ -2106,28 +2106,30 @@ fn scan_watchdog_fires_promptly_even_when_a_status_read_is_separately_stuck() {
          Plan 10-06's regression"
     );
 
-    let frame_state_failed = events
+    // D-20/HEAD-12: the watchdog fired with no `scan.frameFailed` ever
+    // naming frame 1 specifically -- its own true outcome (mid-attempt or
+    // never dispatched) is unknown to `emit_terminal_job_failure`, which
+    // now reports every frame still in `remaining` as `notAttempted` with
+    // no error, rather than fabricating a per-frame `Failed` attribution
+    // for a job-level cause it did not individually confirm. The watchdog's
+    // own diagnostic text (`BRIDGE_STREAM_STALLED`) still reaches the wire
+    // in `evidencePackageStatus` below.
+    let frame_state_not_attempted = events
         .iter()
-        .find(|event| event["event"] == "scan.frameState" && event["payload"]["state"] == "failed")
+        .find(|event| {
+            event["event"] == "scan.frameState" && event["payload"]["state"] == "notAttempted"
+        })
         .unwrap_or_else(|| {
-            panic!("expected a scan.frameState(failed) event within {elapsed:?}: {events:#?}")
+            panic!("expected a scan.frameState(notAttempted) event within {elapsed:?}: {events:#?}")
         });
     assert_eq!(
-        frame_state_failed["payload"]["frameIndex"].as_u64(),
+        frame_state_not_attempted["payload"]["frameIndex"].as_u64(),
         Some(1),
-        "the one requested-and-never-completed slot must be reported failed: {frame_state_failed:#?}"
-    );
-    assert_eq!(
-        frame_state_failed["payload"]["error"]["recoverable"].as_bool(),
-        Some(false),
-        "the silence watchdog's failure must be recoverable:false: {frame_state_failed:#?}"
+        "the one requested-and-never-confirmed slot must be reported notAttempted: {frame_state_not_attempted:#?}"
     );
     assert!(
-        frame_state_failed["payload"]["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("BRIDGE_STREAM_STALLED"),
-        "error message must name BRIDGE_STREAM_STALLED: {frame_state_failed:#?}"
+        frame_state_not_attempted["payload"]["error"].is_null(),
+        "a notAttempted frame must carry no error: {frame_state_not_attempted:#?}"
     );
 
     assert!(
@@ -2147,7 +2149,24 @@ fn scan_watchdog_fires_promptly_even_when_a_status_read_is_separately_stuck() {
         .iter()
         .map(|v| v.as_u64().expect("slot must be a number"))
         .collect();
-    assert_eq!(failed_slots, vec![1], "events: {events:#?}");
+    assert!(
+        failed_slots.is_empty(),
+        "the never-confirmed slot must not be double-counted under failed: {events:#?}"
+    );
+    let not_attempted_slots: Vec<u64> = completed_event["payload"]["summary"]["notAttempted"]
+        .as_array()
+        .expect("summary.notAttempted must be an array")
+        .iter()
+        .map(|v| v.as_u64().expect("slot must be a number"))
+        .collect();
+    assert_eq!(not_attempted_slots, vec![1], "events: {events:#?}");
+    assert!(
+        completed_event["payload"]["summary"]["evidencePackageStatus"]
+            .as_str()
+            .unwrap_or("")
+            .contains("silence watchdog"),
+        "the watchdog's own cause must still be findable in evidencePackageStatus: {completed_event:#?}"
+    );
 
     // Cleanup: kill directly rather than the graceful engine.shutdown dance
     // every other test in this file uses. server.rs's own SEPARATE
@@ -2644,20 +2663,26 @@ fn scan_error_reaches_the_client_through_the_full_server_path() {
         v.get("event") == Some(&json!("scan.completed"))
     });
 
-    let frame_state_failed = events
+    // D-20/HEAD-12: `scan.error` here names no specific slot (it is a
+    // job-level bridge closure, not a `scan.frameFailed` for frame 1
+    // itself), so frame 1 is still in `remaining` when
+    // `emit_terminal_job_failure` runs and is honestly reported
+    // `notAttempted` with no error, rather than a fabricated per-frame
+    // `Failed` attribution. The real bridge code still reaches the client
+    // in `evidencePackageStatus` below.
+    let frame_state_not_attempted = events
         .iter()
-        .find(|event| event["event"] == "scan.frameState" && event["payload"]["state"] == "failed")
-        .unwrap_or_else(|| panic!("expected a scan.frameState(failed) event: {events:#?}"));
+        .find(|event| {
+            event["event"] == "scan.frameState" && event["payload"]["state"] == "notAttempted"
+        })
+        .unwrap_or_else(|| panic!("expected a scan.frameState(notAttempted) event: {events:#?}"));
     assert_eq!(
-        frame_state_failed["payload"]["frameIndex"].as_u64(),
+        frame_state_not_attempted["payload"]["frameIndex"].as_u64(),
         Some(1)
     );
     assert!(
-        frame_state_failed["payload"]["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("REFEED_REQUIRED"),
-        "error message must name the real bridge code: {frame_state_failed:#?}"
+        frame_state_not_attempted["payload"]["error"].is_null(),
+        "a notAttempted frame must carry no error: {frame_state_not_attempted:#?}"
     );
     let evidence = events
         .iter()
@@ -2670,17 +2695,20 @@ fn scan_error_reaches_the_client_through_the_full_server_path() {
         evidence["payload"]["builds"]["app"],
         "0.0.0-test+scan-binding"
     );
-    assert_eq!(
-        frame_state_failed["payload"]["error"]["evidence"]["evidenceId"],
-        evidence["payload"]["evidenceId"]
-    );
-    assert_eq!(
-        frame_state_failed["payload"]["error"]["evidence"]["operationId"],
-        evidence["payload"]["operationId"]
-    );
-    assert_eq!(
-        frame_state_failed["payload"]["error"]["evidence"]["sessionEpoch"],
-        evidence["payload"]["sessionEpoch"]
+    // The evidence event itself is unattributed to any specific frame
+    // (T-03-46: an archived/per-frame record must never carry a richer
+    // evidence payload than codes and messages) -- its own fields above
+    // are the client's whole contract now, not a per-frame cross-check.
+    let completed_event = events
+        .iter()
+        .find(|event| event["event"] == "scan.completed")
+        .expect("scan.completed event must be present");
+    assert!(
+        completed_event["payload"]["summary"]["evidencePackageStatus"]
+            .as_str()
+            .unwrap_or("")
+            .contains("REFEED_REQUIRED"),
+        "the real bridge code must still be findable in evidencePackageStatus: {completed_event:#?}"
     );
 
     let scan_completed_count = events
@@ -3202,42 +3230,28 @@ fn bridge_crash_mid_batch_reports_honest_failure_with_zero_receipt_loss() {
         "only frame 1 may have completed: {events:#?}"
     );
 
+    // D-20/HEAD-12: frame 1 completed and is durable; the bridge then died
+    // with neither frame 2 nor frame 3 individually attributed by a
+    // `scan.frameFailed` -- both are still in `remaining` when
+    // `emit_terminal_job_failure` runs and are honestly reported
+    // `notAttempted` with no error (never a fabricated per-frame
+    // `NOT_CONNECTED` attribution neither frame specifically raised).
     for frame_index in [2, 3] {
         let frame_state = events
             .iter()
             .find(|event| {
                 event["event"] == "scan.frameState"
                     && event["payload"]["frameIndex"] == json!(frame_index)
-                    && event["payload"]["state"] == "failed"
+                    && event["payload"]["state"] == "notAttempted"
             })
             .unwrap_or_else(|| {
-                panic!("expected scan.frameState{{failed}} for frame {frame_index}: {events:#?}")
+                panic!(
+                    "expected scan.frameState{{notAttempted}} for frame {frame_index}: {events:#?}"
+                )
             });
-        assert_eq!(
-            frame_state["payload"]["error"]["recoverable"].as_bool(),
-            Some(false),
-            "post-crash frame failure must be recoverable:false: {frame_state:#?}"
-        );
-        assert_eq!(
-            frame_state["payload"]["error"]["code"],
-            "NOT_CONNECTED",
-            "dead bridge ownership is a typed connection loss: {frame_state:#?}"
-        );
-        let message = frame_state["payload"]["error"]["message"]
-            .as_str()
-            .unwrap_or("");
         assert!(
-            [
-                "sessionEpoch=1; bridgeGenerationStart=1; bridgeGenerationCurrent=1; bridgeHealthy=false",
-                "no device call, automatic open, or motion retry was attempted",
-            ]
-            .iter()
-            .all(|evidence| message.contains(evidence)),
-            "connection evidence must survive in the technical error: {frame_state:#?}"
-        );
-        assert!(
-            !message.contains("bridge-ls5000-0") && !message.contains('/'),
-            "async connection evidence must not disclose device IDs or paths: {frame_state:#?}"
+            frame_state["payload"]["error"].is_null(),
+            "a notAttempted frame must carry no error: {frame_state:#?}"
         );
     }
 
@@ -3263,10 +3277,14 @@ fn bridge_crash_mid_batch_reports_honest_failure_with_zero_receipt_loss() {
         Some(vec![json!(1)]),
         "summary.completed: {summary:#?}"
     );
+    assert!(
+        summary["failed"].as_array().map_or(true, |a| a.is_empty()),
+        "neither frame 2 nor 3 was individually attributed -- summary.failed must be empty: {summary:#?}"
+    );
     assert_eq!(
-        summary["failed"].as_array().map(|a| a.clone()),
+        summary["notAttempted"].as_array().map(|a| a.clone()),
         Some(vec![json!(2), json!(3)]),
-        "summary.failed: {summary:#?}"
+        "summary.notAttempted: {summary:#?}"
     );
     assert!(
         summary["skipped"].as_array().map_or(true, |a| a.is_empty()),

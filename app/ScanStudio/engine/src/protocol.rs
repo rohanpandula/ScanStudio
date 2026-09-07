@@ -155,6 +155,43 @@ pub enum ErrorCode {
     /// clients must not convert this into an automatic retry.
     MeterControllerRefused,
     MeterUnusable,
+    /// D-20/HEAD-12: the requested operation needs an established roll
+    /// preview/session, which is not currently present (bridge `NO_PREVIEW`).
+    NoPreview,
+    /// D-20/HEAD-12: CoolscanPy positively identified a non-strip-feeder
+    /// adapter before `roll.preview`'s worker dispatch (bridge
+    /// `ADAPTER_UNSUPPORTED`).
+    AdapterUnsupported,
+    /// D-20/HEAD-12: the roll's fingerprint at approval/scan time no longer
+    /// matches the one the operation was minted against (bridge
+    /// `FINGERPRINT_REFUSED`).
+    FingerprintRefused,
+    /// D-20/HEAD-12: CoolscanPy's `RefeedRequired` (or an internal
+    /// `IndexDecodeError`/`RollSessionError`) — the operator must eject,
+    /// refeed, and preview again (bridge `REFEED_REQUIRED`).
+    RefeedRequired,
+    /// D-20/HEAD-12 (the 2026-09-07 batch abort this plan exists for): an
+    /// unclassified synchronized refusal — e.g. a stale unit attention
+    /// breaking a ready group, or completed preview evidence from a
+    /// different USB topology (bridge `ROLL_MISMATCH`).
+    RollMismatch,
+    /// D-20/HEAD-12: surfaced only after the bridge's own fine-scan retry
+    /// budget for a transport-smear fault is exhausted (bridge
+    /// `TRANSPORT_SMEAR_DETECTED`).
+    TransportSmearDetected,
+    /// D-20/HEAD-12: CoolscanPy's `GeometryValidationError` (bridge
+    /// `GEOMETRY_VALIDATION_ERROR`).
+    GeometryValidationError,
+    /// D-20/HEAD-12: CoolscanPy's `SplitAlignmentError` (bridge
+    /// `SPLIT_ALIGNMENT_ERROR`).
+    SplitAlignmentError,
+    /// D-20/HEAD-12: CoolscanPy's `BatchIntegrityError` (bridge
+    /// `BATCH_INTEGRITY_ERROR`).
+    BatchIntegrityError,
+    /// D-20/HEAD-12: the bridge does not implement the requested operation
+    /// for this material, e.g. black-and-white negative fine scanning
+    /// (bridge `NOT_IMPLEMENTED`).
+    NotImplemented,
 }
 
 // ---------------------------------------------------------------------
@@ -311,6 +348,22 @@ pub struct LoadMediaParams {
     /// it leaves the simulator's output exactly as it has always been.
     #[serde(default)]
     pub preview_fixture: Option<String>,
+    /// D-20/HEAD-12: a **simulator-only test affordance** (one-shot, opt-in)
+    /// that arms a batch abort at this 1-based frame index for the next
+    /// `scan.start`/`scan.resume`, so the failed-batch-recovery path (D-19..
+    /// D-24) is exercisable without hardware. Validated against the
+    /// bridge's own error-code vocabulary at the `sim.loadMedia` dispatch
+    /// arm before the simulator ever sees it; the real backend rejects
+    /// `sim.loadMedia` outright regardless of this field, unchanged by this
+    /// addition. `#[serde(default)]` so omitting it leaves the simulator's
+    /// output exactly as it has always been.
+    #[serde(default)]
+    pub abort_at_frame: Option<u32>,
+    /// D-20/HEAD-12: the bridge error code the armed abort reports, e.g.
+    /// `"ROLL_MISMATCH"`. Defaults to `"ROLL_MISMATCH"` when `abortAtFrame`
+    /// is set and this is omitted. Ignored when `abortAtFrame` is absent.
+    #[serde(default)]
+    pub abort_code: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -589,6 +642,17 @@ pub struct ProjectCreateParams {
     pub film_process: domain::FilmProcess,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<String>,
+    /// D-21/HEAD-12: 1-based frame indices to create excluded, so the
+    /// pre-project (unselected-frame) operator choice is correct in the
+    /// manifest the moment it is first written -- no post-create exclusion
+    /// window during which a scan could start against the wrong set.
+    /// Validated by the `project.create` dispatch arm (every index within
+    /// `1..=frameCount`, and at least one frame left unexcluded) before
+    /// `manifest::create_project_with_excluded_frames` ever sees it.
+    /// `#[serde(default)]` so an absent field creates every frame
+    /// unexcluded, exactly like today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_frames: Option<Vec<u32>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -895,6 +959,13 @@ pub struct ScanSummary {
     pub completed: Vec<u32>,
     pub failed: Vec<u32>,
     pub skipped: Vec<u32>,
+    /// D-20/HEAD-12: frames a batch abort never reached. Reachable only
+    /// from a `Waiting` frame (see `domain::frame_state_can_transition`) --
+    /// a frame that was ever `Active` is `completed`/`failed`/`skipped`,
+    /// never here. `#[serde(default)]` so an older engine's summary (which
+    /// never sent this key) still decodes with an empty list.
+    #[serde(default)]
+    pub not_attempted: Vec<u32>,
     pub stopped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duty_cycle: Option<DutyCycleReport>,
@@ -1089,6 +1160,7 @@ mod tests {
             frame_count: 36,
             film_process: domain::FilmProcess::Positive,
             directory: Some("/tmp/scanstudio-test/proj-1".into()),
+            excluded_frames: None,
         };
         let value = serde_json::to_value(&with_directory).unwrap();
         assert_eq!(value["directory"], json!("/tmp/scanstudio-test/proj-1"));
@@ -1177,6 +1249,7 @@ mod tests {
             completed: vec![1],
             failed: vec![],
             skipped: vec![],
+            not_attempted: vec![],
             stopped: false,
             duty_cycle: None,
             evidence_package_status: None,
@@ -1197,6 +1270,7 @@ mod tests {
             completed: vec![1],
             failed: vec![],
             skipped: vec![],
+            not_attempted: vec![],
             stopped: false,
             duty_cycle: Some(DutyCycleReport {
                 per_frame_idle_ms: vec![FrameIdleSample {

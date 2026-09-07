@@ -401,6 +401,14 @@ struct State {
     /// default (unarmed) path this field can produce is what
     /// `fnv1a64_matches_golden_thumbnails` pins.
     preview_fixture: Option<PreviewFixture>,
+    /// D-20/HEAD-12: a **simulator-only test affordance** (1-based frame
+    /// index, bridge error code string) that fails the named frame and
+    /// marks every later frame `NotAttempted` the next time a scan reaches
+    /// it. `None` by default and after every fresh `load_media`, exactly
+    /// like `preview_fixture`. Consumed (reset to `None`) by
+    /// `run_scan_job` the moment it actually fires -- one-shot, never
+    /// surviving into a later scan on the same connection.
+    batch_abort: Option<(u32, String)>,
 }
 
 impl Default for State {
@@ -420,6 +428,7 @@ impl Default for State {
             thumbnail_operation_active: false,
             manual_approval_binding: None,
             preview_fixture: None,
+            batch_abort: None,
         }
     }
 }
@@ -760,6 +769,19 @@ impl SimulatedLs5000 {
     pub fn arm_preview_fixture(&self, fixture: Option<PreviewFixture>) {
         self.state.lock().unwrap().preview_fixture = fixture;
     }
+
+    /// D-20/HEAD-12: arms (`Some((frame_index, bridge_code))`) or clears
+    /// (`None`) the one-shot batch-abort test affordance. Not part of
+    /// `ScannerBackend` -- dispatched directly by the `sim.loadMedia` arm
+    /// (`server.rs`), exactly like `arm_preview_fixture` above, and only
+    /// after `load_media` has already succeeded, which is only reachable
+    /// when this backend is the active one (`RealLs5000::load_media`
+    /// unconditionally refuses). `bridge_code` is validated against the
+    /// bridge's own vocabulary by the dispatch arm before this is ever
+    /// called.
+    pub fn arm_batch_abort(&self, abort: Option<(u32, String)>) {
+        self.state.lock().unwrap().batch_abort = abort;
+    }
 }
 
 impl Default for SimulatedLs5000 {
@@ -886,6 +908,11 @@ impl ScannerBackend for SimulatedLs5000 {
         // sim.loadMedia dispatch arm immediately after this succeeds)
         // re-arms it only when that same request named one.
         state.preview_fixture = None;
+        // D-20/HEAD-12: same reset for the batch-abort affordance --
+        // property of the loaded media, cleared here, re-armed only by
+        // `arm_batch_abort` when that same `sim.loadMedia` request named
+        // one.
+        state.batch_abort = None;
         Ok(status_snapshot(&state))
     }
 
@@ -1071,7 +1098,7 @@ impl ScannerBackend for SimulatedLs5000 {
         output_authorities: Option<crate::render::JobOutputAuthorities>,
         event_tx: mpsc::Sender<String>,
     ) -> Result<String, EngineError> {
-        let (job_id, time_scale, fault_injection, output_authorities) = {
+        let (job_id, time_scale, fault_injection, batch_abort, output_authorities) = {
             let mut state = backend.state.lock().unwrap();
             if !state.connected {
                 return Err(EngineError::new(
@@ -1165,6 +1192,7 @@ impl ScannerBackend for SimulatedLs5000 {
                 job_id,
                 state.time_scale,
                 state.fault_injection.clone(),
+                state.batch_abort.clone(),
                 output_authorities,
             )
         };
@@ -1183,6 +1211,7 @@ impl ScannerBackend for SimulatedLs5000 {
                 output_authorities,
                 time_scale,
                 fault_injection,
+                batch_abort,
                 event_tx,
             );
         });
@@ -1560,6 +1589,7 @@ fn run_scan_job(
     output_authorities: crate::render::JobOutputAuthorities,
     time_scale: f64,
     fault_injection: FaultInjection,
+    batch_abort: Option<(u32, String)>,
     event_tx: mpsc::Sender<String>,
 ) {
     let device_id = backend.device.device_id.clone();
@@ -1592,6 +1622,7 @@ fn run_scan_job(
                     completed: vec![],
                     failed: vec![],
                     skipped: vec![],
+                    not_attempted: vec![],
                     stopped: true,
                     duty_cycle: None,
                     evidence_package_status: None,
@@ -1623,6 +1654,7 @@ fn run_scan_job(
 
     let mut summary = ScanSummary::default();
     let mut stop_seen: Option<StopMode> = None;
+    let mut batch_abort_triggered = false;
 
     'frames: for (i, &frame_index) in frames.iter().enumerate() {
         let frame_ordinal = i as u32 + 1;
@@ -1683,6 +1715,60 @@ fn run_scan_job(
                 error: None,
             },
         );
+
+        // D-20/HEAD-12 (1d, the 2026-09-07 batch abort): a simulator-only
+        // test affordance that fails this exact frame with the armed
+        // bridge code, in the bridge's own message shape, then marks every
+        // later frame NotAttempted -- reproducing a failed-batch-recovery
+        // scenario without hardware. One-shot: consumed here so it never
+        // survives into a later scan on this connection.
+        if let Some((abort_frame, abort_code)) = batch_abort.as_ref() {
+            if *abort_frame == frame_index {
+                let mapped_code = crate::real_backend::map_bridge_error_code_str(abort_code);
+                let error = EngineError::new(
+                    mapped_code,
+                    format!(
+                        "bridge scan.frameFailed ({abort_code}): simulated batch abort armed via sim.loadMedia"
+                    ),
+                )
+                .with_recoverable(crate::real_backend::map_bridge_error_code_recoverable(
+                    abort_code,
+                ));
+                let error_payload = ErrorPayload::from(&error);
+                let _ = set_frame_state(&backend, &job_id, frame_index, FrameState::Failed);
+                emit(
+                    &event_tx,
+                    "scan.frameState",
+                    FrameStatePayload {
+                        job_id: job_id.clone(),
+                        frame_index,
+                        state: FrameState::Failed,
+                        attempt: 1,
+                        error: Some(error_payload),
+                    },
+                );
+                summary.failed.push(frame_index);
+                for &later_frame in &frames[i + 1..] {
+                    let _ =
+                        set_frame_state(&backend, &job_id, later_frame, FrameState::NotAttempted);
+                    emit(
+                        &event_tx,
+                        "scan.frameState",
+                        FrameStatePayload {
+                            job_id: job_id.clone(),
+                            frame_index: later_frame,
+                            state: FrameState::NotAttempted,
+                            attempt: 1,
+                            error: None,
+                        },
+                    );
+                    summary.not_attempted.push(later_frame);
+                }
+                backend.state.lock().unwrap().batch_abort = None;
+                batch_abort_triggered = true;
+                break 'frames;
+            }
+        }
 
         let inject_fault = matches!(fault_injection, FaultInjection::Demo) && frame_index == 13;
         let mut attempt: u32 = 1;
@@ -1980,7 +2066,9 @@ fn run_scan_job(
         );
     }
 
-    let final_state = if stop_seen.is_some() {
+    let final_state = if batch_abort_triggered {
+        JobState::Failed
+    } else if stop_seen.is_some() {
         JobState::Stopped
     } else {
         JobState::Completed
@@ -2983,6 +3071,184 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    /// D-20/HEAD-12 (1d, the 2026-09-07 batch abort): with a batch abort
+    /// armed at frame 3, frames 1-2 complete normally, frame 3 fails with
+    /// the armed bridge code and a bridge-shaped message, and frames 4-5
+    /// (the batch never reaches them) are `notAttempted` with no error.
+    /// `summary.failed == [3]`, `summary.notAttempted == [4, 5]` -- never
+    /// the reverse.
+    #[test]
+    fn armed_batch_abort_fails_the_named_frame_and_marks_the_rest_not_attempted() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        let options = ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+        };
+        sim.connect(DEVICE_ID, &options).expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+        sim.arm_batch_abort(Some((3, "ROLL_MISMATCH".to_string())));
+
+        let (tx, rx) = mpsc::channel();
+        let recipe = CaptureRecipe {
+            resolution_dpi: 40,
+            ..CaptureRecipe::default()
+        };
+        let (output, output_dir) = isolated_output_recipe("batch-abort");
+        SimulatedLs5000::scan_start(
+            &sim,
+            vec![1, 2, 3, 4, 5],
+            recipe,
+            ProcessingRecipe::default(),
+            output,
+            HashMap::new(),
+            None,
+            tx,
+        )
+        .expect("scan start");
+
+        let mut frame_states: HashMap<u32, (String, Option<serde_json::Value>)> = HashMap::new();
+        let mut final_job_state: Option<String> = None;
+        let summary: serde_json::Value;
+        loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("scan.completed event");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if value["event"] == "scan.frameState" {
+                let index = value["payload"]["frameIndex"].as_u64().unwrap() as u32;
+                let state = value["payload"]["state"].as_str().unwrap().to_string();
+                let error = value["payload"]["error"]
+                    .as_object()
+                    .map(|_| value["payload"]["error"].clone());
+                frame_states.insert(index, (state, error));
+            }
+            if value["event"] == "scan.jobState" {
+                final_job_state = value["payload"]["state"].as_str().map(|s| s.to_string());
+            }
+            if value["event"] == "scan.completed" {
+                summary = value["payload"]["summary"].clone();
+                break;
+            }
+        }
+
+        assert_eq!(frame_states.get(&1).unwrap().0, "completed");
+        assert_eq!(frame_states.get(&2).unwrap().0, "completed");
+        let (frame3_state, frame3_error) = frame_states.get(&3).unwrap();
+        assert_eq!(frame3_state, "failed");
+        let frame3_error = frame3_error.as_ref().expect("frame 3 must carry an error");
+        assert_eq!(frame3_error["code"], serde_json::json!("ROLL_MISMATCH"));
+        assert!(
+            frame3_error["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("bridge scan.frameFailed (ROLL_MISMATCH):"),
+            "message must be the bridge's own shape: {}",
+            frame3_error["message"]
+        );
+        for frame in [4u32, 5] {
+            let (state, error) = frame_states.get(&frame).unwrap();
+            assert_eq!(state, "notAttempted", "frame {frame} must be notAttempted");
+            assert!(error.is_none(), "frame {frame} must carry no error");
+        }
+        assert_eq!(final_job_state.as_deref(), Some("failed"));
+        assert_eq!(summary["completed"], serde_json::json!([1, 2]));
+        assert_eq!(summary["failed"], serde_json::json!([3]));
+        assert_eq!(summary["notAttempted"], serde_json::json!([4, 5]));
+
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    /// The arm is one-shot: consumed by the job it aborts, never surviving
+    /// into a later scan on the same connection -- otherwise a `resume`
+    /// after excluding the armed frame would abort all over again.
+    #[test]
+    fn armed_batch_abort_does_not_survive_into_a_second_scan() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        let options = ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+        };
+        sim.connect(DEVICE_ID, &options).expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+        sim.arm_batch_abort(Some((2, "ROLL_MISMATCH".to_string())));
+
+        let recipe = CaptureRecipe {
+            resolution_dpi: 40,
+            ..CaptureRecipe::default()
+        };
+
+        // First scan: consumes the arm.
+        let (tx1, rx1) = mpsc::channel();
+        let (output1, output_dir1) = isolated_output_recipe("batch-abort-one-shot-1");
+        SimulatedLs5000::scan_start(
+            &sim,
+            vec![1, 2, 3],
+            recipe.clone(),
+            ProcessingRecipe::default(),
+            output1,
+            HashMap::new(),
+            None,
+            tx1,
+        )
+        .expect("scan start");
+        loop {
+            let line = rx1.recv_timeout(Duration::from_secs(30)).expect("event");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if value["event"] == "scan.completed" {
+                break;
+            }
+        }
+
+        // Second scan over the same (now excluded-in-practice) frame 2 must
+        // complete normally -- the arm must not still be live.
+        let (tx2, rx2) = mpsc::channel();
+        let (output2, output_dir2) = isolated_output_recipe("batch-abort-one-shot-2");
+        SimulatedLs5000::scan_start(
+            &sim,
+            vec![2],
+            recipe,
+            ProcessingRecipe::default(),
+            output2,
+            HashMap::new(),
+            None,
+            tx2,
+        )
+        .expect("scan start");
+        let summary: serde_json::Value;
+        loop {
+            let line = rx2.recv_timeout(Duration::from_secs(30)).expect("event");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if value["event"] == "scan.completed" {
+                summary = value["payload"]["summary"].clone();
+                break;
+            }
+        }
+        assert_eq!(
+            summary["completed"],
+            serde_json::json!([2]),
+            "the one-shot arm must not re-fire on a second scan"
+        );
+        assert_eq!(summary["failed"], serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(&output_dir1);
+        let _ = std::fs::remove_dir_all(&output_dir2);
+    }
+
+    /// With nothing armed, a fresh `load_media` leaves `batch_abort` unset
+    /// -- the simulator's default output is unchanged by this plan.
+    #[test]
+    fn unarmed_batch_abort_leaves_load_media_output_unchanged() {
+        let sim = SimulatedLs5000::new();
+        let options = ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+        };
+        sim.connect(DEVICE_ID, &options).expect("connect");
+        let status = sim.load_media(MediaCarrier::Roll36).expect("load media");
+        assert_eq!(status.frame_count, Some(36));
+        assert_eq!(sim.state.lock().unwrap().batch_abort, None);
     }
 
     #[test]

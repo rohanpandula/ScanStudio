@@ -1093,6 +1093,12 @@ pub enum FrameState {
     Completed,
     Failed,
     Skipped,
+    /// D-20/HEAD-12: the batch never reached this frame -- distinct from
+    /// `Failed` (which names a frame the scanner actually attempted and
+    /// that raised its own typed error). Reachable only from `Waiting`
+    /// (see `frame_state_can_transition` below), so a frame that ever went
+    /// `Active` can never be relabelled `NotAttempted`.
+    NotAttempted,
 }
 
 /// No "excluded" variant — excluded frames never enter a job at all
@@ -1106,6 +1112,7 @@ pub fn frame_state_can_transition(from: FrameState, to: FrameState) -> bool {
             | (Active, Failed)
             | (Active, Skipped)
             | (Failed, Active)
+            | (Waiting, NotAttempted)
     )
 }
 

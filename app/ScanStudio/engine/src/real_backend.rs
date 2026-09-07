@@ -4900,15 +4900,59 @@ fn map_bridge_error(err: BridgeCallError) -> EngineError {
     }
 }
 
+/// The bridge's own closed `ErrorCode` vocabulary
+/// (`bridge/src/scanstudio_bridge/protocol.py:24-51`), read verbatim as
+/// wire string literals. The authoritative membership test for "is this a
+/// real bridge code" — used by `map_bridge_error_code_never_flattens_a_
+/// known_bridge_code_to_internal` below and by the `sim.loadMedia`
+/// dispatch arm (`server.rs`) to validate the D-20 batch-abort test
+/// affordance's `abortCode` before the simulator ever sees it.
+pub(crate) const BRIDGE_ERROR_CODES: &[&str] = &[
+    "UNKNOWN_METHOD",
+    "INVALID_PARAMS",
+    "NOT_CONNECTED",
+    "ALREADY_CONNECTED",
+    "DEVICE_NOT_FOUND",
+    "DEVICE_BUSY",
+    "NO_PREVIEW",
+    "UNKNOWN_JOB",
+    "HW_MOTION_NOT_ARMED",
+    "HARDWARE_LANE_BUSY",
+    "EJECT_FAILED",
+    "FEEDER_PARKED",
+    "ADAPTER_UNSUPPORTED",
+    "FINGERPRINT_REFUSED",
+    "MANUAL_REVIEW_REQUIRED",
+    "REFEED_REQUIRED",
+    "FILM_FEED_INTERRUPTED",
+    "ROLL_MISMATCH",
+    "TRANSPORT_SMEAR_DETECTED",
+    "GEOMETRY_VALIDATION_ERROR",
+    "SPLIT_ALIGNMENT_ERROR",
+    "BATCH_INTEGRITY_ERROR",
+    "METER_UNUSABLE",
+    "METER_CONTROLLER_REFUSED",
+    "NOT_IMPLEMENTED",
+    "INTERNAL",
+];
+
 /// Maps a raw bridge error-code wire string onto PROTOCOL.md's closed
 /// `ErrorCode` vocabulary — factored out of `map_bridge_error` (10-08) so
 /// every call site that receives a bridge code as plain text (a
 /// `BridgeCallError::BridgeError`'s own `code`, `scan.error`'s `code`,
 /// `hardware.anomaly`'s `code`) shares exactly one mapping table. Same
 /// "never silently drop, always Internal with the real code in the
-/// message text" policy as `map_bridge_error`'s own doc comment.
-fn map_bridge_error_code_str(code: &str) -> ErrorCode {
+/// message text" policy as `map_bridge_error`'s own doc comment. `pub(crate)`
+/// so `sim.rs`'s D-20 batch-abort test affordance resolves the same bridge
+/// string the real backend would, rather than duplicating this table.
+pub(crate) fn map_bridge_error_code_str(code: &str) -> ErrorCode {
     match code {
+        // D-20/HEAD-12: UNKNOWN_METHOD was flattening to Internal like any
+        // other unrecognized string even though it is one of the bridge's
+        // own vocabulary members (`bridge/src/scanstudio_bridge/
+        // protocol.py`) -- ErrorCode::UnknownMethod already exists on this
+        // side for exactly this condition, it was simply never wired here.
+        "UNKNOWN_METHOD" => ErrorCode::UnknownMethod,
         "INVALID_PARAMS" => ErrorCode::InvalidParams,
         "NOT_CONNECTED" => ErrorCode::NotConnected,
         "ALREADY_CONNECTED" => ErrorCode::AlreadyConnected,
@@ -4923,6 +4967,21 @@ fn map_bridge_error_code_str(code: &str) -> ErrorCode {
         "FEEDER_PARKED" => ErrorCode::FeederParked,
         "METER_CONTROLLER_REFUSED" => ErrorCode::MeterControllerRefused,
         "METER_UNUSABLE" => ErrorCode::MeterUnusable,
+        // D-20/HEAD-12 (1a): the ten bridge codes this plan exists to stop
+        // flattening -- most critically ROLL_MISMATCH, the exact code that
+        // reached the 2026-09-07 batch abort as INTERNAL on 27 frames.
+        "NO_PREVIEW" => ErrorCode::NoPreview,
+        "ADAPTER_UNSUPPORTED" => ErrorCode::AdapterUnsupported,
+        "FINGERPRINT_REFUSED" => ErrorCode::FingerprintRefused,
+        "REFEED_REQUIRED" => ErrorCode::RefeedRequired,
+        "ROLL_MISMATCH" => ErrorCode::RollMismatch,
+        "TRANSPORT_SMEAR_DETECTED" => ErrorCode::TransportSmearDetected,
+        "GEOMETRY_VALIDATION_ERROR" => ErrorCode::GeometryValidationError,
+        "SPLIT_ALIGNMENT_ERROR" => ErrorCode::SplitAlignmentError,
+        "BATCH_INTEGRITY_ERROR" => ErrorCode::BatchIntegrityError,
+        "NOT_IMPLEMENTED" => ErrorCode::NotImplemented,
+        // Final fallback for a genuinely unknown string, and the intended
+        // destination for the literal "INTERNAL" itself.
         _ => ErrorCode::Internal,
     }
 }
@@ -4934,7 +4993,7 @@ fn map_bridge_error_code_str(code: &str) -> ErrorCode {
 /// trust-the-wire-bool policy, so the three async event arms (`scan.error`,
 /// `hardware.anomaly`, `scan.frameFailed`) and the synchronous RPC error
 /// path all share exactly one source of truth.
-fn map_bridge_error_code_recoverable(code: &str) -> bool {
+pub(crate) fn map_bridge_error_code_recoverable(code: &str) -> bool {
     code == "HARDWARE_LANE_BUSY"
 }
 
@@ -5775,30 +5834,47 @@ fn reconcile_derivative_failures(
 /// `remaining` is drained into `failed` (mirrors the pre-10-08 inline code
 /// exactly); `completed` is read-only here since a frame already reported
 /// `scan.frameCompleted` must never be re-labeled.
+/// D-20/HEAD-12 (the 2026-09-07 batch abort): whatever is still in
+/// `remaining` when this runs is, by construction, everything the batch
+/// never reached -- the frame that actually raised the failure was already
+/// removed from `remaining` and already recorded in `failed` by whichever
+/// arm attributed it (`scan.frameFailed`, a single-slot `hardware.anomaly`,
+/// ...) before this terminal function is ever called. Emitting `Failed`
+/// with the *same* `error_payload` for all of `remaining` used to claim
+/// every one of those untouched frames raised the identical bridge error
+/// the one attributed frame raised -- dishonest in both directions: the
+/// untouched frames never ran, and only one of them (if any) actually
+/// carries this cause. `NotAttempted` with no error is the honest shape;
+/// `failed` afterward names exactly the frames the scanner actually tried.
 fn emit_terminal_job_failure(
     event_tx: &mpsc::Sender<String>,
     job_id: &str,
     remaining: &mut Vec<u32>,
     completed: &[u32],
     failed: &mut Vec<u32>,
-    error_payload: &ErrorPayload,
+    // Kept for call-site/signature stability even though the new
+    // NotAttempted shape below no longer attaches it to anything: the
+    // frame this error actually describes was already reported by the
+    // caller (scan.frameFailed / a single-slot hardware.anomaly / the
+    // panic-safety net's own synthesized error) before this runs.
+    _error_payload: &ErrorPayload,
     duty_cycle: Option<DutyCycleReport>,
     evidence_package_status: Option<String>,
 ) {
-    for &frame in remaining.iter() {
+    let untouched = std::mem::take(remaining);
+    for &frame in &untouched {
         emit(
             event_tx,
             "scan.frameState",
             FrameStatePayload {
                 job_id: job_id.to_string(),
                 frame_index: frame,
-                state: FrameState::Failed,
+                state: FrameState::NotAttempted,
                 attempt: 1,
-                error: Some(error_payload.clone()),
+                error: None,
             },
         );
     }
-    failed.append(remaining);
     emit(
         event_tx,
         "scan.jobState",
@@ -5816,6 +5892,7 @@ fn emit_terminal_job_failure(
                 completed: completed.to_vec(),
                 failed: failed.clone(),
                 skipped: vec![],
+                not_attempted: untouched,
                 stopped: false,
                 duty_cycle,
                 evidence_package_status,
@@ -8091,6 +8168,7 @@ fn run_real_scan_job_inner(
                                 summary: ScanSummary {
                                     completed: completed_after_derivatives,
                                     failed: failed_after_derivatives,
+                                    not_attempted: vec![],
                                     // BRIDGE.md's scan.completed summary
                                     // has no "skipped" list at all — a
                                     // requested-but-unattempted slot is
@@ -9408,6 +9486,37 @@ mod tests {
         }
     }
 
+    /// D-20/HEAD-12 (1a): the full bridge `ErrorCode` vocabulary
+    /// (`bridge/src/scanstudio_bridge/protocol.py:24-51`), read verbatim as
+    /// wire string literals. Asserts none of them maps to
+    /// `ErrorCode::Internal` except the literal `"INTERNAL"` itself, so a
+    /// future bridge code addition is caught here rather than on a roll
+    /// (the exact 2026-09-07 failure mode: `ROLL_MISMATCH` flattened to
+    /// `INTERNAL` on 27 frames).
+    #[test]
+    fn map_bridge_error_code_never_flattens_a_known_bridge_code_to_internal() {
+        for code in BRIDGE_ERROR_CODES {
+            let mapped = map_bridge_error_code_str(code);
+            if *code == "INTERNAL" {
+                assert_eq!(mapped, ErrorCode::Internal, "INTERNAL must map to Internal");
+            } else {
+                assert_ne!(
+                    mapped,
+                    ErrorCode::Internal,
+                    "bridge code {code} must not flatten to Internal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn map_bridge_error_code_roll_mismatch_is_typed_not_internal() {
+        assert_eq!(
+            map_bridge_error_code_str("ROLL_MISMATCH"),
+            ErrorCode::RollMismatch
+        );
+    }
+
     #[test]
     fn film_feed_interrupted_bridge_code_is_typed_not_internal() {
         assert_eq!(
@@ -9652,6 +9761,94 @@ mod tests {
         assert_ne!(first_bridge_path, second_bridge_path);
     }
 
+    /// D-20/HEAD-12 (1b, the 2026-09-07 batch abort): frames 1-3 complete,
+    /// frame 4 raises `scan.frameFailed` `ROLL_MISMATCH` (the
+    /// `scan.frameFailed` arm's own real shape -- removes 4 from
+    /// `remaining`, appends it to `failed`), then the batch's terminal
+    /// closure runs with frames 5-8 still in `remaining`. Asserts frame 4
+    /// alone is `Failed` with the bridge's own code, frames 5-8 are
+    /// `NotAttempted` with no error, `summary.failed == [4]`, and
+    /// `summary.notAttempted == [5, 6, 7, 8]` -- never the reverse.
+    #[test]
+    fn emit_terminal_job_failure_marks_untouched_frames_not_attempted_not_failed() {
+        let (event_tx, event_rx) = mpsc::channel::<String>();
+        let job_id = "batch-abort-test-job".to_string();
+        let completed = vec![1u32, 2, 3];
+        // Mirrors the "scan.frameFailed" arm's own bookkeeping: frame 4
+        // already removed from `remaining` and already pushed onto
+        // `failed` before the terminal arm ever runs.
+        let mut remaining: Vec<u32> = vec![5, 6, 7, 8];
+        let mut failed: Vec<u32> = vec![4];
+        let error = EngineError::new(
+            ErrorCode::RollMismatch,
+            "bridge scan.frameFailed (ROLL_MISMATCH): meter pass 2 controller refused: low_correlation",
+        )
+        .with_recoverable(map_bridge_error_code_recoverable("ROLL_MISMATCH"));
+        let error_payload = ErrorPayload::from(&error);
+
+        emit_terminal_job_failure(
+            &event_tx,
+            &job_id,
+            &mut remaining,
+            &completed,
+            &mut failed,
+            &error_payload,
+            None,
+            None,
+        );
+        drop(event_tx);
+
+        let events: Vec<Value> = event_rx
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("valid JSON"))
+            .collect();
+
+        for frame in [5u32, 6, 7, 8] {
+            let event = events
+                .iter()
+                .find(|event| {
+                    event["event"] == "scan.frameState"
+                        && event["payload"]["frameIndex"] == json!(frame)
+                })
+                .unwrap_or_else(|| panic!("expected a scan.frameState event for frame {frame}"));
+            assert_eq!(
+                event["payload"]["state"],
+                json!("notAttempted"),
+                "frame {frame} must be notAttempted, not failed"
+            );
+            assert!(
+                event["payload"]["error"].is_null(),
+                "a notAttempted frame must carry no error, got {:?}",
+                event["payload"]["error"]
+            );
+        }
+        // Frame 4 itself is never re-emitted by emit_terminal_job_failure
+        // -- it was already reported Failed by the scan.frameFailed arm,
+        // which ran before this function was ever called.
+        assert!(
+            !events.iter().any(|event| event["event"] == "scan.frameState"
+                && event["payload"]["frameIndex"] == json!(4)),
+            "emit_terminal_job_failure must not re-emit a frame the scan.frameFailed arm already reported"
+        );
+
+        let completed_event = events
+            .iter()
+            .find(|event| event["event"] == "scan.completed")
+            .expect("expected scan.completed");
+        let summary = &completed_event["payload"]["summary"];
+        assert_eq!(summary["completed"], json!([1, 2, 3]));
+        assert_eq!(
+            summary["failed"],
+            json!([4]),
+            "failed must name exactly the frame the scanner actually tried"
+        );
+        assert_eq!(
+            summary["notAttempted"],
+            json!([5, 6, 7, 8]),
+            "notAttempted must name exactly the frames the batch never reached"
+        );
+    }
+
     /// 11-01: directly exercises the same panic-safety pattern the worker
     /// thread uses — a caught panic must still emit an honest terminal
     /// `scan.jobState{Failed}` + `scan.completed` reflecting the progress
@@ -9704,13 +9901,25 @@ mod tests {
             .map(|line| serde_json::from_str(&line).expect("valid JSON"))
             .collect();
 
-        let frame_state_failed = events
+        // D-20/HEAD-12: frame 2's own outcome when the worker panicked is
+        // unknown (it may have been mid-attempt) -- emit_terminal_job_failure
+        // now reports every slot still in `remaining` as notAttempted, never
+        // a fabricated `failed` sharing the panic's own Internal error. This
+        // is at least as honest as the old behavior: "reported failed with a
+        // message admitting the outcome is unknown" was already an
+        // approximation, and "reported not attempted" no longer invents a
+        // false attribution for a slot that was never confirmed to have run.
+        let frame_state_not_attempted = events
             .iter()
             .find(|event| {
-                event["event"] == "scan.frameState" && event["payload"]["state"] == "failed"
+                event["event"] == "scan.frameState" && event["payload"]["state"] == "notAttempted"
             })
-            .expect("expected scan.frameState(failed) for the unknown slot");
-        assert_eq!(frame_state_failed["payload"]["frameIndex"], json!(2));
+            .expect("expected scan.frameState(notAttempted) for the unknown slot");
+        assert_eq!(frame_state_not_attempted["payload"]["frameIndex"], json!(2));
+        assert!(
+            frame_state_not_attempted["payload"]["error"].is_null(),
+            "a notAttempted frame must carry no error"
+        );
 
         let job_state_failed = events
             .iter()
@@ -9731,7 +9940,11 @@ mod tests {
             completed_event["payload"]["summary"]["completed"],
             json!([1])
         );
-        assert_eq!(completed_event["payload"]["summary"]["failed"], json!([2]));
+        assert_eq!(completed_event["payload"]["summary"]["failed"], json!([]));
+        assert_eq!(
+            completed_event["payload"]["summary"]["notAttempted"],
+            json!([2])
+        );
     }
 
     #[test]
