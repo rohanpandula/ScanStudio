@@ -367,11 +367,16 @@ fn is_job_terminal(state: JobState) -> bool {
     )
 }
 
-/// The most recent successful `manual_frames()` call's operator-approval
-/// binding (adversarial review S7a, 2026-08-08). The simulator otherwise
-/// has no manual-review gate at all; this exists solely so a simulated
-/// manual placement -- which always arrives `needsApproval: true` -- is
-/// not a permanent dead end with nothing that could ever clear it.
+/// The most recent operator-approval binding, from either of two sources:
+/// a successful `manual_frames()` call (adversarial review S7a,
+/// 2026-08-08), or `acquire_thumbnails`'s own D-18 preview fixture
+/// flagging a frame (`boundaryAndBlank`). The simulator otherwise has no
+/// manual-review gate at all; this exists solely so a simulated flagged
+/// frame -- which always arrives `needsApproval: true` from either source
+/// -- is not a permanent dead end with nothing that could ever clear it.
+/// Whichever source armed it most recently wins; the two never need to
+/// coexist; a source that reflags after the other still overwrites,
+/// matching `manual_frames()`'s own precedent of one binding at a time.
 #[derive(Debug, Clone)]
 struct ManualApprovalBinding {
     operation_id: String,
@@ -702,18 +707,17 @@ impl SimulatedLs5000 {
         })
     }
 
-    /// `roll.approve` sim parity for manually-placed frames (adversarial
-    /// review S7a, 2026-08-08). The simulator otherwise has NO
-    /// manual-review gate -- every other case is refused with the same
-    /// message as before this change. Only a frame this backend's own
-    /// last successful `manual_frames()` call actually returned, under
-    /// that exact `operation_id`, can be approved; the binding is cleared
-    /// on connect/disconnect/load_media/eject so a stale approval can
-    /// never survive a session or media change (mirrors the S2 fix's own
-    /// "never let frame-indexed state silently outlive the placement that
-    /// produced it" principle). Not part of `ScannerBackend`: dispatched
-    /// directly from `Backends::roll_approve`, exactly like every other
-    /// roll.* method that is real-only or sim-only.
+    /// `roll.approve` sim parity for a flagged frame, from either
+    /// `manual_frames()` (adversarial review S7a, 2026-08-08) or D-18's
+    /// preview fixture. Only a frame `manual_approval_binding` actually
+    /// names, under that exact `operation_id`, can be approved; the
+    /// binding is cleared on connect/disconnect/load_media/eject so a
+    /// stale approval can never survive a session or media change (mirrors
+    /// the S2 fix's own "never let frame-indexed state silently outlive
+    /// the placement that produced it" principle). Not part of
+    /// `ScannerBackend`: dispatched directly from `Backends::roll_approve`,
+    /// exactly like every other roll.* method that is real-only or
+    /// sim-only.
     pub fn roll_approve(
         &self,
         frame_index: u32,
@@ -740,8 +744,9 @@ impl SimulatedLs5000 {
         }
         Err(EngineError::new(
             ErrorCode::InvalidParams,
-            "roll.approve is available on the simulator only for a frame returned by this \
-             session's own manual frame placement; the simulator has no other manual-review gate",
+            "roll.approve is available on the simulator only for a frame this session's own \
+             manual frame placement or preview fixture actually flagged; the simulator has no \
+             other manual-review gate",
         ))
     }
 
@@ -954,9 +959,18 @@ impl ScannerBackend for SimulatedLs5000 {
 
         let thread_frames = accepted_frames.clone();
         let backend_for_thread = Arc::clone(backend);
+        let acquire_operation_id = operation_id.clone();
         thread::spawn(move || {
             let tick_ms = scale_ms(80, time_scale).max(1);
             let last_position = thread_frames.len().saturating_sub(1);
+            // D-18: every frame this preview flags for manual review must
+            // actually be approvable afterward -- `roll_approve`'s own gate
+            // (below) checks `manual_approval_binding`, which until now was
+            // armed only by `manual_frames()`. Accumulated here and armed
+            // once, in the same final lock scope this closure already
+            // takes, keyed by this preview's own operation id so a LATER,
+            // different preview's approval can never reuse a stale binding.
+            let mut fixture_flagged_frames: Vec<u32> = Vec::new();
             for (position, &frame_index) in thread_frames.iter().enumerate() {
                 if !sleep_until_or_cancelled(&backend_for_thread, tick_ms) {
                     return;
@@ -995,6 +1009,7 @@ impl ScannerBackend for SimulatedLs5000 {
                             thumbnail.needs_approval = true;
                             thumbnail.warnings =
                                 vec!["boundary ambiguous (simulated fixture)".to_string()];
+                            fixture_flagged_frames.push(frame_index);
                         }
                     }
                 }
@@ -1023,6 +1038,12 @@ impl ScannerBackend for SimulatedLs5000 {
             state.thumbnail_operation_active = false;
             if !job_is_active(&state) {
                 state.transport = Transport::Idle;
+            }
+            if !fixture_flagged_frames.is_empty() {
+                state.manual_approval_binding = Some(ManualApprovalBinding {
+                    operation_id: acquire_operation_id.clone().unwrap_or_default(),
+                    frame_indices: fixture_flagged_frames.into_iter().collect(),
+                });
             }
             let status = status_snapshot(&state);
             drop(state);
@@ -2629,8 +2650,8 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(blank_path.parent().expect("tile has a parent directory"));
 
-        let textured_path = synthesize_frame_tile(DEVICE_ID, 1, FixtureTileShape::Textured)
-            .expect("textured tile");
+        let textured_path =
+            synthesize_frame_tile(DEVICE_ID, 1, FixtureTileShape::Textured).expect("textured tile");
         let textured_stddev = central_crop_population_stddev(&textured_path);
         assert!(
             textured_stddev > 16.0,
@@ -2638,6 +2659,64 @@ mod tests {
         );
         let _ =
             std::fs::remove_dir_all(textured_path.parent().expect("tile has a parent directory"));
+    }
+
+    /// [Rule 1 - Bug] Found executing plan 03-07 Task 3: `roll_approve`'s
+    /// own gate previously recognized only `manual_frames()`'s binding, so
+    /// a frame the D-18 preview fixture flagged (`needsApproval: true`,
+    /// visible in `status.manualReviewPending`) could never actually be
+    /// approved -- `review.approve`/`roll save --auto-approve` refused
+    /// every such frame with `INVALID_PARAMS`, defeating D-18's own stated
+    /// purpose ("so the review ... paths are exercisable with no
+    /// hardware"). `acquire_thumbnails` now arms `manual_approval_binding`
+    /// for its own flagged frame(s) too.
+    #[test]
+    fn preview_fixture_flagged_frame_is_approvable_via_roll_approve() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Strip6).expect("load media"); // 6 frames
+        sim.arm_preview_fixture(Some(PreviewFixture::BoundaryAndBlank));
+
+        let operation_id = "d18-approve-op";
+        let (tx, rx) = mpsc::channel();
+        SimulatedLs5000::acquire_thumbnails(
+            &sim,
+            None,
+            FilmProcess::default(),
+            Some(operation_id.to_string()),
+            tx,
+        )
+        .expect("acquire");
+
+        // Drain through scanner.status -- the binding is armed in the same
+        // final lock scope that precedes it, so seeing this event means
+        // the binding (if any) is already set.
+        loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timed out waiting for scanner.status");
+            let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if event["event"] == "scanner.status" {
+                break;
+            }
+        }
+
+        sim.roll_approve(5, operation_id, false).expect(
+            "the fixture-flagged frame (5 of 6) must be approvable, not just visible as needsApproval",
+        );
+        let err = sim.roll_approve(1, operation_id, false).unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::InvalidParams,
+            "an unflagged frame must still be refused"
+        );
     }
 
     #[test]

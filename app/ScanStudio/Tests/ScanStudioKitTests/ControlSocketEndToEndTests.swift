@@ -217,8 +217,9 @@ private struct EndToEndHost {
         )
         let server = ControlChannelServer(sessionModel: model)
 
-        // Short /tmp path, never the real ~/.scanstudio/control.sock --
-        // mirrors ScanstudioCLIProcessTests.swift's shortSocketPath.
+        // Short /tmp path, never the app's own real default control socket
+        // location under the user's home directory -- mirrors
+        // ScanstudioCLIProcessTests.swift's shortSocketPath.
         let socketDirectory = tempRoot.appendingPathComponent("sock", isDirectory: true)
         try FileManager.default.createDirectory(at: socketDirectory, withIntermediateDirectories: true)
         let socketPath = socketDirectory.appendingPathComponent("s.sock").path
@@ -547,10 +548,23 @@ private final class E2EEventsFollower: @unchecked Sendable {
 
 // MARK: - The acceptance sequence
 
+// D-18 (plan 03-07 Task 3) added this suite's second `@Test`
+// (`d18AutomationSurfaces`). `.serialized` is required, not cosmetic:
+// `EndToEndHost.start()` (this file, above) calls `setenv("HOME", ...)`/
+// `setenv("TMPDIR", ...)` -- process-wide mutable state, not thread- or
+// test-local -- and restores the prior value in `stop()`. Swift Testing
+// runs a suite's tests in parallel by default; two tests racing
+// `EndToEndHost.start()`/`.stop()` concurrently could each spawn their own
+// real engine subprocess under the OTHER test's `HOME`, silently
+// corrupting both. This was previously safe only because exactly one
+// `@Test` existed; verified here by observing the two tests visibly
+// overlap in the test log (`started` for both before either `passed`)
+// before this trait was added.
 @Suite(
     "Control socket end to end",
     .enabled(if: ProcessInfo.processInfo.environment["SCANSTUDIO_CLI_E2E"] == "1"),
-    .timeLimit(.minutes(10))
+    .timeLimit(.minutes(10)),
+    .serialized
 )
 struct ControlSocketEndToEndTests {
     @Test("""
@@ -827,5 +841,323 @@ struct ControlSocketEndToEndTests {
         }
 
         await host.stop()
+    }
+
+    // MARK: - D-18 automation surfaces (plan 03-07 Task 3)
+    //
+    // A second `@Test` sharing this suite's own `EndToEndHost`/`runE2ECLI`
+    // harness, rather than extending `fullAcceptanceSequence` above --
+    // that sequence's own timing and its six documented deviations stay
+    // completely untouched. `resultObject`/`errorObject` are duplicated
+    // here (not extracted to file scope) for the same reason: zero risk of
+    // perturbing the existing, already-green sequence.
+    //
+    // Each of the seven D-18 surfaces below is proven against a *fresh*
+    // `EndToEndHost`/project where the surface needs one (a project, once
+    // created by `roll.save`/`roll run`, cannot be replaced on the same
+    // session -- `GATE_REFUSED` -- so three hosts run in sequence rather
+    // than one). All three use `.strip6` (6 frames) so the `boundaryAndBlank`
+    // fixture's own "second-to-last flagged, last blank" positions land on
+    // frames 5 and 6 exactly as plan 03-07 Task 2's own tests pin.
+    @Test("""
+    D-18: status --refresh, pre-project blankConfidence, frames select --skip-blank, a paused manual \
+    review's contentConfidence, roll save --auto-approve, and roll run's own receipt/progress/ETA -- \
+    all against sim-ls5000-0 with the boundaryAndBlank simulator fixture armed
+    """)
+    func d18AutomationSurfaces() async throws {
+        func envelopeObject(_ result: E2EStepResult) throws -> [String: Any] {
+            try #require(
+                JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any],
+                Comment(rawValue: result.context)
+            )
+        }
+        func resultObject(_ result: E2EStepResult) throws -> [String: Any] {
+            try #require(try envelopeObject(result)["result"] as? [String: Any], Comment(rawValue: result.context))
+        }
+
+        /// `SessionModel.loadCarrier(_:)` does not yet carry a
+        /// `previewFixture` argument -- plan 03-04 owns extending the
+        /// control-level `sim.loadMedia` wiring for that. This test drives
+        /// the engine's own `sim.loadMedia` a second time, directly
+        /// through the host's `engineClient`, with the fixture added.
+        /// Re-loading the identical carrier is idempotent for every field
+        /// `SessionModel.status` already holds from the `loadCarrier(_:)`
+        /// call that must precede this one -- so this call only arms the
+        /// fixture, it changes nothing `SessionModel`-observable.
+        struct FixtureLoadMediaParams: Encodable, Sendable {
+            let carrier: String
+            let previewFixture: String
+        }
+        func armBoundaryAndBlankFixture(on host: EndToEndHost) async throws {
+            await host.model.loadCarrier(.strip6)
+            let _: ScannerStatus = try await host.engineClient.request(
+                "sim.loadMedia",
+                params: FixtureLoadMediaParams(carrier: SimulatedFilmCarrier.strip6.rawValue, previewFixture: "boundaryAndBlank")
+            )
+        }
+
+        // ---- Host A: status --refresh, pre-project blankConfidence,
+        // skip-blank, and a paused (not auto-approved) manual review ----
+        let hostA = try await EndToEndHost.start()
+        func stepA(_ arguments: [String]) async throws -> E2EStepResult {
+            try await runE2ECLI(arguments, socketPath: hostA.socketPath)
+        }
+        do {
+            let connectResult = try await stepA(["connect", "--device", "sim-ls5000-0"])
+            #expect(connectResult.exitCode == 0, Comment(rawValue: connectResult.context))
+
+            try await armBoundaryAndBlankFixture(on: hostA)
+
+            // -- Surface 1: status --refresh succeeds and carries `scanner`. --
+            let refreshResult = try await stepA(["status", "--refresh"])
+            #expect(refreshResult.exitCode == 0, Comment(rawValue: refreshResult.context))
+            let refreshBody = try resultObject(refreshResult)
+            #expect(refreshBody["scanner"] is [String: Any], Comment(rawValue: refreshResult.context))
+
+            let previewResult = try await stepA(["preview", "--film-loaded"])
+            #expect(previewResult.exitCode == 0, Comment(rawValue: previewResult.context))
+            let previewCompleted = await hostA.waitUntilPreviewComplete()
+            #expect(previewCompleted, "preview did not reach scanner.thumbnailsComplete within the bound")
+
+            // -- Surface 2: pre-project frames list carries a decodable
+            // raster for every frame now that Task 2's fixture is armed --
+            // hasThumbnail true and a non-null blankConfidence throughout. --
+            let framesListResult = try await stepA(["frames", "list"])
+            #expect(framesListResult.exitCode == 0, Comment(rawValue: framesListResult.context))
+            let framesListBody = try resultObject(framesListResult)
+            let frames = try #require(framesListBody["frames"] as? [[String: Any]], Comment(rawValue: framesListResult.context))
+            #expect(frames.count == 6, "expected 6 previewed frames, found \(frames.count)")
+            for frame in frames {
+                let index = frame["index"] as? Int ?? -1
+                #expect(frame["hasThumbnail"] as? Bool == true, "frame \(index) missing hasThumbnail")
+                #expect(frame["blankConfidence"] != nil, "frame \(index) missing blankConfidence")
+            }
+
+            // -- Surface 3: frames select --skip-blank skips the blank
+            // fixture frame (6) but keeps the flagged-yet-textured frame
+            // (5) -- blank-skipping and manual-review-flagging are
+            // independent signals. --
+            let skipBlankResult = try await stepA(["frames", "select", "--skip-blank"])
+            #expect(skipBlankResult.exitCode == 0, Comment(rawValue: skipBlankResult.context))
+            // `skipped` is merged onto the already-rendered envelope
+            // (`FrameCommands.swift`'s own `mergeSkippedIntoRenderedOutput`),
+            // so it is a top-level sibling of `result`, not nested inside it.
+            let skipBlankEnvelope = try envelopeObject(skipBlankResult)
+            let skipped = try #require(skipBlankEnvelope["skipped"] as? [[String: Any]], Comment(rawValue: skipBlankResult.context))
+            let skippedIndices = Set(skipped.compactMap { $0["index"] as? Int })
+            #expect(skippedIndices.contains(6), "the blank fixture frame (6) should have been skipped")
+            #expect(!skippedIndices.contains(5), "the flagged-but-textured frame (5) must not be skipped as blank")
+
+            // -- Surface 4: roll save (no --auto-approve) under the fixture
+            // pauses at manualReviewPending, and a following status names
+            // the flagged frame with a numeric contentConfidence. --
+            let saveResult = try await stepA([
+                "roll", "save", "--name", "d18-review-pending", "--carrier", "strip6",
+                "--frame-count", "6", "--film-process", "c41ColorNegative", "--confirm-motion"
+            ])
+            #expect(saveResult.exitCode == 0, Comment(rawValue: saveResult.context))
+            let saveBody = try resultObject(saveResult)
+            #expect(saveBody["outcome"] as? String == "manualReviewPending", Comment(rawValue: saveResult.context))
+
+            let statusAfterSaveResult = try await stepA(["status"])
+            #expect(statusAfterSaveResult.exitCode == 0, Comment(rawValue: statusAfterSaveResult.context))
+            let statusAfterSaveBody = try resultObject(statusAfterSaveResult)
+            let manualReviewPending = try #require(
+                statusAfterSaveBody["manualReviewPending"] as? [String: Any],
+                Comment(rawValue: statusAfterSaveResult.context)
+            )
+            let pendingFrames = try #require(manualReviewPending["frames"] as? [[String: Any]], Comment(rawValue: statusAfterSaveResult.context))
+            let flaggedFrame = try #require(
+                pendingFrames.first { ($0["index"] as? Int) == 5 },
+                "frame 5 must be the one named by manualReviewPending: \(pendingFrames)"
+            )
+            let contentConfidence = flaggedFrame["contentConfidence"]
+            #expect(
+                (contentConfidence as? Double) != nil || (contentConfidence as? Int) != nil,
+                "contentConfidence must be a number, got \(String(describing: contentConfidence))"
+            )
+        } catch {
+            await hostA.stop()
+            throw error
+        }
+        await hostA.stop()
+
+        // ---- Host B: roll save --auto-approve resolves the same pending
+        // review, and --auto-approve without --confirm-motion refuses
+        // client-side ----
+        let hostB = try await EndToEndHost.start()
+        func stepB(_ arguments: [String]) async throws -> E2EStepResult {
+            try await runE2ECLI(arguments, socketPath: hostB.socketPath)
+        }
+        do {
+            let connectResult = try await stepB(["connect", "--device", "sim-ls5000-0"])
+            #expect(connectResult.exitCode == 0, Comment(rawValue: connectResult.context))
+            try await armBoundaryAndBlankFixture(on: hostB)
+
+            let previewResult = try await stepB(["preview", "--film-loaded"])
+            #expect(previewResult.exitCode == 0, Comment(rawValue: previewResult.context))
+            let previewCompleted = await hostB.waitUntilPreviewComplete()
+            #expect(previewCompleted, "preview did not reach scanner.thumbnailsComplete within the bound")
+
+            let selectAllResult = try await stepB(["frames", "select", "--all"])
+            #expect(selectAllResult.exitCode == 0, Comment(rawValue: selectAllResult.context))
+
+            // -- Surface 5b: --auto-approve without --confirm-motion exits
+            // 77 before any connection -- the host's own stub/request count
+            // is unreachable from this harness, so the exit code and the
+            // fact this same host is reused successfully right after are
+            // the proof no connection was consumed. --
+            let noConfirmResult = try await stepB([
+                "roll", "save", "--auto-approve",
+                "--name", "d18-should-not-save", "--carrier", "strip6",
+                "--frame-count", "6", "--film-process", "c41ColorNegative"
+            ])
+            #expect(noConfirmResult.exitCode == 77, Comment(rawValue: noConfirmResult.context))
+
+            // -- Surface 5a: roll save --auto-approve --confirm-motion
+            // resolves the pending review (frame 5's own contentConfidence
+            // is high -- it is a Textured, not Blank, fixture tile). --
+            let saveAutoApproveResult = try await stepB([
+                "roll", "save", "--auto-approve", "--confirm-motion",
+                "--name", "d18-auto-approve", "--carrier", "strip6",
+                "--frame-count", "6", "--film-process", "c41ColorNegative"
+            ])
+            #expect(saveAutoApproveResult.exitCode == 0, Comment(rawValue: saveAutoApproveResult.context))
+            let saveAutoApproveBody = try resultObject(saveAutoApproveResult)
+            let autoApproved = try #require(saveAutoApproveBody["autoApproved"] as? [Int], Comment(rawValue: saveAutoApproveResult.context))
+            #expect(!autoApproved.isEmpty, "auto-approve should have resolved the pending review")
+            #expect(autoApproved.contains(5))
+        } catch {
+            await hostB.stop()
+            throw error
+        }
+        await hostB.stop()
+
+        // ---- Host C: roll run's own receipt, terminal jobState, on-disk
+        // copy, manifest non-interference, and measured progress/ETA ----
+        let hostC = try await EndToEndHost.start()
+        func stepC(_ arguments: [String]) async throws -> E2EStepResult {
+            try await runE2ECLI(arguments, socketPath: hostC.socketPath)
+        }
+        do {
+            let connectResult = try await stepC(["connect", "--device", "sim-ls5000-0"])
+            #expect(connectResult.exitCode == 0, Comment(rawValue: connectResult.context))
+            try await armBoundaryAndBlankFixture(on: hostC)
+
+            // Matches fullAcceptanceSequence's own documented finding:
+            // SessionModel's default 4000 DPI capture is too slow for a
+            // bounded wait; 100 DPI is this repository's own sanctioned
+            // acceptance-testing resolution.
+            let settingsSetResult = try await stepC(["settings", "set", "--resolution", "100"])
+            #expect(settingsSetResult.exitCode == 0, Comment(rawValue: settingsSetResult.context))
+
+            // roll run performs its own preview/select/save internally --
+            // no separate preview/select/save steps precede it. --frame-
+            // count is deliberately omitted so this run also exercises
+            // D-15's own scanner-reported default.
+            let runResult = try await stepC([
+                "roll", "run",
+                "--name", "d18-roll-run",
+                "--carrier", "strip6",
+                "--film-process", "c41ColorNegative",
+                "--film-loaded", "--confirm-motion",
+                "--skip-blank", "--auto-approve", "--wait"
+            ])
+            #expect(runResult.exitCode == 0, Comment(rawValue: runResult.context))
+            let runBody = try resultObject(runResult)
+
+            // -- Surface 6a: the receipt's steps array names every step in
+            // D-15's order. --
+            let steps = try #require(runBody["steps"] as? [[String: Any]], Comment(rawValue: runResult.context))
+            let stepNames = steps.compactMap { $0["step"] as? String }
+            for expectedStep in [
+                "refresh", "status", "preview", "previewComplete",
+                "framesList", "framesSelect", "rollSave", "reviewStatus", "reviewApprove", "wait"
+            ] {
+                #expect(stepNames.contains(expectedStep), "roll run's receipt is missing step \"\(expectedStep)\": \(stepNames)")
+            }
+            #expect(steps.allSatisfy { ($0["outcome"] as? String) == "ok" }, "every step of a fully-successful roll run must be recorded \"ok\": \(steps)")
+
+            // -- Surface 6b: terminal jobState. --
+            #expect(runBody["jobState"] as? String == "completed", Comment(rawValue: runResult.context))
+
+            // -- Surface 6c: the on-disk receipt exists and parses as the
+            // same object printed on stdout. --
+            let projectDirectory = try #require(
+                (runBody["project"] as? [String: Any])?["directory"] as? String,
+                Comment(rawValue: runResult.context)
+            )
+            let receiptPath = try #require(runBody["receiptPath"] as? String, Comment(rawValue: runResult.context))
+            #expect(FileManager.default.fileExists(atPath: receiptPath), "receiptPath \(receiptPath) does not exist")
+            #expect(
+                URL(fileURLWithPath: receiptPath).lastPathComponent.hasPrefix("cli-run-"),
+                "receiptPath's filename must match the documented cli-run-<timestamp>.json pattern, got \(receiptPath)"
+            )
+            let receiptFromDisk = try #require(
+                JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: receiptPath))) as? [String: Any]
+            )
+            // The on-disk copy cannot self-reference the very path it is
+            // being written to -- receiptPath is populated on the in-memory
+            // receipt only after write(toProjectDirectory:) already
+            // returned that path, so it is the one field the two are
+            // expected to differ on; every other field must match exactly.
+            var runBodyWithoutReceiptPath = runBody
+            runBodyWithoutReceiptPath.removeValue(forKey: "receiptPath")
+            #expect(
+                NSDictionary(dictionary: receiptFromDisk) == NSDictionary(dictionary: runBodyWithoutReceiptPath),
+                "the on-disk receipt must parse as the same object printed on stdout (aside from receiptPath)"
+            )
+
+            // -- Surface 6d: manifest.json is never touched by the receipt
+            // write. RollRunReceiptTests.swift's own writeLandsBesideThe-
+            // Manifest already proves this for the pure write function in
+            // isolation; this proves it holds end to end, through the real
+            // socket and CLI. --
+            let manifestURL = URL(fileURLWithPath: projectDirectory).appendingPathComponent("manifest.json")
+            let mtimeAfterRun = try #require(
+                FileManager.default.attributesOfItem(atPath: manifestURL.path)[.modificationDate] as? Date
+            )
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let mtimeAfterSettling = try #require(
+                FileManager.default.attributesOfItem(atPath: manifestURL.path)[.modificationDate] as? Date
+            )
+            #expect(mtimeAfterRun == mtimeAfterSettling, "manifest.json must not be touched after roll run completes")
+
+            // -- Surface 7: a --wait run without --quiet produced at least
+            // one progress line on stderr, in the documented shape, while
+            // stdout parsed as exactly one JSON object (already proven by
+            // resultObject(runResult) above, which requires exactly one
+            // top-level JSON object). --
+            #expect(
+                runResult.stderr.range(of: #"frame \d+/\d+ pass \d+/\d+ eta \S+"#, options: .regularExpression) != nil,
+                "expected at least one \"frame N/M pass P/Q eta ...\" line on stderr, got: \(runResult.stderr)"
+            )
+
+            // -- Surface 7: a completed job still reports a numeric
+            // etaSeconds. Plain `status`, not `status --job <id>`: the
+            // documented CR-01 behavior (SessionModel.applyCompleted
+            // clears jobId in the same update that reaches the terminal
+            // jobState) means runBody["jobId"] is already nil by the time
+            // this receipt was built -- confirmed empirically running this
+            // very test -- so `--job <id>`'s own `jobResult.jobId == job`
+            // comparison has no id left to match. `progress` (unlike
+            // jobId) is never reset on completion, so it still carries the
+            // job's own last measured value; plain `status` reads it from
+            // the identical source `job.get` would. --
+            #expect(runBody["jobId"] == nil, "documenting the known CR-01 jobId-clears-on-completion behavior this assertion works around")
+            let plainStatusResult = try await stepC(["status"])
+            #expect(plainStatusResult.exitCode == 0, Comment(rawValue: plainStatusResult.context))
+            let plainStatusBody = try resultObject(plainStatusResult)
+            let jobProgress = try #require(plainStatusBody["progress"] as? [String: Any], Comment(rawValue: plainStatusResult.context))
+            let etaSeconds = jobProgress["etaSeconds"]
+            #expect(
+                (etaSeconds as? Double) != nil || (etaSeconds as? Int) != nil,
+                "etaSeconds must be a measured number, got \(String(describing: etaSeconds))"
+            )
+        } catch {
+            await hostC.stop()
+            throw error
+        }
+        await hostC.stop()
     }
 }

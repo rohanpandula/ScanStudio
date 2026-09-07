@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # cli_attach_acceptance.sh — phase gate for SSCLI-02 (Control Socket & CLI,
-# Attach Mode).
+# Attach Mode) and SSCLI-03 (Headless Mode & Parity)'s D-18 automation
+# surfaces.
 #
 # What this proves: the real `scanstudio-cli` binary drives a real,
 # in-process host bound to the real `scanstudio-engine` binary end to end
@@ -9,6 +10,20 @@
 # eject, diagnostics export, events --follow, plus the CONFIRMATION_REQUIRED
 # and HOST_UNREACHABLE negative paths. This is `ControlSocketEndToEndTests`
 # (app/ScanStudio/Tests/ScanStudioKitTests/ControlSocketEndToEndTests.swift).
+#
+# D-18 (plan 03-07): the suite's own second `@Test`, `d18AutomationSurfaces`,
+# additionally proves seven automation surfaces this phase's other plans
+# added, all against `sim-ls5000-0` with the simulator's `boundaryAndBlank`
+# preview fixture armed: `status --refresh` reporting `scanner`; pre-project
+# `frames list` carrying a non-null `blankConfidence` for every frame;
+# `frames select --skip-blank` skipping the blank fixture frame while
+# keeping the flagged-but-textured one; `roll save` pausing at
+# `manualReviewPending` with a numeric `contentConfidence`; `roll save
+# --auto-approve` resolving that same pause (and refusing without
+# `--confirm-motion` before any connection); `roll run`'s own receipt
+# (every D-15 step present, terminal `jobState`, the on-disk copy beside an
+# untouched `manifest.json`); and a measured, non-fabricated `etaSeconds`
+# together with at least one `--wait` progress line on stderr.
 #
 # Order actually run vs. D-17c: D-17c's literal shape is "... -> save ->
 # scan --wait -> ...". This suite runs connect -> preview -> frames select
@@ -117,7 +132,12 @@ if ! (cd "$SWIFT_DIR" && SCANSTUDIO_CLI_E2E=1 swift test --filter ScanStudioKitT
     fail "ControlSocketEndToEndTests"
 fi
 grep -q "Control socket end to end" "$WORK/swift-test.log" || fail "suite did not report running (opt-in gate misconfigured?)"
-pass "harness: ControlSocketEndToEndTests (connect -> preview -> save -> stop -> resume -> scan -> eject -> diagnostics -> events) green"
+# D-18 (plan 03-07): a second, independent name check so a filtered-out or
+# silently-skipped d18AutomationSurfaces test cannot pass this gate --
+# mirrors the suite-name check immediately above. "D-18:" is this test's
+# own display-name prefix (ControlSocketEndToEndTests.swift), unique to it.
+grep -q "D-18:" "$WORK/swift-test.log" || fail "the D-18 automation-surfaces test did not report running (opt-in gate misconfigured, or the test was filtered out)"
+pass "harness: ControlSocketEndToEndTests (connect -> preview -> save -> stop -> resume -> scan -> eject -> diagnostics -> events, plus D-18: status --refresh, pre-project blankConfidence, skip-blank, manual review + auto-approve, roll run's own receipt, and measured progress/ETA) green"
 
 # ---- Stage 4: acceptance evidence -----------------------------------------
 printf 'VERIFY_CLI_ATTACH OK (host-mode=%s, engine=%s, cli=%s)\n' "$HOST_MODE" "$ENGINE_BIN" "$CLI_BIN"
