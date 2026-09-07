@@ -314,7 +314,7 @@ struct ControlRecoverablePassthroughTests {
         ))
 
         let response = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
-            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: true
         )))
         guard case .failure(let id, let error) = response else {
             Issue.record("expected a failure response, got \(response)")

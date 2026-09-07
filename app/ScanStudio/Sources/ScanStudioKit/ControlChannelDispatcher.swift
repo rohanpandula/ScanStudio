@@ -409,6 +409,14 @@ public final class ControlChannelDispatcher {
                     guidance: "Confirm scanner motion is authorized, then resend with motionConfirmed: true."
                 ))
             }
+        case .rollSave(let id, let params):
+            guard params.motionConfirmed == true else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .confirmationRequired,
+                    message: "\"roll.save\" requires motionConfirmed: true (it creates the project and starts the scan).",
+                    guidance: "Confirm scanner motion is authorized, then resend with motionConfirmed: true."
+                ))
+            }
         default:
             break
         }

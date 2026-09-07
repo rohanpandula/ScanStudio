@@ -161,7 +161,8 @@ struct ControlWireProtocolTests {
             name: "Kitchen Table Roll",
             carrier: .roll36,
             frameCount: 36,
-            filmProcess: .c41ColorNegative
+            filmProcess: .c41ColorNegative,
+            motionConfirmed: true
         )
         #expect(try roundTrip(original) == original)
     }

@@ -503,13 +503,37 @@ struct ControlChannelProjectRoutingTests {
 
     // MARK: roll.save
 
+    @Test("roll.save without motionConfirmed is refused with CONFIRMATION_REQUIRED before any engine call")
+    @MainActor
+    func rollSaveWithoutConfirmationIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: nil
+        )))
+        expectFailure(response, id: 1, code: .confirmationRequired)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("roll.save with motionConfirmed: false is refused with CONFIRMATION_REQUIRED before any engine call")
+    @MainActor
+    func rollSaveWithFalseConfirmationIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: false
+        )))
+        expectFailure(response, id: 1, code: .confirmationRequired)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
     @Test("roll.save with no selected frames is refused, carrying SessionModel's own message")
     @MainActor
     func rollSaveWithNoSelectedFramesIsRefused() async {
         let (_, stub, dispatcher) = await makeDispatcher()
         await greet(dispatcher)
         let response = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
-            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: true
         )))
         guard case .failure(let id, let error) = response else {
             Issue.record("expected a failure response, got \(response)")
@@ -520,7 +544,7 @@ struct ControlChannelProjectRoutingTests {
         #expect(await stub.recordedMethods.isEmpty)
     }
 
-    @Test("roll.save on a valid model creates the project, reaches scan.start, and returns saved: true")
+    @Test("roll.save with motionConfirmed: true on a valid model creates the project, reaches scan.start, and returns saved: true")
     @MainActor
     func rollSaveSucceeds() async {
         let (model, stub, dispatcher) = await makeDispatcher()
@@ -529,7 +553,7 @@ struct ControlChannelProjectRoutingTests {
         await stub.clearLog()
 
         let response = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
-            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: true
         )))
         guard case .success(let id, let result) = response, case .rollSave(let rollSaveResult) = result else {
             Issue.record("expected a rollSave success result, got \(response)")

@@ -271,18 +271,20 @@ public struct ControlScanStopParams: Codable, Equatable, Sendable {
     }
 }
 
+/// D-08: carries a confirmation flag because `roll.save` routes to
+/// `saveRollAndScanSelectedFrames(name:carrier:frameCount:filmProcess:)`,
+/// which creates the project and immediately starts the scan of the
+/// selected frames -- the method name alone does not advertise that. `nil`
+/// and `false` both mean unconfirmed, exactly like `ControlScanStartParams`.
+/// No custom initializer, matching the five confirmation-bearing params
+/// above: the compiler's own memberwise one (visible to
+/// `ScanStudioKitTests` via `@testable import`) is sufficient.
 public struct ControlRollSaveParams: Codable, Equatable, Sendable {
     public let name: String
     public let carrier: SimulatedFilmCarrier
     public let frameCount: Int
     public let filmProcess: FilmProcess
-
-    public init(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess) {
-        self.name = name
-        self.carrier = carrier
-        self.frameCount = frameCount
-        self.filmProcess = filmProcess
-    }
+    public let motionConfirmed: Bool?
 }
 
 public struct ControlRollOpenParams: Codable, Equatable, Sendable {
