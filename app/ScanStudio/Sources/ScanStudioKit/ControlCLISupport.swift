@@ -214,6 +214,17 @@ public struct ControlFrameRangeError: Error, Equatable, Sendable {
 /// its refusal is a separate, typed `INVALID_PARAMS` response. A
 /// shape-valid range may still be refused per index by the host.
 public enum ControlFrameRangeParser {
+    /// T-02-13/T-02-28: no single range, and no running total across the
+    /// whole input, may select more than this many indices. Checked by
+    /// pure arithmetic on a two-sided range's `lower`/`upper` bounds
+    /// *before* any `Set` materialization -- `upper - lower + 1` is never
+    /// iterated to find out how big a range is, so `"1-100000000"` is
+    /// refused instantly rather than spending seconds (or exhausting
+    /// memory) building a hundred-million-element `Set` no real project
+    /// could ever contain. No real carrier this app supports has anywhere
+    /// close to 1,000 frames.
+    public static let maxIndexCount = 1_000
+
     /// Returns the deduplicated, ascending-sorted union of every index the
     /// range expands to. Frame indices are 1-based ordinals in this
     /// codebase (confirmed by every project fixture and Phase 1's own
@@ -235,7 +246,9 @@ public enum ControlFrameRangeParser {
             let parts = token.components(separatedBy: "-")
             switch parts.count {
             case 1:
-                indices.insert(try parseIndex(parts[0], token: token))
+                let index = try parseIndex(parts[0], token: token)
+                try checkBudget(adding: 1, token: token, alreadySelected: indices.count)
+                indices.insert(index)
             case 2:
                 let lower = try parseIndex(parts[0], token: token)
                 let upper = try parseIndex(parts[1], token: token)
@@ -245,12 +258,36 @@ public enum ControlFrameRangeParser {
                         message: "Frame range \"\(token)\" is descending; the first index must be less than or equal to the second."
                     )
                 }
+                // Pure arithmetic -- never `lower...upper`'s own `.count`,
+                // which would materialize the range to compute it.
+                let span = upper - lower + 1
+                try checkBudget(adding: span, token: token, alreadySelected: indices.count)
                 indices.formUnion(lower...upper)
             default:
                 throw ControlFrameRangeError(token: token, message: "Frame range entry \"\(token)\" is not a single index or a two-sided range.")
             }
         }
         return indices.sorted()
+    }
+
+    /// Rejects before any `Set` mutation: either `adding` alone already
+    /// exceeds `maxIndexCount` (one oversized range, e.g. `"1-100000000"`),
+    /// or `alreadySelected + adding` would push the running total across
+    /// the whole input over it (many individually-small ranges that sum
+    /// past the ceiling, e.g. `"1-500,501-1000,1001-1500"`).
+    /// `alreadySelected` can undercount the real post-union size by
+    /// whatever overlap `adding` shares with the indices already collected
+    /// (`indices` is a `Set`, so duplicates collapse) -- a deliberately
+    /// conservative approximation: it can only reject a request that would
+    /// have stayed at or under the real count, never admit one that
+    /// exceeds it.
+    private static func checkBudget(adding: Int, token: String, alreadySelected: Int) throws {
+        guard adding <= maxIndexCount, alreadySelected + adding <= maxIndexCount else {
+            throw ControlFrameRangeError(
+                token: token,
+                message: "Frame range \"\(token)\" would select more than \(maxIndexCount) indices in total; reduce the range."
+            )
+        }
     }
 
     private static func parseIndex(_ text: String, token: String) throws -> Int {

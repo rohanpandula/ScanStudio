@@ -252,4 +252,39 @@ struct ControlCLISupportTests {
     func rejectsIntOverflow() {
         #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("99999999999999999999") }
     }
+
+    // MARK: - ControlFrameRangeParser -- T-02-13/T-02-28 span/total ceiling
+
+    @Test("\"1-100000000\" is rejected instantly, never materializing a hundred-million-element Set")
+    func rejectsOversizedSingleRangeWithoutMaterializing() {
+        let start = Date()
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("1-100000000") }
+        // A bound on wall-clock time, not just the thrown-error type: if the
+        // fix regressed to checking the span only after `formUnion`, this
+        // would take multiple seconds (or exhaust memory first) rather than
+        // failing via pure arithmetic before any Set mutation.
+        #expect(Date().timeIntervalSince(start) < 1.0, "must reject via arithmetic, never by materializing the range")
+    }
+
+    @Test("many individually-small ranges that sum past 1,000 total are rejected")
+    func rejectsManyRangesSummingPastTheCeiling() {
+        // Three 500-index ranges: the first two land exactly at the 1,000
+        // ceiling; the third pushes the running total to 1,500.
+        #expect(throws: ControlFrameRangeError.self) {
+            try ControlFrameRangeParser.parse("1-500,501-1000,1001-1500")
+        }
+    }
+
+    @Test("exactly 1,000 indices (the ceiling itself) is accepted")
+    func acceptsExactlyTheCeiling() throws {
+        let result = try ControlFrameRangeParser.parse("1-1000")
+        #expect(result.count == 1_000)
+        #expect(result.first == 1)
+        #expect(result.last == 1_000)
+    }
+
+    @Test("1,001 indices (one past the ceiling) is rejected")
+    func rejectsOneIndexPastTheCeiling() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("1-1001") }
+    }
 }
