@@ -188,3 +188,78 @@ public enum ControlCLIOutput {
         return String(describing: value)
     }
 }
+
+// MARK: - CUPS frame-range parser (D-12)
+
+/// A shape-invalid CUPS frame range (D-12). `token` is the specific
+/// offending entry, not necessarily the whole input, so a caller can point
+/// at what broke.
+public struct ControlFrameRangeError: Error, Equatable, Sendable {
+    public let token: String
+    public let message: String
+
+    public init(token: String, message: String) {
+        self.token = token
+        self.message = message
+    }
+}
+
+/// Parses CUPS-syntax frame ranges (`"1-36,38"`) into the union of their
+/// 1-based frame indices. Grammar: `\d+(-\d+)?(,\d+(-\d+)?)*`, trimmed once
+/// at the ends -- no other whitespace tolerance.
+///
+/// This validates *shape only*: membership against the project's actual
+/// detected frame count is the server's job (`ControlFrameSelectionParams`,
+/// `frames.include`/`frames.exclude` -- `ControlWireProtocol.swift`), and
+/// its refusal is a separate, typed `INVALID_PARAMS` response. A
+/// shape-valid range may still be refused per index by the host.
+public enum ControlFrameRangeParser {
+    /// Returns the deduplicated, ascending-sorted union of every index the
+    /// range expands to. Frame indices are 1-based ordinals in this
+    /// codebase (confirmed by every project fixture and Phase 1's own
+    /// membership validation) -- `0` and negative values are rejected, as
+    /// is a descending range (`"5-2"`) and any token that does not fit in
+    /// `Int`.
+    public static func parse(_ text: String) throws -> [Int] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ControlFrameRangeError(token: text, message: "Frame range must not be empty.")
+        }
+
+        var indices: Set<Int> = []
+        for token in trimmed.components(separatedBy: ",") {
+            guard !token.isEmpty else {
+                throw ControlFrameRangeError(token: trimmed, message: "Frame range has an empty entry between commas.")
+            }
+
+            let parts = token.components(separatedBy: "-")
+            switch parts.count {
+            case 1:
+                indices.insert(try parseIndex(parts[0], token: token))
+            case 2:
+                let lower = try parseIndex(parts[0], token: token)
+                let upper = try parseIndex(parts[1], token: token)
+                guard lower <= upper else {
+                    throw ControlFrameRangeError(
+                        token: token,
+                        message: "Frame range \"\(token)\" is descending; the first index must be less than or equal to the second."
+                    )
+                }
+                indices.formUnion(lower...upper)
+            default:
+                throw ControlFrameRangeError(token: token, message: "Frame range entry \"\(token)\" is not a single index or a two-sided range.")
+            }
+        }
+        return indices.sorted()
+    }
+
+    private static func parseIndex(_ text: String, token: String) throws -> Int {
+        guard !text.isEmpty, let value = Int(text) else {
+            throw ControlFrameRangeError(token: token, message: "\"\(text)\" in \"\(token)\" is not a valid frame index.")
+        }
+        guard value >= 1 else {
+            throw ControlFrameRangeError(token: token, message: "Frame index \(value) in \"\(token)\" must be 1 or greater.")
+        }
+        return value
+    }
+}

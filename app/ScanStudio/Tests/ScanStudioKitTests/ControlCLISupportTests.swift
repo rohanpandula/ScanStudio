@@ -162,4 +162,94 @@ struct ControlCLISupportTests {
         #expect(rendered.contains("scan.start is already running"))
         #expect(!rendered.contains("{"))
     }
+
+    // MARK: - ControlFrameRangeParser -- accepted shapes
+
+    @Test("\"1-36,38\" yields 1...36 plus 38")
+    func rangeWithTrailingSingleValue() throws {
+        #expect(try ControlFrameRangeParser.parse("1-36,38") == Array(1...36) + [38])
+    }
+
+    @Test("\"7\" yields [7]")
+    func singleIndex() throws {
+        #expect(try ControlFrameRangeParser.parse("7") == [7])
+    }
+
+    @Test("\"7-7\" yields [7] (single-value range)")
+    func singleValueRange() throws {
+        #expect(try ControlFrameRangeParser.parse("7-7") == [7])
+    }
+
+    @Test("\"3,1-2,2\" yields [1,2,3] (deduplicated, sorted)")
+    func deduplicatedAndSorted() throws {
+        #expect(try ControlFrameRangeParser.parse("3,1-2,2") == [1, 2, 3])
+    }
+
+    @Test("the parser never returns a value less than 1")
+    func neverReturnsBelowOne() throws {
+        let allResults = try ["1-36,38", "7", "7-7", "3,1-2,2"].flatMap { try ControlFrameRangeParser.parse($0) }
+        #expect(allResults.allSatisfy { $0 >= 1 })
+    }
+
+    // MARK: - ControlFrameRangeParser -- rejected shapes (one input per assertion)
+
+    @Test("empty string is rejected")
+    func rejectsEmptyString() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("") }
+    }
+
+    @Test("a whitespace-only string is rejected")
+    func rejectsWhitespaceOnlyString() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse(" ") }
+    }
+
+    @Test("\"0\" is rejected (frame indices are 1-based)")
+    func rejectsZero() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("0") }
+    }
+
+    @Test("\"-3\" is rejected (negative)")
+    func rejectsNegative() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("-3") }
+    }
+
+    @Test("\"1-\" is rejected (missing upper bound)")
+    func rejectsMissingUpperBound() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("1-") }
+    }
+
+    @Test("\"1,,2\" is rejected (doubled comma)")
+    func rejectsDoubledComma() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("1,,2") }
+    }
+
+    @Test("\"1,\" is rejected (trailing comma)")
+    func rejectsTrailingComma() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("1,") }
+    }
+
+    @Test("\",1\" is rejected (leading comma)")
+    func rejectsLeadingComma() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse(",1") }
+    }
+
+    @Test("\"a\" is rejected (non-numeric)")
+    func rejectsNonNumeric() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("a") }
+    }
+
+    @Test("\"1-a\" is rejected (non-numeric upper bound)")
+    func rejectsNonNumericUpperBound() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("1-a") }
+    }
+
+    @Test("\"5-2\" is rejected (descending range)")
+    func rejectsDescendingRange() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("5-2") }
+    }
+
+    @Test("a value overflowing Int is rejected")
+    func rejectsIntOverflow() {
+        #expect(throws: ControlFrameRangeError.self) { try ControlFrameRangeParser.parse("99999999999999999999") }
+    }
 }
