@@ -622,6 +622,32 @@ public final class SessionModel {
     public private(set) var status: ScannerStatus?
     public private(set) var engineVersion: String?
     public private(set) var thumbnails: [Int: Thumbnail] = [:]
+    /// `BlankFrameHint.Score` per frame index, computed once per arriving
+    /// thumbnail (`"scanner.thumbnail"`) and once more when the whole preview
+    /// completes (`"scanner.thumbnailsComplete"`, so the final frame count is
+    /// authoritative for the positional prior) -- never on a repeated
+    /// `frames.list`, which only reads this cache. An absent key is the
+    /// honest answer for a frame whose thumbnail carried no decodable raster
+    /// (every simulator frame, or a real frame whose tile failed to decode):
+    /// `ControlFrameSummary` reports its five hint fields as `null` together,
+    /// never a fabricated score (D-12/HEAD-06, T-03-31).
+    ///
+    /// `blankFrameHints` must be cleared everywhere `thumbnails` itself is
+    /// reset to `[:]`, so the two dictionaries can never disagree about which
+    /// frames exist -- today that is exactly three sites: this property's own
+    /// declaration is the fourth mention below only to keep that count
+    /// honest. The three reset sites are `acquirePreview()`'s pre-request
+    /// reset, `invalidatePreviewRegistrationForProjectOpen()`, and
+    /// `clearMediaState()`. A site that resets `thumbnails` without a
+    /// matching `blankFrameHints = [:]` alongside it is a bug -- grep for
+    /// `thumbnails = [:]` before adding a new one.
+    public private(set) var blankFrameHints: [Int: BlankFrameHint.Score] = [:]
+    /// Raw `(mean, stddev)` per frame index backing `blankFrameHints` --
+    /// kept separately so a whole-roll re-score (`BlankFrameHint.score`,
+    /// which needs every frame's flatness to evaluate the positional prior)
+    /// never has to re-decode a raster it already read once. Cleared
+    /// alongside `blankFrameHints` at the same three sites.
+    private var thumbnailStatistics: [Int: (mean: Double, stddev: Double)] = [:]
     /// Exact operation identity of the latest successfully completed preview.
     /// Manual boundary approval is valid only while this same identity remains
     /// current.
@@ -1680,6 +1706,8 @@ public final class SessionModel {
         // if this one also refuses, `scanner.thumbnailsFailed` re-sets it.
         refeedRequired = false
         thumbnails = [:]
+        blankFrameHints = [:]
+        thumbnailStatistics = [:]
         isAcquiringThumbnails = true
         activeOperationStartedAt = Date()
 
@@ -2939,6 +2967,8 @@ public final class SessionModel {
         previewFilmProcess = nil
         pendingPreviewFilmProcess = nil
         thumbnails = [:]
+        blankFrameHints = [:]
+        thumbnailStatistics = [:]
         latestCompletedPreviewOperationId = nil
         clearPendingManualReviewScan()
         clearAttendedScanRecovery()
@@ -4353,6 +4383,29 @@ public final class SessionModel {
                     projectFrameCount: self.project?.frameCount
                 ) else { return }
                 self.thumbnails[$0.frameIndex] = $0.thumbnail
+                // One decode per arriving thumbnail, cached in
+                // `thumbnailStatistics` -- a repeated `frames.list` reads
+                // `blankFrameHints` and decodes nothing (T-03-32). A
+                // simulator frame has no `imagePath` (sim.rs never sets one)
+                // and therefore gets no statistics entry at all -- the
+                // honest "no raster" answer, not a fabricated one.
+                if let imagePath = $0.thumbnail.imagePath,
+                   let raster = ThumbnailLuminance.decodeLuminance(atPath: imagePath),
+                   let stats = ThumbnailLuminance.statistics(
+                       centralCropOf: raster.pixels,
+                       width: raster.width,
+                       height: raster.height
+                   ) {
+                    self.thumbnailStatistics[$0.frameIndex] = stats
+                }
+                // The positional prior needs every frame's neighbours, so
+                // the cheap correct thing is to re-score the whole (small,
+                // tile-count-sized) map on each arrival rather than try to
+                // patch one entry incrementally. `thumbnails.count` is a
+                // running tally, not yet the roll's true total -- the
+                // `"scanner.thumbnailsComplete"` arm below re-scores once
+                // more with the authoritative final count.
+                self.recomputeBlankFrameHints(previewedFrameCount: self.thumbnails.count)
             }
         case "scanner.thumbnailsComplete":
             decodeAndApply(event, as: ThumbnailsCompletePayload.self) {
@@ -4378,6 +4431,10 @@ public final class SessionModel {
                     previewOperationId: operationId,
                     previewFrameCount: $0.count
                 )
+                // Re-score with the now-authoritative final frame count
+                // (`$0.count`), not the running tally the arrival-time
+                // recompute above used.
+                self.recomputeBlankFrameHints(previewedFrameCount: $0.count)
             }
         case "scanner.thumbnailsFailed":
             // Previously dropped by `default:` — live 2026-07-26 a
@@ -4452,6 +4509,16 @@ public final class SessionModel {
         return previewedIndices.filter(projectIndices.contains)
     }
 
+    /// Re-scores `blankFrameHints` from `thumbnailStatistics` in full --
+    /// see `blankFrameHints`'s own doc comment for why a full re-score
+    /// (rather than an incremental patch) is the cheap correct choice here.
+    private func recomputeBlankFrameHints(previewedFrameCount: Int) {
+        blankFrameHints = BlankFrameHint.score(
+            statistics: thumbnailStatistics,
+            previewedFrameCount: previewedFrameCount
+        )
+    }
+
     private func clearMediaState(
         preservingPreviewAuthorization: Bool = false,
         preservingActiveJob: Bool = false
@@ -4473,6 +4540,8 @@ public final class SessionModel {
             pendingPreviewFilmProcess = nil
         }
         thumbnails = [:]
+        blankFrameHints = [:]
+        thumbnailStatistics = [:]
         latestCompletedPreviewOperationId = nil
         clearPendingManualReviewScan()
         clearAttendedScanRecovery()
