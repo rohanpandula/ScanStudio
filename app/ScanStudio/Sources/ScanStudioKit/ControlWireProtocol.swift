@@ -516,6 +516,11 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     public let scanReadinessReason: String?
     public let lastErrorMessage: String?
     public let lastControlRefusal: ControlRefusalRecord?
+    /// D-13/HEAD-07, additive: `nil` (and omitted from the wire) when
+    /// nothing is pending. See `ControlManualReviewPending`'s own doc
+    /// comment for why this reaches `status`/`control.snapshot`/
+    /// `control.changed` from a single source.
+    public let manualReviewPending: ControlManualReviewPending?
 
     public init(
         device: DeviceInfo? = nil,
@@ -534,7 +539,8 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         scanReadiness: String,
         scanReadinessReason: String? = nil,
         lastErrorMessage: String? = nil,
-        lastControlRefusal: ControlRefusalRecord? = nil
+        lastControlRefusal: ControlRefusalRecord? = nil,
+        manualReviewPending: ControlManualReviewPending? = nil
     ) {
         self.device = device
         self.scanner = scanner
@@ -553,11 +559,23 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.scanReadinessReason = scanReadinessReason
         self.lastErrorMessage = lastErrorMessage
         self.lastControlRefusal = lastControlRefusal
+        self.manualReviewPending = manualReviewPending
     }
 }
 
 /// `errorCode` carries only `ErrorPayload.code`, never the whole payload
 /// and never any hardware diagnostic detail (T-01-05).
+///
+/// The five `Double?` hint fields (D-12/HEAD-06) are `BlankFrameHint.Score`,
+/// reported as a **heuristic**, never a fact -- see
+/// `app/ScanStudio/protocol/CONTROL.md`'s own "Blank-frame hint" section and
+/// `BlankFrameHint`'s doc comment for the formula. They are `nil` **together**
+/// whenever the frame's thumbnail carried no decodable raster (every
+/// simulator frame, or a real frame whose tile failed to decode) -- never
+/// individually populated, and never a fabricated number (T-03-31).
+/// `needsApproval`/`reviewEvidence` mirror `Thumbnail.needsApproval`/
+/// `.warnings` verbatim -- `reviewEvidence` *is* D-12's boundary evidence,
+/// no separate field was needed.
 public struct ControlFrameSummary: Codable, Equatable, Sendable {
     public let index: Int
     public let excluded: Bool
@@ -566,6 +584,13 @@ public struct ControlFrameSummary: Codable, Equatable, Sendable {
     public let state: String?
     public let manualReviewDecision: String?
     public let errorCode: String?
+    public let blankConfidence: Double?
+    public let thumbnailStddev: Double?
+    public let thumbnailMean: Double?
+    public let endBonus: Double?
+    public let runBonus: Double?
+    public let needsApproval: Bool
+    public let reviewEvidence: [String]
 
     public init(
         index: Int,
@@ -574,7 +599,14 @@ public struct ControlFrameSummary: Codable, Equatable, Sendable {
         hasThumbnail: Bool,
         state: String? = nil,
         manualReviewDecision: String? = nil,
-        errorCode: String? = nil
+        errorCode: String? = nil,
+        blankConfidence: Double? = nil,
+        thumbnailStddev: Double? = nil,
+        thumbnailMean: Double? = nil,
+        endBonus: Double? = nil,
+        runBonus: Double? = nil,
+        needsApproval: Bool = false,
+        reviewEvidence: [String] = []
     ) {
         self.index = index
         self.excluded = excluded
@@ -583,6 +615,51 @@ public struct ControlFrameSummary: Codable, Equatable, Sendable {
         self.state = state
         self.manualReviewDecision = manualReviewDecision
         self.errorCode = errorCode
+        self.blankConfidence = blankConfidence
+        self.thumbnailStddev = thumbnailStddev
+        self.thumbnailMean = thumbnailMean
+        self.endBonus = endBonus
+        self.runBonus = runBonus
+        self.needsApproval = needsApproval
+        self.reviewEvidence = reviewEvidence
+    }
+}
+
+/// One flagged frame within `ControlStatusResult.manualReviewPending`
+/// (D-13/HEAD-07). `reason` is the frame's first `warnings` entry, or the
+/// literal `"boundaryAmbiguous"` when there is none -- never an empty
+/// string, never a fabricated sentence. `contentConfidence` is `1 -
+/// blankConfidence` of the same `BlankFrameHint.Score` `frames.list` reports
+/// for this index, or `nil` when no hint exists for it (T-03-31: a missing
+/// hint stays missing, it is never defaulted to a plausible number).
+public struct ControlManualReviewFrame: Codable, Equatable, Sendable {
+    public let index: Int
+    public let reason: String
+    public let evidence: [String]
+    public let contentConfidence: Double?
+
+    public init(
+        index: Int,
+        reason: String,
+        evidence: [String] = [],
+        contentConfidence: Double? = nil
+    ) {
+        self.index = index
+        self.reason = reason
+        self.evidence = evidence
+        self.contentConfidence = contentConfidence
+    }
+}
+
+/// D-13/HEAD-07: built inside `buildStatusResult()`, the same aggregate
+/// `events.subscribe` streams -- so a pending boundary review reaches
+/// `status`, `control.snapshot`, and `control.changed` from one source, with
+/// no separate event wiring (T-03-34).
+public struct ControlManualReviewPending: Codable, Equatable, Sendable {
+    public let frames: [ControlManualReviewFrame]
+
+    public init(frames: [ControlManualReviewFrame]) {
+        self.frames = frames
     }
 }
 
@@ -685,15 +762,33 @@ public struct ControlRollListResult: Codable, Equatable, Sendable {
     }
 }
 
+/// `outcome` (D-13/HEAD-07) names which of three things actually happened,
+/// since a `true` `saved` alone cannot distinguish them --
+/// `SessionModel.saveRollAndScanSelectedFrames`'s own `return started ||
+/// pendingManualReviewScan?.frames == requestedFrames` line is exactly why:
+/// `"started"` (the scan began), `"manualReviewPending"` (the project was
+/// created but a flagged frame paused it at the boundary-review gate,
+/// visible in `status.manualReviewPending`), or `"failed"` (the save itself
+/// succeeded -- the project exists -- but starting the scan did not, a case
+/// distinct from an outright refusal, which never reaches this result type
+/// at all). The CLI exits 0 for `"started"`/`"manualReviewPending"` alike
+/// (T-03-34) -- only `"failed"` is a caller-visible problem.
 public struct ControlRollSaveResult: Codable, Equatable, Sendable {
     public let saved: Bool
     public let projectName: String?
     public let projectDirectory: String?
+    public let outcome: String
 
-    public init(saved: Bool, projectName: String? = nil, projectDirectory: String? = nil) {
+    public init(
+        saved: Bool,
+        projectName: String? = nil,
+        projectDirectory: String? = nil,
+        outcome: String = "started"
+    ) {
         self.saved = saved
         self.projectName = projectName
         self.projectDirectory = projectDirectory
+        self.outcome = outcome
     }
 }
 

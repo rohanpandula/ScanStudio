@@ -7,7 +7,9 @@
 // test here drives a fake `EngineClientProtocol` actor. No scanner motion,
 // no GUI, no real engine binary.
 
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
 
 @testable import ScanStudioKit
@@ -332,6 +334,82 @@ private func prepareForRollSaveReadiness(_ model: SessionModel) async -> Bool {
     ))
     model.toggleFrameSelection(1)
     return true
+}
+
+/// Mirrors `prepareForRollSaveReadiness` above (same one-frame shape the
+/// stub's canned `project.create`/`ProjectCreateResult` response requires --
+/// it always returns a fixed one-frame project regardless of the requested
+/// `frameCount`, so `ScanReadinessPolicy`'s `.projectMediaMismatch` check
+/// refuses anything else), but with frame 1's thumbnail exactly the raw
+/// JSON fragment `thumbnailJSON` instead of a plain `brightness`/`tint`
+/// tile -- reaching `pendingManualReviewScan` via `roll.save`'s own
+/// pre-project path (not `driveToPendingManualReview`'s already-open-project
+/// path). A caller passes a `needsApproval`-flagged fragment with or
+/// without an `imagePath`, to prove `manualReviewPending.contentConfidence`'s
+/// two cases (D-13, T-03-31) side by side across two separate tests.
+@MainActor
+private func prepareForRollSaveManualReview(_ model: SessionModel, thumbnailJSON: String) async -> Bool {
+    await model.connect(deviceId: projectRoutingDevice.deviceId)
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.initial(token: token)) == .started else { return false }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnail",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":1,"thumbnail":\#(thumbnailJSON)}}
+            """#.utf8
+        )
+    ))
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":1}}
+            """#.utf8
+        )
+    ))
+    model.toggleFrameSelection(1)
+    return true
+}
+
+/// Writes a uniform single-channel PNG into a fresh temp directory this
+/// function itself owns, and returns its path -- `BlankFrameHintTests.swift`'s
+/// own synthesized-fixture idiom, never a committed image.
+private func writeUniformGrayPNGForProjectRoutingTest(value: UInt8, width: Int = 143, height: Int = 96) -> String? {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    guard (try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else { return nil }
+    let fileURL = directory.appendingPathComponent("frame.png")
+    var buffer = [UInt8](repeating: value, count: width * height)
+    guard let context = CGContext(
+        data: &buffer,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGImageAlphaInfo.none.rawValue
+    ), let cgImage = context.makeImage() else { return nil }
+    guard let destination = CGImageDestinationCreateWithURL(fileURL as CFURL, "public.png" as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(destination, cgImage, nil)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return fileURL.path
+}
+
+/// Mirrors `ControlChannelDispatcherTests.swift`'s own
+/// `ControlEventEnvelopeProbe` -- a `Decodable` twin of the encode-only
+/// `ControlEventEnvelope`, per this suite's established per-file-duplication
+/// convention (no shared test-utility module).
+private struct ProjectRoutingEventEnvelopeProbe<Payload: Decodable>: Decodable {
+    let event: String
+    let payload: Payload
 }
 
 /// Connects, opens the fixture project, and completes a plain preview so
@@ -715,10 +793,126 @@ struct ControlChannelProjectRoutingTests {
         }
         #expect(id == 1)
         #expect(rollSaveResult.saved == true)
+        #expect(rollSaveResult.outcome == "started")
         #expect(rollSaveResult.projectName == projectRoutingProject().name)
         #expect(rollSaveResult.projectDirectory == projectRoutingProjectDirectory)
         #expect(await stub.recordedMethods.contains("project.create"))
         #expect(await stub.recordedMethods.contains("scan.start"))
+    }
+
+    @Test("roll.save whose model ends with pendingManualReviewScan set returns outcome: manualReviewPending and saved: true, and status right after names the same frame with contentConfidence == 1 - blankConfidence (D-13/HEAD-07)")
+    @MainActor
+    func rollSaveReportsManualReviewPendingOutcomeAndStatusReflectsIt() async throws {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let imagePath = try #require(writeUniformGrayPNGForProjectRoutingTest(value: 203))
+        let thumbnailJSON = #"{"needsApproval":true,"warnings":["ambiguous-boundary"],"imagePath":"\#(imagePath)"}"#
+        #expect(await prepareForRollSaveManualReview(model, thumbnailJSON: thumbnailJSON))
+        await stub.clearLog()
+
+        let saveResponse = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: true
+        )))
+        guard case .success(let saveId, let saveResult) = saveResponse, case .rollSave(let rollSaveResult) = saveResult else {
+            Issue.record("expected a rollSave success result, got \(saveResponse)")
+            return
+        }
+        #expect(saveId == 1)
+        #expect(rollSaveResult.saved == true)
+        #expect(rollSaveResult.outcome == "manualReviewPending")
+        #expect(!(await stub.recordedMethods.contains("scan.start")))
+        #expect(model.pendingManualReviewScan != nil)
+
+        let statusResponse = await dispatcher.handle(.status(id: 2))
+        guard case .success(_, let statusResultWrapped) = statusResponse, case .status(let status) = statusResultWrapped else {
+            Issue.record("expected a status success result, got \(statusResponse)")
+            return
+        }
+        let pending = try #require(status.manualReviewPending)
+        #expect(pending.frames.map(\.index) == [1])
+
+        let frame1 = try #require(pending.frames.first { $0.index == 1 })
+        let hint1 = try #require(model.blankFrameHints[1])
+        #expect(frame1.reason == "ambiguous-boundary")
+        #expect(frame1.evidence == ["ambiguous-boundary"])
+        let confidence1 = try #require(frame1.contentConfidence)
+        #expect(abs(confidence1 - (1 - hint1.blankConfidence)) < 1e-9)
+    }
+
+    @Test("roll.save's manualReviewPending reports contentConfidence: nil for a flagged frame with no decodable raster (T-03-31)")
+    @MainActor
+    func rollSaveManualReviewPendingContentConfidenceIsNilWithoutAHint() async throws {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        // needsApproval, but no imagePath -- the honest no-raster case.
+        #expect(await prepareForRollSaveManualReview(model, thumbnailJSON: #"{"needsApproval":true,"warnings":["no-registration"]}"#))
+        await stub.clearLog()
+
+        let saveResponse = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: true
+        )))
+        guard case .success(_, let saveResult) = saveResponse, case .rollSave(let rollSaveResult) = saveResult else {
+            Issue.record("expected a rollSave success result, got \(saveResponse)")
+            return
+        }
+        #expect(rollSaveResult.outcome == "manualReviewPending")
+
+        let statusResponse = await dispatcher.handle(.status(id: 2))
+        guard case .success(_, let statusResultWrapped) = statusResponse, case .status(let status) = statusResultWrapped else {
+            Issue.record("expected a status success result, got \(statusResponse)")
+            return
+        }
+        let frame1 = try #require(status.manualReviewPending?.frames.first { $0.index == 1 })
+        #expect(frame1.reason == "no-registration")
+        #expect(frame1.contentConfidence == nil)
+        #expect(model.blankFrameHints[1] == nil)
+    }
+
+    @Test("events.subscribe's control.changed after a paused roll.save also carries manualReviewPending -- proof buildStatusResult() alone reaches it, no separate event wiring (T-03-34)")
+    @MainActor
+    func eventsSubscribeCarriesManualReviewPendingAfterRollSave() async throws {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        #expect(await prepareForRollSaveManualReview(model, thumbnailJSON: #"{"needsApproval":true,"warnings":["ambiguous-boundary"]}"#))
+
+        let saveResponse = await dispatcher.handle(.rollSave(id: 1, params: ControlRollSaveParams(
+            name: "Test roll", carrier: .mounted, frameCount: 1, filmProcess: .c41ColorNegative, motionConfirmed: true
+        )))
+        guard case .success = saveResponse else {
+            Issue.record("expected roll.save to succeed, got \(saveResponse)")
+            return
+        }
+        #expect(model.pendingManualReviewScan != nil)
+
+        var iterator = dispatcher.subscribeToEvents().makeAsyncIterator()
+        guard let snapshot = await iterator.next() else {
+            Issue.record("expected an initial control.snapshot element")
+            return
+        }
+        let snapshotEnvelope = try JSONDecoder().decode(ProjectRoutingEventEnvelopeProbe<ControlStatusResult>.self, from: snapshot)
+        #expect(snapshotEnvelope.event == "control.snapshot")
+        #expect(snapshotEnvelope.payload.manualReviewPending != nil)
+
+        // A subsequent, otherwise-unrelated mutation still carries the same
+        // pending review in its own control.changed -- proof that
+        // manualReviewPending is not synthesized specially for one snapshot,
+        // it is simply whatever buildStatusResult() (the same aggregate
+        // control.changed streams) currently holds. `toggleFrameSelection`
+        // (not another `scanner.status` event) is the trigger: `roll.save`
+        // already created the project, so `validFrameIndices` -- and
+        // therefore whether a second identical `scanner.status` even
+        // reaches its own `self.status = reconciled` write -- is no longer
+        // the simplest guaranteed mutation available; a plain selection
+        // toggle always writes the tracked `selectedFrameIndices` property.
+        model.toggleFrameSelection(1)
+        guard let changed = await iterator.next() else {
+            Issue.record("expected a control.changed element")
+            return
+        }
+        let changedEnvelope = try JSONDecoder().decode(ProjectRoutingEventEnvelopeProbe<ControlStatusResult>.self, from: changed)
+        #expect(changedEnvelope.event == "control.changed")
+        let pending = try #require(changedEnvelope.payload.manualReviewPending)
+        #expect(pending.frames.map(\.index) == [1])
     }
 
     // MARK: roll.open / roll.list

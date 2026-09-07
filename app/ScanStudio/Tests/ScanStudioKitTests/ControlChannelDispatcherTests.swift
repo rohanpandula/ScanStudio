@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
 
 @testable import ScanStudioKit
@@ -257,6 +259,67 @@ private func driveModelToPendingManualReview(_ model: SessionModel) async -> Boo
     guard model.scanReadiness(for: [1]).isReady else { return false }
     await model.startMockScan()
     return model.pendingManualReviewScan != nil
+}
+
+/// Drives a cold, pre-project preview whose one thumbnail is exactly the
+/// raw JSON fragment `thumbnailJSON` (so a caller can inject an
+/// `imagePath`-bearing or plain simulator-shaped tile interchangeably) --
+/// D-12's pre-project `frames.list` source and its `BlankFrameHint` cache
+/// only ever populate from this same "scanner.thumbnail" event path.
+@MainActor
+private func drivePreProjectPreviewThumbnail(_ model: SessionModel, thumbnailJSON: String) async -> Bool {
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.initial(token: token)) == .started else { return false }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnail",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":1,"thumbnail":\#(thumbnailJSON)}}
+            """#.utf8
+        )
+    ))
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":1}}
+            """#.utf8
+        )
+    ))
+    return true
+}
+
+/// Writes a uniform single-channel PNG (`BlankFrameHintTests.swift`'s own
+/// synthesized-fixture idiom, never a committed image) into a fresh temp
+/// directory this function itself owns, and returns its path -- the
+/// `imagePath` a fake `"scanner.thumbnail"` event needs to give
+/// `ThumbnailLuminance.decodeLuminance(atPath:)` something real to decode.
+private func writeUniformGrayPNGForDispatcherTest(value: UInt8, width: Int = 143, height: Int = 96) -> String? {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    guard (try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else { return nil }
+    let fileURL = directory.appendingPathComponent("frame.png")
+    var buffer = [UInt8](repeating: value, count: width * height)
+    guard let context = CGContext(
+        data: &buffer,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGImageAlphaInfo.none.rawValue
+    ), let cgImage = context.makeImage() else { return nil }
+    guard let destination = CGImageDestinationCreateWithURL(fileURL as CFURL, "public.png" as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(destination, cgImage, nil)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return fileURL.path
 }
 
 // WR-02: `wait*` helpers here are built on `withCheckedContinuation`, which
@@ -663,6 +726,62 @@ struct ControlChannelDispatcherTests {
         let json = String(data: encoded, encoding: .utf8) ?? ""
         #expect(!json.contains("evidence"))
         #expect(framesList.frames.first { $0.index == 1 }?.errorCode == "FEED_JAM")
+    }
+
+    @Test("frames.list before a project exists lists every previewed thumbnail with its blank-frame hint, needsApproval, and reviewEvidence (D-12/HEAD-06)")
+    @MainActor
+    func framesListPreProjectCarriesHintAndReviewEvidence() async throws {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let imagePath = try #require(writeUniformGrayPNGForDispatcherTest(value: 203))
+        let thumbnailJSON = #"{"needsApproval":true,"warnings":["ambiguous-boundary"],"imagePath":"\#(imagePath)"}"#
+        #expect(await drivePreProjectPreviewThumbnail(model, thumbnailJSON: thumbnailJSON))
+
+        let response = await dispatcher.handle(.framesList(id: 20))
+        guard case .success(_, let result) = response, case .framesList(let framesList) = result else {
+            Issue.record("expected a framesList success result")
+            return
+        }
+        #expect(framesList.frames.count == 1)
+        let frame = try #require(framesList.frames.first)
+        #expect(frame.index == 1)
+        #expect(frame.hasThumbnail == true)
+        #expect(frame.excluded == false)
+        #expect(frame.needsApproval == true)
+        #expect(frame.reviewEvidence == ["ambiguous-boundary"])
+        // A uniform-gray tile is fully flat -- the hint must be present and
+        // non-nil, whatever its exact value (BlankFrameHintTests.swift
+        // already proves the formula itself).
+        #expect(frame.blankConfidence != nil)
+        #expect(frame.thumbnailStddev != nil)
+        #expect(frame.thumbnailMean != nil)
+        #expect(frame.endBonus != nil)
+        #expect(frame.runBonus != nil)
+    }
+
+    @Test("frames.list reports all five hint fields as null together for a thumbnail with no decodable raster (T-03-31)")
+    @MainActor
+    func framesListPreProjectNullHintForUndecodableThumbnail() async {
+        let (model, _, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        // Simulator-shaped: brightness/tint, no imagePath at all -- the
+        // honest "no raster" case, never a fabricated score.
+        #expect(await drivePreProjectPreviewThumbnail(model, thumbnailJSON: #"{"brightness":0.5,"tint":0.0}"#))
+
+        let response = await dispatcher.handle(.framesList(id: 21))
+        guard case .success(_, let result) = response, case .framesList(let framesList) = result else {
+            Issue.record("expected a framesList success result")
+            return
+        }
+        let frame = framesList.frames.first
+        #expect(frame?.hasThumbnail == true)
+        #expect(frame?.needsApproval == false)
+        #expect(frame?.reviewEvidence == [])
+        #expect(frame?.blankConfidence == nil)
+        #expect(frame?.thumbnailStddev == nil)
+        #expect(frame?.thumbnailMean == nil)
+        #expect(frame?.endBonus == nil)
+        #expect(frame?.runBonus == nil)
     }
 
     @Test(".settingsGet and .outputsGet mirror the live capture/processing/output recipes")

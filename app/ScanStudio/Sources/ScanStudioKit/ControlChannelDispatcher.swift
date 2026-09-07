@@ -660,10 +660,27 @@ public final class ControlChannelDispatcher {
             // `ScanProject` has no `directory` field -- the resolved
             // directory lives on `SessionModel.projectDirectory`, a
             // separate property `createProject`/`openProject` both set.
+            //
+            // D-13/HEAD-07: `saveRollAndScanSelectedFrames`'s own `return
+            // started || pendingManualReviewScan?.frames == requestedFrames`
+            // line is why a bare `true` here cannot tell "the scan started"
+            // apart from "a flagged frame paused it at the boundary-review
+            // gate" -- reading `pendingManualReviewScan` back out (mirroring
+            // that same equality the model used internally) recovers the
+            // distinction. `"failed"` therefore never comes from this
+            // branch at all: it is reserved for a save that created the
+            // project and then failed to start scanning for a reason that
+            // is neither an outright refusal (already handled by
+            // `outcome(id:errorMessageBefore:)` above) nor a pending review
+            // -- not reachable from today's `SessionModel`, but D-13's own
+            // three-value contract gives a future such case somewhere
+            // honest to report it.
+            let isPendingReview = sessionModel.pendingManualReviewScan?.frames == sessionModel.selectedFrames
             return .success(id: id, result: .rollSave(ControlRollSaveResult(
                 saved: true,
                 projectName: sessionModel.project?.name,
-                projectDirectory: sessionModel.projectDirectory
+                projectDirectory: sessionModel.projectDirectory,
+                outcome: isPendingReview ? "manualReviewPending" : "started"
             )))
         case .rollOpen(let id, let params):
             let errorMessageBefore = sessionModel.lastErrorMessage
@@ -1095,28 +1112,87 @@ public final class ControlChannelDispatcher {
             scanReadiness: String(describing: readiness),
             scanReadinessReason: readiness.reason,
             lastErrorMessage: sessionModel.lastErrorMessage,
-            lastControlRefusal: sessionModel.lastControlRefusal
+            lastControlRefusal: sessionModel.lastControlRefusal,
+            manualReviewPending: buildManualReviewPending()
         )
     }
 
-    /// One `ControlFrameSummary` per frame of the open project -- an empty
-    /// array when no project is open (a legitimate readable state, never an
-    /// error). `errorCode` copies only the bare failure code string; T-01-05
-    /// forbids copying any richer hardware-diagnostic payload alongside it.
-    private func buildFramesListResult() -> ControlFramesListResult {
-        let frames = (sessionModel.project?.frames ?? []).map { frame -> ControlFrameSummary in
-            let index = frame.index
-            return ControlFrameSummary(
-                index: index,
-                excluded: sessionModel.excludedFrameIndices.contains(index),
-                selected: sessionModel.selectedFrameIndices.contains(index),
-                hasThumbnail: sessionModel.thumbnails[index] != nil,
-                state: sessionModel.frameStates[index]?.rawValue,
-                manualReviewDecision: sessionModel.manualReviewDecisions[index].map(Self.manualReviewDecisionName),
-                errorCode: sessionModel.frameErrors[index]?.code
+    /// D-13/HEAD-07: `nil` when nothing is pending. Built from
+    /// `pendingManualReviewScan?.requirements` -- each requirement's own
+    /// `warnings` *is* D-12's boundary evidence (`Thumbnail.warnings`,
+    /// carried through unchanged), so `reason` is simply its first entry,
+    /// or the literal `"boundaryAmbiguous"` when a requirement carries none
+    /// (never an empty string, never an invented sentence).
+    /// `contentConfidence` is `1 - blankConfidence` of the same
+    /// `BlankFrameHint.Score` `frames.list` would report for that index, or
+    /// `nil` when no hint exists (T-03-31: absence stays absence). Because
+    /// this lives inside `buildStatusResult()` -- the same aggregate
+    /// `subscribeToEvents()` observes -- a pending review reaches `status`,
+    /// `control.snapshot`, and `control.changed` from this one source, with
+    /// no separate event wiring (T-03-34).
+    private func buildManualReviewPending() -> ControlManualReviewPending? {
+        guard let requirements = sessionModel.pendingManualReviewScan?.requirements,
+              !requirements.isEmpty
+        else { return nil }
+        let frames = requirements.map { requirement -> ControlManualReviewFrame in
+            ControlManualReviewFrame(
+                index: requirement.frameIndex,
+                reason: requirement.warnings.first ?? "boundaryAmbiguous",
+                evidence: requirement.warnings,
+                contentConfidence: sessionModel.blankFrameHints[requirement.frameIndex].map { 1 - $0.blankConfidence }
             )
         }
+        return ControlManualReviewPending(frames: frames)
+    }
+
+    /// One `ControlFrameSummary` per frame -- with a project open, one per
+    /// `project.frames` entry (as before); with none open, one per
+    /// **previewed thumbnail** (D-12/HEAD-06), sorted ascending. This is the
+    /// pre-project gap D-12 closes: previously, no project meant an empty
+    /// optional-chained frames array with nothing to fall back to, silently
+    /// defaulting to an empty result before any project existed, so a
+    /// script had no way to see which frames were leader before it could
+    /// even call `roll.save`. Nothing can be *excluded* before a project
+    /// exists -- there is no manifest to hold an exclusion -- so `excluded`
+    /// is always `false` in the pre-project branch; that is a real fact
+    /// about this state, not a third state invented to fill the field.
+    private func buildFramesListResult() -> ControlFramesListResult {
+        let frames: [ControlFrameSummary]
+        if let project = sessionModel.project {
+            frames = project.frames.map { frame in
+                buildFrameSummary(index: frame.index, excluded: sessionModel.excludedFrameIndices.contains(frame.index))
+            }
+        } else {
+            frames = sessionModel.thumbnails.keys.sorted().map { index in
+                buildFrameSummary(index: index, excluded: false)
+            }
+        }
         return ControlFramesListResult(frames: frames, selectedFrames: sessionModel.selectedFrames)
+    }
+
+    /// Shared by both `buildFramesListResult()` branches so the hint/review
+    /// fields are computed identically whether or not a project exists yet.
+    /// `errorCode` copies only the bare failure code string; T-01-05 forbids
+    /// copying any richer hardware-diagnostic payload alongside it.
+    private func buildFrameSummary(index: Int, excluded: Bool) -> ControlFrameSummary {
+        let hint = sessionModel.blankFrameHints[index]
+        let thumbnail = sessionModel.thumbnails[index]
+        return ControlFrameSummary(
+            index: index,
+            excluded: excluded,
+            selected: sessionModel.selectedFrameIndices.contains(index),
+            hasThumbnail: thumbnail != nil,
+            state: sessionModel.frameStates[index]?.rawValue,
+            manualReviewDecision: sessionModel.manualReviewDecisions[index].map(Self.manualReviewDecisionName),
+            errorCode: sessionModel.frameErrors[index]?.code,
+            blankConfidence: hint?.blankConfidence,
+            thumbnailStddev: hint?.thumbnailStddev,
+            thumbnailMean: hint?.thumbnailMean,
+            endBonus: hint?.endBonus,
+            runBonus: hint?.runBonus,
+            needsApproval: thumbnail?.needsApproval ?? false,
+            reviewEvidence: thumbnail?.warnings ?? []
+        )
     }
 
     private static func manualReviewDecisionName(_ decision: ManualReviewDecision) -> String {
