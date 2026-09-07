@@ -443,9 +443,47 @@ public final class ControlChannelDispatcher {
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.disconnect()
             return outcome(id: id, errorMessageBefore: errorMessageBefore)
-        case .previewAcquire:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .previewAcquire(let id, let params):
+            // The confirmation check already ran in the preamble above, so
+            // `filmLoadedConfirmed == true` is guaranteed here. This is the
+            // GUI's own gate (`ScanPanelView.canAcquireThumbnails`'s motion
+            // component) mirrored directly.
+            guard sessionModel.hardwareMotionReadiness.allowsMotion else {
+                return .failure(id: id, error: gateRefusal(motionReadiness: sessionModel.hardwareMotionReadiness)
+                    ?? ControlErrorPayload(.gateRefused, message: "Hardware motion is not ready.", gate: .hardwareMotion))
+            }
+            let token = PreviewIntentToken()
+            let intent: PreviewIntent
+            switch params.intent ?? "initial" {
+            case "initial":
+                intent = .initial(token: token)
+            case "refreshSavedProject":
+                intent = .refreshSavedProject(token: token)
+            case "replaceFilmProcess":
+                guard let filmProcess = params.filmProcess else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "\"preview.acquire\" with intent \"replaceFilmProcess\" requires filmProcess."
+                    ))
+                }
+                intent = .replaceFilmProcess(token: token, filmProcess: filmProcess)
+            default:
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "Unknown preview.acquire intent \"\(params.intent ?? "initial")\"."
+                ))
+            }
+            // A `.rejected`/`.failedToStart` outcome is still a *success*
+            // response here: the request was accepted and answered
+            // definitively, and the caller reads `outcome` to see which of
+            // the three occurred. The one place in this phase where a
+            // non-`.started` `PreviewRequestOutcome` is not a failure
+            // response.
+            let requestOutcome = await sessionModel.requestPreview(intent)
+            return .success(id: id, result: .previewAcquire(ControlPreviewAcquireResult(
+                outcome: String(describing: requestOutcome),
+                intentToken: token.id.uuidString
+            )))
         case .framesList(let id):
             return .success(id: id, result: .framesList(buildFramesListResult()))
         case .framesInclude:
@@ -488,9 +526,21 @@ public final class ControlChannelDispatcher {
         case .scanResume:
             // Plan 05/06 replaces this arm
             return placeholder(request)
-        case .scannerEject:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .scannerEject(let id, _):
+            // The confirmation check already ran in the preamble above.
+            guard sessionModel.hardwareMotionReadiness.allowsMotion else {
+                return .failure(id: id, error: gateRefusal(motionReadiness: sessionModel.hardwareMotionReadiness)
+                    ?? ControlErrorPayload(.gateRefused, message: "Hardware motion is not ready.", gate: .hardwareMotion))
+            }
+            // `SessionModel.eject()` re-checks `hardwareMotionReadiness`
+            // internally and keeps its own guard -- this is D-08's defence
+            // in depth, not redundancy: this pre-check gives the caller a
+            // typed refusal, and the model's own guard is what makes the
+            // gate impossible to bypass from any caller, including a future
+            // one that forgets to pre-check here.
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.eject()
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
         case .diagnosticsExport:
             // Plan 05/06 replaces this arm
             return placeholder(request)

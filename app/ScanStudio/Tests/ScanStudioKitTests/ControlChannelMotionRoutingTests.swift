@@ -27,6 +27,21 @@ private let motionRoutingDevice = DeviceInfo(
     supported: true, supportedMultisamplePasses: [4]
 )
 
+/// A fake *real* device fixture (Task 2) -- `hardwareMotionReadiness` is
+/// always `.notApplicable` (motion always allowed) for a simulated device,
+/// so a "motion not ready" test needs a device that reports `kind: "real"`,
+/// exactly like `DeviceConnectionLifecycleTests.swift`'s own device
+/// fixture. This is a label in a mocked engine response, never real
+/// hardware or motion.
+private let motionRoutingRealDevice = DeviceInfo(
+    deviceId: "real-ls5000-motion-routing-test",
+    model: "LS-5000 ED",
+    kind: "real",
+    firmware: "test",
+    connection: "usb",
+    supported: true, supportedMultisamplePasses: [4]
+)
+
 /// Fake engine modelled on `ConnectionLifecycleEngineStub`
 /// (`DeviceConnectionLifecycleTests.swift`) and `ControlDispatcherEngineStub`
 /// (`ControlChannelDispatcherTests.swift`). Rather than one dedicated
@@ -92,18 +107,26 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
         await awaitGate(method)
         switch method {
         case "scanner.list", "scanner.rescan":
-            return try cast(ScannerListResult(devices: [motionRoutingDevice]), as: Result.self)
+            // Both fixtures are always discoverable so a test can connect
+            // to either one by id without a separate scripted response.
+            return try cast(ScannerListResult(devices: [motionRoutingDevice, motionRoutingRealDevice]), as: Result.self)
         case "scanner.connect":
+            let requestedDeviceId = (params as? ConnectParams)?.deviceId
+            let connectedDevice = requestedDeviceId == motionRoutingRealDevice.deviceId
+                ? motionRoutingRealDevice
+                : motionRoutingDevice
             return try cast(ConnectResult(
-                device: motionRoutingDevice,
+                device: connectedDevice,
                 status: ScannerStatus(
                     connected: true, adapter: "SA-21", mediaLoaded: false, carrier: nil,
                     frameCount: nil, lamp: "unknown", transport: "idle", activeJobId: nil,
                     filmPresent: nil, motionArmed: true
                 )
             ), as: Result.self)
-        case "scanner.disconnect":
+        case "scanner.disconnect", "scanner.eject":
             return try cast(EmptyResult(), as: Result.self)
+        case "scanner.acquireThumbnails":
+            return try cast(AcquireThumbnailsAck(accepted: true, frames: []), as: Result.self)
         default:
             throw MotionRoutingStubError.unexpectedMethod(method)
         }
@@ -168,6 +191,25 @@ private func expectFailure(_ response: ControlResponse, id expectedId: UInt64, c
     #expect(error.code == expectedCode.rawValue)
 }
 
+/// Connects to the fake "real" device fixture, then injects a synthetic
+/// `scanner.status` event carrying `motionArmed: false` -- the live-state
+/// route `DeviceConnectionLifecycleTests.swift` drives throughout, never a
+/// settable test seam added to `SessionModel`. Drives
+/// `sessionModel.hardwareMotionReadiness` to `.notEnabled` (`allowsMotion
+/// == false`).
+@MainActor
+private func driveHardwareMotionNotReady(_ model: SessionModel) async {
+    await model.connect(deviceId: motionRoutingRealDevice.deviceId)
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":null,"motionArmed":false}}}
+            """#.utf8
+        )
+    ))
+}
+
 @Suite("Control channel motion routing")
 struct ControlChannelMotionRoutingTests {
     // MARK: Device lifecycle (Task 1)
@@ -199,7 +241,7 @@ struct ControlChannelMotionRoutingTests {
             Issue.record("expected a scannerList success result, got \(firstResponse)")
             return
         }
-        #expect(scannerListResult.devices.map(\.deviceId) == [motionRoutingDevice.deviceId])
+        #expect(scannerListResult.devices.map(\.deviceId) == [motionRoutingDevice.deviceId, motionRoutingRealDevice.deviceId])
         #expect(model.mutatingOperationInFlight == nil)
     }
 
@@ -230,7 +272,7 @@ struct ControlChannelMotionRoutingTests {
             Issue.record("expected a scannerList success result, got \(firstResponse)")
             return
         }
-        #expect(scannerListResult.devices.map(\.deviceId) == [motionRoutingDevice.deviceId])
+        #expect(scannerListResult.devices.map(\.deviceId) == [motionRoutingDevice.deviceId, motionRoutingRealDevice.deviceId])
         #expect(model.mutatingOperationInFlight == nil)
     }
 
@@ -324,5 +366,126 @@ struct ControlChannelMotionRoutingTests {
 
         #expect(ControlChannelDispatcher.parseEngineCodePrefix("This roll is already saved.") == nil)
         #expect(ControlChannelDispatcher.parseEngineCodePrefix("Choose a scanner from Connect: pick one, ScanStudio will not guess.") == nil)
+    }
+
+    // MARK: preview.acquire (Task 2)
+
+    @Test("preview.acquire without filmLoadedConfirmed is refused with CONFIRMATION_REQUIRED before any engine call")
+    @MainActor
+    func previewAcquireWithoutConfirmationIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.previewAcquire(
+            id: 1, params: ControlPreviewAcquireParams(filmLoadedConfirmed: nil, intent: nil, filmProcess: nil)
+        ))
+        expectFailure(response, id: 1, code: .confirmationRequired)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("preview.acquire with confirmation on a not-motion-ready model is refused with GATE_REFUSED before any engine call")
+    @MainActor
+    func previewAcquireWithMotionNotReadyIsRefused() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await driveHardwareMotionNotReady(model)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.previewAcquire(
+            id: 2, params: ControlPreviewAcquireParams(filmLoadedConfirmed: true, intent: nil, filmProcess: nil)
+        ))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 2)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(error.gate == ControlGate.hardwareMotion.rawValue)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("preview.acquire with intent replaceFilmProcess and no filmProcess is refused with INVALID_PARAMS")
+    @MainActor
+    func previewAcquireReplaceFilmProcessWithoutFilmProcessIsInvalid() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.previewAcquire(
+            id: 3, params: ControlPreviewAcquireParams(filmLoadedConfirmed: true, intent: "replaceFilmProcess", filmProcess: nil)
+        ))
+        expectFailure(response, id: 3, code: .invalidParams)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("preview.acquire with an unrecognized intent string is refused with INVALID_PARAMS")
+    @MainActor
+    func previewAcquireUnknownIntentIsInvalid() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.previewAcquire(
+            id: 4, params: ControlPreviewAcquireParams(filmLoadedConfirmed: true, intent: "banana", filmProcess: nil)
+        ))
+        expectFailure(response, id: 4, code: .invalidParams)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("A successful preview.acquire reaches scanner.acquireThumbnails and returns a parseable intentToken")
+    @MainActor
+    func previewAcquireSucceedsAndReachesAcquireThumbnails() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.previewAcquire(
+            id: 5, params: ControlPreviewAcquireParams(filmLoadedConfirmed: true, intent: nil, filmProcess: nil)
+        ))
+        guard case .success(let id, let result) = response, case .previewAcquire(let previewResult) = result else {
+            Issue.record("expected a previewAcquire success result, got \(response)")
+            return
+        }
+        #expect(id == 5)
+        #expect(previewResult.outcome == "started")
+        #expect(UUID(uuidString: previewResult.intentToken) != nil)
+        #expect(await stub.recordedMethods == ["scanner.acquireThumbnails"])
+    }
+
+    // MARK: scanner.eject (Task 2)
+
+    @Test("scanner.eject without motionConfirmed is refused with CONFIRMATION_REQUIRED before any engine call")
+    @MainActor
+    func ejectWithoutConfirmationIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.scannerEject(id: 1, params: ControlScannerEjectParams(motionConfirmed: nil)))
+        expectFailure(response, id: 1, code: .confirmationRequired)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scanner.eject with confirmation on a not-motion-ready model is refused with GATE_REFUSED before any engine call")
+    @MainActor
+    func ejectWithMotionNotReadyIsRefused() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        await driveHardwareMotionNotReady(model)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.scannerEject(id: 2, params: ControlScannerEjectParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 2)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(error.gate == ControlGate.hardwareMotion.rawValue)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("scanner.eject with confirmation and motion ready reaches exactly one scanner.eject request")
+    @MainActor
+    func ejectWithMotionReadySucceeds() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.scannerEject(id: 3, params: ControlScannerEjectParams(motionConfirmed: true)))
+        guard case .success = response else {
+            Issue.record("expected scanner.eject to succeed, got \(response)")
+            return
+        }
+        #expect(await stub.recordedMethods == ["scanner.eject"])
     }
 }
