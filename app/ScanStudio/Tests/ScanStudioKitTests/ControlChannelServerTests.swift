@@ -289,6 +289,23 @@ struct ControlChannelServerTests {
         try ControlSocketPath.validate(exactly103)
     }
 
+    @Test("validate() refuses a path that is itself a symlink (T-02-06)")
+    func validateRefusesSymlinkPath() throws {
+        let path = shortSocketPath("symlink")
+        let directory = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { removeSocketDirectory(for: path) }
+
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: "/tmp/ss-ctl-symlink-target-does-not-exist")
+
+        do {
+            try ControlSocketPath.validate(path)
+            Issue.record("expected validate() to refuse a path that is itself a symlink")
+        } catch let error as ControlSocketError {
+            #expect(error.errnoValue == ELOOP)
+        }
+    }
+
     @Test("probeIsLive is false for a path that has never existed")
     func probeIsLiveFalseForMissingPath() {
         let path = shortSocketPath("missing")
