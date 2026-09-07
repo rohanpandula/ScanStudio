@@ -10,11 +10,11 @@
 // (Phase 2's job) -- `handle(_:)`/`handleLine(_:)` are the only two entry
 // points a future transport needs (D-06).
 //
-// Plan 04 builds this preamble plus the five read-only aggregate commands
+// Plan 04 built this preamble plus the five read-only aggregate commands
 // (`status`, `frames.list`, `settings.get`, `outputs.get`, `job.get`) and
-// `events.subscribe`. Every other D-05 command is left as a deliberate,
-// greppable placeholder that Plans 05 and 06 replace with real routing on
-// top of the preamble this file establishes.
+// `events.subscribe`; Plans 05 and 06 routed the remaining nineteen D-05
+// commands on top of that preamble. Every one of the 25 D-05 commands is
+// now routed -- D-05.
 
 import Foundation
 import Observation
@@ -416,8 +416,7 @@ public final class ControlChannelDispatcher {
     }
 
     /// The routing switch. Only `.hello` is handled ahead of this function;
-    /// every other case here is a deliberate placeholder until Tasks 2/3 of
-    /// this plan and Plans 05/06 replace it with real routing.
+    /// every other one of the 25 D-05 commands has a real routing arm here.
     private func route(_ request: ControlRequest) async -> ControlResponse {
         switch request {
         case .hello:
@@ -528,23 +527,59 @@ public final class ControlChannelDispatcher {
                 capture: sessionModel.captureRecipe,
                 processing: sessionModel.processingRecipe
             )))
-        case .settingsSet:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .settingsSet(let id, let params):
+            if let refusal = settingsOutputsBusyRefusal(method: "settings.set") {
+                return .failure(id: id, error: refusal)
+            }
+            // No individual settings field is written from the dispatcher --
+            // this is the one D-04 fallback entry point Plan 03 added.
+            sessionModel.applySettingsRecipes(capture: params.capture, processing: params.processing)
+            return .success(id: id, result: .empty(ControlEmptyResult()))
         case .outputsGet(let id):
             return .success(id: id, result: .outputs(ControlOutputsResult(outputs: sessionModel.outputRecipe)))
-        case .outputsSet:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .rollSave:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .rollOpen:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .rollList:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .outputsSet(let id, let params):
+            if let refusal = settingsOutputsBusyRefusal(method: "outputs.set") {
+                return .failure(id: id, error: refusal)
+            }
+            // Delegates to the same private `applyRecipes(_:)` path
+            // `openProject(directory:)` already uses -- no individual output
+            // field is written from the dispatcher.
+            sessionModel.applyOutputRecipe(params.outputs)
+            return .success(id: id, result: .empty(ControlEmptyResult()))
+        case .rollSave(let id, let params):
+            // `saveRollAndScanSelectedFrames` sets `lastErrorMessage` on
+            // both its synchronous refusal branches (`project != nil`,
+            // `selectedFrames.isEmpty`) before its own busy flag would even
+            // apply, so the shared `outcome` helper still produces a typed
+            // refusal carrying the model's own explanation for either one.
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            let saved = await sessionModel.saveRollAndScanSelectedFrames(name: params.name, carrier: params.carrier, frameCount: params.frameCount, filmProcess: params.filmProcess)
+            guard saved else {
+                return outcome(id: id, errorMessageBefore: errorMessageBefore)
+            }
+            // `ScanProject` has no `directory` field -- the resolved
+            // directory lives on `SessionModel.projectDirectory`, a
+            // separate property `createProject`/`openProject` both set.
+            return .success(id: id, result: .rollSave(ControlRollSaveResult(
+                saved: true,
+                projectName: sessionModel.project?.name,
+                projectDirectory: sessionModel.projectDirectory
+            )))
+        case .rollOpen(let id, let params):
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.openProject(directory: params.directory)
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+        case .rollList(let id):
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.refreshRecentProjects()
+            switch outcome(id: id, errorMessageBefore: errorMessageBefore) {
+            case .success:
+                return .success(id: id, result: .rollList(ControlRollListResult(
+                    projects: sessionModel.recentProjects.map(Self.mapProjectSummary)
+                )))
+            case .failure(let failureId, let error):
+                return .failure(id: failureId, error: error)
+            }
         case .scanStart(let id, _):
             // Confirmation already checked in the preamble. This is
             // verbatim the expression `ScanPanelView.swift` computes for
@@ -626,9 +661,51 @@ public final class ControlChannelDispatcher {
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.eject()
             return outcome(id: id, errorMessageBefore: errorMessageBefore)
-        case .diagnosticsExport:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .diagnosticsExport(let id, let params):
+            // T-01-20: `params.directory` is a caller-controlled write
+            // destination crossing a trust boundary -- this is the only
+            // filesystem-write primitive the Phase 1 channel exposes.
+            // Every condition below is checked before any write, and the
+            // filename itself is dispatcher-generated, never caller-
+            // supplied, so a caller can never choose what gets overwritten.
+            guard params.directory.hasPrefix("/") else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "\"diagnostics.export\" directory \"\(params.directory)\" must be an absolute path."
+                ))
+            }
+            guard !params.directory.split(separator: "/").contains("..") else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "\"diagnostics.export\" directory \"\(params.directory)\" must not contain \"..\" path components."
+                ))
+            }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: params.directory, isDirectory: &isDirectory), isDirectory.boolValue else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "\"diagnostics.export\" directory \"\(params.directory)\" does not exist."
+                ))
+            }
+            // Film bytes require exact per-export consent, and the control
+            // channel has no consent affordance in Phase 1 -- always
+            // `previewConsent: nil` (T-01-05).
+            let entries = sessionModel.diagnosticBundleEntryNames(previewConsent: nil)
+            let data = sessionModel.makeDiagnosticBundleData(previewConsent: nil)
+            let url = URL(fileURLWithPath: params.directory)
+                .appendingPathComponent(Self.diagnosticBundleFilename())
+            do {
+                try DiagnosticBundleFileWriter.write(data, to: url)
+            } catch {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "\"diagnostics.export\" failed: \(error.localizedDescription)"
+                ))
+            }
+            return .success(id: id, result: .diagnosticsExport(ControlDiagnosticsExportResult(
+                path: url.path,
+                entries: entries
+            )))
         case .eventsSubscribe(let id):
             return .success(id: id, result: .eventsSubscribe(ControlEventsSubscribeResult(
                 subscribed: true,
@@ -637,13 +714,6 @@ public final class ControlChannelDispatcher {
         case .jobGet(let id):
             return .success(id: id, result: .job(buildJobResult()))
         }
-    }
-
-    private func placeholder(_ request: ControlRequest) -> ControlResponse {
-        .failure(id: request.id, error: ControlErrorPayload(
-            .unknownCommand,
-            message: "\"\(request.methodName)\" is not yet routed by this dispatcher build."
-        ))
     }
 
     // MARK: Device discovery (scanner.list / scanner.rescan)
@@ -907,6 +977,37 @@ public final class ControlChannelDispatcher {
             jobPercent: progress.jobPercent,
             etaSeconds: progress.etaSeconds
         )
+    }
+
+    /// `WireProtocol.swift`'s `ProjectSummary` (`SessionModel.recentProjects`'
+    /// element type) is `Decodable`-only, missing the `Encodable`/`Equatable`
+    /// directions the wire needs -- mirrors it field-for-field into
+    /// `ControlProjectSummary` rather than retrofitting cross-module
+    /// conformances onto a type owned by `WireProtocol.swift`.
+    private static func mapProjectSummary(_ summary: ProjectSummary) -> ControlProjectSummary {
+        ControlProjectSummary(
+            id: summary.id,
+            name: summary.name,
+            carrier: summary.carrier,
+            frameCount: summary.frameCount,
+            filmProcess: summary.filmProcess,
+            createdAt: summary.createdAt,
+            directory: summary.directory
+        )
+    }
+
+    // MARK: Diagnostics export (diagnostics.export)
+
+    /// Mirrors `ContentView.swift`'s own `saveDiagnosticBundle()` filename
+    /// scheme (`"ScanStudio-Diagnostics-\(timestamp).zip"`) verbatim, so a
+    /// bundle written by the control channel is indistinguishable from one
+    /// the GUI would have written for the same moment. The filename is
+    /// always generated here, never taken from the request (T-01-20).
+    private static func diagnosticBundleFilename() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate, .withTime, .withTimeZone]
+        let timestamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "")
+        return "ScanStudio-Diagnostics-\(timestamp).zip"
     }
 
     // MARK: Event stream
