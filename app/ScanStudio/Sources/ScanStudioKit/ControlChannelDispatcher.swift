@@ -486,15 +486,43 @@ public final class ControlChannelDispatcher {
             )))
         case .framesList(let id):
             return .success(id: id, result: .framesList(buildFramesListResult()))
-        case .framesInclude:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .framesExclude:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
-        case .reviewApprove:
-            // Plan 05/06 replaces this arm
-            return placeholder(request)
+        case .framesInclude(let id, let params):
+            if let error = validatedFrameIndex(params.frameIndex, method: request.methodName) {
+                return .failure(id: id, error: error)
+            }
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.setFrameExcluded(params.frameIndex, excluded: false)
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+        case .framesExclude(let id, let params):
+            if let error = validatedFrameIndex(params.frameIndex, method: request.methodName) {
+                return .failure(id: id, error: error)
+            }
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.setFrameExcluded(params.frameIndex, excluded: true)
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+        case .reviewApprove(let id, _):
+            // Confirmation already checked in the preamble above.
+            // `approvePendingManualReviewAndStart()` returns silently (no
+            // `lastErrorMessage`) when nothing is pending -- pre-checking
+            // here is RESEARCH Pitfall 1's silent-no-op-to-typed-refusal
+            // translation, so "approved" can never be confused with "there
+            // was nothing to approve".
+            guard sessionModel.pendingManualReviewScan != nil else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .gateRefused,
+                    message: "\"review.approve\" was refused: no manual review is awaiting approval.",
+                    guidance: "There is no pending manual review to approve.",
+                    gate: .manualReviewPending
+                ))
+            }
+            // Attended-scan-recovery approval (`approveEveryFrameAndScan()`,
+            // the path behind `ContentView.swift:571`) is deliberately NOT
+            // routed here. It approves every frame against a different
+            // confirmation contract and needs its own D-05 command name --
+            // Phase 2 / CLI-05 work. Do not add it to this arm.
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.approvePendingManualReviewAndStart()
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
         case .settingsGet(let id):
             return .success(id: id, result: .settings(ControlSettingsResult(
                 capture: sessionModel.captureRecipe,
@@ -734,6 +762,55 @@ public final class ControlChannelDispatcher {
             message: "Hardware motion is not ready (\(String(describing: readiness))): \(readiness.guidance)",
             guidance: readiness.guidance,
             gate: .hardwareMotion
+        )
+    }
+
+    // MARK: Frame selection validation (frames.include / frames.exclude)
+
+    /// D-04: `frames.include`/`frames.exclude` share one frame-index check
+    /// -- no project open, or an index that is not one of the open
+    /// project's actual frame indices, is `INVALID_PARAMS` before either
+    /// arm ever calls `setFrameExcluded(_:excluded:)`.
+    ///
+    /// This checks membership in `project.frames`, not a `0..<count`
+    /// range: frame indices in this codebase are the frame's own 1-based
+    /// `.index` field, confirmed by every existing project fixture (for
+    /// example `AttendedScanRecoveryTests.swift`'s
+    /// `frames: (1...2).map { ProjectFrame(index: $0, ...) }` for a
+    /// 2-frame project) -- a zero-based array-position range would silently
+    /// accept `frameIndex: 0`, which no project ever has.
+    private func validatedFrameIndex(_ frameIndex: Int, method: String) -> ControlErrorPayload? {
+        guard let project = sessionModel.project else {
+            return ControlErrorPayload(.invalidParams, message: "\"\(method)\" requires an open project.")
+        }
+        let validIndices = project.frames.map(\.index).sorted()
+        guard validIndices.contains(frameIndex) else {
+            return ControlErrorPayload(
+                .invalidParams,
+                message: "\"\(method)\" frameIndex \(frameIndex) is not a valid frame index for the open project (valid indices: \(validIndices))."
+            )
+        }
+        return nil
+    }
+
+    // MARK: Settings / outputs busy guard (settings.set / outputs.set)
+
+    /// `applySettingsRecipes(capture:processing:)`/`applyOutputRecipe(_:)`
+    /// are both synchronous (Plan 03) and hold no busy flag of their own,
+    /// so the preamble's `mutatingOperationInFlight` check in `handle(_:)`
+    /// cannot see a running job for either command. Mirrors
+    /// `BatchInspectorView.swift` lines 42-47, where `setupInspector`
+    /// (the settings editors) is rendered only while `!sessionModel
+    /// .isJobActive` and is `.disabled(sessionModel.isResumingBatch)` when
+    /// it is rendered -- a control caller must meet the same bar the GUI
+    /// enforces by not rendering the control at all.
+    private func settingsOutputsBusyRefusal(method: String) -> ControlErrorPayload? {
+        guard sessionModel.isJobActive || sessionModel.isResumingBatch else { return nil }
+        let inFlight = sessionModel.jobId ?? "a resume in progress"
+        return ControlErrorPayload(
+            .controllerBusy,
+            message: "\"\(method)\" was refused: \(inFlight) is active.",
+            guidance: inFlight
         )
     }
 
