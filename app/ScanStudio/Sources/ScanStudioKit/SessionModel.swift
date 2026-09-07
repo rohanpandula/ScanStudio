@@ -653,6 +653,14 @@ public final class SessionModel {
     public private(set) var frameTransportSmearReasons: [Int: String] = [:]
     public private(set) var scanSummary: ScanSummary?
     public private(set) var lastErrorMessage: String?
+    /// Retains the most recent engine failure's typed payload, set only by
+    /// `recordOperationFailure`, so the control channel can pass the
+    /// engine's own `code`/`recoverable` flag through verbatim (OUT-03).
+    /// Consumers must read only `.code` and `.recoverable` from this value —
+    /// `.details`, `.evidence`, `.diagnosticEvidence`, and
+    /// `.diagnosticEvidenceUnavailableReason` are hardware-diagnostic detail
+    /// the control channel must never forward (T-01-05).
+    public private(set) var lastEngineError: EngineRequestError?
     /// Strictly validated witness (or an explicit reason it was unavailable)
     /// from the exact terminal attempt currently represented in diagnostics.
     public private(set) var diagnosticEvidenceAvailability:
@@ -2749,6 +2757,7 @@ public final class SessionModel {
             }
             await persistFrameAlignmentDrafts()
         } catch {
+            recordOperationFailure(error, operation: "project.create")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -2883,6 +2892,7 @@ public final class SessionModel {
             applyRecipes(result.project.recipes)
             restoreDerivativeTransforms(from: result.project.frames)
         } catch {
+            recordOperationFailure(error, operation: "project.open")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -2955,6 +2965,7 @@ public final class SessionModel {
             let result: ProjectListResult = try await engineClient.request("project.list", params: params)
             recentProjects = result.projects
         } catch {
+            recordOperationFailure(error, operation: "project.list")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -2971,6 +2982,7 @@ public final class SessionModel {
             let result: SetFrameResult = try await engineClient.request("project.setFrameExcluded", params: params)
             project = result.project
         } catch {
+            recordOperationFailure(error, operation: "project.setFrameExcluded")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -5150,6 +5162,10 @@ public final class SessionModel {
     ) {
         let wasConnected = diagnosticUIConnected
         let code = Self.diagnosticErrorCode(error)
+        // OUT-03: retained unconditionally so a non-engine error clears any
+        // stale payload rather than leaving one behind for the dispatcher's
+        // code-match guard to find.
+        lastEngineError = error as? EngineRequestError
         if let requestError = error as? EngineRequestError {
             captureDiagnosticEvidence(
                 artifact: resolveDiagnosticEvidence(
