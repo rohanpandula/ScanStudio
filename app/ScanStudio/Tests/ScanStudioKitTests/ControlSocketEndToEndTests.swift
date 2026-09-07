@@ -95,6 +95,26 @@
 // `.wait(timeout:)` pattern), so a wedged reap can no longer hang the
 // suite.
 //
+// A sixth finding, in the shipped `--wait` mechanism itself: `sample`
+// against a second genuinely stuck run showed a `scan --confirm-motion
+// --wait` subprocess parked reading its own stdout (i.e. the CLI process
+// itself was still alive, waiting on `JobWaiter.waitForTerminalOutcome`'s
+// event loop), while a concurrent host-side poll showed the job had
+// already reached `jobId: nil, jobState: .completed`. `JobWaiter` requires
+// a terminal snapshot whose `jobId` is both non-nil and different from the
+// pre-start id; if `SessionModel` clears `jobId` back to `nil` in the same
+// update that reaches a terminal state, and the `@Observable`-driven event
+// relay coalesces that into one observed snapshot, the exact snapshot
+// `JobWaiter` needs never arrives. This reproduced intermittently, more
+// often for a fast-completing re-scan than a longer initial one, and
+// worse under this shared machine's own scheduling pressure. Not a bug
+// this plan's `files_modified` can fix. Every `runE2ECLI` call (see its
+// own doc comment) is therefore bounded and kills the subprocess on
+// timeout, converting a rare indefinite hang into a fast, diagnosable
+// failure -- exactly this plan's own "every subprocess gets a bounded
+// wait then a kill on teardown" constraint, applied to the one place it
+// was still missing.
+//
 // Coverage, not order, is otherwise exactly the plan's suggested shape:
 // connect -> status -> preview -> settings/outputs get -> roll save (starts
 // job A) -> stop -> frames list/exclude/include -> roll list -> re-preview
@@ -118,6 +138,17 @@ enum EndToEndHostKind: Sendable {
     case inProcess
 }
 
+/// Thrown when `HOST_MODE` (set by `scripts/cli_attach_acceptance.sh`,
+/// defaulting to `in-process` for a direct `swift test` invocation) names a
+/// host kind this phase does not implement yet.
+struct UnsupportedHostModeError: Error, CustomStringConvertible {
+    let hostMode: String
+    var description: String {
+        "HOST_MODE '\(hostMode)' is not supported in Phase 2 (only 'in-process' -- "
+            + "Phase 3 adds 'headless', Phase 4 adds 'bundle')."
+    }
+}
+
 /// The `.inProcess` host: `EngineLocator.locate()` -> real `EngineClient` ->
 /// real `SessionModel` -> real `ControlChannelServer` on a short `/tmp`
 /// socket -- mirrors `AppDelegate.init()`/`applicationWillTerminate` minus
@@ -135,6 +166,16 @@ private struct EndToEndHost {
     private let originalTimeScale: String?
 
     static func start() async throws -> EndToEndHost {
+        // scripts/cli_attach_acceptance.sh sets HOST_MODE explicitly
+        // (defaulting to "in-process"); a direct `swift test` invocation
+        // leaves it unset, which defaults identically here. Phase 2
+        // implements exactly one host kind -- this is the seam Phase 3
+        // (HEAD-02, "headless") and Phase 4 (PKG-02, "bundle") extend.
+        let hostMode = ProcessInfo.processInfo.environment["HOST_MODE"] ?? "in-process"
+        guard hostMode == "in-process" else {
+            throw UnsupportedHostModeError(hostMode: hostMode)
+        }
+
         // Read SCANSTUDIO_ENGINE_PATH (if the caller set it) before this
         // function touches any environment variable itself.
         let engineURL = try EngineLocator.locate()
@@ -306,33 +347,86 @@ private struct E2EStepResult {
     }
 }
 
-/// Runs the real built binary with `arguments` plus `--socket socketPath`.
-/// The blocking `Process`/`Pipe` spawn/read/wait sequence runs on a
-/// dedicated background queue via a continuation -- never inline on Swift's
-/// cooperative thread pool -- mirroring `ScanstudioCLIProcessTests.swift`'s
-/// `runCLI` and the identical fix `ScanstudioCLIConfirmationTests.swift`'s
-/// `runConfirmationCLI` needed for the same thread-pool-starvation reason
-/// (both plans' own SUMMARY.md deviations).
-private func runE2ECLI(_ arguments: [String], socketPath: String) async throws -> E2EStepResult {
+/// Thrown when a CLI subprocess does not exit within `runE2ECLI`'s own
+/// bound. Confirmed (via `sample` against a genuinely stuck run) as a real,
+/// narrow race in the shipped `--wait` mechanism: `JobWaiter
+/// .waitForTerminalOutcome` requires a terminal snapshot whose `jobId` is
+/// both non-nil and different from the pre-start id, but `SessionModel`
+/// can clear `jobId` back to `nil` in the same state transition that
+/// reaches a terminal `jobState` -- if the `@Observable`-driven event
+/// relay coalesces that transition into a single observed snapshot (more
+/// likely the faster a simulated job completes, and worse under
+/// scheduling pressure), the snapshot `JobWaiter` needed never arrives and
+/// it waits forever. Not a bug this plan's `files_modified` could or
+/// should fix (`JobWaiter.swift`, `SessionModel.swift`, and
+/// `ControlChannelServer.swift`'s event relay are all out of scope here).
+/// This plan's own constraint -- "every subprocess gets a bounded wait
+/// then a kill on teardown" -- is what turns an occasional, indefinite
+/// hang into a fast, diagnosable failure instead.
+struct E2ESubprocessTimeoutError: Error, CustomStringConvertible {
+    let arguments: [String]
+    let timeoutSeconds: Double
+    var description: String {
+        "step `scanstudio-cli \(arguments.joined(separator: " "))` did not exit within "
+            + "\(Int(timeoutSeconds))s -- killed. See this file's `runE2ECLI` doc comment."
+    }
+}
+
+/// Guarantees a `CheckedContinuation` is resumed exactly once even when two
+/// independent callbacks (normal completion, timeout) race to resume it --
+/// resuming twice is a fatal error, and this environment's own observed
+/// timing makes that race real, not theoretical.
+private final class SingleResumeGuard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    /// Returns `true` for the first caller (which must resume the
+    /// continuation); `false` for every caller after (which must not).
+    func tryClaim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
+/// Runs the real built binary with `arguments` plus `--socket socketPath`,
+/// bounded by `timeoutSeconds`. The blocking `Process`/`Pipe` spawn/read/
+/// wait sequence runs on a dedicated background queue via a continuation --
+/// never inline on Swift's cooperative thread pool -- mirroring
+/// `ScanstudioCLIProcessTests.swift`'s `runCLI` and the identical fix
+/// `ScanstudioCLIConfirmationTests.swift`'s `runConfirmationCLI` needed for
+/// the same thread-pool-starvation reason (both plans' own SUMMARY.md
+/// deviations). A second, independent GCD timer races the same
+/// continuation: if the subprocess has not exited by `timeoutSeconds`, it
+/// is killed and `E2ESubprocessTimeoutError` is thrown instead of leaving
+/// this suite (and `scripts/cli_attach_acceptance.sh`) hung indefinitely --
+/// see `E2ESubprocessTimeoutError`'s own doc comment for why this is
+/// necessary. 60s default: this environment's own real timings never
+/// exceeded a few seconds per step even under load; this is a wide margin
+/// for a shared machine, not a tight bound.
+private func runE2ECLI(_ arguments: [String], socketPath: String, timeoutSeconds: Double = 60) async throws -> E2EStepResult {
     let binary = try EndToEndCLILocator.resolve()
     let allArguments = arguments + ["--socket", socketPath]
+    let process = Process()
+    process.executableURL = binary
+    process.arguments = allArguments
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+
+    let resumeGuard = SingleResumeGuard()
+
     return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<E2EStepResult, Error>) in
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let process = Process()
-                process.executableURL = binary
-                process.arguments = allArguments
-
-                let stdoutPipe = Pipe()
-                let stderrPipe = Pipe()
-                process.standardOutput = stdoutPipe
-                process.standardError = stderrPipe
-
                 try process.run()
                 let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
                 let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-
+                guard resumeGuard.tryClaim() else { return }
                 continuation.resume(returning: E2EStepResult(
                     arguments: arguments,
                     exitCode: process.terminationStatus,
@@ -340,8 +434,16 @@ private func runE2ECLI(_ arguments: [String], socketPath: String) async throws -
                     stderr: String(data: stderrData, encoding: .utf8) ?? ""
                 ))
             } catch {
+                guard resumeGuard.tryClaim() else { return }
                 continuation.resume(throwing: error)
             }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds) {
+            guard resumeGuard.tryClaim() else { return }
+            if process.isRunning {
+                process.terminate()
+            }
+            continuation.resume(throwing: E2ESubprocessTimeoutError(arguments: arguments, timeoutSeconds: timeoutSeconds))
         }
     }
 }
