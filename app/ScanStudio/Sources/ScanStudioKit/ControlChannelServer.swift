@@ -170,6 +170,16 @@ public enum ControlSocketDialer {
     }
 }
 
+/// One entry in a connection's outbound queue. `droppable == false` for a
+/// command response (D-04: a caller's own answer must never be dropped);
+/// `droppable == true` for an event line (`control.snapshot`/
+/// `control.changed`), the only kind Pitfall 3's bounded queue may discard
+/// under pressure.
+private struct OutboundEntry {
+    let bytes: Data
+    let droppable: Bool
+}
+
 /// The real transport for Phase 1's `ControlChannelDispatcher`. One
 /// dispatcher instance is constructed per accepted connection (all sharing
 /// the single `SessionModel` passed to `init`), matching
@@ -196,6 +206,37 @@ public actor ControlChannelServer {
     /// that framer's internal buffer past
     /// `ControlChannelDispatcher.maxRequestLineBytes`.
     private var pendingLineBytes: [Int32: Int] = [:]
+
+    /// This connection's outbound queue (Pitfall 3 / locked judgment call
+    /// 3): responses are never droppable, event lines always are. Lives on
+    /// the server's write side, never inside the dispatcher's own
+    /// `AsyncStream` (which is unbounded by design and must stay that way).
+    private var outboundQueues: [Int32: [OutboundEntry]] = [:]
+    /// A dedicated serial queue per connection that performs the blocking
+    /// `FileHandle.write(contentsOf:)` -- never the accept queue, never
+    /// `.main` -- so a stalled peer's write only ever blocks its own
+    /// connection's drain.
+    private var writeQueues: [Int32: DispatchQueue] = [:]
+    /// Guards against starting a second concurrent drain loop for the same
+    /// connection.
+    private var draining: Set<Int32> = []
+    /// Events dropped since the last `control.dropped` notice was written
+    /// for this connection -- surfaced immediately before the next event
+    /// line (the locked judgment call's "surfaced in the next event"); CLI-
+    /// side handling of `control.dropped` is OPS-10 (Phase 5).
+    private var droppedEventCounts: [Int32: Int] = [:]
+    /// At most one relay task per connection (a second `events.subscribe`
+    /// on an already-subscribed connection must not start a second one);
+    /// cancelling it is what lets its captured dispatcher reference drop,
+    /// which is what terminates that dispatcher's event subscription.
+    private var relayTasks: [Int32: Task<Void, Never>] = [:]
+
+    /// D-04/Pitfall 3: bounds a single connection's outbound queue. Control
+    /// and event lines in this protocol are small JSON objects (well under
+    /// 1 KB each in practice), so this entry-count cap keeps one stalled
+    /// connection's queue at a few hundred kilobytes at most, never
+    /// unbounded.
+    static let outboundQueueBound = 256
 
     private static let listenBacklog: Int32 = 8
 
@@ -367,16 +408,50 @@ public actor ControlChannelServer {
         pendingLineBytes[fd] = max(0, totalPending - consumed)
 
         for line in lines {
-            let responseData = await dispatcher.handleLine(Data(line.utf8))
-            var out = responseData
-            out.append(0x0A)
-            writeDirect(fd: fd, bytes: out)
+            await processLine(fd: fd, dispatcher: dispatcher, line: line)
         }
+    }
+
+    /// Answers one framed line via `dispatcher.handleLine(_:)` -- the
+    /// single call a transport makes per request line -- and, only for a
+    /// *successful* `events.subscribe`, starts this connection's event
+    /// relay. The method-name and success sniffs are cheap, generic JSON
+    /// shape checks (never a re-derivation of routing/gate logic, which
+    /// stays entirely inside the dispatcher).
+    private func processLine(fd: Int32, dispatcher: ControlChannelDispatcher, line: String) async {
+        let lineData = Data(line.utf8)
+        let isEventsSubscribeRequest = Self.methodName(of: lineData) == Self.eventsSubscribeMethod
+        let responseData = await dispatcher.handleLine(lineData)
+        if isEventsSubscribeRequest, Self.isSuccessResponse(responseData) {
+            startEventRelay(fd: fd, dispatcher: dispatcher)
+        }
+        var out = responseData
+        out.append(0x0A)
+        enqueue(fd: fd, bytes: out, droppable: false)
+    }
+
+    private static let eventsSubscribeMethod = "events.subscribe"
+
+    private static func methodName(of line: Data) -> String? {
+        (try? JSONDecoder().decode(ControlMethodSniff.self, from: line))?.method
+    }
+
+    private static func isSuccessResponse(_ data: Data) -> Bool {
+        struct ResponseKindSniff: Decodable { let error: ControlErrorPayload? }
+        guard let sniff = try? JSONDecoder().decode(ResponseKindSniff.self, from: data) else { return false }
+        return sniff.error == nil
     }
 
     /// D-04/T-02-08: writes one `INVALID_PARAMS` line naming the limit,
     /// then closes the connection and drops all its state -- never keeps
     /// buffering, never waits for a newline that may never come.
+    ///
+    /// Writes directly via `write(fd:bytes:)` and `await`s it, rather than
+    /// `enqueue`-ing onto the outbound queue: `closeConnection` immediately
+    /// after would otherwise discard this connection's queue (including
+    /// the entry just appended) before the drain loop's own `Task` ever
+    /// gets a turn to run it -- this refusal is the one write that must be
+    /// on the wire *before* the descriptor closes, not merely queued.
     private func refuseOversizedLine(fd: Int32) async {
         let payload = ControlErrorPayload(
             .invalidParams,
@@ -385,23 +460,112 @@ public actor ControlChannelServer {
         if let data = try? JSONEncoder().encode(ControlResponseErrorEnvelope(id: 0, error: payload)) {
             var out = data
             out.append(0x0A)
-            writeDirect(fd: fd, bytes: out)
+            await write(fd: fd, bytes: out)
         }
         closeConnection(fd)
     }
 
-    /// Task 2 scope: a direct, blocking write on the actor. Task 3 replaces
-    /// call sites with the bounded per-connection outbound queue so a
-    /// stalled peer can never block this actor.
-    private func writeDirect(fd: Int32, bytes: Data) {
+    // MARK: Event relay (Task 3)
+
+    /// After a connection's dispatcher answers `events.subscribe`
+    /// successfully, iterates the dispatcher's own event stream (snapshot
+    /// first, then changes -- D-06) and enqueues each element as a
+    /// droppable outbound entry. At most one relay task per connection.
+    private func startEventRelay(fd: Int32, dispatcher: ControlChannelDispatcher) {
+        guard relayTasks[fd] == nil else { return }
+        relayTasks[fd] = Task { [weak self] in
+            let stream = await dispatcher.subscribeToEvents()
+            for await eventData in stream {
+                guard let self else { return }
+                var out = eventData
+                out.append(0x0A)
+                await self.enqueue(fd: fd, bytes: out, droppable: true)
+            }
+        }
+    }
+
+    /// Appends to this connection's outbound queue and kicks its drain
+    /// loop. When the queue exceeds `outboundQueueBound`, removes the
+    /// *oldest droppable* entry (never a response) and counts it as
+    /// dropped for this connection.
+    private func enqueue(fd: Int32, bytes: Data, droppable: Bool) {
+        guard connections[fd] != nil else { return }
+        var queue = outboundQueues[fd] ?? []
+        queue.append(OutboundEntry(bytes: bytes, droppable: droppable))
+        while queue.count > Self.outboundQueueBound {
+            guard let dropIndex = queue.firstIndex(where: { $0.droppable }) else { break }
+            queue.remove(at: dropIndex)
+            droppedEventCounts[fd, default: 0] += 1
+        }
+        outboundQueues[fd] = queue
+        kickDrain(fd: fd)
+    }
+
+    private func kickDrain(fd: Int32) {
+        guard !draining.contains(fd) else { return }
+        draining.insert(fd)
+        Task { await self.drainLoop(fd: fd) }
+    }
+
+    /// Pops one entry at a time, on the actor, then suspends on a
+    /// continuation resumed from the connection's own write queue once the
+    /// blocking write completes -- so a stalled peer suspends only its own
+    /// connection's drain, never the actor and never another connection.
+    private func drainLoop(fd: Int32) async {
+        while connections[fd] != nil {
+            guard var queue = outboundQueues[fd], !queue.isEmpty else { break }
+            let entry = queue.removeFirst()
+            outboundQueues[fd] = queue
+
+            if entry.droppable {
+                let dropped = droppedEventCounts[fd] ?? 0
+                if dropped > 0 {
+                    droppedEventCounts[fd] = 0
+                    if var notice = Self.encodedDroppedNotice(droppedEvents: dropped) {
+                        notice.append(0x0A)
+                        await write(fd: fd, bytes: notice)
+                    }
+                }
+            }
+            await write(fd: fd, bytes: entry.bytes)
+        }
+        draining.remove(fd)
+    }
+
+    /// The actual blocking `FileHandle.write(contentsOf:)`, performed on
+    /// this connection's own dedicated serial queue -- never the actor,
+    /// never `.main`. The actor only suspends on the continuation; it does
+    /// not block.
+    private func write(fd: Int32, bytes: Data) async {
         guard let handle = connections[fd] else { return }
-        try? handle.write(contentsOf: bytes)
+        let queue = outboundWriteQueue(for: fd)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async {
+                try? handle.write(contentsOf: bytes)
+                continuation.resume()
+            }
+        }
+    }
+
+    private func outboundWriteQueue(for fd: Int32) -> DispatchQueue {
+        if let existing = writeQueues[fd] { return existing }
+        let queue = DispatchQueue(label: "com.scanstudio.controlchannel.write.\(fd)")
+        writeQueues[fd] = queue
+        return queue
+    }
+
+    private static func encodedDroppedNotice(droppedEvents: Int) -> Data? {
+        struct DroppedEventPayload: Encodable { let droppedEvents: Int }
+        return try? JSONEncoder().encode(
+            ControlEventEnvelope(event: "control.dropped", payload: DroppedEventPayload(droppedEvents: droppedEvents))
+        )
     }
 
     /// Closes a connection exactly once -- peer EOF, an oversized line, or
     /// `stop()` -- clearing the readability handler, closing the
     /// descriptor, and dropping every piece of this connection's state.
-    /// Dropping the dispatcher is what terminates its event subscriptions.
+    /// Cancelling the relay task drops its captured dispatcher reference,
+    /// which is what terminates that dispatcher's event subscription.
     ///
     /// Closes through `handle.close()`, never a raw POSIX `close(fd)`: a
     /// readability-handler invocation the kernel already queued before
@@ -420,5 +584,10 @@ public actor ControlChannelServer {
         framers.removeValue(forKey: fd)
         dispatchers.removeValue(forKey: fd)
         pendingLineBytes.removeValue(forKey: fd)
+        outboundQueues.removeValue(forKey: fd)
+        droppedEventCounts.removeValue(forKey: fd)
+        writeQueues.removeValue(forKey: fd)
+        draining.remove(fd)
+        relayTasks.removeValue(forKey: fd)?.cancel()
     }
 }

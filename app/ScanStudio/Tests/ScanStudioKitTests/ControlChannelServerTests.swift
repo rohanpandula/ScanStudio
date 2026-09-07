@@ -110,47 +110,163 @@ private func removeSocketDirectory(for path: String) {
 }
 
 /// A real client for these tests: dials the server via
-/// `ControlSocketDialer.dial`, writes lines, and blocks on `availableData`
-/// for the next complete line -- never sleep-polls. Framing reuses the same
-/// `LineFramer` the server itself uses, so a read that returns more than
-/// one line's worth (or a partial line) stays correct across calls. Not an
-/// actor: used sequentially, within one test's own body, never shared
-/// across a concurrency boundary.
+/// `ControlSocketDialer.dial`, writes lines, and blocks (up to a receive
+/// timeout) on a raw `read()` for the next complete line -- never
+/// sleep-polls. Framing reuses the same `LineFramer` the server itself
+/// uses, so a read that returns more than one line's worth (or a partial
+/// line) stays correct across calls. Not an actor: used sequentially,
+/// within one test's own body, never shared across a concurrency boundary.
+///
+/// Uses raw POSIX `read`/`write` on the dialed descriptor rather than
+/// `FileHandle`: `FileHandle.availableData` blocks with no timeout of its
+/// own, and (separately, discovered while building this suite) raises an
+/// uncatchable `NSFileHandleOperationException` on certain I/O errors --
+/// wrong properties for a test harness where a mistaken assumption about
+/// how much data was actually sent must fail fast, not hang or crash the
+/// whole run. `SO_RCVTIMEO` turns "no more data is ever coming" into a
+/// bounded, ordinary `nil` return.
+///
+/// The actual blocking syscalls run on a dedicated background queue,
+/// bridged back with a continuation -- the same shape this suite's own
+/// `ControlChannelServer.write(fd:bytes:)` uses. A blocking call made
+/// directly inside an `async` test function body would otherwise occupy
+/// one of Swift Concurrency's own cooperative-pool threads (sized to this
+/// machine's 10 cores) for the length of the block; with many tests in
+/// this suite running concurrently, that starved the pool that the
+/// server's own actor/`MainActor` hops also need, and every connection in
+/// every *other* concurrently-running test stopped making progress until
+/// the blocked read finally gave up (discovered as suite-wide failures
+/// that never reproduced with a single test run in isolation).
 private final class TestControlClient {
-    private let handle: FileHandle
+    private let fd: Int32
     private var framer = LineFramer()
     private var buffered: [String] = []
+    private let ioQueue = DispatchQueue(label: "com.scanstudio.controlchannel.test-client")
 
-    init(path: String) throws {
-        handle = FileHandle(fileDescriptor: try ControlSocketDialer.dial(path: path), closeOnDealloc: true)
+    /// `tinyReceiveBuffer` shrinks this client's own `SO_RCVBUF` right
+    /// after connecting, before anything is sent -- the only lever a test
+    /// has (from the client side alone) to force the *server's* write to
+    /// genuinely block after a small, predictable amount of unread data,
+    /// rather than depending on this machine's default kernel socket
+    /// buffer size. `receiveTimeoutSeconds` is a last-resort backstop
+    /// against a wrong test assumption hanging the whole suite, not a
+    /// normal per-operation budget: it defaults to just under the suite's
+    /// own `.timeLimit(.minutes(1))`, since a full `swift test` run's
+    /// worth of concurrently-executing tests can genuinely push an
+    /// individual round trip past a few seconds under real scheduling
+    /// contention, and a too-short default here would fail otherwise-
+    /// correct tests, not just truly hung ones.
+    init(path: String, tinyReceiveBuffer: Bool = false, receiveTimeoutSeconds: Int = 55) throws {
+        fd = try ControlSocketDialer.dial(path: path)
+        if tinyReceiveBuffer {
+            var size: Int32 = 4096
+            _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+        }
+        var timeout = timeval(tv_sec: receiveTimeoutSeconds, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
-    func send(_ line: String) throws {
-        var data = Data(line.utf8)
-        data.append(0x0A)
-        try handle.write(contentsOf: data)
+    func send(_ line: String) async throws {
+        var mutableData = Data(line.utf8)
+        mutableData.append(0x0A)
+        let data = mutableData
+        let fd = self.fd
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            ioQueue.async {
+                var offset = 0
+                var thrown: Error?
+                data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    guard let base = raw.baseAddress else { return }
+                    while offset < raw.count {
+                        let written = Darwin.write(fd, base.advanced(by: offset), raw.count - offset)
+                        if written > 0 {
+                            offset += written
+                            continue
+                        }
+                        if written < 0, errno == EINTR { continue }
+                        thrown = ControlSocketError(context: "TestControlClient.send write()", errnoValue: errno)
+                        return
+                    }
+                }
+                if let thrown {
+                    continuation.resume(throwing: thrown)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
     }
 
-    /// Blocks until a full line is available; returns `nil` once the peer
-    /// has closed (an empty `availableData` read) -- the "next blocking
-    /// read returns empty" proof for a connection Task 2 closed.
-    func readLine() -> String? {
+    /// Blocks (up to the receive timeout) until a full line is available;
+    /// returns `nil` once the peer has closed (an EOF read), the receive
+    /// timeout elapses with no more data, or any other read error -- the
+    /// "next read returns nothing" proof for a connection Task 2 closed,
+    /// and a bounded fallback for a test whose assumption about pending
+    /// data turns out wrong.
+    func readLine() async -> String? {
         while buffered.isEmpty {
-            let data = handle.availableData
-            if data.isEmpty { return nil }
-            buffered.append(contentsOf: framer.feed(data))
+            let fd = self.fd
+            let bytes: [UInt8]? = await withCheckedContinuation { (continuation: CheckedContinuation<[UInt8]?, Never>) in
+                ioQueue.async {
+                    var chunk = [UInt8](repeating: 0, count: 1 << 16)
+                    let bytesRead = chunk.withUnsafeMutableBytes { raw in
+                        Darwin.read(fd, raw.baseAddress, raw.count)
+                    }
+                    continuation.resume(returning: bytesRead > 0 ? Array(chunk[0..<bytesRead]) : nil)
+                }
+            }
+            guard let bytes else { return nil }
+            buffered.append(contentsOf: framer.feed(Data(bytes)))
         }
         return buffered.removeFirst()
     }
 
     func close() {
-        try? handle.close()
+        Darwin.close(fd)
     }
 }
 
 /// Sniffs just the top-level `id` field, decodable against either a
 /// success or an error response envelope.
 private struct ControlServerResponseIdSniff: Decodable { let id: UInt64 }
+
+/// Sniffs just the top-level `event` field of an encoded
+/// `ControlEventEnvelope` line (`control.snapshot`/`control.changed`/
+/// `control.dropped`).
+private struct ControlServerEventNameSniff: Decodable { let event: String }
+
+private struct ControlServerDroppedNoticeSniff: Decodable {
+    struct Payload: Decodable { let droppedEvents: Int }
+    let event: String
+    let payload: Payload
+}
+
+/// A synthetic `scanner.status` event that flips `filmPresent` -- used to
+/// provoke a `SessionModel` change deterministically, mirroring
+/// `ControlBusyIndicatorTests.makeEjectableModel`'s idiom of injecting a
+/// raw event directly rather than routing it through the engine stub.
+private func filmPresenceChangedEvent(filmPresent: Bool) -> EngineEvent {
+    EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":false,"carrier":null,"frameCount":null,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":\#(filmPresent),"motionArmed":true}}}
+            """#.utf8
+        )
+    )
+}
+
+/// Sends `hello` then `events.subscribe` on `client`, discarding the hello
+/// response, the subscribe response, and the initial `control.snapshot` --
+/// the common setup for a connection that is already, actively reading its
+/// event stream.
+private func helloAndSubscribe(_ client: TestControlClient) async throws {
+    try await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+    _ = await client.readLine()
+    try await client.send(#"{"id":2,"method":"events.subscribe","params":{}}"#)
+    _ = await client.readLine() // subscribe response
+    _ = await client.readLine() // control.snapshot
+}
 
 @Suite("Control channel server", .timeLimit(.minutes(1)))
 struct ControlChannelServerTests {
@@ -272,8 +388,8 @@ struct ControlChannelServerTests {
         try await server.start(path: path)
 
         let client = try TestControlClient(path: path)
-        try client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
-        guard let line = client.readLine() else {
+        try await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        guard let line = await client.readLine() else {
             Issue.record("expected a hello response line")
             return
         }
@@ -297,8 +413,8 @@ struct ControlChannelServerTests {
         try await server.start(path: path)
 
         let client = try TestControlClient(path: path)
-        try client.send(#"{"id":1,"method":"status","params":{}}"#)
-        guard let line = client.readLine() else {
+        try await client.send(#"{"id":1,"method":"status","params":{}}"#)
+        guard let line = await client.readLine() else {
             Issue.record("expected a response line")
             return
         }
@@ -321,8 +437,8 @@ struct ControlChannelServerTests {
         try await server.start(path: path)
 
         let client = try TestControlClient(path: path)
-        try client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version + 1),"clientName":"test"}}"#)
-        guard let line = client.readLine() else {
+        try await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version + 1),"clientName":"test"}}"#)
+        guard let line = await client.readLine() else {
             Issue.record("expected a response line")
             return
         }
@@ -344,8 +460,8 @@ struct ControlChannelServerTests {
         try await server.start(path: path)
 
         let client = try TestControlClient(path: path)
-        try client.send("not json at all")
-        guard let line = client.readLine() else {
+        try await client.send("not json at all")
+        guard let line = await client.readLine() else {
             Issue.record("expected a response line")
             return
         }
@@ -356,8 +472,8 @@ struct ControlChannelServerTests {
         #expect(error.error.code == ControlErrorCode.invalidParams.rawValue)
 
         // The connection must still be open: a follow-up hello still works.
-        try client.send(#"{"id":9,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
-        #expect(client.readLine() != nil)
+        try await client.send(#"{"id":9,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        #expect(await client.readLine() != nil)
 
         client.close()
         await server.stop()
@@ -377,9 +493,9 @@ struct ControlChannelServerTests {
         // send is an expected side effect of that race, not a test
         // failure -- the refusal line read below is the actual proof, and
         // the server always writes it before it closes.
-        try? client.send(oversized)
+        try? await client.send(oversized)
 
-        guard let line = client.readLine() else {
+        guard let line = await client.readLine() else {
             Issue.record("expected an INVALID_PARAMS response before closure")
             return
         }
@@ -388,7 +504,7 @@ struct ControlChannelServerTests {
             return
         }
         #expect(error.error.code == ControlErrorCode.invalidParams.rawValue)
-        #expect(client.readLine() == nil)
+        #expect(await client.readLine() == nil)
 
         client.close()
         await server.stop()
@@ -402,16 +518,16 @@ struct ControlChannelServerTests {
         try await server.start(path: path)
 
         let first = try TestControlClient(path: path)
-        try first.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"first"}}"#)
-        guard let firstLine = first.readLine() else {
+        try await first.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"first"}}"#)
+        guard let firstLine = await first.readLine() else {
             Issue.record("expected the first connection's hello response")
             return
         }
         #expect((try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(firstLine.utf8))) == nil)
 
         let second = try TestControlClient(path: path)
-        try second.send(#"{"id":1,"method":"status","params":{}}"#)
-        guard let secondLine = second.readLine() else {
+        try await second.send(#"{"id":1,"method":"status","params":{}}"#)
+        guard let secondLine = await second.readLine() else {
             Issue.record("expected the second connection's response")
             return
         }
@@ -434,13 +550,13 @@ struct ControlChannelServerTests {
         try await server.start(path: path)
 
         let client = try TestControlClient(path: path)
-        try client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
-        _ = client.readLine()
+        try await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        _ = await client.readLine()
 
-        try client.send(#"{"id":2,"method":"status","params":{}}"#)
-        try client.send(#"{"id":3,"method":"status","params":{}}"#)
+        try await client.send(#"{"id":2,"method":"status","params":{}}"#)
+        try await client.send(#"{"id":3,"method":"status","params":{}}"#)
 
-        guard let secondLine = client.readLine(), let thirdLine = client.readLine() else {
+        guard let secondLine = await client.readLine(), let thirdLine = await client.readLine() else {
             Issue.record("expected two response lines")
             return
         }
@@ -450,6 +566,164 @@ struct ControlChannelServerTests {
         #expect(thirdId?.id == 3)
 
         client.close()
+        await server.stop()
+    }
+
+    // MARK: Task 3 -- bounded per-connection event relay
+
+    @Test("A subscribing client receives a control.snapshot event line first, before any state change")
+    func subscribeReceivesSnapshotFirst() async throws {
+        let path = shortSocketPath("snapshot")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        _ = await client.readLine()
+
+        try await client.send(#"{"id":2,"method":"events.subscribe","params":{}}"#)
+        guard let subscribeResponseLine = await client.readLine() else {
+            Issue.record("expected an events.subscribe response line")
+            return
+        }
+        #expect((try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(subscribeResponseLine.utf8))) == nil)
+
+        guard let eventLine = await client.readLine() else {
+            Issue.record("expected a control.snapshot event line")
+            return
+        }
+        let eventName = try? JSONDecoder().decode(ControlServerEventNameSniff.self, from: Data(eventLine.utf8)).event
+        #expect(eventName == "control.snapshot")
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A SessionModel mutation after a subscription produces a control.changed line on the same connection")
+    func subscriptionSeesControlChangedAfterMutation() async throws {
+        let path = shortSocketPath("changed")
+        defer { removeSocketDirectory(for: path) }
+        let model = await makeIdleModel(ControlServerEngineStub())
+        let server = ControlChannelServer(sessionModel: model)
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try await helloAndSubscribe(client)
+
+        await model.handle(event: filmPresenceChangedEvent(filmPresent: true))
+
+        guard let eventLine = await client.readLine() else {
+            Issue.record("expected a control.changed event line")
+            return
+        }
+        let eventName = try? JSONDecoder().decode(ControlServerEventNameSniff.self, from: Data(eventLine.utf8)).event
+        #expect(eventName == "control.changed")
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A connection that never subscribed receives no event lines while a subscribed connection does")
+    func nonSubscribedConnectionReceivesNoEvents() async throws {
+        let path = shortSocketPath("nosub")
+        defer { removeSocketDirectory(for: path) }
+        let model = await makeIdleModel(ControlServerEngineStub())
+        let server = ControlChannelServer(sessionModel: model)
+        try await server.start(path: path)
+
+        let subscriber = try TestControlClient(path: path)
+        try await helloAndSubscribe(subscriber)
+
+        let bystander = try TestControlClient(path: path)
+        try await bystander.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"bystander"}}"#)
+        _ = await bystander.readLine()
+
+        await model.handle(event: filmPresenceChangedEvent(filmPresent: true))
+
+        guard let subscriberLine = await subscriber.readLine() else {
+            Issue.record("expected the subscriber to receive control.changed")
+            return
+        }
+        let subscriberEventName = try? JSONDecoder().decode(ControlServerEventNameSniff.self, from: Data(subscriberLine.utf8)).event
+        #expect(subscriberEventName == "control.changed")
+
+        // The bystander must not receive an event line: round-trip an
+        // ordinary request and prove the very next line on its connection
+        // is that response, not a leaked event.
+        try await bystander.send(#"{"id":9,"method":"status","params":{}}"#)
+        guard let bystanderLine = await bystander.readLine() else {
+            Issue.record("expected the bystander's status response")
+            return
+        }
+        let bystanderId = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(bystanderLine.utf8))
+        #expect(bystanderId?.id == 9)
+
+        subscriber.close()
+        bystander.close()
+        await server.stop()
+    }
+
+    @Test("A stalled subscriber's overflowing queue does not block a different connection's status round trip, and the stalled peer later sees control.dropped before the next control.changed")
+    func stalledSubscriberDoesNotBlockAnotherConnection() async throws {
+        let path = shortSocketPath("stalled")
+        defer { removeSocketDirectory(for: path) }
+        let model = await makeIdleModel(ControlServerEngineStub())
+        let server = ControlChannelServer(sessionModel: model)
+        try await server.start(path: path)
+
+        // Connection A subscribes but never reads afterward -- not even
+        // its own subscribe response or the initial snapshot -- simulating
+        // a consumer that has stopped draining its socket. A tiny receive
+        // buffer forces the server's write to genuinely block after a
+        // small, predictable amount of unread data, rather than depending
+        // on this machine's default kernel socket buffer size (measured
+        // large enough in practice to otherwise absorb this whole test's
+        // mutation count without ever blocking).
+        let stalled = try TestControlClient(path: path, tinyReceiveBuffer: true)
+        try await stalled.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"stalled"}}"#)
+        try await stalled.send(#"{"id":2,"method":"events.subscribe","params":{}}"#)
+
+        // Drive far more mutations than the outbound queue bound so this
+        // server's own bounded queue overflows (Pitfall 3's drop-oldest
+        // path). Coalescing in the dispatcher's own change-observation
+        // (independently measured at ~90%+ fidelity for rapid mutations)
+        // still leaves comfortably more real notifications than the bound.
+        let overflowMutationCount = ControlChannelServer.outboundQueueBound * 3
+        for index in 0..<overflowMutationCount {
+            await model.handle(event: filmPresenceChangedEvent(filmPresent: index % 2 == 0))
+        }
+
+        // A second, ordinary connection must still complete a request
+        // while the stalled connection's queue is backed up.
+        let other = try TestControlClient(path: path)
+        try await other.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"other"}}"#)
+        _ = await other.readLine()
+        try await other.send(#"{"id":9,"method":"status","params":{}}"#)
+        guard let otherLine = await other.readLine() else {
+            Issue.record("expected the other connection's status response despite the stalled subscriber")
+            return
+        }
+        let otherId = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(otherLine.utf8))
+        #expect(otherId?.id == 9)
+
+        // Now let the stalled connection resume reading and look for the
+        // control.dropped notice, bounded so a wrong assumption fails
+        // clearly instead of hanging.
+        var droppedNotice: ControlServerDroppedNoticeSniff?
+        for _ in 0..<(overflowMutationCount + 10) {
+            guard let line = await stalled.readLine() else { break }
+            if let sniff = try? JSONDecoder().decode(ControlServerDroppedNoticeSniff.self, from: Data(line.utf8)),
+               sniff.event == "control.dropped" {
+                droppedNotice = sniff
+                break
+            }
+        }
+        #expect(droppedNotice != nil)
+        #expect((droppedNotice?.payload.droppedEvents ?? 0) > 0)
+
+        stalled.close()
+        other.close()
         await server.stop()
     }
 }
