@@ -938,11 +938,17 @@ struct ScanstudioCLIConfirmationTests {
         // the CLI's own parse-time gate and, since --confirm-motion is
         // given, the wire's motionConfirmed field) but is refused by the
         // host for an unrelated precondition -- no frames are selected.
-        // Unlike scan.start's own scanReadiness pre-check (which returns
-        // before ever touching SessionModel), saveRollAndScanSelectedFrames
-        // is always called and sets lastErrorMessage itself before
-        // refusing, so this refusal -- unlike scan's -- is a genuine
-        // SessionModel mutation a follower can observe as control.changed.
+        // saveRollAndScanSelectedFrames is always called and sets
+        // lastErrorMessage itself before refusing, so this was already a
+        // genuine SessionModel mutation a follower could observe as
+        // control.changed even before the Gap 2 fix below. This test
+        // predates that fix and still asserts on lastErrorMessage rather
+        // than lastControlRefusal, deliberately -- it documents the case
+        // that always worked. `ControlChannelClientTests.swift`'s
+        // `independentFollowerObservesConfirmationRequiredRefusal` covers
+        // the case that did not: a scan.start CONFIRMATION_REQUIRED
+        // refusal, which confirmationRefusal(for:) used to return without
+        // ever touching SessionModel at all.
         let refused = try await runConfirmationCLI(
             ["roll", "save", "--name", "x", "--carrier", "roll36", "--frame-count", "36", "--film-process", "c41ColorNegative", "--confirm-motion"],
             socketPath: host.socketPath

@@ -324,7 +324,28 @@ public final class ControlChannelDispatcher {
     /// order -- each step returns before the next runs: hello/greeted,
     /// schema version, confirmation, busy, route. D-09: a refusal is
     /// returned once; nothing here waits, repeats, or re-issues anything.
+    ///
+    /// SAFE-04 (Gap 2 fix): every `.failure` this function (or anything it
+    /// calls, including `route(_:)`) produces is recorded on the shared
+    /// `SessionModel` via `recordControlRefusal` before returning -- one
+    /// choke point rather than a write scattered across every individual
+    /// refusal site, so `CONFIRMATION_REQUIRED`, `GATE_REFUSED`,
+    /// `CONTROLLER_BUSY`, `INVALID_PARAMS`, `SCHEMA_VERSION_MISMATCH`, and
+    /// `HELLO_REQUIRED` all become an `@Observable` write every subscriber's
+    /// `control.changed` picks up, not only the refused connection's own
+    /// direct RPC response. `handleLine(_:)`'s decode-failure branch is the
+    /// other choke point, for the two codes (`UNKNOWN_COMMAND`, and
+    /// `INVALID_PARAMS` for a line that never became a typed `ControlRequest`
+    /// at all) that never reach this function.
     public func handle(_ request: ControlRequest) async -> ControlResponse {
+        let response = await handleAndRoute(request)
+        if case .failure(_, let error) = response {
+            sessionModel.recordControlRefusal(command: request.methodName, code: error.code, gate: error.gate)
+        }
+        return response
+    }
+
+    private func handleAndRoute(_ request: ControlRequest) async -> ControlResponse {
         if case .hello(let id, let params) = request {
             return handleHello(id: id, params: params)
         }
@@ -1024,7 +1045,8 @@ public final class ControlChannelDispatcher {
             selectedFrames: sessionModel.selectedFrames,
             scanReadiness: String(describing: readiness),
             scanReadinessReason: readiness.reason,
-            lastErrorMessage: sessionModel.lastErrorMessage
+            lastErrorMessage: sessionModel.lastErrorMessage,
+            lastControlRefusal: sessionModel.lastControlRefusal
         )
     }
 
@@ -1181,6 +1203,15 @@ public final class ControlChannelDispatcher {
     /// call a future transport makes per request line. Never throws, never
     /// crashes: an encode failure falls back to a hand-built minimal
     /// `INVALID_PARAMS` line.
+    ///
+    /// SAFE-04 (Gap 2 fix): a decode-time refusal (`UNKNOWN_COMMAND`, or
+    /// `INVALID_PARAMS` for an oversized/malformed line or an undecodable
+    /// params shape) never becomes a typed `ControlRequest`, so it can
+    /// never reach `handle(_:)`'s own recording choke point -- this is the
+    /// second, and only other, place a refusal is recorded. The command
+    /// name is recovered by re-sniffing the same line once more (best
+    /// effort: `nil` for a line too malformed to carry a `method` at all,
+    /// for example an oversized line or invalid JSON).
     public func handleLine(_ line: Data) async -> Data {
         let response: ControlResponse
         switch Self.decode(line) {
@@ -1188,6 +1219,8 @@ public final class ControlChannelDispatcher {
             response = await handle(request)
         case .failure(let failure):
             response = .failure(id: failure.id, error: failure.error)
+            let recoveredMethod = try? JSONDecoder().decode(ControlMethodSniff.self, from: line).method
+            sessionModel.recordControlRefusal(command: recoveredMethod, code: failure.error.code, gate: failure.error.gate)
         }
         if let data = try? response.encoded() {
             return data

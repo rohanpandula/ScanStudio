@@ -661,6 +661,22 @@ public final class SessionModel {
     /// `.diagnosticEvidenceUnavailableReason` are hardware-diagnostic detail
     /// the control channel must never forward (T-01-05).
     public private(set) var lastEngineError: EngineRequestError?
+    /// SAFE-04 (Gap 2 fix): the most recent wire-level refusal
+    /// `ControlChannelDispatcher` produced -- set only by
+    /// `recordControlRefusal(command:code:gate:)`, never by any workflow
+    /// method in this file. Because this is an `@Observable` write, every
+    /// refusal (`CONFIRMATION_REQUIRED`, `GATE_REFUSED`, `CONTROLLER_BUSY`,
+    /// `INVALID_PARAMS`, `UNKNOWN_COMMAND`, `SCHEMA_VERSION_MISMATCH`,
+    /// `HELLO_REQUIRED`) now reaches `buildStatusResult()`'s tracked read
+    /// and therefore every subscriber's `control.changed`, not only the
+    /// refused connection's own direct RPC response -- closing the gap
+    /// where `confirmationRefusal(for:)`/`gateRefusal(...)` returned a
+    /// value without ever writing to `SessionModel`.
+    public private(set) var lastControlRefusal: ControlRefusalRecord?
+    /// Monotonically increasing, never reset -- lets a follower distinguish
+    /// two otherwise-identical refusals (same command/code/gate) as
+    /// separate occurrences.
+    private var controlRefusalSequence: UInt64 = 0
     /// Strictly validated witness (or an explicit reason it was unavailable)
     /// from the exact terminal attempt currently represented in diagnostics.
     public private(set) var diagnosticEvidenceAvailability:
@@ -5178,6 +5194,34 @@ public final class SessionModel {
         // record numbers/bools/nested objects straight into
         // `diagnosticTimeline.record` without a report-side change.
         diagnosticTimeline.record(event: event, fields: fields.mapValues { .string($0) })
+    }
+
+    /// SAFE-04 (Gap 2 fix): the one entry point `ControlChannelDispatcher`
+    /// calls at every refusal choke point (`handle(_:)`,
+    /// `handleLine(_:)`'s decode-failure branch) -- never called from any
+    /// workflow method in this file. Recorded on the diagnostics timeline
+    /// the same way every other session event is (`recordDiagnostic`), and
+    /// retained on `lastControlRefusal` so the next `buildStatusResult()`
+    /// (an `@Observable`-tracked read) picks it up and every subscriber's
+    /// `control.changed` carries it -- not only the refused connection's
+    /// own direct RPC response.
+    public func recordControlRefusal(command: String?, code: String, gate: String?) {
+        controlRefusalSequence += 1
+        lastControlRefusal = ControlRefusalRecord(
+            command: command,
+            code: code,
+            gate: gate,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            sequence: controlRefusalSequence
+        )
+        recordDiagnostic(
+            event: "control.refused",
+            fields: [
+                "command": command ?? "unknown",
+                "code": code,
+                "gate": gate ?? "none"
+            ]
+        )
     }
 
     /// A scanner operation can prove that the bridge has no live device

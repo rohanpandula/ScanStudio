@@ -421,6 +421,32 @@ public struct ControlProjectSummary: Codable, Equatable, Sendable {
 
 // MARK: - Results
 
+/// SAFE-04 (Gap 2 fix): a single recorded wire-level refusal, carried on
+/// `ControlStatusResult.lastControlRefusal` so it reaches every subscriber
+/// on every connection via `control.snapshot`/`control.changed` -- not
+/// only the requesting connection's own direct RPC response. `code` is a
+/// free `String` (the exact `ControlErrorPayload.code`/engine-passthrough
+/// code the refusal carried), `gate` mirrors `ControlErrorPayload.gate`
+/// (`nil` for a non-gate refusal). `sequence` is a monotonically
+/// increasing counter (never reset), so a follower can tell two refusals
+/// with identical `command`/`code`/`gate` apart -- for example the same
+/// command refused twice in a row for the same reason.
+public struct ControlRefusalRecord: Codable, Equatable, Sendable {
+    public let command: String?
+    public let code: String
+    public let gate: String?
+    public let timestamp: String
+    public let sequence: UInt64
+
+    public init(command: String?, code: String, gate: String?, timestamp: String, sequence: UInt64) {
+        self.command = command
+        self.code = code
+        self.gate = gate
+        self.timestamp = timestamp
+        self.sequence = sequence
+    }
+}
+
 /// A full session snapshot built from `SessionModel` public state only.
 /// `hardwareMotionReadiness` and `scanReadiness` carry their enum case
 /// names as stable strings (computed by the dispatcher) so a caller can
@@ -441,6 +467,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     public let scanReadiness: String
     public let scanReadinessReason: String?
     public let lastErrorMessage: String?
+    public let lastControlRefusal: ControlRefusalRecord?
 
     public init(
         device: DeviceInfo? = nil,
@@ -457,7 +484,8 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         selectedFrames: [Int],
         scanReadiness: String,
         scanReadinessReason: String? = nil,
-        lastErrorMessage: String? = nil
+        lastErrorMessage: String? = nil,
+        lastControlRefusal: ControlRefusalRecord? = nil
     ) {
         self.device = device
         self.scanner = scanner
@@ -474,6 +502,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.scanReadiness = scanReadiness
         self.scanReadinessReason = scanReadinessReason
         self.lastErrorMessage = lastErrorMessage
+        self.lastControlRefusal = lastControlRefusal
     }
 }
 

@@ -264,6 +264,54 @@ struct ControlChannelClientTests {
         await server.stop()
     }
 
+    @Test("SAFE-04 (Gap 2 fix): an independent follower on a second connection observes a control.changed carrying the refusal after another connection's scan.start is refused for a missing confirmation")
+    func independentFollowerObservesConfirmationRequiredRefusal() async throws {
+        let path = shortSocketPath("safe04-confirmation")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlClientEngineStub()))
+        try await server.start(path: path)
+
+        // The follower: its own connection never sends the refused command
+        // and is never the one that receives CONFIRMATION_REQUIRED as a
+        // direct RPC response -- everything it learns comes from the event
+        // stream alone.
+        let follower = try await ControlChannelClient.open(path: path, clientName: "follower")
+        _ = try await follower.requestWithoutParams(method: "events.subscribe")
+        var followerEvents = await follower.events().makeAsyncIterator()
+        _ = await followerEvents.next() // the initial control.snapshot
+
+        // A second, independent connection sends scan.start without
+        // motionConfirmed -- confirmationRefusal(for:) refuses it before
+        // ever calling a SessionModel method (Gap 2's root cause: a pure
+        // function returning a value, previously with no SessionModel
+        // write for the follower's own observation-tracking to see).
+        let actor = try await ControlChannelClient.open(path: path, clientName: "actor")
+        let refusal = try await actor.request(
+            method: "scan.start",
+            params: ControlScanStartParams(motionConfirmed: false)
+        )
+        guard case .failure(let payload) = refusal else {
+            Issue.record("expected scan.start without motionConfirmed to be refused on the actor's own connection")
+            return
+        }
+        #expect(payload.code == ControlErrorCode.confirmationRequired.rawValue)
+
+        guard let changedLine = await followerEvents.next() else {
+            Issue.record("expected the follower to observe a control.changed event for the refusal")
+            return
+        }
+        let envelope = try JSONDecoder().decode(EventEnvelope<ControlStatusResult>.self, from: changedLine)
+        #expect(envelope.event == "control.changed")
+        let refusalRecord = try #require(envelope.payload.lastControlRefusal)
+        #expect(refusalRecord.command == "scan.start")
+        #expect(refusalRecord.code == ControlErrorCode.confirmationRequired.rawValue)
+        #expect(refusalRecord.gate == nil)
+
+        await actor.shutdown()
+        await follower.shutdown()
+        await server.stop()
+    }
+
     @Test("shutdown() while a request is in flight resumes that request with a connectionClosed error rather than hanging")
     func shutdownWhileRequestInFlightResumesWithConnectionClosedError() async throws {
         let path = shortSocketPath("shutdown")
