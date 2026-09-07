@@ -177,6 +177,119 @@ fn synthesize_preview_strip(
     Ok(path)
 }
 
+// ---------------------------------------------------------------------
+// Preview fixtures (D-18, additive) -- a simulator-only test affordance so
+// the manual-review and skip-blank paths are exercisable without hardware.
+// Opt-in via `sim.loadMedia`'s own `previewFixture` param
+// (`protocol::LoadMediaParams`); the real backend rejects `sim.loadMedia`
+// outright (`RealLs5000::load_media`), unchanged by this addition. With no
+// fixture ever armed, `thumbnail_for`/`acquire_thumbnails` are byte-
+// identical to before this section existed -- `thumbnail_for` itself is
+// never modified, and every write below lives on a wholly separate branch.
+// ---------------------------------------------------------------------
+
+/// `sim.loadMedia`'s own two `previewFixture` values. Stored on `State`
+/// alongside the carrier -- a property of the loaded media, reset to
+/// `None` on every `load_media` call exactly like `carrier`/`frame_count`/
+/// `adapter` already are, and re-armed by `SimulatedLs5000
+/// ::arm_preview_fixture` only when that same `sim.loadMedia` request
+/// named one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewFixture {
+    /// Every previewed frame's thumbnail carries a `Textured` tile.
+    Textured,
+    /// Every previewed frame carries a `Textured` tile except the last
+    /// two (by position in the accepted-frames list): the second-to-last
+    /// is flagged for manual review with a `Textured` tile, and the last
+    /// carries a `Blank` tile -- the leader's own position on a real roll.
+    BoundaryAndBlank,
+}
+
+impl PreviewFixture {
+    /// Recognizes `sim.loadMedia`'s two wire strings. Returns `None` for
+    /// anything else -- the caller (the dispatch arm, `server.rs`) is the
+    /// one that turns an unrecognized value into `ErrorCode::InvalidParams`,
+    /// naming the actual offending string; this function only recognizes.
+    pub fn parse(value: &str) -> Option<PreviewFixture> {
+        match value {
+            "textured" => Some(PreviewFixture::Textured),
+            "boundaryAndBlank" => Some(PreviewFixture::BoundaryAndBlank),
+            _ => None,
+        }
+    }
+}
+
+/// The two tiles a preview fixture can write. Never consulted by
+/// `thumbnail_for` -- only by the fixture branch inside `acquire_thumbnails`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureTileShape {
+    Textured,
+    Blank,
+}
+
+/// 03-BLANK-HINT.md's own fixture dimensions -- matching them means a
+/// decoded tile's central-80%-crop statistics land where that document's
+/// calibration table already describes.
+const FIXTURE_TILE_WIDTH_PX: u32 = 143;
+const FIXTURE_TILE_HEIGHT_PX: u32 = 96;
+/// The calibration roll's own clear-base value (03-BLANK-HINT.md: frames
+/// 37/38 measured mean ~202.8) -- `Blank`'s uniform gray, chosen so a
+/// decoded tile's mean lands where the calibration table's own blank rows
+/// do, not merely so its stddev is zero.
+const FIXTURE_BLANK_GRAY: u8 = 203;
+
+/// Writes one `FIXTURE_TILE_WIDTH_PX x FIXTURE_TILE_HEIGHT_PX` PNG tile for
+/// one fixture frame, reusing `synthesize_preview_strip`'s own directory-
+/// naming and error-mapping shape verbatim: a fresh
+/// `scanstudio-sim-previews/tiles-<nanos hex>/` directory per call, holding
+/// `frame-<index>.png`. `Blank` is uniform `FIXTURE_BLANK_GRAY` with zero
+/// variation (central-crop stddev 0, `blankConfidence` 1.00); `Textured` is
+/// a deterministic gradient (coarse structure) plus `fnv1a64`-driven
+/// per-pixel noise (fine structure), tuned so the central-crop stddev sits
+/// comfortably above `BlankFrameHint`'s own flatness ceiling -- measured,
+/// not assumed, by this module's own
+/// `textured_tile_stddev_is_comfortably_above_the_flatness_window` test.
+fn synthesize_frame_tile(
+    device_id: &str,
+    frame_index: u32,
+    shape: FixtureTileShape,
+) -> Result<std::path::PathBuf, EngineError> {
+    let image = image::RgbImage::from_fn(FIXTURE_TILE_WIDTH_PX, FIXTURE_TILE_HEIGHT_PX, |x, y| {
+        match shape {
+            FixtureTileShape::Blank => image::Rgb([FIXTURE_BLANK_GRAY; 3]),
+            FixtureTileShape::Textured => {
+                let h = fnv1a64(&format!("{device_id}:tile:{frame_index}:{x}:{y}"));
+                let gradient = (x * 255 / FIXTURE_TILE_WIDTH_PX.max(1)) as i32;
+                let noise = ((h % 121) as i32) - 60; // -60..=60, deterministic per pixel
+                let value = (gradient + noise).clamp(0, 255) as u8;
+                image::Rgb([value, value, value])
+            }
+        }
+    });
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir()
+        .join("scanstudio-sim-previews")
+        .join(format!("tiles-{nanos:x}"));
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to create simulator preview tile directory: {err}"),
+        )
+    })?;
+    let path = dir.join(format!("frame-{frame_index}.png"));
+    image.save(&path).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to write simulator preview tile image: {err}"),
+        )
+    })?;
+    Ok(path)
+}
+
 /// Lowercase 16-hex-char FNV-1a 64 of
 /// `"{resolutionDpi}:{bitDepth}:{multisamplePasses}:{channels}"`.
 pub fn settings_fingerprint(recipe: &CaptureRecipe) -> String {
@@ -279,6 +392,10 @@ struct State {
     job_seq: u64,
     thumbnail_operation_active: bool,
     manual_approval_binding: Option<ManualApprovalBinding>,
+    /// D-18: `None` by default and after every fresh `load_media` -- the
+    /// default (unarmed) path this field can produce is what
+    /// `fnv1a64_matches_golden_thumbnails` pins.
+    preview_fixture: Option<PreviewFixture>,
 }
 
 impl Default for State {
@@ -297,6 +414,7 @@ impl Default for State {
             job_seq: 0,
             thumbnail_operation_active: false,
             manual_approval_binding: None,
+            preview_fixture: None,
         }
     }
 }
@@ -626,6 +744,17 @@ impl SimulatedLs5000 {
              session's own manual frame placement; the simulator has no other manual-review gate",
         ))
     }
+
+    /// D-18: arms (`Some`) or clears (`None`) the opt-in preview fixture
+    /// for the currently-loaded media. Not part of `ScannerBackend` --
+    /// dispatched directly by the `sim.loadMedia` arm (`server.rs`),
+    /// exactly like `manual_frames`/`roll_approve` above are for their own
+    /// sim-only affordances -- called only after `load_media` has already
+    /// succeeded, which is only reachable when this backend is the active
+    /// one (`RealLs5000::load_media` unconditionally refuses).
+    pub fn arm_preview_fixture(&self, fixture: Option<PreviewFixture>) {
+        self.state.lock().unwrap().preview_fixture = fixture;
+    }
 }
 
 impl Default for SimulatedLs5000 {
@@ -745,6 +874,13 @@ impl ScannerBackend for SimulatedLs5000 {
         // Newly loaded media invalidates any manual placement made against
         // whatever was loaded before.
         state.manual_approval_binding = None;
+        // D-18: a fixture is a property of the loaded media, reset here
+        // exactly like carrier/frame_count/adapter above -- a fresh load
+        // with no explicit fixture request leaves acquire_thumbnails
+        // byte-identical to today. `arm_preview_fixture` (called by the
+        // sim.loadMedia dispatch arm immediately after this succeeds)
+        // re-arms it only when that same request named one.
+        state.preview_fixture = None;
         Ok(status_snapshot(&state))
     }
 
@@ -787,7 +923,7 @@ impl ScannerBackend for SimulatedLs5000 {
         operation_id: Option<String>,
         event_tx: mpsc::Sender<String>,
     ) -> Result<Vec<u32>, EngineError> {
-        let (accepted_frames, time_scale, device_id) = {
+        let (accepted_frames, time_scale, device_id, preview_fixture) = {
             let mut state = backend.state.lock().unwrap();
             if !state.connected {
                 return Err(EngineError::new(
@@ -808,18 +944,60 @@ impl ScannerBackend for SimulatedLs5000 {
             let accepted = frames.unwrap_or_else(|| (1..=frame_count).collect());
             state.transport = Transport::Busy;
             state.thumbnail_operation_active = true;
-            (accepted, state.time_scale, backend.device.device_id.clone())
+            (
+                accepted,
+                state.time_scale,
+                backend.device.device_id.clone(),
+                state.preview_fixture,
+            )
         };
 
         let thread_frames = accepted_frames.clone();
         let backend_for_thread = Arc::clone(backend);
         thread::spawn(move || {
             let tick_ms = scale_ms(80, time_scale).max(1);
-            for &frame_index in &thread_frames {
+            let last_position = thread_frames.len().saturating_sub(1);
+            for (position, &frame_index) in thread_frames.iter().enumerate() {
                 if !sleep_until_or_cancelled(&backend_for_thread, tick_ms) {
                     return;
                 }
-                let thumbnail = thumbnail_for(&device_id, frame_index);
+                let mut thumbnail = thumbnail_for(&device_id, frame_index);
+                // D-18: a wholly separate branch from thumbnail_for's own
+                // default path above -- with no fixture armed
+                // (`preview_fixture == None`, the default), `thumbnail` is
+                // untouched from here on, byte-identical to before this
+                // fixture support existed.
+                if let Some(fixture) = preview_fixture {
+                    let is_last = position == last_position;
+                    let is_second_to_last = last_position > 0 && position + 1 == last_position;
+                    let shape = match fixture {
+                        PreviewFixture::Textured => FixtureTileShape::Textured,
+                        PreviewFixture::BoundaryAndBlank if is_last => FixtureTileShape::Blank,
+                        PreviewFixture::BoundaryAndBlank => FixtureTileShape::Textured,
+                    };
+                    // A fixture tile failing to write (disk full, etc.)
+                    // must not crash the preview thread -- fall back to
+                    // this frame's own default, unfixtured thumbnail
+                    // exactly as if no fixture had been armed.
+                    if let Ok(path) = synthesize_frame_tile(&device_id, frame_index, shape) {
+                        thumbnail.image_path = Some(path.display().to_string());
+                        // T-10-07 (protocol.rs's own documented wire
+                        // contract): exactly one of imagePath or
+                        // {brightness, tint} is ever populated, never
+                        // both. thumbnail_for() above always sets
+                        // brightness/tint; a fixture tile is this
+                        // module's own stand-in for a real backend's
+                        // raster, so it must clear them exactly like a
+                        // real backend's own Thumbnail would.
+                        thumbnail.brightness = None;
+                        thumbnail.tint = None;
+                        if fixture == PreviewFixture::BoundaryAndBlank && is_second_to_last {
+                            thumbnail.needs_approval = true;
+                            thumbnail.warnings =
+                                vec!["boundary ambiguous (simulated fixture)".to_string()];
+                        }
+                    }
+                }
                 emit(
                     &event_tx,
                     "scanner.thumbnail",
@@ -2302,6 +2480,164 @@ mod tests {
             assert_eq!(event["event"], expected_event);
             assert_eq!(event["payload"]["operationId"], operation_id);
         }
+    }
+
+    // -------------------------------------------------------------
+    // Preview fixtures (D-18)
+    // -------------------------------------------------------------
+
+    /// Central-80%-crop population stddev of a fixture tile's luma
+    /// channel -- the same crop rule `BlankFrameHint` (Swift) and
+    /// 03-BLANK-HINT.md use: drop 10% on every side so sprocket/edge
+    /// bleed never counts.
+    fn central_crop_population_stddev(path: &std::path::Path) -> f64 {
+        let decoded = image::open(path).expect("decode fixture tile").into_luma8();
+        let (width, height) = decoded.dimensions();
+        let x0 = width / 10;
+        let x1 = width - x0;
+        let y0 = height / 10;
+        let y1 = height - y0;
+        let mut values = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                values.push(f64::from(decoded.get_pixel(x, y).0[0]));
+            }
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance =
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        variance.sqrt()
+    }
+
+    #[test]
+    fn acquire_thumbnails_with_no_preview_fixture_is_unchanged() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Strip6).expect("load media");
+        // No sim.arm_preview_fixture call at all -- the default, unarmed
+        // path this test pins.
+
+        let (tx, rx) = mpsc::channel();
+        SimulatedLs5000::acquire_thumbnails(
+            &sim,
+            Some(vec![1, 2, 3]),
+            FilmProcess::default(),
+            None,
+            tx,
+        )
+        .expect("acquire");
+
+        for _ in 0..3 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timed out waiting for a thumbnail");
+            let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            assert_eq!(event["event"], "scanner.thumbnail");
+            let thumbnail = &event["payload"]["thumbnail"];
+            assert!(
+                thumbnail["imagePath"].is_null(),
+                "no fixture armed must never populate imagePath"
+            );
+            assert!(
+                thumbnail["needsApproval"].is_null(),
+                "no fixture armed must never flag a frame for approval (needsApproval omitted when false)"
+            );
+        }
+    }
+
+    #[test]
+    fn acquire_thumbnails_with_boundary_and_blank_preview_fixture_flags_the_right_frames() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Strip6).expect("load media"); // 6 frames
+        sim.arm_preview_fixture(Some(PreviewFixture::BoundaryAndBlank));
+
+        let (tx, rx) = mpsc::channel();
+        SimulatedLs5000::acquire_thumbnails(&sim, None, FilmProcess::default(), None, tx)
+            .expect("acquire");
+
+        let mut flagged_count = 0;
+        let mut last_frame_image_path: Option<String> = None;
+        for _ in 0..6 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timed out waiting for a thumbnail");
+            let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            assert_eq!(event["event"], "scanner.thumbnail");
+            let frame_index = event["payload"]["frameIndex"]
+                .as_u64()
+                .expect("frameIndex");
+            let thumbnail = &event["payload"]["thumbnail"];
+
+            let image_path = thumbnail["imagePath"]
+                .as_str()
+                .unwrap_or_else(|| panic!("frame {frame_index} must carry a fixture tile's imagePath"));
+            assert!(
+                std::path::Path::new(image_path).is_file(),
+                "imagePath must name an existing, readable file, frame {frame_index}"
+            );
+            assert!(
+                thumbnail["brightness"].is_null() && thumbnail["tint"].is_null(),
+                "T-10-07: a fixtured thumbnail must not also carry brightness/tint, frame {frame_index}"
+            );
+
+            if thumbnail["needsApproval"].as_bool() == Some(true) {
+                flagged_count += 1;
+                assert_eq!(
+                    frame_index, 5,
+                    "only the second-to-last of 6 frames should be flagged"
+                );
+                let warnings = thumbnail["warnings"]
+                    .as_array()
+                    .expect("a flagged frame must carry non-empty warnings");
+                assert!(!warnings.is_empty());
+            }
+            if frame_index == 6 {
+                last_frame_image_path = Some(image_path.to_string());
+            }
+        }
+        assert_eq!(
+            flagged_count, 1,
+            "exactly one frame must be flagged for manual review"
+        );
+        let last_path = last_frame_image_path.expect("frame 6 must have been observed");
+        assert!(std::path::Path::new(&last_path).is_file());
+    }
+
+    #[test]
+    fn preview_fixture_tile_stddevs_sit_on_opposite_sides_of_the_flatness_window() {
+        let blank_path =
+            synthesize_frame_tile(DEVICE_ID, 1, FixtureTileShape::Blank).expect("blank tile");
+        let blank_stddev = central_crop_population_stddev(&blank_path);
+        assert!(
+            blank_stddev < 4.0,
+            "blank tile central-crop stddev {blank_stddev} should be < 4.0"
+        );
+        let _ = std::fs::remove_dir_all(blank_path.parent().expect("tile has a parent directory"));
+
+        let textured_path = synthesize_frame_tile(DEVICE_ID, 1, FixtureTileShape::Textured)
+            .expect("textured tile");
+        let textured_stddev = central_crop_population_stddev(&textured_path);
+        assert!(
+            textured_stddev > 16.0,
+            "textured tile central-crop stddev {textured_stddev} should be > 16.0"
+        );
+        let _ =
+            std::fs::remove_dir_all(textured_path.parent().expect("tile has a parent directory"));
     }
 
     #[test]

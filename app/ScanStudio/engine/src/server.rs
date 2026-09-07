@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::domain::{self, EngineError, ScannerBackend};
 use crate::protocol::{self, ErrorCode, ErrorPayload, Request};
 use crate::real_backend::RealLs5000;
-use crate::sim::SimulatedLs5000;
+use crate::sim::{PreviewFixture, SimulatedLs5000};
 
 /// Default request timeout for the real backend's `BridgeClient`, applied
 /// whenever `SCANSTUDIO_BRIDGE_CMD` is configured (`Backends::from_env` is
@@ -446,6 +446,18 @@ impl Backends {
                 ErrorCode::NotConnected,
                 "scanner is not connected",
             )),
+        }
+    }
+
+    /// D-18: arms `fixture` on the simulator only. A no-op unless the
+    /// simulator is the active device -- the `sim.loadMedia` dispatch arm
+    /// only calls this after `load_media` above has already succeeded,
+    /// which never happens with a real device active
+    /// (`RealLs5000::load_media` unconditionally refuses), so the `Real`/
+    /// `None` cases are unreachable in practice, not merely unhandled.
+    fn arm_sim_preview_fixture(&self, fixture: Option<PreviewFixture>) {
+        if self.active == Some(ActiveDevice::Sim) {
+            self.sim.arm_preview_fixture(fixture);
         }
     }
 
@@ -1114,7 +1126,21 @@ fn handle_request(
         }
         "sim.loadMedia" => {
             let params: protocol::LoadMediaParams = parse_params(&request.params)?;
+            // D-18: validated before `load_media` runs, so an unrecognized
+            // value never reaches the simulator at all.
+            let fixture = match params.preview_fixture.as_deref() {
+                None => None,
+                Some(value) => Some(PreviewFixture::parse(value).ok_or_else(|| {
+                    EngineError::new(
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "previewFixture \"{value}\" is not recognized; expected \"textured\" or \"boundaryAndBlank\""
+                        ),
+                    )
+                })?),
+            };
             let status = backends.load_media(params.carrier)?;
+            backends.arm_sim_preview_fixture(fixture);
             emit_event(
                 tx,
                 "scanner.status",
@@ -5241,5 +5267,48 @@ mod tests {
         let err =
             handle_request(&mut backends, &tx, &strip_request, &mut project_state).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotConnected);
+    }
+
+    #[test]
+    fn sim_load_media_preview_fixture_rejects_unknown_and_accepts_known_values() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+
+        let connect_request = Request {
+            id: 1,
+            method: "scanner.connect".into(),
+            params: serde_json::json!({ "deviceId": "sim-ls5000-0" }),
+        };
+        handle_request(&mut backends, &tx, &connect_request, &mut project_state)
+            .expect("scanner.connect");
+
+        // D-18: an unrecognized previewFixture is refused before the
+        // simulator ever sees it -- carrier is otherwise valid, so a
+        // success here would mean the value was silently ignored rather
+        // than validated.
+        let nonsense_request = Request {
+            id: 2,
+            method: "sim.loadMedia".into(),
+            params: serde_json::json!({ "carrier": "strip6", "previewFixture": "nonsense" }),
+        };
+        let err =
+            handle_request(&mut backends, &tx, &nonsense_request, &mut project_state).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+
+        let valid_request = Request {
+            id: 3,
+            method: "sim.loadMedia".into(),
+            params: serde_json::json!({ "carrier": "strip6", "previewFixture": "boundaryAndBlank" }),
+        };
+        let result = handle_request(&mut backends, &tx, &valid_request, &mut project_state)
+            .expect("sim.loadMedia with a recognized previewFixture must succeed");
+        assert_eq!(result["mediaLoaded"], true);
     }
 }

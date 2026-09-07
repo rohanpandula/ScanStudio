@@ -299,6 +299,18 @@ pub struct ConnectResult {
 #[serde(rename_all = "camelCase")]
 pub struct LoadMediaParams {
     pub carrier: domain::MediaCarrier,
+    /// D-18: a **simulator-only test affordance** letting an automated
+    /// test arm one flagged boundary frame and one blank frame with real
+    /// rasters, so the manual-review and skip-blank paths are exercisable
+    /// without hardware. Accepts exactly `"textured"` or
+    /// `"boundaryAndBlank"` (`sim::PreviewFixture::parse`); any other
+    /// string is refused `ErrorCode::InvalidParams` at the `sim.loadMedia`
+    /// dispatch arm, before the simulator itself ever sees it. The real
+    /// backend rejects `sim.loadMedia` outright regardless of this field
+    /// (`RealLs5000::load_media`) -- unchanged by this addition. Omitting
+    /// it leaves the simulator's output exactly as it has always been.
+    #[serde(default)]
+    pub preview_fixture: Option<String>,
 }
 
 // ---------------------------------------------------------------------
