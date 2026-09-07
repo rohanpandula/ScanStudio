@@ -109,6 +109,49 @@ private func removeSocketDirectory(for path: String) {
     try? FileManager.default.removeItem(atPath: directory)
 }
 
+/// A real client for these tests: dials the server via
+/// `ControlSocketDialer.dial`, writes lines, and blocks on `availableData`
+/// for the next complete line -- never sleep-polls. Framing reuses the same
+/// `LineFramer` the server itself uses, so a read that returns more than
+/// one line's worth (or a partial line) stays correct across calls. Not an
+/// actor: used sequentially, within one test's own body, never shared
+/// across a concurrency boundary.
+private final class TestControlClient {
+    private let handle: FileHandle
+    private var framer = LineFramer()
+    private var buffered: [String] = []
+
+    init(path: String) throws {
+        handle = FileHandle(fileDescriptor: try ControlSocketDialer.dial(path: path), closeOnDealloc: true)
+    }
+
+    func send(_ line: String) throws {
+        var data = Data(line.utf8)
+        data.append(0x0A)
+        try handle.write(contentsOf: data)
+    }
+
+    /// Blocks until a full line is available; returns `nil` once the peer
+    /// has closed (an empty `availableData` read) -- the "next blocking
+    /// read returns empty" proof for a connection Task 2 closed.
+    func readLine() -> String? {
+        while buffered.isEmpty {
+            let data = handle.availableData
+            if data.isEmpty { return nil }
+            buffered.append(contentsOf: framer.feed(data))
+        }
+        return buffered.removeFirst()
+    }
+
+    func close() {
+        try? handle.close()
+    }
+}
+
+/// Sniffs just the top-level `id` field, decodable against either a
+/// success or an error response envelope.
+private struct ControlServerResponseIdSniff: Decodable { let id: UInt64 }
+
 @Suite("Control channel server", .timeLimit(.minutes(1)))
 struct ControlChannelServerTests {
     // MARK: Task 1 -- path policy, dial/probe, bind/stale-reclaim lifecycle
@@ -211,5 +254,202 @@ struct ControlChannelServerTests {
         await server.stop()
         #expect(FileManager.default.fileExists(atPath: path) == false)
         #expect(await server.isListening == false)
+    }
+
+    // MARK: Task 2 -- accept loop, per-connection dispatcher, line handling
+    //
+    // None of these tests are `@MainActor`: `adopt(_:)` hops to `MainActor`
+    // to construct each connection's dispatcher, and these tests block on
+    // real socket reads. Running the blocking read itself on `MainActor`
+    // would starve that same hop and deadlock -- `makeIdleModel`'s own
+    // `@MainActor` is still reachable via a plain `await` from here.
+
+    @Test("A hello line gets back a response whose id matches and whose result carries the schema version")
+    func helloRoundTrip() async throws {
+        let path = shortSocketPath("hello")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        guard let line = client.readLine() else {
+            Issue.record("expected a hello response line")
+            return
+        }
+        struct HelloSuccessEnvelope: Decodable { let id: UInt64; let result: ControlHelloResult }
+        guard let envelope = try? JSONDecoder().decode(HelloSuccessEnvelope.self, from: Data(line.utf8)) else {
+            Issue.record("expected a decodable hello success envelope, got: \(line)")
+            return
+        }
+        #expect(envelope.id == 1)
+        #expect(envelope.result.schemaVersion == ControlSchema.version)
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A request before hello is refused with HELLO_REQUIRED")
+    func requestBeforeHelloRefused() async throws {
+        let path = shortSocketPath("prehello")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try client.send(#"{"id":1,"method":"status","params":{}}"#)
+        guard let line = client.readLine() else {
+            Issue.record("expected a response line")
+            return
+        }
+        guard let error = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(line.utf8)) else {
+            Issue.record("expected an error envelope, got: \(line)")
+            return
+        }
+        #expect(error.id == 1)
+        #expect(error.error.code == ControlErrorCode.helloRequired.rawValue)
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A hello with the wrong schemaVersion is refused with SCHEMA_VERSION_MISMATCH")
+    func helloVersionMismatchRefused() async throws {
+        let path = shortSocketPath("badversion")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version + 1),"clientName":"test"}}"#)
+        guard let line = client.readLine() else {
+            Issue.record("expected a response line")
+            return
+        }
+        guard let error = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(line.utf8)) else {
+            Issue.record("expected an error envelope, got: \(line)")
+            return
+        }
+        #expect(error.error.code == ControlErrorCode.schemaVersionMismatch.rawValue)
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A malformed line is refused with INVALID_PARAMS and the connection stays open")
+    func malformedLineRefusedConnectionStaysOpen() async throws {
+        let path = shortSocketPath("malformed")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try client.send("not json at all")
+        guard let line = client.readLine() else {
+            Issue.record("expected a response line")
+            return
+        }
+        guard let error = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(line.utf8)) else {
+            Issue.record("expected an error envelope, got: \(line)")
+            return
+        }
+        #expect(error.error.code == ControlErrorCode.invalidParams.rawValue)
+
+        // The connection must still be open: a follow-up hello still works.
+        try client.send(#"{"id":9,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        #expect(client.readLine() != nil)
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A line over maxRequestLineBytes is refused with INVALID_PARAMS and the connection is then closed")
+    func oversizedLineRefusedAndClosed() async throws {
+        let path = shortSocketPath("oversized")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        let oversized = String(repeating: "a", count: ControlChannelDispatcher.maxRequestLineBytes + 1)
+        // The server closes its end mid-write once the accumulated bytes
+        // cross the bound (T-02-08); a resulting broken-pipe error on this
+        // send is an expected side effect of that race, not a test
+        // failure -- the refusal line read below is the actual proof, and
+        // the server always writes it before it closes.
+        try? client.send(oversized)
+
+        guard let line = client.readLine() else {
+            Issue.record("expected an INVALID_PARAMS response before closure")
+            return
+        }
+        guard let error = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(line.utf8)) else {
+            Issue.record("expected an error envelope, got: \(line)")
+            return
+        }
+        #expect(error.error.code == ControlErrorCode.invalidParams.rawValue)
+        #expect(client.readLine() == nil)
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A second connection's pre-hello request is still refused after a different connection has already greeted")
+    func perConnectionGreetedStateIsIsolated() async throws {
+        let path = shortSocketPath("isolated")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let first = try TestControlClient(path: path)
+        try first.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"first"}}"#)
+        guard let firstLine = first.readLine() else {
+            Issue.record("expected the first connection's hello response")
+            return
+        }
+        #expect((try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(firstLine.utf8))) == nil)
+
+        let second = try TestControlClient(path: path)
+        try second.send(#"{"id":1,"method":"status","params":{}}"#)
+        guard let secondLine = second.readLine() else {
+            Issue.record("expected the second connection's response")
+            return
+        }
+        guard let error = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(secondLine.utf8)) else {
+            Issue.record("expected an error envelope for the ungreeted second connection, got: \(secondLine)")
+            return
+        }
+        #expect(error.error.code == ControlErrorCode.helloRequired.rawValue)
+
+        first.close()
+        second.close()
+        await server.stop()
+    }
+
+    @Test("Two requests on one connection get their responses back in request order")
+    func responsesArriveInRequestOrder() async throws {
+        let path = shortSocketPath("ordered")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        _ = client.readLine()
+
+        try client.send(#"{"id":2,"method":"status","params":{}}"#)
+        try client.send(#"{"id":3,"method":"status","params":{}}"#)
+
+        guard let secondLine = client.readLine(), let thirdLine = client.readLine() else {
+            Issue.record("expected two response lines")
+            return
+        }
+        let secondId = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(secondLine.utf8))
+        let thirdId = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(thirdLine.utf8))
+        #expect(secondId?.id == 2)
+        #expect(thirdId?.id == 3)
+
+        client.close()
+        await server.stop()
     }
 }

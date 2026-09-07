@@ -183,18 +183,32 @@ public actor ControlChannelServer {
     private var acceptSource: DispatchSourceRead?
     private var boundPath: String?
 
+    /// One entry per accepted, still-open connection, all keyed by the raw
+    /// descriptor. `dispatchers[fd]` is this connection's own
+    /// `ControlChannelDispatcher` -- its `hello`/subscription state is per
+    /// instance, never shared across connections (Pattern 1).
+    private var connections: [Int32: FileHandle] = [:]
+    private var framers: [Int32: LineFramer] = [:]
+    private var dispatchers: [Int32: ControlChannelDispatcher] = [:]
+    /// Bytes accumulated since this connection's last complete line --
+    /// D-04's buffer-level bound, checked *before* feeding into
+    /// `LineFramer` so a peer that never sends a newline can never grow
+    /// that framer's internal buffer past
+    /// `ControlChannelDispatcher.maxRequestLineBytes`.
+    private var pendingLineBytes: [Int32: Int] = [:]
+
     private static let listenBacklog: Int32 = 8
 
     public init(sessionModel: SessionModel) {
         self.sessionModel = sessionModel
-        // Matches `EngineClient.init`'s own rationale verbatim: a write to a
-        // peer that has already closed its end (a disconnected control
-        // client, or -- in a test process that never constructs a real
-        // `EngineClient` -- the *first* place SIGPIPE's default
-        // process-killing disposition would ever be touched at all) must
-        // degrade to an EPIPE error on the write call, not terminate the
-        // process. Safe to call repeatedly; a global signal disposition,
-        // not per-connection state.
+        // Matches the subprocess client's own init-time rationale
+        // verbatim: a write to a peer that has already closed its end (a
+        // disconnected control client, or -- in a test process that never
+        // constructs a real subprocess client -- the *first* place
+        // SIGPIPE's default process-killing disposition would ever be
+        // touched at all) must degrade to an EPIPE error on the write
+        // call, not terminate the process. Safe to call repeatedly; a
+        // global signal disposition, not per-connection state.
         signal(SIGPIPE, SIG_IGN)
     }
 
@@ -252,6 +266,9 @@ public actor ControlChannelServer {
     /// closes the listening descriptor, and `unlink`s exactly the path this
     /// instance bound. Safe to call on a server that never started.
     public func stop() async {
+        for fd in Array(connections.keys) {
+            closeConnection(fd)
+        }
         acceptSource?.setCancelHandler {}
         acceptSource?.cancel()
         acceptSource = nil
@@ -283,9 +300,10 @@ public actor ControlChannelServer {
         }
     }
 
-    /// `EngineClient.swift:170-179`'s exact shape: only synchronous work
-    /// (`accept()`) happens in the event handler; everything else hops into
-    /// a `Task` immediately.
+    /// The weak-self, immediate-`Task`-hop callback shape used elsewhere in
+    /// this target for a readability handler around an OS resource: only
+    /// synchronous work (`accept()`) happens in the event handler itself;
+    /// everything else hops into a `Task` immediately.
     private func armAcceptSource(fd: Int32) {
         let queue = DispatchQueue(label: "com.scanstudio.controlchannel.accept.\(fd)")
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
@@ -299,10 +317,108 @@ public actor ControlChannelServer {
         acceptSource = source
     }
 
-    /// Task 1 scope: accept and immediately close. Task 2 constructs the
-    /// per-connection `ControlChannelDispatcher` and wires line handling
-    /// here.
-    private func adopt(_ fd: Int32) {
-        close(fd)
+    /// Constructs this connection's own `ControlChannelDispatcher` (a
+    /// `MainActor` hop, since the dispatcher's initializer is
+    /// `MainActor`-isolated -- Pattern 1: one dispatcher per connection, all
+    /// sharing the single `sessionModel` this server was handed), wraps the
+    /// descriptor in a `FileHandle`, and installs the same weak-self
+    /// immediate-`Task`-hop readability shape `armAcceptSource` uses: empty
+    /// data means the peer closed, anything else feeds this connection's
+    /// `LineFramer`.
+    private func adopt(_ fd: Int32) async {
+        let dispatcher = await MainActor.run {
+            ControlChannelDispatcher(sessionModel: sessionModel)
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        connections[fd] = handle
+        framers[fd] = LineFramer()
+        dispatchers[fd] = dispatcher
+        pendingLineBytes[fd] = 0
+        handle.readabilityHandler = { [weak self] fileHandle in
+            let data = fileHandle.availableData
+            guard let self else { return }
+            if data.isEmpty {
+                Task { await self.closeConnection(fd) }
+            } else {
+                Task { await self.feed(fd: fd, chunk: data) }
+            }
+        }
+    }
+
+    /// Feeds one chunk through this connection's `LineFramer`, in order,
+    /// and answers every complete line via `dispatcher.handleLine(_:)`.
+    /// Enforces D-04's byte bound at the buffer level -- before framing,
+    /// not only inside `decode(_:)` -- so a peer that never sends a newline
+    /// is refused and closed instead of buffered to exhaustion (T-02-08).
+    private func feed(fd: Int32, chunk: Data) async {
+        guard var framer = framers[fd], let dispatcher = dispatchers[fd] else { return }
+        let totalPending = (pendingLineBytes[fd] ?? 0) + chunk.count
+        guard totalPending <= ControlChannelDispatcher.maxRequestLineBytes else {
+            await refuseOversizedLine(fd: fd)
+            return
+        }
+
+        let lines = framer.feed(chunk)
+        framers[fd] = framer
+        // Bytes consumed by the lines just extracted (content + the
+        // stripped newline byte each); whatever remains is this
+        // connection's new unterminated-partial-line residue.
+        let consumed = lines.reduce(0) { $0 + $1.utf8.count + 1 }
+        pendingLineBytes[fd] = max(0, totalPending - consumed)
+
+        for line in lines {
+            let responseData = await dispatcher.handleLine(Data(line.utf8))
+            var out = responseData
+            out.append(0x0A)
+            writeDirect(fd: fd, bytes: out)
+        }
+    }
+
+    /// D-04/T-02-08: writes one `INVALID_PARAMS` line naming the limit,
+    /// then closes the connection and drops all its state -- never keeps
+    /// buffering, never waits for a newline that may never come.
+    private func refuseOversizedLine(fd: Int32) async {
+        let payload = ControlErrorPayload(
+            .invalidParams,
+            message: "Request line exceeded \(ControlChannelDispatcher.maxRequestLineBytes) bytes before a newline was seen."
+        )
+        if let data = try? JSONEncoder().encode(ControlResponseErrorEnvelope(id: 0, error: payload)) {
+            var out = data
+            out.append(0x0A)
+            writeDirect(fd: fd, bytes: out)
+        }
+        closeConnection(fd)
+    }
+
+    /// Task 2 scope: a direct, blocking write on the actor. Task 3 replaces
+    /// call sites with the bounded per-connection outbound queue so a
+    /// stalled peer can never block this actor.
+    private func writeDirect(fd: Int32, bytes: Data) {
+        guard let handle = connections[fd] else { return }
+        try? handle.write(contentsOf: bytes)
+    }
+
+    /// Closes a connection exactly once -- peer EOF, an oversized line, or
+    /// `stop()` -- clearing the readability handler, closing the
+    /// descriptor, and dropping every piece of this connection's state.
+    /// Dropping the dispatcher is what terminates its event subscriptions.
+    ///
+    /// Closes through `handle.close()`, never a raw POSIX `close(fd)`: a
+    /// readability-handler invocation the kernel already queued before
+    /// `readabilityHandler` was cleared can still run with a stale
+    /// reference to this same descriptor number. Closing the raw fd out
+    /// from under `FileHandle`'s own dispatch source races that queued
+    /// invocation (`availableData` raises an uncatchable
+    /// `NSFileHandleOperationException` on a bad descriptor, and under a
+    /// busy suite a just-closed fd number is often already reassigned to
+    /// an unrelated connection). Routing the close through the handle lets
+    /// Foundation coordinate its own source teardown first.
+    private func closeConnection(_ fd: Int32) {
+        guard let handle = connections.removeValue(forKey: fd) else { return }
+        handle.readabilityHandler = nil
+        try? handle.close()
+        framers.removeValue(forKey: fd)
+        dispatchers.removeValue(forKey: fd)
+        pendingLineBytes.removeValue(forKey: fd)
     }
 }
