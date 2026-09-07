@@ -216,7 +216,11 @@ private func makeEjectableModel(_ stub: BusyIndicatorEngineStub) async -> Sessio
     return model
 }
 
-@Suite("Control busy indicator")
+// WR-02: `wait*` helpers here are built on `withCheckedContinuation`, which
+// never resumes on its own -- a routing/flag regression used to hang the
+// suite instead of failing fast. `.timeLimit` is Swift Testing's
+// suite-level bound (minutes is its minimum granularity).
+@Suite("Control busy indicator", .timeLimit(.minutes(1)))
 struct ControlBusyIndicatorTests {
     @Test("Idle state has no mutating operation in flight once initial discovery settles")
     @MainActor

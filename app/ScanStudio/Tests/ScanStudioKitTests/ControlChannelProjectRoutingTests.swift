@@ -373,7 +373,11 @@ private func prepareForResumeBatchReadiness(_ model: SessionModel) async -> Bool
     return true
 }
 
-@Suite("Control channel project routing")
+// WR-02: `wait*` helpers here are built on `withCheckedContinuation`, which
+// never resumes on its own -- a routing regression used to hang the suite
+// instead of failing fast. `.timeLimit` is Swift Testing's suite-level bound
+// (minutes is its minimum granularity).
+@Suite("Control channel project routing", .timeLimit(.minutes(1)))
 struct ControlChannelProjectRoutingTests {
     // MARK: frames.include / frames.exclude
 

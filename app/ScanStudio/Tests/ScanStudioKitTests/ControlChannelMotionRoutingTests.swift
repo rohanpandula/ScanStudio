@@ -348,7 +348,13 @@ private func driveHardwareMotionNotReady(_ model: SessionModel) async {
     ))
 }
 
-@Suite("Control channel motion routing")
+// WR-02: every wait helper in this file (`hold`/`release`/
+// `waitForRequestCount`) is built on `withCheckedContinuation`, which never
+// resumes on its own. A routing regression that breaks an expected engine
+// call used to hang the suite forever instead of failing fast; `.timeLimit`
+// is Swift Testing's suite-level bound (minutes is its minimum granularity),
+// so a hung continuation now fails with a clear timeout instead.
+@Suite("Control channel motion routing", .timeLimit(.minutes(1)))
 struct ControlChannelMotionRoutingTests {
     // MARK: Device lifecycle (Task 1)
 
