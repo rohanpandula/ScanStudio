@@ -484,4 +484,37 @@ struct AttendedScanRecoveryTests {
         await client.resumeApproval()
         #expect(await approval.value)
     }
+
+    @Test("WR-01: resumeBatch reports a typed refusal instead of a silent no-op while an attended-scan-recovery approval is in flight")
+    @MainActor
+    func resumeBatchRefusesWhileAttendedApprovalInFlight() async {
+        let client = AttendedRecoveryEngineStub(holdFirstApproval: true)
+        let (model, _) = await preparedModel(client: client)
+
+        await model.startMockScan()
+        for frameIndex in 1...2 {
+            emitFailure(
+                model,
+                frameIndex: frameIndex,
+                code: ScanFailureCode.attendedBindingRequired,
+                message: "typed refusal"
+            )
+        }
+        emitCompletion(model, completed: [], failed: [1, 2])
+        #expect(model.canApproveEveryFrameAndScan)
+
+        let approval = Task { @MainActor in
+            await model.approveEveryFrameAndScan()
+        }
+        await client.waitForApproval()
+
+        // A direct `SessionModel` call (IN-01: not gated by the dispatcher's
+        // own busy preamble) used to return silently here with
+        // `lastErrorMessage` untouched.
+        await model.resumeBatch()
+        #expect(model.lastErrorMessage == "An attended-scan-recovery approval is already in progress.")
+
+        await client.resumeApproval()
+        #expect(await approval.value)
+    }
 }

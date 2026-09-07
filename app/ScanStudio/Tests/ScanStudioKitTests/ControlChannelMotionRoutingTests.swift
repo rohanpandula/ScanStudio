@@ -853,4 +853,69 @@ struct ControlChannelMotionRoutingTests {
         #expect(error.guidance == ScanReadinessPolicy.Decision.targetRequired.reason)
         #expect(await stub.recordedMethods.isEmpty)
     }
+
+    // WR-01: `resumeBatch()`'s own guard reads three `private` flags plus
+    // `isResumingBatch` this dispatcher cannot see directly -- these two
+    // tests prove a `scan.resume` racing each of them gets a typed refusal
+    // instead of a silent success (RESEARCH Pitfall 1), the same failure
+    // mode CR-01 closes for `scan.start`.
+
+    @Test("scan.resume reports GATE_REFUSED, not a silent success, while a scan is already starting")
+    @MainActor
+    func scanResumeIsRefusedWhilePendingScanStart() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        #expect(await prepareMotionRoutingScanReadiness(model))
+        await stub.clearLog()
+        await stub.hold("scan.start")
+
+        // `scanSingleFrame(_:)` (unlike `startMockScan()`) never calls
+        // `beginMutatingOperation`, so `mutatingOperationInFlight` stays nil
+        // throughout -- the dispatcher's generic busy preamble cannot catch
+        // this race. Only `resumeBatch()`'s own `pendingScanStart` guard can.
+        let scanTask = Task { @MainActor in
+            await model.scanSingleFrame(1)
+        }
+        await stub.waitForRequestCount("scan.start", 1)
+        #expect(model.mutatingOperationInFlight == nil)
+
+        let response = await dispatcher.handle(.scanResume(id: 7, params: ControlScanResumeParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            await stub.release("scan.start")
+            await scanTask.value
+            return
+        }
+        #expect(id == 7)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(await stub.requestCounts["scan.start"] == 1)
+
+        await stub.release("scan.start")
+        await scanTask.value
+    }
+
+    @Test("resumeBatch reports a typed refusal instead of a silent no-op while a resume is already in flight")
+    @MainActor
+    func resumeBatchRefusesSecondDirectCallWhileResuming() async {
+        let (model, stub, _) = await makeDispatcher()
+        #expect(await prepareMotionRoutingScanReadiness(model))
+        await stub.clearLog()
+        await stub.hold("project.pendingFrames")
+
+        let first = Task { @MainActor in
+            await model.resumeBatch()
+        }
+        await stub.waitForRequestCount("project.pendingFrames", 1)
+        #expect(model.isResumingBatch)
+        #expect(model.mutatingOperationInFlight == "scan.resume")
+
+        // A direct `SessionModel` call -- IN-01: not gated by the
+        // dispatcher's own busy preamble -- used to return silently here
+        // with `lastErrorMessage` untouched.
+        await model.resumeBatch()
+        #expect(model.lastErrorMessage == "A resume is already in progress.")
+
+        await stub.release("project.pendingFrames")
+        _ = await first.value
+    }
 }

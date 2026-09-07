@@ -3197,10 +3197,42 @@ public final class SessionModel {
     /// One explicit resume owns both the authoritative read and scan startup.
     /// A rejected/cancelled action cannot acquire permission from later state.
     public func resumeBatch() async {
-        guard !Task.isCancelled, !isResumingBatch, !isChangingProject,
-              pendingScanStart == nil, jobId == nil, !isJobActive,
-              pendingManualReviewScan == nil, pendingManualReviewApproval == nil,
-              pendingAttendedScanApproval == nil else { return }
+        guard !Task.isCancelled, !isChangingProject,
+              jobId == nil, !isJobActive else { return }
+        // WR-01: each of these four used to share the bare `return` above,
+        // so a dispatcher-routed `scan.resume` arriving in any of these
+        // states saw `lastErrorMessage` unchanged and reported a typed
+        // success for a resume that never ran (RESEARCH Pitfall 1, the same
+        // failure mode CR-01 closes for `scan.start`). Same fix, applied to
+        // every reason the dispatcher's own `.scanResume` arm cannot see
+        // directly: a resume already in flight, a scan already starting, an
+        // attended-recovery approval in progress, or a manual review
+        // approval in progress.
+        guard !isResumingBatch else {
+            lastErrorMessage = "A resume is already in progress."
+            return
+        }
+        guard pendingScanStart == nil else {
+            lastErrorMessage = "A scan is already starting."
+            return
+        }
+        guard pendingAttendedScanApproval == nil else {
+            lastErrorMessage = "An attended-scan-recovery approval is already in progress."
+            return
+        }
+        guard pendingManualReviewApproval == nil else {
+            lastErrorMessage = "A manual review approval is already in progress."
+            return
+        }
+        // Bundled and left silent, unlike the four guards above: a
+        // dispatcher-routed `scan.resume` already gets a typed
+        // `GATE_REFUSED` (`gate: .manualReviewPending`) for this exact
+        // condition from `gateRefusal(scanReadiness:)` before `resumeBatch()`
+        // is ever called (see `ControlChannelDispatcher.swift`'s
+        // `.scanResume` arm) -- this is defence in depth for a direct
+        // `SessionModel` caller, not a second, differently-worded copy of
+        // that same refusal.
+        guard pendingManualReviewScan == nil else { return }
         guard project != nil else {
             lastErrorMessage = ScanReadinessPolicy.Decision.projectRequired.reason
             return
