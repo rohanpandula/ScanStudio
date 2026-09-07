@@ -393,6 +393,52 @@ struct ControlChannelServerTests {
         await serverB.stop()
     }
 
+    @Test("WR-03: a connection accepted while stop() runs concurrently is closed too, never left open past stop()'s return")
+    func adoptAfterStopClosesTheLateConnection() async throws {
+        let path = shortSocketPath("adopt-after-stop")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        // `stop()`'s own body has no internal `await` (every step is a
+        // synchronous dictionary/syscall operation), so once scheduled it
+        // always runs to completion in one atomic step on the server's
+        // actor -- the only way `adopt(_:)` can still be mid-flight when
+        // `stop()` drains the actor is via `adopt(_:)`'s own
+        // `await MainActor.run { ControlChannelDispatcher(...) }` hop.
+        // A bounded, non-suspending busy-wait scheduled on the MainActor
+        // just before triggering the connection below reliably holds that
+        // hop pending for the whole window, constructing WR-03's race
+        // directly rather than depending on incidental scheduling luck to
+        // hit a window otherwise measured in microseconds.
+        let occupancyMilliseconds = 200.0
+        let occupier = Task { @MainActor in
+            let deadline = Date().addingTimeInterval(occupancyMilliseconds / 1000)
+            while Date() < deadline {}
+        }
+        await Task.yield() // let the occupier actually start and claim the MainActor
+
+        let client = try TestControlClient(path: path)
+        // Bounds only how long this test waits before calling stop(), so
+        // the accept handler's own dedicated GCD queue has time to fire
+        // and spawn adopt(_:)'s Task first -- the pass/fail outcome below
+        // is decided by the connection's actual usability afterward, not
+        // by this sleep's exact duration.
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        await server.stop()
+
+        _ = await occupier.value // let adopt()'s pending MainActor hop finally resolve
+
+        // Whether adopt() registered the connection then unwound it
+        // (WR-03's own fix, exercised if the connection was accepted
+        // before stop() ran) or the connection was never accepted in time
+        // at all, it must not be usable afterward either way.
+        try? await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        #expect(await client.readLine() == nil, "a connection accepted while stop() ran concurrently must not remain open")
+
+        client.close()
+    }
+
     @MainActor
     @Test("simulateHostCrash() leaves the file on disk but probeIsLive sees it as dead, and a successor reclaims it")
     func crashedSocketIsReclaimed() async throws {

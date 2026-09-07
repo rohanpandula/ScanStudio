@@ -192,6 +192,12 @@ public actor ControlChannelServer {
     private var listenDescriptor: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private var boundPath: String?
+    /// WR-03: set at the very start of `stop()`, before it closes any
+    /// existing connection -- `adopt(_:)` re-checks this after registering
+    /// a newly-accepted connection so one that slips in after `stop()` has
+    /// already drained `connections` is closed too, rather than outliving
+    /// the server's declared-stopped state.
+    private var isStopped = false
 
     /// One entry per accepted, still-open connection, all keyed by the raw
     /// descriptor. `dispatchers[fd]` is this connection's own
@@ -362,7 +368,12 @@ public actor ControlChannelServer {
     /// Cancels the accept source, closes every connection descriptor,
     /// closes the listening descriptor, and `unlink`s exactly the path this
     /// instance bound. Safe to call on a server that never started.
+    ///
+    /// WR-03: `isStopped` is set first, before closing any connection
+    /// present right now -- `adopt(_:)`'s own after-registration re-check
+    /// is what catches a connection accepted concurrently with this call.
     public func stop() async {
+        isStopped = true
         for fd in Array(connections.keys) {
             closeConnection(fd)
         }
@@ -401,13 +412,26 @@ public actor ControlChannelServer {
     /// this target for a readability handler around an OS resource: only
     /// synchronous work (`accept()`) happens in the event handler itself;
     /// everything else hops into a `Task` immediately.
+    ///
+    /// WR-04: if `self` has already been deallocated by the time this
+    /// `Task` actually runs, `self?.adopt(clientFD)` alone would be a
+    /// silent no-op -- `clientFD`, a real, already-`accept()`-ed
+    /// descriptor, would never be closed. `self` is captured once into a
+    /// local `let` so the `nil` branch can still close the leaked
+    /// descriptor explicitly.
     private func armAcceptSource(fd: Int32) {
         let queue = DispatchQueue(label: "com.scanstudio.controlchannel.accept.\(fd)")
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in
             let clientFD = accept(fd, nil, nil)
             guard clientFD >= 0 else { return }
-            Task { await self?.adopt(clientFD) }
+            Task { [weak self] in
+                guard let self else {
+                    close(clientFD)
+                    return
+                }
+                await self.adopt(clientFD)
+            }
         }
         source.setCancelHandler { close(fd) }
         source.resume()
@@ -422,6 +446,18 @@ public actor ControlChannelServer {
     /// immediate-`Task`-hop readability shape `armAcceptSource` uses: empty
     /// data means the peer closed, anything else feeds this connection's
     /// `LineFramer`.
+    ///
+    /// WR-03: `stop()` and this function can race -- `armAcceptSource`'s
+    /// event handler spawns this function's own `Task` on a successful
+    /// `accept()`, but if `stop()` reaches and drains the actor first, it
+    /// closes only the connections present in `connections` *at that
+    /// moment*, before this function ever runs. The `MainActor.run` hop
+    /// just below is itself a suspension point `stop()` could interleave
+    /// through even if this function checked `isStopped` only at its own
+    /// start -- so the check instead runs *after* every registration
+    /// statement (and after installing the live `readabilityHandler`),
+    /// undoing the whole registration via the same `closeConnection(_:)`
+    /// every other teardown path uses if the server stopped meanwhile.
     private func adopt(_ fd: Int32) async {
         let dispatcher = await MainActor.run {
             ControlChannelDispatcher(sessionModel: sessionModel)
@@ -439,6 +475,9 @@ public actor ControlChannelServer {
             } else {
                 Task { await self.feed(fd: fd, chunk: data) }
             }
+        }
+        if isStopped {
+            closeConnection(fd)
         }
     }
 
