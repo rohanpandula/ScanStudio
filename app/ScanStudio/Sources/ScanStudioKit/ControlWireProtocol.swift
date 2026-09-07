@@ -199,3 +199,405 @@ public struct ControlHelloResult: Codable, Equatable, Sendable {
         self.appVersion = appVersion
     }
 }
+
+// MARK: - Confirmation-bearing params (D-08)
+//
+// D-08: a missing confirmation must be refused with a typed confirmation
+// error, never treated as an invalid-params failure, and no field default
+// may mean "confirmed". Declaring each flag as an optional satisfies both:
+// an absent wire key decodes to `nil`, and the dispatcher treats anything
+// other than an explicit `true` as unconfirmed. These five structs are
+// decoded, never hand-constructed outside tests, so — like
+// `WireProtocol.swift`'s own decode-only leaf types (`ProjectSummary`,
+// `WireSniff`) — they declare no custom initializer; the compiler's own
+// memberwise one (visible to `ScanStudioKitTests` via `@testable import`)
+// is sufficient, and guarantees every field must be supplied explicitly
+// rather than silently defaulting.
+
+public struct ControlPreviewAcquireParams: Codable, Equatable, Sendable {
+    public let filmLoadedConfirmed: Bool?
+    /// `"initial"` | `"replaceFilmProcess"` | `"refreshSavedProject"`;
+    /// an absent key means `"initial"`.
+    public let intent: String?
+    public let filmProcess: FilmProcess?
+}
+
+public struct ControlScanStartParams: Codable, Equatable, Sendable {
+    public let motionConfirmed: Bool?
+}
+
+public struct ControlScanResumeParams: Codable, Equatable, Sendable {
+    public let motionConfirmed: Bool?
+}
+
+public struct ControlScannerEjectParams: Codable, Equatable, Sendable {
+    public let motionConfirmed: Bool?
+}
+
+/// Carries a confirmation flag because it routes to
+/// `SessionModel.approvePendingManualReviewAndStart()`, which starts a
+/// scan — the method name alone does not advertise the motion.
+public struct ControlReviewApproveParams: Codable, Equatable, Sendable {
+    public let motionConfirmed: Bool?
+}
+
+// MARK: - Remaining params
+
+public struct ControlScannerConnectParams: Codable, Equatable, Sendable {
+    public let deviceId: String?
+
+    public init(deviceId: String? = nil) {
+        self.deviceId = deviceId
+    }
+}
+
+/// Shared by `frames.include` and `frames.exclude` — both act on exactly
+/// one frame index.
+public struct ControlFrameSelectionParams: Codable, Equatable, Sendable {
+    public let frameIndex: Int
+
+    public init(frameIndex: Int) {
+        self.frameIndex = frameIndex
+    }
+}
+
+/// `mode` is `"afterCurrentFrame"` (the absent-key default) or
+/// `"immediate"` — no other value is accepted.
+public struct ControlScanStopParams: Codable, Equatable, Sendable {
+    public let mode: String?
+
+    public init(mode: String? = nil) {
+        self.mode = mode
+    }
+}
+
+public struct ControlRollSaveParams: Codable, Equatable, Sendable {
+    public let name: String
+    public let carrier: SimulatedFilmCarrier
+    public let frameCount: Int
+    public let filmProcess: FilmProcess
+
+    public init(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess) {
+        self.name = name
+        self.carrier = carrier
+        self.frameCount = frameCount
+        self.filmProcess = filmProcess
+    }
+}
+
+public struct ControlRollOpenParams: Codable, Equatable, Sendable {
+    public let directory: String
+
+    public init(directory: String) {
+        self.directory = directory
+    }
+}
+
+public struct ControlSettingsSetParams: Codable, Equatable, Sendable {
+    public let capture: CaptureRecipe
+    public let processing: ProcessingRecipe
+
+    public init(capture: CaptureRecipe, processing: ProcessingRecipe) {
+        self.capture = capture
+        self.processing = processing
+    }
+}
+
+public struct ControlOutputsSetParams: Codable, Equatable, Sendable {
+    public let outputs: OutputRecipe
+
+    public init(outputs: OutputRecipe) {
+        self.outputs = outputs
+    }
+}
+
+public struct ControlDiagnosticsExportParams: Codable, Equatable, Sendable {
+    public let directory: String
+
+    public init(directory: String) {
+        self.directory = directory
+    }
+}
+
+// MARK: - Result mirror types
+//
+// `SessionModel.ScanProgress` and `WireProtocol.swift`'s `ProjectSummary`
+// are each missing one direction this channel needs on the wire
+// (`ScanProgress` is `Equatable, Sendable` only — no `Codable`;
+// `ProjectSummary` is `Decodable` only — no `Encodable` or `Equatable`).
+// Both are leaf, display-shaped data with no engine-private handles, so
+// rather than retrofitting cross-module conformances onto types owned
+// elsewhere, this file declares its own small mirrors — matching this same
+// file's `ControlFrameSummary` precedent below, and D-01's own rule that a
+// control-channel result is "built from SessionModel state," not a literal
+// reuse of every existing type regardless of shape.
+
+/// Mirrors `SessionModel.ScanProgress`'s fields for the wire.
+public struct ControlScanProgress: Codable, Equatable, Sendable {
+    public let jobId: String
+    public let frameIndex: Int
+    public let frameOrdinal: Int
+    public let totalFrames: Int
+    public let pass: Int
+    public let totalPasses: Int
+    public let framePercent: Double
+    public let jobPercent: Double
+    public let etaSeconds: Double
+
+    public init(
+        jobId: String,
+        frameIndex: Int,
+        frameOrdinal: Int,
+        totalFrames: Int,
+        pass: Int,
+        totalPasses: Int,
+        framePercent: Double,
+        jobPercent: Double,
+        etaSeconds: Double
+    ) {
+        self.jobId = jobId
+        self.frameIndex = frameIndex
+        self.frameOrdinal = frameOrdinal
+        self.totalFrames = totalFrames
+        self.pass = pass
+        self.totalPasses = totalPasses
+        self.framePercent = framePercent
+        self.jobPercent = jobPercent
+        self.etaSeconds = etaSeconds
+    }
+}
+
+/// Mirrors `WireProtocol.swift`'s `ProjectSummary` fields for the wire.
+public struct ControlProjectSummary: Codable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let carrier: SimulatedFilmCarrier
+    public let frameCount: Int
+    public let filmProcess: FilmProcess
+    public let createdAt: String
+    public let directory: String
+
+    public init(
+        id: String,
+        name: String,
+        carrier: SimulatedFilmCarrier,
+        frameCount: Int,
+        filmProcess: FilmProcess,
+        createdAt: String,
+        directory: String
+    ) {
+        self.id = id
+        self.name = name
+        self.carrier = carrier
+        self.frameCount = frameCount
+        self.filmProcess = filmProcess
+        self.createdAt = createdAt
+        self.directory = directory
+    }
+}
+
+// MARK: - Results
+
+/// A full session snapshot built from `SessionModel` public state only.
+/// `hardwareMotionReadiness` and `scanReadiness` carry their enum case
+/// names as stable strings (computed by the dispatcher) so a caller can
+/// branch on them without either enum leaking into the wire vocabulary.
+public struct ControlStatusResult: Codable, Equatable, Sendable {
+    public let device: DeviceInfo?
+    public let scanner: ScannerStatus?
+    public let projectName: String?
+    public let projectDirectory: String?
+    public let jobId: String?
+    public let jobState: JobState?
+    public let refeedRequired: Bool
+    public let hardwareMotionReadiness: String
+    public let motionAllowed: Bool
+    public let motionGuidance: String?
+    public let mutatingOperationInFlight: String?
+    public let selectedFrames: [Int]
+    public let scanReadiness: String
+    public let scanReadinessReason: String?
+    public let lastErrorMessage: String?
+
+    public init(
+        device: DeviceInfo? = nil,
+        scanner: ScannerStatus? = nil,
+        projectName: String? = nil,
+        projectDirectory: String? = nil,
+        jobId: String? = nil,
+        jobState: JobState? = nil,
+        refeedRequired: Bool,
+        hardwareMotionReadiness: String,
+        motionAllowed: Bool,
+        motionGuidance: String? = nil,
+        mutatingOperationInFlight: String? = nil,
+        selectedFrames: [Int],
+        scanReadiness: String,
+        scanReadinessReason: String? = nil,
+        lastErrorMessage: String? = nil
+    ) {
+        self.device = device
+        self.scanner = scanner
+        self.projectName = projectName
+        self.projectDirectory = projectDirectory
+        self.jobId = jobId
+        self.jobState = jobState
+        self.refeedRequired = refeedRequired
+        self.hardwareMotionReadiness = hardwareMotionReadiness
+        self.motionAllowed = motionAllowed
+        self.motionGuidance = motionGuidance
+        self.mutatingOperationInFlight = mutatingOperationInFlight
+        self.selectedFrames = selectedFrames
+        self.scanReadiness = scanReadiness
+        self.scanReadinessReason = scanReadinessReason
+        self.lastErrorMessage = lastErrorMessage
+    }
+}
+
+/// `errorCode` carries only `ErrorPayload.code`, never the whole payload
+/// and never any hardware diagnostic detail (T-01-05).
+public struct ControlFrameSummary: Codable, Equatable, Sendable {
+    public let index: Int
+    public let excluded: Bool
+    public let selected: Bool
+    public let hasThumbnail: Bool
+    public let state: String?
+    public let manualReviewDecision: String?
+    public let errorCode: String?
+
+    public init(
+        index: Int,
+        excluded: Bool,
+        selected: Bool,
+        hasThumbnail: Bool,
+        state: String? = nil,
+        manualReviewDecision: String? = nil,
+        errorCode: String? = nil
+    ) {
+        self.index = index
+        self.excluded = excluded
+        self.selected = selected
+        self.hasThumbnail = hasThumbnail
+        self.state = state
+        self.manualReviewDecision = manualReviewDecision
+        self.errorCode = errorCode
+    }
+}
+
+public struct ControlFramesListResult: Codable, Equatable, Sendable {
+    public let frames: [ControlFrameSummary]
+    public let selectedFrames: [Int]
+
+    public init(frames: [ControlFrameSummary], selectedFrames: [Int]) {
+        self.frames = frames
+        self.selectedFrames = selectedFrames
+    }
+}
+
+/// `frameErrorCodes` maps a stringified frame index to a bare
+/// `ErrorPayload.code` string — codes only, never a full error payload.
+public struct ControlJobResult: Codable, Equatable, Sendable {
+    public let jobId: String?
+    public let jobState: JobState?
+    public let progress: ControlScanProgress?
+    public let completedFrameCount: Int
+    public let pendingFrameCount: Int
+    public let receiptCount: Int
+    public let frameErrorCodes: [String: String]
+
+    public init(
+        jobId: String? = nil,
+        jobState: JobState? = nil,
+        progress: ControlScanProgress? = nil,
+        completedFrameCount: Int,
+        pendingFrameCount: Int,
+        receiptCount: Int,
+        frameErrorCodes: [String: String] = [:]
+    ) {
+        self.jobId = jobId
+        self.jobState = jobState
+        self.progress = progress
+        self.completedFrameCount = completedFrameCount
+        self.pendingFrameCount = pendingFrameCount
+        self.receiptCount = receiptCount
+        self.frameErrorCodes = frameErrorCodes
+    }
+}
+
+public struct ControlSettingsResult: Codable, Equatable, Sendable {
+    public let capture: CaptureRecipe
+    public let processing: ProcessingRecipe
+
+    public init(capture: CaptureRecipe, processing: ProcessingRecipe) {
+        self.capture = capture
+        self.processing = processing
+    }
+}
+
+public struct ControlOutputsResult: Codable, Equatable, Sendable {
+    public let outputs: OutputRecipe
+
+    public init(outputs: OutputRecipe) {
+        self.outputs = outputs
+    }
+}
+
+public struct ControlScannerListResult: Codable, Equatable, Sendable {
+    public let devices: [DeviceInfo]
+
+    public init(devices: [DeviceInfo]) {
+        self.devices = devices
+    }
+}
+
+public struct ControlRollListResult: Codable, Equatable, Sendable {
+    public let projects: [ControlProjectSummary]
+
+    public init(projects: [ControlProjectSummary]) {
+        self.projects = projects
+    }
+}
+
+public struct ControlRollSaveResult: Codable, Equatable, Sendable {
+    public let saved: Bool
+    public let projectName: String?
+    public let projectDirectory: String?
+
+    public init(saved: Bool, projectName: String? = nil, projectDirectory: String? = nil) {
+        self.saved = saved
+        self.projectName = projectName
+        self.projectDirectory = projectDirectory
+    }
+}
+
+/// `outcome` is the `PreviewRequestOutcome` case name (`"started"` |
+/// `"rejected"` | `"failedToStart"`), computed by the dispatcher.
+public struct ControlPreviewAcquireResult: Codable, Equatable, Sendable {
+    public let outcome: String
+    public let intentToken: String
+
+    public init(outcome: String, intentToken: String) {
+        self.outcome = outcome
+        self.intentToken = intentToken
+    }
+}
+
+public struct ControlDiagnosticsExportResult: Codable, Equatable, Sendable {
+    public let path: String
+    public let entries: [String]
+
+    public init(path: String, entries: [String]) {
+        self.path = path
+        self.entries = entries
+    }
+}
+
+public struct ControlEventsSubscribeResult: Codable, Equatable, Sendable {
+    public let subscribed: Bool
+    public let snapshot: ControlStatusResult
+
+    public init(subscribed: Bool, snapshot: ControlStatusResult) {
+        self.subscribed = subscribed
+        self.snapshot = snapshot
+    }
+}

@@ -93,4 +93,391 @@ struct ControlWireProtocolTests {
         #expect(sniff.id == 7)
         #expect(sniff.method == "scan.start")
     }
+
+    // MARK: - Round-trip helper
+
+    private func roundTrip<T: Codable & Equatable>(_ value: T) throws -> T {
+        let data = try JSONEncoder().encode(value)
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    // MARK: - Params round-trips (all 25 D-05 commands)
+
+    @Test("ControlPreviewAcquireParams round-trips")
+    func previewAcquireParamsRoundTrips() throws {
+        let original = ControlPreviewAcquireParams(
+            filmLoadedConfirmed: true,
+            intent: "replaceFilmProcess",
+            filmProcess: .c41ColorNegative
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlScanStartParams round-trips")
+    func scanStartParamsRoundTrips() throws {
+        let original = ControlScanStartParams(motionConfirmed: true)
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlScanResumeParams round-trips")
+    func scanResumeParamsRoundTrips() throws {
+        let original = ControlScanResumeParams(motionConfirmed: true)
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlScannerEjectParams round-trips")
+    func scannerEjectParamsRoundTrips() throws {
+        let original = ControlScannerEjectParams(motionConfirmed: true)
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlReviewApproveParams round-trips")
+    func reviewApproveParamsRoundTrips() throws {
+        let original = ControlReviewApproveParams(motionConfirmed: true)
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlScannerConnectParams round-trips")
+    func scannerConnectParamsRoundTrips() throws {
+        let original = ControlScannerConnectParams(deviceId: "sim-ls5000-0")
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlFrameSelectionParams round-trips")
+    func frameSelectionParamsRoundTrips() throws {
+        let original = ControlFrameSelectionParams(frameIndex: 12)
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlScanStopParams round-trips")
+    func scanStopParamsRoundTrips() throws {
+        let original = ControlScanStopParams(mode: "immediate")
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlRollSaveParams round-trips")
+    func rollSaveParamsRoundTrips() throws {
+        let original = ControlRollSaveParams(
+            name: "Kitchen Table Roll",
+            carrier: .roll36,
+            frameCount: 36,
+            filmProcess: .c41ColorNegative
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlRollOpenParams round-trips")
+    func rollOpenParamsRoundTrips() throws {
+        let original = ControlRollOpenParams(directory: "/Users/test/ScanStudio Projects/roll-1")
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlSettingsSetParams round-trips")
+    func settingsSetParamsRoundTrips() throws {
+        let original = ControlSettingsSetParams(
+            capture: CaptureRecipe(resolutionDpi: 4000, bitDepth: 16, multisamplePasses: 4, channels: "rgbi"),
+            processing: ProcessingRecipe(
+                filmProcess: .c41ColorNegative,
+                autofocusEachFrame: true,
+                autoExposureEachFrame: true,
+                digitalIceEnabled: true,
+                digitalIceMode: .legacy
+            )
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlOutputsSetParams round-trips")
+    func outputsSetParamsRoundTrips() throws {
+        let original = ControlOutputsSetParams(outputs: Self.sampleOutputRecipe)
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlDiagnosticsExportParams round-trips")
+    func diagnosticsExportParamsRoundTrips() throws {
+        let original = ControlDiagnosticsExportParams(directory: "/Users/test/Diagnostics")
+        #expect(try roundTrip(original) == original)
+    }
+
+    // MARK: - Result round-trips
+
+    @Test("ControlScanProgress round-trips")
+    func scanProgressRoundTrips() throws {
+        let original = ControlScanProgress(
+            jobId: "job-1",
+            frameIndex: 3,
+            frameOrdinal: 2,
+            totalFrames: 36,
+            pass: 1,
+            totalPasses: 4,
+            framePercent: 50.0,
+            jobPercent: 12.5,
+            etaSeconds: 240.0
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlProjectSummary round-trips")
+    func projectSummaryRoundTrips() throws {
+        let original = ControlProjectSummary(
+            id: "proj-1",
+            name: "Kitchen Table Roll",
+            carrier: .roll36,
+            frameCount: 36,
+            filmProcess: .c41ColorNegative,
+            createdAt: "2026-07-22T09:00:00Z",
+            directory: "/Users/test/ScanStudio Projects/roll-1"
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlStatusResult round-trips")
+    func statusResultRoundTrips() throws {
+        let original = ControlStatusResult(
+            device: DeviceInfo(
+                deviceId: "sim-ls5000-0",
+                model: "LS-5000 ED",
+                kind: "simulated",
+                firmware: "1.03",
+                connection: "usb",
+                supported: true,
+                supportedMultisamplePasses: [4]
+            ),
+            scanner: ScannerStatus(
+                connected: true,
+                adapter: "SA-30",
+                mediaLoaded: false,
+                carrier: "roll36",
+                frameCount: 36,
+                lamp: "stable",
+                transport: "idle",
+                activeJobId: nil,
+                filmPresent: true,
+                motionArmed: true
+            ),
+            projectName: "Kitchen Table Roll",
+            projectDirectory: "/Users/test/ScanStudio Projects/roll-1",
+            jobId: nil,
+            jobState: nil,
+            refeedRequired: false,
+            hardwareMotionReadiness: "ready",
+            motionAllowed: true,
+            motionGuidance: nil,
+            mutatingOperationInFlight: nil,
+            selectedFrames: [1, 2, 3],
+            scanReadiness: "previewsUnavailable",
+            scanReadinessReason: "Preview the loaded film before scanning.",
+            lastErrorMessage: nil
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlFrameSummary round-trips")
+    func frameSummaryRoundTrips() throws {
+        let original = ControlFrameSummary(
+            index: 4,
+            excluded: false,
+            selected: true,
+            hasThumbnail: true,
+            state: "completed",
+            manualReviewDecision: nil,
+            errorCode: nil
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlFramesListResult round-trips")
+    func framesListResultRoundTrips() throws {
+        let original = ControlFramesListResult(
+            frames: [
+                ControlFrameSummary(index: 1, excluded: false, selected: true, hasThumbnail: true),
+                ControlFrameSummary(index: 2, excluded: true, selected: false, hasThumbnail: false),
+            ],
+            selectedFrames: [1]
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlJobResult round-trips")
+    func jobResultRoundTrips() throws {
+        let original = ControlJobResult(
+            jobId: "job-1",
+            jobState: .scanning,
+            progress: ControlScanProgress(
+                jobId: "job-1",
+                frameIndex: 3,
+                frameOrdinal: 2,
+                totalFrames: 36,
+                pass: 1,
+                totalPasses: 4,
+                framePercent: 50.0,
+                jobPercent: 12.5,
+                etaSeconds: 240.0
+            ),
+            completedFrameCount: 2,
+            pendingFrameCount: 34,
+            receiptCount: 2,
+            frameErrorCodes: ["5": "FEED_JAM"]
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlSettingsResult round-trips")
+    func settingsResultRoundTrips() throws {
+        let original = ControlSettingsResult(
+            capture: CaptureRecipe(resolutionDpi: 4000, bitDepth: 16, multisamplePasses: 4, channels: "rgbi"),
+            processing: ProcessingRecipe(
+                filmProcess: .c41ColorNegative,
+                autofocusEachFrame: true,
+                autoExposureEachFrame: true,
+                digitalIceEnabled: true,
+                digitalIceMode: .legacy
+            )
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlOutputsResult round-trips")
+    func outputsResultRoundTrips() throws {
+        let original = ControlOutputsResult(outputs: Self.sampleOutputRecipe)
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlScannerListResult round-trips")
+    func scannerListResultRoundTrips() throws {
+        let original = ControlScannerListResult(devices: [
+            DeviceInfo(
+                deviceId: "sim-ls5000-0",
+                model: "LS-5000 ED",
+                kind: "simulated",
+                firmware: "1.03",
+                connection: "usb",
+                supported: true,
+                supportedMultisamplePasses: nil
+            )
+        ])
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlRollListResult round-trips")
+    func rollListResultRoundTrips() throws {
+        let original = ControlRollListResult(projects: [
+            ControlProjectSummary(
+                id: "proj-1",
+                name: "Kitchen Table Roll",
+                carrier: .roll36,
+                frameCount: 36,
+                filmProcess: .c41ColorNegative,
+                createdAt: "2026-07-22T09:00:00Z",
+                directory: "/Users/test/ScanStudio Projects/roll-1"
+            )
+        ])
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlRollSaveResult round-trips")
+    func rollSaveResultRoundTrips() throws {
+        let original = ControlRollSaveResult(
+            saved: true,
+            projectName: "Kitchen Table Roll",
+            projectDirectory: "/Users/test/ScanStudio Projects/roll-1"
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlPreviewAcquireResult round-trips")
+    func previewAcquireResultRoundTrips() throws {
+        let original = ControlPreviewAcquireResult(outcome: "started", intentToken: "intent-1")
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlDiagnosticsExportResult round-trips")
+    func diagnosticsExportResultRoundTrips() throws {
+        let original = ControlDiagnosticsExportResult(
+            path: "/Users/test/Diagnostics/bundle.zip",
+            entries: ["telemetry.jsonl", "diagnostics.jsonl"]
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    @Test("ControlEventsSubscribeResult round-trips")
+    func eventsSubscribeResultRoundTrips() throws {
+        let original = ControlEventsSubscribeResult(
+            subscribed: true,
+            snapshot: ControlStatusResult(
+                refeedRequired: false,
+                hardwareMotionReadiness: "notApplicable",
+                motionAllowed: true,
+                selectedFrames: [],
+                scanReadiness: "scannerDisconnected"
+            )
+        )
+        #expect(try roundTrip(original) == original)
+    }
+
+    // MARK: - D-08: confirmation flags decode nil when absent
+
+    @Test("D-08: motionConfirmed decodes nil when the key is absent from JSON")
+    func motionConfirmedDecodesNilWhenAbsent() throws {
+        let empty = Data("{}".utf8)
+        let scanStart = try JSONDecoder().decode(ControlScanStartParams.self, from: empty)
+        let scanResume = try JSONDecoder().decode(ControlScanResumeParams.self, from: empty)
+        let eject = try JSONDecoder().decode(ControlScannerEjectParams.self, from: empty)
+        let reviewApprove = try JSONDecoder().decode(ControlReviewApproveParams.self, from: empty)
+
+        #expect(scanStart.motionConfirmed == nil, "D-08: an absent key must decode to nil, never a confirmed default")
+        #expect(scanResume.motionConfirmed == nil, "D-08: an absent key must decode to nil, never a confirmed default")
+        #expect(eject.motionConfirmed == nil, "D-08: an absent key must decode to nil, never a confirmed default")
+        #expect(reviewApprove.motionConfirmed == nil, "D-08: an absent key must decode to nil, never a confirmed default")
+    }
+
+    @Test("D-08: filmLoadedConfirmed decodes nil when the key is absent from JSON")
+    func filmLoadedConfirmedDecodesNilWhenAbsent() throws {
+        let params = try JSONDecoder().decode(ControlPreviewAcquireParams.self, from: Data("{}".utf8))
+        #expect(params.filmLoadedConfirmed == nil, "D-08: an absent key must decode to nil, never a confirmed default")
+        #expect(params.intent == nil)
+        #expect(params.filmProcess == nil)
+    }
+
+    // MARK: - T-01-05: frame/job failures carry bare codes only
+
+    @Test("ControlFrameSummary encodes no hardware-diagnostic key")
+    func frameSummaryCarriesNoDiagnosticFields() throws {
+        let summary = ControlFrameSummary(index: 1, excluded: false, selected: false, hasThumbnail: false, errorCode: "FEED_JAM")
+        let data = try JSONEncoder().encode(summary)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(object["errorCode"] as? String == "FEED_JAM")
+        #expect(object["evidence"] == nil)
+        #expect(object["diagnosticEvidence"] == nil)
+    }
+
+    @Test("ControlJobResult encodes no hardware-diagnostic key")
+    func jobResultCarriesNoDiagnosticFields() throws {
+        let result = ControlJobResult(completedFrameCount: 1, pendingFrameCount: 2, receiptCount: 1, frameErrorCodes: ["3": "FEED_JAM"])
+        let data = try JSONEncoder().encode(result)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect((object["frameErrorCodes"] as? [String: String])?["3"] == "FEED_JAM")
+        #expect(object["evidence"] == nil)
+        #expect(object["diagnosticEvidence"] == nil)
+    }
+
+    // MARK: - Fixtures
+
+    private static let sampleOutputRecipe = OutputRecipe(
+        archive: ArchiveRecipe(filenameTemplate: "Archive_####", destination: "/Scans/Archive"),
+        positive: PositiveRecipe(
+            enabled: true,
+            fileFormat: .tiff,
+            colorProfile: .sRgb,
+            filenameTemplate: "Positive_####",
+            destination: "/Scans/Positive"
+        ),
+        preview: PreviewRecipe(
+            enabled: true,
+            fileFormat: .jpeg,
+            maxLongEdgePx: 1024,
+            filenameTemplate: "Preview_####",
+            destination: "/Scans/Preview"
+        )
+    )
 }
