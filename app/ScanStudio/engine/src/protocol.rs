@@ -21,6 +21,19 @@ pub struct Request {
     pub params: serde_json::Value,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RequestMetadata {
+    pub correlation_token: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RequestMetadataSniff {
+    #[serde(default)]
+    pub metadata: Option<RequestMetadata>,
+}
+
 /// Outbound success shape (engine -> app): `{"id": .., "result": ..}`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Response<T> {
@@ -217,6 +230,30 @@ pub struct HelloResult {
     pub engine_version: String,
     pub protocol_version: u32,
     pub capabilities: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvidenceAuthority {
+    pub session_id: String,
+    pub path: String,
+    pub allowed_root: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvidenceFileAuthority {
+    pub entry_name: String,
+    pub path: String,
+    pub allowed_root: String,
+    pub sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInventoryResult {
+    pub bridge_telemetry: Option<SessionEvidenceAuthority>,
+    pub attempt_journals: Vec<SessionEvidenceFileAuthority>,
 }
 
 // ---------------------------------------------------------------------

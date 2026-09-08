@@ -17,10 +17,10 @@ struct ScanstudioCLI: AsyncParsableCommand {
         abstract: "Drives a running ScanStudio app over its local control socket.",
         subcommands: [
             Connect.self, Disconnect.self, Rescan.self, Status.self,
-            Frames.self, Settings.self, Outputs.self, Roll.self, Diagnostics.self,
+            Frames.self, Settings.self, Outputs.self, Preset.self, Roll.self, Diagnostics.self,
             Preview.self, Review.self, Eject.self,
             Scan.self, Stop.self, Resume.self,
-            Events.self, Sim.self, Host.self
+            Events.self, Sim.self, Session.self, Link.self, Wait.self, Host.self
         ]
     )
 }

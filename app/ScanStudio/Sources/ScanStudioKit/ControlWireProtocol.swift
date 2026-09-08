@@ -186,6 +186,7 @@ public struct ControlEmptyResult: Codable, Equatable, Sendable {
 public struct ControlMethodSniff: Decodable, Sendable {
     public let id: UInt64
     public let method: String
+    public let metadata: RequestMetadata?
 }
 
 // MARK: - hello
@@ -1032,6 +1033,44 @@ public struct ControlDiagnosticsExportResult: Codable, Equatable, Sendable {
 
     public init(path: String, entries: [String]) {
         self.path = path
+        self.entries = entries
+    }
+}
+
+/// Exact host-owned evidence authority for `session.inventory`. A present
+/// source carries both its path and the root against which the exporter must
+/// revalidate it; an unavailable optional carries only `missingReason`.
+public struct ControlSessionEvidenceEntry: Codable, Equatable, Sendable {
+    public let entryName: String
+    public let sourceKind: String
+    public let path: String?
+    public let allowedRoot: String?
+    public let expectedSha256: String?
+    public let missingReason: String?
+
+    public init(
+        entryName: String,
+        sourceKind: String,
+        path: String? = nil,
+        allowedRoot: String? = nil,
+        expectedSha256: String? = nil,
+        missingReason: String? = nil
+    ) {
+        self.entryName = entryName
+        self.sourceKind = sourceKind
+        self.path = path
+        self.allowedRoot = allowedRoot
+        self.expectedSha256 = expectedSha256
+        self.missingReason = missingReason
+    }
+}
+
+public struct ControlSessionInventoryResult: Codable, Equatable, Sendable {
+    public let diagnosticSessionId: String
+    public let entries: [ControlSessionEvidenceEntry]
+
+    public init(diagnosticSessionId: String, entries: [ControlSessionEvidenceEntry]) {
+        self.diagnosticSessionId = diagnosticSessionId
         self.entries = entries
     }
 }

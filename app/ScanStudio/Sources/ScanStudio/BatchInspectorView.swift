@@ -10,6 +10,8 @@ struct BatchInspectorView: View {
     @State private var rawSettingsExpanded = false
     @State private var positiveTiffSettingsExpanded = false
     @State private var positiveJPEGSettingsExpanded = false
+    @State private var namedPresetNames: [String] = []
+    @State private var presetError: String?
     @FocusState private var focusedGearField: GearField?
     @State private var presentedRecentGear: GearField?
 
@@ -56,6 +58,7 @@ struct BatchInspectorView: View {
         // project) so `sessionModel.exifToolDetection` is already populated
         // before the user ever opens a frame detail view's ExifTool panel.
         .task { await sessionModel.detectExifTool() }
+        .task { refreshNamedPresets() }
         .alert("Saved file unavailable", isPresented: Binding(
             get: { missingSavedOutput != nil },
             set: { if !$0 { missingSavedOutput = nil } }
@@ -63,6 +66,14 @@ struct BatchInspectorView: View {
             Button("OK", role: .cancel) { missingSavedOutput = nil }
         } message: {
             Text("The recorded file is no longer at this location. It may have been moved or deleted.\n\(missingSavedOutput ?? "")")
+        }
+        .alert("Preset unavailable", isPresented: Binding(
+            get: { presetError != nil },
+            set: { if !$0 { presetError = nil } }
+        )) {
+            Button("OK", role: .cancel) { presetError = nil }
+        } message: {
+            Text(presetError ?? "The preset could not be loaded.")
         }
     }
 
@@ -115,6 +126,22 @@ struct BatchInspectorView: View {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    private func refreshNamedPresets() {
+        namedPresetNames = (try? ScanRecipePresetStore().list()) ?? []
+    }
+
+    private func applyNamedPreset(_ name: String) {
+        do {
+            let preset = try ScanRecipePresetStore().load(named: name)
+            // The shared SessionModel path applies capture settings while
+            // retaining the project's persisted exposure lock.
+            sessionModel.applySettingsRecipes(capture: preset.capture, processing: preset.processing)
+            sessionModel.applyOutputRecipe(preset.output)
+        } catch {
+            presetError = String(describing: error)
+        }
+    }
+
     private var setupInspector: some View {
         Group {
             InspectorSection(title: "Scan Settings") {
@@ -127,6 +154,21 @@ struct BatchInspectorView: View {
                         ForEach(ScanRecipePreset.allCases) { preset in
                             Text(preset.label).tag(preset)
                         }
+                    }
+                }
+                InspectorSettingRow(label: "Saved preset") {
+                    Menu {
+                        if namedPresetNames.isEmpty {
+                            Text("No saved presets")
+                        } else {
+                            ForEach(namedPresetNames, id: \.self) { name in
+                                Button(name) { applyNamedPreset(name) }
+                            }
+                        }
+                        Divider()
+                        Button("Refresh") { refreshNamedPresets() }
+                    } label: {
+                        Label("Choose…", systemImage: "bookmark")
                     }
                 }
                 if sessionModel.scanRecipePreset == .custom {

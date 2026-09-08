@@ -152,6 +152,7 @@ struct Roll: AsyncParsableCommand {
         /// once their own single request resolves -- so it runs through
         /// `runAutoApprove` below instead, never through either of those.
         func run() async throws {
+            // Older hosts may ignore startScan; never give them motion authority in --no-scan mode.
             let params = ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: noScan ? false : confirmMotion, startScan: noScan ? false : nil)
             guard autoApprove else {
                 guard wait else {

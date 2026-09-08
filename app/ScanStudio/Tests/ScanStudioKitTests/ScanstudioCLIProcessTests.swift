@@ -239,6 +239,7 @@ private struct CLIProcessHost {
     let stub: CLIProcessEngineStub
     let server: ControlChannelServer
     let socketPath: String
+    let projectDirectory: String
 
     static func start(label: String) async throws -> CLIProcessHost {
         let stub = CLIProcessEngineStub()
@@ -246,7 +247,15 @@ private struct CLIProcessHost {
         let server = ControlChannelServer(sessionModel: model)
         let path = shortSocketPath(label)
         try await server.start(path: path)
-        return CLIProcessHost(model: model, stub: stub, server: server, socketPath: path)
+        let projectDirectory = (path as NSString).deletingLastPathComponent + "/project"
+        try FileManager.default.createDirectory(atPath: projectDirectory, withIntermediateDirectories: false)
+        return CLIProcessHost(
+            model: model,
+            stub: stub,
+            server: server,
+            socketPath: path,
+            projectDirectory: projectDirectory
+        )
     }
 }
 
@@ -316,10 +325,13 @@ private func runCLI(
                 let process = Process()
                 process.executableURL = binary
                 process.arguments = allArguments
-                if let homeDirectory {
+                let isolatedHome = homeDirectory ?? socketPath.map {
+                    ($0 as NSString).deletingLastPathComponent
+                }
+                if let isolatedHome {
                     var environment = ProcessInfo.processInfo.environment
-                    environment["HOME"] = homeDirectory
-                    environment["CFFIXED_USER_HOME"] = homeDirectory
+                    environment["HOME"] = isolatedHome
+                    environment["CFFIXED_USER_HOME"] = isolatedHome
                     process.environment = environment
                 }
 
@@ -460,7 +472,7 @@ struct ScanstudioCLIProcessTests {
     func framesListReturnsFramesArray() async throws {
         let host = try await CLIProcessHost.start(label: "frames-list")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "list"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
@@ -475,7 +487,7 @@ struct ScanstudioCLIProcessTests {
     func framesExcludeValidIndexReachesEngineOnce() async throws {
         let host = try await CLIProcessHost.start(label: "frames-exclude")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "exclude", "1"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
@@ -489,7 +501,7 @@ struct ScanstudioCLIProcessTests {
     func framesIncludePartialRangeReportsAppliedIndices() async throws {
         let host = try await CLIProcessHost.start(label: "frames-partial")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "include", "1-2"], socketPath: host.socketPath)
         // D-24/HEAD-12 (CF-14, the 2026-09-07 batch abort): a partial
@@ -606,7 +618,7 @@ struct ScanstudioCLIProcessTests {
         // dispatcher-level coverage of the excluded/completed refusals.
         let host = try await CLIProcessHost.start(label: "frames-select-post-project")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "select", "--all"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
@@ -621,7 +633,7 @@ struct ScanstudioCLIProcessTests {
     func framesPlaceFromFileAppliesRowsAndOffset() async throws {
         let host = try await CLIProcessHost.start(label: "frames-place-file")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
         await host.model.handle(event: EngineEvent(
             name: "scanner.status",
             rawLine: Data(
@@ -793,6 +805,42 @@ struct ScanstudioCLIProcessTests {
             c41Render: before.c41Render
         )
         #expect(after == expected)
+
+        await host.server.stop()
+    }
+
+    @Test("preset save/list/apply round-trips through the mock host and the GUI store path")
+    func presetRoundTripUsesSharedStorePath() async throws {
+        let host = try await CLIProcessHost.start(label: "preset-roundtrip")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("ss-cli-preset-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let originalCapture = await host.model.captureRecipe
+        let originalOutput = await host.model.outputRecipe
+        let saved = try await runCLI(["preset", "save", "shared"], socketPath: host.socketPath, homeDirectory: home.path)
+        #expect(saved.exitCode == 0)
+        let listed = try await runCLI(["preset", "list"], socketPath: nil, homeDirectory: home.path)
+        #expect(listed.exitCode == 0)
+        #expect(listed.stdout.contains("shared"))
+
+        let loaded = try ScanRecipePresetStore(directory: home.appendingPathComponent(".scanstudio/presets"))
+            .load(named: "shared")
+        await host.model.applySettingsRecipes(
+            capture: CaptureRecipe(
+                resolutionDpi: 1_000,
+                bitDepth: originalCapture.bitDepth,
+                multisamplePasses: originalCapture.multisamplePasses,
+                channels: originalCapture.channels
+            ),
+            processing: loaded.processing
+        )
+        await host.model.applyOutputRecipe(loaded.output)
+        let applied = try await runCLI(["preset", "apply", "shared"], socketPath: host.socketPath, homeDirectory: home.path)
+        #expect(applied.exitCode == 0)
+        #expect(await host.model.captureRecipe == originalCapture)
+        #expect(await host.model.outputRecipe == originalOutput)
 
         await host.server.stop()
     }

@@ -194,6 +194,54 @@ and `--digital-ice-mode`. `outputs set` accepts `--from-json`,
 `--preview-enabled`/`--no-preview-enabled`, and `--preview-destination`.
 They take no motion flag and exit `0, 65, 69, 70, 75`.
 
+### `preset`
+
+```text
+preset save NAME    → settings.get, outputs.get, local JSON write
+preset list          → local JSON read only
+preset apply NAME    → settings.get, settings.set, outputs.set
+scan --preset NAME   → preset apply, then scan.start
+```
+
+Presets are versioned JSON files in `~/.scanstudio/presets/`. They contain
+the existing capture, processing, and output recipes; confirmations, scanner
+identity, and unverified-hardware authorization are never stored. `save`
+reads settings and outputs through the control socket but sends no scanner
+request. `list` is entirely local. `apply` changes settings and outputs
+without moving film. Applying a preset preserves the currently persisted
+manual exposure lock; the preset cannot replace that authority. `scan
+--preset` still requires `--confirm-motion` and applies the preset before the
+existing scan readiness and motion workflow. The GUI Scan Settings panel
+lists the same files and uses the same recipe application path. The two
+existing set requests are sequential, so a later refusal can leave the first
+recipe applied; the command reports that refusal and never starts a scan.
+
+### `wait`
+
+```text
+wait --for film-present|film-absent|idle|job-done|registered [--timeout SECONDS]
+```
+
+`wait` subscribes once to the control event stream, evaluates the subscribe
+snapshot, and then waits on later typed snapshots. It never polls, refreshes,
+or starts a host for an observational command. A satisfied condition exits
+`0`; an expired timeout emits `WAIT_TIMEOUT` and exits `124`; an established
+host connection that reaches EOF emits the existing `control.hostExited`
+terminal and exits `76`. Unknown status values never satisfy a condition.
+
+### `link health` and `session export`
+
+```text
+link health [--minutes 15]
+session export --to /existing/parent/new.zip
+```
+
+`link health` summarizes retained bridge telemetry from the session inventory
+without probing the scanner; missing telemetry is reported as unknown. The
+window is 1–1440 minutes and defaults to 15. `session export` writes a
+create-only ZIP whose parent directory already exists, preserving source
+hashes and explicit missing-source reasons; it refuses an existing archive.
+
 ### `roll`
 
 ```text
@@ -282,15 +330,24 @@ required. It stops at the first refusal and never retries. Exits are `0, 64,
 
 ```text
 scan --confirm-motion [--wait] [--frames RANGE] [--repeat COUNT] [--pass TOKEN]
+     [--preset NAME]
                                → scan.start, job.get
+scan --dry-run [--frames RANGE] → scan.preflight (no scan.start)
 stop [--immediate]             → scan.stop
 resume --confirm-motion [--wait] → scan.resume, job.get
+resume --dry-run               → scan.preflight (no scan.resume)
 eject --confirm-motion         → scanner.eject
 ```
 
-`scan`, `resume`, and `eject` require `--confirm-motion`. `stop` only stops an
-existing job and starts no motion. Scan/resume/eject exit `0, 65, 69, 70, 75,
-77`; stop exits `0, 65, 69, 70, 75`.
+The motion forms of `scan`, `resume`, and `eject` require `--confirm-motion`;
+the two `--dry-run` forms are observational and do not open a motion request.
+They report film, registration, readiness, writable destinations, and a
+conservative space estimate (256 MiB per frame at 4000 dpi, scaled by
+resolution, plus project/output headroom). A ready report exits `0`; a failed
+gate report exits `65`. `scan --dry-run --preset NAME` is rejected locally;
+apply the preset first, then inspect the effective settings. `stop` only stops
+an existing job and starts no motion. Scan/resume/eject exit `0, 65, 69, 70,
+75, 77`; stop exits `0, 65, 69, 70, 75`.
 
 `--frames` accepts comma-separated indices and ranges, including previously
 completed frames for an explicit rescan. `--repeat` accepts 1–100 and requires
@@ -339,6 +396,7 @@ setup uses `0, 65, 69, 70, 75`.
 | 76 | Established host connection closed | `control.hostExited` for streaming observers |
 | 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
 | 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
+| 124 | Wait timeout | `WAIT_TIMEOUT` from `wait --for … --timeout …` |
 
 `--wait` maps `completed` and `stopped` to 0 and a failed terminal job to 65.
 

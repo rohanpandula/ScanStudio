@@ -719,6 +719,11 @@ struct ControlSocketEndToEndTests {
 
             // -- scan --confirm-motion --wait: a genuine re-scan of the
             // now-fully-receipted selection (D-17c's "re-scan" step). --
+            let dryRun = try await step(["scan", "--dry-run"])
+            #expect(dryRun.exitCode == 0, Comment(rawValue: dryRun.context))
+            #expect(try resultObject(dryRun)["ready"] as? Bool == true)
+            let registered = try await step(["wait", "--for", "registered", "--timeout", "1"])
+            #expect(registered.exitCode == 0, Comment(rawValue: registered.context))
             let scanResult = try await step(["scan", "--confirm-motion", "--wait"])
             #expect(scanResult.exitCode == 0, Comment(rawValue: scanResult.context))
             let scanBody = try resultObject(scanResult)
@@ -864,6 +869,45 @@ struct ControlSocketEndToEndTests {
             #expect(state["jobId"] == nil || state["jobId"] is NSNull)
             #expect(state["device"] == nil || state["device"] is NSNull)
             #expect(state["previewComplete"] as? Bool == false)
+
+            let dryRun = try await runE2ECLI(["scan", "--dry-run"], socketPath: host.socketPath)
+            #expect(dryRun.exitCode == 65, Comment(rawValue: dryRun.context))
+            let dryRunEnvelope = try #require(
+                JSONSerialization.jsonObject(with: Data(dryRun.stdout.utf8)) as? [String: Any]
+            )
+            let dryRunResult = try #require(dryRunEnvelope["result"] as? [String: Any])
+            #expect(dryRunResult["ready"] as? Bool == false)
+            let stateAfterDryRun = try await host.status()
+            #expect(stateAfterDryRun["jobId"] == nil || stateAfterDryRun["jobId"] is NSNull)
+            #expect(stateAfterDryRun["device"] == nil || stateAfterDryRun["device"] is NSNull)
+            #expect(stateAfterDryRun["previewComplete"] as? Bool == false)
+
+            let linkHealth = try await runE2ECLI(["link", "health"], socketPath: host.socketPath)
+            #expect(linkHealth.exitCode == 0, Comment(rawValue: linkHealth.context))
+            let linkEnvelope = try #require(
+                JSONSerialization.jsonObject(with: Data(linkHealth.stdout.utf8)) as? [String: Any]
+            )
+            let linkResult = try #require(linkEnvelope["result"] as? [String: Any])
+            #expect(linkResult["status"] as? String == "unknown")
+
+            let sessionArchive = host.tempRoot.appendingPathComponent("session-evidence.zip")
+            let exported = try await runE2ECLI(
+                ["session", "export", "--to", sessionArchive.path],
+                socketPath: host.socketPath
+            )
+            #expect(exported.exitCode == 0, Comment(rawValue: exported.context))
+            let exportEnvelope = try #require(
+                JSONSerialization.jsonObject(with: Data(exported.stdout.utf8)) as? [String: Any]
+            )
+            let exportResult = try #require(exportEnvelope["result"] as? [String: Any])
+            #expect(exportResult["path"] as? String == sessionArchive.path)
+            #expect(exportResult["includedEntryCount"] as? Int == 2)
+            #expect(exportResult["missingEntryCount"] as? Int == 2)
+            let archiveBytes = try Data(contentsOf: sessionArchive)
+            #expect(archiveBytes.starts(with: [0x50, 0x4b, 0x03, 0x04]))
+            #expect(archiveBytes.range(of: Data("manifest.json".utf8)) != nil)
+            #expect(archiveBytes.range(of: Data("diagnostics.jsonl".utf8)) != nil)
+            #expect(archiveBytes.range(of: Data("control-transcript.ndjson".utf8)) != nil)
 
             await host.stop()
             let watcherExit = await watcher.waitForExit()

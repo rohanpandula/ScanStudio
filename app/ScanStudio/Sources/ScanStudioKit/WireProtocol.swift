@@ -17,6 +17,24 @@ import Foundation
 
 // MARK: - Wire envelope
 
+/// Additive transport tracing carried by request envelopes. It identifies
+/// one CLI request across the control, engine, and bridge boundaries without
+/// changing any operation or domain identifier.
+public struct RequestMetadata: Codable, Equatable, Sendable {
+    public let correlationToken: String
+
+    public init(correlationToken: String) {
+        self.correlationToken = correlationToken
+    }
+}
+
+/// The dispatcher scopes metadata to the exact request task. Child tasks
+/// created while an asynchronous operation is admitted inherit the value;
+/// unrelated concurrent requests cannot overwrite it.
+public enum RequestCorrelationContext {
+    @TaskLocal public static var token: String?
+}
+
 /// Inbound shape (app -> engine): `{"id": .., "method": .., "params": ..}`.
 /// Used by `EngineClient` to serialize outgoing requests. `Encodable`-only
 /// (matching `EngineClient.request`'s `Params: Encodable` constraint) —
@@ -25,11 +43,23 @@ public struct RequestEnvelope<Params: Encodable>: Encodable {
     public let id: UInt64
     public let method: String
     public let params: Params
+    public let metadata: RequestMetadata?
 
-    public init(id: UInt64, method: String, params: Params) {
+    public init(id: UInt64, method: String, params: Params, metadata: RequestMetadata? = nil) {
         self.id = id
         self.method = method
         self.params = params
+        self.metadata = metadata
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, method, params, metadata }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(method, forKey: .method)
+        try container.encode(params, forKey: .params)
+        try container.encodeIfPresent(metadata, forKey: .metadata)
     }
 }
 
@@ -40,6 +70,7 @@ public struct DecodedRequestEnvelope<Params: Decodable>: Decodable {
     public let id: UInt64
     public let method: String
     public let params: Params
+    public let metadata: RequestMetadata?
 }
 
 /// Outbound success shape (engine -> app): `{"id": .., "result": ..}`.
@@ -273,6 +304,24 @@ public struct HelloResult: Decodable, Sendable {
     public let engineVersion: String
     public let protocolVersion: Int
     public let capabilities: [String]
+}
+
+public struct EngineSessionEvidenceAuthority: Decodable, Equatable, Sendable {
+    public let sessionId: String
+    public let path: String
+    public let allowedRoot: String
+}
+
+public struct EngineSessionEvidenceFileAuthority: Decodable, Equatable, Sendable {
+    public let entryName: String
+    public let path: String
+    public let allowedRoot: String
+    public let sha256: String
+}
+
+public struct EngineSessionInventoryResult: Decodable, Equatable, Sendable {
+    public let bridgeTelemetry: EngineSessionEvidenceAuthority?
+    public let attemptJournals: [EngineSessionEvidenceFileAuthority]?
 }
 
 // MARK: - scanner.list
@@ -1155,6 +1204,21 @@ public struct ScanStartParams: Codable, Sendable {
         self.recipe = recipe
         self.processing = processing
         self.output = output
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case frames, onFrameFailure, allowedMeterRefusalSlots, passToken, recipe, processing, output
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        frames = try values.decode([Int].self, forKey: .frames)
+        onFrameFailure = try values.decodeIfPresent(ScanFrameFailurePolicy.self, forKey: .onFrameFailure) ?? .stop
+        allowedMeterRefusalSlots = try values.decodeIfPresent([Int].self, forKey: .allowedMeterRefusalSlots) ?? []
+        passToken = try values.decodeIfPresent(String.self, forKey: .passToken)
+        recipe = try values.decode(CaptureRecipe.self, forKey: .recipe)
+        processing = try values.decodeIfPresent(ProcessingRecipe.self, forKey: .processing)
+        output = try values.decodeIfPresent(OutputRecipe.self, forKey: .output)
     }
 }
 

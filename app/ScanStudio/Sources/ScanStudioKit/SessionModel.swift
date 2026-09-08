@@ -5755,6 +5755,83 @@ public final class SessionModel {
         diagnosticTimeline.logURL?.path
     }
 
+    /// Read-only evidence authorities for this host session. Every present
+    /// path comes from the component that created it; unavailable optional
+    /// sources stay explicit rather than being guessed from a basename or a
+    /// newest-file search.
+    public func sessionEvidenceInventory() async -> ControlSessionInventoryResult {
+        let diagnostics: ControlSessionEvidenceEntry
+        if let logURL = diagnosticTimeline.logURL {
+            diagnostics = .init(
+                entryName: "diagnostics.jsonl",
+                sourceKind: "appDiagnostics",
+                path: logURL.path,
+                allowedRoot: logURL.deletingLastPathComponent().path
+            )
+        } else {
+            diagnostics = .init(
+                entryName: "diagnostics.jsonl",
+                sourceKind: "appDiagnostics",
+                missingReason: "this host session has no persisted diagnostic log"
+            )
+        }
+        let telemetry: ControlSessionEvidenceEntry
+        let attemptJournals: [ControlSessionEvidenceEntry]
+        do {
+            let engineInventory: EngineSessionInventoryResult = try await engineClient.request(
+                "session.inventory",
+                params: EmptyParams()
+            )
+            if let authority = engineInventory.bridgeTelemetry {
+                telemetry = .init(
+                    entryName: "bridge-telemetry.jsonl",
+                    sourceKind: "bridgeTelemetry",
+                    path: authority.path,
+                    allowedRoot: authority.allowedRoot
+                )
+            } else {
+                telemetry = .init(
+                    entryName: "bridge-telemetry.jsonl",
+                    sourceKind: "bridgeTelemetry",
+                    missingReason: "this engine session has no bridge telemetry authority"
+                )
+            }
+            let retainedJournals = engineInventory.attemptJournals ?? []
+            if retainedJournals.isEmpty {
+                attemptJournals = [.init(
+                    entryName: "attempt-journals",
+                    sourceKind: "attemptJournals",
+                    missingReason: "no finalized capture-evidence journal is retained by this host session"
+                )]
+            } else {
+                attemptJournals = retainedJournals.map { authority in
+                    .init(
+                        entryName: authority.entryName,
+                        sourceKind: "attemptJournals",
+                        path: authority.path,
+                        allowedRoot: authority.allowedRoot,
+                        expectedSha256: authority.sha256
+                    )
+                }
+            }
+        } catch {
+            telemetry = .init(
+                entryName: "bridge-telemetry.jsonl",
+                sourceKind: "bridgeTelemetry",
+                missingReason: "the engine did not expose an exact bridge telemetry authority"
+            )
+            attemptJournals = [.init(
+                entryName: "attempt-journals",
+                sourceKind: "attemptJournals",
+                missingReason: "the engine did not expose an exact finalized capture-evidence journal inventory"
+            )]
+        }
+        return ControlSessionInventoryResult(
+            diagnosticSessionId: diagnosticTimeline.sessionID,
+            entries: [diagnostics, telemetry] + attemptJournals
+        )
+    }
+
     /// The one preview tile that can be explicitly opted into for the next
     /// export. Merely reading this value performs no filesystem or engine I/O.
     public var diagnosticPreviewCandidate: DiagnosticPreviewConsent? {
@@ -5886,6 +5963,21 @@ public final class SessionModel {
                 "command": command ?? "unknown",
                 "code": code,
                 "gate": gate ?? "none"
+            ]
+        )
+    }
+
+    public func recordControlRequest(
+        command: String,
+        requestID: UInt64,
+        correlationToken: String
+    ) {
+        recordDiagnostic(
+            event: "control.request",
+            fields: [
+                "command": command,
+                "controlRequestId": String(requestID),
+                "correlationToken": correlationToken,
             ]
         )
     }

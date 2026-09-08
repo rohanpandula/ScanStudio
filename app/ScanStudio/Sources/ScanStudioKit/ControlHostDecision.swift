@@ -59,8 +59,8 @@ public enum ControlHostDecision {
     // `job.get` is an internal status follow-up, while status --refresh keeps
     // the public command label "status". These commands never create a host.
     public static let readOnlyCommands: Set<String> = [
-        "status", "events", "frames.list", "settings.get", "outputs.get",
-        "roll.list", "diagnostics.export", "job.get"
+        "status", "events", "wait", "frames.list", "settings.get", "outputs.get",
+        "roll.list", "diagnostics.export", "job.get", "scan.preflight", "link.health", "session.export"
     ]
 
     public static func isReadOnly(_ command: String) -> Bool {

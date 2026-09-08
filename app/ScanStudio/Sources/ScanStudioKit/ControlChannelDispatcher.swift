@@ -61,11 +61,13 @@ public enum ControlRequest: Sendable {
     case rollSolveExposure(id: UInt64, params: ControlRollSolveExposureParams)
     case rollVerify(id: UInt64, params: ControlRollVerifyParams)
     case rollCollect(id: UInt64, params: ControlRollCollectParams)
+    case scanPreflight(id: UInt64, params: ControlScanPreflightParams)
     case scanStart(id: UInt64, params: ControlScanStartParams)
     case scanStop(id: UInt64, params: ControlScanStopParams)
     case scanResume(id: UInt64, params: ControlScanResumeParams)
     case scannerEject(id: UInt64, params: ControlScannerEjectParams)
     case diagnosticsExport(id: UInt64, params: ControlDiagnosticsExportParams)
+    case sessionInventory(id: UInt64)
     case eventsSubscribe(id: UInt64)
     case jobGet(id: UInt64, params: ControlJobGetParams)
     /// D-23/HEAD-12: dismisses a pending manual review without starting
@@ -103,11 +105,13 @@ extension ControlRequest {
         case .rollList(let id): id
         case .rollSolveExposure(let id, _): id
         case .rollVerify(let id, _), .rollCollect(let id, _): id
+        case .scanPreflight(let id, _): id
         case .scanStart(let id, _): id
         case .scanStop(let id, _): id
         case .scanResume(let id, _): id
         case .scannerEject(let id, _): id
         case .diagnosticsExport(let id, _): id
+        case .sessionInventory(let id): id
         case .eventsSubscribe(let id): id
         case .jobGet(let id, _): id
         case .reviewCancel(let id): id
@@ -142,11 +146,13 @@ extension ControlRequest {
         case .rollSolveExposure: "roll.solveExposure"
         case .rollVerify: "roll.verify"
         case .rollCollect: "roll.collect"
+        case .scanPreflight: "scan.preflight"
         case .scanStart: "scan.start"
         case .scanStop: "scan.stop"
         case .scanResume: "scan.resume"
         case .scannerEject: "scanner.eject"
         case .diagnosticsExport: "diagnostics.export"
+        case .sessionInventory: "session.inventory"
         case .eventsSubscribe: "events.subscribe"
         case .jobGet: "job.get"
         case .reviewCancel: "review.cancel"
@@ -167,7 +173,7 @@ extension ControlRequest {
              .scanStart, .scanStop, .scanResume, .scannerEject, .reviewCancel:
             true
         case .hello, .status, .framesList, .settingsGet, .outputsGet,
-             .diagnosticsExport, .eventsSubscribe, .jobGet, .rollVerify:
+             .diagnosticsExport, .sessionInventory, .eventsSubscribe, .jobGet, .rollVerify, .scanPreflight:
             false
         }
     }
@@ -198,7 +204,9 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case rollCollection(CalibrationCollectionResult)
     case previewAcquire(ControlPreviewAcquireResult)
     case diagnosticsExport(ControlDiagnosticsExportResult)
+    case sessionInventory(ControlSessionInventoryResult)
     case eventsSubscribe(ControlEventsSubscribeResult)
+    case scanPreflight(ScanPreflightReport)
     case scanOutcome(ControlScanOutcomeResult)
 
     public func encode(to encoder: Encoder) throws {
@@ -222,7 +230,9 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .rollCollection(let value): try container.encode(value)
         case .previewAcquire(let value): try container.encode(value)
         case .diagnosticsExport(let value): try container.encode(value)
+        case .sessionInventory(let value): try container.encode(value)
         case .eventsSubscribe(let value): try container.encode(value)
+        case .scanPreflight(let value): try container.encode(value)
         case .scanOutcome(let value): try container.encode(value)
         }
     }
@@ -353,11 +363,13 @@ public final class ControlChannelDispatcher {
         case "roll.solveExposure": return decoded(ControlRollSolveExposureParams.self) { .rollSolveExposure(id: $0, params: $1) }
         case "roll.verify": return decoded(ControlRollVerifyParams.self) { .rollVerify(id: $0, params: $1) }
         case "roll.collect": return decoded(ControlRollCollectParams.self) { .rollCollect(id: $0, params: $1) }
+        case "scan.preflight": return decoded(ControlScanPreflightParams.self) { .scanPreflight(id: $0, params: $1) }
         case "scan.start": return decoded(ControlScanStartParams.self) { .scanStart(id: $0, params: $1) }
         case "scan.stop": return decoded(ControlScanStopParams.self) { .scanStop(id: $0, params: $1) }
         case "scan.resume": return decoded(ControlScanResumeParams.self) { .scanResume(id: $0, params: $1) }
         case "scanner.eject": return decoded(ControlScannerEjectParams.self) { .scannerEject(id: $0, params: $1) }
         case "diagnostics.export": return decoded(ControlDiagnosticsExportParams.self) { .diagnosticsExport(id: $0, params: $1) }
+        case "session.inventory": return decoded(EmptyParams.self) { id, _ in .sessionInventory(id: id) }
         case "events.subscribe": return decoded(EmptyParams.self) { id, _ in .eventsSubscribe(id: id) }
         case "job.get": return decoded(ControlJobGetParams.self) { .jobGet(id: $0, params: $1) }
         case "review.cancel": return decoded(EmptyParams.self) { id, _ in .reviewCancel(id: id) }
@@ -519,6 +531,17 @@ public final class ControlChannelDispatcher {
             preconditionFailure("`.hello` is intercepted in handle(_:) before reaching route(_:).")
         case .status(let id):
             return .success(id: id, result: .status(buildStatusResult()))
+        case .scanPreflight(let id, let params):
+            let frames = params.resume == true ? sessionModel.pendingFrames : (params.frames ?? sessionModel.selectedFrames)
+            guard params.resume != true || params.frames == nil,
+                  frames.count <= 10_000, frames.allSatisfy({ $0 > 0 }), Set(frames).count == frames.count else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "Preflight frames must be unique positive indices; resume uses the cached pending set."))
+            }
+            return .success(id: id, result: .scanPreflight(ScanPreflightReport.evaluate(
+                status: buildStatusResult(), frames: frames,
+                readiness: sessionModel.scanReadiness(for: frames),
+                capture: sessionModel.captureRecipe, outputs: sessionModel.outputRecipe
+            )))
         case .scannerList(let id):
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.refreshAvailableDevices(rescan: false)
@@ -1166,6 +1189,11 @@ public final class ControlChannelDispatcher {
                 path: url.path,
                 entries: entries
             )))
+        case .sessionInventory(let id):
+            return .success(
+                id: id,
+                result: .sessionInventory(await sessionModel.sessionEvidenceInventory())
+            )
         case .eventsSubscribe(let id):
             return .success(id: id, result: .eventsSubscribe(ControlEventsSubscribeResult(
                 subscribed: true,
@@ -1760,18 +1788,48 @@ public final class ControlChannelDispatcher {
     /// for example an oversized line or invalid JSON).
     public func handleLine(_ line: Data) async -> Data {
         let response: ControlResponse
-        switch Self.decode(line) {
-        case .success(let request):
-            response = await handle(request)
-        case .failure(let failure):
-            response = .failure(id: failure.id, error: failure.error)
-            let recoveredMethod = try? JSONDecoder().decode(ControlMethodSniff.self, from: line).method
-            sessionModel.recordControlRefusal(command: recoveredMethod, code: failure.error.code, gate: failure.error.gate)
+        let sniff = try? JSONDecoder().decode(ControlMethodSniff.self, from: line)
+        let correlationToken = sniff?.metadata?.correlationToken
+        if let correlationToken, !Self.validCorrelationToken(correlationToken) {
+            response = .failure(id: sniff?.id ?? 0, error: ControlErrorPayload(
+                .invalidParams,
+                message: "metadata.correlationToken is invalid."
+            ))
+            sessionModel.recordControlRefusal(
+                command: sniff?.method,
+                code: ControlErrorCode.invalidParams.rawValue,
+                gate: nil
+            )
+        } else {
+            switch Self.decode(line) {
+            case .success(let request):
+                if let correlationToken {
+                    sessionModel.recordControlRequest(
+                        command: request.methodName,
+                        requestID: request.id,
+                        correlationToken: correlationToken
+                    )
+                }
+                response = await RequestCorrelationContext.$token.withValue(correlationToken) {
+                    await handle(request)
+                }
+            case .failure(let failure):
+                response = .failure(id: failure.id, error: failure.error)
+                let recoveredMethod = sniff?.method
+                sessionModel.recordControlRefusal(command: recoveredMethod, code: failure.error.code, gate: failure.error.gate)
+            }
         }
         if let data = try? response.encoded(hardwareVerification: sessionModel.envelopeHardwareVerification) {
             return data
         }
         return Self.fallbackInvalidParamsLine(id: response.id, hardwareVerification: sessionModel.envelopeHardwareVerification)
+    }
+
+    private nonisolated static func validCorrelationToken(_ token: String) -> Bool {
+        !token.isEmpty && token.utf8.count <= 128 && token.utf8.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
+                || $0 == 45 || $0 == 46 || $0 == 58 || $0 == 95
+        }
     }
 
     private static func fallbackInvalidParamsLine(id: UInt64, hardwareVerification: String) -> Data {

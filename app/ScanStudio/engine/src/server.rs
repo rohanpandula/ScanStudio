@@ -180,6 +180,12 @@ struct Backends {
 }
 
 impl Backends {
+    fn set_request_correlation(&self, correlation_token: Option<&str>) {
+        if let Some(real) = &self.real {
+            real.set_request_correlation(correlation_token);
+        }
+    }
+
     /// Reads `SCANSTUDIO_BRIDGE_CMD` — the ONLY place in the engine this
     /// environment variable is read. Unset/empty enables simulator-only mode.
     /// A failed configured bridge leaves the engine alive, but discovery
@@ -278,6 +284,30 @@ impl Backends {
     fn set_client_build(&self, client_build: Option<String>) {
         if let Some(real) = &self.real {
             real.set_client_build(client_build);
+        }
+    }
+
+    /// Returns only the identity cached from the bridge's initial hello.
+    /// This read never calls the bridge, opens a scanner, or probes USB.
+    fn telemetry_evidence_identity(&self) -> Option<protocol::SessionEvidenceAuthority> {
+        let identity = self.real.as_ref()?.telemetry_evidence_identity()?;
+        Some(protocol::SessionEvidenceAuthority {
+            session_id: identity.session_id,
+            path: identity.path,
+            allowed_root: identity.allowed_root,
+        })
+    }
+
+    fn attempt_journal_evidence(&self) -> Vec<protocol::SessionEvidenceFileAuthority> {
+        self.real
+            .as_ref()
+            .map(|real| real.attempt_journal_evidence())
+            .unwrap_or_default()
+    }
+
+    fn clear_session_evidence(&self) {
+        if let Some(real) = &self.real {
+            real.clear_session_evidence();
         }
     }
 
@@ -1062,7 +1092,20 @@ pub fn run() {
             std::process::exit(0);
         }
 
-        match handle_request(&mut backends, &tx, &request, &mut project_state) {
+        let correlation_token = match request_correlation_token(&line) {
+            Ok(token) => token,
+            Err(error) => {
+                respond_error(&tx, request.id, &error);
+                continue;
+            }
+        };
+        match handle_request_with_correlation(
+            &mut backends,
+            &tx,
+            &request,
+            &mut project_state,
+            correlation_token.as_deref(),
+        ) {
             Ok(result) => {
                 if request.method == "engine.hello" {
                     hello_received = true;
@@ -1144,6 +1187,26 @@ pub fn run() {
     let _ = writer.join();
 }
 
+fn request_correlation_token(line: &str) -> Result<Option<String>, EngineError> {
+    let metadata = serde_json::from_str::<protocol::RequestMetadataSniff>(line)
+        .map_err(|_| EngineError::new(ErrorCode::InvalidParams, "invalid request metadata"))?
+        .metadata;
+    let Some(metadata) = metadata else { return Ok(None) };
+    let token = metadata.correlation_token;
+    let valid = !token.is_empty()
+        && token.len() <= 128
+        && token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'_')
+        });
+    if !valid {
+        return Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            "invalid metadata.correlationToken",
+        ));
+    }
+    Ok(Some(token))
+}
+
 /// `engine.hello` must be the first request; every other method before it
 /// is rejected with `INVALID_PARAMS`. Extracted as a pure function so it's
 /// unit-testable without a real stdin/stdout session.
@@ -1164,6 +1227,17 @@ fn handle_request(
     request: &Request,
     project_state: &mut ProjectState,
 ) -> Result<serde_json::Value, EngineError> {
+    handle_request_with_correlation(backends, tx, request, project_state, None)
+}
+
+fn handle_request_with_correlation(
+    backends: &mut Backends,
+    tx: &mpsc::Sender<String>,
+    request: &Request,
+    project_state: &mut ProjectState,
+    correlation_token: Option<&str>,
+) -> Result<serde_json::Value, EngineError> {
+    backends.set_request_correlation(correlation_token);
     backends.reconcile_async_real_session();
     match request.method.as_str() {
         "engine.hello" => {
@@ -1186,6 +1260,10 @@ fn handle_request(
                 capabilities: vec!["simulated-ls5000".to_string()],
             })
         }
+        "session.inventory" => to_json(&protocol::SessionInventoryResult {
+            bridge_telemetry: backends.telemetry_evidence_identity(),
+            attempt_journals: backends.attempt_journal_evidence(),
+        }),
         "scanner.list" => to_json(&protocol::ScannerListResult {
             devices: backends.list_devices()?,
         }),
@@ -1851,6 +1929,7 @@ fn handle_request(
                 &excluded_frames,
             )?;
             let project = project_state.set(project, directory)?;
+            backends.clear_session_evidence();
             let directory = project_state
                 .directory
                 .as_ref()
@@ -1874,6 +1953,7 @@ fn handle_request(
             }
             let project =
                 project_state.set(project, std::path::PathBuf::from(&params.directory))?;
+            backends.clear_session_evidence();
             let directory = project_state
                 .directory
                 .as_ref()

@@ -198,6 +198,7 @@ private struct ConfirmationHost {
     let stub: ConfirmationEngineStub
     let server: ControlChannelServer
     let socketPath: String
+    let projectDirectory: String
 
     static func start(label: String) async throws -> ConfirmationHost {
         let stub = ConfirmationEngineStub()
@@ -205,7 +206,15 @@ private struct ConfirmationHost {
         let server = ControlChannelServer(sessionModel: model)
         let path = confirmationSocketPath(label)
         try await server.start(path: path)
-        return ConfirmationHost(model: model, stub: stub, server: server, socketPath: path)
+        let projectDirectory = (path as NSString).deletingLastPathComponent + "/project"
+        try FileManager.default.createDirectory(atPath: projectDirectory, withIntermediateDirectories: false)
+        return ConfirmationHost(
+            model: model,
+            stub: stub,
+            server: server,
+            socketPath: path,
+            projectDirectory: projectDirectory
+        )
     }
 }
 
@@ -218,9 +227,12 @@ private struct ConfirmationHost {
 /// this is its own copy, not a shared import).
 @MainActor
 @discardableResult
-private func prepareConfirmationScanReadiness(_ model: SessionModel) async -> Bool {
+private func prepareConfirmationScanReadiness(
+    _ model: SessionModel,
+    projectDirectory: String
+) async -> Bool {
     await model.connect(deviceId: confirmationDevice.deviceId)
-    await model.openProject(directory: confirmationProjectDirectory)
+    await model.openProject(directory: projectDirectory)
     model.handle(event: EngineEvent(
         name: "scanner.status",
         rawLine: Data(
@@ -415,6 +427,11 @@ private func runConfirmationCLI(
     let process = Process()
     process.executableURL = binary
     process.arguments = allArguments
+    var environment = ProcessInfo.processInfo.environment
+    let isolatedHome = (socketPath as NSString).deletingLastPathComponent
+    environment["HOME"] = isolatedHome
+    environment["CFFIXED_USER_HOME"] = isolatedHome
+    process.environment = environment
 
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
@@ -500,6 +517,11 @@ private final class ConfirmationEventsFollower: @unchecked Sendable {
         let process = Process()
         process.executableURL = binary
         process.arguments = ["events", "--follow", "--socket", socketPath]
+        var environment = ProcessInfo.processInfo.environment
+        let isolatedHome = (socketPath as NSString).deletingLastPathComponent
+        environment["HOME"] = isolatedHome
+        environment["CFFIXED_USER_HOME"] = isolatedHome
+        process.environment = environment
         let stdoutPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = Pipe()
@@ -710,7 +732,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanConfirmedWithoutWaitReturnsJobId() async throws {
         let host = try await ConfirmationHost.start(label: "scan-nowait")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
 
         let result = try await runConfirmationCLI(["scan", "--confirm-motion"], socketPath: host.socketPath)
@@ -756,7 +778,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanRepeatUsesSequentialPassTokens() async throws {
         let host = try await ConfirmationHost.start(label: "scan-repeat")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        #expect(await prepareConfirmationScanReadiness(host.model))
+        #expect(await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory))
 
         async let outcome = runConfirmationCLI(
             ["scan", "--confirm-motion", "--repeat", "2", "--pass", "Arep", "--quiet"],
@@ -798,7 +820,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanWaitDrivenToCompletedExitsZero() async throws {
         let host = try await ConfirmationHost.start(label: "scan-wait-completed")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
 
         async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
@@ -820,7 +842,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanWaitDrivenToFailedExitsEngineOrGateError() async throws {
         let host = try await ConfirmationHost.start(label: "scan-wait-failed")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
 
         async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
@@ -844,7 +866,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanWaitDrivenToStoppedExitsZero() async throws {
         let host = try await ConfirmationHost.start(label: "scan-wait-stopped")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
 
         async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
@@ -865,7 +887,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanWaitDrivenToCompletedViaScanCompletedEventExitsZero() async throws {
         let host = try await ConfirmationHost.start(label: "scan-wait-completed-event")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
 
         async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
@@ -898,7 +920,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanWaitHostGoneMidWaitExitsHostUnreachable() async throws {
         let host = try await ConfirmationHost.start(label: "scan-wait-host-gone")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
 
         async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
@@ -931,7 +953,7 @@ struct ScanstudioCLIConfirmationTests {
     func stopImmediateSendsImmediateMode() async throws {
         let host = try await ConfirmationHost.start(label: "stop-immediate")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
 
         let startResult = try await runConfirmationCLI(["scan", "--confirm-motion"], socketPath: host.socketPath)
@@ -949,7 +971,7 @@ struct ScanstudioCLIConfirmationTests {
     func scanRecoverableEngineErrorIsReportedNotRetried() async throws {
         let host = try await ConfirmationHost.start(label: "scan-recoverable")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
-        let ready = await prepareConfirmationScanReadiness(host.model)
+        let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
         await host.stub.failNext("scan.start", with: EngineRequestError(
             code: "FEED_JAM", message: "film jammed mid-feed", recoverable: true

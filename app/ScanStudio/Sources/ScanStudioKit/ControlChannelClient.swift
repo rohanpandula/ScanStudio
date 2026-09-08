@@ -262,7 +262,15 @@ public actor ControlChannelClient {
         }
         nextRequestId += 1
         let id = nextRequestId
-        let envelope = RequestEnvelope(id: id, method: method, params: params)
+        let metadata = invocationID.map {
+            RequestMetadata(correlationToken: "\($0):\(id)")
+        }
+        let envelope = RequestEnvelope(
+            id: id,
+            method: method,
+            params: params,
+            metadata: metadata
+        )
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ControlClientResponse, Error>) in

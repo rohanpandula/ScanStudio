@@ -318,17 +318,27 @@ fn real_engine_status_forwards_live_motion_armed_observation() {
 /// operator-actionable classification rather than flattening it to INTERNAL.
 #[test]
 fn preview_motion_not_armed_surfaces_a_typed_public_error() {
+    let log_directory = unique_output_destination("correlated-preview-refusal");
+    let log_path = log_directory.join("bridge-calls.log");
+    std::fs::write(&log_path, "").expect("create mock bridge call log");
+    let log_path_string = log_path.display().to_string();
     let (mut child, mut stdin, rx, reader_handle) = spawn_connected_engine_with_bridge_env(
         "e2e-motion-not-armed",
-        &[("MOCK_BRIDGE_REJECT_PREVIEW_MOTION_NOT_ARMED", "1")],
+        &[
+            ("MOCK_BRIDGE_REJECT_PREVIEW_MOTION_NOT_ARMED", "1"),
+            ("MOCK_BRIDGE_CALL_LOG", log_path_string.as_str()),
+        ],
     );
 
-    send(
-        &mut stdin,
-        3,
-        "scanner.acquireThumbnails",
-        json!({"frames": [1], "operationId": "unarmed-preview"}),
-    );
+    let correlation_token = "trace-fixture:3";
+    let request = json!({
+        "id": 3,
+        "method": "scanner.acquireThumbnails",
+        "params": {"frames": [1], "operationId": "unarmed-preview"},
+        "metadata": {"correlationToken": correlation_token},
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+    stdin.flush().unwrap();
     let preview = recv_response_for(&rx, 3, |_| {});
     assert_eq!(
         preview["error"]["code"],
@@ -336,12 +346,19 @@ fn preview_motion_not_armed_surfaces_a_typed_public_error() {
         "the live bridge refusal must not be flattened: {preview:#?}"
     );
     assert_eq!(preview["error"]["recoverable"], false);
+    assert!(
+        read_mock_bridge_calls(&log_path)
+            .iter()
+            .any(|call| call == &format!("roll.preview {correlation_token}")),
+        "the bridge envelope must retain the exact engine request token"
+    );
 
     send(&mut stdin, 4, "engine.shutdown", json!({}));
     assert!(recv_response_for(&rx, 4, |_| {}).get("error").is_none());
     let exit = wait_for_exit_bounded(&mut child, Duration::from_secs(10));
     assert!(exit.success(), "engine did not exit 0: {exit:?}");
     let _ = reader_handle.join();
+    let _ = std::fs::remove_dir_all(log_directory);
 }
 
 /// WV-5 (first live Windows validation, 2026-08-13): a preview requested on

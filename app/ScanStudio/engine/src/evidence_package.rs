@@ -77,12 +77,20 @@ impl JournalCopyBudget {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidencePackageResult {
     pub status: String,
     pub path: Option<String>,
     pub detail: String,
+    pub journal_files: Vec<EvidencePackageFileDigest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidencePackageFileDigest {
+    pub package_path: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +113,7 @@ struct PackageManifest<'a> {
     detail: &'a str,
     effective_settings: &'a serde_json::Value,
     frames: Vec<FrameManifest<'a>>,
+    journal_files: &'a [EvidencePackageFileDigest],
 }
 
 #[derive(Serialize)]
@@ -209,7 +218,7 @@ fn finalize_with_optional_expected_root(
     package
         .verify_namespace()
         .map_err(|error| format!("verify held evidence package authority: {error}"))?;
-    let (status, detail) = finalize_into(
+    let (status, detail, journal_files) = finalize_into(
         package,
         job_id,
         frames,
@@ -221,6 +230,7 @@ fn finalize_with_optional_expected_root(
         status,
         path: Some(package.final_path().display().to_string()),
         detail,
+        journal_files,
     })
 }
 
@@ -231,7 +241,7 @@ fn finalize_into(
     effective_settings: &serde_json::Value,
     expected_root: Option<&Path>,
     base_error: Option<String>,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, Vec<EvidencePackageFileDigest>), String> {
     let mut manifests = Vec::with_capacity(frames.len());
     let mut published_files = Vec::<PackageFileProof>::new();
     let mut unavailable = frames.is_empty();
@@ -348,6 +358,18 @@ fn finalize_into(
     } else {
         "Capture artifacts and exact bridge attempt journals copied.".to_string()
     };
+    let mut journal_files = published_files
+        .iter()
+        .filter(|proof| proof.relative_path.starts_with("attempts"))
+        .map(|proof| EvidencePackageFileDigest {
+            package_path: proof
+                .relative_path
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            sha256: proof.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    journal_files.sort_by(|left, right| left.package_path.cmp(&right.package_path));
     let manifest = PackageManifest {
         schema_version: 1,
         status,
@@ -355,10 +377,11 @@ fn finalize_into(
         detail: &detail,
         effective_settings,
         frames: manifests,
+        journal_files: &journal_files,
     };
     let data = serialize_json_bounded(&manifest, MAX_EVIDENCE_MANIFEST_BYTES)?;
     commit_manifest_authoritatively(package, &data, &published_files, || Ok(()))?;
-    Ok((status.into(), detail))
+    Ok((status.into(), detail, journal_files))
 }
 
 struct BoundedJsonBuffer {
@@ -514,6 +537,7 @@ fn validate_portable_component(component: &std::ffi::OsStr) -> Result<(), String
 struct PackageFileProof {
     relative_path: PathBuf,
     file: std::fs::File,
+    sha256: String,
 }
 
 fn digest_reader_exact(
@@ -968,11 +992,12 @@ where
             package_path: destination
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/"),
-            sha256: source_hash,
+            sha256: source_hash.clone(),
         },
         PackageFileProof {
             relative_path: destination.to_path_buf(),
             file: output,
+            sha256: source_hash,
         },
     ))
 }
@@ -1512,6 +1537,7 @@ mod tests {
         let mismatched_proof = PackageFileProof {
             relative_path: PathBuf::from("missing-proof.bin"),
             file: held,
+            sha256: String::new(),
         };
 
         assert!(commit_manifest_authoritatively(
@@ -1621,7 +1647,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.status, "complete");
-        let final_dir = PathBuf::from(result.path.unwrap());
+        let expected_journal_files = [
+            ("capture/ir.tif", "capture/ir.tif"),
+            ("capture/meter.tif", "capture/meter.tif"),
+            ("capture/rgb.tif", "capture/rgb.tif"),
+            ("journal/events.jsonl", "journal/events.jsonl"),
+        ]
+        .map(|(package_suffix, source_suffix)| EvidencePackageFileDigest {
+            package_path: format!("attempts/session-0001/{package_suffix}"),
+            sha256: digest(&attempts.join("attempt-1").join(source_suffix))
+                .unwrap()
+                .sha256,
+        });
+        assert_eq!(result.journal_files, expected_journal_files);
+        let final_dir = PathBuf::from(result.path.clone().unwrap());
         assert!(final_dir
             .join("attempts/session-0001/journal/events.jsonl")
             .is_file());
@@ -1656,6 +1695,10 @@ mod tests {
         assert_eq!(
             manifest["frames"][0]["journalRoot"],
             "attempts/session-0001"
+        );
+        assert_eq!(
+            manifest["journalFiles"],
+            serde_json::to_value(expected_journal_files).unwrap()
         );
         assert!(
             finalize_with_expected_root(

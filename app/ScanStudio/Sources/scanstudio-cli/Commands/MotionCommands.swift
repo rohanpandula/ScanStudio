@@ -219,6 +219,12 @@ struct Scan: AsyncParsableCommand {
     @Option(name: .customLong("allow-meter-refusal-slots"), help: "Known blank frame indices or ranges eligible for a metering-refusal skip.")
     var allowedMeterRefusalRanges: String?
 
+    @Option(name: .customLong("preset"), help: "Apply a saved scan and output preset before starting the scan.")
+    var presetName: String?
+
+    @Flag(name: .customLong("dry-run"), help: "Report cached readiness and destination gates without starting a scan.")
+    var dryRun = false
+
     private var repeatPlan = ScanRepeatPlan(
         frames: nil,
         passTokens: [nil],
@@ -227,7 +233,7 @@ struct Scan: AsyncParsableCommand {
     )
 
     mutating func validate() throws {
-        guard confirmMotion else {
+        guard confirmMotion || dryRun else {
             let payload = ControlErrorPayload(
                 .confirmationRequired,
                 message: "\"scan\" requires --confirm-motion.",
@@ -236,6 +242,11 @@ struct Scan: AsyncParsableCommand {
             let text = try ControlCLIOutput.renderError(command: "scan.start", payload: payload, human: options.human)
             print(text, terminator: "")
             throw ExitCode(77)
+        }
+        if let presetName {
+            do { _ = try ScanRecipePresetStore().load(named: presetName) }
+            catch { try PresetCommandSupport.failLocal(command: "scan.start", options: options, error: error) }
+            if dryRun { throw ValidationError("Apply the preset first, then run scan --dry-run to inspect the effective settings.") }
         }
         do {
             repeatPlan = try ScanRepeatPlan.make(
@@ -267,6 +278,10 @@ struct Scan: AsyncParsableCommand {
     }
 
     func run() async throws {
+        if dryRun {
+            try await MotionStartRunner.runDryRun(frames: repeatPlan.frames, resume: false, options: options)
+            return
+        }
         if repeatPlan.passTokens.count > 1 {
             try await MotionStartRunner.runRepeatedScan(
                 frames: repeatPlan.frames,
@@ -274,7 +289,7 @@ struct Scan: AsyncParsableCommand {
                 onFrameFailure: repeatPlan.onFrameFailure,
                 allowedMeterRefusalSlots: repeatPlan.allowedMeterRefusalSlots,
                 options: options,
-                quiet: options.quiet
+                quiet: options.quiet, presetName: presetName
             )
             return
         }
@@ -290,7 +305,7 @@ struct Scan: AsyncParsableCommand {
             ),
             options: options,
             wait: wait,
-            quiet: options.quiet
+            quiet: options.quiet, presetName: presetName
         )
     }
 }
@@ -407,8 +422,11 @@ struct Resume: AsyncParsableCommand {
     @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
     var wait = false
 
+    @Flag(name: .customLong("dry-run"), help: "Report cached pending-frame gates without resuming.")
+    var dryRun = false
+
     mutating func validate() throws {
-        guard confirmMotion else {
+        guard confirmMotion || dryRun else {
             let payload = ControlErrorPayload(
                 .confirmationRequired,
                 message: "\"resume\" requires --confirm-motion.",
@@ -421,6 +439,10 @@ struct Resume: AsyncParsableCommand {
     }
 
     func run() async throws {
+        if dryRun {
+            try await MotionStartRunner.runDryRun(frames: nil, resume: true, options: options)
+            return
+        }
         try await MotionStartRunner.run(
             command: "scan.resume",
             method: "scan.resume",
@@ -442,16 +464,47 @@ struct Resume: AsyncParsableCommand {
 /// suppresses a stderr write that `JobWaiter` itself never performs (see
 /// its own header).
 enum MotionStartRunner {
+    static func runDryRun(frames: [Int]?, resume: Bool, options: GlobalOptions) async throws {
+        let command = "scan.preflight"
+        let client = try await CommandRunner.openConnection(command: command, options: options)
+        try await preflight(command: command, client: client, frames: frames, resume: resume, options: options, dryRun: true)
+    }
+
+    static func preflight(
+        command: String, client: ControlChannelClient, frames: [Int]?, resume: Bool,
+        options: GlobalOptions, dryRun: Bool = false
+    ) async throws {
+        let response = try await CommandRunner.request(
+            command: command, method: "scan.preflight",
+            params: ControlScanPreflightParams(frames: frames, resume: resume), options: options, client: client
+        )
+        guard case .result(let data) = response else {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+            return
+        }
+        let report: ScanPreflightReport
+        do { report = try JSONDecoder().decode(ScanPreflightReport.self, from: data) }
+        catch { try await CommandRunner.fail(command: command, options: options, client: client, error: error) }
+        if dryRun || !report.ready {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+            if !report.ready { throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue) }
+        }
+    }
+
     static func runRepeatedScan(
         frames: [Int]?,
         passTokens: [String],
         onFrameFailure: ScanFrameFailurePolicy,
         allowedMeterRefusalSlots: [Int],
         options: GlobalOptions,
-        quiet: Bool
+        quiet: Bool,
+        presetName: String? = nil
     ) async throws {
         let command = "scan.start"
         let client = try await CommandRunner.openConnection(command: command, options: options)
+        if let presetName {
+            try await PresetCommandSupport.apply(name: presetName, options: options, command: command, emitResult: false, existingClient: client)
+        }
         let onProgress: (@Sendable (ControlScanProgress) -> Void)?
         if quiet {
             onProgress = nil
@@ -484,6 +537,7 @@ enum MotionStartRunner {
             var previousJobId = try await JobWaiter.subscribe(client: client)
             var jobs: [[String: Any]] = []
             for passToken in passTokens {
+                try await preflight(command: command, client: client, frames: resolvedFrames, resume: false, options: options)
                 let response = try await CommandRunner.request(
                     command: command,
                     method: "scan.start",
@@ -593,9 +647,18 @@ enum MotionStartRunner {
         params: Params,
         options: GlobalOptions,
         wait: Bool,
-        quiet: Bool
+        quiet: Bool,
+        presetName: String? = nil
     ) async throws {
         let client = try await CommandRunner.openConnection(command: command, options: options)
+        if let presetName {
+            try await PresetCommandSupport.apply(name: presetName, options: options, command: command, emitResult: false, existingClient: client)
+        }
+
+        if method == "scan.start" || method == "scan.resume" {
+            try await preflight(command: command, client: client, frames: (params as? ControlScanStartParams)?.frames,
+                                resume: method == "scan.resume", options: options)
+        }
 
         var preStartJobId: String?
         if wait {

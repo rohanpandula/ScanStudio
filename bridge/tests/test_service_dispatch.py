@@ -670,8 +670,16 @@ def test_device_eject_bridge_error_from_transport_records_error_telemetry(
     svc = _opened_service(tmp_path, _ParkedTransport())
     _arm(monkeypatch, tmp_path)
 
+    correlation_token = "trace-fixture:3"
     with pytest.raises(BridgeError) as excinfo:
-        svc.dispatch({"id": 2, "method": "device.eject"}, lambda *_a: None)
+        svc.dispatch(
+            {
+                "id": 2,
+                "method": "device.eject",
+                "metadata": {"correlationToken": correlation_token},
+            },
+            lambda *_a: None,
+        )
 
     assert excinfo.value.code == ErrorCode.FEEDER_PARKED
     error_entry = next(
@@ -681,6 +689,7 @@ def test_device_eject_bridge_error_from_transport_records_error_telemetry(
     )
     assert error_entry["code"] == ErrorCode.FEEDER_PARKED.value
     assert "power cycle" in error_entry["message"]
+    assert error_entry["correlationToken"] == correlation_token
 
 
 def test_device_eject_unmapped_transport_exception_is_eject_failed_not_internal(

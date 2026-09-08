@@ -436,6 +436,8 @@ class BridgeService:
     def dispatch(self, request: dict, emit: Callable[[str, dict], None]) -> dict:
         request = validate_request(request)
         method = request.get("method")
+        metadata = request.get("metadata") or {}
+        telemetry = self._telemetry.correlated(metadata.get("correlationToken"))
 
         if method in _METHOD_PARAM_SCHEMAS:
             required, optional = _METHOD_PARAM_SCHEMAS[method]
@@ -464,7 +466,7 @@ class BridgeService:
         if method == "device.close":
             return self._handle_device_close(emit)
         if method == "roll.preview":
-            return self._handle_roll_preview(request, emit)
+            return self._handle_roll_preview(request, emit, telemetry)
         if method == "roll.approve":
             params = request["params"]
             # Additive (2026-08-08 adversarial review, S1): `fingerprint` is
@@ -494,7 +496,7 @@ class BridgeService:
             )
             return {}
         if method == "roll.solveExposure":
-            return self._handle_solve_exposure(request, emit)
+            return self._handle_solve_exposure(request, emit, telemetry)
         if method == "roll.setSpacingOffset":
             if not self._device_open:
                 raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
@@ -534,11 +536,11 @@ class BridgeService:
                 )
             return to_wire(self._transport.preview_strip())
         if method == "scan.start":
-            return self._handle_scan_start(request, emit)
+            return self._handle_scan_start(request, emit, telemetry)
         if method == "scan.stop":
             return self._handle_scan_stop(request)
         if method == "device.eject":
-            return self._handle_device_eject(emit)
+            return self._handle_device_eject(emit, telemetry)
 
         raise BridgeError(ErrorCode.UNKNOWN_METHOD, f"unknown method '{method}'")
 
@@ -551,6 +553,13 @@ class BridgeService:
             params["protocolVersion"], "protocolVersion", minimum=0, maximum=2**31 - 1
         )
         result = hello_result(protocol_version, BRIDGE_VERSION)
+        result.update(
+            {
+                "telemetrySessionId": self._telemetry.session_id,
+                "telemetryPath": str(self._telemetry.path),
+                "telemetryRoot": str(self._telemetry.root),
+            }
+        )
         self._hello_received = True
         return result
 
@@ -642,7 +651,12 @@ class BridgeService:
         emit("device.status", {"status": to_wire(status)})
         return {}
 
-    def _handle_device_eject(self, emit: Callable[[str, dict], None]) -> dict:
+    def _handle_device_eject(
+        self,
+        emit: Callable[[str, dict], None],
+        telemetry: safety.TelemetryLog | None = None,
+    ) -> dict:
+        telemetry = telemetry or self._telemetry
         # NOT_CONNECTED is listed as a notable error for device.eject in
         # BRIDGE.md's Methods table; CoolscanPyTransport.eject() enforces it
         # internally but MockTransport.eject() does not (it unconditionally
@@ -669,11 +683,11 @@ class BridgeService:
             # lines carry code AND message, same as roll.preview's --
             # the 2026-07-25 live failure was undiagnosable from telemetry
             # precisely because only a bare code was recorded.
-            self._telemetry.record("device.eject", "started")
+            telemetry.record("device.eject", "started")
             try:
                 ejected = bool(self._transport.eject())
             except BridgeError as exc:
-                self._telemetry.record(
+                telemetry.record(
                     "device.eject", "error", code=exc.code.value, message=str(exc)
                 )
                 raise
@@ -690,7 +704,7 @@ class BridgeService:
                     f"eject failed before completion "
                     f"({type(exc).__name__}: {exc})"
                 )
-                self._telemetry.record(
+                telemetry.record(
                     "device.eject",
                     "error",
                     code=ErrorCode.EJECT_FAILED.value,
@@ -708,7 +722,7 @@ class BridgeService:
             # transports already raise instead of returning False; this
             # guard keeps the guarantee true for any future Transport too.
             message = "transport reported the film was not ejected"
-            self._telemetry.record(
+            telemetry.record(
                 "device.eject",
                 "error",
                 code=ErrorCode.EJECT_FAILED.value,
@@ -720,7 +734,7 @@ class BridgeService:
         # its own preview state; this clears the service-side copy that
         # scan.start's gate actually checks).
         self._preview_material = None
-        self._telemetry.record("device.eject", "ok", ejected=True)
+        telemetry.record("device.eject", "ok", ejected=True)
         # Status is emitted AFTER the lane release above, mirroring the
         # 2026-07-25 terminal-event ordering rule: a client reacting to
         # this event and polling device.status must observe the lane free.
@@ -729,7 +743,13 @@ class BridgeService:
 
     # -- roll.preview / roll.approve --------------------------------------------------
 
-    def _handle_roll_preview(self, request: dict, emit: Callable[[str, dict], None]) -> dict:
+    def _handle_roll_preview(
+        self,
+        request: dict,
+        emit: Callable[[str, dict], None],
+        telemetry: safety.TelemetryLog | None = None,
+    ) -> dict:
+        telemetry = telemetry or self._telemetry
         # NOT_CONNECTED is listed as a notable error for roll.preview in
         # BRIDGE.md's Methods table, alongside HW_MOTION_NOT_ARMED and
         # HARDWARE_LANE_BUSY -- both of which are already checked
@@ -780,7 +800,6 @@ class BridgeService:
         # success only.
 
         transport = self._transport
-        telemetry = self._telemetry
         # BRIDGE.md's SAFE-02 "Telemetry" guardrail: one JSONL line before
         # the call, one after the outcome is known -- for every
         # hardware-bound call, not just anomalies (T-08-05).
@@ -871,7 +890,13 @@ class BridgeService:
         self._motion_thread.start()
         return {"accepted": True}
 
-    def _handle_solve_exposure(self, request: dict, emit: Callable[[str, dict], None]) -> dict:
+    def _handle_solve_exposure(
+        self,
+        request: dict,
+        emit: Callable[[str, dict], None],
+        telemetry: safety.TelemetryLog | None = None,
+    ) -> dict:
+        telemetry = telemetry or self._telemetry
         if not self._device_open:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
         if self._preview_material is None:
@@ -888,11 +913,11 @@ class BridgeService:
             event = "roll.exposureError"
             payload = {}
             try:
-                self._telemetry.record("roll.solveExposure", "started", slot=slot)
+                telemetry.record("roll.solveExposure", "started", slot=slot)
                 solution = self._transport.solve_exposure(slot)
                 payload = {"solution": solution}
                 event = "roll.exposureSolved"
-                self._telemetry.record("roll.solveExposure", "ok", slot=slot)
+                telemetry.record("roll.solveExposure", "ok", slot=slot)
             except Exception as exc:
                 code = exc.code.value if isinstance(exc, BridgeError) else ErrorCode.INTERNAL.value
                 payload = {"code": code, "message": str(exc), "slot": slot}
@@ -903,7 +928,7 @@ class BridgeService:
                     ErrorCode.MANUAL_REVIEW_REQUIRED.value, ErrorCode.HARDWARE_LANE_BUSY.value,
                 }:
                     self._preview_material = None
-                self._telemetry.record("roll.solveExposure", "error", **payload)
+                telemetry.record("roll.solveExposure", "error", **payload)
             finally:
                 self._lane_held = False
                 lane.__exit__(None, None, None)
@@ -970,7 +995,13 @@ class BridgeService:
 
     # -- scan.start / scan.stop --------------------------------------------------------
 
-    def _handle_scan_start(self, request: dict, emit: Callable[[str, dict], None]) -> dict:
+    def _handle_scan_start(
+        self,
+        request: dict,
+        emit: Callable[[str, dict], None],
+        telemetry: safety.TelemetryLog | None = None,
+    ) -> dict:
+        telemetry = telemetry or self._telemetry
         # See _handle_roll_preview: same reasoning for checking NOT_CONNECTED
         # synchronously. NO_PREVIEW is also listed as a notable error for
         # scan.start -- self._preview_material is exactly the state
@@ -1062,7 +1093,6 @@ class BridgeService:
         self._last_job = job_record
 
         transport = self._transport
-        telemetry = self._telemetry
         # BRIDGE.md's SAFE-02 "Telemetry" guardrail: one JSONL line before
         # the call, one after the outcome is known -- for every
         # hardware-bound call, not just anomalies (T-08-05). The

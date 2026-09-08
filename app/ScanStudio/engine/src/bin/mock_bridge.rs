@@ -132,7 +132,7 @@ struct MockState {
 }
 
 impl MockState {
-    fn record_call(&self, method: &str) {
+    fn record_call(&self, request: &BridgeRequest) {
         let Some(path) = self.call_log_path.as_ref() else {
             return;
         };
@@ -140,7 +140,13 @@ impl MockState {
             .create(true)
             .append(true)
             .open(path)
-            .and_then(|mut file| writeln!(file, "{method}"))
+            .and_then(|mut file| {
+                if let Some(metadata) = &request.metadata {
+                    writeln!(file, "{} {}", request.method, metadata.correlation_token)
+                } else {
+                    writeln!(file, "{}", request.method)
+                }
+            })
         {
             eprintln!("mock_bridge: could not append call log {}: {error}", path.display());
         }
@@ -455,7 +461,7 @@ fn main() {
             }
         };
 
-        state.record_call(&request.method);
+        state.record_call(&request);
 
         // Simulated hard crash: checked first, before any other handling
         // of this request (including the hello gate below), so it fires
@@ -608,6 +614,9 @@ fn handle_request(
                 bridge_version: "0.0.1-mock".to_string(),
                 protocol_version: 1,
                 capabilities: vec!["ls5000-coolscanpy".to_string()],
+                telemetry_session_id: None,
+                telemetry_path: None,
+                telemetry_root: None,
             })
         }
         "device.list" => {

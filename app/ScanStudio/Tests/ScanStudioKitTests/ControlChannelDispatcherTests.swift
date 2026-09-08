@@ -74,6 +74,7 @@ private actor ControlDispatcherEngineStub: EngineClientProtocol {
     /// assert this count is exactly `0` -- the literal proof that the
     /// refusal never reached the engine on behalf of the refused command.
     private(set) var requestCount = 0
+    private(set) var lastCorrelationToken: String?
 
     private var ejectRequestCount = 0
     private var ejectContinuation: CheckedContinuation<EmptyResult, Error>?
@@ -86,6 +87,7 @@ private actor ControlDispatcherEngineStub: EngineClientProtocol {
         if method != "scanner.list", method != "scanner.rescan" {
             requestCount += 1
         }
+        lastCorrelationToken = RequestCorrelationContext.token
         switch method {
         case "scanner.list", "scanner.rescan":
             return try cast(ScannerListResult(devices: [controlDispatcherDevice]), as: Result.self)
@@ -106,6 +108,13 @@ private actor ControlDispatcherEngineStub: EngineClientProtocol {
                 )
             ), as: Result.self)
         case "scanner.status":
+            if RequestCorrelationContext.token == "trace-fixture:3" {
+                throw EngineRequestError(
+                    code: "NOT_CONNECTED",
+                    message: "simulated traced refusal",
+                    recoverable: false
+                )
+            }
             // Deliberately distinct from `scanner.connect`'s own status
             // above (mediaLoaded/carrier/frameCount/filmPresent all
             // differ) -- proves a `scanner.refresh` test observes a fresh
@@ -152,6 +161,8 @@ private actor ControlDispatcherEngineStub: EngineClientProtocol {
         ejectContinuation?.resume(returning: EmptyResult())
         ejectContinuation = nil
     }
+
+    func correlationToken() -> String? { lastCorrelationToken }
 
     private func resumeSatisfiedEjectWaiters() {
         let satisfied = ejectWaiters.filter { ejectRequestCount >= $0.count }
@@ -329,6 +340,47 @@ private func writeUniformGrayPNGForDispatcherTest(value: UInt8, width: Int = 143
 @Suite("Control channel dispatcher", .timeLimit(.minutes(1)))
 struct ControlChannelDispatcherTests {
     // MARK: Hello / schema version gate
+
+    @Test("A traced engine refusal keeps one token in dispatch context and diagnostics")
+    @MainActor
+    func correlatedRefusalReachesEngineAndDiagnosticTimeline() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "scanstudio-correlation-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suiteName = "scanstudio-correlation-\(UUID().uuidString)"
+        let preferences = UserDefaults(suiteName: suiteName)!
+        defer { preferences.removePersistentDomain(forName: suiteName) }
+        let stub = ControlDispatcherEngineStub()
+        let model = SessionModel(
+            engineClient: stub,
+            preferences: preferences,
+            diagnosticsDirectory: directory
+        )
+        let discoveryDeadline = ContinuousClock.now + .seconds(1)
+        while model.isDiscoveringDevices, ContinuousClock.now < discoveryDeadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(!model.isDiscoveringDevices)
+        await model.connect(deviceId: controlDispatcherDevice.deviceId)
+        let dispatcher = ControlChannelDispatcher(sessionModel: model)
+        await greet(dispatcher)
+
+        let token = "trace-fixture:3"
+        let line = Data(
+            #"{"id":3,"method":"scanner.refresh","params":{},"metadata":{"correlationToken":"\#(token)"}}"#.utf8
+        )
+        let responseData = await dispatcher.handleLine(line)
+        let response = try JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: responseData)
+
+        #expect(response.error.code == "NOT_CONNECTED")
+        #expect(await stub.correlationToken() == token)
+        let log = try #require(FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
+        let diagnostics = try String(contentsOf: log, encoding: .utf8)
+        #expect(diagnostics.contains("\"correlationToken\":\"\(token)\""))
+        #expect(diagnostics.contains("\"controlRequestId\":\"3\""))
+    }
 
     @Test("A request before any hello is refused with HELLO_REQUIRED")
     @MainActor

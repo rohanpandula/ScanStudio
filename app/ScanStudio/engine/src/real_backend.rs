@@ -22,7 +22,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::bridge_protocol::{BridgeHelloParams, BridgeHelloResult, BridgeRequest};
+use crate::bridge_protocol::{
+    BridgeHelloParams, BridgeHelloResult, BridgeRequest, BridgeRequestMetadata,
+};
 
 /// Fixed, short timeout for the best-effort `bridge.shutdown` attempted on
 /// drop — independent of whatever `request_timeout` the client was
@@ -501,6 +503,9 @@ impl BridgeClient {
                 bridge_version: String::new(),
                 protocol_version: 0,
                 capabilities: vec![],
+                telemetry_session_id: None,
+                telemetry_path: None,
+                telemetry_root: None,
             }),
             alive,
             generation,
@@ -558,7 +563,16 @@ impl BridgeClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, BridgeCallError> {
-        self.call_with_timeout(method, params, self.request_timeout)
+        self.call_correlated(method, params, None)
+    }
+
+    fn call_correlated(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        metadata: Option<BridgeRequestMetadata>,
+    ) -> Result<serde_json::Value, BridgeCallError> {
+        self.call_with_timeout(method, params, self.request_timeout, metadata)
     }
 
     /// Like [`call`](Self::call), but bounded by an explicit `deadline`
@@ -574,7 +588,17 @@ impl BridgeClient {
         params: serde_json::Value,
         deadline: Duration,
     ) -> Result<serde_json::Value, BridgeCallError> {
-        self.call_with_timeout(method, params, deadline)
+        self.call_with_deadline_correlated(method, params, deadline, None)
+    }
+
+    fn call_with_deadline_correlated(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: Duration,
+        metadata: Option<BridgeRequestMetadata>,
+    ) -> Result<serde_json::Value, BridgeCallError> {
+        self.call_with_timeout(method, params, deadline, metadata)
     }
 
     fn call_with_timeout(
@@ -582,6 +606,7 @@ impl BridgeClient {
         method: &str,
         params: serde_json::Value,
         timeout: Duration,
+        metadata: Option<BridgeRequestMetadata>,
     ) -> Result<serde_json::Value, BridgeCallError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel::<serde_json::Value>();
@@ -594,6 +619,7 @@ impl BridgeClient {
             id,
             method: method.to_string(),
             params,
+            metadata,
         }) {
             Ok(l) => l,
             Err(err) => {
@@ -849,7 +875,12 @@ impl Drop for BridgeClient {
         // worker has exited. If it cannot acknowledge in this short window,
         // leave it alive with its inherited ownership fence rather than
         // killing a potentially in-flight USB transaction.
-        let _ = self.call_with_timeout("bridge.shutdown", serde_json::json!({}), SHUTDOWN_TIMEOUT);
+        let _ = self.call_with_timeout(
+            "bridge.shutdown",
+            serde_json::json!({}),
+            SHUTDOWN_TIMEOUT,
+            None,
+        );
         let _ = self.reap_child_if_exited();
     }
 }
@@ -883,8 +914,18 @@ use serde::Serialize;
 /// `ScannerBackend` method translates the engine's PROTOCOL.md-shaped call
 /// into a BRIDGE.md request/event sequence, and translates the response
 /// back.
+#[derive(Debug, Clone)]
+struct SessionEvidencePackage {
+    job_id: String,
+    result: crate::evidence_package::EvidencePackageResult,
+}
+
 pub struct RealLs5000 {
     bridge: BridgeClient,
+    /// Updated by the engine's single request-dispatch thread and consumed
+    /// synchronously by bridge calls admitted for that request. Preview,
+    /// exposure, and scan workers only consume events and never read it.
+    request_correlation: Mutex<Option<String>>,
     /// Monotonic identity for each successful explicit `device.open`.
     /// Async workers capture it so a late worker from an old connection can
     /// never invalidate a newer connection.
@@ -928,6 +969,9 @@ pub struct RealLs5000 {
     active_scan_job_id: Arc<Mutex<Option<String>>>,
     /// The sole reader of an accepted roll.solveExposure terminal event.
     active_exposure_operation_id: Arc<Mutex<Option<String>>>,
+    /// Journal identities retained only after the package manifest commits.
+    /// Project changes clear this; no historical pathname discovery occurs.
+    session_evidence_packages: Mutex<Vec<SessionEvidencePackage>>,
     /// Frontend build identity reported by the one successful engine.hello
     /// for this process. It is metadata only: never used for hardware policy,
     /// and absent/invalid values merely make #106 evidence unavailable.
@@ -2623,6 +2667,85 @@ impl StableBridgeInputs {
 }
 
 impl RealLs5000 {
+    pub(crate) fn set_request_correlation(&self, correlation_token: Option<&str>) {
+        *self.request_correlation.lock().unwrap() = correlation_token.map(str::to_string);
+    }
+
+    fn request_metadata(&self) -> Option<BridgeRequestMetadata> {
+        self.request_correlation
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|correlation_token| BridgeRequestMetadata { correlation_token })
+    }
+
+    pub(crate) fn telemetry_evidence_identity(
+        &self,
+    ) -> Option<BridgeTelemetryEvidenceIdentity> {
+        let hello = self.bridge.hello_info();
+        Some(BridgeTelemetryEvidenceIdentity {
+            session_id: hello.telemetry_session_id?,
+            path: hello.telemetry_path?,
+            allowed_root: hello.telemetry_root?,
+        })
+    }
+
+    pub(crate) fn attempt_journal_evidence(
+        &self,
+    ) -> Vec<crate::protocol::SessionEvidenceFileAuthority> {
+        let packages = self.session_evidence_packages.lock().unwrap();
+        let mut files = Vec::new();
+        for (package_index, package) in packages.iter().enumerate() {
+            let Some(root) = package.result.path.as_deref() else {
+                continue;
+            };
+            let root = std::path::Path::new(root);
+            if !root.is_absolute() {
+                continue;
+            }
+            for journal in &package.result.journal_files {
+                let relative = std::path::Path::new(&journal.package_path);
+                if relative.is_absolute()
+                    || relative.components().any(|component| {
+                        !matches!(component, std::path::Component::Normal(_))
+                    })
+                {
+                    continue;
+                }
+                files.push(crate::protocol::SessionEvidenceFileAuthority {
+                    entry_name: format!(
+                        "attempt-journals/{}/package-{:04}/{}",
+                        package.job_id,
+                        package_index + 1,
+                        journal.package_path
+                    ),
+                    path: root.join(relative).display().to_string(),
+                    allowed_root: root.display().to_string(),
+                    sha256: journal.sha256.clone(),
+                });
+            }
+        }
+        files.sort_by(|left, right| left.entry_name.cmp(&right.entry_name));
+        files
+    }
+
+    pub(crate) fn clear_session_evidence(&self) {
+        self.session_evidence_packages.lock().unwrap().clear();
+    }
+
+    fn retain_session_evidence(
+        &self,
+        job_id: &str,
+        results: &[crate::evidence_package::EvidencePackageResult],
+    ) {
+        let mut packages = self.session_evidence_packages.lock().unwrap();
+        packages.retain(|package| package.job_id != job_id);
+        packages.extend(results.iter().cloned().map(|result| SessionEvidencePackage {
+            job_id: job_id.to_string(),
+            result,
+        }));
+    }
+
     /// Spawns `bridge_cmd`, completes the `bridge.hello` handshake (via
     /// `BridgeClient::spawn`), and resolves the one device `device.list`
     /// reports. Never returns a partially-initialized backend — every
@@ -2711,6 +2834,7 @@ impl RealLs5000 {
         let detected_holder = derive_detected_holder(&bridge_device.capabilities);
         Ok(RealLs5000 {
             bridge,
+            request_correlation: Mutex::new(None),
             next_session_epoch: AtomicU64::new(0),
             active_session_epoch: AtomicU64::new(0),
             active_session_bridge_generation: AtomicU64::new(0),
@@ -2721,6 +2845,7 @@ impl RealLs5000 {
             preview_terminal_session_loss_test_hook: false,
             active_scan_job_id: Arc::new(Mutex::new(None)),
             active_exposure_operation_id: Arc::new(Mutex::new(None)),
+            session_evidence_packages: Mutex::new(Vec::new()),
             client_build: Mutex::new(None),
             active_device: Mutex::new(None),
             device_id: bridge_device.device_id,
@@ -3338,8 +3463,15 @@ impl RealLs5000 {
             .flatten()
             .map(str::to_string);
         let call_result = match options.deadline {
-            Some(deadline) => self.bridge.call_with_deadline(method, params, deadline),
-            None => self.bridge.call(method, params),
+            Some(deadline) => self.bridge.call_with_deadline_correlated(
+                method,
+                params,
+                deadline,
+                self.request_metadata(),
+            ),
+            None => self
+                .bridge
+                .call_correlated(method, params, self.request_metadata()),
         };
         let result = match call_result {
             Ok(result) => result,
@@ -4224,10 +4356,11 @@ impl ScannerBackend for RealLs5000 {
         };
         let result_value = self
             .bridge
-            .call_with_deadline(
+            .call_with_deadline_correlated(
                 "device.open",
                 open_params,
                 DEVICE_OPEN_CALL_DEADLINE,
+                self.request_metadata(),
             )
             .map_err(|error| match error {
                 bridge_error @ BridgeCallError::BridgeError { .. } => {
@@ -6338,6 +6471,7 @@ fn finalize_evidence_status_after_bridge_terminal(
         return EvidenceFinalization {
             summary: "disabled".to_string(),
             cleanup_gate: EvidenceCleanupGate::NotRequested,
+            packages: Vec::new(),
         };
     }
 
@@ -6350,6 +6484,7 @@ fn finalize_evidence_status_after_bridge_terminal(
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
     let mut failures = Vec::new();
     let mut finalized = Vec::new();
+    let mut package_results = Vec::new();
     let mut every_package_verified_complete = true;
     for package in packages {
         let (frames, coverage_error) =
@@ -6370,6 +6505,7 @@ fn finalize_evidence_status_after_bridge_terminal(
             Ok(result) => {
                 every_package_verified_complete &= result.status == "complete";
                 finalized.push(format!("{}: {}", result.status, result.detail));
+                package_results.push(result);
             }
             Err(error) => {
                 every_package_verified_complete = false;
@@ -6385,6 +6521,7 @@ fn finalize_evidence_status_after_bridge_terminal(
         } else {
             EvidenceCleanupGate::Hold
         },
+        packages: package_results,
     }
 }
 
@@ -6479,6 +6616,7 @@ enum EvidenceCleanupGate {
 struct EvidenceFinalization {
     summary: String,
     cleanup_gate: EvidenceCleanupGate,
+    packages: Vec<crate::evidence_package::EvidencePackageResult>,
 }
 
 /// Synthetic engine-side termination (panic, watchdog, or a bridge
@@ -8609,6 +8747,10 @@ fn run_real_scan_job_inner(
                                     &settings,
                                     Some(&evidence_terminal_error),
                                 );
+                            backend.retain_session_evidence(
+                                &job_id,
+                                &package_finalization.packages,
+                            );
                             if let Some(working) = capture_plan.private_working_directory.as_ref() {
                                 format!("{}; {}", package_finalization.summary, working.recovery_message("scan.error ended this engine job before derivative/terminal reconciliation"))
                             } else {
@@ -8719,6 +8861,10 @@ fn run_real_scan_job_inner(
                             &shared_evidence,
                             &settings,
                             evidence_admission_error.as_deref(),
+                        );
+                        backend.retain_session_evidence(
+                            &job_id,
+                            &package_finalization.packages,
                         );
                         let private_capture_status = finalize_private_capture_workspace(
                             &capture_plan,

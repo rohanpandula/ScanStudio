@@ -5,7 +5,7 @@ roll. It is a command sequence, not a completion claim. The simulator has
 already exercised repeat, verify, and collect; a physical result remains
 `UNVALIDATED` until the operator reviews the retained evidence.
 
-The owner must supply, before starting:
+Record these inputs before starting:
 
 - the exact signed `scanstudio-cli` path and a private control socket;
 - the discovered scanner ID (for example `ls5000-usb-0`), the film stock, the
@@ -16,8 +16,8 @@ The owner must supply, before starting:
   `settings get` and `outputs get` and reviewed by the operator;
 - the candidate app, bridge, CoolscanPy, and driver versions. Record the
   published driver candidate as `0.7.9` when that is the build under review;
-  record the actual app/bridge versions separately. A future release candidate
-  version is `TBD` until the owner supplies it.
+  record the actual app/bridge versions separately. Stamp each local candidate
+  with a unique version before presenting its attended commands.
 
 No command below ejects, reloads, retries, or claims that calibration is
 complete. Stop at the first refusal. An operator checkpoint is required at

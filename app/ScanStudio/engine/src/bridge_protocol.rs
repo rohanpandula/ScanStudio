@@ -32,6 +32,14 @@ pub struct BridgeRequest {
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BridgeRequestMetadata>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeRequestMetadata {
+    pub correlation_token: String,
 }
 
 /// Outbound success shape (bridge -> engine): `{"id": .., "result": ..}`.
@@ -549,6 +557,20 @@ pub struct BridgeHelloResult {
     pub bridge_version: String,
     pub protocol_version: u32,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_root: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeTelemetryEvidenceIdentity {
+    pub session_id: String,
+    pub path: String,
+    pub allowed_root: String,
 }
 
 // ---------------------------------------------------------------------
