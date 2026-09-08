@@ -52,7 +52,7 @@ current list unchanged. A failed re-attempt returns the same recoverable
 (rescan never replaces a connected session's backend).
 
 ### `scanner.connect`
-`{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo"}}` → `{device: DeviceInfo, status: ScannerStatus, alreadyConnected: boolean}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. **D-16:** re-connecting the device that is already connected is a success, reports `alreadyConnected: true`, and reaches no backend (no `sim.connect`/`real.connect` call, so no `ConnectOptions` is ever re-applied to the already-open session); a fresh connect reports `alreadyConnected: false`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED` (a *different* device while one is already connected).
+`{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo", allowUnverifiedHardware?: bool}}` → `{device: DeviceInfo, status: ScannerStatus, alreadyConnected: boolean}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. **D-16:** re-connecting the device that is already connected is a success, reports `alreadyConnected: true`, and reaches no backend (no `sim.connect`/`real.connect` call, so no `ConnectOptions` is ever re-applied to the already-open session); a fresh connect reports `alreadyConnected: false`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED` (a *different* device while one is already connected).
 
 ### `scanner.disconnect`
 `{}` → `{}` and emits `scanner.status` with `connected: false`. Errors: `NOT_CONNECTED`, `SCANNER_BUSY` (transport operation active).
@@ -202,13 +202,33 @@ Creating never replaces an existing project (#99): if the target directory alrea
 ### `project.applyMetadata`
 `{frameIndex: u32}` → `{success: bool, exitCode: i32, stdout: string, stderr: string, targets: [string]}`. Rebuilds the exact same argument array `previewMetadataCommand` would show for this frame — server-side, from the active project's own resolved metadata and receipts; it never accepts or executes a client-supplied argument list — and spawns it directly via an argument-array subprocess (never a shell). Errors: `PROJECT_NOT_FOUND` (no project open), `INVALID_PARAMS` (frame index does not exist in this project; ExifTool is not available; or the frame has no scanned outputs yet).
 
+## Hardware verification provenance
+
+`options.allowUnverifiedHardware` is a boolean defaulting to `false`, independent
+of environment or GUI preferences. A recognized candidate also needs
+`DeviceInfo.unverifiedAllowed == true`; unknown and name-only identities retain
+their refusal. `supported` continues to describe verified support, not whether
+an operator has accepted an unverified attempt. Advertised recipe limits describe
+the implemented protocol path; they do not establish an unverified model’s native
+capabilities.
+
+The exact opened device supplies `ScannerStatus.deviceModel` and
+`hardwareVerification`; disconnected/unknown status omits them. Every new scan
+receipt records model and tier, including simulated unverified captures. Legacy
+receipts decode absent verification as `verified` and absent model as unknown,
+without rewriting stored data. New derivative TIFFs carry the actual receipt
+model and `ScanStudio; hardwareVerification=<tier>` software metadata; original
+capture artifacts are never relabelled. A simulated tier is policy-test
+provenance, never physical validation.
+
 ## Types
 
 ```
 DeviceInfo      {deviceId: "sim-ls5000-0", model: "SUPER COOLSCAN 5000 ED",
                  kind: "simulated", firmware: "1.03-sim", connection: "USB (simulated)",
-                 supported: bool, supportedMultisamplePasses?: [u32]}
-ScannerStatus   {connected: bool, adapter: string|null,      // simulator: "SA-30 (simulated)" | "SA-21 (simulated)" | "MA-21 (simulated)"; real: "SA-30" | "SA-21" | "MA-21"
+                 supported: bool, supportedMultisamplePasses?: [u32],
+                 unverifiedAllowed?: bool, hardwareVerification?: "verified"|"unverified"}
+ScannerStatus   {connected: bool, deviceModel?: string, hardwareVerification?: "verified"|"unverified", adapter: string|null,      // simulator: "SA-30 (simulated)" | "SA-21 (simulated)" | "MA-21 (simulated)"; real: "SA-30" | "SA-21" | "MA-21"
                  mediaLoaded: bool, carrier: "roll36"|"strip6"|"mounted"|null,
                  frameCount: u32|null, lamp: "off"|"warming"|"stable",
                  transport: "idle"|"busy"|"locked", activeJobId: string|null,
@@ -260,7 +280,7 @@ ExposureAuthority    {rgbSource: string, irSource: string,
                       activeControllerChannelsRaw10ns: {R,G,B,IR: u32},
                       deviceBoundClampedChannelsRaw10ns: {R?,G?,B?: u32},
                       deviceExposureBoundsRaw10ns: [u32, u32]}
-ScanReceipt     {jobId, frameIndex, startedAt: ISO-8601 UTC string, durationMs: u64,
+ScanReceipt     {jobId, frameIndex, deviceModel?: string, hardwareVerification: "verified"|"unverified", startedAt: ISO-8601 UTC string, durationMs: u64,
                  passes: u32, resolutionDpi: u32, bitDepth: u32, channels: string,
                  engineVersion: string, deviceId: string, simulated: true,
                  settingsFingerprint: 16-hex-char string,

@@ -18,6 +18,7 @@ __all__ = [
     "Material",
     "Channels",
     "Capabilities",
+    "HardwareVerification",
     "DeviceInfo",
     "DeviceStatus",
     "CaptureRecipe",
@@ -57,6 +58,11 @@ class Channels(StrEnum):
     RGBI = "rgbi"
 
 
+class HardwareVerification(StrEnum):
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+
+
 @dataclass(frozen=True)
 class Capabilities:
     ir_channel: bool
@@ -78,6 +84,8 @@ class DeviceInfo:
     model: str
     capabilities: Capabilities
     supported: bool = True
+    unverified_allowed: bool = False
+    hardware_verification: HardwareVerification = HardwareVerification.VERIFIED
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,8 @@ class DeviceStatus:
     # "36Strip", "240", "Feeder"), or None when it could not be read.
     # Adapter-dependent workflows key on this; diagnostics render it.
     adapter: str | None = None
+    device_model: str | None = None
+    hardware_verification: HardwareVerification | None = None
 
 
 @dataclass(frozen=True)
@@ -333,6 +343,7 @@ class ScanReceipt:
     # Optional grayscale TIFF paired with ``raw_export_path`` when the raw
     # recipe selects separate infrared and the capture supplied an IR plane.
     raw_export_ir_path: str | None = None
+    hardware_verification: HardwareVerification = HardwareVerification.VERIFIED
 
 
 # --- internal (non-wire) types Plan 08-02 needs ---

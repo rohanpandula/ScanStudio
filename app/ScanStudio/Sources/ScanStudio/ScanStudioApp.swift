@@ -53,7 +53,12 @@ struct ScanStudioApp: App {
         }
 
         Settings {
-            UpdateSettingsView(model: appDelegate.updateFlowModel)
+            Group {
+                UpdateSettingsView(model: appDelegate.updateFlowModel)
+                if case .ready(_, let model) = appDelegate.launchState {
+                    HardwareSettingsView(model: model)
+                }
+            }
         }
     }
 }

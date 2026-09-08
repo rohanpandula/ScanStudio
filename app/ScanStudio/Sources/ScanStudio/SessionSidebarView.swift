@@ -95,7 +95,8 @@ struct SessionSidebarView: View {
                 switch DeviceSelectionPolicy.state(
                     isDiscovering: sessionModel.isDiscoveringDevices,
                     isConnecting: sessionModel.isConnectingDevice,
-                    devices: sessionModel.availableDevices
+                    devices: sessionModel.availableDevices,
+                    allowUnverified: sessionModel.allowUnverifiedHardware
                 ) {
                 case .discovering:
                     connectionProgress(.discovering)

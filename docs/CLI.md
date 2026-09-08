@@ -40,7 +40,7 @@ Global options may be placed on every command:
 ## Output contract
 
 Without `--human`, each ordinary command writes exactly one JSON object. It has
-`schemaVersion`, `command`, and `mode`, plus exactly one of `result`, `error`,
+`schemaVersion`, `command`, `mode`, and `hardwareVerification`, plus exactly one of `result`, `error`,
 or `event`. The streaming `events --follow` command writes one event envelope
 per event until the host closes the connection.
 Successful commands may also carry `hostStarted`, `hostPid`, and `logPath`.
@@ -59,7 +59,9 @@ The complete wire surface covered by this guide is: `hello`, `status`,
 `roll.open`, `roll.list`, `scan.start`, `scan.stop`, `scan.resume`,
 `scanner.eject`, `diagnostics.export`, `events.subscribe`, and `job.get`.
 
-The following are exact simulator captures. Paths, timestamps, and PIDs are
+The following are retained Phase 4 simulator captures, before the additive
+Phase 5 `hardwareVerification` field. New output includes that live field as
+`verified`, `unverified`, or `notConnected`. These historical examples are exact captures; Paths, timestamps, and PIDs are
 environment-specific; the field names and values show the wire shape.
 
 ```json
@@ -74,13 +76,19 @@ the process exit status; a refusal is also rendered as an `error` envelope.
 ### `connect`, `disconnect`, and `rescan`
 
 ```text
-connect [--device ID]       → scanner.connect
+connect [--device ID] [--allow-unverified-hardware] → scanner.connect
 disconnect                  → scanner.disconnect
 rescan                      → scanner.rescan
 ```
 
+The connect opt-in is explicit for each CLI invocation; omitting it means false,
+even when the GUI saved **Allow unverified scanners**. It permits only recognized
+unverified candidates and does not authorize motion. The current driver pin is
+0.7.7, which refuses that open with guidance to upgrade to 0.7.8 after its release.
+See the [hardware matrix](HARDWARE-SUPPORT.md#testing-an-unverified-scanner).
+
 These commands have no motion confirmation flag. They use exits `0, 65, 69,
-70, 75`. `connect` may omit `--device`; `rescan` is the discovery operation.
+70, 75`. `connect` may omit `--device`: it reuses the last selected device if still discovered, or requires one discovered device when no previous selection exists. It refuses if the previous device disappeared. `rescan` is the discovery operation.
 
 ```json
 {"command":"scanner.rescan","hostPid":12596,"hostStarted":false,"mode":"attach-headless","result":{"devices":[{"connection":"USB (simulated)","deviceId":"sim-ls5000-0","firmware":"1.03-sim","kind":"simulated","model":"SUPER COOLSCAN 5000 ED","supported":true}]},"schemaVersion":1}

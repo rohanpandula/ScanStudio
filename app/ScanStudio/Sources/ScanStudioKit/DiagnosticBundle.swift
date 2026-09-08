@@ -172,7 +172,9 @@ public enum DiagnosticBundleBuilder {
         reportText: String,
         redactionContext: ErrorPresentationContext,
         preview: PreviewContent,
-        evidence: EvidenceContent
+        evidence: EvidenceContent,
+        hardwareVerification: String? = nil,
+        deviceModel: String? = nil
     ) -> [StoredZipWriter.Entry] {
         var manifestLines = [
             "ScanStudio diagnostic bundle",
@@ -180,6 +182,14 @@ public enum DiagnosticBundleBuilder {
             "diagnostics.jsonl: share-redacted session events, one JSON object per line",
             "report.txt: share-redacted error report at the time of export",
         ]
+        if let hardwareVerification {
+            let safeVerification = sanitizedField(.string(hardwareVerification), context: redactionContext)
+            if case .string(let value) = safeVerification { manifestLines.append("hardware verification: \(value)") }
+        }
+        if let deviceModel {
+            let safeModel = sanitizedField(.string(deviceModel), context: redactionContext)
+            if case .string(let value) = safeModel { manifestLines.append("device model: \(value)") }
+        }
         var entries = [
             StoredZipWriter.Entry(
                 name: "diagnostics.jsonl",

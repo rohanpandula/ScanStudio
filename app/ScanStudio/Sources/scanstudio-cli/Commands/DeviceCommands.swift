@@ -21,11 +21,14 @@ struct Connect: AsyncParsableCommand {
     @Option(name: .customLong("device"), help: "Device id to connect to. Omitted means let the app choose.")
     var device: String?
 
+    @Flag(name: .customLong("allow-unverified-hardware"), help: "Allow connecting to a recognized but unverified scanner for this command.")
+    var allowUnverifiedHardware = false
+
     func run() async throws {
         try await CommandRunner.run(
             command: "scanner.connect",
             method: "scanner.connect",
-            params: ControlScannerConnectParams(deviceId: device),
+            params: ControlScannerConnectParams(deviceId: device, allowUnverifiedHardware: allowUnverifiedHardware),
             options: options
         )
     }
@@ -121,7 +124,7 @@ struct Status: AsyncParsableCommand {
         let connectResponse = try await CommandRunner.request(
             command: "status",
             method: "scanner.connect",
-            params: ControlScannerConnectParams(),
+            params: ControlScannerConnectParams(allowUnverifiedHardware: false),
             options: options,
             client: client
         )

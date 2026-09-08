@@ -296,10 +296,10 @@ fn connect_unknown_device_id_maps_to_unknown_device() {
 }
 
 #[test]
-fn unsupported_bridge_device_is_listed_but_never_connectable() {
+fn unsupported_bridge_device_is_listed_but_requires_opt_in() {
     // Lane D (#14): the mock advertises a recognized-but-unsupported LS-50.
     // The backend starts so scanner.list can name the unit, but connect is
-    // refused fail-closed.
+    // refused by default.
     let backend = RealLs5000::new_with_env(
         mock_bridge_bin(),
         GENEROUS_TIMEOUT,
@@ -310,7 +310,7 @@ fn unsupported_bridge_device_is_listed_but_never_connectable() {
     assert_eq!(backend.device_info().model, "LS-50 ED");
     assert!(
         !backend.device_info().supported,
-        "an unsupported model must never be connectable"
+        "an unsupported model must remain visibly unsupported"
     );
 
     let err = backend
@@ -354,18 +354,41 @@ fn connect_decides_per_requested_device_in_a_dual_attach() {
     )
     .expect("RealLs5000::new should start with two devices attached");
 
+    assert_eq!(
+        backend
+            .device_infos()
+            .iter()
+            .map(|device| device.device_id.as_str())
+            .collect::<Vec<_>>(),
+        [DEVICE_ID, UNSUPPORTED_DEVICE_ID]
+    );
+
     let err = backend
         .connect(UNSUPPORTED_DEVICE_ID, &ConnectOptions::default())
         .expect_err("connecting the unsupported LS-50 must still be refused");
     assert_eq!(err.code, ErrorCode::NotSupported);
 
     let result = backend
-        .connect(DEVICE_ID, &ConnectOptions::default())
-        .expect(
-            "connecting the supported LS-5000 must succeed even with an \
-             unsupported LS-50 also attached",
-        );
+        .connect(
+            UNSUPPORTED_DEVICE_ID,
+            &ConnectOptions {
+                allow_unverified_hardware: true,
+                ..ConnectOptions::default()
+            },
+        )
+        .expect("explicit opt-in must open the exact selected LS-50");
+    assert_eq!(result.device.device_id, UNSUPPORTED_DEVICE_ID);
+    assert_eq!(result.device.model, "LS-50 ED");
+    assert_eq!(
+        result.device.hardware_verification,
+        domain::HardwareVerification::Unverified
+    );
     assert!(result.status.connected);
+    assert_eq!(result.status.device_model.as_deref(), Some("LS-50 ED"));
+    assert_eq!(
+        result.status.hardware_verification,
+        Some(domain::HardwareVerification::Unverified)
+    );
 }
 
 #[test]

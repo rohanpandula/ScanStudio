@@ -27,6 +27,7 @@ use crate::protocol::{
 };
 
 const DEVICE_ID: &str = "sim-ls5000-0";
+const UNVERIFIED_DEVICE_ID: &str = "sim-ls50-0";
 
 // ---------------------------------------------------------------------
 // Determinism (D-08, SIM-03)
@@ -385,6 +386,7 @@ struct ManualApprovalBinding {
 
 struct State {
     connected: bool,
+    selected_device_id: &'static str,
     adapter: Option<String>,
     media_loaded: bool,
     carrier: Option<MediaCarrier>,
@@ -415,6 +417,7 @@ impl Default for State {
     fn default() -> Self {
         State {
             connected: false,
+            selected_device_id: DEVICE_ID,
             adapter: None,
             media_loaded: false,
             carrier: None,
@@ -462,6 +465,21 @@ fn status_snapshot(state: &State) -> ScannerStatus {
         lamp: state.lamp,
         transport: state.transport,
         active_job_id,
+        device_model: state.connected.then(|| {
+            if state.selected_device_id == UNVERIFIED_DEVICE_ID {
+                "LS-50 ED"
+            } else {
+                "SUPER COOLSCAN 5000 ED"
+            }
+            .to_string()
+        }),
+        hardware_verification: state.connected.then_some(
+            if state.selected_device_id == UNVERIFIED_DEVICE_ID {
+                crate::domain::HardwareVerification::Unverified
+            } else {
+                crate::domain::HardwareVerification::Verified
+            },
+        ),
         // The simulator has no bridge-side SAFE-02 latch to inspect.
         motion_armed: None,
         // The simulator has no bridge to source a real film-presence read
@@ -476,6 +494,7 @@ fn status_snapshot(state: &State) -> ScannerStatus {
 
 pub struct SimulatedLs5000 {
     device: DeviceInfo,
+    unverified_device: DeviceInfo,
     state: Mutex<State>,
     cancelled: AtomicBool,
 }
@@ -490,6 +509,8 @@ impl SimulatedLs5000 {
                 firmware: "1.03-sim".to_string(),
                 connection: "USB (simulated)".to_string(),
                 supported: true,
+                unverified_allowed: false,
+                hardware_verification: crate::domain::HardwareVerification::Verified,
                 // No bridge to source a capability list from, and
                 // skip_serializing_if keeps this key off the wire entirely
                 // (byte-identical scanner.list/scanner.connect JSON to
@@ -505,16 +526,38 @@ impl SimulatedLs5000 {
                 // None is simply the smaller, zero-new-fixtures change.
                 supported_multisample_passes: None,
             },
+            unverified_device: DeviceInfo {
+                device_id: UNVERIFIED_DEVICE_ID.to_string(),
+                model: "LS-50 ED".to_string(),
+                kind: "simulated".to_string(),
+                firmware: "1.00-sim".to_string(),
+                connection: "USB (simulated)".to_string(),
+                supported: false,
+                unverified_allowed: true,
+                hardware_verification: crate::domain::HardwareVerification::Unverified,
+                supported_multisample_passes: None,
+            },
             state: Mutex::new(State::default()),
             cancelled: AtomicBool::new(false),
         }
     }
 
-    /// `scanner.list` is device discovery, independent of connection state
-    /// — always exactly one simulated device in M1. Not part of
-    /// `ScannerBackend` since it doesn't touch backend connection state.
+    /// The selected simulator identity, or the verified default while
+    /// disconnected. Not part of `ScannerBackend` because it is read-only.
     pub fn device_info(&self) -> DeviceInfo {
-        self.device.clone()
+        if self.state.lock().unwrap().selected_device_id == UNVERIFIED_DEVICE_ID {
+            self.unverified_device.clone()
+        } else {
+            self.device.clone()
+        }
+    }
+
+    pub fn device_infos(&self) -> Vec<DeviceInfo> {
+        vec![self.device.clone(), self.unverified_device.clone()]
+    }
+
+    pub fn recognizes(&self, device_id: &str) -> bool {
+        matches!(device_id, DEVICE_ID | UNVERIFIED_DEVICE_ID)
     }
 
     /// Pure in-process activity snapshot used by metadata publication. It
@@ -796,12 +839,23 @@ impl ScannerBackend for SimulatedLs5000 {
         device_id: &str,
         options: &ConnectOptions,
     ) -> Result<ConnectResult, EngineError> {
-        if device_id != DEVICE_ID {
+        if !self.recognizes(device_id) {
             return Err(EngineError::new(
                 ErrorCode::UnknownDevice,
                 format!("unknown device id '{device_id}'"),
             ));
         }
+        if device_id == UNVERIFIED_DEVICE_ID && !options.allow_unverified_hardware {
+            return Err(EngineError::new(
+                ErrorCode::NotSupported,
+                "LS-50 ED is recognized but not supported; only the LS-5000 is supported. Turn on \"Allow unverified scanners\" (or pass --allow-unverified-hardware) to open it anyway; every output will be tagged unverified.",
+            ));
+        }
+        let connected_device = if device_id == UNVERIFIED_DEVICE_ID {
+            self.unverified_device.clone()
+        } else {
+            self.device.clone()
+        };
         let mut state = self.state.lock().unwrap();
         if state.connected {
             return Err(EngineError::new(
@@ -810,6 +864,11 @@ impl ScannerBackend for SimulatedLs5000 {
             ));
         }
         state.connected = true;
+        state.selected_device_id = if device_id == UNVERIFIED_DEVICE_ID {
+            UNVERIFIED_DEVICE_ID
+        } else {
+            DEVICE_ID
+        };
         state.adapter = None;
         state.media_loaded = false;
         state.carrier = None;
@@ -833,7 +892,7 @@ impl ScannerBackend for SimulatedLs5000 {
 
         let status = status_snapshot(&state);
         Ok(ConnectResult {
-            device: self.device.clone(),
+            device: connected_device,
             status,
             already_connected: false,
         })
@@ -854,6 +913,7 @@ impl ScannerBackend for SimulatedLs5000 {
             ));
         }
         state.connected = false;
+        state.selected_device_id = DEVICE_ID;
         state.adapter = None;
         state.media_loaded = false;
         state.carrier = None;
@@ -1407,7 +1467,7 @@ fn build_receipt(
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
     output: &OutputRecipe,
-    device_id: &str,
+    device: &DeviceInfo,
     written: &crate::render::WrittenPaths,
     project_root: Option<&crate::render::ProjectOutputRootAuthority>,
 ) -> Result<ScanReceipt, crate::domain::EngineError> {
@@ -1435,7 +1495,9 @@ fn build_receipt(
         bit_depth: recipe.bit_depth,
         channels: channels_str(recipe.channels).to_string(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        device_id: device_id.to_string(),
+        device_id: device.device_id.clone(),
+        device_model: Some(device.model.clone()),
+        hardware_verification: device.hardware_verification,
         simulated: true,
         settings_fingerprint: settings_fingerprint(recipe),
         processing: Some(processing.clone()),
@@ -1592,7 +1654,8 @@ fn run_scan_job(
     batch_abort: Option<(u32, String)>,
     event_tx: mpsc::Sender<String>,
 ) {
-    let device_id = backend.device.device_id.clone();
+    let device = backend.device_info();
+    let device_id = device.device_id.clone();
     let carrier = backend
         .state
         .lock()
@@ -1907,6 +1970,8 @@ fn run_scan_job(
                     &effective_output,
                     Some(detected_boundary),
                     effective_alignment,
+                    device.hardware_verification,
+                    Some(device.model.as_str()),
                     match output_authorities.frame(frame_index) {
                         Ok(authority) => authority,
                         Err(error) => {
@@ -1945,7 +2010,7 @@ fn run_scan_job(
                         &effective_recipe,
                         &effective_processing,
                         &effective_output,
-                        &device_id,
+                        &device,
                         &written,
                         output_authorities.project_root(),
                     )
@@ -2196,7 +2261,7 @@ mod tests {
             &recipe,
             &processing,
             &output,
-            DEVICE_ID,
+            &SimulatedLs5000::new().device_info(),
             &written,
             None,
         )
@@ -2223,7 +2288,7 @@ mod tests {
             &recipe,
             &processing,
             &output,
-            DEVICE_ID,
+            &SimulatedLs5000::new().device_info(),
             &written_none,
             None,
         )
@@ -2269,7 +2334,7 @@ mod tests {
             assert!(renamed.is_err(), "held Windows output must deny replacement");
             build_receipt(
                 "job-binding-replacement", 1, 1000, &recipe, &processing, &output,
-                DEVICE_ID, &written, Some(&project_root),
+                &SimulatedLs5000::new().device_info(), &written, Some(&project_root),
             ).expect("denied replacement retains valid receipt evidence");
             drop((written, project_root));
             let _ = std::fs::remove_dir_all(root);
@@ -2285,7 +2350,7 @@ mod tests {
             &recipe,
             &processing,
             &output,
-            DEVICE_ID,
+            &SimulatedLs5000::new().device_info(),
             &written,
             Some(&project_root),
         )
@@ -2320,6 +2385,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 1.0,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         let status = sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2476,6 +2542,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2523,6 +2590,7 @@ mod tests {
             &ConnectOptions {
                 time_scale: 1.0,
                 fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
             },
         )
         .expect("connect");
@@ -2561,6 +2629,7 @@ mod tests {
             &ConnectOptions {
                 time_scale: 0.01,
                 fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
             },
         )
         .expect("connect");
@@ -2626,6 +2695,7 @@ mod tests {
             &ConnectOptions {
                 time_scale: 0.01,
                 fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
             },
         )
         .expect("connect");
@@ -2669,6 +2739,7 @@ mod tests {
             &ConnectOptions {
                 time_scale: 0.01,
                 fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
             },
         )
         .expect("connect");
@@ -2766,6 +2837,7 @@ mod tests {
             &ConnectOptions {
                 time_scale: 0.01,
                 fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
             },
         )
         .expect("connect");
@@ -2835,6 +2907,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2915,6 +2988,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2967,6 +3041,7 @@ mod tests {
             // the race against the frame's own (scaled) duration.
             time_scale: 0.2,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -3085,6 +3160,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -3169,6 +3245,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -3244,6 +3321,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         let status = sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -3270,6 +3348,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Strip6).expect("load media");
@@ -3349,6 +3428,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Mounted).expect("load media");

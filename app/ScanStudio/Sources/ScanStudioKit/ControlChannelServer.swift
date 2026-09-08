@@ -754,7 +754,7 @@ public actor ControlChannelServer {
         let lines = framer.feed(chunk)
         framers[fd] = framer
         guard !lines.contains(where: { $0.utf8.count > ControlChannelDispatcher.maxRequestLineBytes }) else {
-            await refuseOversizedLine(fd: fd, token: token)
+            await refuseOversizedLine(fd: fd, token: token, dispatcher: dispatcher)
             return
         }
         // Bytes consumed by the lines just extracted (content + the
@@ -763,7 +763,7 @@ public actor ControlChannelServer {
         let consumed = lines.reduce(0) { $0 + $1.utf8.count + 1 }
         let totalPending = max(0, (pendingLineBytes[fd] ?? 0) + chunk.count - consumed)
         guard totalPending <= ControlChannelDispatcher.maxRequestLineBytes else {
-            await refuseOversizedLine(fd: fd, token: token)
+            await refuseOversizedLine(fd: fd, token: token, dispatcher: dispatcher)
             return
         }
         pendingLineBytes[fd] = totalPending
@@ -877,13 +877,13 @@ public actor ControlChannelServer {
     /// the entry just appended) before the drain loop's own `Task` ever
     /// gets a turn to run it -- this refusal is the one write that must be
     /// on the wire *before* the descriptor closes, not merely queued.
-    private func refuseOversizedLine(fd: Int32, token: UUID) async {
+    private func refuseOversizedLine(fd: Int32, token: UUID, dispatcher: ControlChannelDispatcher) async {
         guard connectionTokens[fd] == token else { return }
         let payload = ControlErrorPayload(
             .invalidParams,
             message: "Request line exceeded \(ControlChannelDispatcher.maxRequestLineBytes) bytes before a newline was seen."
         )
-        if let data = try? JSONEncoder().encode(ControlResponseErrorEnvelope(id: 0, error: payload)) {
+        if let data = try? JSONEncoder().encode(ControlResponseErrorEnvelope(id: 0, error: payload, hardwareVerification: await dispatcher.currentHardwareVerification)) {
             var out = data
             out.append(0x0A)
             await write(fd: fd, token: token, bytes: out)
@@ -973,7 +973,8 @@ public actor ControlChannelServer {
                 let dropped = droppedEventCounts[fd] ?? 0
                 if dropped > 0 {
                     droppedEventCounts[fd] = 0
-                    if var notice = Self.encodedDroppedNotice(droppedEvents: dropped) {
+                    let verification = await dispatchers[fd]?.currentHardwareVerification ?? "notConnected"
+                    if var notice = Self.encodedDroppedNotice(droppedEvents: dropped, hardwareVerification: verification) {
                         notice.append(0x0A)
                         await write(fd: fd, token: token, bytes: notice)
                     }
@@ -1006,10 +1007,10 @@ public actor ControlChannelServer {
         return queue
     }
 
-    private static func encodedDroppedNotice(droppedEvents: Int) -> Data? {
+    private static func encodedDroppedNotice(droppedEvents: Int, hardwareVerification: String) -> Data? {
         struct DroppedEventPayload: Encodable { let droppedEvents: Int }
         return try? JSONEncoder().encode(
-            ControlEventEnvelope(event: "control.dropped", payload: DroppedEventPayload(droppedEvents: droppedEvents))
+            ControlEventEnvelope(event: "control.dropped", payload: DroppedEventPayload(droppedEvents: droppedEvents), hardwareVerification: hardwareVerification)
         )
     }
 

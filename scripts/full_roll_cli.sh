@@ -92,6 +92,7 @@ if (( simulator )); then
     socket="$socket_dir/control.sock"
     mkdir -p "$run_dir/home"
     export HOME="$run_dir/home"
+    export CFFIXED_USER_HOME="$HOME"
     unset SCANSTUDIO_BRIDGE_CMD SCANSTUDIO_HW_MOTION SCANSTUDIO_BRIDGE_SOURCE \
         SCANSTUDIO_BRIDGE_PYTHON SCANSTUDIO_BRIDGE_BASE_DIR
     export SCANSTUDIO_BRIDGE_TRANSPORT=mock

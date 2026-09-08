@@ -55,7 +55,7 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | `bridge.hello` | `{clientName: string, protocolVersion: 1}` | `{bridgeName: "scanstudio-bridge", bridgeVersion: string, protocolVersion: 1, capabilities: ["ls5000-coolscanpy"]}` | `INVALID_PARAMS` |
 | `bridge.shutdown` | `{}` | `{}` | `HARDWARE_LANE_BUSY` while an owned worker remains active |
 | `device.list` | `{}` | `{devices: [DeviceInfo]}` | — |
-| `device.open` | `{deviceId: string}` | `{device: DeviceInfo, status: DeviceStatus}` | `DEVICE_NOT_FOUND`, `ALREADY_CONNECTED`, `DEVICE_BUSY` |
+| `device.open` | `{deviceId: string, allowUnverifiedHardware?: bool}` | `{device: DeviceInfo, status: DeviceStatus}` | `DEVICE_NOT_FOUND`, `ALREADY_CONNECTED`, `DEVICE_BUSY` |
 | `device.status` | `{}` | `DeviceStatus` | `NOT_CONNECTED` |
 | `device.close` | `{}` | `{}` | `NOT_CONNECTED`, `HARDWARE_LANE_BUSY` |
 | `roll.preview` | `{material: "colorNegative"\|"blackAndWhiteNegative", slots?: [number]}` | `{accepted: true}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`; via `roll.previewError`: `FEEDER_PARKED`, `ADAPTER_UNSUPPORTED`, `REFEED_REQUIRED`, `DEVICE_BUSY`, `ROLL_MISMATCH` |
@@ -179,22 +179,25 @@ DeviceInfo
   model: string
   capabilities: Capabilities
   supported?: bool                        // optional; absent means true (see prose below)
+  unverifiedAllowed?: bool                 // absent means false
+  hardwareVerification?: "verified"|"unverified" // legacy absent means verified
 
-`DeviceInfo.supported` (Lane D, additive) is optional and defaults to `true`
-when a response omits it, for compatibility with bridges built before this
-field existed (deliberate fail-open: an old bridge that never emits
-`supported` is trusted exactly as before). `false` marks a recognized-but-
-unsupported Nikon Coolscan model (e.g. an LS-50 or LS-40 seen alongside the
-LS-5000): the device is still returned by `device.list` so it is visible,
-but a client must not call `device.open` for that id. If it does anyway,
-the bridge's own CoolscanPy `open()` call refuses it, surfacing the
-identical `DEVICE_NOT_FOUND` wire error `device.open` already returns for
-an id it has never seen at all -- `supported` is what lets a client tell
-the two apart (present-but-unsupported vs. genuinely absent) before ever
-sending the request. The reference engine additionally pre-checks
-`supported` itself and reports a local `NOT_SUPPORTED` condition without
-sending `device.open` at all; that engine-side error is not part of this
-wire contract.
+`DeviceInfo.supported` remains optional with legacy default `true`.
+`unverifiedAllowed` defaults to `false` and marks a recognized identity that may
+be attempted with explicit opt-in; it does not establish protocol compatibility.
+`hardwareVerification` is `verified` or `unverified` (legacy default `verified`).
+The LS-5000 remains the verified identity. Unknown identities never become
+openable through the flag, and name-only recognition is not a USB capture path.
+
+`device.open.allowUnverifiedHardware` defaults to `false` and rejects non-boolean
+values. Opening an unverified candidate requires both the request flag and its
+`unverifiedAllowed` classification. With the currently pinned 0.7.7 driver,
+that branch returns `DEVICE_NOT_FOUND` explaining that 0.7.8 is required. The
+bridge checks for the keyword before making one opt-in call, never retries a
+`TypeError`, and always calls legacy `coolscanpy.open(id)` for the LS-5000.
+The engine reports `NOT_SUPPORTED` before the bridge when opt-in is missing.
+Motion arming, attendance, recipe validation, and recovery rules are unchanged.
+
 
 Capabilities
   irChannel: bool
@@ -348,6 +351,7 @@ ScanReceipt
   depth: number
   deviceId: string
   deviceModel: string
+  hardwareVerification: "verified"|"unverified" // legacy absent means verified
   reviewedFingerprintSha256: string
   freshFingerprintSha256: string
   manualApproval: ApprovalReceipt|null
@@ -420,10 +424,11 @@ Three methods are MOTION-CAPABLE: `roll.preview`, `scan.start`, `device.eject`.
 
 The wired `material: "colorNegative"` capture fixes `resolutionDpi: 4000`, `bitDepth: 16`, `channels: "rgbi"`, `autofocus: true` — fixed by the LS-5000's single-pass protocol, not client-configurable. Two fields are configurable within it (2026-09-06):
 
-- `multisamplePasses` must be a member of the opened device's `capabilities.supportedMultisamplePasses`. Production advertises `[4]` (the traced Nikon Scan capture). `[1, 4]` is advertised only when the bridge process has `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE` set to exactly `"1"` AND the loaded CoolscanPy (0.7.7 or later) takes `Roll.scan_many(samples_per_scan=...)`; the value is then passed through. Single-sample capture is lab-only and unvalidated: on the live LS-5000 (2026-09-06) the scanner accepted the one-sample window and metered normally, but the first fine READ failed with a libusb OVERFLOW and the transport had to be power-cycled, so the traced 4-sample transaction framing does not carry over. A verified single-sample trace is required before this gate can be removed.
+- `multisamplePasses` must be a member of the opened device's `capabilities.supportedMultisamplePasses`. Production advertises `[4]`. The bridge's source constant `SINGLE_SAMPLE_VALIDATED_RUN` ships as `None`; `[1, 4]` requires an attended validation evidence identifier in that constant and the release notes, plus a driver that declares and accepts `samples_per_scan`. The old `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE` environment variable has no effect. While the gate is closed, the production recipe with `multisamplePasses: 1` returns `INVALID_PARAMS` before motion. The 2026-09-06 first fine READ failed with libusb OVERFLOW and required a power-cycle; simulator tests and derived framing arithmetic cannot unlock this gate.
+
 - `autoExposure: true` meters every frame. `autoExposure: false` meters the lowest requested slot as its own one-frame batch, then holds that frame's metered RGB exposure for every other requested slot through `Roll.scan_many(exposure_override_10ns=...)`; infrared is always metered, and each receipt's `exposure` reports the values actually commanded.
 
-> **`capabilities.multiSample` semantics (clarified 2026-07-23):** the bool means "the transport exposes a *variable* multi-sample control", NOT "the hardware can multisample." The LS-5000 multisamples on every wired capture — fixed 4× per the contract above. The real CoolscanPy transport reports `false` here (no adjustable knob) while MockTransport reports `true`; clients must not interpret `false` as "no multisampling" and must not encode the mock's `true` as real-device behavior. `Capabilities.supportedMultisamplePasses` is the device-sourced accepted set for `CaptureRecipe.multisamplePasses` — `[4]` for the LS-5000, or `[1, 4]` under the lab-only single-sample gate above — replacing what was previously hardcoded client-side; a future device with different pass options (e.g. a 9000 ED) supplies its own list here instead of requiring a code change. Any other value for any of those fields is `INVALID_PARAMS`, naming the first mismatched field. `"blackAndWhiteNegative"` fine scanning always returns `NOT_IMPLEMENTED` (preview still works for it). MockTransport enforces this identical contract by default, plus an opt-in permissive mode used only to test the rejection path itself.
+> **`capabilities.multiSample` semantics (clarified 2026-07-23):** the bool means "the transport exposes a *variable* multi-sample control", NOT "the hardware can multisample." The LS-5000 multisamples on every wired capture — fixed 4× per the contract above. The real CoolscanPy transport reports `false` here (no adjustable knob) while MockTransport reports `true`; clients must not interpret `false` as "no multisampling" and must not encode the mock's `true` as real-device behavior. `Capabilities.supportedMultisamplePasses` is the device-sourced accepted set for `CaptureRecipe.multisamplePasses` — `[4]` for the LS-5000, or `[1, 4]` under the attended-validation single-sample gate above — replacing what was previously hardcoded client-side; a future device with different pass options (e.g. a 9000 ED) supplies its own list here instead of requiring a code change. Any other value for any of those fields is `INVALID_PARAMS`, naming the first mismatched field. `"blackAndWhiteNegative"` fine scanning always returns `NOT_IMPLEMENTED` (preview still works for it). MockTransport enforces this identical contract by default, plus an opt-in permissive mode used only to test the rejection path itself.
 
 > **Debug recipe gate (lab-only, additive, 2026-07-23):** when the bridge process has env `SCANSTUDIO_BRIDGE_DEBUG_RECIPE` set to exactly `"1"`, `scan.start`'s recipe validation for `material: "colorNegative"` ALSO accepts a second, fixed diagnostic recipe: `resolutionDpi: 1000`, `bitDepth: 8`, `multisamplePasses: 1`, `channels: "rgb"` — `autofocus`/`autoExposure` are unconstrained under this override (either boolean is accepted for either field). This exists to isolate which phase of a real scan is failing (see the `scan.phase` telemetry above) using a fast, low-res, single-pass, no-IR capture instead of waiting on the full fixed recipe above. Purely additive, never a replacement: the primary fixed recipe is still accepted whether or not the env var is set, `Capabilities.supportedMultisamplePasses` is unchanged by this gate (it advertises `[4]` regardless), and default behavior (env unset, or set to anything other than exactly `"1"`) is byte-identical to before this override existed. This gate is for a lab bench session only — a client must never set it as part of normal operation.
 

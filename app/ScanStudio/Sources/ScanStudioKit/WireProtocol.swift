@@ -308,6 +308,36 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
     /// change required. Never encoded by this app (`DeviceInfo` is only
     /// ever decoded, never constructed here to send outbound).
     public let supportedMultisamplePasses: [Int]?
+    public let unverifiedAllowed: Bool
+    public let hardwareVerification: String?
+
+    public init(
+        deviceId: String, model: String, kind: String, firmware: String,
+        connection: String, supported: Bool, supportedMultisamplePasses: [Int]? = nil,
+        unverifiedAllowed: Bool = false, hardwareVerification: String? = nil
+    ) {
+        self.deviceId = deviceId; self.model = model; self.kind = kind
+        self.firmware = firmware; self.connection = connection; self.supported = supported
+        self.supportedMultisamplePasses = supportedMultisamplePasses
+        self.unverifiedAllowed = unverifiedAllowed; self.hardwareVerification = hardwareVerification
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case deviceId, model, kind, firmware, connection, supported, supportedMultisamplePasses
+        case unverifiedAllowed, hardwareVerification
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        deviceId = try c.decode(String.self, forKey: .deviceId)
+        model = try c.decode(String.self, forKey: .model)
+        kind = try c.decode(String.self, forKey: .kind)
+        firmware = try c.decode(String.self, forKey: .firmware)
+        connection = try c.decode(String.self, forKey: .connection)
+        supported = try c.decode(Bool.self, forKey: .supported)
+        supportedMultisamplePasses = try c.decodeIfPresent([Int].self, forKey: .supportedMultisamplePasses)
+        unverifiedAllowed = try c.decodeIfPresent(Bool.self, forKey: .unverifiedAllowed) ?? false
+        hardwareVerification = try c.decodeIfPresent(String.self, forKey: .hardwareVerification)
+    }
 }
 
 // MARK: - scanner.connect
@@ -315,10 +345,20 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
 public struct ConnectOptions: Codable, Equatable, Sendable {
     public let timeScale: Double
     public let faultInjection: String
+    public let allowUnverifiedHardware: Bool
 
-    public init(timeScale: Double, faultInjection: String) {
+    public init(timeScale: Double, faultInjection: String, allowUnverifiedHardware: Bool = false) {
         self.timeScale = timeScale
         self.faultInjection = faultInjection
+        self.allowUnverifiedHardware = allowUnverifiedHardware
+    }
+
+    private enum CodingKeys: String, CodingKey { case timeScale, faultInjection, allowUnverifiedHardware }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        timeScale = try c.decode(Double.self, forKey: .timeScale)
+        faultInjection = try c.decode(String.self, forKey: .faultInjection)
+        allowUnverifiedHardware = try c.decodeIfPresent(Bool.self, forKey: .allowUnverifiedHardware) ?? false
     }
 }
 
@@ -355,6 +395,8 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
     /// readiness check. Optional keeps older engine/status payloads
     /// decodable; `nil` means unknown/not checked, never ready.
     public let motionArmed: Bool?
+    public let hardwareVerification: String?
+    public let deviceModel: String?
 
     public init(
         connected: Bool,
@@ -366,7 +408,9 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
         transport: String,
         activeJobId: String?,
         filmPresent: Bool? = nil,
-        motionArmed: Bool? = nil
+        motionArmed: Bool? = nil,
+        hardwareVerification: String? = nil,
+        deviceModel: String? = nil
     ) {
         self.connected = connected
         self.adapter = adapter
@@ -378,6 +422,8 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
         self.activeJobId = activeJobId
         self.filmPresent = filmPresent
         self.motionArmed = motionArmed
+        self.hardwareVerification = hardwareVerification
+        self.deviceModel = deviceModel
     }
 
     /// Reconciles a legacy/stale preview flag with the stronger live sensor
@@ -395,7 +441,9 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
             transport: transport,
             activeJobId: activeJobId,
             filmPresent: false,
-            motionArmed: motionArmed
+            motionArmed: motionArmed,
+            hardwareVerification: hardwareVerification,
+            deviceModel: deviceModel
         )
     }
 }
@@ -1251,6 +1299,26 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
     public let irPath: String?
     public let meterRgbiPath: String?
     public let hardwareTelemetry: HardwareTelemetry?
+    public let deviceModel: String?
+    public let hardwareVerification: String?
+
+    public init(
+        jobId: String, frameIndex: Int, startedAt: String, durationMs: Int, passes: Int,
+        resolutionDpi: Int, bitDepth: Int, channels: String, engineVersion: String,
+        deviceId: String, simulated: Bool, settingsFingerprint: String,
+        processing: ProcessingRecipe?, output: OutputRecipe?, outputs: WrittenOutputs?,
+        rgbPath: String?, irPath: String?, meterRgbiPath: String?, hardwareTelemetry: HardwareTelemetry?,
+        deviceModel: String? = nil, hardwareVerification: String? = nil
+    ) {
+        self.jobId = jobId; self.frameIndex = frameIndex; self.startedAt = startedAt
+        self.durationMs = durationMs; self.passes = passes; self.resolutionDpi = resolutionDpi
+        self.bitDepth = bitDepth; self.channels = channels; self.engineVersion = engineVersion
+        self.deviceId = deviceId; self.simulated = simulated; self.settingsFingerprint = settingsFingerprint
+        self.processing = processing; self.output = output; self.outputs = outputs
+        self.rgbPath = rgbPath; self.irPath = irPath; self.meterRgbiPath = meterRgbiPath
+        self.hardwareTelemetry = hardwareTelemetry; self.deviceModel = deviceModel
+        self.hardwareVerification = hardwareVerification
+    }
 
     public var id: String { "\(jobId)#\(frameIndex)@\(startedAt)" }
 }

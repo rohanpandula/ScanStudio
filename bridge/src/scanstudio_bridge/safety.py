@@ -199,6 +199,7 @@ class TelemetryLog:
         self, base_dir: Path = DEFAULT_BASE_DIR, session_id: str | None = None
     ) -> None:
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
+        self.hardware_verification = "notConnected"
         path = base_dir / _TELEMETRY_DIRNAME / f"{self.session_id}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = path.open("a")
@@ -209,6 +210,7 @@ class TelemetryLog:
             "method": method,
             "outcome": outcome,
             **fields,
+            "hardware_verification": self.hardware_verification,
         }
         self._fh.write(json.dumps(entry))
         self._fh.write("\n")

@@ -253,6 +253,8 @@ pub struct ConnectOptions {
     pub time_scale: f64,
     #[serde(default)]
     pub fault_injection: FaultInjection,
+    #[serde(default)]
+    pub allow_unverified_hardware: bool,
 }
 
 impl Default for ConnectOptions {
@@ -260,6 +262,7 @@ impl Default for ConnectOptions {
         ConnectOptions {
             time_scale: default_time_scale(),
             fault_injection: FaultInjection::default(),
+            allow_unverified_hardware: false,
         }
     }
 }
@@ -299,6 +302,12 @@ pub struct ScannerStatus {
     pub lamp: Lamp,
     pub transport: Transport,
     pub active_job_id: Option<String>,
+    /// Exact connected scanner model; absent while disconnected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_model: Option<String>,
+    /// Connected scanner's verification tier; absent while disconnected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_verification: Option<domain::HardwareVerification>,
     /// Read-only result of the bridge's live SAFE-02 readiness re-check.
     /// Real backends forward `Some(true|false)` from `DeviceStatus`; the
     /// simulator has no bridge-side latch and therefore omits this field.

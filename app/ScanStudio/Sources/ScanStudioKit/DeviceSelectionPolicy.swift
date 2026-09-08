@@ -29,7 +29,8 @@ public enum DeviceSelectionPolicy {
     public static func state(
         isDiscovering: Bool,
         isConnecting: Bool = false,
-        devices: [DeviceInfo]
+        devices: [DeviceInfo],
+        allowUnverified: Bool = false
     ) -> State {
         if isDiscovering {
             return .discovering
@@ -38,7 +39,7 @@ public enum DeviceSelectionPolicy {
             return .connecting
         }
         let unsupported = unsupportedDevices(from: devices)
-        let visibleDevices = connectionCandidates(from: devices)
+        let visibleDevices = UnverifiedHardwarePolicy.connectCandidates(from: devices, allowUnverified: allowUnverified)
         switch visibleDevices.count {
         case 0:
             // No connectable device, but a recognized unsupported model is
@@ -78,9 +79,12 @@ public enum DeviceSelectionPolicy {
         return real + other
     }
 
-    /// An unspecified target is safe only when exactly one device exists.
-    /// Multiple devices always require an explicit user choice.
-    public static func resolveNilTarget(devices: [DeviceInfo]) -> String? {
+    /// Reuse an explicitly selected previous device only while it is still
+    /// discovered. Otherwise multiple devices require an explicit choice.
+    public static func resolveNilTarget(devices: [DeviceInfo], previousDeviceId: String? = nil) -> String? {
+        if let previousDeviceId {
+            return devices.contains(where: { $0.deviceId == previousDeviceId }) ? previousDeviceId : nil
+        }
         // A caller that omitted its target may not silently gain permission to
         // choose a real scanner merely because the UI filters a simulator out.
         // The UI always sends an explicit id from `state`'s visible candidate.

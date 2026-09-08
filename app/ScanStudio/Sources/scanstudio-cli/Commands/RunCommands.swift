@@ -66,6 +66,9 @@ extension Roll {
         @Option(name: .customLong("frame-count"), help: "Frame count for this carrier. Defaults to the scanner's own reported frame count from this run's initial refresh.")
         var frameCount: Int?
 
+        @Flag(name: .customLong("allow-unverified-hardware"), help: "Allow connecting to a recognized but unverified scanner for this run.")
+        var allowUnverifiedHardware = false
+
         @Option(name: .customLong("film-process"), help: "Film process: positive, c41ColorNegative, bwNegative, or kodachrome.", transform: {
             guard let value = FilmProcess(rawValue: $0) else {
                 throw ValidationError("film-process must be one of: \(FilmProcess.allCases.map(\.rawValue).joined(separator: ", "))")
@@ -130,6 +133,7 @@ extension Roll {
                 skipBlank: skipBlank,
                 autoApprove: autoApprove,
                 wait: wait,
+                allowUnverifiedHardware: allowUnverifiedHardware,
                 options: options
             )
         }
@@ -150,6 +154,7 @@ enum RollRun {
         skipBlank: Bool,
         autoApprove: Bool,
         wait: Bool,
+        allowUnverifiedHardware: Bool,
         options: GlobalOptions
     ) async throws {
         let command = "roll.run"
@@ -160,6 +165,7 @@ enum RollRun {
         try await walk(
             name: name, carrier: carrier, requestedFrameCount: requestedFrameCount,
             filmProcess: filmProcess, skipBlank: skipBlank, autoApprove: autoApprove, wait: wait,
+            allowUnverifiedHardware: allowUnverifiedHardware,
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
         )
 
@@ -176,6 +182,7 @@ enum RollRun {
         skipBlank: Bool,
         autoApprove: Bool,
         wait: Bool,
+        allowUnverifiedHardware: Bool,
         command: String,
         options: GlobalOptions,
         client: ControlChannelClient,
@@ -196,13 +203,36 @@ enum RollRun {
 
         // Step 1: scanner.refresh (with D-16's one permitted reconnect),
         // then status -- the same pair `status --refresh` sends.
-        guard try await refreshScanner(command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) else { return }
+        guard try await refreshScanner(command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode, allowUnverifiedHardware: allowUnverifiedHardware) else { return }
         guard let statusData = try await sendStep(
             "status", method: "status", params: EmptyParams(),
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
         ) else { return }
         guard let status = try? JSONDecoder().decode(ControlStatusResult.self, from: statusData) else {
             try await CommandRunner.fail(command: command, options: options, client: client, error: ControlChannelClientError.malformedResponse)
+        }
+
+        // `refreshScanner` can succeed without reconnecting when the GUI
+        // already opened an unverified device. The run flag is per-command;
+        // never inherit the GUI's opt-in through that live session.
+        if UnverifiedHardwarePolicy.shouldRefuseConnectedUnverified(
+            verification: status.scanner?.hardwareVerification,
+            allowUnverified: allowUnverifiedHardware
+        ) {
+            let payload = ControlErrorPayload(
+                code: "NOT_SUPPORTED",
+                message: "\"roll run\" requires --allow-unverified-hardware for an unverified scanner.",
+                recoverable: false,
+                guidance: "Retry with --allow-unverified-hardware after confirming the scanner is intended for this run."
+            )
+            exitCode = recordRefusal(
+                payload,
+                step: "status",
+                command: "status",
+                startedAt: ControlRunReceipt.isoTimestamp(),
+                receipt: &receipt
+            )
+            return
         }
 
         guard let frameCount = requestedFrameCount ?? status.scanner?.frameCount else {
@@ -423,7 +453,8 @@ enum RollRun {
         options: GlobalOptions,
         client: ControlChannelClient,
         receipt: inout ControlRunReceipt,
-        exitCode: inout Int32
+        exitCode: inout Int32,
+        allowUnverifiedHardware: Bool
     ) async throws -> Bool {
         let startedAt = ControlRunReceipt.isoTimestamp()
         let firstResponse = try await CommandRunner.request(command: command, method: "scanner.refresh", params: EmptyParams(), options: options, client: client)
@@ -436,7 +467,7 @@ enum RollRun {
             return false
         }
 
-        let connectResponse = try await CommandRunner.request(command: command, method: "scanner.connect", params: ControlScannerConnectParams(), options: options, client: client)
+        let connectResponse = try await CommandRunner.request(command: command, method: "scanner.connect", params: ControlScannerConnectParams(allowUnverifiedHardware: allowUnverifiedHardware), options: options, client: client)
         if case .failure(let payload) = connectResponse {
             exitCode = recordRefusal(payload, step: "refresh", command: "scanner.connect", startedAt: startedAt, receipt: &receipt)
             return false

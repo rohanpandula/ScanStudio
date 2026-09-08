@@ -35,7 +35,7 @@ def digest(path):
 
 def isolated_environment(root):
     # Never inherit bridge commands, arming, Python hooks, or developer output paths.
-    return {"HOME": str(root), "TMPDIR": str(root), "PATH": "/usr/bin:/bin",
+    return {"HOME": str(root), "CFFIXED_USER_HOME": str(root), "TMPDIR": str(root), "PATH": "/usr/bin:/bin",
             "LANG": "C", "LC_ALL": "C"}
 
 
@@ -134,7 +134,7 @@ def scan_params(root, frames):
     return {"frames": frames, "recipe": RECIPE, "output": output}
 
 
-def verify_receipts(root, expected):
+def verify_receipts(root, expected, device_id='sim-ls5000-0'):
     project = json.loads((root / 'manifest.json').read_text())
     completed = [f['index'] for f in project['frames'] if f['receipts']]
     require(completed == expected, f"persisted completion mismatch: {completed} != {expected}")
@@ -144,8 +144,12 @@ def verify_receipts(root, expected):
             continue
         require(len(frame['receipts']) == 1, f"frame was rescanned: {frame['index']}")
         receipt = frame['receipts'][0]
-        require(receipt['simulated'] is True and receipt['deviceId'] == 'sim-ls5000-0',
+        require(receipt['simulated'] is True and receipt['deviceId'] == device_id,
                 'receipt must identify simulated capture')
+        if device_id == 'sim-ls50-0':
+            require(receipt.get('hardwareVerification') == 'unverified'
+                    and 'LS-50' in receipt.get('deviceModel', ''),
+                    'unverified receipt lost model or verification provenance')
         require(receipt['frameIndex'] == frame['index'] and receipt['resolutionDpi'] == 100
                 and receipt['bitDepth'] == 16, 'receipt capture settings mismatch')
         outputs = receipt['outputs']
@@ -167,6 +171,8 @@ def verify_receipts(root, expected):
             snapshots[str(path)] = [sha, stat.st_size, stat.st_ino, stat.st_mtime_ns]
             images.append({"path": str(path), "width": 99, "height": 149,
                            "dtype": "uint8" if role == 'preview' else 'uint16'})
+            if role == 'positive' and device_id == 'sim-ls50-0':
+                images[-1]['deviceModel'] = receipt['deviceModel']
     return project, snapshots, images
 
 
@@ -183,6 +189,14 @@ for item in json.load(sys.stdin):
         raise SystemExit('unreadable image or wrong dimensions: ' + item['path'])
     if str(image.dtype) != item['dtype']:
         raise SystemExit('wrong image bit depth: ' + item['path'])
+    if 'deviceModel' in item:
+        import tifffile
+        with tifffile.TiffFile(item['path']) as tiff:
+            tags = tiff.pages[0].tags
+            if tags.get('Model') is None or tags['Model'].value != item['deviceModel']:
+                raise SystemExit('TIFF lost device model: ' + item['path'])
+            if tags.get('Software') is None or 'hardwareVerification=unverified' not in tags['Software'].value:
+                raise SystemExit('TIFF lost unverified provenance: ' + item['path'])
 '''
     subprocess.run([str(runtime), '-I', '-B', '-c', code,
                     str(runtime.parents[2] / 'site-packages')],
@@ -249,7 +263,7 @@ def _bundle_engine_pids(engine_path):
     return pids
 
 
-def cli_acceptance(cli, runtime, root):
+def cli_acceptance(cli, runtime, root, device_id='sim-ls5000-0'):
     started = time.monotonic()
     socket_directory, socket_path = _gate_socket_directory()
     host_log = socket_directory / 'host.log'
@@ -293,7 +307,18 @@ def cli_acceptance(cli, runtime, root):
         require(status.get('hostPid') == host_pid, f"attached host pid mismatch: {status}")
 
         _require_simulator_devices(step('rescan'))
-        step('connect', '--device', 'sim-ls5000-0')
+        if device_id == 'sim-ls50-0':
+            refusal = step('connect', '--device', device_id, expect_exit=65)
+            require((refusal.get('error') or {}).get('code') == 'NOT_SUPPORTED',
+                    f"unverified device opened without opt-in: {refusal}")
+            connected = step('connect', '--device', device_id, '--allow-unverified-hardware')
+            require(connected.get('hardwareVerification') == 'unverified',
+                    f"connect lost live unverified provenance: {connected}")
+            current = step('status')
+            require(current.get('hardwareVerification') == 'unverified',
+                    f"status lost live unverified provenance: {current}")
+        else:
+            step('connect', '--device', device_id)
         step('sim', 'load-media', '--carrier', 'strip6')
         step('preview', '--film-loaded')
         wait_for_status(lambda result: result.get('previewComplete') is True, 'preview')
@@ -321,12 +346,12 @@ def cli_acceptance(cli, runtime, root):
         require(pending and len(pending) < 6,
                 f"stop did not preserve a partial batch for resume: {stopped}")
         completed = [index for index in range(1, 7) if index not in pending]
-        _, preserved, images = verify_receipts(roll, completed)
+        _, preserved, images = verify_receipts(roll, completed, device_id)
         decode_images(runtime, images, root)
         step('frames', 'exclude', '6')
         step('frames', 'include', '6')
         step('preview', '--film-loaded', '--intent', 'refreshSavedProject')
-        wait_for_status(lambda result: result.get('previewComplete') is True, 'refreshed preview')
+        wait_for_status(lambda result: result.get('scanReadiness') == 'ready', 'refreshed scan readiness')
         resumed = step('resume', '--confirm-motion', '--wait')
         require((resumed.get('result') or {}).get('jobState') == 'completed',
                 f"resume did not complete the partial batch: {resumed}")
@@ -335,7 +360,7 @@ def cli_acceptance(cli, runtime, root):
                 f"missing confirmation was not refused: {refusal}")
         step('eject', '--confirm-motion')
         require(roll is not None, 'CLI roll path was not captured')
-        _, snapshots, images = verify_receipts(roll, list(range(1, 7)))
+        _, snapshots, images = verify_receipts(roll, list(range(1, 7)), device_id)
         require(all(snapshots[path] == snapshot for path, snapshot in preserved.items()),
                 'resume overwrote completed output')
         decode_images(runtime, images, root)
@@ -436,7 +461,7 @@ def acceptance(app, root):
         decode_images(runtime, images, root)
         client.close(graceful=True)
         client = None
-        cli_report = cli_acceptance(cli_path, runtime, root)
+        cli_report = cli_acceptance(cli_path, runtime, root, device_id='sim-ls50-0')
         return {"status": "passed", "scope": "simulator software only", "architecture": "arm64",
                 "appVersion": info.get('CFBundleShortVersionString'), "macOS": platform.mac_ver()[0],
                 "minimumMacOS": info['LSMinimumSystemVersion'], "engineSha256": digest(engine_path),

@@ -428,14 +428,26 @@ struct ControlChannelClientTests {
         var iterator = await client.events().makeAsyncIterator()
         _ = await iterator.next() // the initial control.snapshot
 
-        await model.handle(event: filmPresenceChangedEvent(filmPresent: true))
-
-        guard let changedLine = await iterator.next() else {
-            Issue.record("expected a control.changed event line")
-            return
+        for tier in ["verified", "unverified", "notConnected"] {
+            var status: [String: Any] = [
+                "connected": tier != "notConnected", "mediaLoaded": false,
+                "lamp": "stable", "transport": "idle", "filmPresent": true
+            ]
+            if tier != "notConnected" { status["hardwareVerification"] = tier }
+            let raw = try JSONSerialization.data(withJSONObject: [
+                "event": "scanner.status", "payload": ["status": status]
+            ])
+            await model.handle(event: EngineEvent(name: "scanner.status", rawLine: raw))
+            guard let changedLine = await iterator.next() else {
+                Issue.record("expected a control.changed event line")
+                return
+            }
+            let envelope = try JSONDecoder().decode(EventEnvelope<ControlStatusResult>.self, from: changedLine)
+            #expect(envelope.event == "control.changed")
+            let wire = try JSONSerialization.jsonObject(with: changedLine) as? [String: Any]
+            #expect(wire?["hardwareVerification"] as? String == tier)
+            #expect(await client.cliEnvelopeContext.hardwareVerification == tier)
         }
-        let envelope = try JSONDecoder().decode(EventEnvelope<ControlStatusResult>.self, from: changedLine)
-        #expect(envelope.event == "control.changed")
 
         await client.shutdown()
         await server.stop()

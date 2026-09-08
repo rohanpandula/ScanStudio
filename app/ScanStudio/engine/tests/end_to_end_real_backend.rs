@@ -202,10 +202,10 @@ fn sim_only_when_bridge_cmd_unset() {
         .expect("devices must be an array");
     assert_eq!(
         devices.len(),
-        1,
-        "with SCANSTUDIO_BRIDGE_CMD unset, scanner.list must show exactly one device: {devices:?}"
+        2,
+        "with SCANSTUDIO_BRIDGE_CMD unset, scanner.list must stay simulator-only: {devices:?}"
     );
-    assert_eq!(devices[0]["kind"], json!("simulated"));
+    assert!(devices.iter().all(|device| device["kind"] == "simulated"));
 
     send(&mut stdin, 3, "engine.shutdown", json!({}));
     let shutdown_resp = recv_response_for(&rx, 3, |_| {});
@@ -1816,8 +1816,8 @@ fn real_device_listed_and_connectable_when_bridge_cmd_set() {
         .expect("devices must be an array");
     assert_eq!(
         devices.len(),
-        2,
-        "with SCANSTUDIO_BRIDGE_CMD set to a working bridge, scanner.list must show two devices: {devices:?}"
+        3,
+        "a working bridge adds its device to both simulator identities: {devices:?}"
     );
     let real_devices: Vec<&Value> = devices
         .iter()
@@ -1845,9 +1845,11 @@ fn real_device_listed_and_connectable_when_bridge_cmd_set() {
         .iter()
         .filter(|device| device["kind"] == json!("simulated"))
         .collect();
-    assert_eq!(sim_devices.len(), 1, "expected exactly one simulated device: {devices:?}");
+    assert_eq!(sim_devices.len(), 2, "expected both simulated devices: {devices:?}");
     assert!(
-        sim_devices[0].get("supportedMultisamplePasses").is_none(),
+        sim_devices
+            .iter()
+            .all(|device| device.get("supportedMultisamplePasses").is_none()),
         "the simulator has no bridge-sourced capability list and must omit the key entirely, not null: {devices:?}"
     );
 

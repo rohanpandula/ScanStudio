@@ -165,6 +165,10 @@ pub struct BridgeDeviceInfo {
     /// always sends this; the default keeps older test fixtures valid.
     #[serde(default = "bridge_device_default_supported")]
     pub supported: bool,
+    #[serde(default)]
+    pub unverified_allowed: bool,
+    #[serde(default)]
+    pub hardware_verification: crate::domain::HardwareVerification,
 }
 
 fn bridge_device_default_supported() -> bool {
@@ -196,6 +200,10 @@ pub struct BridgeDeviceStatus {
     /// never a particular adapter (BRIDGE.md `DeviceStatus.adapter`).
     #[serde(default)]
     pub adapter: Option<String>,
+    #[serde(default)]
+    pub device_model: Option<String>,
+    #[serde(default)]
+    pub hardware_verification: Option<crate::domain::HardwareVerification>,
 }
 
 // ---------------------------------------------------------------------
@@ -451,6 +459,8 @@ pub struct BridgeScanReceipt {
     pub depth: u32,
     pub device_id: String,
     pub device_model: String,
+    #[serde(default)]
+    pub hardware_verification: crate::domain::HardwareVerification,
     pub reviewed_fingerprint_sha256: String,
     pub fresh_fingerprint_sha256: String,
     pub manual_approval: Option<BridgeApprovalReceipt>,
@@ -553,6 +563,8 @@ pub struct BridgeDeviceListResult {
 #[serde(rename_all = "camelCase")]
 pub struct BridgeDeviceOpenParams {
     pub device_id: String,
+    #[serde(default)]
+    pub allow_unverified_hardware: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -908,6 +920,7 @@ mod tests {
             depth: 16,
             device_id: "ls5000-usb-0".into(),
             device_model: "SUPER COOLSCAN 5000 ED".into(),
+            hardware_verification: crate::domain::HardwareVerification::Verified,
             reviewed_fingerprint_sha256: "3f9a7e2c8b1d4560a9e4c1d7f6b2a830".into(),
             fresh_fingerprint_sha256: "3f9a7e2c8b1d4560a9e4c1d7f6b2a830".into(),
             manual_approval: None,

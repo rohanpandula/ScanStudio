@@ -125,10 +125,12 @@ public struct ControlErrorPayload: Codable, Equatable, Sendable {
 public struct ControlResponseEnvelope<Result: Encodable>: Encodable {
     public let id: UInt64
     public let result: Result
+    public let hardwareVerification: String
 
-    public init(id: UInt64, result: Result) {
+    public init(id: UInt64, result: Result, hardwareVerification: String = "notConnected") {
         self.id = id
         self.result = result
+        self.hardwareVerification = hardwareVerification
     }
 }
 
@@ -138,10 +140,20 @@ public struct ControlResponseEnvelope<Result: Encodable>: Encodable {
 public struct ControlResponseErrorEnvelope: Codable, Equatable, Sendable {
     public let id: UInt64
     public let error: ControlErrorPayload
+    public let hardwareVerification: String
 
-    public init(id: UInt64, error: ControlErrorPayload) {
+    public init(id: UInt64, error: ControlErrorPayload, hardwareVerification: String = "notConnected") {
         self.id = id
         self.error = error
+        self.hardwareVerification = hardwareVerification
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, error, hardwareVerification }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UInt64.self, forKey: .id)
+        error = try c.decode(ControlErrorPayload.self, forKey: .error)
+        hardwareVerification = try c.decodeIfPresent(String.self, forKey: .hardwareVerification) ?? "notConnected"
     }
 }
 
@@ -149,10 +161,12 @@ public struct ControlResponseErrorEnvelope: Codable, Equatable, Sendable {
 public struct ControlEventEnvelope<Payload: Encodable>: Encodable {
     public let event: String
     public let payload: Payload
+    public let hardwareVerification: String
 
-    public init(event: String, payload: Payload) {
+    public init(event: String, payload: Payload, hardwareVerification: String = "notConnected") {
         self.event = event
         self.payload = payload
+        self.hardwareVerification = hardwareVerification
     }
 }
 
@@ -290,9 +304,18 @@ public struct ControlReviewApproveParams: Codable, Equatable, Sendable {
 
 public struct ControlScannerConnectParams: Codable, Equatable, Sendable {
     public let deviceId: String?
+    public let allowUnverifiedHardware: Bool
 
-    public init(deviceId: String? = nil) {
+    public init(deviceId: String? = nil, allowUnverifiedHardware: Bool = false) {
         self.deviceId = deviceId
+        self.allowUnverifiedHardware = allowUnverifiedHardware
+    }
+
+    private enum CodingKeys: String, CodingKey { case deviceId, allowUnverifiedHardware }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        deviceId = try c.decodeIfPresent(String.self, forKey: .deviceId)
+        allowUnverifiedHardware = try c.decodeIfPresent(Bool.self, forKey: .allowUnverifiedHardware) ?? false
     }
 }
 

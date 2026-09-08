@@ -93,16 +93,18 @@ public struct ControlCLIEnvelopeContext: Sendable, Equatable {
     public let hostStarted: Bool
     public let hostPid: Int32?
     public let logPath: String?
+    public let hardwareVerification: String
 
-    public init(mode: ControlHostMode, hostStarted: Bool, hostPid: Int32?, logPath: String?) {
+    public init(mode: ControlHostMode, hostStarted: Bool, hostPid: Int32?, logPath: String?, hardwareVerification: String = "notConnected") {
         self.mode = mode
         self.hostStarted = hostStarted
         self.hostPid = hostPid
         self.logPath = logPath
+        self.hardwareVerification = hardwareVerification
     }
 
     public static let unreached = ControlCLIEnvelopeContext(
-        mode: .unreached, hostStarted: false, hostPid: nil, logPath: nil
+        mode: .unreached, hostStarted: false, hostPid: nil, logPath: nil, hardwareVerification: "notConnected"
     )
 }
 
@@ -155,6 +157,7 @@ public enum ControlCLIOutput {
             key: value
         ]
         envelope["hostStarted"] = context.hostStarted
+        envelope["hardwareVerification"] = context.hardwareVerification
         if let hostPid = context.hostPid { envelope["hostPid"] = hostPid }
         if let logPath = context.logPath { envelope["logPath"] = logPath }
         return envelope

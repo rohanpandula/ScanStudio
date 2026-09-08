@@ -164,7 +164,7 @@ Final attended full-roll hardware acceptance for beta.16 is **NOT RUN**. Simulat
 acceptance covers stop, reopen, process interruption, destination refusal,
 resume, and saved-file integrity; it cannot prove physical image quality or
 transport. The [hardware matrix](../../docs/HARDWARE-SUPPORT.md) distinguishes
-LS-5000 evidence from recognition/probing of unsupported models. Real B&W
+LS-5000 evidence from unverified LS-40/LS-50 candidates and name-only FireWire recognition. Explicit opt-in requires CoolscanPy 0.7.8; the current 0.7.7 pin still refuses unverified opens. Real B&W
 fine scanning remains blocked; infrared ICE is unsuitable for silver B&W film.
 
 ## Contracts, platforms, and licenses

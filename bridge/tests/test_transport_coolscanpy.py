@@ -689,13 +689,17 @@ def test_list_devices_passes_through_supported_from_coolscanpy(
 ) -> None:
     # Lane D (#14): a recognized-but-unsupported model must reach the wire
     # with supported=False so the app never offers a connect affordance.
-    info = _fake_device_info(supported=False)
+    info = _fake_device_info(
+        device_id="usb:1:9", model="LS-50 ED", supported=False
+    )
     monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
 
     devices = CoolscanPyTransport().list_devices()
 
     assert len(devices) == 1
     assert devices[0].supported is False
+    assert devices[0].unverified_allowed is True
+    assert devices[0].hardware_verification is domain.HardwareVerification.UNVERIFIED
 
 
 def test_capabilities_from_coolscanpy_reports_fixed_supported_multisample_passes() -> None:
@@ -877,6 +881,68 @@ def test_open_device_refuses_an_unverified_identity_without_synthesizing_ls5000(
 
     assert excinfo.value.code == ErrorCode.DEVICE_NOT_FOUND
     assert "Coolscan Mystery Model" in str(excinfo.value)
+
+    with pytest.raises(BridgeError) as opted_in:
+        CoolscanPyTransport().open_device(
+            info.id, allow_unverified_hardware=True
+        )
+    assert opted_in.value.code is ErrorCode.DEVICE_NOT_FOUND
+
+
+def test_verified_open_never_passes_unverified_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = _fake_device_info()
+    device = _FakeDevice(info=info)
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+    monkeypatch.setattr(coolscanpy, "open", lambda device_id: device)
+
+    opened = CoolscanPyTransport().open_device(
+        info.id, allow_unverified_hardware=True
+    )
+
+    assert opened.hardware_verification is domain.HardwareVerification.VERIFIED
+
+
+def test_legacy_driver_refuses_unverified_open_before_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = _fake_device_info(device_id="usb:1:9", model="LS-50 ED", supported=False)
+    calls: list[str] = []
+
+    def legacy_open(device_id: str) -> object:
+        calls.append(device_id)
+        return object()
+
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+    monkeypatch.setattr(coolscanpy, "open", legacy_open)
+
+    with pytest.raises(BridgeError) as refused:
+        CoolscanPyTransport().open_device(info.id, allow_unverified_hardware=True)
+
+    assert refused.value.code is ErrorCode.DEVICE_NOT_FOUND
+    assert "0.7.8" in refused.value.message
+    assert calls == []
+
+
+def test_unverified_driver_type_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = _fake_device_info(device_id="usb:1:9", model="LS-50 ED", supported=False)
+    calls: list[str] = []
+
+    def failing_open(device_id: str, *, allow_unverified: bool = False) -> object:
+        calls.append(device_id)
+        raise TypeError("unverified open failed")
+
+    monkeypatch.setattr(coolscanpy, "get_devices", lambda: [info])
+    monkeypatch.setattr(coolscanpy, "open", failing_open)
+
+    with pytest.raises(BridgeError) as refused:
+        CoolscanPyTransport().open_device(info.id, allow_unverified_hardware=True)
+
+    assert refused.value.code is ErrorCode.DEVICE_NOT_FOUND
+    assert calls == [info.id]
 
 
 # -- preview -----------------------------------------------------------------------
@@ -4032,7 +4098,7 @@ def test_confirmed_real_device_eject_needs_no_second_probe(monkeypatch):
 
 
 def _single_sample_driver(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stand in for CoolscanPy 0.7.7's declaration plus the lab opt-in without
+    """Stand in for the validated driver capability without
     needing that driver installed: the transport consults this one helper for
     the accepted set."""
     monkeypatch.setattr(coolscanpy_transport_module, "supported_samples_per_scan", lambda: (1, 4))
@@ -4052,19 +4118,33 @@ def _scan(transport: CoolscanPyTransport, slots: list[int], recipe: domain.Captu
 def test_supported_samples_per_scan_never_widens_on_a_declaration_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(coolscanpy_transport_module.SINGLE_SAMPLE_ENV_VAR, raising=False)
     monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, 4), raising=False)
-    # Without the lab opt-in the driver's declaration changes nothing.
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
     assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
-    monkeypatch.setenv(coolscanpy_transport_module.SINGLE_SAMPLE_ENV_VAR, "1")
+
+    monkeypatch.setenv("SCANSTUDIO_BRIDGE_SINGLE_SAMPLE", "1")
+    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
+
+    monkeypatch.setattr(
+        coolscanpy_transport_module,
+        "SINGLE_SAMPLE_VALIDATED_RUN",
+        "2026-09-09 LS-5000 ED firmware 1.03 SA-30 junk strip",
+    )
     has_keyword = "samples_per_scan" in inspect.signature(coolscanpy.Roll.scan_many).parameters
     assert coolscanpy_transport_module.supported_samples_per_scan() == ((1, 4) if has_keyword else (4,))
+
+
+def test_supported_samples_per_scan_stays_closed_without_driver_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        coolscanpy_transport_module,
+        "SINGLE_SAMPLE_VALIDATED_RUN",
+        "2026-09-09 LS-5000 ED firmware 1.03 SA-30 junk strip",
+    )
     monkeypatch.delattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", raising=False)
     assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
     monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, True, "4"), raising=False)
-    assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
-    monkeypatch.setenv(coolscanpy_transport_module.SINGLE_SAMPLE_ENV_VAR, "true")
-    monkeypatch.setattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", (1, 4), raising=False)
     assert coolscanpy_transport_module.supported_samples_per_scan() == (4,)
 
 

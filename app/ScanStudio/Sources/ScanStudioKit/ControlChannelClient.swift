@@ -101,6 +101,17 @@ public actor ControlChannelClient {
         cliEnvelopeContext = context
     }
 
+    private func updateHardwareVerification(_ value: String?) {
+        guard let value, value == "verified" || value == "unverified" || value == "notConnected" else { return }
+        cliEnvelopeContext = ControlCLIEnvelopeContext(
+            mode: cliEnvelopeContext.mode,
+            hostStarted: cliEnvelopeContext.hostStarted,
+            hostPid: cliEnvelopeContext.hostPid,
+            logPath: cliEnvelopeContext.logPath,
+            hardwareVerification: value
+        )
+    }
+
     /// Dials `path` via `ControlSocketDialer`'s own `dial(path:)` -- the
     /// same primitive the server's own stale-socket probe uses, so this
     /// file contains no second dial implementation -- wraps the descriptor,
@@ -273,6 +284,9 @@ public actor ControlChannelClient {
             return
         }
         guard let id = sniff.id else {
+            if let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
+                updateHardwareVerification(object["hardwareVerification"] as? String)
+            }
             routeEvent(lineData)
             return
         }
@@ -281,6 +295,9 @@ public actor ControlChannelClient {
                 contentsOf: Data("ControlChannelClient: dropped a response for unknown request id \(id)\n".utf8)
             )
             return
+        }
+        if let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
+            updateHardwareVerification(object["hardwareVerification"] as? String)
         }
         if let errorEnvelope = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: lineData) {
             continuation.resume(returning: .failure(errorEnvelope.error))

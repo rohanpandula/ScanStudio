@@ -878,19 +878,6 @@ use crate::protocol::{
 };
 use serde::Serialize;
 
-/// One bridge-reported device's identity/support flag as of the last
-/// `device.list` this engine instance saw, keyed by device id in
-/// `RealLs5000::known_devices`. `connect()` looks up the REQUESTED device id
-/// here (Lane D, #14-C) so a dual-attach -- e.g. an unsupported LS-50
-/// alongside a supported LS-5000 -- refuses only the specific unsupported
-/// unit that was actually asked for, not every id regardless of which
-/// device this engine happened to see first.
-#[derive(Debug, Clone)]
-struct KnownDevice {
-    model: String,
-    supported: bool,
-}
-
 /// Backend for the real Nikon LS-5000, speaking to it through the
 /// `scanstudio-bridge` subprocess over `BridgeClient`. Every
 /// `ScannerBackend` method translates the engine's PROTOCOL.md-shaped call
@@ -943,20 +930,19 @@ pub struct RealLs5000 {
     /// for this process. It is metadata only: never used for hardware policy,
     /// and absent/invalid values merely make #106 evidence unavailable.
     client_build: Mutex<Option<String>>,
+    /// Exact identity returned by the successful device.open for this session.
+    active_device: Mutex<Option<domain::DeviceInfo>>,
     device_id: String,
     model: String,
     /// False when the bridge discovered a recognized-but-unsupported Nikon
     /// model (Lane D, #14). The backend still starts so ``scanner.list`` can
-    /// show the unit by name, but ``connect`` refuses it.
+    /// show the unit and its explicit opt-in eligibility.
     supported: bool,
-    /// Every device this engine instance's construction-time `device.list`
-    /// reported, keyed by id (Lane D, #14-C). `device_id`/`model`/`supported`
-    /// above stay the single FIRST-seen device (unchanged -- `device_info()`
-    /// still reports only one device, matching `scanner.list`'s existing
-    /// one-real-device shape); this map exists so `connect(device_id)` can
-    /// decide per REQUESTED device instead of trusting whichever device was
-    /// first in the original list.
-    known_devices: HashMap<String, KnownDevice>,
+    unverified_allowed: bool,
+    hardware_verification: domain::HardwareVerification,
+    /// Every identity from the bridge's construction-time `device.list`, in
+    /// discovery order. `connect(device_id)` selects from this exact set.
+    known_devices: Vec<domain::DeviceInfo>,
     /// The holder classification derived from the bridge's authoritative
     /// `DeviceInfo.capabilities`. `device.list` supplies the initial value,
     /// and every successful `device.open` refreshes it because a holder may
@@ -2691,20 +2677,26 @@ impl RealLs5000 {
         // Lane D, #14-C: snapshot every device this device.list reported,
         // not just the first -- connect() needs the REQUESTED device's own
         // supported flag, not whichever device this engine happened to see
-        // first. device_id/model/supported below deliberately stay the
-        // first-seen device unchanged (device_info()/scanner.list still
-        // report exactly one real device).
-        let known_devices: HashMap<String, KnownDevice> = devices_result
+        // first. The scalar fields below remain the first-seen disconnected
+        // default; scanner.list uses the complete ordered snapshot.
+        let firmware_label = format!("bridge {}", bridge.hello_info().bridge_version);
+        let known_devices: Vec<domain::DeviceInfo> = devices_result
             .devices
             .iter()
             .map(|device| {
-                (
-                    device.device_id.clone(),
-                    KnownDevice {
-                        model: device.model.clone(),
-                        supported: device.supported,
-                    },
-                )
+                domain::DeviceInfo {
+                    device_id: device.device_id.clone(),
+                    model: device.model.clone(),
+                    kind: "real".to_string(),
+                    firmware: firmware_label.clone(),
+                    connection: "USB (bridge)".to_string(),
+                    supported: device.supported,
+                    unverified_allowed: device.unverified_allowed,
+                    hardware_verification: device.hardware_verification,
+                    supported_multisample_passes: Some(
+                        derive_supported_multisample_passes(&device.capabilities),
+                    ),
+                }
             })
             .collect();
         let bridge_device =
@@ -2715,8 +2707,6 @@ impl RealLs5000 {
         let supported_multisample_passes =
             derive_supported_multisample_passes(&bridge_device.capabilities);
         let detected_holder = derive_detected_holder(&bridge_device.capabilities);
-        let firmware_label = format!("bridge {}", bridge.hello_info().bridge_version);
-
         Ok(RealLs5000 {
             bridge,
             next_session_epoch: AtomicU64::new(0),
@@ -2729,9 +2719,12 @@ impl RealLs5000 {
             preview_terminal_session_loss_test_hook: false,
             active_scan_job_id: Arc::new(Mutex::new(None)),
             client_build: Mutex::new(None),
+            active_device: Mutex::new(None),
             device_id: bridge_device.device_id,
             model: bridge_device.model,
             supported: bridge_device.supported,
+            unverified_allowed: bridge_device.unverified_allowed,
+            hardware_verification: bridge_device.hardware_verification,
             known_devices,
             detected_holder: Mutex::new(detected_holder),
             firmware_label,
@@ -2806,6 +2799,9 @@ impl RealLs5000 {
     /// `SimulatedLs5000::device_info`. Not part of `ScannerBackend` since it
     /// doesn't touch backend connection state.
     pub fn device_info(&self) -> domain::DeviceInfo {
+        if let Some(device) = self.active_device.lock().unwrap().clone() {
+            return device;
+        }
         domain::DeviceInfo {
             device_id: self.device_id.clone(),
             model: self.model.clone(),
@@ -2813,6 +2809,8 @@ impl RealLs5000 {
             firmware: self.firmware_label.clone(),
             connection: "USB (bridge)".to_string(),
             supported: self.supported,
+            unverified_allowed: self.unverified_allowed,
+            hardware_verification: self.hardware_verification,
             // The same device-sourced set scan_start's own INVALID_PARAMS
             // gate already validates multisamplePasses against (see the
             // "multisamplePasses must be one of {:?} for this device"
@@ -2822,6 +2820,25 @@ impl RealLs5000 {
             // Capabilities, never absent data.
             supported_multisample_passes: Some(self.supported_multisample_passes.clone()),
         }
+    }
+
+    pub fn device_infos(&self) -> Vec<domain::DeviceInfo> {
+        let mut devices = self.known_devices.clone();
+        if let Some(active) = self.active_device.lock().unwrap().clone() {
+            if let Some(device) = devices
+                .iter_mut()
+                .find(|device| device.device_id == active.device_id)
+            {
+                *device = active;
+            }
+        }
+        devices
+    }
+
+    pub(crate) fn recognizes(&self, device_id: &str) -> bool {
+        self.known_devices
+            .iter()
+            .any(|device| device.device_id == device_id)
     }
 
     pub(crate) fn set_client_build(&self, client_build: Option<String>) {
@@ -2844,6 +2861,7 @@ impl RealLs5000 {
         let epoch = self.active_session_epoch.swap(0, Ordering::AcqRel);
         let invalidated = epoch != 0;
         if invalidated {
+            *self.active_device.lock().unwrap() = None;
             // A request-side session loss cannot prove that a preview worker
             // has stopped reading the process-global event queue. Retire
             // completed approval immediately, but leave the exact active or
@@ -2866,6 +2884,8 @@ impl RealLs5000 {
             lamp: Lamp::Off,
             transport: Transport::Idle,
             active_job_id: None,
+            device_model: None,
+            hardware_verification: None,
             motion_armed: None,
             film_present: None,
         }
@@ -3400,6 +3420,7 @@ impl RealLs5000 {
         {
             return false;
         }
+        *self.active_device.lock().unwrap() = None;
 
         Self::invalidate_preview_state_for_epoch_locked(&mut preview_state, expected_epoch);
         drop(preview_state);
@@ -3879,11 +3900,17 @@ impl ScannerBackend for RealLs5000 {
     fn connect(
         &self,
         device_id: &str,
-        _options: &ConnectOptions,
+        options: &ConnectOptions,
     ) -> Result<ConnectResult, EngineError> {
         self.ensure_preview_stream_allows_connect_or_eject()?;
-        if let Some(requested) = self.known_devices.get(device_id) {
-            if !requested.supported {
+        if let Some(requested) = self
+            .known_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+        {
+            if !requested.supported
+                && !(options.allow_unverified_hardware && requested.unverified_allowed)
+            {
                 // Recognize-and-refuse (Lane D, #14 / #14-C): refuse the
                 // SPECIFIC requested device when it is a recognized-but-
                 // unsupported Nikon model, decided from THIS id's own
@@ -3893,21 +3920,26 @@ impl ScannerBackend for RealLs5000 {
                 // supported LS-5000) must not block connecting to the
                 // LS-5000 just because the LS-50 happened to enumerate
                 // first.
-                return Err(EngineError::new(
-                    ErrorCode::NotSupported,
+                let message = if requested.unverified_allowed {
                     format!(
-                        "{} is recognized but not supported; only the LS-5000 is supported",
+                        "{} is recognized but not supported; only the LS-5000 is supported. Turn on \"Allow unverified scanners\" (or pass --allow-unverified-hardware) to open it anyway; every output will be tagged unverified.",
                         requested.model
-                    ),
-                ));
+                    )
+                } else {
+                    format!(
+                        "{} is recognized but not supported; no unverified capture path is available for this device",
+                        requested.model
+                    )
+                };
+                return Err(EngineError::new(ErrorCode::NotSupported, message));
             }
         }
         // An id this engine's device.list snapshot did not recognize falls
         // through to device.open below, which surfaces the bridge's own
         // not-found response -- unchanged from before known_devices existed.
         // BRIDGE.md has no equivalent of the simulator's `timeScale` /
-        // `faultInjection` concepts — both are simulator-only, so
-        // `options` is intentionally ignored here.
+        // `faultInjection` concepts. The unverified flag is forwarded only
+        // for a recognized device whose discovery record explicitly permits it.
         self.bridge
             .ensure_running_for_explicit_connect()
             .map_err(|err| {
@@ -3916,11 +3948,28 @@ impl ScannerBackend for RealLs5000 {
                     format!("bridge is unavailable for explicit reconnect: {err}"),
                 )
             })?;
+        let allow_unverified_hardware = self
+            .known_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .is_some_and(|device| {
+                !device.supported
+                    && device.unverified_allowed
+                    && options.allow_unverified_hardware
+            });
+        let open_params = if allow_unverified_hardware {
+            serde_json::json!({
+                "deviceId": device_id,
+                "allowUnverifiedHardware": true,
+            })
+        } else {
+            serde_json::json!({ "deviceId": device_id })
+        };
         let result_value = self
             .bridge
             .call_with_deadline(
                 "device.open",
-                serde_json::json!({ "deviceId": device_id }),
+                open_params,
                 DEVICE_OPEN_CALL_DEADLINE,
             )
             .map_err(|error| match error {
@@ -3944,9 +3993,23 @@ impl ScannerBackend for RealLs5000 {
         // `device.open` is newer than the construction-time `device.list`
         // result: the physical holder can change while disconnected.
         self.refresh_detected_holder(&result.device.capabilities);
+        let opened_device = domain::DeviceInfo {
+            device_id: result.device.device_id.clone(),
+            model: result.device.model.clone(),
+            kind: "real".to_string(),
+            firmware: self.firmware_label.clone(),
+            connection: "USB (bridge)".to_string(),
+            supported: result.device.supported,
+            unverified_allowed: result.device.unverified_allowed,
+            hardware_verification: result.device.hardware_verification,
+            supported_multisample_passes: Some(derive_supported_multisample_passes(
+                &result.device.capabilities,
+            )),
+        };
+        *self.active_device.lock().unwrap() = Some(opened_device.clone());
         self.mark_session_connected();
         Ok(ConnectResult {
-            device: self.device_info(),
+            device: opened_device,
             status: map_status(&result.status, self.detected_holder()),
             already_connected: false,
         })
@@ -5130,6 +5193,8 @@ fn map_status(
             Transport::Idle
         },
         active_job_id: bridge.active_job_id.clone(),
+        device_model: bridge.device_model.clone(),
+        hardware_verification: bridge.hardware_verification,
         motion_armed: Some(bridge.motion_armed),
         film_present: bridge.film_present,
     }
@@ -5639,6 +5704,8 @@ fn build_real_receipt(
         channels: channels_str(recipe.channels).to_string(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         device_id: bridge_receipt.device_id.clone(),
+        device_model: Some(bridge_receipt.device_model.clone()),
+        hardware_verification: bridge_receipt.hardware_verification,
         simulated: false,
         settings_fingerprint: crate::sim::settings_fingerprint(recipe),
         processing: Some(processing.clone()),
@@ -7539,6 +7606,8 @@ fn run_real_scan_job_inner(
                                         derivative_geometry.as_ref(),
                                         nikonlook_exposure_10ns_from_receipt(&frame_completed.receipt.exposure),
                                         frame_completed.receipt.dpi,
+                                        frame_completed.receipt.hardware_verification,
+                                        Some(frame_completed.receipt.device_model.as_str()),
                                         authorities,
                                     )
                                     .and_then(|written| {
@@ -9210,6 +9279,8 @@ mod tests {
             motion_armed: false,
             film_present: Some(true),
             adapter: Some("Mount".to_string()),
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
         let heuristic_holder = derive_detected_holder(&capabilities(Some(40), true));
         let status = map_status(&bridge_status, heuristic_holder);
@@ -9232,6 +9303,8 @@ mod tests {
             motion_armed: false,
             film_present: None,
             adapter: Some("Feeder".to_string()),
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
         let status = map_status(&bridge_status, None);
         assert_eq!(status.adapter.as_deref(), Some("Feeder"));
@@ -9268,6 +9341,8 @@ mod tests {
             motion_armed: false,
             film_present: Some(true),
             adapter: None,
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
         let holder = derive_detected_holder(&capabilities(Some(40), true));
         let status = map_status(&bridge_status, holder);
@@ -9319,6 +9394,8 @@ mod tests {
             motion_armed: true,
             film_present: None,
             adapter: None,
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
 
         let status = map_status(&bridge_status, None);
@@ -9394,6 +9471,8 @@ mod tests {
                     motion_armed: false,
                     film_present: Some(true),
                     adapter: None,
+                    device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+                    hardware_verification: Some(domain::HardwareVerification::Verified),
                 },
                 derive_detected_holder(&capabilities(capacity, frame_control)),
             );

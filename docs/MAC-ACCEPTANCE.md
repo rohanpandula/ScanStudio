@@ -26,8 +26,8 @@ fully decode images, with no host Python imaging dependency.
 
 The central `app/ScanStudio/scripts/test_packaged_bridge.sh` gate invokes this
 script with its relocated app and bundled runtime, before the final codesign
-verification. Thus `make package` (root or app directory),
-`make -C app/ScanStudio package-check`, packaged CI, the macOS 14 floor check,
+verification. Thus `make package` and `make package-check` from `app/ScanStudio`,
+packaged CI, the macOS 14 floor check,
 and signed-package verification automatically include acceptance. DMG packaging
 also calls that gate against the mounted app, so the same test covers the DMG
 contents. Separate workflow invocations are unnecessary. Retain the JSON stdout
@@ -41,7 +41,9 @@ establish execution on macOS 14.
 
 The gate creates a disposable roll under a unique path containing spaces and
 `#`. HOME, TMPDIR, and child environment are isolated. No bridge command or
-hardware-arming settings are inherited; only `sim-ls5000-0` is selected. It never
+hardware-arming settings are inherited. The engine leg selects `sim-ls5000-0`;
+the CLI leg selects `sim-ls50-0`, proves default refusal and explicit opt-in,
+and checks live verification, receipt model/tier, and derivative TIFF tags. It never
 launches the native app or commands scanner movement.
 
 1. Create a three-frame C-41 project and explicitly request preview for frames

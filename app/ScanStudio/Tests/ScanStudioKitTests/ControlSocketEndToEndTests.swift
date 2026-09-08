@@ -31,9 +31,9 @@ private struct EndToEndHost {
     let enginePids: [Int32]
     private let originalEnvironment: [String: String]
     private static let isolatedKeys = [
-        "HOME", "TMPDIR", "SCANSTUDIO_TIMESCALE", "SCANSTUDIO_BRIDGE_CMD",
+        "HOME", "CFFIXED_USER_HOME", "TMPDIR", "SCANSTUDIO_TIMESCALE", "SCANSTUDIO_BRIDGE_CMD",
         "SCANSTUDIO_HW_MOTION", "SCANSTUDIO_BRIDGE_SOURCE", "SCANSTUDIO_BRIDGE_PYTHON",
-        "SCANSTUDIO_BRIDGE_TRANSPORT", "SCANSTUDIO_BRIDGE_BASE_DIR", "SCANSTUDIO_TEST_PREFERENCES_SUITE"
+        "SCANSTUDIO_BRIDGE_TRANSPORT", "SCANSTUDIO_BRIDGE_BASE_DIR"
     ]
 
     static func start() async throws -> EndToEndHost {
@@ -52,14 +52,16 @@ private struct EndToEndHost {
         setenv("HOME", root.path, 1)
         setenv("TMPDIR", root.path, 1)
         setenv("SCANSTUDIO_TIMESCALE", "0.1", 1)
-        setenv("SCANSTUDIO_TEST_PREFERENCES_SUITE", "dev.scanstudio.e2e.\(root.lastPathComponent)", 1)
+        setenv("CFFIXED_USER_HOME", root.path, 1)
         var handle: SessionHost.Handle?
         var pid = getpid()
         do {
             if kind == .inProcess {
                 handle = try await SessionHost.launch(
                     engineURL: engineURL, socketPath: socket,
-                    diagnosticsDirectory: root.appendingPathComponent("diagnostics"), hostKind: .gui
+                    diagnosticsDirectory: root.appendingPathComponent("diagnostics"),
+                    preferences: UserDefaults(suiteName: "dev.scanstudio.e2e.\(root.lastPathComponent)")!,
+                    hostKind: .gui
                 )
             } else {
                 let result = try await runE2ECLI([
@@ -1118,6 +1120,25 @@ struct ControlSocketEndToEndTests {
             // byte-for-byte (D-19's own documented contract).
             let saveProgress = try #require(saveBody["progress"] as? [String: Any], Comment(rawValue: saveResult.context))
             let firstJobId = try #require(saveProgress["jobId"] as? String, Comment(rawValue: saveResult.context))
+
+            // The save --wait response can observe the job's terminal state
+            // before the per-frame projection has published its terminal
+            // error. Wait for the job-specific terminal snapshot carrying
+            // the attributed frame code before reading frames/list.
+            var frame3FailurePublished = false
+            for _ in 0..<200 {
+                let pollResult = try await step(["status", "--job", firstJobId])
+                #expect(pollResult.exitCode == 0, Comment(rawValue: pollResult.context))
+                let pollBody = try resultObject(pollResult)
+                let frameErrorCodes = pollBody["frameErrorCodes"] as? [String: String]
+                if pollBody["jobState"] as? String == "failed",
+                   frameErrorCodes?["3"] == "ROLL_MISMATCH" {
+                    frame3FailurePublished = true
+                    break
+                }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            #expect(frame3FailurePublished, "the failed job must publish frame 3's attributed terminal error")
 
             // -- D-20: frames list names the armed frame's real cause,
             // never INTERNAL, and every later frame is notAttempted with

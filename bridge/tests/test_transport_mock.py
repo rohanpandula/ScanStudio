@@ -66,10 +66,9 @@ def _output_with_raw(
 # -- list_devices ---------------------------------------------------------------
 
 
-def test_list_devices_returns_exactly_one_device() -> None:
+def test_list_devices_returns_verified_and_unverified_devices() -> None:
     devices = MockTransport().list_devices()
-    assert len(devices) == 1
-    assert devices[0].device_id == _DEVICE_ID
+    assert [device.device_id for device in devices] == [_DEVICE_ID, "mock-ls50-0"]
 
 
 def test_slot_templates_reserve_distinct_paths_and_reject_bad_maps(tmp_path: Path) -> None:

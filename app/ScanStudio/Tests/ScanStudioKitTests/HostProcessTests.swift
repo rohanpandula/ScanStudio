@@ -25,15 +25,13 @@ struct HostProcessTests {
         let socket = root.appendingPathComponent("s.sock").path
         let log = root.appendingPathComponent("host.log").path
         #expect(socket.utf8.count < 104)
-        let preferencesSuite = "scanstudio.host.\(UUID().uuidString)"
-        defer { UserDefaults(suiteName: preferencesSuite)?.removePersistentDomain(forName: preferencesSuite) }
 
         let environment = [
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
             "HOME": root.path,
+            "CFFIXED_USER_HOME": root.path,
             "TMPDIR": root.path,
-            "SCANSTUDIO_TIMESCALE": "0.1",
-            "SCANSTUDIO_TEST_PREFERENCES_SUITE": preferencesSuite
+            "SCANSTUDIO_TIMESCALE": "0.1"
         ]
         let start = try runCLI(["host", "--detach", "--simulator", "--socket", socket, "--engine", engine, "--log", log], environment: environment)
         #expect(start.status == 0, Comment(rawValue: start.stdout + start.stderr))

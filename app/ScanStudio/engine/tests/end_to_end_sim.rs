@@ -129,6 +129,93 @@ fn simulated_status_omits_bridge_motion_armed() {
 }
 
 #[test]
+fn ls50_requires_explicit_opt_in_and_stamps_live_status() {
+    let bin = env!("CARGO_BIN_EXE_scanstudio-engine");
+    let mut child = Command::new(bin)
+        .env_remove("SCANSTUDIO_BRIDGE_CMD")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn simulator-only engine");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader_handle = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    send(
+        &mut stdin,
+        1,
+        "engine.hello",
+        json!({"clientName": "sim-ls50-opt-in", "protocolVersion": 1}),
+    );
+    assert!(recv_response_for(&rx, 1, |_| {}).get("error").is_none());
+
+    send(&mut stdin, 2, "scanner.list", json!({}));
+    let devices = recv_response_for(&rx, 2, |_| {});
+    let ls50 = devices["result"]["devices"]
+        .as_array()
+        .expect("device list")
+        .iter()
+        .find(|device| device["deviceId"] == "sim-ls50-0")
+        .expect("LS-50 simulation");
+    assert_eq!(ls50["unverifiedAllowed"], true);
+    assert_eq!(ls50["hardwareVerification"], "unverified");
+
+    send(
+        &mut stdin,
+        3,
+        "scanner.connect",
+        json!({"deviceId": "sim-ls50-0"}),
+    );
+    let refused = recv_response_for(&rx, 3, |_| {});
+    assert_eq!(refused["error"]["code"], "NOT_SUPPORTED");
+
+    send(
+        &mut stdin,
+        4,
+        "scanner.connect",
+        json!({
+            "deviceId": "sim-ls50-0",
+            "options": {"allowUnverifiedHardware": true}
+        }),
+    );
+    let connected = recv_response_for(&rx, 4, |_| {});
+    assert_eq!(connected["result"]["device"]["model"], "LS-50 ED");
+    assert_eq!(
+        connected["result"]["status"]["hardwareVerification"],
+        "unverified"
+    );
+    assert_eq!(connected["result"]["status"]["deviceModel"], "LS-50 ED");
+
+    send(&mut stdin, 5, "scanner.status", json!({}));
+    let status = recv_response_for(&rx, 5, |_| {});
+    assert_eq!(status["result"]["hardwareVerification"], "unverified");
+    assert_eq!(status["result"]["deviceModel"], "LS-50 ED");
+
+    // An old explicit opt-in cannot authorize a later request that omits it.
+    send(
+        &mut stdin,
+        6,
+        "scanner.connect",
+        json!({"deviceId": "sim-ls50-0"}),
+    );
+    let stale_opt_in = recv_response_for(&rx, 6, |_| {});
+    assert_eq!(stale_opt_in["error"]["code"], "NOT_SUPPORTED");
+
+    send(&mut stdin, 7, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 7, |_| {}).get("error").is_none());
+    assert!(child.wait().expect("wait for engine").success());
+    let _ = reader_handle.join();
+}
+
+#[test]
 fn connect_scan_stop_after_current_frame_shutdown() {
     // Real archive/positive/preview files land on disk now (Plan 03-02) --
     // never write into "/Scans/..." (unwritable in CI); use a fresh,
@@ -184,7 +271,7 @@ fn connect_scan_stop_after_current_frame_shutdown() {
     );
     assert_eq!(
         list_resp["result"]["devices"].as_array().map(|a| a.len()),
-        Some(1)
+        Some(2)
     );
 
     // 3. scanner.connect, timeScale ~= 0.01

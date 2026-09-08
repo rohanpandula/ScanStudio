@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 import coolscanpy
+import coolscanpy._device as coolscanpy_device
 import numpy as np
 import tifffile
 from coolscanpy.exceptions import DeviceBusy
@@ -300,7 +301,14 @@ class _ScanPhase:
             )
 
 
-SINGLE_SAMPLE_ENV_VAR = "SCANSTUDIO_BRIDGE_SINGLE_SAMPLE"
+# This stays locked until an attended 4000 dpi, 16-bit, RGBI, 1-pass short-strip
+# run records settingsFingerprint 42ac10bb4c4b88e9 with no
+# LIBUSB_ERROR_OVERFLOW or required power-cycle. The commit that sets it must
+# copy the exact run string into docs/releases/v0.7.0-beta.17.md. It is a source
+# evidence gate, never environment- or file-controlled. The 2026-09-06 run at
+# ~/ScanStudio-QA/single-sample-20260906/single-sample-failure-1949Z failed its
+# first fine READ at completed_bytes 0 of 619458560 and required a power-cycle.
+SINGLE_SAMPLE_VALIDATED_RUN: str | None = None
 
 
 def supported_samples_per_scan() -> tuple[int, ...]:
@@ -313,9 +321,8 @@ def supported_samples_per_scan() -> tuple[int, ...]:
     the driver would reject. Both conditions are checked so a partial or
     foreign attribute can never widen the accepted set on its own.
 
-    Single-sample capture is additionally gated behind
-    `SCANSTUDIO_BRIDGE_SINGLE_SAMPLE=1` (lab-only, like the debug recipe
-    gate): on the live LS-5000 (2026-09-06) the scanner accepted the
+    Single-sample capture is additionally gated by a recorded attended run:
+    on the live LS-5000 (2026-09-06) the scanner accepted the
     1-sample window and metered normally, but the first fine READ then
     failed with LIBUSB_ERROR_OVERFLOW and wedged the transport -- the
     single-sample data phase is framed differently from the traced 4-sample
@@ -324,7 +331,7 @@ def supported_samples_per_scan() -> tuple[int, ...]:
     """
 
     traced = domain.FIXED_COLOR_NEGATIVE_RECIPE.multisample_passes
-    if os.environ.get(SINGLE_SAMPLE_ENV_VAR) != "1":
+    if not isinstance(SINGLE_SAMPLE_VALIDATED_RUN, str) or not SINGLE_SAMPLE_VALIDATED_RUN:
         return (traced,)
     declared = getattr(coolscanpy, "SUPPORTED_SAMPLES_PER_SCAN", None)
     try:
@@ -377,12 +384,31 @@ def _capabilities_from_coolscanpy(caps: coolscanpy.Capabilities) -> domain.Capab
 
 
 def _device_info_from_coolscanpy(info: coolscanpy.DeviceInfo) -> domain.DeviceInfo:
+    product_table = coolscanpy_device._NIKON_COOLSCAN_USB_MODELS.get(
+        coolscanpy_device._LS5000_USB_VENDOR_ID, {}
+    )
+    unverified_usb_models = {
+        model
+        for product_id, model in product_table.items()
+        if product_id != coolscanpy_device._LS5000_USB_PRODUCT_ID
+    }
+    unverified_allowed = (
+        not info.supported
+        and info.id.startswith("usb:")
+        and info.model in unverified_usb_models
+    )
     return domain.DeviceInfo(
         device_id=info.id,
         vendor=info.vendor,
         model=info.model,
         capabilities=_capabilities_from_coolscanpy(info.capabilities),
         supported=info.supported,
+        unverified_allowed=unverified_allowed,
+        hardware_verification=(
+            domain.HardwareVerification.VERIFIED
+            if info.supported
+            else domain.HardwareVerification.UNVERIFIED
+        ),
     )
 
 
@@ -443,6 +469,7 @@ def _scan_receipt_from_coolscanpy(
     ir_path: str | None,
     meter_rgbi_path: str | None,
     attempts_root: Path | None,
+    hardware_verification: domain.HardwareVerification = domain.HardwareVerification.VERIFIED,
     raw_export_path: str | None = None,
     raw_export_ir_path: str | None = None,
 ) -> domain.ScanReceipt:
@@ -521,6 +548,7 @@ def _scan_receipt_from_coolscanpy(
         capture_duration_ms=receipt.capture_duration_ms,
         raw_export_path=raw_export_path,
         raw_export_ir_path=raw_export_ir_path,
+        hardware_verification=hardware_verification,
     )
 
 
@@ -706,6 +734,8 @@ class CoolscanPyTransport:
     def __init__(self) -> None:
         self._device: coolscanpy.Device | None = None
         self._device_id: str | None = None
+        self._device_model: str | None = None
+        self._hardware_verification = domain.HardwareVerification.VERIFIED
         self._roll: coolscanpy.Roll | None = None
         self._material: domain.Material | None = None
         self._preview_established = False
@@ -758,7 +788,9 @@ class CoolscanPyTransport:
     def list_devices(self) -> list[domain.DeviceInfo]:
         return [_device_info_from_coolscanpy(info) for info in coolscanpy.get_devices()]
 
-    def open_device(self, device_id: str) -> domain.DeviceInfo:
+    def open_device(
+        self, device_id: str, *, allow_unverified_hardware: bool = False
+    ) -> domain.DeviceInfo:
         if self._device is not None:
             raise BridgeError(ErrorCode.ALREADY_CONNECTED, "a device is already open")
         try:
@@ -776,18 +808,51 @@ class CoolscanPyTransport:
                     f"expected one attached Coolscan matching {device_id!r}; found {len(matches)}"
                 )
             info = matches[0]
-            if not info.supported:
+            bridge_info = _device_info_from_coolscanpy(info)
+            if not info.supported and not bridge_info.unverified_allowed:
                 raise coolscanpy.DeviceNotFound(
-                    f"{info.model} is not a positively identified supported LS-5000"
+                    f"{info.model} is recognized but not supported; only the LS-5000 is supported"
                 )
-            opened_device = coolscanpy.open(info.id)
+            if not info.supported and not allow_unverified_hardware:
+                raise coolscanpy.DeviceNotFound(
+                    f'{info.model} is recognized but not supported; only the LS-5000 is supported. '
+                    'Turn on "Allow unverified scanners" (or pass '
+                    "--allow-unverified-hardware) to open it anyway; every output will be tagged unverified."
+                )
+            if info.supported:
+                opened_device = coolscanpy.open(info.id)
+                verification = domain.HardwareVerification.VERIFIED
+            else:
+                try:
+                    supports_unverified = (
+                        "allow_unverified" in inspect.signature(coolscanpy.open).parameters
+                    )
+                except (TypeError, ValueError):
+                    supports_unverified = False
+                if not supports_unverified:
+                    raise BridgeError(
+                        ErrorCode.DEVICE_NOT_FOUND,
+                        "the installed CoolscanPy predates unverified-hardware support; version 0.7.8 or newer is required",
+                    )
+                try:
+                    opened_device = coolscanpy.open(info.id, allow_unverified=True)
+                except TypeError as exc:
+                    raise BridgeError(
+                        ErrorCode.DEVICE_NOT_FOUND,
+                        f"CoolscanPy could not open {info.model} in unverified mode; version 0.7.8 or newer is required: {exc}",
+                    ) from exc
+                verification = domain.HardwareVerification.UNVERIFIED
+        except BridgeError:
+            raise
         except coolscanpy.DeviceNotFound as exc:
             raise BridgeError(ErrorCode.DEVICE_NOT_FOUND, str(exc)) from exc
         except coolscanpy.DeviceBusy as exc:
             raise BridgeError(ErrorCode.DEVICE_BUSY, str(exc)) from exc
         self._device = opened_device
         self._device_id = info.id
-        return _device_info_from_coolscanpy(info)
+        self._device_model = info.model
+        self._hardware_verification = verification
+        return bridge_info
 
     def status(self) -> domain.DeviceStatus:
         if self._device is None:
@@ -824,6 +889,8 @@ class CoolscanPyTransport:
                     motion_armed=False,
                     film_present=None,
                     adapter=None,
+                    device_model=None,
+                    hardware_verification=None,
                 )
         else:
             film_present = None
@@ -862,6 +929,8 @@ class CoolscanPyTransport:
             motion_armed=False,
             film_present=film_present,
             adapter=adapter,
+            device_model=self._device_model,
+            hardware_verification=self._hardware_verification,
         )
 
     def close_device(self) -> None:
@@ -875,6 +944,8 @@ class CoolscanPyTransport:
         self._device.close()
         self._device = None
         self._device_id = None
+        self._device_model = None
+        self._hardware_verification = domain.HardwareVerification.VERIFIED
         self._material = None
         self._preview_established = False
         self._recorded_preview_attempt_journal = None
@@ -1635,6 +1706,7 @@ class CoolscanPyTransport:
                                     raw_export_path=raw_export_path_str,
                                     raw_export_ir_path=raw_export_ir_path_str,
                                     attempts_root=self.attempts_root,
+                                    hardware_verification=self._hardware_verification,
                                 )
                                 on_frame(slot, receipt)
                                 completed.append(slot)

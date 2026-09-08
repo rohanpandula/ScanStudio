@@ -580,6 +580,31 @@ public final class SessionModel {
     }
 
     public private(set) var device: DeviceInfo?
+    /// Diagnostic provenance for the most recent explicit unverified open
+    /// attempt. This survives a failed open or disconnect for refusal
+    /// reporting, while live status continues to return nil when disconnected.
+    public private(set) var lastUnverifiedHardwareAttemptModel: String?
+    public var allowUnverifiedHardware: Bool {
+        didSet { preferences.set(allowUnverifiedHardware, forKey: Self.allowUnverifiedHardwareKey) }
+    }
+    /// Tier from the currently connected response. Disconnected sessions have no verdict.
+    public var connectedHardwareVerification: String? {
+        guard status?.connected == true else { return nil }
+        return status?.hardwareVerification ?? device?.hardwareVerification ?? "verified"
+    }
+    public var connectedHardwareDeviceModel: String? {
+        guard status?.connected == true else { return nil }
+        return status?.deviceModel ?? device?.model
+    }
+    public var diagnosticHardwareVerification: String? {
+        connectedHardwareVerification ?? (lastUnverifiedHardwareAttemptModel == nil ? nil : "unverified")
+    }
+    public var diagnosticHardwareDeviceModel: String? {
+        connectedHardwareDeviceModel ?? lastUnverifiedHardwareAttemptModel
+    }
+    public var envelopeHardwareVerification: String {
+        connectedHardwareVerification ?? "notConnected"
+    }
     /// D-16: the last device id a successful `connect(deviceId:)` resolved
     /// to, kept even after `disconnect()`/`invalidateConnection` clear
     /// `device`/`status` -- its whole purpose is to survive a lost session
@@ -1021,6 +1046,7 @@ public final class SessionModel {
     public private(set) var recentGearHistory = RecentGearHistory()
     private static let recentGearHistoryKey = "ScanStudio.recentGearHistory.v1"
     private static let filenameTemplateDefaultKey = "ScanStudio.filenameTemplateDefault.v1"
+    private static let allowUnverifiedHardwareKey = "ScanStudio.allowUnverifiedHardware.v1"
 
     // MARK: - Roll metadata (META-01/02) + ExifTool (META-03) + resume (PERSIST-02)
 
@@ -1425,6 +1451,7 @@ public final class SessionModel {
     ) {
         self.engineClient = engineClient
         self.preferences = preferences
+        self.allowUnverifiedHardware = preferences.bool(forKey: Self.allowUnverifiedHardwareKey)
         self.diagnosticTimeline = SessionDiagnosticTimeline(
             sessionID: UUID().uuidString.lowercased(),
             directory: diagnosticsDirectory
@@ -1553,10 +1580,10 @@ public final class SessionModel {
         }
     }
 
-    /// Connects to a specific device by id. A nil target fails closed unless
-    /// discovery finds exactly one device; engine result ordering is never
+    /// Connects to a specific device by id. A nil target reuses the previous
+    /// selected id, or requires exactly one device on first use; ordering is never
     /// treated as permission to choose between real hardware and simulator.
-    public func connect(deviceId: String? = nil) async {
+    public func connect(deviceId: String? = nil, allowUnverifiedHardware: Bool? = nil) async {
         guard !Task.isCancelled, !isConnectingDevice else { return }
         isConnectingDevice = true
         defer { isConnectingDevice = false }
@@ -1585,7 +1612,7 @@ public final class SessionModel {
                 }
                 try Task.checkCancellation()
                 guard let resolvedDeviceId = DeviceSelectionPolicy.resolveNilTarget(
-                    devices: availableDevices
+                    devices: availableDevices, previousDeviceId: lastConnectedDeviceId
                 ) else {
                     lastErrorMessage = availableDevices.isEmpty
                         ? "No scanner is available. Refresh the device list and try again."
@@ -1596,7 +1623,20 @@ public final class SessionModel {
             }
             let timeScale = ProcessInfo.processInfo.environment["SCANSTUDIO_TIMESCALE"]
                 .flatMap(Double.init) ?? 1.0
-            let options = ConnectOptions(timeScale: timeScale, faultInjection: "none")
+            let effectiveAllowUnverified = allowUnverifiedHardware ?? self.allowUnverifiedHardware
+            if effectiveAllowUnverified,
+               let target = availableDevices.first(where: { $0.deviceId == targetDeviceId }),
+               target.unverifiedAllowed
+            {
+                lastUnverifiedHardwareAttemptModel = target.model
+            } else {
+                lastUnverifiedHardwareAttemptModel = nil
+            }
+            let options = ConnectOptions(
+                timeScale: timeScale,
+                faultInjection: "none",
+                allowUnverifiedHardware: effectiveAllowUnverified
+            )
             let params = ConnectParams(deviceId: targetDeviceId, options: options)
             recordDiagnostic(
                 event: "device.connect.requested",
@@ -5378,7 +5418,9 @@ public final class SessionModel {
             reportText: reportText,
             redactionContext: errorPresentationContext,
             preview: previewContent,
-            evidence: evidenceContent
+            evidence: evidenceContent,
+            hardwareVerification: diagnosticHardwareVerification,
+            deviceModel: diagnosticHardwareDeviceModel
         )
         return StoredZipWriter.write(entries)
     }

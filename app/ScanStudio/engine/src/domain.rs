@@ -23,9 +23,15 @@ pub struct DeviceInfo {
     pub kind: String,
     pub firmware: String,
     pub connection: String,
-    /// False for a recognized-but-unsupported Nikon model (Lane D): it is
-    /// listed by name in ``scanner.list`` but is never connectable.
+    /// False for a recognized model outside the verified LS-5000 path.
     pub supported: bool,
+    /// True only for a recognized device that may be opened under the
+    /// explicit unverified-hardware opt-in.
+    #[serde(default)]
+    pub unverified_allowed: bool,
+    /// Verification tier this identity receives when opened.
+    #[serde(default)]
+    pub hardware_verification: HardwareVerification,
     /// Device-sourced accepted set for `CaptureRecipe.multisample_passes`.
     /// A real backend populates this from `RealLs5000::supported_multisample_passes`
     /// (itself `derive_supported_multisample_passes`, read from BRIDGE.md's
@@ -41,6 +47,23 @@ pub struct DeviceInfo {
     /// not yet send it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_multisample_passes: Option<Vec<u32>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum HardwareVerification {
+    #[default]
+    Verified,
+    Unverified,
+}
+
+impl HardwareVerification {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unverified => "unverified",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1195,6 +1218,12 @@ pub struct ScanReceipt {
     pub channels: String,
     pub engine_version: String,
     pub device_id: String,
+    /// Exact model reported by the device that produced this capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_model: Option<String>,
+    /// Persisted capture tier. Legacy receipts decode as verified.
+    #[serde(default)]
+    pub hardware_verification: HardwareVerification,
     pub simulated: bool,
     pub settings_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1408,6 +1437,8 @@ mod tests {
             firmware: "1.03-sim".into(),
             connection: "USB (simulated)".into(),
             supported: true,
+            unverified_allowed: false,
+            hardware_verification: HardwareVerification::Verified,
             supported_multisample_passes: None,
         };
         let value = serde_json::to_value(&device).unwrap();
@@ -1441,6 +1472,8 @@ mod tests {
             firmware: "bridge 0.7.0".into(),
             connection: "USB (bridge)".into(),
             supported: true,
+            unverified_allowed: false,
+            hardware_verification: HardwareVerification::Verified,
             supported_multisample_passes: Some(vec![4]),
         };
         let value = serde_json::to_value(&device).unwrap();
@@ -1790,6 +1823,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -2025,6 +2060,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -2061,6 +2098,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,

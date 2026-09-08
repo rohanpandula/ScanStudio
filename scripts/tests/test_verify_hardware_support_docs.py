@@ -29,6 +29,22 @@ class HardwareSupportDocsTests(unittest.TestCase):
             "Latest release notes: [v0.7.0-beta.12]\n"
             "Package built | Device enumerated | Preview exercised | One-frame capture validated\n"
             "closed evidence #24\nclosed evidence #26\nissues/101\nissues/104\n"
+            "## Model compatibility\n"
+            "| Model | Adapter | Verified on | Evidence | Status |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| LS-5000 ED | SA-30 | macOS | run | Verified — supported |\n"
+            "| LS-50 ED | unknown | none | none | unverified |\n"
+            "| LS-4000 ED | unknown | none | none | Recognized by name only |\n"
+            "## Testing an unverified scanner\n"
+        )
+        driver = root / "coolscanpy/src/coolscanpy/_device.py"
+        driver.parent.mkdir(parents=True)
+        driver.write_text(
+            '_CANONICAL_LS5000_MODEL = "LS-5000 ED"\n'
+            '_LS5000_USB_VENDOR_ID = 0x04B0\n_LS5000_USB_PRODUCT_ID = 0x4002\n'
+            '_NIKON_COOLSCAN_USB_MODELS: dict = {_LS5000_USB_VENDOR_ID: '
+            '{_LS5000_USB_PRODUCT_ID: "LS-5000 ED", 0x4001: "LS-50 ED"}}\n'
+            '_SANE_COOLSCAN_MODEL_MARKERS: tuple = (("LS-4000", "LS-4000 ED"),)\n'
         )
         (root / "README.md").write_text("See docs/HARDWARE-SUPPORT.md\n")
         (root / "app" / "ScanStudio" / "README.md").write_text(
@@ -67,7 +83,24 @@ class HardwareSupportDocsTests(unittest.TestCase):
         ):
             VERIFIER.verify_hardware_support_docs(root)
 
+    def test_model_evidence_and_driver_structure_fail_closed(self) -> None:
+        for old, new, error in (
+            ("| LS-50 ED |", "| Imaginary model |", "LS-50 ED"),
+            ("Verified — supported", "unverified", "LS-5000 ED"),
+            ("## Testing an unverified scanner", "", "Testing an unverified"),
+        ):
+            with self.subTest(change=old):
+                root = self.fixture()
+                matrix = root / "docs/HARDWARE-SUPPORT.md"
+                matrix.write_text(matrix.read_text().replace(old, new))
+                with self.assertRaisesRegex(VERIFIER.HardwareSupportDocsError, error):
+                    VERIFIER.verify_hardware_support_docs(root)
+        root = self.fixture()
+        driver = root / "coolscanpy/src/coolscanpy/_device.py"
+        driver.write_text(driver.read_text() + "\n_NIKON_COOLSCAN_USB_MODELS = dynamic()\n")
+        with self.assertRaisesRegex(VERIFIER.HardwareSupportDocsError, "no longer a literal"):
+            VERIFIER.verify_hardware_support_docs(root)
+
 
 if __name__ == "__main__":
     unittest.main()
-

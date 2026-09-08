@@ -90,7 +90,7 @@ focus, framing, color, or dust-removal quality.
 | Scanner | Current scope |
 | --- | --- |
 | LS-5000 / SUPER COOLSCAN 5000 ED, USB | C-41 color-roll workflow in Beta; retained real preview/capture evidence from one Apple Silicon Mac and one scanner configuration. |
-| LS-40 / Coolscan IV ED and LS-50 / Coolscan V ED, USB | Identity recognition only; unsupported for scanning. |
+| LS-40 / Coolscan IV ED and LS-50 / Coolscan V ED, USB | Recognized but unverified; the candidate adds explicit opt-in requiring CoolscanPy 0.7.8 (current pin remains 0.7.7). No capture evidence. |
 | LS-4000, LS-8000, LS-9000, FireWire | Discovery and a motion-free driver probe through ASFireWire; unsupported for scanning. See [FireWire guidance](coolscanpy/FIREWIRE.md). |
 
 The [hardware evidence matrix](docs/HARDWARE-SUPPORT.md) separates package,

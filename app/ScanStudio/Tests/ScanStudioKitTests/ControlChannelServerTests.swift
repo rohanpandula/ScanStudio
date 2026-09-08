@@ -893,46 +893,47 @@ struct ControlChannelServerTests {
         try await client.send(#"{"id":0,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
         _ = await client.readLine() // hello response
 
-        let requestCount = 500
-        for burst in 0..<5 {
-            var combined = Data()
-            for id in 1...requestCount {
-                combined.append(Data(#"{"id":\#(id),"method":"status","params":{}}"#.utf8))
-                combined.append(0x0A)
-            }
-            // ~50 rapid separate write(2) calls, back to back with no
-            // delay -- the shape CF-01's old per-chunk `Task { feed(...) }`
-            // spawn could feed `LineFramer` out of order under.
-            for chunk in splitIntoChunks(combined, pieceCount: 50) {
-                try await client.sendRawChunk(chunk)
-            }
-
-            var seenIds: Set<UInt64> = []
-            for _ in 0..<requestCount {
-                guard let line = await client.readLine() else {
-                    Issue.record("burst \(burst): connection closed early, only \(seenIds.count)/\(requestCount) responses seen")
-                    break
-                }
-                guard let sniff = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(line.utf8)) else {
-                    Issue.record("burst \(burst): expected a decodable response envelope, got: \(line)")
-                    continue
-                }
-                #expect(sniff.id != 0, "burst \(burst): a spurious id:0 response means a request was mis-framed, got: \(line)")
-                if let errorEnvelope = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(line.utf8)) {
-                    #expect(
-                        errorEnvelope.error.code != ControlErrorCode.invalidParams.rawValue
-                            && errorEnvelope.error.code != ControlErrorCode.unknownCommand.rawValue,
-                        "burst \(burst): request \(sniff.id) was spuriously refused: \(line)"
-                    )
-                }
-                seenIds.insert(sniff.id)
-            }
-            #expect(seenIds.count == requestCount, "burst \(burst): expected \(requestCount) distinct response ids, got \(seenIds.count)")
-            #expect(
-                seenIds == Set((1...requestCount).map(UInt64.init)),
-                "burst \(burst): response ids must be exactly 1...\(requestCount), missing: \(Set(1...requestCount).subtracting(seenIds.map { Int($0) }))"
-            )
+        // Below the 256-response cap: this tests framing/order, not an
+        // unread 500-response backlog that may correctly be disconnected.
+        let requestCount = 128
+        var combined = Data()
+        for id in 1...requestCount {
+            combined.append(Data(#"{"id":\#(id),"method":"status","params":{}}"#.utf8))
+            combined.append(0x0A)
         }
+        // ~50 rapid separate write(2) calls, back to back with no
+        // delay -- the shape CF-01's old per-chunk `Task { feed(...) }`
+        // spawn could feed `LineFramer` out of order under.
+        for chunk in splitIntoChunks(combined, pieceCount: 50) {
+            try await client.sendRawChunk(chunk)
+        }
+
+        var seenIds: Set<UInt64> = []
+        for expectedId in 1...requestCount {
+            guard let line = await client.readLine() else {
+                Issue.record("connection closed early, only \(seenIds.count)/\(requestCount) responses seen")
+                break
+            }
+            guard let sniff = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(line.utf8)) else {
+                Issue.record("expected a decodable response envelope, got: \(line)")
+                continue
+            }
+            #expect(sniff.id != 0, "a spurious id:0 response means a request was mis-framed, got: \(line)")
+            if let errorEnvelope = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(line.utf8)) {
+                #expect(
+                    errorEnvelope.error.code != ControlErrorCode.invalidParams.rawValue
+                        && errorEnvelope.error.code != ControlErrorCode.unknownCommand.rawValue,
+                    "request \(sniff.id) was spuriously refused: \(line)"
+                )
+            }
+            #expect(sniff.id == UInt64(expectedId), "response order must match request order")
+            seenIds.insert(sniff.id)
+        }
+        #expect(seenIds.count == requestCount, "expected \(requestCount) distinct response ids, got \(seenIds.count)")
+        #expect(
+            seenIds == Set((1...requestCount).map(UInt64.init)),
+            "response ids must be exactly 1...\(requestCount), missing: \(Set(1...requestCount).subtracting(seenIds.map { Int($0) }))"
+        )
 
         client.close()
         await server.stop()

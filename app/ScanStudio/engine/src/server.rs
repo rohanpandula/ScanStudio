@@ -262,15 +262,15 @@ impl Backends {
         self.list_devices()
     }
 
-    /// `scanner.list`: the simulator always, plus the real device only if
+    /// `scanner.list`: the simulator always, plus real devices only if
     /// `SCANSTUDIO_BRIDGE_CMD` was configured and started successfully.
     fn list_devices(&self) -> Result<Vec<domain::DeviceInfo>, EngineError> {
         if let Some(error) = &self.startup_error {
             return Err(error.clone());
         }
-        let mut v = vec![self.sim.device_info()];
+        let mut v = self.sim.device_infos();
         if let Some(real) = &self.real {
-            v.push(real.device_info());
+            v.extend(real.device_infos());
         }
         Ok(v)
     }
@@ -301,34 +301,44 @@ impl Backends {
         options: &protocol::ConnectOptions,
     ) -> Result<protocol::ConnectResult, EngineError> {
         if let Some(active) = self.active {
-            let active_device_id = match active {
-                ActiveDevice::Sim => self.sim.device_info().device_id,
-                ActiveDevice::Real => self.real.as_ref().unwrap().device_info().device_id,
+            let active_device = match active {
+                ActiveDevice::Sim => self.sim.device_info(),
+                ActiveDevice::Real => self.real.as_ref().unwrap().device_info(),
             };
-            if device_id != active_device_id {
+            if device_id != active_device.device_id {
                 return Err(EngineError::new(
                     ErrorCode::AlreadyConnected,
                     "another device is already connected; disconnect first",
                 ));
             }
-            let device = match active {
-                ActiveDevice::Sim => self.sim.device_info(),
-                ActiveDevice::Real => self.real.as_ref().unwrap().device_info(),
-            };
+            if active_device.hardware_verification
+                == domain::HardwareVerification::Unverified
+                && !options.allow_unverified_hardware
+            {
+                return Err(EngineError::new(
+                    ErrorCode::NotSupported,
+                    format!(
+                        "{} is recognized but not supported; only the LS-5000 is supported. Turn on \"Allow unverified scanners\" (or pass --allow-unverified-hardware) to open it anyway; every output will be tagged unverified.",
+                        active_device.model
+                    ),
+                ));
+            }
             let status = self.status()?;
             return Ok(protocol::ConnectResult {
-                device,
+                device: active_device,
                 status,
                 already_connected: true,
             });
         }
 
-        if device_id == self.sim.device_info().device_id {
+        if self.sim.recognizes(device_id) {
             let result = self.sim.connect(device_id, options)?;
             self.active = Some(ActiveDevice::Sim);
             Ok(result)
-        } else if self.real.is_some()
-            && device_id == self.real.as_ref().unwrap().device_info().device_id
+        } else if self
+            .real
+            .as_ref()
+            .is_some_and(|real| real.recognizes(device_id))
         {
             let result = self.real.as_ref().unwrap().connect(device_id, options)?;
             self.active = Some(ActiveDevice::Real);
@@ -2281,7 +2291,14 @@ mod tests {
         let devices = backends
             .rescan(None)
             .expect("rescan without a bridge cmd is a no-op");
-        assert_eq!(devices.len(), 1, "sim-only list stays sim-only: {devices:#?}");
+        assert_eq!(
+            devices
+                .iter()
+                .map(|device| device.device_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sim-ls5000-0", "sim-ls50-0"],
+            "sim-only list stays sim-only: {devices:#?}"
+        );
         assert!(backends.real.is_none());
     }
 
@@ -3833,6 +3850,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -3990,6 +4009,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "usb-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: false,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -4487,6 +4508,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -4557,6 +4580,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,

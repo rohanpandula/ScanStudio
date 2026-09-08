@@ -94,6 +94,7 @@ class MacAcceptanceTests(unittest.TestCase):
             env = gate.isolated_environment(self.root)
         self.assertFalse(any(k.startswith(('SCANSTUDIO_', 'PYTHON')) for k in env))
         self.assertEqual(env['HOME'], str(self.root))
+        self.assertEqual(env['CFFIXED_USER_HOME'], str(self.root))
 
     def test_intel_and_universal_packages_are_refused(self):
         with patch.object(gate.platform, 'system', return_value='Darwin'), \
@@ -146,10 +147,11 @@ class MacAcceptanceTests(unittest.TestCase):
         calls = []
         statuses = iter([
             {'mode': 'attach-headless', 'hostPid': 42, 'result': {}},
-            {'result': {'previewComplete': True}},
+            {'hardwareVerification': 'unverified', 'result': {}},
+            {'result': {'previewComplete': True, 'scanReadiness': 'ready'}},
             {'result': {'jobId': 'job-1', 'jobState': 'scanning', 'pendingFrames': [2, 3, 4, 5, 6]}},
             {'result': {'jobId': None, 'jobState': 'stopped', 'pendingFrames': [2, 3, 4, 5, 6]}},
-            {'result': {'previewComplete': True}},
+            {'result': {'previewComplete': True, 'scanReadiness': 'ready'}},
         ])
         roll = self.root / 'packaged-roll'
         roll.mkdir()
@@ -163,7 +165,11 @@ class MacAcceptanceTests(unittest.TestCase):
             if arguments == ('status',):
                 return next(statuses)
             if arguments == ('rescan',):
-                return {'result': {'devices': [{'deviceId': 'sim-ls5000-0'}]}}
+                return {'result': {'devices': [{'deviceId': 'sim-ls50-0'}]}}
+            if arguments[:1] == ('connect',):
+                if '--allow-unverified-hardware' not in arguments:
+                    return {'error': {'code': 'NOT_SUPPORTED'}}
+                return {'hardwareVerification': 'unverified', 'result': {}}
             if arguments == ('frames', 'list'):
                 return {'result': {'frames': [{'index': index} for index in range(1, 7)]}}
             if arguments[:2] == ('roll', 'save'):
@@ -181,7 +187,7 @@ class MacAcceptanceTests(unittest.TestCase):
                 patch.object(gate, '_bundle_engine_pids', side_effect=[{900}, {900, 901}, {900}]), \
                 patch.object(gate, 'verify_receipts', side_effect=receipt_results) as verify, \
                 patch.object(gate, 'decode_images'), patch.object(gate.time, 'sleep'):
-            report = gate.cli_acceptance(cli, runtime, self.root)
+            report = gate.cli_acceptance(cli, runtime, self.root, device_id='sim-ls50-0')
 
         commands = [arguments for arguments, _, _ in calls]
         self.assertIn('--simulator', commands[0])

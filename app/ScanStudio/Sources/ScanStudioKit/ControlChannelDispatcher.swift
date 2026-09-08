@@ -224,12 +224,12 @@ public enum ControlResponse: Equatable, Sendable {
 
     /// `{"id":…,"result":…}` or `{"id":…,"error":…}`, via the encode-direction
     /// envelope mirrors `ControlWireProtocol.swift` declares.
-    public func encoded() throws -> Data {
+    public func encoded(hardwareVerification: String = "notConnected") throws -> Data {
         switch self {
         case .success(let id, let result):
-            try JSONEncoder().encode(ControlResponseEnvelope(id: id, result: result))
+            try JSONEncoder().encode(ControlResponseEnvelope(id: id, result: result, hardwareVerification: hardwareVerification))
         case .failure(let id, let error):
-            try JSONEncoder().encode(ControlResponseErrorEnvelope(id: id, error: error))
+            try JSONEncoder().encode(ControlResponseErrorEnvelope(id: id, error: error, hardwareVerification: hardwareVerification))
         }
     }
 }
@@ -243,6 +243,7 @@ public enum ControlResponse: Equatable, Sendable {
 /// per accepted connection.
 @MainActor
 public final class ControlChannelDispatcher {
+    public var currentHardwareVerification: String { sessionModel.envelopeHardwareVerification }
     /// A request line longer than this is refused before any parse is
     /// attempted at all -- a decode-time denial-of-service guard.
     /// `nonisolated` because the pure, static `decode(_:)` below reads it
@@ -525,7 +526,7 @@ public final class ControlChannelDispatcher {
             // `DeviceSelectionPolicy` resolve the target", the same as the
             // GUI's own no-argument connect.
             let errorMessageBefore = sessionModel.lastErrorMessage
-            await sessionModel.connect(deviceId: params.deviceId)
+            await sessionModel.connect(deviceId: params.deviceId, allowUnverifiedHardware: params.allowUnverifiedHardware)
             switch outcome(id: id, errorMessageBefore: errorMessageBefore) {
             case .success:
                 // D-16: `alreadyConnected` reflects this exact connect's
@@ -1479,7 +1480,7 @@ public final class ControlChannelDispatcher {
         let subscriptionId = UUID()
         activeEventSubscriptions.insert(subscriptionId)
         return AsyncStream { continuation in
-            if let data = Self.encodedEvent(name: Self.snapshotEventName, snapshot: buildStatusResult()) {
+            if let data = Self.encodedEvent(name: Self.snapshotEventName, snapshot: buildStatusResult(), hardwareVerification: currentHardwareVerification) {
                 continuation.yield(data)
             }
             armEventObservation(subscriptionId: subscriptionId, continuation: continuation)
@@ -1508,7 +1509,7 @@ public final class ControlChannelDispatcher {
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.activeEventSubscriptions.contains(subscriptionId) else { return }
-                if let data = Self.encodedEvent(name: Self.changedEventName, snapshot: self.buildStatusResult()) {
+                if let data = Self.encodedEvent(name: Self.changedEventName, snapshot: self.buildStatusResult(), hardwareVerification: self.currentHardwareVerification) {
                     continuation.yield(data)
                 }
                 self.armEventObservation(subscriptionId: subscriptionId, continuation: continuation)
@@ -1516,8 +1517,8 @@ public final class ControlChannelDispatcher {
         }
     }
 
-    private static func encodedEvent(name: String, snapshot: ControlStatusResult) -> Data? {
-        try? JSONEncoder().encode(ControlEventEnvelope(event: name, payload: snapshot))
+    private static func encodedEvent(name: String, snapshot: ControlStatusResult, hardwareVerification: String) -> Data? {
+        try? JSONEncoder().encode(ControlEventEnvelope(event: name, payload: snapshot, hardwareVerification: hardwareVerification))
     }
 
     // MARK: Line-based entry point
@@ -1545,16 +1546,16 @@ public final class ControlChannelDispatcher {
             let recoveredMethod = try? JSONDecoder().decode(ControlMethodSniff.self, from: line).method
             sessionModel.recordControlRefusal(command: recoveredMethod, code: failure.error.code, gate: failure.error.gate)
         }
-        if let data = try? response.encoded() {
+        if let data = try? response.encoded(hardwareVerification: sessionModel.envelopeHardwareVerification) {
             return data
         }
-        return Self.fallbackInvalidParamsLine(id: response.id)
+        return Self.fallbackInvalidParamsLine(id: response.id, hardwareVerification: sessionModel.envelopeHardwareVerification)
     }
 
-    private static func fallbackInvalidParamsLine(id: UInt64) -> Data {
-        Data(
-            #"{"id":\#(id),"error":{"code":"INVALID_PARAMS","message":"Failed to encode the response.","recoverable":false}}"#
-                .utf8
-        )
+    private static func fallbackInvalidParamsLine(id: UInt64, hardwareVerification: String) -> Data {
+        let payload = ControlErrorPayload(.invalidParams, message: "Failed to encode the response.")
+        return (try? JSONEncoder().encode(ControlResponseErrorEnvelope(
+            id: id, error: payload, hardwareVerification: hardwareVerification
+        ))) ?? Data()
     }
 }
