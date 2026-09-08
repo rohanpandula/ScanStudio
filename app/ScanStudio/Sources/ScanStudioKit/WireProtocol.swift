@@ -1096,17 +1096,20 @@ public struct OutputRecipe: Codable, Equatable, Sendable {
 
 public struct ScanStartParams: Codable, Sendable {
     public let frames: [Int]
+    public let passToken: String?
     public let recipe: CaptureRecipe
     public let processing: ProcessingRecipe?
     public let output: OutputRecipe?
 
     public init(
         frames: [Int],
+        passToken: String? = nil,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe? = nil,
         output: OutputRecipe? = nil
     ) {
         self.frames = frames
+        self.passToken = passToken
         self.recipe = recipe
         self.processing = processing
         self.output = output
@@ -1281,6 +1284,7 @@ public struct HardwareTelemetry: Codable, Equatable, Sendable {
 
 public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
     public let jobId: String
+    public let passToken: String?
     public let frameIndex: Int
     public let startedAt: String
     public let durationMs: Int
@@ -1303,14 +1307,14 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
     public let hardwareVerification: String?
 
     public init(
-        jobId: String, frameIndex: Int, startedAt: String, durationMs: Int, passes: Int,
+        jobId: String, passToken: String? = nil, frameIndex: Int, startedAt: String, durationMs: Int, passes: Int,
         resolutionDpi: Int, bitDepth: Int, channels: String, engineVersion: String,
         deviceId: String, simulated: Bool, settingsFingerprint: String,
         processing: ProcessingRecipe?, output: OutputRecipe?, outputs: WrittenOutputs?,
         rgbPath: String?, irPath: String?, meterRgbiPath: String?, hardwareTelemetry: HardwareTelemetry?,
         deviceModel: String? = nil, hardwareVerification: String? = nil
     ) {
-        self.jobId = jobId; self.frameIndex = frameIndex; self.startedAt = startedAt
+        self.jobId = jobId; self.passToken = passToken; self.frameIndex = frameIndex; self.startedAt = startedAt
         self.durationMs = durationMs; self.passes = passes; self.resolutionDpi = resolutionDpi
         self.bitDepth = bitDepth; self.channels = channels; self.engineVersion = engineVersion
         self.deviceId = deviceId; self.simulated = simulated; self.settingsFingerprint = settingsFingerprint

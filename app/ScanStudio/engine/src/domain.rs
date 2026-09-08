@@ -141,6 +141,7 @@ pub trait ScannerBackend: Send + Sync + Sized {
         Self::scan_start_with_output_authorities(
             backend,
             frames,
+            None,
             recipe,
             processing,
             output,
@@ -158,6 +159,7 @@ pub trait ScannerBackend: Send + Sync + Sized {
     fn scan_start_with_output_authorities(
         backend: &std::sync::Arc<Self>,
         frames: Vec<u32>,
+        pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
         output: OutputRecipe,
@@ -1209,6 +1211,8 @@ pub struct HardwareTelemetry {
 #[serde(rename_all = "camelCase")]
 pub struct ScanReceipt {
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_token: Option<String>,
     pub frame_index: u32,
     pub started_at: String,
     pub duration_ms: u64,
@@ -1814,6 +1818,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: "job-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1900,
@@ -2051,6 +2056,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: "job-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1900,
@@ -2089,6 +2095,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: "job-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1900,

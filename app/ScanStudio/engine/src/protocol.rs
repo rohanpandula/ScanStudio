@@ -586,6 +586,8 @@ pub struct PreviewStripResult {
 #[serde(rename_all = "camelCase")]
 pub struct ScanStartParams {
     pub frames: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_token: Option<String>,
     pub recipe: domain::CaptureRecipe,
     #[serde(default)]
     pub processing: domain::ProcessingRecipe,

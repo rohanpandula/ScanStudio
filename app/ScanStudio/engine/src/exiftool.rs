@@ -6731,6 +6731,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: "job-bound-output".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-27T00:00:00Z".into(),
             duration_ms: 0,

@@ -1,4 +1,5 @@
 pub mod bridge_protocol;
+pub mod calibration;
 pub mod diagnostic_evidence;
 pub mod domain;
 pub mod evidence_package;

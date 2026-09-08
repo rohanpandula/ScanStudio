@@ -1150,6 +1150,7 @@ impl ScannerBackend for SimulatedLs5000 {
     fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
+        pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
         output: OutputRecipe,
@@ -1264,6 +1265,7 @@ impl ScannerBackend for SimulatedLs5000 {
                 backend_for_thread,
                 thread_job_id,
                 frames,
+                pass_token,
                 recipe,
                 processing,
                 output,
@@ -1462,6 +1464,7 @@ fn pass_number_for(elapsed_ms: u64, overhead_ms: u64, pass_ms: u64, total_passes
 #[allow(clippy::too_many_arguments)]
 fn build_receipt(
     job_id: &str,
+    pass_token: Option<&str>,
     frame_index: u32,
     duration_ms: u64,
     recipe: &CaptureRecipe,
@@ -1487,6 +1490,7 @@ fn build_receipt(
         exposure_authority: None,
         auto_crop: written.auto_crop.clone(),
         job_id: job_id.to_string(),
+        pass_token: pass_token.map(str::to_string),
         frame_index,
         started_at: format_iso8601(started_at_secs),
         duration_ms,
@@ -1644,6 +1648,7 @@ fn run_scan_job(
     backend: Arc<SimulatedLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -2005,6 +2010,7 @@ fn run_scan_job(
                     // refusal and is never silently dropped.
                     build_receipt(
                         &job_id,
+                        pass_token.as_deref(),
                         frame_index,
                         frame_total_ms,
                         &effective_recipe,
@@ -2256,6 +2262,7 @@ mod tests {
 
         let receipt = build_receipt(
             "job-1",
+            None,
             1,
             1000,
             &recipe,
@@ -2283,6 +2290,7 @@ mod tests {
         };
         let receipt_none = build_receipt(
             "job-1",
+            None,
             1,
             1000,
             &recipe,
@@ -2333,7 +2341,7 @@ mod tests {
         if cfg!(windows) {
             assert!(renamed.is_err(), "held Windows output must deny replacement");
             build_receipt(
-                "job-binding-replacement", 1, 1000, &recipe, &processing, &output,
+                "job-binding-replacement", None, 1, 1000, &recipe, &processing, &output,
                 &SimulatedLs5000::new().device_info(), &written, Some(&project_root),
             ).expect("denied replacement retains valid receipt evidence");
             drop((written, project_root));
@@ -2345,6 +2353,7 @@ mod tests {
 
         let error = build_receipt(
             "job-binding-replacement",
+            None,
             1,
             1000,
             &recipe,
@@ -3399,6 +3408,94 @@ mod tests {
             read_back.frames[0].receipts[0].job_id, read_back.frames[1].receipts[0].job_id,
             "both persisted receipts must belong to the same job"
         );
+
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn repeated_scan_passes_keep_unique_outputs_and_append_receipts() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanstudio-sim-repeat-test-{}",
+            crate::manifest::generate_project_id()
+        ));
+        let (_project, project_dir) = crate::manifest::create_project(
+            "Repeat Test",
+            MediaCarrier::Mounted,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create project");
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Mounted).expect("load media");
+
+        for pass in ["Arep01", "Arep02"] {
+            let mut output = OutputRecipe::default();
+            output.archive.destination = project_dir.join("Archive").display().to_string();
+            output.positive.enabled = false;
+            output.preview.enabled = false;
+            output.archive.filename_template = "{stock}_$Frame_{pass}".into();
+            crate::render::materialize_output_filename_tokens_with_pass(
+                &mut output,
+                &crate::domain::MetadataSet::default(),
+                Some(pass),
+            );
+            let (tx, rx) = mpsc::channel();
+            SimulatedLs5000::scan_start_with_output_authorities(
+                &sim,
+                vec![1],
+                Some(pass.into()),
+                CaptureRecipe {
+                    resolution_dpi: 40,
+                    ..CaptureRecipe::default()
+                },
+                ProcessingRecipe::default(),
+                output,
+                HashMap::new(),
+                Some(project_dir.clone()),
+                None,
+                tx,
+            )
+            .expect("start repeat");
+            loop {
+                let value: serde_json::Value = serde_json::from_str(
+                    &rx.recv_timeout(Duration::from_secs(30)).expect("terminal event"),
+                )
+                .expect("event json");
+                if value["event"] == "scan.completed" {
+                    break;
+                }
+            }
+        }
+
+        let project = crate::manifest::read_manifest(&project_dir).expect("read manifest");
+        let receipts = &project.frames[0].receipts;
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].pass_token.as_deref(), Some("Arep01"));
+        assert_eq!(receipts[1].pass_token.as_deref(), Some("Arep02"));
+        let paths = receipts
+            .iter()
+            .map(|receipt| {
+                receipt
+                    .outputs
+                    .as_ref()
+                    .and_then(|outputs| outputs.archive_path.clone())
+                    .expect("archive path")
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths[0].ends_with("UnknownFilm_0001_Arep01.tif"));
+        assert!(paths[1].ends_with("UnknownFilm_0001_Arep02.tif"));
+        assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
 
         let _ = std::fs::remove_dir_all(&project_dir);
     }

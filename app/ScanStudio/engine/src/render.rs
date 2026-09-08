@@ -5221,23 +5221,41 @@ pub fn materialize_output_filename_tokens(
     recipes: &mut domain::OutputRecipe,
     metadata: &domain::MetadataSet,
 ) {
+    materialize_output_filename_tokens_with_pass(recipes, metadata, None);
+}
+
+pub fn materialize_output_filename_tokens_with_pass(
+    recipes: &mut domain::OutputRecipe,
+    metadata: &domain::MetadataSet,
+    pass_token: Option<&str>,
+) {
     for template in [
         &mut recipes.archive.filename_template,
         &mut recipes.positive.filename_template,
         &mut recipes.preview.filename_template,
         &mut recipes.raw_export.filename_template,
     ] {
-        *template = materialize_filename_tokens(template, metadata);
+        *template = materialize_filename_tokens_with_pass(template, metadata, pass_token);
     }
 }
 
 pub fn materialize_filename_tokens(template: &str, metadata: &domain::MetadataSet) -> String {
+    materialize_filename_tokens_with_pass(template, metadata, None)
+}
+
+pub fn materialize_filename_tokens_with_pass(
+    template: &str,
+    metadata: &domain::MetadataSet,
+    pass_token: Option<&str>,
+) -> String {
     let (year, month, day) = metadata_date_tokens(metadata.date.as_ref());
+    let stock = filename_component(metadata.film_stock.as_deref().unwrap_or("UnknownFilm"));
+    let pass = filename_component(pass_token.unwrap_or("UnknownPass"));
     let substitutions = [
-        (
-            "$FilmStock",
-            filename_component(metadata.film_stock.as_deref().unwrap_or("UnknownFilm")),
-        ),
+        ("$FilmStock", stock.clone()),
+        ("{stock}", stock),
+        ("$Pass", pass.clone()),
+        ("{pass}", pass),
         (
             "$Camera",
             filename_component(metadata.camera.as_deref().unwrap_or("UnknownCamera")),

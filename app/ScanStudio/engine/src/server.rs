@@ -652,6 +652,7 @@ impl Backends {
     fn scan_start(
         &self,
         frames: Vec<u32>,
+        pass_token: Option<String>,
         recipe: domain::CaptureRecipe,
         processing: domain::ProcessingRecipe,
         output: domain::OutputRecipe,
@@ -664,6 +665,7 @@ impl Backends {
             Some(ActiveDevice::Sim) => SimulatedLs5000::scan_start_with_output_authorities(
                 &self.sim,
                 frames,
+                pass_token,
                 recipe,
                 processing,
                 output,
@@ -675,6 +677,7 @@ impl Backends {
             Some(ActiveDevice::Real) => RealLs5000::scan_start_with_output_authorities(
                 self.real.as_ref().unwrap(),
                 frames,
+                pass_token,
                 recipe,
                 processing,
                 output,
@@ -1234,6 +1237,20 @@ fn handle_request(
         }
         "scan.start" => {
             let mut params: protocol::ScanStartParams = parse_params(&request.params)?;
+            if let Some(pass_token) = params.pass_token.as_deref() {
+                let valid = !pass_token.is_empty()
+                    && pass_token.len() <= 64
+                    && !matches!(pass_token, "." | "..")
+                    && pass_token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+                if !valid {
+                    return Err(EngineError::new(
+                        ErrorCode::InvalidParams,
+                        "passToken must be 1...64 ASCII letters, digits, '.', '_', or '-' (and not '.' or '..')",
+                    ));
+                }
+            }
             crate::render::validate_user_output_recipe_paths(&params.output)?;
             params.processing = params.processing.effective();
             // Capture the project namespace before any filesystem-based
@@ -1392,9 +1409,10 @@ fn handle_request(
                 .map(|project| project.roll_metadata.clone())
                 .unwrap_or_default();
             let mut effective_output = params.output.clone();
-            crate::render::materialize_output_filename_tokens(
+            crate::render::materialize_output_filename_tokens_with_pass(
                 &mut effective_output,
                 &roll_metadata,
+                params.pass_token.as_deref(),
             );
             crate::render::validate_user_output_recipe_paths(&effective_output)?;
             for (frame_index, override_values) in overrides.iter_mut() {
@@ -1410,7 +1428,11 @@ fn handle_request(
                         })
                         .and_then(|frame| frame.metadata_override.as_ref())
                         .unwrap_or(&roll_metadata);
-                    crate::render::materialize_output_filename_tokens(output, metadata);
+                    crate::render::materialize_output_filename_tokens_with_pass(
+                        output,
+                        metadata,
+                        params.pass_token.as_deref(),
+                    );
                     crate::render::validate_user_output_recipe_paths(output)?;
                 }
             }
@@ -1436,7 +1458,11 @@ fn handle_request(
                         .output
                         .clone()
                         .unwrap_or_else(|| params.output.clone());
-                    crate::render::materialize_output_filename_tokens(&mut frame_output, metadata);
+                    crate::render::materialize_output_filename_tokens_with_pass(
+                        &mut frame_output,
+                        metadata,
+                        params.pass_token.as_deref(),
+                    );
                     crate::render::validate_user_output_recipe_paths(&frame_output)?;
                     frame_values.output = Some(frame_output);
                 }
@@ -1525,6 +1551,7 @@ fn handle_request(
             }
             let job_id = backends.scan_start(
                 params.frames,
+                params.pass_token,
                 params.recipe,
                 params.processing,
                 effective_output,
@@ -3841,6 +3868,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: "job-smear-1".into(),
+            pass_token: None,
             frame_index,
             started_at: "2026-07-23T09:00:00Z".into(),
             duration_ms: 1200,
@@ -4000,6 +4028,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: "job-real-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-23T09:00:00Z".into(),
             duration_ms: 1200,
@@ -4443,6 +4472,7 @@ mod tests {
     fn scan_start_params_round_trips_with_frame_alignments() {
         let params = protocol::ScanStartParams {
             frames: vec![1, 2],
+            pass_token: None,
             recipe: domain::CaptureRecipe::default(),
             processing: domain::ProcessingRecipe::default(),
             output: domain::OutputRecipe::default(),
@@ -4499,6 +4529,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: "job-resume-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1000,
@@ -4571,6 +4602,7 @@ mod tests {
             exposure_authority: None,
             auto_crop: None,
             job_id: job_id.into(),
+            pass_token: None,
             frame_index,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1000,

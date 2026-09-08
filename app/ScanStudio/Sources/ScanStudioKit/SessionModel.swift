@@ -423,6 +423,7 @@ public final class SessionModel {
         let connectionEpoch: UInt64
         let previewOperationId: String
         let frames: [Int]
+        let passToken: String?
     }
 
     /// Immutable authority for the accepted scan whose terminal summary may
@@ -477,6 +478,7 @@ public final class SessionModel {
     private struct PendingManualReviewScanAuthorization {
         let requestId: UUID
         let frames: [Int]
+        let passToken: String?
         /// Every flagged frame the bridge must approve before scan.start.
         let requirements: [ManualReviewRequirement]
         /// The subset not already resolved with "Use Frame Anyway" when the
@@ -1873,9 +1875,16 @@ public final class SessionModel {
     /// Starts a batch for the selected frames using the editable capture
     /// recipe currently shown in the Batch Settings inspector.
     public func startMockScan() async {
+        await startMockScan(frames: selectedFrames, passToken: nil)
+    }
+
+    /// Control-channel entry point for an explicit frame set and optional
+    /// calibration pass token. It shares the GUI's complete readiness and
+    /// manual-review path rather than issuing a second scan-start flow.
+    public func startMockScan(frames: [Int], passToken: String?) async {
         let previous = beginMutatingOperation("scan.start")
         defer { mutatingOperationInFlight = previous }
-        _ = await startScanOrRequestManualReview(frames: selectedFrames)
+        _ = await startScanOrRequestManualReview(frames: frames, passToken: passToken)
     }
 
     /// Scans exactly one frame regardless of the grid's current selection —
@@ -2251,7 +2260,8 @@ public final class SessionModel {
 
         do {
             guard let result = try await dispatchScanStart(
-                frames: authorization.frames
+                frames: authorization.frames,
+                passToken: authorization.passToken
             ) else {
                 return false
             }
@@ -2285,7 +2295,7 @@ public final class SessionModel {
     /// forgotten or delayed UI confirmation cannot bypass it.
     @discardableResult
     private func startScanOrRequestManualReview(
-        frames: [Int], resumingBatch: Bool = false
+        frames: [Int], resumingBatch: Bool = false, passToken: String? = nil
     ) async -> Bool {
         guard !isChangingProject, !isResumingBatch || resumingBatch else { return false }
         guard pendingAttendedScanApproval == nil else { return false }
@@ -2337,6 +2347,7 @@ public final class SessionModel {
 
             if let current = pendingManualReviewScanAuthorization,
                current.frames == frames,
+               current.passToken == passToken,
                current.requirements == requirements,
                current.confirmationRequirements == confirmationRequirements,
                current.previewOperationId == previewOperationId,
@@ -2357,6 +2368,7 @@ public final class SessionModel {
                 PendingManualReviewScanAuthorization(
                     requestId: request.id,
                     frames: request.frames,
+                    passToken: passToken,
                     requirements: requirements,
                     confirmationRequirements: confirmationRequirements,
                     previewOperationId: previewOperationId,
@@ -2383,7 +2395,10 @@ public final class SessionModel {
 
         clearPendingManualReviewScan()
         do {
-            guard let result = try await dispatchScanStart(frames: frames) else {
+            guard let result = try await dispatchScanStart(
+                frames: frames,
+                passToken: passToken
+            ) else {
                 return false
             }
             beginJob(id: result.jobId, frames: frames)
@@ -5034,7 +5049,10 @@ public final class SessionModel {
     /// connection that authorized it still owns the session. Events may race
     /// ahead of the response and are buffered during this exact interval;
     /// outside it, unknown-job events are dropped.
-    func dispatchScanStart(frames: [Int]) async throws -> ScanStartResult? {
+    func dispatchScanStart(
+        frames: [Int],
+        passToken: String? = nil
+    ) async throws -> ScanStartResult? {
         guard pendingScanStart == nil else {
             recordDiagnostic(
                 event: "scan.start.ignored",
@@ -5051,7 +5069,8 @@ public final class SessionModel {
             id: UUID(),
             connectionEpoch: connectionEpoch,
             previewOperationId: previewOperationId,
-            frames: frames
+            frames: frames,
+            passToken: passToken
         )
         pendingScanStart = marker
         defer {
@@ -5074,6 +5093,7 @@ public final class SessionModel {
 
         let params = ScanStartParams(
             frames: frames,
+            passToken: passToken,
             recipe: captureRecipe,
             processing: processingRecipe,
             output: outputRecipe
@@ -5114,6 +5134,7 @@ public final class SessionModel {
             && pendingScanStart.connectionEpoch == marker.connectionEpoch
             && pendingScanStart.previewOperationId == marker.previewOperationId
             && pendingScanStart.frames == marker.frames
+            && pendingScanStart.passToken == marker.passToken
             && marker.frames == frames
             && connectionEpoch == marker.connectionEpoch
             && diagnosticUIConnected
@@ -5218,6 +5239,7 @@ public final class SessionModel {
               pendingScanStart.connectionEpoch == marker.connectionEpoch,
               pendingScanStart.previewOperationId == marker.previewOperationId,
               pendingScanStart.frames == marker.frames,
+              pendingScanStart.passToken == marker.passToken,
               marker.frames == frames,
               connectionEpoch == marker.connectionEpoch,
               diagnosticUIConnected,

@@ -115,7 +115,11 @@ struct ControlWireProtocolTests {
 
     @Test("ControlScanStartParams round-trips")
     func scanStartParamsRoundTrips() throws {
-        let original = ControlScanStartParams(motionConfirmed: true)
+        let original = ControlScanStartParams(
+            motionConfirmed: true,
+            frames: [2, 20],
+            passToken: "Arep01"
+        )
         #expect(try roundTrip(original) == original)
     }
 

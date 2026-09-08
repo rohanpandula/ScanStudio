@@ -4553,6 +4553,7 @@ impl ScannerBackend for RealLs5000 {
     fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
+        pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
         output: OutputRecipe,
@@ -4598,6 +4599,7 @@ impl ScannerBackend for RealLs5000 {
         dispatch_real_scan_with_output_authorities(
             backend,
             frames,
+            pass_token,
             recipe,
             processing,
             output,
@@ -4766,6 +4768,7 @@ fn with_ambiguous_scan_start_recovery_holds(
 fn dispatch_real_scan_with_output_authorities(
     backend: &Arc<RealLs5000>,
     frames: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -4920,6 +4923,7 @@ fn dispatch_real_scan_with_output_authorities(
             backend_for_thread,
             thread_job_id,
             frames,
+            pass_token,
             recipe,
             processing,
             output,
@@ -5682,6 +5686,7 @@ fn map_exposure_authority(authority: &BridgeExposureAuthority) -> domain::Exposu
 /// receipt-arrival time.
 fn build_real_receipt(
     job_id: &str,
+    pass_token: Option<&str>,
     slot: u32,
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
@@ -5695,6 +5700,7 @@ fn build_real_receipt(
             .map(map_exposure_authority),
         auto_crop: None,
         job_id: job_id.to_string(),
+        pass_token: pass_token.map(str::to_string),
         frame_index: slot,
         started_at: bridge_receipt.started_at.clone().unwrap_or_default(),
         duration_ms: bridge_receipt.capture_duration_ms.unwrap_or_default(),
@@ -6982,6 +6988,7 @@ fn run_real_scan_job(
     backend: Arc<RealLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -7015,6 +7022,7 @@ fn run_real_scan_job(
     let shared_evidence_for_inner = Arc::clone(&shared_evidence);
     let event_tx_for_inner = event_tx.clone();
     let frames_for_inner = frames.clone();
+    let pass_token_for_inner = pass_token.clone();
     let recipe_for_inner = recipe.clone();
     let processing_for_inner = processing.clone();
     let output_for_inner = output.clone();
@@ -7027,6 +7035,7 @@ fn run_real_scan_job(
             backend_for_inner,
             job_id_for_inner,
             frames_for_inner,
+            pass_token_for_inner,
             recipe_for_inner,
             processing_for_inner,
             output_for_inner,
@@ -7120,6 +7129,7 @@ fn run_real_scan_job_inner(
     backend: Arc<RealLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -7520,6 +7530,7 @@ fn run_real_scan_job_inner(
                         // the exact RGB/IR/meter provenance.
                         let base_receipt = build_real_receipt(
                             &job_id,
+                            pass_token.as_deref(),
                             frame_completed.slot,
                             &recipe,
                             &effective_processing,

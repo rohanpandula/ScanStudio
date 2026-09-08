@@ -267,9 +267,13 @@ public struct ControlPreviewAcquireParams: Codable, Equatable, Sendable {
 
 public struct ControlScanStartParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
+    public let frames: [Int]?
+    public let passToken: String?
 
-    public init(motionConfirmed: Bool?) {
+    public init(motionConfirmed: Bool?, frames: [Int]? = nil, passToken: String? = nil) {
         self.motionConfirmed = motionConfirmed
+        self.frames = frames
+        self.passToken = passToken
     }
 }
 

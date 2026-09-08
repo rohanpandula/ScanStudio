@@ -94,6 +94,7 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
 
     private(set) var requestCounts: [String: Int] = [:]
     private(set) var recordedScanStopModes: [String] = []
+    private(set) var recordedScanStarts: [ScanStartParams] = []
     private var scriptedFailures: [String: EngineRequestError] = [:]
 
     /// Scripts the next call to `method` to throw `error` instead of
@@ -101,6 +102,10 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
     /// second call to the same method answers the fixed happy path.
     func failNext(_ method: String, with error: EngineRequestError) {
         scriptedFailures[method] = error
+    }
+
+    func requestCount(_ method: String) -> Int {
+        requestCounts[method, default: 0]
     }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
@@ -133,7 +138,13 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
                 as: Result.self
             )
         case "scan.start":
-            return try cast(ScanStartResult(jobId: Self.jobId), as: Result.self)
+            guard let scan = params as? ScanStartParams else {
+                throw ConfirmationStubError.unexpectedResultType
+            }
+            recordedScanStarts.append(scan)
+            let count = requestCounts[method] ?? 1
+            let jobId = count == 1 ? Self.jobId : "\(Self.jobId)-\(count)"
+            return try cast(ScanStartResult(jobId: jobId), as: Result.self)
         case "scan.stop":
             let mode = (params as? ScanStopParams)?.mode ?? "afterCurrentFrame"
             recordedScanStopModes.append(mode)
@@ -250,6 +261,16 @@ private func driveConfirmationJobState(_ model: SessionModel, jobId: String, sta
     model.handle(event: EngineEvent(
         name: "scan.jobState",
         rawLine: Data(#"{"event":"scan.jobState","payload":{"jobId":"\#(jobId)","state":"\#(state)"}}"#.utf8)
+    ))
+}
+
+@MainActor
+private func driveConfirmationCompleted(_ model: SessionModel, jobId: String, frameIndex: Int = 1) {
+    model.handle(event: EngineEvent(
+        name: "scan.completed",
+        rawLine: Data(
+            #"{"event":"scan.completed","payload":{"jobId":"\#(jobId)","summary":{"completed":[\#(frameIndex)],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
+        )
     ))
 }
 
@@ -697,6 +718,78 @@ struct ScanstudioCLIConfirmationTests {
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let resultObject = try #require(object["result"] as? [String: Any])
         #expect(resultObject["jobId"] as? String == ConfirmationEngineStub.jobId)
+
+        await host.server.stop()
+    }
+
+    @Test("scan repeat requires a pass token before opening a control socket")
+    func scanRepeatWithoutPassIsRejectedBeforeConnection() async throws {
+        let result = try await runConfirmationCLI(
+            ["scan", "--confirm-motion", "--frames", "1", "--repeat", "2"],
+            socketPath: confirmationSocketPath("repeat-no-pass")
+        )
+        #expect(result.exitCode == 64)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+        )
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["message"] as? String == "--pass is required when --repeat is greater than 1.")
+    }
+
+    @Test("scan repeat count is bounded to 1 through 100 before connection")
+    func scanRepeatCountIsBounded() async throws {
+        for count in [0, 101] {
+            let result = try await runConfirmationCLI(
+                ["scan", "--confirm-motion", "--repeat", String(count), "--pass", "Arep"],
+                socketPath: confirmationSocketPath("repeat-bound-\(count)")
+            )
+            #expect(result.exitCode == 64)
+            let object = try #require(
+                JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+            )
+            let error = try #require(object["error"] as? [String: Any])
+            #expect((error["message"] as? String)?.contains("1...100") == true)
+        }
+    }
+
+    @Test("scan repeat snapshots selected frames and waits sequentially with Arep pass tokens")
+    func scanRepeatUsesSequentialPassTokens() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-repeat")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        #expect(await prepareConfirmationScanReadiness(host.model))
+
+        async let outcome = runConfirmationCLI(
+            ["scan", "--confirm-motion", "--repeat", "2", "--pass", "Arep", "--quiet"],
+            socketPath: host.socketPath
+        )
+        for _ in 0..<11_000 where await host.stub.requestCount("scan.start") < 1 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(await host.stub.requestCount("scan.start") == 1)
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "scanning")
+        await driveConfirmationCompleted(host.model, jobId: ConfirmationEngineStub.jobId)
+        for _ in 0..<11_000 where await host.stub.requestCount("scan.start") < 2 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(await host.stub.requestCount("scan.start") == 2)
+        let secondJobId = "\(ConfirmationEngineStub.jobId)-2"
+        await driveConfirmationJobState(host.model, jobId: secondJobId, state: "scanning")
+        await driveConfirmationCompleted(host.model, jobId: secondJobId)
+
+        let result = try await outcome
+        #expect(result.exitCode == 0)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+        )
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["repeatCount"] as? Int == 2)
+        #expect(resultObject["completedRepeatCount"] as? Int == 2)
+        #expect(resultObject["passTokens"] as? [String] == ["Arep01", "Arep02"])
+        #expect(resultObject["frames"] as? [Int] == [1])
+        #expect((resultObject["jobs"] as? [[String: Any]])?.count == 2)
+        let starts = await host.stub.recordedScanStarts
+        #expect(starts.map(\.frames) == [[1], [1]])
+        #expect(starts.map(\.passToken) == ["Arep01", "Arep02"])
 
         await host.server.stop()
     }

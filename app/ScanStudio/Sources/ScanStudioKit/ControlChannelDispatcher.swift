@@ -880,22 +880,44 @@ public final class ControlChannelDispatcher {
             case .failure(let failureId, let error):
                 return .failure(id: failureId, error: error)
             }
-        case .scanStart(let id, _):
+        case .scanStart(let id, let params):
+            let requestedFrames = params.frames ?? sessionModel.selectedFrames
+            if params.frames != nil
+                && (requestedFrames.isEmpty || Set(requestedFrames).count != requestedFrames.count
+                    || requestedFrames.contains(where: { $0 < 1 })) {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "scan.start frames must be unique positive indices."
+                ))
+            }
+            if let passToken = params.passToken {
+                let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+                if passToken.isEmpty || passToken.utf8.count > 64
+                    || passToken == "." || passToken == ".."
+                    || passToken.unicodeScalars.contains(where: { !allowed.contains($0) }) {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "passToken must be 1...64 ASCII letters, digits, '.', '_', or '-' (and not '.' or '..')."
+                    ))
+                }
+            }
             // Confirmation already checked in the preamble. This is
             // verbatim the expression `ScanPanelView.swift` computes for
             // its own Scan button's `.disabled` binding.
-            let decision = sessionModel.scanReadiness(for: sessionModel.selectedFrames)
+            let decision = sessionModel.scanReadiness(for: requestedFrames)
             if let refusal = gateRefusal(scanReadiness: decision) {
                 return .failure(id: id, error: refusal)
             }
             let errorMessageBefore = sessionModel.lastErrorMessage
-            let requestedFrames = sessionModel.selectedFrames
             // RESEARCH Pitfall 4: `startMockScan()` is the real GUI Scan
             // button entry point for both real and simulated devices. Route
             // here and nowhere else -- a second "real" scan-start method
             // would duplicate its manual-review branching, exactly what
             // D-04 forbids.
-            await sessionModel.startMockScan()
+            await sessionModel.startMockScan(
+                frames: requestedFrames,
+                passToken: params.passToken
+            )
             return scanOutcomeResponse(id: id, errorMessageBefore: errorMessageBefore, requestedFrames: requestedFrames)
         case .scanStop(let id, let params):
             let mode: String

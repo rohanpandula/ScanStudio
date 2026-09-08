@@ -204,6 +204,17 @@ struct Scan: AsyncParsableCommand {
     @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
     var wait = false
 
+    @Option(name: .customLong("frames"), help: "Scan explicit frame indices or ranges, for example 20 or 1-6,9.")
+    var frameRanges: String?
+
+    @Option(name: .customLong("repeat"), help: "Run this exact scan sequentially 1...100 times. Repeats always wait for each job.")
+    var repeatCount = 1
+
+    @Option(name: .customLong("pass"), help: "Filename/receipt pass prefix. With repeats, TOKEN becomes TOKEN01, TOKEN02, and so on.")
+    var passToken: String?
+
+    private var repeatPlan = ScanRepeatPlan(frames: nil, passTokens: [nil])
+
     mutating func validate() throws {
         guard confirmMotion else {
             let payload = ControlErrorPayload(
@@ -215,17 +226,100 @@ struct Scan: AsyncParsableCommand {
             print(text, terminator: "")
             throw ExitCode(77)
         }
+        do {
+            repeatPlan = try ScanRepeatPlan.make(
+                frameRanges: frameRanges,
+                repeatCount: repeatCount,
+                passToken: passToken
+            )
+        } catch let error as ScanRepeatPlan.ValidationError {
+            let payload = ControlErrorPayload(
+                code: ControlCLIErrorCode.invalidRange.rawValue,
+                message: error.message,
+                recoverable: false
+            )
+            let text = try ControlCLIOutput.renderError(command: "scan.start", payload: payload, human: options.human)
+            print(text, terminator: "")
+            throw ExitCode(64)
+        } catch let error as ControlFrameRangeError {
+            let payload = ControlErrorPayload(
+                code: ControlCLIErrorCode.invalidRange.rawValue,
+                message: error.message,
+                recoverable: false
+            )
+            let text = try ControlCLIOutput.renderError(command: "scan.start", payload: payload, human: options.human)
+            print(text, terminator: "")
+            throw ExitCode(64)
+        }
     }
 
     func run() async throws {
+        if repeatPlan.passTokens.count > 1 {
+            try await MotionStartRunner.runRepeatedScan(
+                frames: repeatPlan.frames,
+                passTokens: repeatPlan.passTokens.compactMap { $0 },
+                options: options,
+                quiet: options.quiet
+            )
+            return
+        }
         try await MotionStartRunner.run(
             command: "scan.start",
             method: "scan.start",
-            params: ControlScanStartParams(motionConfirmed: true),
+            params: ControlScanStartParams(
+                motionConfirmed: true,
+                frames: repeatPlan.frames,
+                passToken: repeatPlan.passTokens[0]
+            ),
             options: options,
             wait: wait,
             quiet: options.quiet
         )
+    }
+}
+
+struct ScanRepeatPlan: Codable, Equatable {
+    struct ValidationError: Error {
+        let message: String
+    }
+
+    let frames: [Int]?
+    let passTokens: [String?]
+
+    static func make(
+        frameRanges: String?,
+        repeatCount: Int,
+        passToken: String?
+    ) throws -> Self {
+        guard (1...100).contains(repeatCount) else {
+            throw ValidationError(message: "--repeat must be within 1...100, got \(repeatCount).")
+        }
+        if repeatCount > 1, passToken == nil {
+            throw ValidationError(message: "--pass is required when --repeat is greater than 1.")
+        }
+        let frames = try frameRanges.map(ControlFrameRangeParser.parse)
+        let tokens: [String?]
+        if repeatCount == 1 {
+            tokens = [passToken]
+        } else {
+            tokens = (1...repeatCount).map { "\(passToken!)\(String(format: "%02d", $0))" }
+        }
+        for token in tokens.compactMap({ $0 }) {
+            guard validPassToken(token) else {
+                throw ValidationError(
+                    message: "--pass must produce 1...64 ASCII letters, digits, '.', '_', or '-' (and not '.' or '..')."
+                )
+            }
+        }
+        return Self(frames: frames, passTokens: tokens)
+    }
+
+    private static func validPassToken(_ token: String) -> Bool {
+        !token.isEmpty && token.utf8.count <= 64 && token != "." && token != ".."
+            && token.utf8.allSatisfy {
+                (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0)
+                    || $0 == 46 || $0 == 95 || $0 == 45
+            }
     }
 }
 
@@ -307,6 +401,143 @@ struct Resume: AsyncParsableCommand {
 /// suppresses a stderr write that `JobWaiter` itself never performs (see
 /// its own header).
 enum MotionStartRunner {
+    static func runRepeatedScan(
+        frames: [Int]?,
+        passTokens: [String],
+        options: GlobalOptions,
+        quiet: Bool
+    ) async throws {
+        let command = "scan.start"
+        let client = try await CommandRunner.openConnection(command: command, options: options)
+        let onProgress: (@Sendable (ControlScanProgress) -> Void)?
+        if quiet {
+            onProgress = nil
+        } else {
+            onProgress = { (progress: ControlScanProgress) in
+                FileHandle.standardError.write(Data((ControlProgressLine.render(progress) + "\n").utf8))
+            }
+        }
+
+        do {
+            let resolvedFrames: [Int]
+            if let frames {
+                resolvedFrames = frames
+            } else {
+                let response = try await CommandRunner.requestWithoutParams(
+                    command: command,
+                    method: "frames.list",
+                    options: options,
+                    client: client
+                )
+                guard case .result(let data) = response else {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                    return
+                }
+                resolvedFrames = try JSONDecoder().decode(
+                    ControlFramesListResult.self,
+                    from: data
+                ).selectedFrames
+            }
+            var previousJobId = try await JobWaiter.subscribe(client: client)
+            var jobs: [[String: Any]] = []
+            for passToken in passTokens {
+                let response = try await CommandRunner.request(
+                    command: command,
+                    method: "scan.start",
+                    params: ControlScanStartParams(
+                        motionConfirmed: true,
+                        frames: resolvedFrames,
+                        passToken: passToken
+                    ),
+                    options: options,
+                    client: client
+                )
+                guard case .result(let startData) = response else {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                    return
+                }
+                let startObject = ((try? JSONSerialization.jsonObject(with: startData)) as? [String: Any]) ?? [:]
+                if startObject["outcome"] as? String == "manualReviewPending" {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                    return
+                }
+                guard let terminal = try await JobWaiter.waitForTerminalOutcome(
+                    client: client,
+                    preStartJobId: previousJobId,
+                    onProgress: onProgress
+                ) else {
+                    await client.shutdown()
+                    let payload = ControlErrorPayload(
+                        code: ControlCLIErrorCode.hostUnreachable.rawValue,
+                        message: "\"scan.start\" was waiting on the job's event stream, but the control host went away.",
+                        recoverable: false
+                    )
+                    let text = try ControlCLIOutput.renderError(
+                        command: command,
+                        payload: payload,
+                        human: options.human,
+                        context: await client.cliEnvelopeContext
+                    )
+                    print(text, terminator: "")
+                    throw ExitCode(ControlCLIExitCode.noHostReachable.rawValue)
+                }
+                guard case .result(let data) = terminal else {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: terminal)
+                    return
+                }
+                let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+                jobs.append(object)
+                let result = try JSONDecoder().decode(ControlJobResult.self, from: data)
+                previousJobId = result.jobId
+                if result.jobState != .completed || !result.frameErrorCodes.isEmpty {
+                    try await renderRepeatedScanResult(
+                        frames: resolvedFrames,
+                        passTokens: passTokens,
+                        jobs: jobs,
+                        options: options,
+                        client: client
+                    )
+                    throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
+                }
+            }
+            try await renderRepeatedScanResult(
+                frames: resolvedFrames,
+                passTokens: passTokens,
+                jobs: jobs,
+                options: options,
+                client: client
+            )
+        } catch let exitCode as ExitCode {
+            throw exitCode
+        } catch {
+            try await CommandRunner.fail(command: command, options: options, client: client, error: error)
+        }
+    }
+
+    private static func renderRepeatedScanResult(
+        frames: [Int]?,
+        passTokens: [String],
+        jobs: [[String: Any]],
+        options: GlobalOptions,
+        client: ControlChannelClient
+    ) async throws {
+        var result: [String: Any] = [
+            "repeatCount": passTokens.count,
+            "completedRepeatCount": jobs.count,
+            "passTokens": passTokens,
+            "jobs": jobs,
+        ]
+        if let frames { result["frames"] = frames }
+        let text = try ControlCLIOutput.renderResult(
+            command: "scan.start",
+            resultJSON: result,
+            human: options.human,
+            context: await client.cliEnvelopeContext
+        )
+        print(text, terminator: "")
+        await client.shutdown()
+    }
+
     static func run<Params: Encodable & Sendable>(
         command: String,
         method: String,
