@@ -1538,19 +1538,26 @@ public struct ProjectCreateParams: Codable, Sendable {
     // entirely (matching `AcquireThumbnailsParams.frames`'s established
     // omit-on-nil behavior), rather than encoding a literal JSON `null`.
     public let directory: String?
+    /// D-21/HEAD-12: 1-based frame indices to create excluded --
+    /// `SessionModel.createProject`'s own previewed-indices-minus-
+    /// selection computation, sent once at create time. `nil` omits the
+    /// key, creating every frame unexcluded (today's behavior unchanged).
+    public let excludedFrames: [Int]?
 
     public init(
         name: String,
         carrier: SimulatedFilmCarrier,
         frameCount: Int,
         filmProcess: FilmProcess,
-        directory: String? = nil
+        directory: String? = nil,
+        excludedFrames: [Int]? = nil
     ) {
         self.name = name
         self.carrier = carrier
         self.frameCount = frameCount
         self.filmProcess = filmProcess
         self.directory = directory
+        self.excludedFrames = excludedFrames
     }
 }
 

@@ -1160,4 +1160,265 @@ struct ControlSocketEndToEndTests {
         }
         await hostC.stop()
     }
+
+    // D-19..D-24 (HEAD-12, plan 03-08 Task 4): the 2026-09-07 real-hardware
+    // batch abort, replayed against sim-ls5000-0 and recovered from through
+    // the CLI alone -- a third `@Test` sharing this suite's own
+    // `EndToEndHost`/`runE2ECLI`/`.serialized` trait, named separately so a
+    // failure here never hides inside `fullAcceptanceSequence`'s own name.
+    @Test("""
+    D-19..D-24: a simulated batch abort on sim-ls5000-0 is attributed to the frame that raised it \
+    (never INTERNAL), leaves every later frame notAttempted, and is recovered from through the CLI \
+    alone -- excluding the failed frame without reopening the roll, resuming the rest, and a \
+    partial-application frames exclude report -- with no GUI and no hardware.
+    """)
+    func aBatchAbortIsAttributedAndRecoverableThroughTheCLIAlone() async throws {
+        let host = try await EndToEndHost.start()
+
+        func step(_ arguments: [String]) async throws -> E2EStepResult {
+            try await runE2ECLI(arguments, socketPath: host.socketPath)
+        }
+        func envelopeObject(_ result: E2EStepResult) throws -> [String: Any] {
+            try #require(
+                JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any],
+                Comment(rawValue: result.context)
+            )
+        }
+        func resultObject(_ result: E2EStepResult) throws -> [String: Any] {
+            try #require(try envelopeObject(result)["result"] as? [String: Any], Comment(rawValue: result.context))
+        }
+        func errorObject(_ result: E2EStepResult) throws -> [String: Any] {
+            try #require(try envelopeObject(result)["error"] as? [String: Any], Comment(rawValue: result.context))
+        }
+
+        /// D-20/HEAD-12: the batch-abort test affordance. `LoadMediaParams`
+        /// (WireProtocol.swift) does not carry `abortAtFrame`/`abortCode`
+        /// -- mirrors `d18AutomationSurfaces`'s own `FixtureLoadMediaParams`
+        /// exactly: drives the engine's `sim.loadMedia` a second time
+        /// directly through the host's `engineClient`, since no D-08
+        /// channel command loads simulated media at all (this file's own
+        /// header comment). The first `loadCarrier(_:)` call establishes
+        /// `SessionModel.status` client-side; this second, raw call is
+        /// idempotent for every field that call already set and additive
+        /// only for the abort arm.
+        struct BatchAbortLoadMediaParams: Encodable, Sendable {
+            let carrier: String
+            let abortAtFrame: Int
+            let abortCode: String
+        }
+
+        do {
+            // -- Device enumeration guard (T-02-37), copied from
+            // fullAcceptanceSequence: every enumerated deviceId is sim-
+            // before any motion-capable step. --
+            let rescanResult = try await step(["rescan"])
+            #expect(rescanResult.exitCode == 0, Comment(rawValue: rescanResult.context))
+            let rescanBody = try resultObject(rescanResult)
+            let devices = try #require(rescanBody["devices"] as? [[String: Any]], Comment(rawValue: rescanResult.context))
+            for device in devices {
+                let deviceId = device["deviceId"] as? String ?? ""
+                #expect(deviceId.hasPrefix("sim-"), "non-simulator device exposed to the acceptance run: \(deviceId)")
+            }
+
+            let connectResult = try await step(["connect", "--device", "sim-ls5000-0"])
+            #expect(connectResult.exitCode == 0, Comment(rawValue: connectResult.context))
+
+            let settingsSetResult = try await step(["settings", "set", "--resolution", "100"])
+            #expect(settingsSetResult.exitCode == 0, Comment(rawValue: settingsSetResult.context))
+
+            // Arms the abort at frame 3 with the exact bridge code the
+            // 2026-09-07 incident itself raised.
+            await host.model.loadCarrier(.strip6)
+            let _: ScannerStatus = try await host.engineClient.request(
+                "sim.loadMedia",
+                params: BatchAbortLoadMediaParams(
+                    carrier: SimulatedFilmCarrier.strip6.rawValue, abortAtFrame: 3, abortCode: "ROLL_MISMATCH"
+                )
+            )
+
+            let previewResult = try await step(["preview", "--film-loaded"])
+            #expect(previewResult.exitCode == 0, Comment(rawValue: previewResult.context))
+            let previewCompleted = await host.waitUntilPreviewComplete()
+            #expect(previewCompleted, "preview did not reach scanner.thumbnailsComplete within the bound")
+
+            // -- D-21: select 1-4, deliberately leaving 5-6 unselected, so
+            // `roll save` persists them as exclusions at creation time. --
+            let selectResult = try await step(["frames", "select", "1-4"])
+            #expect(selectResult.exitCode == 0, Comment(rawValue: selectResult.context))
+
+            // `roll save ... --wait` on a batch that ends failed exits 65
+            // (documented in CONTROL.md's own Exit codes section) -- the
+            // printed result is still the job's own terminal snapshot,
+            // `MotionStartRunner`'s shared `--wait` tail for `scan`/
+            // `resume`/`roll save` alike.
+            let saveResult = try await step([
+                "roll", "save", "--name", "batch-abort-e2e", "--carrier", "strip6",
+                "--frame-count", "6", "--film-process", "c41ColorNegative", "--confirm-motion", "--wait"
+            ])
+            #expect(saveResult.exitCode == 65, Comment(rawValue: saveResult.context))
+            let saveBody = try resultObject(saveResult)
+            #expect(saveBody["jobState"] as? String == "failed", Comment(rawValue: saveResult.context))
+            // Documented CR-01 behavior (see d18AutomationSurfaces's own
+            // comment): SessionModel.applyCompleted clears jobId in the
+            // same update that reaches the terminal jobState, so this
+            // bare (no explicit jobId) snapshot's own top-level jobId is
+            // already absent by the time it was captured -- `progress`,
+            // unlike jobId, is never reset on completion, so the id
+            // survives there. The detailed D-19 checks (notAttemptedFrames,
+            // finishedAt) belong on the explicit `status --job <id>` call
+            // below, not this bare snapshot -- an absent/null jobId keeps
+            // job.get's historical "currently tracked job" shape
+            // byte-for-byte (D-19's own documented contract).
+            let saveProgress = try #require(saveBody["progress"] as? [String: Any], Comment(rawValue: saveResult.context))
+            let firstJobId = try #require(saveProgress["jobId"] as? String, Comment(rawValue: saveResult.context))
+
+            // -- D-20: frames list names the armed frame's real cause,
+            // never INTERNAL, and every later frame is notAttempted with
+            // no error. --
+            let framesListResult = try await step(["frames", "list"])
+            #expect(framesListResult.exitCode == 0, Comment(rawValue: framesListResult.context))
+            let framesListBody = try resultObject(framesListResult)
+            let frames = try #require(framesListBody["frames"] as? [[String: Any]], Comment(rawValue: framesListResult.context))
+            let frame3 = try #require(frames.first { ($0["index"] as? Int) == 3 }, "frame 3 missing: \(frames)")
+            #expect(frame3["state"] as? String == "failed")
+            #expect(frame3["errorCode"] as? String == "ROLL_MISMATCH", "frame 3's own cause must never flatten to INTERNAL: \(frame3)")
+            let frame3Message = try #require(frame3["errorMessage"] as? String, "frame 3 missing errorMessage: \(frame3)")
+            #expect(frame3Message.contains("ROLL_MISMATCH"))
+            let frame4 = try #require(frames.first { ($0["index"] as? Int) == 4 }, "frame 4 missing: \(frames)")
+            #expect(frame4["state"] as? String == "notAttempted")
+            #expect(frame4["errorCode"] == nil, "a notAttempted frame must carry no error: \(frame4)")
+            for excludedIndex in [5, 6] {
+                let excludedFrame = try #require(
+                    frames.first { ($0["index"] as? Int) == excludedIndex }, "frame \(excludedIndex) missing: \(frames)"
+                )
+                #expect(
+                    excludedFrame["excluded"] as? Bool == true,
+                    "frame \(excludedIndex) was never selected before roll save and must be excluded (D-21): \(excludedFrame)"
+                )
+            }
+
+            // -- status.lastErrorMessage carries the bridge's own text, and
+            // pendingFrames omits the frames the operator never selected
+            // (D-21). --
+            let statusResult = try await step(["status"])
+            #expect(statusResult.exitCode == 0, Comment(rawValue: statusResult.context))
+            let statusBody = try resultObject(statusResult)
+            let lastErrorMessage = try #require(statusBody["lastErrorMessage"] as? String, Comment(rawValue: statusResult.context))
+            #expect(lastErrorMessage.contains("ROLL_MISMATCH"))
+            let pendingFramesAfterAbort = try #require(statusBody["pendingFrames"] as? [Int], Comment(rawValue: statusResult.context))
+            #expect(
+                !pendingFramesAfterAbort.contains(5) && !pendingFramesAfterAbort.contains(6),
+                "frames the operator never selected must never be offered for resume: \(pendingFramesAfterAbort)"
+            )
+            #expect(pendingFramesAfterAbort.contains(4))
+
+            // -- D-19: the finished job stays queryable, with per-frame
+            // codes and a finishedAt timestamp; an unknown id is
+            // JOB_NOT_FOUND. --
+            let jobStatusResult = try await step(["status", "--job", firstJobId])
+            #expect(jobStatusResult.exitCode == 0, Comment(rawValue: jobStatusResult.context))
+            let jobStatusBody = try resultObject(jobStatusResult)
+            #expect(jobStatusBody["jobState"] as? String == "failed", Comment(rawValue: jobStatusResult.context))
+            #expect(jobStatusBody["finishedAt"] is String, "a terminal job must carry finishedAt: \(jobStatusBody)")
+            let frameErrorCodes = try #require(jobStatusBody["frameErrorCodes"] as? [String: String], Comment(rawValue: jobStatusResult.context))
+            #expect(frameErrorCodes["3"] == "ROLL_MISMATCH")
+
+            let unknownJobResult = try await step(["status", "--job", "does-not-exist"])
+            #expect(unknownJobResult.exitCode == 65, Comment(rawValue: unknownJobResult.context))
+            let unknownJobError = try errorObject(unknownJobResult)
+            #expect(unknownJobError["code"] as? String == "JOB_NOT_FOUND", Comment(rawValue: unknownJobResult.context))
+
+            // -- Recovery, D-22: excluding the armed frame updates
+            // pendingFrames immediately -- no roll open anywhere in this
+            // sequence. --
+            let excludeFrame3Result = try await step(["frames", "exclude", "3"])
+            #expect(excludeFrame3Result.exitCode == 0, Comment(rawValue: excludeFrame3Result.context))
+
+            let statusAfterExcludeResult = try await step(["status"])
+            #expect(statusAfterExcludeResult.exitCode == 0, Comment(rawValue: statusAfterExcludeResult.context))
+            let statusAfterExcludeBody = try resultObject(statusAfterExcludeResult)
+            let pendingFramesAfterExclude = try #require(
+                statusAfterExcludeBody["pendingFrames"] as? [Int], Comment(rawValue: statusAfterExcludeResult.context)
+            )
+            #expect(
+                !pendingFramesAfterExclude.contains(3),
+                "excluding frame 3 must be visible in pendingFrames immediately, without reopening the roll: \(pendingFramesAfterExclude)"
+            )
+            #expect(pendingFramesAfterExclude == [4])
+
+            // -- D-23: resume either starts directly or pauses for review;
+            // either way, review cancel (if needed) must never clear the
+            // selection. --
+            let selectedFramesBeforeResume = statusAfterExcludeBody["selectedFrames"] as? [Int]
+            let resumeResult = try await step(["resume", "--confirm-motion"])
+            #expect(resumeResult.exitCode == 0, Comment(rawValue: resumeResult.context))
+            let resumeBody = try resultObject(resumeResult)
+            let resumeOutcome = resumeBody["outcome"] as? String
+
+            if resumeOutcome == "manualReviewPending" {
+                let cancelResult = try await step(["review", "cancel"])
+                #expect(cancelResult.exitCode == 0, Comment(rawValue: cancelResult.context))
+                let statusAfterCancelResult = try await step(["status"])
+                #expect(statusAfterCancelResult.exitCode == 0, Comment(rawValue: statusAfterCancelResult.context))
+                let statusAfterCancelBody = try resultObject(statusAfterCancelResult)
+                #expect(
+                    (statusAfterCancelBody["selectedFrames"] as? [Int]) == selectedFramesBeforeResume,
+                    "review cancel must never clear the operator's selection (D-23)"
+                )
+
+                let reselectResult = try await step(["frames", "select", "4"])
+                #expect(reselectResult.exitCode == 0, Comment(rawValue: reselectResult.context))
+                let secondResumeResult = try await step(["resume", "--confirm-motion", "--wait"])
+                #expect(secondResumeResult.exitCode == 0, Comment(rawValue: secondResumeResult.context))
+                let secondResumeBody = try resultObject(secondResumeResult)
+                #expect(secondResumeBody["jobState"] as? String == "completed", Comment(rawValue: secondResumeResult.context))
+            } else {
+                // Without --wait, a resume that actually started prints an
+                // immediate job.get snapshot instead of {outcome}
+                // (MotionStartRunner's own pre-existing, unchanged
+                // behavior for this path -- resumeOutcome is nil here, not
+                // "started", because this body has no outcome key at all).
+                let resumedJobId = try #require(
+                    resumeBody["jobId"] as? String,
+                    "expected an immediate job.get snapshot naming the resumed job: \(resumeBody)"
+                )
+                var finalJobState: String?
+                for _ in 0..<200 {
+                    let pollResult = try await step(["status", "--job", resumedJobId])
+                    #expect(pollResult.exitCode == 0, Comment(rawValue: pollResult.context))
+                    let pollBody = try resultObject(pollResult)
+                    if let state = pollBody["jobState"] as? String, ["completed", "failed", "stopped"].contains(state) {
+                        finalJobState = state
+                        break
+                    }
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                }
+                #expect(finalJobState == "completed", "the resumed job must complete: \(String(describing: finalJobState))")
+            }
+
+            // -- The resumed job completes frame 4, never re-touching the
+            // excluded frame (3) or the already-completed frames (1, 2). --
+            let finalFramesListResult = try await step(["frames", "list"])
+            #expect(finalFramesListResult.exitCode == 0, Comment(rawValue: finalFramesListResult.context))
+            let finalFramesListBody = try resultObject(finalFramesListResult)
+            let finalFrames = try #require(finalFramesListBody["frames"] as? [[String: Any]], Comment(rawValue: finalFramesListResult.context))
+            let finalFrame4 = try #require(finalFrames.first { ($0["index"] as? Int) == 4 }, "frame 4 missing: \(finalFrames)")
+            #expect(finalFrame4["state"] as? String == "completed", "frame 4 must have completed once resumed: \(finalFrame4)")
+
+            // -- D-24: a partial frames exclude range reports both applied
+            // and failed, and exits 65. --
+            let partialExcludeResult = try await step(["frames", "exclude", "4,99"])
+            #expect(partialExcludeResult.exitCode == 65, Comment(rawValue: partialExcludeResult.context))
+            let partialExcludeEnvelope = try envelopeObject(partialExcludeResult)
+            let applied = try #require(partialExcludeEnvelope["applied"] as? [Int], Comment(rawValue: partialExcludeResult.context))
+            let failedEntries = try #require(partialExcludeEnvelope["failed"] as? [[String: Any]], Comment(rawValue: partialExcludeResult.context))
+            #expect(applied == [4])
+            #expect(failedEntries.count == 1)
+            #expect(failedEntries.first?["index"] as? Int == 99)
+        } catch {
+            await host.stop()
+            throw error
+        }
+        await host.stop()
+    }
 }

@@ -2759,6 +2759,21 @@ public final class SessionModel {
         let preProjectSelection = project == nil
             ? selectedFrameIndices
             : []
+        // D-21/HEAD-12 (the 2026-09-07 batch abort): every previewed frame
+        // the operator did NOT select is created excluded on the fresh
+        // manifest, in this same project.create call -- never a post-create
+        // exclusion loop, which would leave a window in which the project
+        // disagrees with the operator's choice while a scan is starting
+        // (and the 19:38Z evidence shows a single setFrameExcluded can hit
+        // the 60s request timeout on its own). `validFrameIndices` is read
+        // here, before `project` is reassigned below, so it reflects the
+        // previewed (not yet project-scoped) frame set exactly like
+        // `preProjectSelection` does. `nil` (an existing project is being
+        // replaced) mirrors `preProjectSelection`'s own conditional: no
+        // "previewed but unselected" concept applies there.
+        let excludedFrames: [Int]? = project == nil
+            ? Set(validFrameIndices).subtracting(preProjectSelection).sorted()
+            : nil
         let preProjectSelectionAnchor = project == nil
             ? selectionAnchorFrameIndex
             : nil
@@ -2784,7 +2799,8 @@ public final class SessionModel {
                 name: name,
                 carrier: carrier,
                 frameCount: frameCount,
-                filmProcess: filmProcess
+                filmProcess: filmProcess,
+                excludedFrames: excludedFrames
             )
             let result: ProjectCreateResult = try await engineClient.request("project.create", params: params)
             resetProjectScopedScanState()

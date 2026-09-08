@@ -25,6 +25,18 @@
 # untouched `manifest.json`); and a measured, non-fabricated `etaSeconds`
 # together with at least one `--wait` progress line on stderr.
 #
+# D-19..D-24 (plan 03-08): the suite's own third `@Test`,
+# `aBatchAbortIsAttributedAndRecoverableThroughTheCLIAlone`, replays the
+# 2026-09-07 real-hardware batch-abort-at-frame-10 recovery against
+# `sim-ls5000-0`'s batch-abort test affordance and proves the whole
+# recovery is possible from the CLI alone: the aborted frame is attributed
+# to the bridge condition that raised it (never flattened to INTERNAL),
+# every later frame is reported `notAttempted` (not `failed`), `job get`
+# and `status --job` return the same terminal snapshot after `jobId`
+# clears, the failed frame is excluded without reopening the roll, the
+# rest of the roll resumes and completes, and `frames exclude` reports
+# which of the requested frames it actually applied.
+#
 # Order actually run vs. D-17c: D-17c's literal shape is "... -> save ->
 # scan --wait -> ...". This suite runs connect -> preview -> frames select
 # --all -> save (which itself starts a job) -> stop -> frames list/exclude/
@@ -137,7 +149,12 @@ grep -q "Control socket end to end" "$WORK/swift-test.log" || fail "suite did no
 # mirrors the suite-name check immediately above. "D-18:" is this test's
 # own display-name prefix (ControlSocketEndToEndTests.swift), unique to it.
 grep -q "D-18:" "$WORK/swift-test.log" || fail "the D-18 automation-surfaces test did not report running (opt-in gate misconfigured, or the test was filtered out)"
-pass "harness: ControlSocketEndToEndTests (connect -> preview -> save -> stop -> resume -> scan -> eject -> diagnostics -> events, plus D-18: status --refresh, pre-project blankConfidence, skip-blank, manual review + auto-approve, roll run's own receipt, and measured progress/ETA) green"
+# D-19..D-24 (plan 03-08): a third, independent name check so a filtered-out
+# or silently-skipped batch-abort-recovery test cannot pass this gate --
+# mirrors the D-18 check immediately above. "D-19..D-24:" is this test's own
+# display-name prefix (ControlSocketEndToEndTests.swift), unique to it.
+grep -q "D-19..D-24:" "$WORK/swift-test.log" || fail "the D-19..D-24 batch-abort-recovery test (aBatchAbortIsAttributedAndRecoverableThroughTheCLIAlone) did not report running (opt-in gate misconfigured, or the test was filtered out)"
+pass "harness: ControlSocketEndToEndTests (connect -> preview -> save -> stop -> resume -> scan -> eject -> diagnostics -> events, plus D-18: status --refresh, pre-project blankConfidence, skip-blank, manual review + auto-approve, roll run's own receipt, measured progress/ETA, and D-19..D-24: batch-abort attribution + CLI-only recovery) green"
 
 # ---- Stage 4: acceptance evidence -----------------------------------------
 printf 'VERIFY_CLI_ATTACH OK (host-mode=%s, engine=%s, cli=%s)\n' "$HOST_MODE" "$ENGINE_BIN" "$CLI_BIN"
