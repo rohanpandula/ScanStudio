@@ -32,14 +32,14 @@ VENDORED_DIR="coolscanpy/src/coolscanpy"
 KNOWN_VENDORED_DIVERGENCE=(
   # required scanner_identity + capture-timing feature; re-pinned for 0.7.8
   # (identity opt-in and single-sample framing landed upstream)
-  "protocol/ls5000_single_pass/worker.py|03ff5e7755c9083b460b46ac4858853e543fc6ff8259690db2ac992689bc355d|710be2217b11112e1f0f9c1af7c2b144feed8c7be0bb222553507fea51c12cfc"
+  "protocol/ls5000_single_pass/worker.py|eadc1e86e25b9d759dfb4c9787943bb9f54ce35d558961b33b0436fa2340d08d|710be2217b11112e1f0f9c1af7c2b144feed8c7be0bb222553507fea51c12cfc"
   # LeadingFrameClippedError + confident-clear-film gate; re-pinned for 0.7.8
   # (identity opt-in and single-sample framing landed upstream)
   "protocol/ls5000_single_pass/roll_index.py|c99c54a434d0d53e94e51ed503f0289709b5f20365e16606f365264a617c8b17|38013a1e942c3d1d1798ca0e718fb7ccdc3bc605277ca729e9891fa53bcde311"
   # its export surface for the class above
   "protocol/ls5000_single_pass/__init__.py|ce8aa97b707f5ef83f96128b378722191f7280bd41c1f3acbb04c75e3ea7523e|1f0f324034a95e2c8ca772ce52a78a800b0bf215d3ae4ec77422b08b1376856c"
   # pins differ because the two files above differ; re-pinned for 0.7.8
-  "protocol/ls5000_single_pass/bundle.py|afbaab40c7cd2215f1d69f30f2a223a060475c27bda8391de8d42dfc2aaea77f|35a0d9d5461d0c6519308311d9244495f527bc1a0040c2a850f048efa1c862dd"
+  "protocol/ls5000_single_pass/bundle.py|d366dd983a52c8b61e483bc01fc9f3933d5771afbbbddc5e7c0f796259962188|35a0d9d5461d0c6519308311d9244495f527bc1a0040c2a850f048efa1c862dd"
   # packaged-app libusb resolution (app bundles its own signed binary)
   "protocol/ls5000_single_pass/usb_backend.py|afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62|666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1"
   # capture-timing receipt fields (started_at/duration); re-pinned for 0.7.8

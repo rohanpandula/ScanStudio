@@ -3247,9 +3247,7 @@ def _patch_samples_contract(
         entry["expected_data_in"] = payload
 
 
-def _patch_fine_read_contract(plan: list[dict], samples_per_scan: int) -> None:
-    """Size the fine READ from the sample count commanded in SET_WINDOW."""
-
+def _fine_request_bytes(samples_per_scan: int) -> int:
     if (
         isinstance(samples_per_scan, bool)
         or not isinstance(samples_per_scan, int)
@@ -3259,13 +3257,23 @@ def _patch_fine_read_contract(plan: list[dict], samples_per_scan: int) -> None:
             f"samples_per_scan {samples_per_scan!r} is not one of "
             f"{SUPPORTED_SAMPLES_PER_SCAN}"
         )
+    return (
+        EXPECTED_FINE_REQUEST
+        if samples_per_scan == TRACED_SAMPLES_PER_SCAN
+        else SINGLE_SAMPLE_RECORD_BYTES
+    )
+
+
+def _patch_fine_read_contract(plan: list[dict], samples_per_scan: int) -> None:
+    """Size the fine READ from the sample count commanded in SET_WINDOW."""
+
+    request_len = _fine_request_bytes(samples_per_scan)
     matches = [entry for entry in plan if entry.get("role") == "fine-rgbi4-template"]
     if len(matches) != 1:
         raise ProtocolError("plan must contain exactly one fine-rgbi4-template")
     target = matches[0]
-    if samples_per_scan == TRACED_SAMPLES_PER_SCAN:
+    if request_len == EXPECTED_FINE_REQUEST:
         return
-    request_len = SINGLE_SAMPLE_RECORD_BYTES
     cdb = bytearray.fromhex(target.get("cdb", ""))
     if len(cdb) != 10 or cdb[0] != 0x28:
         raise ProtocolError("fine READ template has an invalid CDB")
@@ -4974,9 +4982,8 @@ def _run_live_continuation_frame(
         entry for entry in active_plan if entry.get("role") == "fine-rgbi4-template"
     )
     active_target.update(target)
-    _patch_fine_read_contract(active_plan, _batch_samples_per_scan(batch_job))
-    target = active_target
-    expected_bytes = EXPECTED_FINE_READS * target["request_len"]
+    samples_per_scan = _batch_samples_per_scan(batch_job)
+    expected_bytes = EXPECTED_FINE_READS * _fine_request_bytes(samples_per_scan)
     output_path = frame_spec.output
     journal_path = frame_spec.journal
     meter_path = _full_capture_meter_path(output_path)
@@ -5006,6 +5013,8 @@ def _run_live_continuation_frame(
         dict(DEFAULT_EXPOSURES),
     )
     steps = compile_continuation_steps(active_plan, continuation_plan)
+    _patch_fine_read_contract(active_plan, samples_per_scan)
+    target = active_target
     batch_identity = {
         "frame_index": frame_index,
         "frame_total": len(batch_job.frames),
@@ -5833,12 +5842,15 @@ def run_live_capture(
     )
     active_target.update(target)
     active_samples_per_scan = samples_per_scan
-    _patch_fine_read_contract(active_plan, active_samples_per_scan)
     target = active_target
     expected_bytes = (
         0
         if preview_only or preview_and_hold
-        else (METER_CAPTURE_BYTES if meter_only else read_count * target["request_len"])
+        else (
+            METER_CAPTURE_BYTES
+            if meter_only
+            else read_count * _fine_request_bytes(active_samples_per_scan)
+        )
     )
     calibration_session_id = (
         batch_job.session_id
@@ -6607,11 +6619,10 @@ def run_live_capture(
                         journal["hold_outcome"] = "resumed-as-batch"
                         _write_journal(journal_path, journal)
 
-                        _patch_fine_read_contract(
-                            active_plan, active_samples_per_scan
-                        )
                         target = active_plan[-1]
-                        expected_bytes = read_count * target["request_len"]
+                        expected_bytes = read_count * _fine_request_bytes(
+                            active_samples_per_scan
+                        )
                         meter_sidecar_path = _full_capture_meter_path(
                             first_spec.output
                         )
@@ -6900,6 +6911,9 @@ def run_live_capture(
                         DYNAMIC_WINDOW_GROUPS[0],
                         METER_GET_WINDOW_GROUPS[0],
                         dict(DEFAULT_EXPOSURES),
+                    )
+                    _patch_fine_read_contract(
+                        bound_plan, active_samples_per_scan
                     )
                     # `preamble` holds these dictionaries by reference.  Update
                     # them in place so the very next command (SEND 0x8f) is the

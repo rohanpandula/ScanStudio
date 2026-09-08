@@ -5491,6 +5491,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
     ready_groups: list[tuple[int, ...]] = []
     transactions: list[int] = []
 
@@ -5745,6 +5746,7 @@ def _run_fake_continuation_frame(
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
 
     def ready(
         _ep_out: object,
@@ -6069,18 +6071,39 @@ def test_continuation_executor_without_override_matches_pre_override_fine_contra
     assert journal["frame_complete"] is True
 
 
+def _expected_fine_read(samples_per_scan: int) -> tuple[str, int]:
+    if samples_per_scan == 1:
+        return "28000000000100f80080", worker_module.SINGLE_SAMPLE_RECORD_BYTES
+    return worker_module.EXPECTED_FINE_CDB, worker_module.EXPECTED_FINE_REQUEST
+
+
+def _install_one_read_plan_validator(
+    monkeypatch: pytest.MonkeyPatch, canonical_target: dict
+) -> None:
+    real_validate_plan = worker_module.validate_plan
+    one_read_target = {**canonical_target, "repeat": 1}
+
+    def validate_canonical(candidate: list[dict]) -> dict:
+        expected_reads = worker_module.EXPECTED_FINE_READS
+        if candidate[-1]["repeat"] == 2_980:
+            worker_module.EXPECTED_FINE_READS = 2_980
+        try:
+            real_validate_plan(candidate)
+        finally:
+            worker_module.EXPECTED_FINE_READS = expected_reads
+        return one_read_target
+
+    monkeypatch.setattr(worker_module, "validate_plan", validate_canonical)
+
+
+@pytest.mark.parametrize("samples_per_scan", [1, 4])
 def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    samples_per_scan: int,
 ) -> None:
     plan = load_canonical_plan()
     canonical_target = worker_module.validate_plan(plan)
-    tiny_target = {
-        **canonical_target,
-        "repeat": 1,
-        "request_len": 1,
-        "request_parts": [1],
-    }
     for sequence in worker_module.PREVIEW_READ_SEQUENCES:
         entry = plan[sequence - 1]
         entry["request_len"] = 1
@@ -6200,6 +6223,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         CANONICAL_PLAN_SHA256,
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
+        samples_per_scan=samples_per_scan,
     )
     nonce = "offline-batch-nonce"
     first.ack.write_text(
@@ -6222,7 +6246,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     reserves: list[int] = []
     sent_tables: list[bytes] = []
     transactions: list[int] = []
-    fine_reads: list[int] = []
+    fine_reads: list[tuple[str, int]] = []
     ready_groups: list[tuple[int, ...]] = []
     ack_boundaries: list[tuple[int, int, int, int]] = []
     releases: list[tuple[object, object]] = []
@@ -6287,8 +6311,8 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         elif sequence in worker_module.METER_READ_SEQUENCES:
             payload = b"m"
         elif sequence == 607:
-            fine_reads.append(sequence)
-            payload = b"f"
+            fine_reads.append((entry["cdb"], entry["request_len"]))
+            payload = b"f" * entry["request_len"]
         else:
             payload = bytes.fromhex(entry.get("expected_data_in", ""))
         return TransactionResult(
@@ -6399,7 +6423,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     )
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
-    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    _install_one_read_plan_validator(monkeypatch, canonical_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     monkeypatch.setattr(
         worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: "Nikon LS-5000 ED 1.03"
@@ -6475,6 +6499,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         1,
         frame=first.slot,
         boundary_offset_rows=first.boundary_offset_rows,
+        samples_per_scan=samples_per_scan,
         batch_job=batch,
         continuation_plan=load_canonical_continuation_plan(),
         continuation_plan_sha256=(worker_module.CANONICAL_CONTINUATION_PLAN_SHA256),
@@ -6491,7 +6516,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
             origin.selector,
             origin.code,
         )
-    assert fine_reads == [607, 607]
+    assert fine_reads == [_expected_fine_read(samples_per_scan)] * 2
     assert [(frame, slot) for frame, slot, _tx, _ready in ack_boundaries] == [
         (1, 7),
         (2, 18),
@@ -6583,7 +6608,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
             3: commanded["B"],
             9: worker_module.DEFAULT_EXPOSURES["IR"],
         }
-    assert second.output.read_bytes() == b"f"
+    assert second.output.read_bytes() == b"f" * _expected_fine_read(samples_per_scan)[1]
     session = json.loads(session_journal_path.read_text(encoding="utf-8"))
     assert session["status"] == "complete"
     assert session["allow_unverified"] is False
@@ -6777,9 +6802,11 @@ def test_guarded_candidate_outside_scanner_bounds_is_clamped_and_journaled(
     ]
 
 
+@pytest.mark.parametrize("samples_per_scan", [(1, 1), (4, 4), (1, 4)])
 def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    samples_per_scan: tuple[int, int],
 ) -> None:
     """(a)/(b) task requirement, at the wire level -- the only layer in
     this suite that actually speaks SCSI: preview-and-hold, then two
@@ -6795,12 +6822,6 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
 
     plan = load_canonical_plan()
     canonical_target = worker_module.validate_plan(plan)
-    tiny_target = {
-        **canonical_target,
-        "repeat": 1,
-        "request_len": 1,
-        "request_parts": [1],
-    }
     for sequence in worker_module.PREVIEW_READ_SEQUENCES:
         entry = plan[sequence - 1]
         entry["request_len"] = 1
@@ -6922,7 +6943,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
             "allow_unverified": False,
             "exposure_override_10ns": None,
             "manual_boundary_rows": None,
-            "samples_per_scan": 4,
+            "samples_per_scan": samples_per_scan[0 if frame.slot == 7 else 1],
             "frames": [
                 {
                     "ack": f"frame-{frame.slot:03d}/parent-ack.json",
@@ -6946,7 +6967,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     header_8e = b"\0\x8e\0\0\0\x06"
     reserves: list[int] = []
     variable_frame_table_calls: list[int] = []
-    fine_reads: list[int] = []
+    fine_reads: list[tuple[str, int]] = []
     ready_groups: list[tuple[int, ...]] = []
     releases: list[tuple[object, object]] = []
     ejects: list[str] = []
@@ -7004,8 +7025,8 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
         elif sequence in worker_module.METER_READ_SEQUENCES:
             payload = b"m"
         elif sequence == 607:
-            fine_reads.append(sequence)
-            payload = b"f"
+            fine_reads.append((entry["cdb"], entry["request_len"]))
+            payload = b"f" * entry["request_len"]
         else:
             payload = bytes.fromhex(entry.get("expected_data_in", ""))
         return TransactionResult(
@@ -7165,7 +7186,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     )
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
-    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    _install_one_read_plan_validator(monkeypatch, canonical_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: None)
     monkeypatch.setattr(
@@ -7249,7 +7270,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     assert len(variable_frame_table_calls) == 1, (
         "exactly one command-64 frame-table transaction across both rounds"
     )
-    assert fine_reads == [607, 607], "one fine READ per round, two rounds"
+    assert fine_reads == [_expected_fine_read(samples) for samples in samples_per_scan]
     assert releases == [(ep_out, ep_in)], "exactly one RELEASE_UNIT, at the very end"
     assert ejects == ["eject"], "exactly one eject, at the very end"
 
@@ -7690,6 +7711,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     # Exercise the opted-in USB identity while preserving the revision
     # threading this test was written to cover.
