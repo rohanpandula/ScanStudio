@@ -223,7 +223,9 @@ def verify_app(app):
 
 def _cli_json(cli, socket_path, root, *arguments, expect_exit=0):
     argv = [str(cli), *arguments, '--socket', str(socket_path)]
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT,
+    # A six-frame job wait needs an aggregate budget, unlike a single reply.
+    timeout = TIMEOUT * 6 if '--wait' in arguments else TIMEOUT
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
                                env=isolated_environment(root), cwd=root)
     if completed.returncode != expect_exit:
         raise RuntimeError(f"CLI {' '.join(argv)} exited {completed.returncode}, expected {expect_exit}; stdout={completed.stdout!r}; stderr={completed.stderr!r}")

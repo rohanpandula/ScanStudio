@@ -401,6 +401,7 @@ private final class E2EEventsFollower: @unchecked Sendable {
     /// buffer is fed by a genuinely separate OS thread reading a real
     /// subprocess's pipe, so a pure `Task.yield()` loop can spin through
     /// its whole budget without ever giving that thread a scheduling slice.
+    @MainActor
     func waitForFirstLine() async -> [String: Any]? {
         for _ in 0..<2_000 {
             if let first = buffer.snapshot().first,
