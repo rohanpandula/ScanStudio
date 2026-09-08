@@ -59,13 +59,31 @@ public struct ScanPreflightReport: Codable, Equatable, Sendable {
             ("preview", outputs.preview.enabled, outputs.preview.destination),
         ]
         // Match the engine's admission rule early enough for --dry-run to be
-        // useful. This is an observational lexical check only; the engine's
+        // useful. This is an observational path check only; the engine's
         // held directory authorities remain the final security boundary.
         if let projectDirectory = status.projectDirectory {
-            let root = URL(fileURLWithPath: projectDirectory).standardizedFileURL.path
+            func canonicalPath(_ value: String) -> String {
+                var unresolved = URL(fileURLWithPath: value).standardizedFileURL
+                var suffix: [String] = []
+                var isDirectory: ObjCBool = false
+                while !FileManager.default.fileExists(atPath: unresolved.path, isDirectory: &isDirectory), unresolved.path != "/" {
+                    suffix.insert(unresolved.lastPathComponent, at: 0)
+                    unresolved.deleteLastPathComponent()
+                }
+                var resolved = unresolved.resolvingSymlinksInPath().standardizedFileURL
+                for component in suffix {
+                    resolved.appendPathComponent(component, isDirectory: false)
+                }
+                return resolved.standardizedFileURL.path
+            }
+            // Resolve existing symlink components before comparing. macOS's
+            // /tmp alias is /private/tmp; the engine's held authority sees
+            // the canonical path, so preflight must agree for dry-run and
+            // real admission.
+            let root = canonicalPath(projectDirectory)
             let rootPrefix = root == "/" ? "/" : root + "/"
             for (role, enabled, destination) in metadataDestinations where enabled {
-                let path = URL(fileURLWithPath: destination).standardizedFileURL.path
+                let path = canonicalPath(destination)
                 let withinProject = path == root || path.hasPrefix(rootPrefix)
                 check(
                     "DESTINATION_WITHIN_PROJECT",

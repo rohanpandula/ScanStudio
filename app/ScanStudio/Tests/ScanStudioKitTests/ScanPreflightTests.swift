@@ -61,6 +61,21 @@ struct ScanPreflightTests {
         )
         #expect(inside.ready)
         #expect(!inside.checks.contains { $0.code == "DESTINATION_WITHIN_PROJECT" && !$0.passed })
+
+        let alias = external.appendingPathComponent("project-alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
+        defer { try? FileManager.default.removeItem(at: alias) }
+        let aliasedOutput = OutputRecipe(
+            archive: ArchiveRecipe(filenameTemplate: "Archive#", destination: alias.appendingPathComponent("archive").path),
+            rawExport: output.rawExport,
+            positive: output.positive,
+            preview: output.preview
+        )
+        let aliased = ScanPreflightReport.evaluate(
+            status: status, frames: [1], readiness: .ready, capture: capture, outputs: aliasedOutput
+        )
+        #expect(aliased.ready)
+        #expect(!aliased.checks.contains { $0.code == "DESTINATION_WITHIN_PROJECT" && !$0.passed })
     }
 
     @Test("missing film and unwritable destinations refuse without creating output")
