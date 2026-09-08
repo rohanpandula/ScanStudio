@@ -12,7 +12,7 @@ struct Roll: AsyncParsableCommand {
         // file -- it composes Save's own request shape plus five other
         // already-shipped commands into one unattended walk, so it earns a
         // file of its own rather than crowding this one.
-        subcommands: [Save.self, Open.self, List.self, SolveExposure.self, Verify.self, Collect.self, Run.self]
+        subcommands: [Save.self, Open.self, List.self, SolveExposure.self, Verify.self, Collect.self, Run.self, Report.self]
     )
 
     /// `roll save` -> `roll.save`.

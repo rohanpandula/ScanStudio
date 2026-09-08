@@ -494,3 +494,35 @@ retain `control.dropped` notices. Established connection EOF emits one local
 `control.hostExited` event and exits **76**. This means observation was lost;
 it does not claim that an in-flight scan succeeded or failed. Ordinary local
 shutdown after a finite command does not synthesize that event.
+
+## Shell completion
+
+The CLI's existing argument parser generates completion scripts; no plugin or
+separate completion implementation is needed:
+
+```sh
+scanstudio-cli --generate-completion-script zsh > /tmp/_scanstudio-cli
+scanstudio-cli --generate-completion-script fish > /tmp/scanstudio-cli.fish
+```
+
+Load the generated file through your shell's normal completion configuration.
+Generation is offline and never connects to the scanner.
+
+## Retained roll reports and host services
+
+`roll report DIRECTORY --to /absolute/path/report.html` produces a self-contained
+HTML contact sheet without connecting to a host. It verifies retained artifact
+hashes, embeds available preview images, and refuses destination collisions.
+Missing review evidence is labeled Unknown. Non-thumbnail files are verified
+with streaming reads (1 GiB per artifact); embedded previews have a 32 MiB total
+limit. The receipt hash describes the normalized decoded receipt, not the bytes
+of the original manifest.
+
+`host service generate --bundle /absolute/ScanStudio.app --to /absolute/host.plist`
+only writes a new plist. `host service install --bundle /absolute/ScanStudio.app`
+explicitly installs and bootstraps `com.scanstudio.headless` in the current
+user's LaunchAgents directory; `host service remove` unloads and removes only
+that marked service. Existing plists are never overwritten. Failed launchctl
+operations retain the plist for inspection. The service starts the resident
+host at login and uses private logs; it does not restart failed hosts or run a
+scan job. Motion still requires an explicit CLI request and its confirmations.

@@ -62,6 +62,18 @@ public struct SessionEvidenceExportResult: Codable, Equatable, Sendable {
     public let missingEntryCount: Int
 }
 
+/// A verified digest for a retained file. Unlike `verifiedSnapshot`, this
+/// keeps the file contents streamed and is suitable for large scan outputs.
+public struct SessionEvidenceVerifiedDigest: Equatable, Sendable {
+    public let byteLength: UInt64
+    public let sha256: String
+
+    public init(byteLength: UInt64, sha256: String) {
+        self.byteLength = byteLength
+        self.sha256 = sha256
+    }
+}
+
 public enum SessionEvidenceExportError: Error, Equatable, LocalizedError, Sendable {
     case invalidInventory(String)
     case unsafeSource(String)
@@ -127,6 +139,14 @@ public enum SessionEvidenceExporter {
         let allowedRoot: DirectoryAuthority
     }
 
+    private struct OpenSnapshot {
+        let source: URL
+        let state: FileState
+        let canonicalPath: String
+        let handle: FileHandle
+        let allowedRoot: DirectoryAuthority
+    }
+
     private struct DirectoryAuthority {
         let url: URL
         let canonicalPath: String
@@ -148,6 +168,7 @@ public enum SessionEvidenceExporter {
     // real session evidence set exceeds these bounds.
     private static let maximumSourceBytes: Int64 = 64 * 1024 * 1024
     private static let maximumAggregateBytes: Int64 = 256 * 1024 * 1024
+    private static let maximumBoundArtifactBytes: Int64 = 1 * 1024 * 1024 * 1024
 
     public static func export(
         inventory: [SessionEvidenceInventoryEntry],
@@ -180,6 +201,58 @@ public enum SessionEvidenceExporter {
             try verifyStableFile(snapshot)
             try verifyExpectedHash(entry.expectedSha256, data: snapshot.data, name: entry.entryName)
             return snapshot.data
+        }
+    }
+
+    /// Verifies a retained file's namespace and expected hash while streaming
+    /// its contents. This is for bound scan artifacts whose bytes exceed the
+    /// in-memory evidence snapshot limit.
+    public static func verifiedDigest(
+        of entry: SessionEvidenceInventoryEntry
+    ) throws -> SessionEvidenceVerifiedDigest? {
+        switch entry.source {
+        case .missing:
+            return nil
+        case .file(let source, let allowedRoot):
+            let snapshot = try openStableFile(
+                source,
+                allowedRoot: allowedRoot,
+                maximumBytes: maximumBoundArtifactBytes
+            )
+            defer {
+                try? snapshot.handle.close()
+                try? snapshot.allowedRoot.handle.close()
+            }
+
+            var hasher = SHA256()
+            var offset: off_t = 0
+            let chunkSize = 1 << 20
+            while offset < off_t(snapshot.state.size) {
+                let remaining = Int(min(Int64(chunkSize), snapshot.state.size - Int64(offset)))
+                var chunk = Data(count: remaining)
+                let count = chunk.withUnsafeMutableBytes { bytes in
+                    Darwin.pread(
+                        snapshot.handle.fileDescriptor,
+                        bytes.baseAddress!,
+                        remaining,
+                        offset
+                    )
+                }
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else {
+                    throw SessionEvidenceExportError.changedSource(source.path)
+                }
+                hasher.update(data: chunk.prefix(count))
+                offset += off_t(count)
+            }
+
+            try verifyStableFile(snapshot, maximumBytes: maximumBoundArtifactBytes)
+            let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            try verifyExpectedHash(entry.expectedSha256, digest: digest, name: entry.entryName)
+            return SessionEvidenceVerifiedDigest(
+                byteLength: UInt64(snapshot.state.size),
+                sha256: digest
+            )
         }
     }
 
@@ -412,6 +485,52 @@ public enum SessionEvidenceExporter {
     }
 
     private static func readStableFile(_ source: URL, allowedRoot: URL) throws -> ReadSnapshot {
+        let snapshot = try openStableFile(source, allowedRoot: allowedRoot, maximumBytes: maximumSourceBytes)
+        do {
+            var data = Data(count: Int(snapshot.state.size))
+            var offset = 0
+            while offset < data.count {
+                let count = data.withUnsafeMutableBytes { bytes in
+                    Darwin.pread(
+                        snapshot.handle.fileDescriptor,
+                        bytes.baseAddress!.advanced(by: offset),
+                        bytes.count - offset,
+                        off_t(offset)
+                    )
+                }
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else {
+                    throw SessionEvidenceExportError.changedSource(
+                        "\(source.path) became shorter while being read"
+                    )
+                }
+                offset += count
+            }
+            let after = try validatedState(snapshot.handle.fileDescriptor, source: source)
+            guard after == snapshot.state, try canonicalPath(source) == snapshot.canonicalPath else {
+                throw SessionEvidenceExportError.changedSource(source.path)
+            }
+            try validateNamespace(source, expected: snapshot.state)
+            return ReadSnapshot(
+                source: snapshot.source,
+                data: data,
+                state: snapshot.state,
+                canonicalPath: snapshot.canonicalPath,
+                handle: snapshot.handle,
+                allowedRoot: snapshot.allowedRoot
+            )
+        } catch {
+            try? snapshot.handle.close()
+            try? snapshot.allowedRoot.handle.close()
+            throw error
+        }
+    }
+
+    private static func openStableFile(
+        _ source: URL,
+        allowedRoot: URL,
+        maximumBytes: Int64
+    ) throws -> OpenSnapshot {
         let root = try openDirectoryAuthority(allowedRoot)
         let canonicalSource: String
         do {
@@ -442,35 +561,10 @@ public enum SessionEvidenceExporter {
         }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         do {
-            let before = try validatedState(descriptor, source: source)
+            let before = try validatedState(descriptor, source: source, maximumBytes: maximumBytes)
             try validateNamespace(source, expected: before)
-            var data = Data(count: Int(before.size))
-            var offset = 0
-            while offset < data.count {
-                let count = data.withUnsafeMutableBytes { bytes in
-                    Darwin.pread(
-                        descriptor,
-                        bytes.baseAddress!.advanced(by: offset),
-                        bytes.count - offset,
-                        off_t(offset)
-                    )
-                }
-                if count < 0, errno == EINTR { continue }
-                guard count > 0 else {
-                    throw SessionEvidenceExportError.changedSource(
-                        "\(source.path) became shorter while being read"
-                    )
-                }
-                offset += count
-            }
-            let after = try validatedState(descriptor, source: source)
-            guard after == before, try canonicalPath(source) == canonicalSource else {
-                throw SessionEvidenceExportError.changedSource(source.path)
-            }
-            try validateNamespace(source, expected: before)
-            return ReadSnapshot(
+            return OpenSnapshot(
                 source: source,
-                data: data,
                 state: before,
                 canonicalPath: canonicalSource,
                 handle: handle,
@@ -483,9 +577,9 @@ public enum SessionEvidenceExporter {
         }
     }
 
-    private static func verifyStableFile(_ snapshot: ReadSnapshot) throws {
+    private static func verifyStableFile(_ snapshot: ReadSnapshot, maximumBytes: Int64 = maximumSourceBytes) throws {
         try verifyDirectoryAuthority(snapshot.allowedRoot)
-        let state = try validatedState(snapshot.handle.fileDescriptor, source: snapshot.source)
+        let state = try validatedState(snapshot.handle.fileDescriptor, source: snapshot.source, maximumBytes: maximumBytes)
         guard state == snapshot.state,
               try canonicalPath(snapshot.source) == snapshot.canonicalPath else {
             throw SessionEvidenceExportError.changedSource(snapshot.source.path)
@@ -493,7 +587,21 @@ public enum SessionEvidenceExporter {
         try validateNamespace(snapshot.source, expected: state)
     }
 
-    private static func validatedState(_ descriptor: Int32, source: URL) throws -> FileState {
+    private static func verifyStableFile(_ snapshot: OpenSnapshot, maximumBytes: Int64) throws {
+        try verifyDirectoryAuthority(snapshot.allowedRoot)
+        let state = try validatedState(snapshot.handle.fileDescriptor, source: snapshot.source, maximumBytes: maximumBytes)
+        guard state == snapshot.state,
+              try canonicalPath(snapshot.source) == snapshot.canonicalPath else {
+            throw SessionEvidenceExportError.changedSource(snapshot.source.path)
+        }
+        try validateNamespace(snapshot.source, expected: state)
+    }
+
+    private static func validatedState(
+        _ descriptor: Int32,
+        source: URL,
+        maximumBytes: Int64 = maximumSourceBytes
+    ) throws -> FileState {
         var info = stat()
         guard fstat(descriptor, &info) == 0,
               (info.st_mode & S_IFMT) == S_IFREG,
@@ -503,7 +611,7 @@ public enum SessionEvidenceExporter {
             )
         }
         let state = FileState(info)
-        guard state.size >= 0, state.size <= maximumSourceBytes else {
+        guard state.size >= 0, state.size <= maximumBytes else {
             throw SessionEvidenceExportError.limitExceeded("source exceeds the per-file limit: \(source.path)")
         }
         guard state.size == 0 || state.blocks * 512 >= state.size else {
@@ -730,6 +838,24 @@ public enum SessionEvidenceExporter {
                   (48...57).contains($0) || (97...102).contains($0)
               }),
               sha256(data) == normalized else {
+            throw SessionEvidenceExportError.changedSource(
+                "\(name) did not match its retained SHA-256"
+            )
+        }
+    }
+
+    private static func verifyExpectedHash(
+        _ expected: String?,
+        digest: String,
+        name: String
+    ) throws {
+        guard let expected else { return }
+        let normalized = expected.lowercased()
+        guard normalized.utf8.count == 64,
+              normalized.utf8.allSatisfy({
+                  (48...57).contains($0) || (97...102).contains($0)
+              }),
+              digest == normalized else {
             throw SessionEvidenceExportError.changedSource(
                 "\(name) did not match its retained SHA-256"
             )

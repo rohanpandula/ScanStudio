@@ -12,6 +12,7 @@ struct BatchInspectorView: View {
     @State private var positiveJPEGSettingsExpanded = false
     @State private var namedPresetNames: [String] = []
     @State private var presetError: String?
+    @State private var reportError: String?
     @FocusState private var focusedGearField: GearField?
     @State private var presentedRecentGear: GearField?
 
@@ -75,6 +76,14 @@ struct BatchInspectorView: View {
         } message: {
             Text(presetError ?? "The preset could not be loaded.")
         }
+        .alert("Roll report unavailable", isPresented: Binding(
+            get: { reportError != nil },
+            set: { if !$0 { reportError = nil } }
+        )) {
+            Button("OK", role: .cancel) { reportError = nil }
+        } message: {
+            Text(reportError ?? "The HTML report could not be written.")
+        }
     }
 
     @ViewBuilder
@@ -90,6 +99,10 @@ struct BatchInspectorView: View {
                 }
                 Button("Show Roll Folder in Finder") {
                     revealSavedFile(URL(fileURLWithPath: directory))
+                }
+                .controlSize(.small)
+                Button("Generate HTML Report") {
+                    generateRollReport(directory: directory)
                 }
                 .controlSize(.small)
                 if let frameIndex = sessionModel.detailFrameIndex ?? sessionModel.frameTransformTargetIndex {
@@ -124,6 +137,19 @@ struct BatchInspectorView: View {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func generateRollReport(directory: String) {
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try RollHTMLReport.write(projectDirectory: URL(fileURLWithPath: directory))
+                }.value
+                NSWorkspace.shared.open(URL(fileURLWithPath: result.path))
+            } catch {
+                reportError = error.localizedDescription
+            }
+        }
     }
 
     private func refreshNamedPresets() {

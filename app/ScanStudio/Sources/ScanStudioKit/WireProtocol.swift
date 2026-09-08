@@ -1307,6 +1307,25 @@ public struct WrittenFileBinding: Codable, Equatable, Sendable {
     public let fileId: UInt64?
 }
 
+public struct MetadataOutputBindings: Codable, Equatable, Sendable {
+    public let archive: WrittenFileBinding?
+    public let archiveXmp: WrittenFileBinding?
+    public let positive: WrittenFileBinding?
+    public let preview: WrittenFileBinding?
+
+    public init(
+        archive: WrittenFileBinding? = nil,
+        archiveXmp: WrittenFileBinding? = nil,
+        positive: WrittenFileBinding? = nil,
+        preview: WrittenFileBinding? = nil
+    ) {
+        self.archive = archive
+        self.archiveXmp = archiveXmp
+        self.positive = positive
+        self.preview = preview
+    }
+}
+
 public struct CaptureOutputBindings: Codable, Equatable, Sendable {
     public let rawNegative: WrittenFileBinding?
     public let rawNegativeIr: WrittenFileBinding?
@@ -1323,6 +1342,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
     public let previewPath: String?
     public let rawNegativePath: String?
     public let rawNegativeIrPath: String?
+    public let metadataBindings: MetadataOutputBindings?
     public let captureBindings: CaptureOutputBindings?
     /// Exact presentation transform applied to positive/preview derivatives.
     /// The archive/IR/meter capture files are never transformed.
@@ -1334,6 +1354,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         previewPath: String?,
         rawNegativePath: String? = nil,
         rawNegativeIrPath: String? = nil,
+        metadataBindings: MetadataOutputBindings? = nil,
         captureBindings: CaptureOutputBindings? = nil,
         derivativeTransform: DerivativeTransform = .identity
     ) {
@@ -1342,12 +1363,13 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         self.previewPath = previewPath
         self.rawNegativePath = rawNegativePath
         self.rawNegativeIrPath = rawNegativeIrPath
+        self.metadataBindings = metadataBindings
         self.captureBindings = captureBindings
         self.derivativeTransform = derivativeTransform
     }
 
     private enum CodingKeys: String, CodingKey {
-        case archivePath, positivePath, previewPath, rawNegativePath, rawNegativeIrPath, captureBindings, derivativeTransform
+        case archivePath, positivePath, previewPath, rawNegativePath, rawNegativeIrPath, metadataBindings, captureBindings, derivativeTransform
     }
 
     public init(from decoder: Decoder) throws {
@@ -1357,6 +1379,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         previewPath = try values.decodeIfPresent(String.self, forKey: .previewPath)
         rawNegativePath = try values.decodeIfPresent(String.self, forKey: .rawNegativePath)
         rawNegativeIrPath = try values.decodeIfPresent(String.self, forKey: .rawNegativeIrPath)
+        metadataBindings = try values.decodeIfPresent(MetadataOutputBindings.self, forKey: .metadataBindings)
         captureBindings = try values.decodeIfPresent(CaptureOutputBindings.self, forKey: .captureBindings)
         derivativeTransform = try values.decodeIfPresent(
             DerivativeTransform.self,

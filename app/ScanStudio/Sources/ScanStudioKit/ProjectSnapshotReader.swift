@@ -2,10 +2,10 @@ import Foundation
 
 /// Best-effort local manifest refresh, invoked only from a detached task.
 /// Oversized/unreadable snapshots keep the existing dirty-state warning.
-enum ProjectSnapshotReader {
-    static let maximumBytes = 16 * 1_024 * 1_024
+public enum ProjectSnapshotReader {
+    public static let maximumBytes = 16 * 1_024 * 1_024
 
-    static func read(_ url: URL) -> ScanProject? {
+    public static func read(_ url: URL) -> ScanProject? {
         do {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }

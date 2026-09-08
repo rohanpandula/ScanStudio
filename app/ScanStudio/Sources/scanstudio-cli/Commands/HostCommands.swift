@@ -10,7 +10,7 @@ struct Host: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "host",
         abstract: "Runs a resident headless ScanStudio host.",
-        subcommands: [Run.self, HostStop.self],
+        subcommands: [Run.self, HostStop.self, HostService.self],
         defaultSubcommand: Run.self
     )
 }
