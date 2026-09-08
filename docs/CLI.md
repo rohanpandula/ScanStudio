@@ -276,8 +276,8 @@ host stop                                      → verified pidfile stop
 bypasses the real hardware bootstrap, scrubs bridge/hardware state, and is the
 only supported way to create an isolated simulator host. `--engine` is a
 development/test override and `--log` chooses the detached log path. `host`
-commands do not require motion flags. `host` exits `0, 65, 69, 70, 75`;
-`host stop` exits `0, 69, 70, 75`.
+commands do not require motion flags. `host` exits `0, 64, 65, 69, 70, 75`;
+`host stop` exits `0, 64, 69, 70, 75`.
 
 ### Calibration commands
 
@@ -316,15 +316,27 @@ retroactively certified. Neither verification nor collection moves film.
 roll run --name NAME --carrier mounted|strip6|roll36 [--frame-count N]
          --film-process PROCESS --film-loaded --confirm-motion
          [--skip-blank] [--auto-approve] [--wait|--no-wait]
+         [--hopper] [--allow-unverified-hardware]
          → scanner.refresh, status, preview.acquire, events.subscribe,
            frames.list, frames.select, roll.save, review.approve, job.get
 ```
 
-This is the one-connection whole-roll walk: refresh/connect when needed,
+This is the whole-roll workflow: refresh/connect when needed,
 preview, wait for `previewComplete`, select frames, save, resolve an optional
 review, and wait for the job. Both `--film-loaded` and `--confirm-motion` are
 required. It stops at the first refusal and never retries. Exits are `0, 64,
 65, 69, 70, 75, 77`.
+
+For repeated numbered rolls, add `--hopper`:
+
+```text
+roll run --hopper --name NAME --carrier CARRIER --film-process PROCESS
+         --film-loaded --confirm-motion [--frame-count N]
+```
+
+Hopper mode names rolls `NAME-001`, `NAME-002`, and so on, ejects after each
+completed roll, waits for the next film, and stops on the first refusal. It
+requires waiting; `--no-wait` is refused.
 
 ### `scan`, `stop`, `resume`, and `eject`
 
@@ -370,7 +382,8 @@ ranges/repeat arguments exit 64 before connecting.
 diagnostics export --to DIRECTORY → diagnostics.export
 events --follow                   → events.subscribe
 sim load-media [--carrier strip6|roll36] [--preview-fixture NAME]
-                [--abort-at-frame N] [--abort-code CODE] → sim.loadMedia
+                [--abort-at-frame N] [--abort-code CODE]
+                [--stall-at-frame N] → sim.loadMedia
 ```
 
 Diagnostics requires an existing absolute directory with no `..` component.
