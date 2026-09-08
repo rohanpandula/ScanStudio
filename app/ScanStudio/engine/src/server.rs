@@ -687,6 +687,7 @@ impl Backends {
     fn scan_start(
         &self,
         frames: Vec<u32>,
+        allowed_meter_refusal_slots: Vec<u32>,
         pass_token: Option<String>,
         recipe: domain::CaptureRecipe,
         processing: domain::ProcessingRecipe,
@@ -700,6 +701,7 @@ impl Backends {
             Some(ActiveDevice::Sim) => SimulatedLs5000::scan_start_with_output_authorities(
                 &self.sim,
                 frames,
+                allowed_meter_refusal_slots,
                 pass_token,
                 recipe,
                 processing,
@@ -712,6 +714,7 @@ impl Backends {
             Some(ActiveDevice::Real) => RealLs5000::scan_start_with_output_authorities(
                 self.real.as_ref().unwrap(),
                 frames,
+                allowed_meter_refusal_slots,
                 pass_token,
                 recipe,
                 processing,
@@ -1418,6 +1421,50 @@ fn handle_request(
                     ));
                 }
             }
+            match params.on_frame_failure {
+                protocol::ScanFrameFailurePolicy::Stop => {
+                    if !params.allowed_meter_refusal_slots.is_empty() {
+                        return Err(EngineError::new(
+                            ErrorCode::InvalidParams,
+                            "allowedMeterRefusalSlots requires onFrameFailure=skip",
+                        ));
+                    }
+                }
+                protocol::ScanFrameFailurePolicy::Skip => {
+                    if params.allowed_meter_refusal_slots.is_empty() {
+                        return Err(EngineError::new(
+                            ErrorCode::InvalidParams,
+                            "onFrameFailure=skip requires allowedMeterRefusalSlots",
+                        ));
+                    }
+                    if params
+                        .allowed_meter_refusal_slots
+                        .windows(2)
+                        .any(|pair| pair[0] >= pair[1])
+                        || params
+                            .allowed_meter_refusal_slots
+                            .iter()
+                            .any(|slot| !params.frames.contains(slot))
+                    {
+                        return Err(EngineError::new(
+                            ErrorCode::InvalidParams,
+                            "allowedMeterRefusalSlots must be a sorted unique subset of frames",
+                        ));
+                    }
+                    if backends.active == Some(ActiveDevice::Sim) {
+                        return Err(EngineError::new(
+                            ErrorCode::NotSupported,
+                            "meter-refusal skipping is unavailable in simulator mode",
+                        ));
+                    }
+                    if project_state.directory.is_none() {
+                        return Err(EngineError::new(
+                            ErrorCode::ProjectNotFound,
+                            "meter-refusal skipping requires an open project for its durable skip record",
+                        ));
+                    }
+                }
+            }
             crate::render::validate_user_output_recipe_paths(&params.output)?;
             params.processing = params.processing.effective();
             // Capture the project namespace before any filesystem-based
@@ -1732,6 +1779,7 @@ fn handle_request(
             }
             let job_id = backends.scan_start(
                 params.frames,
+                params.allowed_meter_refusal_slots,
                 params.pass_token,
                 params.recipe,
                 params.processing,
@@ -3799,6 +3847,12 @@ mod tests {
             film_process: domain::FilmProcess::BwNegative,
             ..domain::ProcessingRecipe::default()
         });
+        let persisted = crate::manifest::persist_project_update(
+            &directory,
+            project_state.active.as_ref().expect("active project"),
+        )
+        .expect("persist legacy conflicting override");
+        project_state.active = Some(persisted);
 
         let scan = Request {
             id: 3,
@@ -4691,6 +4745,8 @@ mod tests {
     fn scan_start_params_round_trips_with_frame_alignments() {
         let params = protocol::ScanStartParams {
             frames: vec![1, 2],
+            on_frame_failure: protocol::ScanFrameFailurePolicy::Stop,
+            allowed_meter_refusal_slots: vec![],
             pass_token: None,
             recipe: domain::CaptureRecipe::default(),
             processing: domain::ProcessingRecipe::default(),
@@ -5332,6 +5388,12 @@ mod tests {
             .expect("project active")
             .frames[0]
             .output_override = Some(all_off);
+        let persisted = crate::manifest::persist_project_update(
+            &directory,
+            project_state.active.as_ref().expect("project active"),
+        )
+        .expect("persist legacy all-off override");
+        project_state.active = Some(persisted);
         let project_local_output = project_state
             .active
             .as_ref()

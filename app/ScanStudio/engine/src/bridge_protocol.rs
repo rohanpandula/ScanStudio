@@ -652,6 +652,8 @@ pub struct BridgeScanStartParams {
     pub slots: Vec<u32>,
     pub recipe: BridgeCaptureRecipe,
     pub output: BridgeOutputSpec,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_meter_refusal_slots: Vec<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -745,9 +747,25 @@ pub struct BridgeFrameCompletedPayload {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct BridgeFrameSkippedPayload {
+    pub job_id: String,
+    pub slot: u32,
+    pub code: String,
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
+    #[serde(default)]
+    pub journal_path: Option<String>,
+    #[serde(default)]
+    pub journal_sha256: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeScanCompletedSummary {
     pub completed: Vec<u32>,
     pub failed: Vec<u32>,
+    #[serde(default)]
+    pub skipped: Vec<u32>,
     pub stopped: bool,
 }
 

@@ -1153,6 +1153,7 @@ impl ScannerBackend for SimulatedLs5000 {
     fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
+        _allowed_meter_refusal_slots: Vec<u32>,
         pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
@@ -3483,6 +3484,7 @@ mod tests {
             SimulatedLs5000::scan_start_with_output_authorities(
                 &sim,
                 vec![1],
+                vec![],
                 Some(pass.into()),
                 CaptureRecipe {
                     resolution_dpi: 40,

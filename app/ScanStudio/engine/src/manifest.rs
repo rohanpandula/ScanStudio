@@ -495,6 +495,26 @@ fn write_manifest_atomically_at_locked(
                         ),
                     ));
                 }
+                let incoming_skips = project
+                    .frames
+                    .iter()
+                    .find(|frame| frame.index == on_disk_frame.index)
+                    .map(|frame| frame.skip_records.as_slice())
+                    .unwrap_or(&[]);
+                if on_disk_frame
+                    .skip_records
+                    .iter()
+                    .any(|record| !incoming_skips.contains(record))
+                {
+                    return Err(EngineError::new(
+                        ErrorCode::ManifestInvalid,
+                        format!(
+                            "refusing to write manifest at {}: frame {} would lose an on-disk skip record",
+                            display_directory.display(),
+                            on_disk_frame.index,
+                        ),
+                    ));
+                }
             }
         }
         Err(err) if err.code == ErrorCode::ProjectNotFound => {}
@@ -839,6 +859,7 @@ pub fn create_project_with_excluded_frames(
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         })
         .collect();
@@ -1360,6 +1381,13 @@ fn merge_receipts(on_disk: ScanProject, mut into: ScanProject) -> ScanProject {
             }
         }
         target.receipts = merged_receipts;
+        let mut merged_skips = on_disk_frame.skip_records;
+        for record in target.skip_records.drain(..) {
+            if !merged_skips.contains(&record) {
+                merged_skips.push(record);
+            }
+        }
+        target.skip_records = merged_skips;
     }
     into
 }
@@ -1408,6 +1436,26 @@ pub(crate) fn persist_frame_receipt_at(
     let mut project = read_manifest_from_directory_handle(&guard.directory, display_directory)?;
     mutate_frame(&mut project, frame_index, |frame| {
         frame.receipts.push(receipt.clone())
+    })?;
+    write_manifest_atomically_at_locked(&guard.directory, display_directory, &project)
+}
+
+pub(crate) fn persist_frame_skip_at(
+    directory: &File,
+    display_directory: &Path,
+    frame_index: u32,
+    record: &crate::domain::ScanSkipRecord,
+) -> Result<(), EngineError> {
+    let guard = lock_manifest_transaction_at(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(
+        display_directory,
+        &guard.directory,
+    )?;
+    let mut project = read_manifest_from_directory_handle(&guard.directory, display_directory)?;
+    mutate_frame(&mut project, frame_index, |frame| {
+        if !frame.skip_records.contains(record) {
+            frame.skip_records.push(record.clone());
+        }
     })?;
     write_manifest_atomically_at_locked(&guard.directory, display_directory, &project)
 }
@@ -2181,6 +2229,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![receipt],
                 },
                 ProjectFrame {
@@ -2191,6 +2240,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
             ],
@@ -2622,6 +2672,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 })
                 .collect(),

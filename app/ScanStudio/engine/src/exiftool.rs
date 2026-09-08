@@ -6759,6 +6759,7 @@ mod tests {
                 output_override: None,
                 alignment: None,
                 metadata_override: None,
+                skip_records: vec![],
                 receipts: vec![],
             }],
         }

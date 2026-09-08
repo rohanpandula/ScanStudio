@@ -3018,6 +3018,128 @@ fn per_frame_failed_closure_with_no_scan_error_reaches_the_client_through_the_fu
     let _ = reader_handle.join();
 }
 
+#[test]
+fn allowed_meter_refusal_skip_continues_without_a_receipt_for_the_blank_slot() {
+    let output_directory = unique_output_destination("meter-refusal-skip");
+    let bin = env!("CARGO_BIN_EXE_scanstudio-engine");
+    let mut child = Command::new(bin)
+        .env("SCANSTUDIO_BRIDGE_CMD", env!("CARGO_BIN_EXE_mock_bridge"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn engine binary");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader_handle = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    send(
+        &mut stdin,
+        1,
+        "engine.hello",
+        json!({"clientName": "e2e-meter-skip-test", "protocolVersion": 1}),
+    );
+    assert!(recv_response_for(&rx, 1, |_| {})["error"].is_null());
+    send(
+        &mut stdin,
+        2,
+        "project.create",
+        json!({
+            "name": "Meter skip",
+            "carrier": "strip6",
+            "frameCount": 2,
+            "filmProcess": "c41ColorNegative",
+            "directory": output_directory.join("project").display().to_string()
+        }),
+    );
+    assert!(recv_response_for(&rx, 2, |_| {})["error"].is_null());
+    send(
+        &mut stdin,
+        3,
+        "scanner.connect",
+        json!({"deviceId": "bridge-ls5000-0"}),
+    );
+    assert!(recv_response_for(&rx, 3, |_| {})["error"].is_null());
+    send(
+        &mut stdin,
+        4,
+        "scan.start",
+        json!({
+            "frames": [1, 2],
+            "onFrameFailure": "skip",
+            "allowedMeterRefusalSlots": [1],
+            "recipe": {"multisamplePasses": 4},
+            "output": {
+                "archive": {
+                    "destination": output_directory.join("project/archive").display().to_string(),
+                    "filenameTemplate": "frame-####"
+                },
+                "positive": {"enabled": false},
+                "preview": {"enabled": false}
+            }
+        }),
+    );
+    let start_response = recv_response_for(&rx, 4, |_| {});
+    assert!(
+        start_response["error"].is_null(),
+        "scan.start failed: {start_response:?}"
+    );
+    let events = drain_until(&rx, Duration::from_secs(5), |event| {
+        event["event"] == "scan.completed"
+    });
+    assert!(events.iter().any(|event| {
+        event["event"] == "scan.frameState"
+            && event["payload"]["frameIndex"] == 1
+            && event["payload"]["state"] == "skipped"
+            && event["payload"]["error"]["code"] == "METER_CONTROLLER_REFUSED"
+    }));
+    assert!(!events.iter().any(|event| {
+        event["event"] == "scan.frameCompleted" && event["payload"]["frameIndex"] == 1
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "scan.frameCompleted" && event["payload"]["frameIndex"] == 2
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "scan.jobState" && event["payload"]["state"] == "completed"
+    }));
+    let terminal = events
+        .iter()
+        .find(|event| event["event"] == "scan.completed")
+        .expect("scan.completed");
+    assert_eq!(terminal["payload"]["summary"]["completed"], json!([2]));
+    assert_eq!(terminal["payload"]["summary"]["failed"], json!([]));
+    assert_eq!(terminal["payload"]["summary"]["skipped"], json!([1]));
+    send(
+        &mut stdin,
+        5,
+        "project.setRollMetadata",
+        json!({"metadata": {"notes": "stale server snapshot must retain skip"}}),
+    );
+    assert!(recv_response_for(&rx, 5, |_| {})["error"].is_null());
+    let persisted = std::fs::read_to_string(output_directory.join("project/manifest.json"))
+        .expect("read persisted project");
+    let project: Value = serde_json::from_str(&persisted).expect("parse persisted project");
+    assert_eq!(project["frames"][0]["receipts"], json!([]));
+    assert_eq!(project["frames"][0]["skipRecords"][0]["jobId"], terminal["payload"]["jobId"]);
+    assert_eq!(project["frames"][0]["skipRecords"][0]["passToken"], Value::Null);
+    assert_eq!(project["frames"][0]["skipRecords"][0]["slot"], 1);
+    assert_eq!(project["frames"][0]["skipRecords"][0]["code"], "METER_CONTROLLER_REFUSED");
+    assert_eq!(project["frames"][0]["skipRecords"][0]["details"]["pass"], 2);
+
+    send(&mut stdin, 6, "engine.shutdown", json!({}));
+    assert!(recv_response_for(&rx, 6, |_| {})["error"].is_null());
+    assert!(wait_for_exit_bounded(&mut child, Duration::from_secs(10)).success());
+    let _ = reader_handle.join();
+    let _ = std::fs::remove_dir_all(output_directory);
+}
+
 /// Plan 12-02 helper: spawns the engine against the mock bridge with the
 /// mid-batch death flag armed, creates a three-frame strip6 project, and
 /// connects to the real device. Both 12-02 tests reuse this setup; ids 1-3

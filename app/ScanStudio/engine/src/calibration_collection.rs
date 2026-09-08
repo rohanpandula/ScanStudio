@@ -425,12 +425,24 @@ pub fn collect(
         ));
     }
 
+    let skips: Vec<_> = project.frames.iter().flat_map(|frame| &frame.skip_records)
+        .filter(|record| record.pass_token.as_deref() == Some(metadata.pass.as_str())
+            && selected_job_ids.is_none_or(|ids| ids.contains(&record.job_id)))
+        .collect();
+    for record in &skips {
+        if !metadata.slot_map.contains_key(&record.slot) {
+            return Err(format!("skipped slot {} has no physical-frame entry", record.slot));
+        }
+    }
     let selected = select_receipts(
         project,
         selected_job_ids,
         &metadata.pass,
         &metadata.slot_map,
     )?;
+    if selected.is_empty() && skips.is_empty() {
+        return Err("no receipts or recorded skips matched the requested pass and job IDs".into());
+    }
     let preflighted = preflight_receipts(&authority, &selected)?;
     authority
         .verify_namespace()
@@ -611,8 +623,10 @@ pub fn collect(
         },
         "lockedExposure": locked_exposure_metadata(project, metadata),
         "exceptions": {
-            "status": "unavailable",
-            "detail": "selected receipts do not persist exception records",
+            "status": if skips.is_empty() { "noneRecorded" } else { "recorded" },
+            "records": skips,
+            "journalEvidence": "unavailable: the driver callback does not expose journal paths or hashes",
+            "detail": "Recorded skips have no capture receipt or exposure/clipping measurement; older runs may lack exception records",
         },
         "settings": &project.recipes,
         "frames": metadata_frames,
@@ -625,10 +639,7 @@ pub fn collect(
 
     let mut ledger = String::new();
     for file in &files {
-        ledger.push_str(&format!(
-            "{}  {}  {} bytes\n",
-            file.sha256, file.path, file.byte_length
-        ));
+        ledger.push_str(&format!("{}  {}\n", file.sha256, file.path));
     }
     let hash_file = write_new_file(&destination_dir, "file-hashes.txt", ledger.as_bytes())?;
     let hashes_path = destination.join("file-hashes.txt");
@@ -692,9 +703,6 @@ fn select_receipts<'a>(
                 physical_frame,
             });
         }
-    }
-    if selected.is_empty() {
-        return Err("no receipts matched the requested pass and job IDs".into());
     }
     Ok(selected)
 }
@@ -1198,6 +1206,7 @@ mod tests {
                     output_override: None,
                     alignment: Some(FrameAlignment::draft(0)),
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![receipt],
                 })
                 .collect(),
@@ -1293,7 +1302,7 @@ mod tests {
         );
         let ledger = std::fs::read_to_string(&result_a.hashes_path).unwrap();
         assert!(ledger.contains(&format!(
-            "{}  stock_20_A1.tif",
+            "{}  stock_20_A1.tif\n",
             a.outputs
                 .as_ref()
                 .unwrap()
@@ -1320,6 +1329,34 @@ mod tests {
         collect(&root, &project, None, &out_b, &metadata_b).unwrap();
         assert!(!out_b.join("stock_21_B.tif").exists());
         assert!(out_b.join("stock_21_B-meter.tif").exists());
+
+        // An all-skipped pass still exports its durable exceptions, never a fake capture.
+        let mut skipped_project = project.clone();
+        skipped_project.frames[0].skip_records.push(crate::domain::ScanSkipRecord {
+            job_id: "job-skipped".into(),
+            pass_token: Some("A2".into()),
+            slot: 1,
+            code: "METER_CONTROLLER_REFUSED".into(),
+            details: crate::domain::MeterControllerRefusalDetails { pass: 1, reasons: vec![] },
+        });
+        let skipped_metadata = CollectionMetadata { pass: "A2".into(), ..metadata_a.clone() };
+        let skipped_output = export_parent.join("skipped");
+        let skipped_result = collect(&root, &skipped_project, None, &skipped_output, &skipped_metadata).unwrap();
+        assert_eq!(skipped_result.files.len(), 2); // metadata and its hash ledger only
+        let skipped_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(skipped_output.join("roll-metadata.json")).unwrap()
+        ).unwrap();
+        assert_eq!(skipped_json["exceptions"]["records"][0]["slot"], 1);
+        assert_eq!(skipped_json["exceptions"]["records"][0]["jobId"], "job-skipped");
+        assert_eq!(skipped_json["frames"].as_array().unwrap().len(), 0);
+        let report = crate::calibration::verify_pass(&skipped_project, &crate::calibration::VerifyParams {
+            pass: Some("A2".into()), exposure_identical: true, no_clipping: true,
+        });
+        assert_eq!(report.status, VerificationStatus::Unknown);
+        assert_eq!(report.checked_receipts, 0);
+        assert!(report.issues.iter().any(|issue| issue.field == "allowedMeterRefusalSkip"));
+        let missing_map = CollectionMetadata { slot_map: BTreeMap::from([(2, 21)]), ..skipped_metadata };
+        assert!(collect(&root, &skipped_project, None, &export_parent.join("unmapped-skip"), &missing_map).is_err());
 
         let mut corrupt = project.clone();
         corrupt.frames[0].receipts[0]

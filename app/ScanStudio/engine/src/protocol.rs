@@ -618,6 +618,10 @@ pub struct PreviewStripResult {
 #[serde(rename_all = "camelCase")]
 pub struct ScanStartParams {
     pub frames: Vec<u32>,
+    #[serde(default)]
+    pub on_frame_failure: ScanFrameFailurePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_meter_refusal_slots: Vec<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_token: Option<String>,
     pub recipe: domain::CaptureRecipe,
@@ -631,6 +635,14 @@ pub struct ScanStartParams {
     /// ignores unknown fields per PROTOCOL.md forward compatibility.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub frame_alignments: std::collections::HashMap<u32, domain::FrameAlignment>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ScanFrameFailurePolicy {
+    #[default]
+    Stop,
+    Skip,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1180,6 +1192,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
                 domain::ProjectFrame {
@@ -1190,6 +1203,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
             ],

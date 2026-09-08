@@ -4810,6 +4810,7 @@ impl ScannerBackend for RealLs5000 {
     fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
+        allowed_meter_refusal_slots: Vec<u32>,
         pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
@@ -4856,6 +4857,7 @@ impl ScannerBackend for RealLs5000 {
         dispatch_real_scan_with_output_authorities(
             backend,
             frames,
+            allowed_meter_refusal_slots,
             pass_token,
             recipe,
             processing,
@@ -5097,6 +5099,7 @@ fn with_ambiguous_scan_start_recovery_holds(
 fn dispatch_real_scan_with_output_authorities(
     backend: &Arc<RealLs5000>,
     frames: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
     pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
@@ -5141,6 +5144,7 @@ fn dispatch_real_scan_with_output_authorities(
     let bridge_params = build_scan_start_params_with_bridge_output(
         Some(requested_job_id.clone()),
         frames.clone(),
+        allowed_meter_refusal_slots.clone(),
         &recipe,
         &processing,
         capture_plan.bridge_output.clone(),
@@ -5252,6 +5256,7 @@ fn dispatch_real_scan_with_output_authorities(
             backend_for_thread,
             thread_job_id,
             frames,
+            allowed_meter_refusal_slots,
             pass_token,
             recipe,
             processing,
@@ -5601,6 +5606,7 @@ fn build_scan_start_params(
     build_scan_start_params_with_bridge_output(
         None,
         slots,
+        vec![],
         recipe,
         processing,
         BridgeOutputSpec {
@@ -5615,6 +5621,7 @@ fn build_scan_start_params(
 fn build_scan_start_params_with_bridge_output(
     job_id: Option<String>,
     slots: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
     bridge_output: BridgeOutputSpec,
@@ -5622,6 +5629,7 @@ fn build_scan_start_params_with_bridge_output(
     BridgeScanStartParams {
         job_id,
         slots,
+        allowed_meter_refusal_slots,
         recipe: BridgeCaptureRecipe {
             resolution_dpi: recipe.resolution_dpi,
             bit_depth: recipe.bit_depth,
@@ -6194,8 +6202,13 @@ fn compute_duty_cycle_report(samples: &[FrameIdleSample]) -> Option<DutyCycleRep
 /// is instead called after every point `completed`/`failed` actually
 /// change (see `run_real_scan_job_inner`'s `emit_frame_progress`), so
 /// the ordinal it returns tracks frames actually started/completed.
-fn compute_frame_ordinal(completed: &[u32], failed: &[u32], total_frames: u32) -> u32 {
-    let resolved = (completed.len() + failed.len()) as u32;
+fn compute_frame_ordinal(
+    completed: &[u32],
+    failed: &[u32],
+    skipped: &[u32],
+    total_frames: u32,
+) -> u32 {
+    let resolved = (completed.len() + failed.len() + skipped.len()) as u32;
     (resolved + 1).min(total_frames.max(1))
 }
 
@@ -6255,6 +6268,7 @@ fn emit_terminal_job_failure(
     remaining: &mut Vec<u32>,
     completed: &[u32],
     failed: &mut Vec<u32>,
+    skipped: &[u32],
     // Kept for call-site/signature stability even though the new
     // NotAttempted shape below no longer attaches it to anything: the
     // frame this error actually describes was already reported by the
@@ -6294,7 +6308,7 @@ fn emit_terminal_job_failure(
             summary: ScanSummary {
                 completed: completed.to_vec(),
                 failed: failed.clone(),
-                skipped: vec![],
+                skipped: skipped.to_vec(),
                 not_attempted: untouched,
                 stopped: false,
                 duty_cycle,
@@ -7269,6 +7283,7 @@ fn bridge_event_belongs_to_scan_job(value: &serde_json::Value, job_id: &str) -> 
         event_name,
         "scan.progress"
             | "scan.frameRetrying"
+            | "scan.frameSkipped"
             | "scan.frameCompleted"
             | "hardware.anomaly"
             | "scan.frameFailed"
@@ -7318,6 +7333,7 @@ fn run_real_scan_job(
     backend: Arc<RealLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
     pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
@@ -7333,7 +7349,8 @@ fn run_real_scan_job(
     // whatever real progress was already reported to the client must still
     // be wrapped in an honest terminal scan.completed. Shared progress is
     // updated incrementally so it survives a caught panic.
-    let shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>)>> = Arc::new(Mutex::new((vec![], vec![])));
+    let shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>, Vec<u32>)>> =
+        Arc::new(Mutex::new((vec![], vec![], vec![])));
     let shared_evidence: Arc<Mutex<Vec<crate::evidence_package::EvidenceFrame>>> =
         Arc::new(Mutex::new(Vec::new()));
 
@@ -7365,6 +7382,7 @@ fn run_real_scan_job(
             backend_for_inner,
             job_id_for_inner,
             frames_for_inner,
+            allowed_meter_refusal_slots,
             pass_token_for_inner,
             recipe_for_inner,
             processing_for_inner,
@@ -7385,16 +7403,20 @@ fn run_real_scan_job(
             "scanstudio-engine: scan worker thread panicked for job {job_id}; \
              emitting honest terminal failure with best-known progress"
         );
-        let (known_completed, known_failed) = shared_progress
+        let (known_completed, known_failed, known_skipped) = shared_progress
             .lock()
-            .map(|guard| (guard.0.clone(), guard.1.clone()))
+            .map(|guard| (guard.0.clone(), guard.1.clone(), guard.2.clone()))
             .unwrap_or_else(|poisoned| {
                 let guard = poisoned.into_inner();
-                (guard.0.clone(), guard.1.clone())
+                (guard.0.clone(), guard.1.clone(), guard.2.clone())
             });
         let mut remaining: Vec<u32> = frames
             .into_iter()
-            .filter(|f| !known_completed.contains(f) && !known_failed.contains(f))
+            .filter(|f| {
+                !known_completed.contains(f)
+                    && !known_failed.contains(f)
+                    && !known_skipped.contains(f)
+            })
             .collect();
         let mut failed = known_failed;
         let error = EngineError::new(
@@ -7414,6 +7436,7 @@ fn run_real_scan_job(
             &mut remaining,
             &known_completed,
             &mut failed,
+            &known_skipped,
             &error_payload,
             None,
             Some(evidence_package_status),
@@ -7459,6 +7482,7 @@ fn run_real_scan_job_inner(
     backend: Arc<RealLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
     pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
@@ -7467,7 +7491,7 @@ fn run_real_scan_job_inner(
     output_authorities: crate::render::JobOutputAuthorities,
     capture_plan: RealCapturePlan,
     event_tx: mpsc::Sender<String>,
-    shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>)>>,
+    shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>, Vec<u32>)>>,
     shared_evidence: Arc<Mutex<Vec<crate::evidence_package::EvidenceFrame>>>,
     session_epoch: u64,
     bridge_generation: u64,
@@ -7500,9 +7524,15 @@ fn run_real_scan_job_inner(
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
+    let allowed_meter_refusal_slots = allowed_meter_refusal_slots
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     let mut remaining: Vec<u32> = frames;
     let mut completed: Vec<u32> = Vec::new();
     let mut failed: Vec<u32> = Vec::new();
+    let mut skipped: Vec<u32> = Vec::new();
+    let mut skip_event_invalid = false;
+    let mut skip_persistence_failed = false;
     // Frames captured successfully by the bridge whose engine-side
     // derivative render failed. The terminal bridge summary must not
     // re-label these frames completed.
@@ -7519,10 +7549,11 @@ fn run_real_scan_job_inner(
     let mut evidence_admission_error: Option<String> = None;
     // Collected only after a frame's bridge capture and engine receipt have
     // both succeeded. Packaging waits for terminal scan.completed below.
-    let sync_progress = |completed: &[u32], failed: &[u32]| {
+    let sync_progress = |completed: &[u32], failed: &[u32], skipped: &[u32]| {
         if let Ok(mut guard) = shared_progress.lock() {
             guard.0 = completed.to_vec();
             guard.1 = failed.to_vec();
+            guard.2 = skipped.to_vec();
         }
     };
     // 2026-07-26 fix (frame-ordinal display bug, live 2026-07-25):
@@ -7542,12 +7573,13 @@ fn run_real_scan_job_inner(
     // this closure need not borrow the enclosing loop's own
     // `frame_durations_ms` (declared below, alongside `idle_samples`) —
     // every call site passes its own up-to-date slice explicitly.
-    let emit_frame_progress = |completed: &[u32], failed: &[u32], remaining: &[u32], durations_ms: &[u64]| {
+    let emit_frame_progress = |completed: &[u32], failed: &[u32], skipped: &[u32], remaining: &[u32], durations_ms: &[u64]| {
         let frame_index = remaining
             .first()
             .copied()
             .or_else(|| completed.last().copied())
             .or_else(|| failed.last().copied())
+            .or_else(|| skipped.last().copied())
             .unwrap_or(0);
         emit(
             &event_tx,
@@ -7555,7 +7587,7 @@ fn run_real_scan_job_inner(
             ScanProgressPayload {
                 job_id: job_id.clone(),
                 frame_index,
-                frame_ordinal: compute_frame_ordinal(completed, failed, total_frames),
+                frame_ordinal: compute_frame_ordinal(completed, failed, skipped, total_frames),
                 total_frames,
                 pass: 1,
                 total_passes: recipe.multisample_passes,
@@ -7563,7 +7595,7 @@ fn run_real_scan_job_inner(
                 // job end, nothing remains) — never a fabricated
                 // sub-frame fraction.
                 frame_percent: 0.0,
-                job_percent: (completed.len() + failed.len()) as f64 * 100.0
+                job_percent: (completed.len() + failed.len() + skipped.len()) as f64 * 100.0
                     / total_frames.max(1) as f64,
                 // D-17: measured from this job's own resolved-frame
                 // durations (mean × frames remaining); 0.0 only before the
@@ -7665,6 +7697,7 @@ fn run_real_scan_job_inner(
                                 frame_ordinal: compute_frame_ordinal(
                                     &completed,
                                     &failed,
+                                    &skipped,
                                     total_frames,
                                 ),
                                 total_frames,
@@ -7681,7 +7714,7 @@ fn run_real_scan_job_inner(
                                 // this event does not itself resolve a
                                 // frame, so it reads the samples gathered
                                 // so far rather than pushing a new one.
-                                job_percent: (completed.len() + failed.len()) as f64 * 100.0
+                                job_percent: (completed.len() + failed.len() + skipped.len()) as f64 * 100.0
                                     / total_frames.max(1) as f64,
                                 eta_seconds: eta_seconds_from_samples(&frame_durations_ms, remaining.len()),
                             },
@@ -7709,6 +7742,109 @@ fn run_real_scan_job_inner(
                                 error: None,
                             },
                         );
+                    }
+                    "scan.frameSkipped" => {
+                        let Some(payload) = value.get("payload").cloned() else {
+                            skip_event_invalid = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                "bridge emitted scan.frameSkipped without a payload".to_string()
+                            });
+                            continue;
+                        };
+                        let Ok(frame_skipped) =
+                            serde_json::from_value::<BridgeFrameSkippedPayload>(payload)
+                        else {
+                            skip_event_invalid = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                "bridge emitted malformed scan.frameSkipped payload".to_string()
+                            });
+                            continue;
+                        };
+                        let details = frame_skipped.details.as_ref().and_then(|value| {
+                            serde_json::from_value::<domain::MeterControllerRefusalDetails>(
+                                value.clone(),
+                            )
+                            .ok()
+                        });
+                        if frame_skipped.code != "METER_CONTROLLER_REFUSED"
+                            || !allowed_meter_refusal_slots.contains(&frame_skipped.slot)
+                            || !remaining.contains(&frame_skipped.slot)
+                            || details.is_none()
+                        {
+                            skip_event_invalid = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                format!(
+                                    "bridge emitted an unauthorized or duplicate frameSkipped slot {}",
+                                    frame_skipped.slot
+                                )
+                            });
+                            continue;
+                        }
+                        let record = domain::ScanSkipRecord {
+                            job_id: job_id.clone(),
+                            pass_token: pass_token.clone(),
+                            slot: frame_skipped.slot,
+                            code: frame_skipped.code.clone(),
+                            details: details.expect("validated above"),
+                        };
+                        let persist_result = output_authorities
+                            .project_root()
+                            .ok_or_else(|| {
+                                EngineError::new(
+                                    ErrorCode::ProjectNotFound,
+                                    "the open project authority is unavailable for the skip record",
+                                )
+                            })
+                            .and_then(|project_root| {
+                                crate::manifest::persist_frame_skip_at(
+                                    project_root.directory_handle(),
+                                    project_root.canonical_path(),
+                                    frame_skipped.slot,
+                                    &record,
+                                )
+                            });
+                        if let Err(error) = persist_result {
+                            skip_persistence_failed = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                format!("failed to persist meter-refusal skip record: {error}")
+                            });
+                        }
+                        let error = EngineError::new(
+                            ErrorCode::MeterControllerRefused,
+                            format!(
+                                "meter controller refused allowed blank slot {}",
+                                frame_skipped.slot
+                            ),
+                        )
+                        .with_recoverable(false)
+                        .with_details(frame_skipped.details);
+                        emit(
+                            &event_tx,
+                            "scan.frameState",
+                            FrameStatePayload {
+                                job_id: job_id.clone(),
+                                frame_index: frame_skipped.slot,
+                                state: FrameState::Skipped,
+                                attempt: 1,
+                                error: Some(ErrorPayload::from(&error)),
+                            },
+                        );
+                        remaining.retain(|&slot| slot != frame_skipped.slot);
+                        skipped.push(frame_skipped.slot);
+                        sync_progress(&completed, &failed, &skipped);
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(
+                            &completed,
+                            &failed,
+                            &skipped,
+                            &remaining,
+                            &frame_durations_ms,
+                        );
+                        last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.frameCompleted" => {
                         let Some(payload) = value.get("payload").cloned() else {
@@ -7839,7 +7975,7 @@ fn run_real_scan_job_inner(
                             if !derivative_failed.contains(&frame_completed.slot) {
                                 derivative_failed.push(frame_completed.slot);
                             }
-                            sync_progress(&completed, &failed);
+                            sync_progress(&completed, &failed, &skipped);
                             // D-17: pushed BEFORE last_resolved_at is
                             // reassigned below, so this frame's own
                             // duration is included in the ETA
@@ -7849,7 +7985,7 @@ fn run_real_scan_job_inner(
                                     .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                     .as_millis() as u64,
                             );
-                            emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                            emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                             last_resolved_at = Some(event_arrived_at);
                             continue;
                         }
@@ -8227,7 +8363,7 @@ fn run_real_scan_job_inner(
                                 }
                             }
                         }
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // D-17: pushed BEFORE last_resolved_at is
                         // reassigned below, so this frame's own duration
                         // is included in the ETA emit_frame_progress
@@ -8237,7 +8373,7 @@ fn run_real_scan_job_inner(
                                 .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                 .as_millis() as u64,
                         );
-                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                        emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "hardware.anomaly" => {
@@ -8313,7 +8449,7 @@ fn run_real_scan_job_inner(
                                 failed.push(frame);
                             }
                         }
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // D-17: pushed BEFORE last_resolved_at is
                         // reassigned below, so this frame's own duration
                         // is included in the ETA emit_frame_progress
@@ -8323,7 +8459,7 @@ fn run_real_scan_job_inner(
                                 .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                 .as_millis() as u64,
                         );
-                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                        emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.frameFailed" => {
@@ -8381,7 +8517,7 @@ fn run_real_scan_job_inner(
                                 }
                             }
                         }
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // D-17: pushed BEFORE last_resolved_at is
                         // reassigned below, so this frame's own duration
                         // is included in the ETA emit_frame_progress
@@ -8391,7 +8527,7 @@ fn run_real_scan_job_inner(
                                 .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                 .as_millis() as u64,
                         );
-                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                        emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.error" => {
@@ -8492,11 +8628,12 @@ fn run_real_scan_job_inner(
                             &mut remaining,
                             &completed,
                             &mut failed,
+                            &skipped,
                             &error_payload,
                             compute_duty_cycle_report(&idle_samples),
                             Some(evidence_package_status),
                         );
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // 2026-07-25 incident fix (stale SCANNING after a
                         // zero-completed batch): a job that failed via
                         // scan.error left the app showing scanner.status
@@ -8545,6 +8682,23 @@ fn run_real_scan_job_inner(
                         else {
                             continue;
                         };
+                        let mut terminal_skipped = scan_completed.summary.skipped.clone();
+                        let mut observed_skipped = skipped.clone();
+                        terminal_skipped.sort_unstable();
+                        observed_skipped.sort_unstable();
+                        let skip_summary_mismatch = terminal_skipped != observed_skipped
+                            || scan_completed
+                                .summary
+                                .completed
+                                .iter()
+                                .chain(scan_completed.summary.failed.iter())
+                                .any(|slot| observed_skipped.contains(slot));
+                        if skip_summary_mismatch && evidence_admission_error.is_none() {
+                            evidence_admission_error = Some(format!(
+                                "bridge scan.completed skipped summary {:?} did not match observed frameSkipped events {:?}",
+                                terminal_skipped, observed_skipped
+                            ));
+                        }
                         let (completed_after_derivatives, failed_after_derivatives) =
                             reconcile_derivative_failures(
                                 scan_completed.summary.completed,
@@ -8582,12 +8736,33 @@ fn run_real_scan_job_inner(
                         } else {
                             package_finalization.summary
                         };
+                        let not_attempted_after_terminal = if skip_summary_mismatch
+                            || skip_event_invalid
+                        {
+                            remaining
+                                .iter()
+                                .copied()
+                                .filter(|slot| {
+                                    !completed_after_derivatives.contains(slot)
+                                        && !failed_after_derivatives.contains(slot)
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        };
                         emit(
                             &event_tx,
                             "scan.jobState",
                             JobStatePayload {
                                 job_id: job_id.clone(),
-                                state: JobState::Completed,
+                                state: if skip_summary_mismatch
+                                    || skip_event_invalid
+                                    || skip_persistence_failed
+                                {
+                                    JobState::Failed
+                                } else {
+                                    JobState::Completed
+                                },
                             },
                         );
                         emit(
@@ -8598,12 +8773,8 @@ fn run_real_scan_job_inner(
                                 summary: ScanSummary {
                                     completed: completed_after_derivatives,
                                     failed: failed_after_derivatives,
-                                    not_attempted: vec![],
-                                    // BRIDGE.md's scan.completed summary
-                                    // has no "skipped" list at all — a
-                                    // requested-but-unattempted slot is
-                                    // simply absent from both arrays.
-                                    skipped: vec![],
+                                    skipped: observed_skipped,
+                                    not_attempted: not_attempted_after_terminal,
                                     stopped: scan_completed.summary.stopped,
                                     duty_cycle: compute_duty_cycle_report(&idle_samples),
                                     evidence_package_status: Some(evidence_package_status),
@@ -8679,6 +8850,7 @@ fn run_real_scan_job_inner(
                     &mut remaining,
                     &completed,
                     &mut failed,
+                    &skipped,
                     &error_payload,
                     compute_duty_cycle_report(&idle_samples),
                     Some(deferred_evidence_status(
@@ -8688,7 +8860,7 @@ fn run_real_scan_job_inner(
                         "the silence watchdog fired without a real bridge scan.completed closure",
                     )),
                 );
-                sync_progress(&completed, &failed);
+                sync_progress(&completed, &failed, &skipped);
                 if ownership_lost {
                     // Pure in-process ownership transition: no device call,
                     // process restart, automatic open, or motion retry.
@@ -9860,12 +10032,12 @@ mod tests {
     fn compute_frame_ordinal_matches_session_journal_active_frame_index() {
         let completed: Vec<u32> = (5..17).collect(); // slots 5..16: 12 completed
         assert_eq!(completed.len(), 12);
-        assert_eq!(compute_frame_ordinal(&completed, &[], 34), 13);
+        assert_eq!(compute_frame_ordinal(&completed, &[], &[], 34), 13);
     }
 
     #[test]
     fn compute_frame_ordinal_starts_at_one_before_any_frame_resolves() {
-        assert_eq!(compute_frame_ordinal(&[], &[], 34), 1);
+        assert_eq!(compute_frame_ordinal(&[], &[], &[], 34), 1);
     }
 
     #[test]
@@ -9874,13 +10046,13 @@ mod tests {
         // regardless of which of the 12 succeeded vs failed.
         let completed: Vec<u32> = (1..=10).collect();
         let failed = vec![11, 12];
-        assert_eq!(compute_frame_ordinal(&completed, &failed, 34), 13);
+        assert_eq!(compute_frame_ordinal(&completed, &failed, &[], 34), 13);
     }
 
     #[test]
     fn compute_frame_ordinal_caps_at_total_once_every_frame_is_resolved() {
         let completed: Vec<u32> = (1..=34).collect();
-        assert_eq!(compute_frame_ordinal(&completed, &[], 34), 34);
+        assert_eq!(compute_frame_ordinal(&completed, &[], &[], 34), 34);
     }
 
     #[test]
@@ -10232,6 +10404,7 @@ mod tests {
             &mut remaining,
             &completed,
             &mut failed,
+            &[],
             &error_payload,
             None,
             None,
@@ -10330,6 +10503,7 @@ mod tests {
             &mut remaining,
             &known_completed,
             &mut failed,
+            &[],
             &error_payload,
             None,
             None,

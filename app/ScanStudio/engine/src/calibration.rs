@@ -63,12 +63,23 @@ pub fn verify_pass(project: &ScanProject, params: &VerifyParams) -> Verification
             .map(|receipt| receipt.job_id.clone())
             .collect::<Vec<_>>()
     });
-    verify(
+    let mut report = verify(
         project,
         selected_jobs.as_deref(),
         params.exposure_identical,
         params.no_clipping,
-    )
+    );
+    for record in project.frames.iter().flat_map(|frame| &frame.skip_records)
+        .filter(|record| params.pass.as_deref().is_none_or(|pass| record.pass_token.as_deref() == Some(pass))) {
+        report.issues.push(issue(
+            VerificationStatus::Pass,
+            Some(record.job_id.clone()),
+            Some(record.slot),
+            "allowedMeterRefusalSkip",
+            "Explicitly allowed meter refusal was recorded as skipped; no capture, exposure, or clipping measurement exists for this slot",
+        ));
+    }
+    report
 }
 
 /// Verifies the requested receipt properties without changing the project.
@@ -406,6 +417,7 @@ mod tests {
                     output_override: None,
                     alignment: Some(FrameAlignment::draft(0)),
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![receipt],
                 })
                 .collect(),

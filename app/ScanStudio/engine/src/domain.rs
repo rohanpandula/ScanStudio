@@ -141,6 +141,7 @@ pub trait ScannerBackend: Send + Sync + Sized {
         Self::scan_start_with_output_authorities(
             backend,
             frames,
+            vec![],
             None,
             recipe,
             processing,
@@ -159,6 +160,7 @@ pub trait ScannerBackend: Send + Sync + Sized {
     fn scan_start_with_output_authorities(
         backend: &std::sync::Arc<Self>,
         frames: Vec<u32>,
+        allowed_meter_refusal_slots: Vec<u32>,
         pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
@@ -1030,7 +1032,42 @@ pub struct ProjectFrame {
     /// the roll-wide `rollMetadata` for this frame, with no per-field merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_override: Option<MetadataSet>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_records: Vec<ScanSkipRecord>,
     pub receipts: Vec<ScanReceipt>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanSkipRecord {
+    pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_token: Option<String>,
+    pub slot: u32,
+    pub code: String,
+    pub details: MeterControllerRefusalDetails,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeterControllerRefusalDetails {
+    pub pass: u32,
+    pub reasons: Vec<MeterControllerRefusalReason>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeterControllerRefusalReason {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_raw_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_raw_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_aggregate_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_aggregate_samples: Option<u32>,
 }
 
 /// Lightweight listing shape for `project.list` — everything in
@@ -1285,8 +1322,8 @@ pub struct ScanReceipt {
     /// simulated receipts and legacy real receipts that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_transform: Option<String>,
-    /// CoolscanPy's `Frame.meter_rgbi` auto-exposure prepass file, when the
-    /// bridge supplies one. `None` on every simulated receipt.
+    /// CoolscanPy's `Frame.meter_rgbi` auto-exposure prepass file, or the
+    /// simulator's explicitly synthetic meter fixture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meter_rgbi_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1771,6 +1808,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
                 ProjectFrame {
@@ -1781,6 +1819,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
                 ProjectFrame {
@@ -1791,6 +1830,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
             ],
@@ -1822,6 +1862,7 @@ mod tests {
                 output_override: None,
                 alignment: None,
                 metadata_override: None,
+                skip_records: vec![],
                 receipts: vec![],
             }],
         });
@@ -1847,6 +1888,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         });
 
@@ -1889,6 +1931,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![receipt],
         });
     }
@@ -1909,6 +1952,7 @@ mod tests {
             output_override: Some(OutputRecipe::default()),
             alignment: Some(FrameAlignment::approved(5)),
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         });
     }
@@ -1923,6 +1967,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         };
         let value = serde_json::to_value(&frame).unwrap();
@@ -1946,6 +1991,7 @@ mod tests {
                 location: Some("Home".into()),
                 ..MetadataSet::default()
             }),
+            skip_records: vec![],
             receipts: vec![],
         });
 
@@ -1957,6 +2003,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         };
         let value = serde_json::to_value(&frame).unwrap();
