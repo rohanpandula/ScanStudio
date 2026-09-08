@@ -744,6 +744,34 @@ def test_status_forwards_coolscanpy_film_present_tristate(
     assert transport.status().film_present is verdict
 
 
+@pytest.mark.parametrize("verdict", (True, False, None))
+def test_status_uses_open_roll_film_status_without_a_second_device_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: bool | None,
+) -> None:
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
+    transport, device = _opened_transport(monkeypatch, roll)
+    device.film_present_result = True
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    calls = 0
+
+    def held_status() -> bool | None:
+        nonlocal calls
+        calls += 1
+        return verdict
+
+    roll.film_present = held_status  # type: ignore[attr-defined]
+    device_calls_before = device.film_present_calls
+
+    status = transport.status()
+
+    assert status.film_present is verdict
+    assert status.preview_established is (verdict is not False)
+    assert status.slot_count == (None if verdict is False else 1)
+    assert calls == 1
+    assert device.film_present_calls == device_calls_before
+
+
 def test_status_degrades_a_device_busy_film_present_probe_to_unknown_while_staying_connected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

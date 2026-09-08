@@ -1024,6 +1024,57 @@ class Roll:
             self._check_slot(session, slot)
             return session.slots[slot - 1].manual_review
 
+    def film_present(self) -> bool | None:
+        """Read film presence without competing for a held USB interface.
+
+        A preview reservation is owned by its still-running child, so the
+        query is handed to that child and the fresh hold rendezvous it
+        returns replaces the consumed one.  Without a held reservation,
+        this is the ordinary motion-free :meth:`Device.film_present` probe.
+        Any unsafe or malformed held handoff is an unknown verdict and is
+        retained as evidence; it is never retried through a second USB open.
+        """
+
+        with self._state_condition:
+            self._require_mutable_review_locked()
+            held = self._held_session
+            if held is not None:
+                self._held_session = None
+            self._preview_active = True
+            self._preview_thread_id = threading.get_ident()
+
+        io_acquired = False
+        try:
+            if held is None:
+                return self._device.film_present()
+            self._device._acquire_io_lock("roll film status")
+            io_acquired = True
+            result = self._ensure_adapter().film_status_held_session(held)
+            with self._state_condition:
+                self._held_session = result.held_again
+            return result.film_present
+        except Exception as error:
+            if held is not None:
+                if (
+                    not io_acquired
+                    or (
+                        held.process.poll() is None
+                        and not held.hold_ack_path.exists()
+                    )
+                ):
+                    with self._state_condition:
+                        self._held_session = held
+                self._preserve_evidence(f"held film-status query failed: {error}")
+                return None
+            raise
+        finally:
+            if io_acquired:
+                self._device._release_io_lock()
+            with self._state_condition:
+                self._preview_active = False
+                self._preview_thread_id = None
+                self._state_condition.notify_all()
+
     # -- scanning --------------------------------------------------------
 
     def solve_exposure(self, slot: int) -> ExposureSolution:

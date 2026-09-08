@@ -2135,7 +2135,7 @@ def test_malformed_transport_failure_evidence_never_replaces_original_error(
     assert str(error).startswith("original transport refusal")
 
 
-def test_wait_for_hold_decision_accepts_scan_and_release_actions(
+def test_wait_for_hold_decision_accepts_all_supported_actions(
     tmp_path: Path,
 ) -> None:
     """wait_for_hold_decision is a deliberate sibling of wait_for_parent_ack
@@ -2144,7 +2144,7 @@ def test_wait_for_hold_decision_accepts_scan_and_release_actions(
     minted. "eject" ends the session by replaying the traced vendor eject
     sequence before releasing -- the operator-changed-their-mind case."""
 
-    for action in ("scan", "release", "eject"):
+    for action in ("scan", "meter", "status", "release", "eject"):
         ack_path = tmp_path / f"hold-ack-{action}.json"
         ack_path.write_text(
             json.dumps(

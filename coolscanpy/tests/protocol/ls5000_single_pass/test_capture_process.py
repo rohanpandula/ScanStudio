@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import secrets
 import subprocess
 import sys
@@ -3363,6 +3364,7 @@ def _held_adapter(
     held_after_batch_journal_overrides: dict[str, Any] | None = None,
     child_class: type[FakeHeldBatchProcess] = FakeHeldBatchProcess,
     held_teardown_wait_seconds: float = 5.0,
+    held_status_wait_seconds: float = 20.0,
 ) -> capture.CaptureProcessAdapter:
     return capture.CaptureProcessAdapter(
         worker_path=binding.worker,
@@ -3381,7 +3383,23 @@ def _held_adapter(
         ),
         batch_poll_seconds=0,
         held_teardown_wait_seconds=held_teardown_wait_seconds,
+        held_status_wait_seconds=held_status_wait_seconds,
     )
+
+
+@pytest.mark.parametrize("value", (0, -1, math.nan, math.inf, -math.inf))
+def test_held_status_wait_must_be_finite_and_positive(
+    tmp_path: Path,
+    binding: Binding,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        _held_adapter(
+            tmp_path,
+            binding,
+            [],
+            held_status_wait_seconds=value,
+        )
 
 
 def test_begin_held_preview_never_releases(tmp_path: Path, binding: Binding) -> None:

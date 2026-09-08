@@ -3611,15 +3611,19 @@ impl RealLs5000 {
         self.fresh_status_for_session_with_options(
             session_epoch,
             bridge_generation,
-            SessionCallOptions::default(),
+            SessionCallOptions {
+                // A held child's TEST UNIT READY may use the same bounded
+                // startup-attention settle loop as the pre-preview probe.
+                deadline: Some(PREVIEW_FILM_PROBE_DEADLINE),
+                ..SessionCallOptions::default()
+            },
         )
     }
 
     /// `fresh_status_for_session` with a caller-supplied call bound. The
     /// pre-preview film probe passes [`PREVIEW_FILM_PROBE_DEADLINE`] because
     /// its status read can legitimately wait on the driver's settle loop;
-    /// everything else keeps the generic control-plane bound via the
-    /// zero-argument wrapper above.
+    /// ordinary status reads use that same bound via the wrapper above.
     fn fresh_status_for_session_with_options(
         &self,
         session_epoch: u64,
@@ -4136,6 +4140,7 @@ impl RealLs5000 {
             image_path: Some(result.thumbnail.image_path),
             boundary_rows: Some(result.thumbnail.boundary_rows),
             spacing_offset: Some(result.thumbnail.spacing_offset),
+            registration_offset: result.thumbnail.registration_offset,
             partial: result.thumbnail.partial,
             needs_approval: result.thumbnail.needs_approval,
             warnings: result.thumbnail.warnings,
@@ -4217,6 +4222,7 @@ impl RealLs5000 {
                     image_path: Some(thumbnail.image_path),
                     boundary_rows: Some(thumbnail.boundary_rows),
                     spacing_offset: Some(thumbnail.spacing_offset),
+                    registration_offset: None,
                     partial: thumbnail.partial,
                     needs_approval: thumbnail.needs_approval,
                     warnings: thumbnail.warnings,
@@ -4609,6 +4615,7 @@ impl ScannerBackend for RealLs5000 {
                                     image_path: Some(bridge_thumbnail.image_path.clone()),
                                     boundary_rows: Some(bridge_thumbnail.boundary_rows),
                                     spacing_offset: Some(bridge_thumbnail.spacing_offset),
+                                    registration_offset: bridge_thumbnail.registration_offset,
                                     partial: bridge_thumbnail.partial,
                                     needs_approval: bridge_thumbnail.needs_approval,
                                     warnings: bridge_thumbnail.warnings.clone(),

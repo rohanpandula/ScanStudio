@@ -2470,6 +2470,8 @@ def wait_for_hold_decision(
     by replaying the traced vendor eject sequence before releasing).
     ``"meter"`` publishes the same strictly validated one-slot job shape,
     but stops at the meter boundary and returns to a fresh hold wait.
+    ``"status"`` performs only TEST UNIT READY through this already-owned
+    interface, publishes its tri-state result, and likewise returns held.
     """
 
     if timeout_seconds < 0 or poll_seconds < 0:
@@ -2501,7 +2503,7 @@ def wait_for_hold_decision(
                         f"expected {required!r}"
                     )
             action = payload.get("action")
-            if action not in ("scan", "meter", "release", "eject"):
+            if action not in ("scan", "meter", "status", "release", "eject"):
                 raise SynchronizedProtocolError(
                     f"hold decision has invalid action {action!r}"
                 )
@@ -5912,6 +5914,48 @@ def _run_live_held_meter(
     return next_job_path, next_ack_path, next_session_id
 
 
+def _run_live_held_film_status(
+    ep_out: Any,
+    ep_in: Any,
+    root: Path,
+    *,
+    hold_session_id: str,
+    actual_usb_bus: int,
+    actual_usb_address: int,
+) -> tuple[Path, Path, str]:
+    """Probe film without motion and return a fresh hold rendezvous."""
+
+    from coolscanpy.transport.adapter_status import probe_claimed_adapter_status
+
+    result = probe_claimed_adapter_status(
+        ep_out,
+        ep_in,
+        device_id=f"usb:{actual_usb_bus}:{actual_usb_address}",
+    )
+    next_session_id = secrets.token_hex(16)
+    next_job_path = root / f"hold-job-{next_session_id}.json"
+    next_ack_path = root / f"hold-ack-{next_session_id}.json"
+    _write_json_exclusive(
+        root / f"hold-status-{hold_session_id}.json",
+        {
+            "schema_version": 1,
+            "status": "film-status-complete-held",
+            "hold_session_id": hold_session_id,
+            "film_present": result.film_present,
+            "raw_status": result.raw_status,
+            "sense_history": list(result.sense_history),
+            "device_id": result.device_id,
+            "unit_released": False,
+            "hold_resume": {
+                "hold_session_id": next_session_id,
+                "hold_job_path": str(next_job_path),
+                "hold_ack_path": str(next_ack_path),
+            },
+        },
+    )
+    return next_job_path, next_ack_path, next_session_id
+
+
 def run_live_capture(
     plan: list[dict],
     plan_path: Path,
@@ -6845,39 +6889,53 @@ def run_live_capture(
                         action = wait_for_hold_decision(
                             hold_ack_path, hold_session_id=hold_session_id
                         )
-                        while action == "meter":
-                            if density_calibration is None or density_evidence is None:
-                                raise SynchronizedProtocolError(
-                                    "held meter reached without density reservation evidence"
+                        while action in ("meter", "status"):
+                            if action == "status":
+                                (
+                                    hold_job_path,
+                                    hold_ack_path,
+                                    hold_session_id,
+                                ) = _run_live_held_film_status(
+                                    ep_out,
+                                    ep_in,
+                                    hold_job_path.parent,
+                                    hold_session_id=hold_session_id,
+                                    actual_usb_bus=actual_usb_bus,
+                                    actual_usb_address=actual_usb_address,
                                 )
-                            (
-                                hold_job_path,
-                                hold_ack_path,
-                                hold_session_id,
-                            ) = _run_live_held_meter(
-                                ep_out,
-                                ep_in,
-                                plan,
-                                plan_path,
-                                plan_sha256,
-                                continuation_plan,
-                                continuation_plan_sha256,
-                                hold_job_path,
-                                hold_session_id=hold_session_id,
-                                preview_bytes=preview_bytes,
-                                live_sub_8e_table=live_sub_8e_table,
-                                lifecycle=batch_lifecycle,
-                                density_calibration=density_calibration,
-                                density_evidence=density_evidence,
-                                actual_usb_bus=actual_usb_bus,
-                                actual_usb_address=actual_usb_address,
-                                expected_calibration_session_id=calibration_session_id,
-                                expected_usb_vendor_id=expected_usb_vendor_id,
-                                expected_usb_product_id=expected_usb_product_id,
-                                expected_scanner_model=expected_scanner_model,
-                                scanner_identity=scanner_identity,
-                                allow_unverified=allow_unverified,
-                            )
+                            else:
+                                if density_calibration is None or density_evidence is None:
+                                    raise SynchronizedProtocolError(
+                                        "held meter reached without density reservation evidence"
+                                    )
+                                (
+                                    hold_job_path,
+                                    hold_ack_path,
+                                    hold_session_id,
+                                ) = _run_live_held_meter(
+                                    ep_out,
+                                    ep_in,
+                                    plan,
+                                    plan_path,
+                                    plan_sha256,
+                                    continuation_plan,
+                                    continuation_plan_sha256,
+                                    hold_job_path,
+                                    hold_session_id=hold_session_id,
+                                    preview_bytes=preview_bytes,
+                                    live_sub_8e_table=live_sub_8e_table,
+                                    lifecycle=batch_lifecycle,
+                                    density_calibration=density_calibration,
+                                    density_evidence=density_evidence,
+                                    actual_usb_bus=actual_usb_bus,
+                                    actual_usb_address=actual_usb_address,
+                                    expected_calibration_session_id=calibration_session_id,
+                                    expected_usb_vendor_id=expected_usb_vendor_id,
+                                    expected_usb_product_id=expected_usb_product_id,
+                                    expected_scanner_model=expected_scanner_model,
+                                    scanner_identity=scanner_identity,
+                                    allow_unverified=allow_unverified,
+                                )
                             action = wait_for_hold_decision(
                                 hold_ack_path, hold_session_id=hold_session_id
                             )
@@ -7976,42 +8034,56 @@ def run_live_capture(
                 action = wait_for_hold_decision(
                     round_hold_ack_path, hold_session_id=round_hold_session_id
                 )
-                while action == "meter":
-                    if density_calibration is None or density_evidence is None:
-                        raise SynchronizedProtocolError(
-                            "held meter reached without density reservation evidence"
+                while action in ("meter", "status"):
+                    if action == "status":
+                        (
+                            round_hold_job_path,
+                            round_hold_ack_path,
+                            round_hold_session_id,
+                        ) = _run_live_held_film_status(
+                            ep_out,
+                            ep_in,
+                            round_hold_job_path.parent,
+                            hold_session_id=round_hold_session_id,
+                            actual_usb_bus=actual_usb_bus,
+                            actual_usb_address=actual_usb_address,
                         )
-                    (
-                        round_hold_job_path,
-                        round_hold_ack_path,
-                        round_hold_session_id,
-                    ) = _run_live_held_meter(
-                        ep_out,
-                        ep_in,
-                        plan,
-                        plan_path,
-                        plan_sha256,
-                        continuation_plan,
-                        continuation_plan_sha256,
-                        round_hold_job_path,
-                        hold_session_id=round_hold_session_id,
-                        preview_bytes=preview_bytes,
-                        live_sub_8e_table=live_sub_8e_table,
-                        lifecycle=batch_lifecycle,
-                        density_calibration=density_calibration,
-                        density_evidence=density_evidence,
-                        actual_usb_bus=actual_usb_bus,
-                        actual_usb_address=actual_usb_address,
-                        expected_calibration_session_id=calibration_session_id,
-                        expected_usb_vendor_id=expected_usb_vendor_id,
-                        expected_usb_product_id=expected_usb_product_id,
-                        expected_scanner_model=expected_scanner_model,
-                        scanner_identity=scanner_identity,
-                        allow_unverified=allow_unverified,
-                        session_journal_path=session_journal_path,
-                        session_journal=session_journal,
-                        include_density_evidence=not completed_slots,
-                    )
+                    else:
+                        if density_calibration is None or density_evidence is None:
+                            raise SynchronizedProtocolError(
+                                "held meter reached without density reservation evidence"
+                            )
+                        (
+                            round_hold_job_path,
+                            round_hold_ack_path,
+                            round_hold_session_id,
+                        ) = _run_live_held_meter(
+                            ep_out,
+                            ep_in,
+                            plan,
+                            plan_path,
+                            plan_sha256,
+                            continuation_plan,
+                            continuation_plan_sha256,
+                            round_hold_job_path,
+                            hold_session_id=round_hold_session_id,
+                            preview_bytes=preview_bytes,
+                            live_sub_8e_table=live_sub_8e_table,
+                            lifecycle=batch_lifecycle,
+                            density_calibration=density_calibration,
+                            density_evidence=density_evidence,
+                            actual_usb_bus=actual_usb_bus,
+                            actual_usb_address=actual_usb_address,
+                            expected_calibration_session_id=calibration_session_id,
+                            expected_usb_vendor_id=expected_usb_vendor_id,
+                            expected_usb_product_id=expected_usb_product_id,
+                            expected_scanner_model=expected_scanner_model,
+                            scanner_identity=scanner_identity,
+                            allow_unverified=allow_unverified,
+                            session_journal_path=session_journal_path,
+                            session_journal=session_journal,
+                            include_density_evidence=not completed_slots,
+                        )
                     action = wait_for_hold_decision(
                         round_hold_ack_path,
                         hold_session_id=round_hold_session_id,

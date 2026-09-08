@@ -425,7 +425,10 @@ def _normalize_preview_tile(image: np.ndarray) -> np.ndarray:
 
 
 def _thumbnail_from_coolscanpy(
-    thumbnail: coolscanpy.Thumbnail, *, image_path: str
+    thumbnail: coolscanpy.Thumbnail,
+    *,
+    image_path: str,
+    registration_offset: int | None = None,
 ) -> domain.Thumbnail:
     # `.image` is normalized (_normalize_preview_tile) and written to disk
     # by the caller (preview(), below) -- image_path is threaded through
@@ -438,8 +441,37 @@ def _thumbnail_from_coolscanpy(
         needs_approval=thumbnail.needs_approval,
         warnings=tuple(thumbnail.warnings),
         image_path=image_path,
+        registration_offset=registration_offset,
         partial=thumbnail.partial,
     )
+
+
+def _detected_registration_offset(
+    roll: object, thumbnail: coolscanpy.Thumbnail
+) -> int | None:
+    """Expose the detector's edge residual without re-running detection.
+
+    CoolscanPy's completed session already carries the fitted lattice and the
+    observed clear-film edge for each slot. The residual is review evidence;
+    it is intentionally separate from ``spacing_offset``, which is the
+    currently applied transport-table crop.
+    """
+    session = getattr(roll, "_session", None)
+    try:
+        slot = session.slots[thumbnail.slot - 1]
+        boundary = session.detection.boundaries[slot.base_origin.boundary_index]
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if (
+        boundary.manual_review
+        or boundary.support not in {"direct", "direct-wide"}
+        or boundary.evidence_run is None
+    ):
+        return None
+    residual = int(round(boundary.output_row - boundary.fitted_row))
+    if not -144 <= residual <= 144:
+        return None
+    return residual
 
 
 def _approval_receipt_from_coolscanpy(
@@ -864,7 +896,16 @@ class CoolscanPyTransport:
         # exception means the session itself is gone, classified here at
         # this boundary since the driver draws no such distinction itself --
         # matched on exception type, never a message string.
-        film_present_attr = getattr(self._device, "film_present", None)
+        roll_film_present_attr = (
+            getattr(self._roll, "film_present", None)
+            if self._roll is not None
+            else None
+        )
+        film_present_attr = (
+            roll_film_present_attr
+            if callable(roll_film_present_attr)
+            else getattr(self._device, "film_present", None)
+        )
         if callable(film_present_attr):
             try:
                 film_present = film_present_attr()
@@ -1112,7 +1153,15 @@ class CoolscanPyTransport:
             tifffile.imwrite(
                 tile_path, _normalize_preview_tile(thumbnail.image), photometric="rgb"
             )
-            on_thumbnail(_thumbnail_from_coolscanpy(thumbnail, image_path=str(tile_path)))
+            on_thumbnail(
+                _thumbnail_from_coolscanpy(
+                    thumbnail,
+                    image_path=str(tile_path),
+    registration_offset=_detected_registration_offset(
+                        self._roll, thumbnail
+                    ),
+                )
+            )
 
         self._material = material
         self._preview_established = True
