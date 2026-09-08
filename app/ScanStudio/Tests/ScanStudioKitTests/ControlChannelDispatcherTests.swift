@@ -442,6 +442,20 @@ struct ControlChannelDispatcherTests {
         }
     }
 
+    @Test("hello rejects controller labels that are blank, oversized, or non-printable")
+    @MainActor
+    func helloRejectsInvalidControllerLabels() async {
+        for name in ["   ", String(repeating: "x", count: 129), "line\nbreak"] {
+            let (_, _, dispatcher) = await makeDispatcher()
+            let response = await dispatcher.handle(.hello(
+                id: 1,
+                params: ControlHelloParams(schemaVersion: ControlSchema.version, clientName: name)
+            ))
+            expectFailure(response, id: 1, code: .invalidParams)
+            expectFailure(await dispatcher.handle(.status(id: 2)), id: 2, code: .helloRequired)
+        }
+    }
+
     // MARK: Decode failures
 
     @Test("An unknown method name is refused with UNKNOWN_COMMAND, carrying the request's own id")
@@ -549,11 +563,20 @@ struct ControlChannelDispatcherTests {
         }
         #expect(id == 99)
         #expect(error.code == ControlErrorCode.controllerBusy.rawValue)
+        #expect(error.message.contains("ScanStudio GUI"))
         #expect(error.guidance == "scanner.eject")
+        guard case .success(_, .status(let status)) = await dispatcher.handle(.status(id: 100)) else {
+            Issue.record("expected status while GUI-owned eject is held")
+            await stub.succeedEject()
+            await ejectOperation.value
+            return
+        }
+        #expect(status.controller == "ScanStudio GUI")
 
         await stub.succeedEject()
         await ejectOperation.value
         #expect(model.mutatingOperationInFlight == nil)
+        #expect(model.mutatingOperationController == nil)
     }
 
     // MARK: scanner.refresh (D-11)

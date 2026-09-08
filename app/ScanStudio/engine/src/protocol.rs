@@ -411,6 +411,10 @@ pub struct LoadMediaParams {
     /// is set and this is omitted. Ignored when `abortAtFrame` is absent.
     #[serde(default)]
     pub abort_code: Option<String>,
+    /// Simulator-only one-shot stall after the named frame's first progress
+    /// tick. Immediate stop remains available; a new media load clears it.
+    #[serde(default)]
+    pub stall_at_frame: Option<u32>,
 }
 
 // ---------------------------------------------------------------------

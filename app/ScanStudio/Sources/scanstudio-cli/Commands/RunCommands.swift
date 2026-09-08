@@ -405,6 +405,7 @@ enum RollRun {
         receipt.project = ControlRunReceipt.Project(name: saveResult.projectName, directory: saveResult.projectDirectory)
 
         var scanOutcome = saveResult.outcome
+        var activeMarker: (ActiveJobMarker, ActiveJobMarker.Context)?
         if let job {
             guard let directory = saveResult.projectDirectory else {
                 try await CommandRunner.fail(
@@ -430,7 +431,30 @@ enum RollRun {
             }
             guard let data = try await sendStep("scan", method: "scan.start", params: ControlScanStartParams(motionConfirmed: true, frames: selected),
                                                command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) else { return }
-            scanOutcome = try JSONDecoder().decode(ControlScanOutcomeResult.self, from: data).outcome
+            let outcome = try JSONDecoder().decode(ControlScanOutcomeResult.self, from: data)
+            scanOutcome = outcome.outcome
+            receipt.jobId = outcome.jobId
+            if scanOutcome == "started" {
+                guard let jobId = outcome.jobId,
+                      let context = try await ActiveJobMarker.context(
+                        client: client,
+                        socketPath: CommandRunner.socketPath(options),
+                        projectDirectory: directory
+                      ) else {
+                    try await CommandRunner.fail(
+                        command: command, options: options, client: client,
+                        error: ControlChannelClientError.malformedResponse
+                    )
+                }
+                activeMarker = (
+                    try ActiveJobMarker.write(
+                        jobId: jobId,
+                        context: context,
+                        correlationToken: await client.lastCorrelationToken(for: "scan.start")
+                    ),
+                    context
+                )
+            }
         }
         var jobStarted = scanOutcome == "started"
 
@@ -486,6 +510,9 @@ enum RollRun {
             let jobResult = try? JSONDecoder().decode(ControlJobResult.self, from: data)
             receipt.jobId = jobResult?.jobId
             receipt.jobState = jobResult?.jobState.map { String(describing: $0) }
+            if let activeMarker {
+                try ActiveJobMarker.retire(activeMarker.0, from: activeMarker.1)
+            }
             guard jobResult?.jobState != .failed else {
                 // The wire call itself succeeded -- only the job's own
                 // terminal state was a failure -- mirroring

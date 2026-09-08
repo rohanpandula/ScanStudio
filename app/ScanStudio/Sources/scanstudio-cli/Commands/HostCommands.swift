@@ -181,7 +181,9 @@ struct Run: AsyncParsableCommand {
     }
 
     private func openWithTimeout(path: String, timeout: Duration) async throws -> ControlChannelClient {
-        try await ControlChannelClient.open(path: path, clientName: "scanstudio-cli host", helloTimeout: timeout)
+        try await ControlChannelClient.open(
+            path: path, clientName: options.resolvedControllerName, helloTimeout: timeout
+        )
     }
 
     private func prepareLogParent(_ path: String) throws {
@@ -297,7 +299,9 @@ struct HostStop: AsyncParsableCommand {
     }
 
     private func openWithTimeout(path: String, timeout: Duration) async throws -> ControlChannelClient {
-        try await ControlChannelClient.open(path: path, clientName: "scanstudio-cli host stop", helloTimeout: timeout)
+        try await ControlChannelClient.open(
+            path: path, clientName: options.resolvedControllerName, helloTimeout: timeout
+        )
     }
 
     private func fail(code: String, message: String, guidance: String?) throws -> Never {

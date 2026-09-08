@@ -77,6 +77,8 @@ public actor ControlChannelClient {
     private var framer = LineFramer()
     private var nextRequestId: UInt64 = 0
     private var pendingRequests: [UInt64: PendingRequest] = [:]
+    private var idempotencyMethodOrdinals: [String: Int] = [:]
+    private var lastCorrelationTokensByMethod: [String: String] = [:]
     private var transcript: ControlSessionTranscript?
     private var transcriptCopyProjectDirectory: String?
 
@@ -232,16 +234,42 @@ public actor ControlChannelClient {
     /// typed refusal is returned as `.failure`, never thrown (D-14).
     public func request<Params: Encodable & Sendable>(
         method: String,
-        params: Params
+        params: Params,
+        idempotencyKeyBase: String? = nil
     ) async throws -> ControlClientResponse {
-        try await performRequest(method: method, params: params)
+        try await performRequest(
+            method: method,
+            params: params,
+            idempotencyKey: derivedIdempotencyKey(base: idempotencyKeyBase, method: method)
+        )
     }
 
     /// For the channel's no-params commands. Still sends `"params": {}` on
     /// the wire -- `ControlChannelDispatcher.decode(_:)` expects a params
     /// object even for an empty one.
-    public func requestWithoutParams(method: String) async throws -> ControlClientResponse {
-        try await performRequest(method: method, params: EmptyParams())
+    public func requestWithoutParams(
+        method: String,
+        idempotencyKeyBase: String? = nil
+    ) async throws -> ControlClientResponse {
+        try await performRequest(
+            method: method,
+            params: EmptyParams(),
+            idempotencyKey: derivedIdempotencyKey(base: idempotencyKeyBase, method: method)
+        )
+    }
+
+    private func derivedIdempotencyKey(base: String?, method: String) -> String? {
+        guard let base else { return nil }
+        let ordinal = idempotencyMethodOrdinals[method, default: 0]
+        idempotencyMethodOrdinals[method] = ordinal + 1
+        return ordinal == 0 ? "\(base):\(method)" : "\(base):\(method):\(ordinal + 1)"
+    }
+
+    /// Exact token attached to the most recently sent request for `method`.
+    /// Callers read it only after that admission response; no global context
+    /// or regenerated request identity is involved.
+    public func lastCorrelationToken(for method: String) -> String? {
+        lastCorrelationTokensByMethod[method]
     }
 
     /// Deliberately implements **no** request timeout. D-13's `--wait`
@@ -255,16 +283,19 @@ public actor ControlChannelClient {
     /// (`shutdown()`).
     private func performRequest<Params: Encodable & Sendable>(
         method: String,
-        params: Params
+        params: Params,
+        idempotencyKey: String? = nil
     ) async throws -> ControlClientResponse {
         guard !isShutDown else {
             throw ControlChannelClientError.connectionClosed
         }
         nextRequestId += 1
         let id = nextRequestId
-        let metadata = invocationID.map {
-            RequestMetadata(correlationToken: "\($0):\(id)")
-        }
+        let correlationToken = invocationID.map { "\($0):\(id)" }
+        if let correlationToken { lastCorrelationTokensByMethod[method] = correlationToken }
+        let metadata = correlationToken == nil && idempotencyKey == nil
+            ? nil
+            : RequestMetadata(correlationToken: correlationToken, idempotencyKey: idempotencyKey)
         let envelope = RequestEnvelope(
             id: id,
             method: method,

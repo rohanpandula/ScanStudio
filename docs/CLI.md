@@ -550,3 +550,16 @@ IORegistry USB topology checks. It does not start a host, refresh a scanner,
 open USB, or remove stale files. Unknown facts are warnings; proven failures
 produce exit 65. A stalled host query stops after two seconds so the other
 diagnostic rows can still be returned.
+
+
+### Reliable observers and automation defaults
+
+`scan --wait` and `resume --wait` save an active-job marker in the roll directory. A later waiting command or bare `status --job` uses the recorded host/session/job identity to attach to that job. A marker from a different host session refuses; inspect it before starting new work. Terminal markers are retired, with hook delivery records retained separately.
+
+`--controller-name LABEL` identifies the caller in status/events and busy refusals. Its default is `SCANSTUDIO_CONTROLLER`, then `scanstudio-cli`. This is a display label, not authentication. `--socket` overrides `SCANSTUDIO_SOCKET`. Explicit `--json`, `--ndjson`, or `--human` overrides `SCANSTUDIO_OUTPUT=json|ndjson|human`. These environment defaults never grant film or motion confirmation.
+
+`--key KEY` deduplicates mutating requests for the same controller within one host diagnostic session. Reusing a key with a different payload refuses. Concurrent duplicates await the original result; composed commands derive separate keys per method and occurrence. The cache holds at most 256 operations and refuses new keys when full. Restarting the host clears it; use the saved job marker to recover an observer.
+
+`scan --wait` and `resume --wait` accept `--on-frame 'command'` and `--on-fail 'command'`. Hooks receive `SCANSTUDIO_JOB_ID`, `SCANSTUDIO_CORRELATION_TOKEN`, `SCANSTUDIO_FRAME_INDEX`, `SCANSTUDIO_RECEIPT_KEY`, `SCANSTUDIO_RECEIPT_PATH`, `SCANSTUDIO_ERROR_JSON`, and `SCANSTUDIO_HOOK_KIND`. Delivery is recorded before launch, so observer reattachment does not launch it again. A crash between recording and launch can miss a delivery. Hook commands are not persisted. Hooks run independently with null stdio and a ten-second lifetime limit; failures do not retry or stop the scan.
+
+`selftest` creates private temporary simulator hosts and reports pass/fail plus evidence directories for stalled-frame stop, feed-jam resume, and killed-observer reattachment. It uses no real scanner. Development builds accept `selftest --engine /absolute/path/to/scanstudio-engine`; packaged builds resolve their bundled engine.

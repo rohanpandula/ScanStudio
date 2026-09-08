@@ -69,8 +69,11 @@ struct Status: AsyncParsableCommand {
 
     @OptionGroup var options: GlobalOptions
 
-    @Option(name: .customLong("job"), help: "Report this job id's status instead of the full session snapshot.")
-    var job: String?
+    @Flag(name: .customLong("job"), help: "Report a job. Omit JOB_ID to use this project's active-job marker.")
+    var reportJob = false
+
+    @Argument(help: "Job id used with --job. Omit it to use the active-job marker.")
+    var jobId: String?
 
     /// D-11: the one read-only-shaped flag that is not side-effect-free --
     /// it asks the scanner for its current state (`scanner.refresh`) before
@@ -83,11 +86,14 @@ struct Status: AsyncParsableCommand {
     var watch = false
 
     mutating func validate() throws {
-        if watch, job != nil {
+        if watch, reportJob {
             throw ValidationError("\"status --watch\" cannot be combined with --job.")
         }
         if watch, refresh {
             throw ValidationError("\"status --watch\" cannot be combined with --refresh.")
+        }
+        if jobId != nil, !reportJob {
+            throw ValidationError("A status JOB_ID requires --job.")
         }
     }
 
@@ -106,15 +112,59 @@ struct Status: AsyncParsableCommand {
         if refresh {
             reconnected = try await refreshOrReconnect(client: client)
         }
-        guard let job else {
+        guard reportJob else {
             let response = try await CommandRunner.requestWithoutParams(command: "status", method: "status", options: options, client: client)
             try await finishStatus(client: client, response: response, reconnected: reconnected)
             return
         }
 
+        var marker: ActiveJobMarker?
+        var markerContext: ActiveJobMarker.Context?
+        let requestedJobId: String
+        if let jobId {
+            requestedJobId = jobId
+        } else {
+            do {
+                guard let context = try await ActiveJobMarker.context(
+                    client: client,
+                    socketPath: CommandRunner.socketPath(options)
+                ), let loaded = try ActiveJobMarker.load(from: context) else {
+                    let response = ControlClientResponse.failure(ControlErrorPayload(
+                        code: ControlCLIErrorCode.jobNotFound.rawValue,
+                        message: "This project has no active-job marker.",
+                        recoverable: false
+                    ))
+                    try await finishStatus(client: client, response: response, reconnected: reconnected)
+                    return
+                }
+                guard loaded.matches(context) else {
+                    let response = ControlClientResponse.failure(ControlErrorPayload(
+                        .gateRefused,
+                        message: "The active-job marker belongs to a different socket, host session, or project."
+                    ))
+                    try await finishStatus(client: client, response: response, reconnected: reconnected)
+                    return
+                }
+                marker = loaded
+                markerContext = context
+                requestedJobId = loaded.jobId
+            } catch {
+                try await CommandRunner.fail(command: "status", options: options, client: client, error: error)
+            }
+        }
         let response = try await CommandRunner.request(
-            command: "status", method: "job.get", params: ControlJobGetParams(jobId: job), options: options, client: client
+            command: "status", method: "job.get", params: ControlJobGetParams(jobId: requestedJobId), options: options, client: client
         )
+        if let marker, let markerContext {
+            switch response {
+            case .failure(let payload) where payload.code == "JOB_NOT_FOUND":
+                try? ActiveJobMarker.retire(marker, from: markerContext)
+            case .result(let data) where (try? JSONDecoder().decode(ControlJobResult.self, from: data).jobState?.isTerminal) == true:
+                try? ActiveJobMarker.retire(marker, from: markerContext)
+            default:
+                break
+            }
+        }
         try await finishStatus(client: client, response: response, reconnected: reconnected)
     }
 

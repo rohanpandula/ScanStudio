@@ -660,7 +660,24 @@ public final class SessionModel {
     /// `isResumingBatch`, etc.) -- those stay because each drives its own
     /// progress affordance; this one only answers "is any mutation in
     /// flight right now."
-    public private(set) var mutatingOperationInFlight: String?
+    public private(set) var mutatingOperationController: String?
+    private var controlRequestController: String?
+    public private(set) var mutatingOperationInFlight: String? {
+        didSet {
+            if mutatingOperationInFlight == nil {
+                mutatingOperationController = nil
+            } else if oldValue == nil {
+                mutatingOperationController = controlRequestController ?? "ScanStudio GUI"
+            }
+        }
+    }
+
+    /// Installs the informational controller label for the next control
+    /// mutation. The dispatcher clears it after routing; confirmations and
+    /// all authorization gates remain separate and unchanged.
+    func setControlRequestController(_ name: String?) {
+        controlRequestController = name
+    }
     /// Saves and returns the previous value of `mutatingOperationInFlight`,
     /// then assigns `name` -- but only when no mutating operation is already
     /// in flight. `connect()` calls `await refreshAvailableDevices()`
@@ -682,6 +699,57 @@ public final class SessionModel {
     }
     public private(set) var status: ScannerStatus?
     public private(set) var engineVersion: String?
+
+    enum IdempotentRequestAdmission {
+        case execute(token: String)
+        case replay(ControlResponse)
+        case wait(token: String)
+        case conflict
+        case capacity
+    }
+
+    private struct IdempotentRequestEntry {
+        let fingerprint: String
+        var response: ControlResponse?
+        var waiters: [CheckedContinuation<ControlResponse, Never>] = []
+    }
+
+    private static let maximumIdempotentRequests = 256
+    private var idempotentRequests: [String: IdempotentRequestEntry] = [:]
+
+    /// Host-memory-only admission. Restarting the host deliberately loses
+    /// this bounded cache; durable active-job markers remain the separate
+    /// authority for scan reattachment after restart.
+    func admitIdempotentRequest(
+        scope: String,
+        key: String,
+        fingerprint: String
+    ) -> IdempotentRequestAdmission {
+        let token = "\(scope)\u{0}\(key)"
+        if let entry = idempotentRequests[token] {
+            guard entry.fingerprint == fingerprint else { return .conflict }
+            return entry.response.map(IdempotentRequestAdmission.replay) ?? .wait(token: token)
+        }
+        guard idempotentRequests.count < Self.maximumIdempotentRequests else { return .capacity }
+        idempotentRequests[token] = IdempotentRequestEntry(fingerprint: fingerprint)
+        return .execute(token: token)
+    }
+
+    func waitForIdempotentRequest(token: String) async -> ControlResponse {
+        if let response = idempotentRequests[token]?.response { return response }
+        return await withCheckedContinuation { continuation in
+            idempotentRequests[token]?.waiters.append(continuation)
+        }
+    }
+
+    func completeIdempotentRequest(token: String, response: ControlResponse) {
+        guard var entry = idempotentRequests[token], entry.response == nil else { return }
+        entry.response = response
+        let waiters = entry.waiters
+        entry.waiters.removeAll()
+        idempotentRequests[token] = entry
+        for waiter in waiters { waiter.resume(returning: response) }
+    }
     public private(set) var thumbnails: [Int: Thumbnail] = [:]
     /// `BlankFrameHint.Score` per frame index, computed once per arriving
     /// thumbnail (`"scanner.thumbnail"`) and once more when the whole preview
@@ -1745,10 +1813,10 @@ public final class SessionModel {
 
     /// Loads a simulated carrier. Previewing remains an explicit next action
     /// after a roll project exists, matching the real scanner's honest flow.
-    public func loadCarrier(_ carrier: SimulatedFilmCarrier, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async {
+    public func loadCarrier(_ carrier: SimulatedFilmCarrier, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil, stallAtFrame: Int? = nil) async {
         lastErrorMessage = nil
         do {
-            let params = LoadMediaParams(carrier: carrier.rawValue, previewFixture: previewFixture, abortAtFrame: abortAtFrame, abortCode: abortCode)
+            let params = LoadMediaParams(carrier: carrier.rawValue, previewFixture: previewFixture, abortAtFrame: abortAtFrame, abortCode: abortCode, stallAtFrame: stallAtFrame)
             let newStatus: ScannerStatus = try await engineClient.request("sim.loadMedia", params: params)
             status = newStatus
             clearMediaState()

@@ -17,6 +17,7 @@
 // now routed -- D-05.
 
 import Foundation
+import CryptoKit
 import Observation
 
 // MARK: - Decode failure
@@ -79,6 +80,14 @@ public enum ControlRequest: Sendable {
 }
 
 extension ControlRequest {
+    public static let mutatingMethodNames: Set<String> = [
+        "scanner.list", "scanner.rescan", "scanner.refresh", "scanner.connect", "scanner.disconnect",
+        "sim.loadMedia", "preview.acquire", "frames.select", "frames.place", "frames.include",
+        "frames.exclude", "review.approve", "settings.set", "outputs.set", "roll.save", "roll.open",
+        "roll.list", "roll.solveExposure", "roll.render", "roll.export", "roll.metadataApply", "roll.collect", "scan.start",
+        "scan.stop", "scan.resume", "scanner.eject", "review.cancel",
+    ]
+
     public var id: UInt64 {
         switch self {
         case .hello(let id, _): id
@@ -166,16 +175,7 @@ extension ControlRequest {
     /// control caller must meet the same bar -- Plan 06 implements the
     /// specific check; this flag is what routes them through it).
     public var isMutating: Bool {
-        switch self {
-        case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect, .simLoadMedia,
-             .previewAcquire, .framesSelect, .framesPlace, .framesInclude, .framesExclude, .reviewApprove,
-             .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList, .rollSolveExposure, .rollCollect,
-             .scanStart, .scanStop, .scanResume, .scannerEject, .reviewCancel:
-            true
-        case .hello, .status, .framesList, .settingsGet, .outputsGet,
-             .diagnosticsExport, .sessionInventory, .eventsSubscribe, .jobGet, .rollVerify, .scanPreflight:
-            false
-        }
+        Self.mutatingMethodNames.contains(methodName)
     }
 }
 
@@ -263,6 +263,15 @@ public enum ControlResponse: Equatable, Sendable {
     }
 }
 
+extension ControlResponse {
+    func replacingID(_ id: UInt64) -> ControlResponse {
+        switch self {
+        case .success(_, let result): .success(id: id, result: result)
+        case .failure(_, let error): .failure(id: id, error: error)
+        }
+    }
+}
+
 // MARK: - Dispatcher
 
 /// Accepts a decoded request and returns an encodable response, plus a
@@ -282,6 +291,7 @@ public final class ControlChannelDispatcher {
     private let sessionModel: SessionModel
     private let hostKind: ControlHostKind
     private var greeted = false
+    private var controllerName = "unidentified controller"
     /// Subscriptions `subscribeToEvents()` still owns. `onTermination`
     /// removes a subscription's id here so a dropped subscriber's observer
     /// chain stops re-arming instead of running for the process lifetime
@@ -422,12 +432,16 @@ public final class ControlChannelDispatcher {
             return refusal
         }
         if request.isMutating, let inFlight = sessionModel.mutatingOperationInFlight {
+            let controller = sessionModel.mutatingOperationController ?? "unknown controller"
             return .failure(id: request.id, error: ControlErrorPayload(
                 .controllerBusy,
-                message: "\"\(request.methodName)\" was refused: \"\(inFlight)\" is already in flight.",
+                message: "\"\(request.methodName)\" was refused: \"\(inFlight)\" is held by controller \"\(controller)\".",
                 guidance: inFlight
             ))
         }
+        guard request.isMutating else { return await route(request) }
+        sessionModel.setControlRequestController(controllerName)
+        defer { sessionModel.setControlRequestController(nil) }
         return await route(request)
     }
 
@@ -442,6 +456,15 @@ public final class ControlChannelDispatcher {
                 message: "Client requested schema version \(params.schemaVersion); this app speaks schema version \(ControlSchema.version)."
             ))
         }
+        if let validationError = ControlControllerName.validationError(params.clientName) {
+            return .failure(id: id, error: ControlErrorPayload(
+                .invalidParams,
+                message: "Client controller name is invalid: \(validationError)."
+            ))
+        }
+        // Display/arbitration provenance only; a controller label grants no
+        // permission and does not satisfy any confirmation or safety gate.
+        controllerName = params.clientName
         greeted = true
         return .success(id: id, result: .hello(ControlHelloResult(
             schemaVersion: ControlSchema.version,
@@ -579,7 +602,7 @@ public final class ControlChannelDispatcher {
                 return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "sim.loadMedia requires a connected simulator."))
             }
             let errorMessageBefore = sessionModel.lastErrorMessage
-            await sessionModel.loadCarrier(carrier, previewFixture: params.previewFixture, abortAtFrame: params.abortAtFrame, abortCode: params.abortCode)
+            await sessionModel.loadCarrier(carrier, previewFixture: params.previewFixture, abortAtFrame: params.abortAtFrame, abortCode: params.abortCode, stallAtFrame: params.stallAtFrame)
             if case .failure(let failureId, let error) = outcome(id: id, errorMessageBefore: errorMessageBefore) {
                 return .failure(id: failureId, error: error)
             }
@@ -1336,7 +1359,8 @@ public final class ControlChannelDispatcher {
         case .success:
             let isPendingReview = sessionModel.pendingManualReviewScan?.frames == requestedFrames
             return .success(id: id, result: .scanOutcome(ControlScanOutcomeResult(
-                outcome: isPendingReview ? "manualReviewPending" : "started"
+                outcome: isPendingReview ? "manualReviewPending" : "started",
+                jobId: isPendingReview ? nil : sessionModel.jobId
             )))
         case .failure(let failureId, let error):
             return .failure(id: failureId, error: error)
@@ -1524,11 +1548,22 @@ public final class ControlChannelDispatcher {
             // gives JobWaiter's stderr progress sink something to read
             // without a second job.get request.
             progress: sessionModel.progress.map(Self.mapScanProgress),
+            completedReceipts: sessionModel.receipts.isEmpty ? nil : sessionModel.receipts.map {
+                ControlCompletedReceipt(
+                    jobId: $0.jobId,
+                    frameIndex: $0.frameIndex,
+                    receiptKey: $0.id,
+                    receiptPath: sessionModel.projectDirectory.map {
+                        URL(fileURLWithPath: $0).appendingPathComponent("manifest.json").path
+                    }
+                )
+            },
             refeedRequired: sessionModel.refeedRequired,
             hardwareMotionReadiness: String(describing: motion),
             motionAllowed: motion.allowsMotion,
             motionGuidance: motion.guidance,
             mutatingOperationInFlight: sessionModel.mutatingOperationInFlight,
+            controller: sessionModel.mutatingOperationController,
             selectedFrames: sessionModel.selectedFrames,
             scanReadiness: String(describing: readiness),
             scanReadinessReason: readiness.reason,
@@ -1818,7 +1853,11 @@ public final class ControlChannelDispatcher {
                     )
                 }
                 response = await RequestCorrelationContext.$token.withValue(correlationToken) {
-                    await handle(request)
+                    await handleWithIdempotency(
+                        request,
+                        key: sniff?.metadata?.idempotencyKey,
+                        originalLine: line
+                    )
                 }
             case .failure(let failure):
                 response = .failure(id: failure.id, error: failure.error)
@@ -1830,6 +1869,92 @@ public final class ControlChannelDispatcher {
             return data
         }
         return Self.fallbackInvalidParamsLine(id: response.id, hardwareVerification: sessionModel.envelopeHardwareVerification)
+    }
+
+    private func handleWithIdempotency(
+        _ request: ControlRequest,
+        key: String?,
+        originalLine: Data
+    ) async -> ControlResponse {
+        guard greeted, request.isMutating, let key else { return await handle(request) }
+        guard let keyError = Self.idempotencyKeyValidationError(key) else {
+            guard let fingerprint = Self.idempotencyFingerprint(
+                method: request.methodName,
+                originalLine: originalLine
+            ) else {
+                return .failure(id: request.id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "Could not normalize the idempotent request payload."
+                ))
+            }
+            // The Unix socket is owner-only; controller + host diagnostic
+            // lifetime is the originating scope. Project paths are excluded
+            // because roll.save can create/change one during the operation.
+            let scope = "\(sessionModel.diagnosticSessionId):\(controllerName)"
+            switch sessionModel.admitIdempotentRequest(
+                scope: scope,
+                key: key,
+                fingerprint: fingerprint
+            ) {
+            case .execute(let token):
+                let response = await handle(request)
+                sessionModel.completeIdempotentRequest(token: token, response: response)
+                return response
+            case .replay(let cached):
+                return recordIdempotentRefusalIfNeeded(cached.replacingID(request.id), request: request)
+            case .wait(let token):
+                let response = await sessionModel.waitForIdempotentRequest(token: token).replacingID(request.id)
+                return recordIdempotentRefusalIfNeeded(response, request: request)
+            case .conflict:
+                return recordIdempotentRefusalIfNeeded(.failure(id: request.id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "Idempotency key \"\(key)\" is already bound to a different operation payload in this controller scope."
+                )), request: request)
+            case .capacity:
+                return recordIdempotentRefusalIfNeeded(.failure(id: request.id, error: ControlErrorPayload(
+                    .controllerBusy,
+                    message: "The host's bounded idempotency cache is full; no keyed operation was started.",
+                    guidance: "Inspect existing work before restarting the host, which clears this in-memory cache."
+                )), request: request)
+            }
+        }
+        return recordIdempotentRefusalIfNeeded(.failure(id: request.id, error: ControlErrorPayload(
+            .invalidParams,
+            message: "metadata.idempotencyKey is invalid: \(keyError)."
+        )), request: request)
+    }
+
+    private func recordIdempotentRefusalIfNeeded(
+        _ response: ControlResponse,
+        request: ControlRequest
+    ) -> ControlResponse {
+        if case .failure(_, let error) = response {
+            sessionModel.recordControlRefusal(command: request.methodName, code: error.code, gate: error.gate)
+        }
+        return response
+    }
+
+    private nonisolated static func idempotencyKeyValidationError(_ key: String) -> String? {
+        guard !key.isEmpty else { return "it is empty" }
+        guard key.utf8.count <= 256 else { return "it exceeds 256 UTF-8 bytes" }
+        guard key.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            return "it contains a non-printable control character"
+        }
+        return nil
+    }
+
+    private nonisolated static func idempotencyFingerprint(
+        method: String,
+        originalLine: Data
+    ) -> String? {
+        guard let envelope = try? JSONSerialization.jsonObject(with: originalLine) as? [String: Any],
+              let params = envelope["params"],
+              JSONSerialization.isValidJSONObject(params),
+              let canonical = try? JSONSerialization.data(
+                withJSONObject: ["method": method, "params": params],
+                options: [.sortedKeys]
+              ) else { return nil }
+        return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
     }
 
     private nonisolated static func validCorrelationToken(_ token: String) -> Bool {

@@ -21,10 +21,12 @@ import Foundation
 /// one CLI request across the control, engine, and bridge boundaries without
 /// changing any operation or domain identifier.
 public struct RequestMetadata: Codable, Equatable, Sendable {
-    public let correlationToken: String
+    public let correlationToken: String?
+    public let idempotencyKey: String?
 
-    public init(correlationToken: String) {
+    public init(correlationToken: String? = nil, idempotencyKey: String? = nil) {
         self.correlationToken = correlationToken
+        self.idempotencyKey = idempotencyKey
     }
 }
 
@@ -539,12 +541,14 @@ public struct LoadMediaParams: Codable, Sendable {
     public let previewFixture: String?
     public let abortAtFrame: Int?
     public let abortCode: String?
+    public let stallAtFrame: Int?
 
-    public init(carrier: String, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) {
+    public init(carrier: String, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil, stallAtFrame: Int? = nil) {
         self.carrier = carrier
         self.previewFixture = previewFixture
         self.abortAtFrame = abortAtFrame
         self.abortCode = abortCode
+        self.stallAtFrame = stallAtFrame
     }
 }
 

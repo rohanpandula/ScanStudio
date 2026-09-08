@@ -589,6 +589,7 @@ struct ControlChannelClientTests {
             Issue.record("expected the admitted status response")
             return
         }
+        #expect(await client.lastCorrelationToken(for: "status") == "failure-test:2")
         #expect((try? JSONDecoder().decode(ControlStatusResult.self, from: statusData)) != nil)
         guard case .result = try await client.requestWithoutParams(method: "events.subscribe") else {
             Issue.record("expected the admitted subscribe response")

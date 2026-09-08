@@ -516,6 +516,12 @@ impl Backends {
         }
     }
 
+    fn arm_sim_stall(&self, frame: Option<u32>) {
+        if self.active == Some(ActiveDevice::Sim) {
+            self.sim.arm_stall(frame);
+        }
+    }
+
     fn eject(&self) -> Result<protocol::ScannerStatus, EngineError> {
         match self.active {
             Some(ActiveDevice::Sim) => self.sim.eject(),
@@ -1324,9 +1330,18 @@ fn handle_request_with_correlation(
             // unrecognized `abortCode` never reaches the simulator either.
             let batch_abort =
                 resolve_sim_batch_abort(params.abort_at_frame, params.abort_code.as_deref())?;
+            let count = match params.carrier {
+                domain::MediaCarrier::Mounted => 1,
+                domain::MediaCarrier::Strip6 => 6,
+                domain::MediaCarrier::Roll36 => 36,
+            };
+            if params.stall_at_frame.is_some_and(|frame| frame == 0 || frame > count) {
+                return Err(EngineError::new(ErrorCode::InvalidParams, "stallAtFrame must be within the loaded carrier"));
+            }
             let status = backends.load_media(params.carrier)?;
             backends.arm_sim_preview_fixture(fixture);
             backends.arm_sim_batch_abort(batch_abort);
+            backends.arm_sim_stall(params.stall_at_frame);
             emit_event(
                 tx,
                 "scanner.status",
@@ -2413,7 +2428,7 @@ fn resolve_sim_batch_abort(
         )),
         (Some(frame_index), code) => {
             let code = code.unwrap_or("ROLL_MISMATCH");
-            if !crate::real_backend::BRIDGE_ERROR_CODES.contains(&code) {
+            if code != "FEED_JAM" && !crate::real_backend::BRIDGE_ERROR_CODES.contains(&code) {
                 return Err(EngineError::new(
                     ErrorCode::InvalidParams,
                     format!("abortCode \"{code}\" is not a recognized bridge error code"),

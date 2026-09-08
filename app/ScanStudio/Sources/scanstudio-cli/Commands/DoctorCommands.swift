@@ -13,7 +13,10 @@ struct Doctor: AsyncParsableCommand {
     @OptionGroup var options: GlobalOptions
 
     func run() async throws {
-        let report = await DoctorCollector.collect(socketPath: CommandRunner.socketPath(options))
+        let report = await DoctorCollector.collect(
+            socketPath: CommandRunner.socketPath(options),
+            controllerName: options.resolvedControllerName
+        )
         let data = try JSONEncoder().encode(report)
         let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
         let rendered = try ControlCLIOutput.renderResult(
@@ -66,9 +69,9 @@ private enum DoctorCollector {
         let hubDepth: Int
     }
 
-    static func collect(socketPath: String) async -> DoctorReport {
+    static func collect(socketPath: String, controllerName: String) async -> DoctorReport {
         let layout = Layout()
-        let host = await hostSnapshot(socketPath: socketPath)
+        let host = await hostSnapshot(socketPath: socketPath, controllerName: controllerName)
         let usb = usbScanners()
         var observations = installationObservations(layout: layout)
         observations += socketObservations(socketPath: socketPath, host: host)
@@ -346,9 +349,9 @@ private enum DoctorCollector {
         return [enumeration, topology]
     }
 
-    private static func hostSnapshot(socketPath: String) async -> HostSnapshot? {
+    private static func hostSnapshot(socketPath: String, controllerName: String) async -> HostSnapshot? {
         guard let client = try? await ControlChannelClient.open(
-            path: socketPath, clientName: "scanstudio-cli doctor", helloTimeout: .seconds(2)
+            path: socketPath, clientName: controllerName, helloTimeout: .seconds(2)
         ), let hello = await client.helloResult else { return nil }
         let snapshot = await withTaskGroup(of: HostSnapshot.self) { group in
             group.addTask {

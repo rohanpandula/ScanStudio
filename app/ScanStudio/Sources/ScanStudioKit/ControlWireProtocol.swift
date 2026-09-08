@@ -203,6 +203,25 @@ public struct ControlHelloParams: Codable, Equatable, Sendable {
     }
 }
 
+/// Human-readable control-session label only. It is deliberately not an
+/// authentication or authorization identity.
+public enum ControlControllerName {
+    public static let maximumUTF8Bytes = 128
+
+    public static func validationError(_ name: String) -> String? {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "controller name must contain a printable non-whitespace character"
+        }
+        guard name.utf8.count <= maximumUTF8Bytes else {
+            return "controller name exceeds the \(maximumUTF8Bytes)-byte limit"
+        }
+        guard name.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            return "controller name contains a non-printable control character"
+        }
+        return nil
+    }
+}
+
 /// D-04: identifies which process owns a control socket.
 public enum ControlHostKind: String, Codable, Sendable, Equatable {
     case gui
@@ -609,6 +628,23 @@ public struct ControlRefusalRecord: Codable, Equatable, Sendable {
     }
 }
 
+/// Durable receipt identities already committed to the open project's
+/// manifest. This compact summary lets a waiting CLI catch up after dropped
+/// events or process reattachment without polling or copying a receipt.
+public struct ControlCompletedReceipt: Codable, Equatable, Sendable {
+    public let jobId: String
+    public let frameIndex: Int
+    public let receiptKey: String
+    public let receiptPath: String?
+
+    public init(jobId: String, frameIndex: Int, receiptKey: String, receiptPath: String?) {
+        self.jobId = jobId
+        self.frameIndex = frameIndex
+        self.receiptKey = receiptKey
+        self.receiptPath = receiptPath
+    }
+}
+
 /// A full session snapshot built from `SessionModel` public state only.
 /// `hardwareMotionReadiness` and `scanReadiness` carry their enum case
 /// names as stable strings (computed by the dispatcher) so a caller can
@@ -643,11 +679,15 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     /// (`encodeIfPresent`), so an older client parsing this envelope is
     /// unaffected.
     public let progress: ControlScanProgress?
+    public let completedReceipts: [ControlCompletedReceipt]?
     public let refeedRequired: Bool
     public let hardwareMotionReadiness: String
     public let motionAllowed: Bool
     public let motionGuidance: String?
     public let mutatingOperationInFlight: String?
+    /// Informational label supplied by the controller that currently owns
+    /// `mutatingOperationInFlight`; nil while no operation is held.
+    public let controller: String?
     public let selectedFrames: [Int]
     public let scanReadiness: String
     public let scanReadinessReason: String?
@@ -675,11 +715,13 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         previewComplete: Bool = false,
         previewOperationId: String? = nil,
         progress: ControlScanProgress? = nil,
+        completedReceipts: [ControlCompletedReceipt]? = nil,
         refeedRequired: Bool,
         hardwareMotionReadiness: String,
         motionAllowed: Bool,
         motionGuidance: String? = nil,
         mutatingOperationInFlight: String? = nil,
+        controller: String? = nil,
         selectedFrames: [Int],
         scanReadiness: String,
         scanReadinessReason: String? = nil,
@@ -697,11 +739,13 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.previewComplete = previewComplete
         self.previewOperationId = previewOperationId
         self.progress = progress
+        self.completedReceipts = completedReceipts
         self.refeedRequired = refeedRequired
         self.hardwareMotionReadiness = hardwareMotionReadiness
         self.motionAllowed = motionAllowed
         self.motionGuidance = motionGuidance
         self.mutatingOperationInFlight = mutatingOperationInFlight
+        self.controller = controller
         self.selectedFrames = selectedFrames
         self.scanReadiness = scanReadiness
         self.scanReadinessReason = scanReadinessReason
@@ -1015,9 +1059,11 @@ public struct ControlRollSolveExposureResult: Codable, Equatable, Sendable {
 /// `.failure` response, not a success carrying a failure string.
 public struct ControlScanOutcomeResult: Codable, Equatable, Sendable {
     public let outcome: String
+    public let jobId: String?
 
-    public init(outcome: String) {
+    public init(outcome: String, jobId: String? = nil) {
         self.outcome = outcome
+        self.jobId = jobId
     }
 }
 

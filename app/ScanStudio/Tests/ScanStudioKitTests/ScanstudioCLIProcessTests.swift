@@ -103,6 +103,9 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
 
     private(set) var requestCounts: [String: Int] = [:]
     private(set) var recordedFrameExclusionFlags: [Bool] = []
+    private var heldMethods: Set<String> = []
+    private var heldMethodWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var requestCountWaiters: [(method: String, count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var holdSessionInventory = false
     private var sessionInventoryWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -117,14 +120,42 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
         for waiter in waiters { waiter.resume() }
     }
 
+    func holdRequests(_ method: String) {
+        heldMethods.insert(method)
+    }
+
+    func releaseRequests(_ method: String) {
+        heldMethods.remove(method)
+        let waiters = heldMethodWaiters.removeValue(forKey: method) ?? []
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func waitForRequestCount(_ method: String, count: Int) async {
+        guard requestCounts[method, default: 0] < count else { return }
+        await withCheckedContinuation { continuation in
+            requestCountWaiters.append((method, count, continuation))
+        }
+    }
+
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
         _ method: String, params: Params
     ) async throws -> Result {
         requestCounts[method, default: 0] += 1
+        let ready = requestCountWaiters.filter { requestCounts[$0.method, default: 0] >= $0.count }
+        requestCountWaiters.removeAll { requestCounts[$0.method, default: 0] >= $0.count }
+        for waiter in ready { waiter.continuation.resume() }
         switch method {
-        case "scanner.list", "scanner.rescan":
+        case "scanner.list":
+            return try cast(ScannerListResult(devices: [cliProcessDevice]), as: Result.self)
+        case "scanner.rescan":
+            if heldMethods.contains(method) {
+                await withCheckedContinuation { heldMethodWaiters[method, default: []].append($0) }
+            }
             return try cast(ScannerListResult(devices: [cliProcessDevice]), as: Result.self)
         case "scanner.connect":
+            if heldMethods.contains(method) {
+                await withCheckedContinuation { heldMethodWaiters[method, default: []].append($0) }
+            }
             return try cast(ConnectResult(
                 device: cliProcessDevice,
                 status: ScannerStatus(
@@ -339,7 +370,8 @@ private func decodeDoctorReport(_ output: String) throws -> DoctorReport {
 private func runCLI(
     _ arguments: [String],
     socketPath: String?,
-    homeDirectory: String? = nil
+    homeDirectory: String? = nil,
+    environmentOverrides: [String: String] = [:]
 ) async throws -> CLIProcessResult {
     let binary = try CLIProcessLocator.resolve()
     let allArguments: [String] = if let socketPath {
@@ -356,10 +388,13 @@ private func runCLI(
                 let isolatedHome = homeDirectory ?? socketPath.map {
                     ($0 as NSString).deletingLastPathComponent
                 }
-                if let isolatedHome {
+                if isolatedHome != nil || !environmentOverrides.isEmpty {
                     var environment = ProcessInfo.processInfo.environment
-                    environment["HOME"] = isolatedHome
-                    environment["CFFIXED_USER_HOME"] = isolatedHome
+                    if let isolatedHome {
+                        environment["HOME"] = isolatedHome
+                        environment["CFFIXED_USER_HOME"] = isolatedHome
+                    }
+                    for (key, value) in environmentOverrides { environment[key] = value }
                     process.environment = environment
                 }
 
@@ -388,6 +423,121 @@ private func runCLI(
 @Suite("scanstudio-cli process", .timeLimit(.minutes(1)))
 struct ScanstudioCLIProcessTests {
     // MARK: Task 1 -- the shared runner, and connect/disconnect/rescan/status
+
+    @Test("controller hello label and environment defaults obey explicit precedence")
+    func controllerAndEnvironmentDefaults() async throws {
+        let host = try await CLIProcessHost.start(label: "controller-defaults")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let home = (host.socketPath as NSString).deletingLastPathComponent
+        let environment = [
+            "SCANSTUDIO_SOCKET": host.socketPath,
+            "SCANSTUDIO_CONTROLLER": "ignored-environment-controller",
+            "SCANSTUDIO_OUTPUT": "human",
+        ]
+        await host.stub.holdRequests("scanner.rescan")
+        let holder = Task {
+            try await runCLI(
+                ["rescan", "--controller-name", "explicit-holder", "--json"],
+                socketPath: nil, homeDirectory: home, environmentOverrides: environment
+            )
+        }
+        await host.stub.waitForRequestCount("scanner.rescan", count: 1)
+
+        let humanStatus = try await runCLI(
+            ["status"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        #expect(humanStatus.stdout.contains("controller: explicit-holder"))
+
+        let status = try await runCLI(
+            ["status", "--json"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        let statusEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(status.stdout.utf8)) as? [String: Any]
+        )
+        let statusResult = try #require(statusEnvelope["result"] as? [String: Any])
+        #expect(statusResult["controller"] as? String == "explicit-holder")
+        #expect(statusResult["mutatingOperationInFlight"] as? String == "scanner.rescan")
+
+        let busy = try await runCLI(
+            ["rescan", "--json"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        let busyEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(busy.stdout.utf8)) as? [String: Any]
+        )
+        let busyError = try #require(busyEnvelope["error"] as? [String: Any])
+        #expect(busy.exitCode == ControlCLIExitCode.busy.rawValue)
+        #expect((busyError["message"] as? String)?.contains("explicit-holder") == true)
+
+        let wrongSocket = shortSocketPath("explicit-socket-wins")
+        let unreachable = try await runCLI(
+            ["status", "--socket", wrongSocket, "--json"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        #expect(unreachable.exitCode == ControlCLIExitCode.noHostReachable.rawValue)
+
+        await host.stub.releaseRequests("scanner.rescan")
+        #expect(try await holder.value.exitCode == 0)
+        await host.server.stop()
+    }
+
+    @Test("same idempotency key awaits one execution and payload mismatch is refused")
+    func idempotencyAdmissionAcrossConnections() async throws {
+        let host = try await CLIProcessHost.start(label: "idempotency")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let home = (host.socketPath as NSString).deletingLastPathComponent
+        let environment = ["SCANSTUDIO_SOCKET": host.socketPath]
+        let common = [
+            "connect", "--device", cliProcessDevice.deviceId,
+            "--controller-name", "idempotency-fixture", "--key", "connect-once",
+        ]
+        await host.stub.holdRequests("scanner.connect")
+        let first = Task {
+            try await runCLI(
+                common, socketPath: nil, homeDirectory: home,
+                environmentOverrides: environment
+            )
+        }
+        await host.stub.waitForRequestCount("scanner.connect", count: 1)
+        let duplicate = Task {
+            try await runCLI(
+                common, socketPath: nil, homeDirectory: home,
+                environmentOverrides: environment
+            )
+        }
+
+        let mismatch = try await runCLI(
+            [
+                "connect", "--device", "sim-other-0",
+                "--controller-name", "idempotency-fixture", "--key", "connect-once",
+            ],
+            socketPath: nil, homeDirectory: home, environmentOverrides: environment
+        )
+        let mismatchEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(mismatch.stdout.utf8)) as? [String: Any]
+        )
+        let mismatchError = try #require(mismatchEnvelope["error"] as? [String: Any])
+        #expect(mismatch.exitCode == ControlCLIExitCode.usage.rawValue)
+        #expect(mismatchError["code"] as? String == ControlErrorCode.invalidParams.rawValue)
+        #expect((mismatchError["message"] as? String)?.contains("different operation payload") == true)
+
+        await host.stub.releaseRequests("scanner.connect")
+        let firstResult = try await first.value
+        let duplicateResult = try await duplicate.value
+        #expect(firstResult.exitCode == 0)
+        #expect(duplicateResult.exitCode == 0)
+        let firstEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(firstResult.stdout.utf8)) as? [String: Any]
+        )
+        let duplicateEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(duplicateResult.stdout.utf8)) as? [String: Any]
+        )
+        #expect((firstEnvelope["result"] as? NSDictionary) == (duplicateEnvelope["result"] as? NSDictionary))
+        #expect(await host.stub.requestCounts["scanner.connect"] == 1)
+        await host.server.stop()
+    }
 
     @Test("doctor is repeatable against an absent isolated socket and creates no state")
     func doctorAbsentSocketIsReadOnlyAndRepeatable() async throws {

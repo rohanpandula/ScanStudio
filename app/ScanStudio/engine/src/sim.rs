@@ -411,6 +411,7 @@ struct State {
     /// `run_scan_job` the moment it actually fires -- one-shot, never
     /// surviving into a later scan on the same connection.
     batch_abort: Option<(u32, String)>,
+    stall_at_frame: Option<u32>,
 }
 
 impl Default for State {
@@ -432,6 +433,7 @@ impl Default for State {
             manual_approval_binding: None,
             preview_fixture: None,
             batch_abort: None,
+            stall_at_frame: None,
         }
     }
 }
@@ -828,6 +830,10 @@ impl SimulatedLs5000 {
     pub fn arm_batch_abort(&self, abort: Option<(u32, String)>) {
         self.state.lock().unwrap().batch_abort = abort;
     }
+
+    pub fn arm_stall(&self, frame: Option<u32>) {
+        self.state.lock().unwrap().stall_at_frame = frame;
+    }
 }
 
 impl Default for SimulatedLs5000 {
@@ -976,6 +982,7 @@ impl ScannerBackend for SimulatedLs5000 {
         // `arm_batch_abort` when that same `sim.loadMedia` request named
         // one.
         state.batch_abort = None;
+        state.stall_at_frame = None;
         Ok(status_snapshot(&state))
     }
 
@@ -1584,6 +1591,15 @@ fn run_one_attempt(
     event_tx: &mpsc::Sender<String>,
 ) -> AttemptOutcome {
     let mut elapsed_ms: u64 = 0;
+    let stalled = {
+        let mut state = backend.state.lock().unwrap();
+        if state.stall_at_frame == Some(frame_index) {
+            state.stall_at_frame = None;
+            true
+        } else {
+            false
+        }
+    };
 
     if frame_total_ms == 0 {
         return AttemptOutcome::Completed;
@@ -1597,6 +1613,13 @@ fn run_one_attempt(
 
         if take_skip_current_request(backend, job_id) {
             return AttemptOutcome::SkippedByUser;
+        }
+
+        // One observable progress tick, then a simulator-only stall. The
+        // existing immediate-stop path remains responsive; no automatic retry.
+        if stalled && elapsed_ms > 0 {
+            thread::sleep(Duration::from_millis(10));
+            continue;
         }
 
         let step = tick_ms.min(frame_total_ms - elapsed_ms);
@@ -1811,14 +1834,15 @@ fn run_scan_job(
         // survives into a later scan on this connection.
         if let Some((abort_frame, abort_code)) = batch_abort.as_ref() {
             if *abort_frame == frame_index {
-                let mapped_code = crate::real_backend::map_bridge_error_code_str(abort_code);
+                let mapped_code = if abort_code == "FEED_JAM" { ErrorCode::FeedJam }
+                    else { crate::real_backend::map_bridge_error_code_str(abort_code) };
                 let error = EngineError::new(
                     mapped_code,
                     format!(
                         "bridge scan.frameFailed ({abort_code}): simulated batch abort armed via sim.loadMedia"
                     ),
                 )
-                .with_recoverable(crate::real_backend::map_bridge_error_code_recoverable(
+                .with_recoverable(abort_code == "FEED_JAM" || crate::real_backend::map_bridge_error_code_recoverable(
                     abort_code,
                 ));
                 let error_payload = ErrorPayload::from(&error);
@@ -3186,6 +3210,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn stalled_frame_stops_without_capture_or_retry() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(DEVICE_ID, &ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
+        }).unwrap();
+        sim.load_media(MediaCarrier::Strip6).unwrap();
+        sim.arm_stall(Some(1));
+        let (tx, rx) = mpsc::channel();
+        let (output, directory) = isolated_output_recipe("stalled-frame");
+        let job = SimulatedLs5000::scan_start(
+            &sim, vec![1], CaptureRecipe { resolution_dpi: 40, ..CaptureRecipe::default() },
+            ProcessingRecipe::default(), output, HashMap::new(), None, tx.clone(),
+        ).unwrap();
+        loop {
+            let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "scan.progress" { break; }
+        }
+        assert!(matches!(rx.recv_timeout(Duration::from_millis(150)), Err(mpsc::RecvTimeoutError::Timeout)));
+        sim.scan_stop(&job, StopMode::Immediate, tx).unwrap();
+        loop {
+            let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_ne!(event["event"], "scan.frameCompleted");
+            if event["event"] == "scan.completed" {
+                assert_eq!(event["payload"]["summary"]["stopped"], true);
+                break;
+            }
+        }
+        assert_eq!(sim.state.lock().unwrap().stall_at_frame, None);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     /// D-20/HEAD-12 (1d, the 2026-09-07 batch abort): with a batch abort

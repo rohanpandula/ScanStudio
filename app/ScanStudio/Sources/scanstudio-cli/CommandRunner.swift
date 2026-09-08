@@ -14,12 +14,11 @@ import Foundation
 import ScanStudioKit
 
 enum CommandRunner {
-    private static let clientName = "scanstudio-cli"
-
-    /// `--socket` if given, otherwise the app's standard control socket
-    /// path (D-15).
+    /// `--socket` if given, then `SCANSTUDIO_SOCKET`, then the app default.
     static func socketPath(_ options: GlobalOptions) -> String {
-        options.socketPath ?? ControlSocketPath.defaultPath()
+        options.socketPath
+            ?? ProcessInfo.processInfo.environment["SCANSTUDIO_SOCKET"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? ControlSocketPath.defaultPath()
     }
 
     /// Opens one connection for `command`. A thrown `ControlSocketError`
@@ -43,7 +42,7 @@ enum CommandRunner {
             )
             let client = try await ControlChannelClient.open(
                 path: path,
-                clientName: clientName,
+                clientName: options.resolvedControllerName,
                 transcriptOptions: .cli()
             )
             await client.setCLIEnvelopeContext(ControlCLIEnvelopeContext(
@@ -79,7 +78,12 @@ enum CommandRunner {
         client: ControlChannelClient
     ) async throws -> ControlClientResponse {
         do {
-            return try await client.request(method: method, params: params)
+            let key = ControlRequest.mutatingMethodNames.contains(method) ? options.idempotencyKey : nil
+            return try await client.request(
+                method: method,
+                params: params,
+                idempotencyKeyBase: key
+            )
         } catch {
             let context = await client.cliEnvelopeContext
             await client.shutdown()

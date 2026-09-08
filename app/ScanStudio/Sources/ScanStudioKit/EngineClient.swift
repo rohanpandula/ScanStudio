@@ -249,7 +249,7 @@ public actor EngineClient {
         }
         nextRequestId += 1
         let id = nextRequestId
-        let metadata = RequestCorrelationContext.token.map(RequestMetadata.init(correlationToken:))
+        let metadata = RequestCorrelationContext.token.map { RequestMetadata(correlationToken: $0) }
         let envelope = RequestEnvelope(id: id, method: method, params: params, metadata: metadata)
         // D-24/HEAD-12 (CF-14): stamped here, not inside `timeoutRequest`,
         // so the journaled duration is this exact request's own real

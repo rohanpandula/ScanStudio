@@ -339,6 +339,37 @@ private func driveConfirmationCompleted(_ model: SessionModel, jobId: String, fr
     ))
 }
 
+@MainActor
+private func driveConfirmationReceipt(_ model: SessionModel, jobId: String, frameIndex: Int = 1) throws {
+    let receipt = ScanReceipt(
+        jobId: jobId,
+        frameIndex: frameIndex,
+        startedAt: "2026-09-08T00:00:00Z",
+        durationMs: 1,
+        passes: 4,
+        resolutionDpi: 4_000,
+        bitDepth: 16,
+        channels: "rgbi",
+        engineVersion: "confirmation-stub",
+        deviceId: confirmationDevice.deviceId,
+        simulated: true,
+        settingsFingerprint: "hook-receipt",
+        processing: nil,
+        output: nil,
+        outputs: nil,
+        rgbPath: nil,
+        irPath: nil,
+        meterRgbiPath: nil,
+        hardwareTelemetry: nil
+    )
+    let receiptObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(receipt))
+    let data = try JSONSerialization.data(withJSONObject: [
+        "event": "scan.frameCompleted",
+        "payload": ["jobId": jobId, "frameIndex": frameIndex, "receipt": receiptObject],
+    ])
+    model.handle(event: EngineEvent(name: "scan.frameCompleted", rawLine: data))
+}
+
 /// Feeds a synthetic `scan.frameState` failure so `job.get`'s
 /// `frameErrorCodes` has a real entry to assert on, mirroring OUT-03's own
 /// `FEED_JAM` fixture (`ControlRecoverablePassthroughTests.swift`).
@@ -565,11 +596,11 @@ private final class ConfirmationEventsFollower: @unchecked Sendable {
     private let process: Process
     private let buffer = ConfirmationLineBuffer()
 
-    init(socketPath: String) throws {
+    init(socketPath: String, commandArguments: [String] = ["events", "--follow"]) throws {
         let binary = try ConfirmationCLILocator.resolve()
         let process = Process()
         process.executableURL = binary
-        process.arguments = ["events", "--follow", "--socket", socketPath]
+        process.arguments = commandArguments + ["--socket", socketPath]
         var environment = ProcessInfo.processInfo.environment
         let isolatedHome = (socketPath as NSString).deletingLastPathComponent
         environment["HOME"] = isolatedHome
@@ -877,6 +908,109 @@ struct ScanstudioCLIConfirmationTests {
         let resultObject = try #require(object["result"] as? [String: Any])
         #expect(resultObject["jobId"] as? String == ConfirmationEngineStub.jobId)
 
+        await host.server.stop()
+    }
+
+    @Test("a killed waiting CLI reattaches to its exact simulated scan job without a second scan.start")
+    func killedWaitingCLIReattachesToExactJob() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-reattach")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        #expect(await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory))
+
+        let first = try ConfirmationEventsFollower(
+            socketPath: host.socketPath,
+            commandArguments: ["scan", "--confirm-motion", "--wait"]
+        )
+        await waitForConfirmationJobToBegin(host.model)
+        let markerPath = URL(fileURLWithPath: host.projectDirectory)
+            .appendingPathComponent(".scanstudio-active-job.json").path
+        for _ in 0..<2_000 where !FileManager.default.fileExists(atPath: markerPath) {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(FileManager.default.fileExists(atPath: markerPath))
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "scanning")
+        first.terminate()
+
+        let reattached = try await runConfirmationCLI(
+            ["scan", "--confirm-motion"],
+            socketPath: host.socketPath
+        )
+        #expect(reattached.exitCode == 0)
+        let envelope = try #require(
+            JSONSerialization.jsonObject(with: Data(reattached.stdout.utf8)) as? [String: Any]
+        )
+        let result = try #require(envelope["result"] as? [String: Any])
+        #expect(result["jobId"] as? String == ConfirmationEngineStub.jobId)
+        #expect(await host.stub.requestCount("scan.start") == 1)
+
+        let markedStatus = try await runConfirmationCLI(["status", "--job"], socketPath: host.socketPath)
+        #expect(markedStatus.exitCode == 0)
+        let statusEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(markedStatus.stdout.utf8)) as? [String: Any]
+        )
+        let statusResult = try #require(statusEnvelope["result"] as? [String: Any])
+        #expect(statusResult["jobId"] as? String == ConfirmationEngineStub.jobId)
+
+        await driveConfirmationCompleted(host.model, jobId: ConfirmationEngineStub.jobId)
+        _ = try await runConfirmationCLI(["status", "--job"], socketPath: host.socketPath)
+        #expect(!FileManager.default.fileExists(atPath: markerPath))
+        await host.server.stop()
+    }
+
+    @Test("failing frame and hanging failure hooks launch once without changing the simulated job result")
+    func hooksAreRecordedOnceAndDoNotBlockJobFailure() async throws {
+        let host = try await ConfirmationHost.start(label: "scan-hooks")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        #expect(await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory))
+        try Data("{}".utf8).write(
+            to: URL(fileURLWithPath: host.projectDirectory).appendingPathComponent("manifest.json")
+        )
+        let frameLog = URL(fileURLWithPath: host.projectDirectory).deletingLastPathComponent()
+            .appendingPathComponent("frame-hook.log")
+        let failLog = URL(fileURLWithPath: host.projectDirectory).deletingLastPathComponent()
+            .appendingPathComponent("fail-hook.log")
+        let frameHook = #"printf '%s|%s|%s\n' "$SCANSTUDIO_FRAME_INDEX" "$SCANSTUDIO_JOB_ID" "$SCANSTUDIO_RECEIPT_PATH" >> "$HOME/frame-hook.log"; exit 9"#
+        let failHook = #"printf '%s\n' "$SCANSTUDIO_ERROR_JSON" >> "$HOME/fail-hook.log"; sleep 30"#
+
+        let startedAt = ContinuousClock.now
+        async let outcome = runConfirmationCLI(
+            ["scan", "--confirm-motion", "--wait", "--on-frame", frameHook, "--on-fail", failHook],
+            socketPath: host.socketPath
+        )
+        await waitForConfirmationJobToBegin(host.model)
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "scanning")
+        try await driveConfirmationReceipt(host.model, jobId: ConfirmationEngineStub.jobId)
+        await driveConfirmationFrameFailure(host.model, jobId: ConfirmationEngineStub.jobId, frameIndex: 2)
+        await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "failed")
+
+        let result = try await outcome
+        #expect(result.exitCode == 65)
+        #expect(startedAt.duration(to: .now) < .seconds(5))
+        for _ in 0..<2_000 where !FileManager.default.fileExists(atPath: frameLog.path)
+            || !FileManager.default.fileExists(atPath: failLog.path) {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let frameLines = (try String(contentsOf: frameLog, encoding: .utf8))
+            .split(separator: "\n")
+        let failLines = (try String(contentsOf: failLog, encoding: .utf8))
+            .split(separator: "\n")
+        #expect(frameLines.count == 1)
+        #expect(frameLines[0].contains("1|\(ConfirmationEngineStub.jobId)|"))
+        #expect(frameLines[0].hasSuffix("/manifest.json"))
+        #expect(failLines.count == 1)
+        #expect(failLines[0].contains("FEED_JAM"))
+
+        let archives = try FileManager.default.contentsOfDirectory(atPath: host.projectDirectory)
+            .filter { $0.hasPrefix(".scanstudio-job-marker-") && $0.hasSuffix(".json") }
+        #expect(archives.count == 1)
+        let archive = try #require(archives.first)
+        let markerObject = try #require(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: host.projectDirectory).appendingPathComponent(archive))
+            ) as? [String: Any]
+        )
+        #expect((markerObject["hookDeliveries"] as? [[String: Any]])?.count == 2)
+        #expect(!String(data: try JSONSerialization.data(withJSONObject: markerObject), encoding: .utf8)!.contains("sleep 30"))
         await host.server.stop()
     }
 
