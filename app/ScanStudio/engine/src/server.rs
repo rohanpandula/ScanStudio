@@ -1450,6 +1450,43 @@ fn handle_request_with_correlation(
                 to_json(&result)
             }
         }
+        "roll.render" | "roll.export" | "roll.metadataApply" => {
+            let directory = project_state.directory.as_deref().ok_or_else(|| {
+                EngineError::new(
+                    ErrorCode::ProjectNotFound,
+                    "open a project before rendering or exporting retained outputs",
+                )
+            })?;
+            let authority = crate::render::acquire_project_output_root_authority(Some(directory))?
+                .expect("a project path always produces an authority");
+            let project = crate::manifest::read_project_at(
+                authority.directory_handle(),
+                authority.canonical_path(),
+            )?;
+            let result = match request.method.as_str() {
+                "roll.render" => {
+                    let params: protocol::RollRenderParams = parse_params(&request.params)?;
+                    serde_json::to_value(crate::render_export::render(&authority, &project, &params)
+                        .map_err(|message| EngineError::new(ErrorCode::InvalidParams, message))?)
+                        .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string()))?
+                }
+                "roll.export" => {
+                    let params: protocol::RollExportParams = parse_params(&request.params)?;
+                    serde_json::to_value(crate::render_export::export(&authority, &project, &params)
+                        .map_err(|message| EngineError::new(ErrorCode::InvalidParams, message))?)
+                        .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string()))?
+                }
+                "roll.metadataApply" => {
+                    let params: protocol::RollMetadataApplyParams = parse_params(&request.params)?;
+                    serde_json::to_value(crate::render_export::metadata_apply(&authority, &project, &params)
+                        .map_err(|message| EngineError::new(ErrorCode::InvalidParams, message))?)
+                        .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string()))?
+                }
+                _ => unreachable!(),
+            };
+            authority.verify_namespace()?;
+            Ok(result)
+        }
         "roll.solveExposure" => {
             let params: protocol::RollSolveExposureParams = parse_params(&request.params)?;
             if params.frame_index == 0 || params.operation_id.trim().is_empty() {

@@ -4984,6 +4984,102 @@ fn copy_bound_source_to_stage(
     Ok(())
 }
 
+/// Run ExifTool against an engine-private copy of one already-bound source.
+/// Pathname-based tools never receive a project or destination path. The
+/// callback runs while the private workspace and its verified output file are
+/// held; callers can publish through their own held destination capability.
+pub(crate) fn with_private_exiftool_copy<T>(
+    mut source: File,
+    source_path: &Path,
+    expected: &WrittenFileBinding,
+    detection: &ExifToolDetection,
+    metadata_arguments: &[String],
+    callback: impl FnOnce(&File, &Path, &WrittenFileBinding) -> Result<T, String>,
+) -> Result<T, String> {
+    let executable = verify_executable_binding(detection).map_err(|error| error.message)?;
+    let workspace = PrivateMetadataWorkspace::create().map_err(|error| error.message)?;
+    let extension = Path::new(&expected.relative_path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("bin");
+    let staged_name = OsString::from(format!("metadata-target.{extension}"));
+    let staged_path = workspace.path.join(&staged_name);
+    let result = (|| {
+        let observed = binding_from_open_file(&mut source, &expected.relative_path)
+            .map_err(|error| error.message)?;
+        if &observed != expected {
+            return Err(format!(
+                "metadata source identity changed before private staging: {}",
+                source_path.display()
+            ));
+        }
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("cannot rewind metadata source: {error}"))?;
+        let mut staged = metadata_publish_sys::create_new_regular(
+            &workspace.directory,
+            &staged_name,
+        )
+        .map_err(|error| format!("cannot create private metadata staging file: {error}"))?;
+        copy_exact_bounded(&mut source, &mut staged, expected.byte_length)
+            .map_err(|error| format!("cannot copy metadata source into private staging: {error}"))?;
+        staged
+            .sync_all()
+            .map_err(|error| format!("cannot sync private metadata staging file: {error}"))?;
+        let staged_binding = binding_from_open_file(&mut staged, &expected.relative_path)
+            .map_err(|error| error.message)?;
+        if staged_binding.sha256 != expected.sha256
+            || staged_binding.byte_length != expected.byte_length
+        {
+            return Err("private metadata staging copy differs from the exact bound source bytes".into());
+        }
+        drop(staged);
+
+        workspace.verify_namespace().map_err(|error| error.message)?;
+        let mut arguments = metadata_arguments.to_vec();
+        arguments.push("-overwrite_original".into());
+        arguments.push(staged_path.display().to_string());
+        let output = run_bounded_exiftool_command(
+            executable,
+            &arguments,
+            EXIFTOOL_APPLY_TIMEOUT,
+            EXIFTOOL_OUTPUT_LIMIT,
+        )
+        .map_err(|error| error.message)?;
+        workspace.verify_namespace().map_err(|error| error.message)?;
+        if !output.status.success() {
+            return Err(format!(
+                "ExifTool metadata apply failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let mut transformed = metadata_publish_sys::open_regular(
+            &workspace.directory,
+            &staged_name,
+        )
+        .map_err(|error| format!("cannot open private ExifTool output: {error}"))?;
+        let transformed_binding = binding_from_open_file(&mut transformed, &expected.relative_path)
+            .map_err(|error| error.message)?;
+        if transformed_binding.byte_length == 0 {
+            return Err("ExifTool produced an empty metadata output".into());
+        }
+        let result = callback(&transformed, &staged_path, &transformed_binding)?;
+        drop(transformed);
+        workspace.verify_namespace().map_err(|error| error.message)?;
+        Ok(result)
+    })();
+    let retired = workspace.retire(&[staged_name]);
+    match (result, retired) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.message),
+        (Err(error), Err(cleanup)) => Err(format!(
+            "{error}; private metadata cleanup failed: {}",
+            cleanup.message
+        )),
+    }
+}
+
 fn copy_verified_private_output_to_attempt(
     private: &File,
     source_name: &OsStr,

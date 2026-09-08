@@ -2043,6 +2043,48 @@ public final class SessionModel {
         }
     }
 
+    public func renderRoll(_ params: ControlRollRenderParams) async -> ControlRenderExportResult? {
+        let previous = beginMutatingOperation("roll.render")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.render", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.render")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    public func exportRoll(_ params: ControlRollExportParams) async -> ControlRenderExportResult? {
+        let previous = beginMutatingOperation("roll.export")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.export", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.export")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    /// Applies the current roll metadata to create-only derivative/export
+    /// copies. This deliberately does not call the legacy project metadata
+    /// transaction, which updates authoritative receipt bindings.
+    public func applyMetadataCopies(_ params: ControlRollMetadataApplyParams) async -> ControlMetadataApplyResult? {
+        let previous = beginMutatingOperation("roll.metadataApply")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.metadataApply", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.metadataApply")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
     private func finishExposureSolve(
         _ marker: PendingExposureSolve,
         result: RollExposureLock?,

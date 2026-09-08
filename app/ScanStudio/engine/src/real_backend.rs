@@ -8228,6 +8228,7 @@ fn run_real_scan_job_inner(
                                         frame_completed.receipt.hardware_verification,
                                         Some(frame_completed.receipt.device_model.as_str()),
                                         authorities,
+                                        None,
                                     )
                                     .and_then(|mut written| {
                                         crate::render::publish_real_raw_export_authorized_with_proofs(

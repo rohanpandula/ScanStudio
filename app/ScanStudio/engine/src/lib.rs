@@ -12,5 +12,6 @@ pub mod processing;
 pub mod protocol;
 pub mod real_backend;
 pub mod render;
+pub mod render_export;
 pub mod server;
 pub mod sim;

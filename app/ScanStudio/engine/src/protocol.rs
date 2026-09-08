@@ -518,6 +518,41 @@ pub struct RollSolveExposureAck {
     pub accepted: bool,
 }
 
+/// Offline re-render of retained, engine-bound masters. This operation never
+/// reaches a scanner backend and writes only create-only derivative files.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollRenderParams {
+    pub frames: Vec<u32>,
+    pub profile: String,
+    pub output: String,
+}
+
+/// Offline create-only export of one bound receipt artifact per selected frame.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollExportParams {
+    pub to: String,
+    pub template: String,
+    pub kind: String,
+    #[serde(default)]
+    pub frames: Option<Vec<u32>>,
+}
+
+/// Apply approved roll metadata to create-only copies of retained outputs.
+/// The authoritative manifest, receipts, and capture files are never targets.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollMetadataApplyParams {
+    pub frames: Vec<u32>,
+    pub to: String,
+    pub template: String,
+    pub kind: String,
+    pub metadata: domain::MetadataSet,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RollExposureSolvedPayload {

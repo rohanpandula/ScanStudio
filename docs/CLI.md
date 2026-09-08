@@ -563,3 +563,10 @@ diagnostic rows can still be returned.
 `scan --wait` and `resume --wait` accept `--on-frame 'command'` and `--on-fail 'command'`. Hooks receive `SCANSTUDIO_JOB_ID`, `SCANSTUDIO_CORRELATION_TOKEN`, `SCANSTUDIO_FRAME_INDEX`, `SCANSTUDIO_RECEIPT_KEY`, `SCANSTUDIO_RECEIPT_PATH`, `SCANSTUDIO_ERROR_JSON`, and `SCANSTUDIO_HOOK_KIND`. Delivery is recorded before launch, so observer reattachment does not launch it again. A crash between recording and launch can miss a delivery. Hook commands are not persisted. Hooks run independently with null stdio and a ten-second lifetime limit; failures do not retry or stop the scan.
 
 `selftest` creates private temporary simulator hosts and reports pass/fail plus evidence directories for stalled-frame stop, feed-jam resume, and killed-observer reattachment. It uses no real scanner. Development builds accept `selftest --engine /absolute/path/to/scanstudio-engine`; packaged builds resolve their bundled engine.
+
+
+### Offline copies from retained outputs
+
+With a saved roll open, `render --frame 2-4 --profile sRGB --output /absolute/new-output` re-renders positives from verified retained masters. Profiles are sRGB, AdobeRGB1998, and ProPhotoRGB. `export --to /absolute/new-directory --template 'Frame_####.tif' --kind positive` copies receipt-bound outputs; kinds are positive, raw, and master. Existing filename metadata/pass tokens are supported. Output files and result sidecars are create-only.
+
+`metadata apply --frame 2 --frame 3 --to /absolute/new-directory --template 'Tagged_####.tif' --film-stock 'Example stock' --camera 'Example camera' --dry-run` previews the approved ExifTool arguments. Remove `--dry-run` to tag new copies. Optional fields are `--lens`, `--date`, and `--notes`; `--kind` selects the source output type. ExifTool works in a private staging directory; tagged copies are verified before create-only publication. Missing ExifTool is reported, and originals, manifests, and capture receipts remain unchanged. The GUI Batch Inspector exposes the same render and metadata operations.

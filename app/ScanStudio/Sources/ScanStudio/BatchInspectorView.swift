@@ -13,6 +13,10 @@ struct BatchInspectorView: View {
     @State private var namedPresetNames: [String] = []
     @State private var presetError: String?
     @State private var reportError: String?
+    @State private var renderError: String?
+    @State private var metadataCopyPreview: ControlMetadataApplyResult?
+    @State private var metadataCopyResult: ControlMetadataApplyResult?
+    @State private var renderProfile = "sRGB"
     @FocusState private var focusedGearField: GearField?
     @State private var presentedRecentGear: GearField?
 
@@ -84,6 +88,14 @@ struct BatchInspectorView: View {
         } message: {
             Text(reportError ?? "The HTML report could not be written.")
         }
+        .alert("Re-render unavailable", isPresented: Binding(
+            get: { renderError != nil },
+            set: { if !$0 { renderError = nil } }
+        )) {
+            Button("OK", role: .cancel) { renderError = nil }
+        } message: {
+            Text(renderError ?? "The retained master could not be rendered.")
+        }
     }
 
     @ViewBuilder
@@ -105,6 +117,22 @@ struct BatchInspectorView: View {
                     generateRollReport(directory: directory)
                 }
                 .controlSize(.small)
+                if let frameIndex = sessionModel.detailFrameIndex ?? sessionModel.frameTransformTargetIndex {
+                    HStack(spacing: 6) {
+                        Menu {
+                            ForEach(["sRGB", "AdobeRGB1998", "ProPhotoRGB"], id: \.self) { profile in
+                                Button(profile) { renderProfile = profile }
+                            }
+                        } label: {
+                            Label("Profile: \(renderProfile)", systemImage: "paintpalette")
+                        }
+                        .controlSize(.small)
+                        Button("Re-render selected") {
+                            renderSelected(frameIndex: frameIndex, projectDirectory: directory)
+                        }
+                        .controlSize(.small)
+                    }
+                }
                 if let frameIndex = sessionModel.detailFrameIndex ?? sessionModel.frameTransformTargetIndex {
                     let receipt = sessionModel.receipts.last(where: { $0.frameIndex == frameIndex })
                         ?? sessionModel.project?.frames.first(where: { $0.index == frameIndex })?.receipts.last
@@ -148,6 +176,21 @@ struct BatchInspectorView: View {
                 NSWorkspace.shared.open(URL(fileURLWithPath: result.path))
             } catch {
                 reportError = error.localizedDescription
+            }
+        }
+    }
+
+    private func renderSelected(frameIndex: Int, projectDirectory: String) {
+        let output = URL(fileURLWithPath: projectDirectory).appendingPathComponent("Rendered-\(renderProfile)")
+        Task {
+            guard let result = await sessionModel.renderRoll(ControlRollRenderParams(
+                frames: [frameIndex], profile: renderProfile, output: output.path
+            )) else {
+                renderError = sessionModel.lastErrorMessage ?? "The retained master could not be rendered."
+                return
+            }
+            if let first = result.files.first {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: first.path)])
             }
         }
     }
@@ -372,6 +415,32 @@ struct BatchInspectorView: View {
                 .padding(.bottom, 6)
 
                 InspectorRow(label: "ExifTool", value: exifToolStatusSummary)
+                HStack(spacing: 8) {
+                    Button("Preview copy metadata") {
+                        Task { metadataCopyPreview = await sessionModel.applyMetadataCopies(metadataCopyParams(dryRun: true)) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(sessionModel.exifToolDetection?.available != true || metadataCopyFrames.isEmpty)
+                    Button("Apply to new copies") {
+                        Task { metadataCopyResult = await sessionModel.applyMetadataCopies(metadataCopyParams(dryRun: false)) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.scanStudioAmber)
+                    .controlSize(.small)
+                    .disabled(metadataCopyPreview == nil)
+                }
+                if let preview = metadataCopyPreview {
+                    Text(preview.arguments.isEmpty ? "No metadata fields are set." : preview.arguments.joined(separator: " "))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Color.scanStudioSecondaryText)
+                        .textSelection(.enabled)
+                }
+                if let result = metadataCopyResult {
+                    Text("Created \(result.files.count) metadata cop\(result.files.count == 1 ? "y" : "ies") in a new directory.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.scanStudioCyan)
+                }
             }
             InspectorSection(title: "Estimated Size") {
                 InspectorRow(
@@ -427,6 +496,24 @@ struct BatchInspectorView: View {
                     .padding(.top, 8)
             }
         }
+    }
+
+    private var metadataCopyFrames: [Int] {
+        sessionModel.project?.frames.filter { !$0.receipts.isEmpty }.map(\.index) ?? []
+    }
+
+    private func metadataCopyParams(dryRun: Bool) -> ControlRollMetadataApplyParams {
+        let destination = URL(fileURLWithPath: sessionModel.positiveDestination)
+            .appendingPathComponent("Metadata Copies", isDirectory: true)
+            .standardizedFileURL.path
+        return ControlRollMetadataApplyParams(
+            frames: metadataCopyFrames,
+            to: destination,
+            template: sessionModel.positiveFilenameTemplate,
+            kind: "positive",
+            metadata: sessionModel.rollMetadataDraft,
+            dryRun: dryRun
+        )
     }
 
     private var saveOutputsSection: some View {

@@ -60,6 +60,9 @@ public enum ControlRequest: Sendable {
     case rollOpen(id: UInt64, params: ControlRollOpenParams)
     case rollList(id: UInt64)
     case rollSolveExposure(id: UInt64, params: ControlRollSolveExposureParams)
+    case rollRender(id: UInt64, params: ControlRollRenderParams)
+    case rollExport(id: UInt64, params: ControlRollExportParams)
+    case rollMetadataApply(id: UInt64, params: ControlRollMetadataApplyParams)
     case rollVerify(id: UInt64, params: ControlRollVerifyParams)
     case rollCollect(id: UInt64, params: ControlRollCollectParams)
     case scanPreflight(id: UInt64, params: ControlScanPreflightParams)
@@ -112,7 +115,7 @@ extension ControlRequest {
         case .rollSave(let id, _): id
         case .rollOpen(let id, _): id
         case .rollList(let id): id
-        case .rollSolveExposure(let id, _): id
+        case .rollSolveExposure(let id, _), .rollRender(let id, _), .rollExport(let id, _), .rollMetadataApply(let id, _): id
         case .rollVerify(let id, _), .rollCollect(let id, _): id
         case .scanPreflight(let id, _): id
         case .scanStart(let id, _): id
@@ -153,6 +156,9 @@ extension ControlRequest {
         case .rollOpen: "roll.open"
         case .rollList: "roll.list"
         case .rollSolveExposure: "roll.solveExposure"
+        case .rollRender: "roll.render"
+        case .rollExport: "roll.export"
+        case .rollMetadataApply: "roll.metadataApply"
         case .rollVerify: "roll.verify"
         case .rollCollect: "roll.collect"
         case .scanPreflight: "scan.preflight"
@@ -200,6 +206,8 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case rollList(ControlRollListResult)
     case rollSave(ControlRollSaveResult)
     case rollExposure(ControlRollSolveExposureResult)
+    case rollRenderExport(ControlRenderExportResult)
+    case rollMetadataApply(ControlMetadataApplyResult)
     case rollVerification(CalibrationVerificationReport)
     case rollCollection(CalibrationCollectionResult)
     case previewAcquire(ControlPreviewAcquireResult)
@@ -226,6 +234,8 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .rollList(let value): try container.encode(value)
         case .rollSave(let value): try container.encode(value)
         case .rollExposure(let value): try container.encode(value)
+        case .rollRenderExport(let value): try container.encode(value)
+        case .rollMetadataApply(let value): try container.encode(value)
         case .rollVerification(let value): try container.encode(value)
         case .rollCollection(let value): try container.encode(value)
         case .previewAcquire(let value): try container.encode(value)
@@ -371,6 +381,9 @@ public final class ControlChannelDispatcher {
         case "roll.open": return decoded(ControlRollOpenParams.self) { .rollOpen(id: $0, params: $1) }
         case "roll.list": return decoded(EmptyParams.self) { id, _ in .rollList(id: id) }
         case "roll.solveExposure": return decoded(ControlRollSolveExposureParams.self) { .rollSolveExposure(id: $0, params: $1) }
+        case "roll.render": return decoded(ControlRollRenderParams.self) { .rollRender(id: $0, params: $1) }
+        case "roll.export": return decoded(ControlRollExportParams.self) { .rollExport(id: $0, params: $1) }
+        case "roll.metadataApply": return decoded(ControlRollMetadataApplyParams.self) { .rollMetadataApply(id: $0, params: $1) }
         case "roll.verify": return decoded(ControlRollVerifyParams.self) { .rollVerify(id: $0, params: $1) }
         case "roll.collect": return decoded(ControlRollCollectParams.self) { .rollCollect(id: $0, params: $1) }
         case "scan.preflight": return decoded(ControlScanPreflightParams.self) { .scanPreflight(id: $0, params: $1) }
@@ -1001,6 +1014,57 @@ public final class ControlChannelDispatcher {
                 id: id,
                 result: .rollExposure(ControlRollSolveExposureResult(solution: solution))
             )
+        case .rollRender(let id, let params):
+            guard !params.frames.isEmpty, params.frames.allSatisfy({ $0 > 0 }) else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.render frames must contain positive frame indices."
+                ))
+            }
+            guard !params.output.isEmpty else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.render output is required."))
+            }
+            guard let result = await sessionModel.renderRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollRenderExport(result))
+        case .rollExport(let id, let params):
+            guard !params.to.isEmpty, !params.template.isEmpty else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.export requires to and template."))
+            }
+            guard ["positive", "raw", "master"].contains(params.kind.lowercased()) else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.export kind must be positive, raw, or master."))
+            }
+            if let frames = params.frames, (frames.isEmpty || frames.contains(where: { $0 <= 0 })) {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.export frames must contain positive frame indices."))
+            }
+            guard let result = await sessionModel.exportRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollRenderExport(result))
+        case .rollMetadataApply(let id, let params):
+            guard !params.frames.isEmpty, params.frames.allSatisfy({ $0 > 0 }) else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.metadataApply frames must contain positive frame indices."
+                ))
+            }
+            guard !params.to.isEmpty, !params.template.isEmpty else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.metadataApply requires to and template."
+                ))
+            }
+            guard ["positive", "raw", "master"].contains(params.kind.lowercased()) else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.metadataApply kind must be positive, raw, or master."
+                ))
+            }
+            guard let result = await sessionModel.applyMetadataCopies(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollMetadataApply(result))
         case .rollVerify(let id, let params):
             guard let report = await sessionModel.verifyRoll(params) else {
                 return outcome(id: id, errorMessageBefore: nil)

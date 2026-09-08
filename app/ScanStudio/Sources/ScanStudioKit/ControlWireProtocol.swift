@@ -329,6 +329,77 @@ public struct ControlRollSolveExposureParams: Codable, Equatable, Sendable {
     }
 }
 
+public struct ControlRollRenderParams: Codable, Equatable, Sendable {
+    public let frames: [Int]
+    public let profile: String
+    public let output: String
+
+    public init(frames: [Int], profile: String, output: String) {
+        self.frames = frames
+        self.profile = profile
+        self.output = output
+    }
+}
+
+public struct ControlRollExportParams: Codable, Equatable, Sendable {
+    public let to: String
+    public let template: String
+    public let kind: String
+    public let frames: [Int]?
+
+    public init(to: String, template: String, kind: String, frames: [Int]? = nil) {
+        self.to = to
+        self.template = template
+        self.kind = kind
+        self.frames = frames
+    }
+}
+
+public struct ControlRollMetadataApplyParams: Codable, Equatable, Sendable {
+    public let frames: [Int]
+    public let to: String
+    public let template: String
+    public let kind: String
+    public let metadata: MetadataSet
+    public let dryRun: Bool
+
+    public init(
+        frames: [Int],
+        to: String,
+        template: String,
+        kind: String,
+        metadata: MetadataSet,
+        dryRun: Bool = false
+    ) {
+        self.frames = frames
+        self.to = to
+        self.template = template
+        self.kind = kind
+        self.metadata = metadata
+        self.dryRun = dryRun
+    }
+}
+
+public struct ControlMetadataApplyFile: Codable, Equatable, Sendable {
+    public let frameIndex: Int
+    public let path: String
+    public let sourceSha256: String
+    public let outputSha256: String
+    public let readbackVerified: Bool
+}
+
+public struct ControlMetadataApplyResult: Codable, Equatable, Sendable {
+    public let operation: String
+    public let dryRun: Bool
+    public let exiftoolAvailable: Bool
+    public let exiftoolPath: String?
+    public let targets: [String]
+    public let arguments: [String]
+    public let fingerprint: String
+    public let files: [ControlMetadataApplyFile]
+    public let resultSidecar: String?
+}
+
 public struct ControlScanResumeParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
 
@@ -1048,6 +1119,19 @@ public struct ControlRollSolveExposureResult: Codable, Equatable, Sendable {
     public init(solution: RollExposureLock) {
         self.solution = solution
     }
+}
+
+public struct ControlRenderExportFile: Codable, Equatable, Sendable {
+    public let frameIndex: Int
+    public let path: String
+    public let byteLength: UInt64
+    public let sha256: String
+}
+
+public struct ControlRenderExportResult: Codable, Equatable, Sendable {
+    public let operation: String
+    public let files: [ControlRenderExportFile]
+    public let resultSidecar: String
 }
 
 /// D-23/HEAD-12: `scan.start`/`scan.resume`'s own result, matching

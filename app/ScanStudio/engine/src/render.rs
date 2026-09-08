@@ -3302,6 +3302,55 @@ fn open_existing_file_proof(path: &Path) -> Result<PublishedFileProof, domain::E
     published_file_proof(path, file)
 }
 
+fn verify_expected_source_binding(
+    file: &std::fs::File,
+    binding: &domain::WrittenFileBinding,
+    path: &Path,
+) -> Result<(), domain::EngineError> {
+    use std::io::{Read, Seek, SeekFrom};
+    use sha2::{Digest, Sha256};
+    let metadata = file.metadata().map_err(|error| {
+        output_authority_error(format!("cannot inspect bound retained master {}: {error}", path.display()))
+    })?;
+    let identity = crate::exiftool::held_file_identity(file, &metadata).ok_or_else(|| {
+        output_authority_error(format!("retained master identity is unavailable: {}", path.display()))
+    })?;
+    if metadata.len() != binding.byte_length
+        || binding.volume_id != Some(identity.0)
+        || binding.file_id != Some(identity.1)
+        || identity.2 != 1
+    {
+        return Err(output_authority_error(format!(
+            "retained master no longer matches its receipt binding: {}",
+            path.display()
+        )));
+    }
+    let mut input = file.try_clone().map_err(|error| {
+        output_authority_error(format!("clone retained master for binding check: {error}"))
+    })?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| output_authority_error(format!("rewind retained master binding check: {error}")))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer).map_err(|error| {
+            output_authority_error(format!("read retained master binding check: {error}"))
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if format!("{:x}", hasher.finalize()) != binding.sha256 {
+        return Err(output_authority_error(format!(
+            "retained master hash no longer matches its receipt binding: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Frame geometry
 // ---------------------------------------------------------------------
@@ -6077,6 +6126,55 @@ pub fn render_derivative_from_archive_with_processing(
         domain::HardwareVerification::Verified,
         None,
         fallback_authorities.frame(frame_index)?,
+        None,
+    )
+}
+
+/// Processing-aware retained-master rendering with an engine-authored source
+/// binding. The binding is checked against the exact no-follow descriptor the
+/// renderer opens, closing the verification/reopen gap for offline callers.
+pub(crate) fn render_derivative_from_archive_with_processing_bound(
+    archive_rgb_path: &std::path::Path,
+    frame_index: u32,
+    processing: &domain::ProcessingRecipe,
+    recipes: &domain::OutputRecipe,
+    storage_transform: Option<&str>,
+    storage_transform_override: Option<&str>,
+    detected_boundary: Option<(u32, u32)>,
+    alignment: Option<&domain::FrameAlignment>,
+    exposure_10ns: Option<[f64; 3]>,
+    resolution_dpi: u32,
+    binding: &domain::WrittenFileBinding,
+) -> Result<WrittenPaths, domain::EngineError> {
+    let fallback_recipe = domain::CaptureRecipe {
+        channels: domain::Channels::Rgbi,
+        ..domain::CaptureRecipe::default()
+    };
+    let fallback_output = recipes.clone();
+    let fallback_authorities = acquire_job_output_authorities(
+        None,
+        &[frame_index],
+        &fallback_recipe,
+        &fallback_output,
+        &std::collections::HashMap::new(),
+    )?;
+    render_derivative_from_archive_with_processing_authorized(
+        archive_rgb_path,
+        None,
+        None,
+        frame_index,
+        processing,
+        recipes,
+        storage_transform,
+        storage_transform_override,
+        detected_boundary,
+        alignment,
+        exposure_10ns,
+        resolution_dpi,
+        domain::HardwareVerification::Verified,
+        None,
+        fallback_authorities.frame(frame_index)?,
+        Some(binding),
     )
 }
 
@@ -6097,6 +6195,7 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
     hardware_verification: domain::HardwareVerification,
     device_model: Option<&str>,
     authorities: &FrameOutputAuthorities,
+    expected_archive_binding: Option<&domain::WrittenFileBinding>,
 ) -> Result<WrittenPaths, domain::EngineError> {
     let derivative_transform = alignment
         .map(|value| value.derivative_transform)
@@ -6130,6 +6229,9 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
         (recipes.archive.enabled || recipes.positive.enabled || recipes.preview.enabled)
             .then(|| open_existing_file_proof(archive_rgb_path))
             .transpose()?;
+    if let (Some(binding), Some(proof)) = (expected_archive_binding, archive_source_proof.as_ref()) {
+        verify_expected_source_binding(&proof.file, binding, archive_rgb_path)?;
+    }
     let mut archive_existing_proof = None;
     let archive_staged = if let Some(output) = authorities.archive.as_ref() {
         let archive_source_proof = archive_source_proof
@@ -10149,6 +10251,7 @@ mod tests {
             domain::HardwareVerification::Verified,
             None,
             authorities.frame(1).unwrap(),
+            None,
         )
         .unwrap();
         assert!(retained.archive_path.is_none());

@@ -790,7 +790,7 @@ fn preflight_receipts<'a>(
     Ok(preflighted)
 }
 
-fn open_bound_source(
+pub(crate) fn open_bound_source(
     authority: &crate::render::ProjectOutputRootAuthority,
     binding: &WrittenFileBinding,
     recorded_path: Option<&str>,
