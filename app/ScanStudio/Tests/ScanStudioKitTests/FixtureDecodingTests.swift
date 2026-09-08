@@ -39,9 +39,11 @@ struct FixtureDecodingTests {
     @Test("03: scanner.list response decodes")
     func listResponse() throws {
         let envelope: ResponseEnvelope<ScannerListResult> = try decodeFixture("03-list-response.json")
-        #expect(envelope.result.devices.count == 1)
+        #expect(envelope.result.devices.map(\.deviceId) == ["sim-ls5000-0", "sim-ls50-0"])
         #expect(envelope.result.devices.first?.deviceId == "sim-ls5000-0")
         #expect(envelope.result.devices.first?.model == "SUPER COOLSCAN 5000 ED")
+        #expect(envelope.result.devices.last?.supported == false)
+        #expect(envelope.result.devices.last?.hardwareVerification == "unverified")
     }
 
     @Test("04: scanner.connect request decodes")
