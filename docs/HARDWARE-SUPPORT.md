@@ -16,7 +16,7 @@ Latest release notes: [v0.7.0-beta.17](releases/v0.7.0-beta.17.md) (release cand
 | Host and scanner | Package built | Device enumerated | Preview exercised | One-frame capture validated | Support / next evidence |
 | --- | --- | --- | --- | --- | --- |
 | Apple Silicon macOS + LS-5000 USB | Yes | Yes | Yes | Yes, on one Mac/scanner configuration; five of six frames of a C-41 short strip on the 2026-09-06 beta.15 candidate (firmware 1.03, SA-30), the sixth refused by the exposure-meter controller | **Beta.** CLI-driven attended roll evidence from 2026-09-07 covers frames 1–9 and 11–36; frame 10 was refused by the IR meter gate, and 37–40 were excluded. More firmware, adapter, macOS, and media diversity is human-owned in [#23](https://github.com/rohanpandula/ScanStudio/issues/23). |
-| LS-40 / Coolscan IV and LS-50 / Coolscan V USB | Packages contain identity recognition only | No retained packaged-app field result | No | No | **Recognized; unverified.** Explicit opt-in requires the separately released CoolscanPy 0.7.8 driver; the current 0.7.7 pin still refuses opening these models. No capture has been validated. Identification evidence is requested in [#27](https://github.com/rohanpandula/ScanStudio/issues/27). |
+| LS-40 / Coolscan IV and LS-50 / Coolscan V USB | Packages contain identity recognition only | No retained packaged-app field result | No | No | **Recognized; unverified.** CoolscanPy 0.7.8 permits explicit opt-in while binding the selected USB identity. No capture has been validated. Identification evidence is requested in [#27](https://github.com/rohanpandula/ScanStudio/issues/27). |
 | LS-4000, LS-8000, and LS-9000 FireWire | No scanning package | Yes, discovery and a motion-free probe on modern macOS | No | No | **Unsupported for scanning.** Driver-probe evidence and the remaining hardware work are tracked in [#28](https://github.com/rohanpandula/ScanStudio/issues/28). |
 
 ## Model compatibility
@@ -52,12 +52,12 @@ The single-sample gate remains closed pending an attended junk-strip run; see
 
 The candidate adds **Allow unverified scanners** in Settings and
 `scanstudio-cli connect --allow-unverified-hardware`. The CLI requires its own
-explicit flag; a saved GUI preference does not opt a CLI command in. With the
-current CoolscanPy 0.7.7 pin, opening a recognized unverified device still returns
-a typed refusal requesting 0.7.8. There is no fallback retry.
+explicit flag; a saved GUI preference does not opt a CLI command in. CoolscanPy
+0.7.8 supports this opt-in; an older driver without the API returns a typed
+upgrade refusal. There is no fallback retry.
 
-Once the approved driver is published and pinned, the opt-in allows a recognized
-USB identity through the existing LS-5000 command path. It does not adapt that
+The opt-in allows a recognized USB identity through the existing LS-5000
+command path. It does not adapt that
 trace to a different scanner. Discovery or connection may succeed while focus,
 metering, preview, or fine reads fail. Status, receipts, derivative TIFF metadata,
 and diagnostics carry the model and `hardwareVerification: unverified`;

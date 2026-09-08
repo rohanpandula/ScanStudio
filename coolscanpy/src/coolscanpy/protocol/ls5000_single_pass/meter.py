@@ -52,6 +52,17 @@ FINAL_CHANGE_LIMIT = 0.05
 CENTRAL_INSET_FRACTION = 0.10
 LINEARITY_GAIN_ERROR_LIMIT = 0.10
 LINEARITY_CORRELATION_MIN = 0.98
+# HW-08: a real LS-5000 ED batch scan (2026-09-07, firmware 1.03, SA-30)
+# aborted at frame 10 -- a dark, low-contrast exposure -- because IR pass
+# correlation 0.9727 fell under the shared 0.98 floor while R/G/B held
+# 0.9995/0.9999/0.9999 (frame 9 passed with IR 0.992). IR's texture_span on
+# that frame was ~4.8k against ~19-24k for R/G/B: little structure survives
+# a dark frame's IR plane even when the pass is genuinely aligned, so it
+# needs its own, looser floor. IR does not drive C-41 negative exposure
+# (only R/G/B do; IR is dust/scratch detection), so relaxing only its gate
+# does not weaken exposure safety. nonlinear_gain and linearity_insufficient
+# stay unchanged for every channel.
+LINEARITY_CORRELATION_MIN_IR = 0.95
 LINEARITY_MIN_SAMPLES = 256
 LINEARITY_CORRELATION_BIN_WIDTH = 9
 LINEARITY_MIN_AGGREGATES = 256
@@ -596,6 +607,9 @@ def _linearity_diagnostic(
     column_inset = max(1, round(METER_WIDTH * CENTRAL_INSET_FRACTION))
     rows = slice(row_inset, METER_ROWS - row_inset)
     columns = slice(column_inset, METER_WIDTH - column_inset)
+    correlation_min = (
+        LINEARITY_CORRELATION_MIN_IR if channel == "IR" else LINEARITY_CORRELATION_MIN
+    )
     previous_stats = previous.channel_statistics[channel]
     current_stats = current.channel_statistics[channel]
     x_grid = (
@@ -658,6 +672,7 @@ def _linearity_diagnostic(
             "measured_gain": None,
             "gain_error_fraction": None,
             "correlation": None,
+            "correlation_min": correlation_min,
             "raw_pixel_correlation": None,
             "correlation_aggregation": aggregation,
             "accepted": False,
@@ -685,7 +700,7 @@ def _linearity_diagnostic(
     accepted = (
         gain_error is not None
         and gain_error <= LINEARITY_GAIN_ERROR_LIMIT
-        and correlation >= LINEARITY_CORRELATION_MIN
+        and correlation >= correlation_min
     )
     return {
         "valid_samples": int(x.size),
@@ -694,6 +709,7 @@ def _linearity_diagnostic(
         "measured_gain": float(measured_gain),
         "gain_error_fraction": (float(gain_error) if gain_error is not None else None),
         "correlation": float(correlation),
+        "correlation_min": correlation_min,
         "raw_pixel_correlation": float(raw_pixel_correlation),
         "correlation_aggregation": aggregation,
         "accepted": bool(accepted),
@@ -863,7 +879,8 @@ def propose_next_exposures(
                             channel,
                         )
                     )
-                if correlation is None or correlation < LINEARITY_CORRELATION_MIN:
+                correlation_min = linearity["correlation_min"]
+                if correlation is None or correlation < correlation_min:
                     refusals.append(
                         SafetyRefusal(
                             "low_correlation",

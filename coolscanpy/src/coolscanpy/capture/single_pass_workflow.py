@@ -58,6 +58,7 @@ from coolscanpy.protocol.ls5000_single_pass.packed import (
     HEIGHT,
     WIDTH,
     decode_full_records,
+    decode_records,
 )
 from coolscanpy.protocol.ls5000_single_pass.streaming_sidecar import (
     CANONICAL_RGB_AVERAGE,
@@ -137,6 +138,7 @@ class PackedCaptureContract:
     width: int = WIDTH
     height: int = HEIGHT
     dpi: int = 4000
+    samples_per_scan: int = 4
 
     def __post_init__(self) -> None:
         for name in ("records", "record_bytes", "width", "height", "dpi"):
@@ -145,6 +147,8 @@ class PackedCaptureContract:
                 raise ValueError(f"{name} must be a positive integer")
         if self.records != (self.height + 1) // 2:
             raise ValueError("packed record count must provide exactly two row slots per record")
+        if type(self.samples_per_scan) is not int or self.samples_per_scan not in (1, 4):
+            raise ValueError("samples_per_scan must be 1 or 4")
 
     @property
     def stream_bytes(self) -> int:
@@ -750,7 +754,18 @@ class LS5000SinglePassWorkflow:
         self._measure_focus = focus_measurer
 
     def _decode_default(self, path: Path) -> tuple[np.ndarray, Mapping[str, object]]:
-        return decode_full_records(path, width=self._contract.width, height=self._contract.height)
+        if self._contract.samples_per_scan == 4:
+            return decode_full_records(
+                path,
+                width=self._contract.width,
+                height=self._contract.height,
+            )
+        return decode_records(
+            path,
+            record_bytes=self._contract.record_bytes,
+            width=self._contract.width,
+            height=self._contract.height,
+        )
 
     def _load_stream_receipt(
         self,
@@ -1093,8 +1108,13 @@ class LS5000SinglePassWorkflow:
                     layout.pop(key)
         if layout.get("padding_validated_records") != self._contract.records:
             raise SinglePassIntegrityError("decoder did not validate padding in every full record")
-        if layout.get("rgb_samples_decoded") != 4 or layout.get("ir_planes_transferred") != 1:
-            raise SinglePassIntegrityError("decoder did not prove the RGB4x plus IR single-pass layout")
+        if (
+            layout.get("rgb_samples_decoded") != self._contract.samples_per_scan
+            or layout.get("ir_planes_transferred") != 1
+        ):
+            raise SinglePassIntegrityError(
+                "decoder did not prove the requested RGB samples plus IR single-pass layout"
+            )
 
         try:
             smear_assessment = self._assess_smear(
@@ -1249,6 +1269,7 @@ class LS5000SinglePassWorkflow:
                 "stream_bytes": self._contract.stream_bytes,
                 "width": self._contract.width,
                 "height": self._contract.height,
+                "samples_per_scan": self._contract.samples_per_scan,
                 "channels": ["R", "G", "B", "IR"],
             },
             "decode_layout": deepcopy(layout),
@@ -1718,7 +1739,10 @@ class LS5000SinglePassWorkflow:
                 raise SinglePassIntegrityError(f"{label} window {index} does not use the selected slot origin")
             if window.get("resolution") != [self._contract.dpi, self._contract.dpi]:
                 raise SinglePassIntegrityError(f"{label} window {index} has an unexpected resolution")
-            if window.get("size") != [self._contract.width, self._contract.height] or window.get("samples") != 4:
+            if (
+                window.get("size") != [self._contract.width, self._contract.height]
+                or window.get("samples") != self._contract.samples_per_scan
+            ):
                 raise SinglePassIntegrityError(f"{label} window {index} is not the proven RGBI4x geometry")
             normalized_window = {field: deepcopy(window[field]) for field in fields}
             if require_interleave:

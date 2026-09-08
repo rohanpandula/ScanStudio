@@ -52,6 +52,7 @@ FULL_PADDING_BYTE_RANGES = (
     (158_968, 159_744),
     (207_096, 207_872),
 )
+SINGLE_SAMPLE_RECORD_BYTES = FULL_PADDING_BYTE_RANGES[0][1]
 
 # Word-grained views of the byte offsets above, shared by the batch and the
 # streaming decode kernels so both produce byte-identical output.
@@ -67,8 +68,12 @@ def infer_record_geometry(path: Path, records: int = EXPECTED_RECORDS) -> int:
     if size % records:
         raise ValueError(f"stream size {size} is not divisible by {records} records")
     record_bytes = size // records
-    if record_bytes not in (PREFIX_RECORD_BYTES, FULL_RECORD_BYTES):
-        raise ValueError(f"record size {record_bytes} is neither {PREFIX_RECORD_BYTES} nor {FULL_RECORD_BYTES}")
+    if record_bytes not in (
+        SINGLE_SAMPLE_RECORD_BYTES,
+        PREFIX_RECORD_BYTES,
+        FULL_RECORD_BYTES,
+    ):
+        raise ValueError(f"unsupported record size {record_bytes}")
     return record_bytes
 
 
@@ -95,7 +100,7 @@ def decode_core_records(
     rows = paired.transpose(0, 3, 2, 1).reshape(-1, width, channels)
     # The clean oracle exposes 5,960 row slots for a requested 5,959 rows.
     # Reverse X to the driver's native film orientation.
-    return np.asarray(rows[:height, ::-1, :]).copy()
+    return np.asarray(rows[:height, ::-1, :]).astype(np.uint16, copy=True)
 
 
 def _counter_train_ok(
@@ -257,6 +262,31 @@ def decode_records(
 ) -> tuple[np.ndarray, dict[str, object]]:
     if record_bytes == FULL_RECORD_BYTES:
         return decode_full_records(path, width=width, height=height)
+    layout: dict[str, object] = {
+        "rgb_samples_decoded": 1,
+        "ir_planes_transferred": 1,
+    }
+    if record_bytes == SINGLE_SAMPLE_RECORD_BYTES:
+        records = (height + 1) // 2
+        raw = np.memmap(
+            path,
+            dtype=np.uint8,
+            mode="r",
+            shape=(records, record_bytes),
+        )
+        start, end = FULL_PADDING_BYTE_RANGES[0]
+        padding = raw[:, start:end].view(">u2")
+        if not _counter_train_ok(padding, first_counter=0xE7FD):
+            raise ValueError("single-sample padding counter train mismatch")
+        layout.update(
+            {
+                "padding_validated_records": records,
+                "padding_byte_ranges": [[start, end]],
+                "single_sample_record": True,
+            }
+        )
+    else:
+        layout["prefix_capture"] = True
     return (
         decode_core_records(
             path,
@@ -265,11 +295,7 @@ def decode_records(
             height=height,
             channels=CHANNELS,
         ),
-        {
-            "rgb_samples_decoded": 1,
-            "ir_planes_transferred": 1,
-            "prefix_capture": True,
-        },
+        layout,
     )
 
 

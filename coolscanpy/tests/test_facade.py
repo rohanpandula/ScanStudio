@@ -58,6 +58,7 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
 from coolscanpy.protocol.ls5000_single_pass.continuation_plan import (
     CANONICAL_CONTINUATION_PLAN_SHA256,
 )
+from coolscanpy.protocol.ls5000_single_pass.packed import SINGLE_SAMPLE_RECORD_BYTES
 from coolscanpy.protocol.ls5000_single_pass.density import (
     DensityCalibration,
     assemble_density_calibration,
@@ -697,11 +698,16 @@ def _make_workflow() -> LS5000SinglePassWorkflow:
 
     return LS5000SinglePassWorkflow(
         contract=PackedCaptureContract(),
-        decoder=lambda _path: (
+        decoder=lambda path: (
             _fake_decoded_frame(),
             {
                 "padding_validated_records": CANONICAL_FINE_READ_COUNT,
-                "rgb_samples_decoded": 4,
+                "rgb_samples_decoded": (
+                    1
+                    if path.stat().st_size
+                    == CANONICAL_FINE_READ_COUNT * SINGLE_SAMPLE_RECORD_BYTES
+                    else 4
+                ),
                 "ir_planes_transferred": 1,
             },
         ),
@@ -789,12 +795,17 @@ class _FakeBatchProcess:
         output = directory / frame["output"]
         journal_path = directory / frame["journal"]
         output.parent.mkdir(parents=True, exist_ok=True)
+        stream_bytes = CANONICAL_FINE_READ_COUNT * (
+            SINGLE_SAMPLE_RECORD_BYTES
+            if self.job["samples_per_scan"] == 1
+            else CANONICAL_FINE_READ_BYTES
+        )
         with output.open("xb") as stream:
-            stream.truncate(_FULL_STREAM_BYTES)
+            stream.truncate(stream_bytes)
         meter_path = output.with_name(f"{output.stem}-meter.bin")
         meter_payload = _meter_sidecar_fixture(frame["slot"])
         meter_path.write_bytes(meter_payload)
-        output_sha256 = _zero_stream_sha256(_FULL_STREAM_BYTES)
+        output_sha256 = _zero_stream_sha256(stream_bytes)
         reviewed_sha = self.job["reviewed_roll_fingerprint"]["binding_sha256"]
         wire_exposures, exposure_override_provenance = _fine_exposure_fields(self.job)
         density, density_preview_sha, density_table_sha = (
@@ -838,11 +849,11 @@ class _FakeBatchProcess:
             "expected_usb_address": self.job["expected_usb_address"],
             "actual_usb_bus": self.job["expected_usb_bus"],
             "actual_usb_address": self.job["expected_usb_address"],
-            "completed_bytes": _FULL_STREAM_BYTES,
+            "completed_bytes": stream_bytes,
             "completed_reads": CANONICAL_FINE_READ_COUNT,
             "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
-            "disk_bytes": _FULL_STREAM_BYTES,
-            "expected_bytes": _FULL_STREAM_BYTES,
+            "disk_bytes": stream_bytes,
+            "expected_bytes": stream_bytes,
             "expected_reads": CANONICAL_FINE_READ_COUNT,
             "frame_complete": True,
             "status": "frame-complete",
@@ -887,7 +898,7 @@ class _FakeBatchProcess:
                     "resolution": [4_000, 4_000],
                     "origin": [0, 100_000 + frame["slot"]],
                     "size": [3_946, 5_959],
-                    "samples": 4,
+                    "samples": self.job["samples_per_scan"],
                     "exposure_raw_10ns": wire_exposures[color],
                 }
                 for color in (1, 2, 3, 9)
@@ -898,7 +909,7 @@ class _FakeBatchProcess:
                     "resolution": [4_000, 4_000],
                     "origin": [0, 100_000 + frame["slot"]],
                     "size": [3_946, 5_959],
-                    "samples": 4,
+                    "samples": self.job["samples_per_scan"],
                     "exposure_raw_10ns": wire_exposures[color],
                     "interleave": 64,
                 }
@@ -3700,6 +3711,10 @@ class TestRollScanMany:
             assert observed_jobs[0]["schema_version"] == 3
             assert observed_jobs[0]["expected_usb_bus"] == 1
             assert observed_jobs[0]["expected_usb_address"] == 2
+            assert observed_jobs[0]["expected_usb_vendor_id"] == 0x04B0
+            assert observed_jobs[0]["expected_usb_product_id"] == 0x4002
+            assert observed_jobs[0]["expected_scanner_model"] == "LS-5000 ED"
+            assert observed_jobs[0]["allow_unverified"] is False
         finally:
             roll.close()
             dev.close()
@@ -6025,6 +6040,18 @@ class TestSaneLaneDiscoveryGate:
         with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
             coolscanpy.open("ls5000")
 
+        dev = coolscanpy.open("ls5000", allow_unverified=True)
+        try:
+            assert dev._info.model == "LS-50 ED"
+            assert dev._capture_identity() == (
+                0x04B0,
+                0x4001,
+                "LS-50 ED",
+                True,
+            )
+        finally:
+            dev.close()
+
     def test_sane_listed_ls5000_stays_supported(
         self,
         fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
@@ -6064,6 +6091,8 @@ class TestSaneLaneDiscoveryGate:
 
         with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
             coolscanpy.open("ls5000")
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000", allow_unverified=True)
 
     def test_sane_model_marker_order_matches_the_longer_digit_model_first(
         self,
@@ -6127,6 +6156,10 @@ class TestSaneLaneDiscoveryGate:
             coolscanpy.open("ls5000")
         with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
             coolscanpy.open("coolscan3:usb:001:009")
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open(
+                "coolscan3:usb:001:009", allow_unverified=True
+            )
 
     @pytest.mark.parametrize(
         ("model", "expected_name", "expected_supported"),

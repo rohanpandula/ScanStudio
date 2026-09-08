@@ -191,9 +191,10 @@ openable through the flag, and name-only recognition is not a USB capture path.
 
 `device.open.allowUnverifiedHardware` defaults to `false` and rejects non-boolean
 values. Opening an unverified candidate requires both the request flag and its
-`unverifiedAllowed` classification. With the currently pinned 0.7.7 driver,
-that branch returns `DEVICE_NOT_FOUND` explaining that 0.7.8 is required. The
-bridge checks for the keyword before making one opt-in call, never retries a
+`unverifiedAllowed` classification. CoolscanPy 0.7.8 supports this call and
+binds the selected identity through the capture worker. An older driver without
+the API returns `DEVICE_NOT_FOUND` explaining the required upgrade. The bridge
+checks for the keyword before making one opt-in call, never retries a
 `TypeError`, and always calls legacy `coolscanpy.open(id)` for the LS-5000.
 The engine reports `NOT_SUPPORTED` before the bridge when opt-in is missing.
 Motion arming, attendance, recipe validation, and recovery rules are unchanged.

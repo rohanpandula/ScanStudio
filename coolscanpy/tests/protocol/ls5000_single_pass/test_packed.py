@@ -10,10 +10,12 @@ from coolscanpy.protocol.ls5000_single_pass.packed import (
     FULL_RECORD_BYTES,
     FULL_RECORD_WORDS,
     FULL_RGB_SAMPLE_BYTE_OFFSETS,
+    SINGLE_SAMPLE_RECORD_BYTES,
     UNIT_WORDS,
     WIDTH,
     decode_core_records,
     decode_full_records,
+    decode_records,
     infer_record_geometry,
 )
 
@@ -79,6 +81,28 @@ def test_core_decoder_preserves_channel_x_row_order_and_discards_surplus_row(tmp
     decoded = decode_core_records(path, record_bytes=record_bytes, width=width, height=height, channels=channels)
 
     np.testing.assert_array_equal(expected, decoded)
+
+
+def test_single_sample_decoder_validates_its_trailing_padding(tmp_path: Path) -> None:
+    record = np.zeros(SINGLE_SAMPLE_RECORD_BYTES // 2, dtype=np.uint16)
+    padding = record[63_136 // 2 : 63_488 // 2]
+    _counter_train(padding, 0xE7FD)
+    path = tmp_path / "single-sample.bin"
+    path.write_bytes(record.astype(">u2").tobytes())
+
+    decoded, report = decode_records(
+        path,
+        record_bytes=SINGLE_SAMPLE_RECORD_BYTES,
+        height=2,
+    )
+
+    assert decoded.shape == (2, WIDTH, 4)
+    assert report["padding_validated_records"] == 1
+    assert report["rgb_samples_decoded"] == 1
+    record[-1] ^= 1
+    path.write_bytes(record.astype(">u2").tobytes())
+    with pytest.raises(ValueError, match="single-sample padding counter train mismatch"):
+        decode_records(path, record_bytes=SINGLE_SAMPLE_RECORD_BYTES, height=2)
 
 
 def test_full_decoder_rounds_four_rgb_samples_and_keeps_one_ir_plane(tmp_path: Path) -> None:
@@ -282,8 +306,10 @@ def test_full_decoder_rejects_cross_record_ebde_dialect_change(tmp_path: Path) -
 
 def test_geometry_inference_accepts_only_known_record_sizes(tmp_path: Path) -> None:
     path = tmp_path / "stream.bin"
+    path.write_bytes(b"\x00" * (2 * SINGLE_SAMPLE_RECORD_BYTES))
+    assert infer_record_geometry(path, records=2) == SINGLE_SAMPLE_RECORD_BYTES
     path.write_bytes(b"\x00" * (2 * FULL_RECORD_BYTES))
     assert infer_record_geometry(path, records=2) == FULL_RECORD_BYTES
     path.write_bytes(b"\x00" * 14)
-    with pytest.raises(ValueError, match="neither"):
+    with pytest.raises(ValueError, match="unsupported"):
         infer_record_geometry(path, records=2)
