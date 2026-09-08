@@ -962,6 +962,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
     assert "--frame" not in prepared.argv
     assert job["session_id"] == prepared.session_id
     assert job == {
+        "allowed_meter_refusal_slots": [],
         "apply_all_boundary_offsets_before_first_frame": True,
         "capture_plan_sha256": CANONICAL_PLAN_SHA256,
         "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
@@ -995,7 +996,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "parent_ack_required_after_every_frame": True,
         "release_once_after_last_frame": True,
         "reviewed_roll_fingerprint": fingerprint.to_payload(),
-        "schema_version": 3,
+        "schema_version": 4,
         "session_id": prepared.session_id,
         "session_contract": "one-process-one-reservation",
     }

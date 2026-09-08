@@ -3708,7 +3708,7 @@ class TestRollScanMany:
 
             assert frame.slot == 2
             assert len(observed_jobs) == 1
-            assert observed_jobs[0]["schema_version"] == 3
+            assert observed_jobs[0]["schema_version"] == 4
             assert observed_jobs[0]["expected_usb_bus"] == 1
             assert observed_jobs[0]["expected_usb_address"] == 2
             assert observed_jobs[0]["expected_usb_vendor_id"] == 0x04B0
