@@ -148,6 +148,12 @@ struct Status: AsyncParsableCommand {
                 marker = loaded
                 markerContext = context
                 requestedJobId = loaded.jobId
+            } catch let exitCode as ExitCode {
+                // `finishStatus` intentionally throws the mapped CLI exit
+                // after rendering a typed refusal. Do not turn that already
+                // rendered JOB_NOT_FOUND/GATE_REFUSED into a second INTERNAL
+                // envelope in this marker-validation catch.
+                throw exitCode
             } catch {
                 try await CommandRunner.fail(command: "status", options: options, client: client, error: error)
             }

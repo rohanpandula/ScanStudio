@@ -141,7 +141,6 @@ pub enum ErrorCode {
     /// already contains a project manifest (valid, zero-receipt, or corrupt).
     /// Creating a project must never replace an existing one; the operator
     /// opens the existing project or picks a different directory.
-
     ProjectAlreadyExists,
     ManifestInvalid,
     ArchiveCollision,
@@ -511,6 +510,8 @@ pub struct RollSetSpacingOffsetResult {
 pub struct RollSolveExposureParams {
     pub frame_index: u32,
     pub operation_id: String,
+    #[serde(default)]
+    pub preview_derived_reference: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

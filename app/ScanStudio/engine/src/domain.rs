@@ -235,6 +235,21 @@ pub enum Channels {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct PreviewExposureAdjustment {
+    pub source: String,
+    pub reference_frame_index: u32,
+    pub reference_thumbnail_mean: f64,
+    pub frame_thumbnail_mean: f64,
+    pub requested_positive_ev: f64,
+    pub applied_positive_ev: f64,
+    pub reference_rgb_exposures_raw_10ns: [u32; 3],
+    pub applied_rgb_exposures_raw_10ns: [u32; 3],
+    #[serde(default)]
+    pub device_bound_clamped_channels: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptureRecipe {
     #[serde(default = "default_resolution_dpi")]
     pub resolution_dpi: u32,
@@ -248,6 +263,9 @@ pub struct CaptureRecipe {
     /// Infrared is deliberately absent and remains metered by the scanner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure_override_10ns: Option<[u32; 3]>,
+    /// Present only on an explicit preview-derived per-frame override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_exposure_adjustment: Option<PreviewExposureAdjustment>,
 }
 
 impl Default for CaptureRecipe {
@@ -258,6 +276,7 @@ impl Default for CaptureRecipe {
             multisample_passes: default_multisample_passes(),
             channels: default_channels(),
             exposure_override_10ns: None,
+            preview_exposure_adjustment: None,
         }
     }
 }
@@ -1000,6 +1019,9 @@ pub struct RollExposureLock {
     pub meter_evidence_sha256: String,
     pub journal_path: String,
     pub journal_sha256: String,
+    /// Missing on legacy manifests and ordinary calibration solves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1344,6 +1366,10 @@ pub struct ScanReceipt {
     /// simulated and legacy receipts, or when the journal read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure_authority: Option<ExposureAuthority>,
+    /// Preview heuristic which requested this frame's RGB vector. Hardware
+    /// authority above remains the source for what the scanner accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_exposure_adjustment: Option<PreviewExposureAdjustment>,
 }
 
 /// Result of the non-destructive auto-crop decision for one frame's
@@ -1616,6 +1642,7 @@ mod tests {
             multisample_passes: 2,
             channels: Channels::Rgbi,
             exposure_override_10ns: None,
+            preview_exposure_adjustment: None,
         };
         round_trip(&recipe);
     }
@@ -1897,6 +1924,7 @@ mod tests {
         // round trip exactly, including the nested receipt.
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
             pass_token: None,
@@ -2140,6 +2168,7 @@ mod tests {
     fn scan_receipt_matches_golden_fixture_shape() {
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
             pass_token: None,
@@ -2179,6 +2208,7 @@ mod tests {
         // being silently dropped by `skip_serializing_if`.
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
             pass_token: None,

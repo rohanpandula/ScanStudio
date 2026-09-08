@@ -6872,6 +6872,7 @@ mod tests {
             .expect("bind test outputs");
         project.frames[0].receipts.push(ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-bound-output".into(),
             pass_token: None,

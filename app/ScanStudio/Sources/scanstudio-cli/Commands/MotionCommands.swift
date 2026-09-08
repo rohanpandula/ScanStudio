@@ -565,9 +565,19 @@ enum MotionStartRunner {
                     from: data
                 ).selectedFrames
             }
-            var previousJobId = try await JobWaiter.subscribe(client: client)
+            var preStartSnapshot = try await JobWaiter.subscribeSnapshot(client: client).snapshot
+            let markerContext: ActiveJobMarker.Context?
+            switch try await resolveMarker(command: command, options: options, client: client) {
+            case .none(let context):
+                markerContext = context
+            case .refusal(let response), .active(_, _, let response):
+                try await CommandRunner.finish(
+                    command: command, options: options, client: client, response: response
+                )
+                return
+            }
             var jobs: [[String: Any]] = []
-            for passToken in passTokens {
+            for (passIndex, passToken) in passTokens.enumerated() {
                 try await preflight(command: command, client: client, frames: resolvedFrames, resume: false, options: options)
                 let response = try await CommandRunner.request(
                     command: command,
@@ -591,9 +601,31 @@ enum MotionStartRunner {
                     try await CommandRunner.finish(command: command, options: options, client: client, response: response)
                     return
                 }
+                guard let outcome = try? JSONDecoder().decode(
+                    ControlScanOutcomeResult.self, from: startData
+                ), let jobId = outcome.jobId, let markerContext else {
+                    try await CommandRunner.fail(
+                        command: command, options: options, client: client,
+                        error: ControlChannelClientError.malformedResponse
+                    )
+                }
+                let marker: ActiveJobMarker
+                do {
+                    marker = try ActiveJobMarker.write(
+                        jobId: jobId,
+                        context: markerContext,
+                        correlationToken: await client.lastCorrelationToken(for: command)
+                    )
+                } catch {
+                    try await CommandRunner.fail(
+                        command: command, options: options, client: client, error: error
+                    )
+                }
                 guard let terminal = try await JobWaiter.waitForTerminalOutcome(
                     client: client,
-                    preStartJobId: previousJobId,
+                    preStartJobId: preStartSnapshot.jobId,
+                    targetJobId: jobId,
+                    initialSnapshot: preStartSnapshot,
                     onProgress: onProgress
                 ) else {
                     await client.shutdown()
@@ -618,7 +650,7 @@ enum MotionStartRunner {
                 let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
                 jobs.append(object)
                 let result = try JSONDecoder().decode(ControlJobResult.self, from: data)
-                previousJobId = result.jobId
+                try ActiveJobMarker.retire(marker, from: markerContext)
                 let skippedKeys = Set((result.skippedFrames ?? []).map(String.init))
                 let fatalFrameErrors = result.frameErrorCodes.keys.contains {
                     !skippedKeys.contains($0)
@@ -633,6 +665,11 @@ enum MotionStartRunner {
                     )
                     throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
                 }
+                if passIndex < passTokens.count - 1 {
+                    preStartSnapshot = try await waitForIdleThenRefresh(
+                        command: command, client: client, options: options
+                    )
+                }
             }
             try await renderRepeatedScanResult(
                 frames: resolvedFrames,
@@ -646,6 +683,58 @@ enum MotionStartRunner {
         } catch {
             try await CommandRunner.fail(command: command, options: options, client: client, error: error)
         }
+    }
+
+    private static func waitForIdleThenRefresh(
+        command: String,
+        client: ControlChannelClient,
+        options: GlobalOptions
+    ) async throws -> ControlStatusResult {
+        let subscription = try await JobWaiter.subscribeSnapshot(client: client)
+        do {
+            let idle = try await ControlEventWaiter.wait(
+                initial: subscription.snapshot,
+                events: await client.events(),
+                condition: .idle,
+                timeout: 30
+            )
+            let response = try await CommandRunner.requestWithoutParams(
+                command: command,
+                method: "scanner.refresh",
+                options: options,
+                client: client
+            )
+            guard case .result = response else {
+                try await CommandRunner.finish(
+                    command: command, options: options, client: client, response: response
+                )
+                throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
+            }
+            return idle
+        } catch ControlEventWaitFailure.timeout {
+            await client.shutdown()
+            let payload = ControlErrorPayload(
+                code: ControlCLIErrorCode.waitTimeout.rawValue,
+                message: "\"scan.start\" timed out waiting for the scanner to become idle between repeated passes.",
+                recoverable: false,
+                guidance: "Inspect scanner status and completed pass receipts before starting any remaining pass."
+            )
+            let text = try ControlCLIOutput.renderError(
+                command: command,
+                payload: payload,
+                human: options.human,
+                context: await client.cliEnvelopeContext
+            )
+            print(text, terminator: "")
+            throw ExitCode(ControlCLIExitCode.waitTimedOut.rawValue)
+        } catch ControlEventWaitFailure.hostExited {
+            await client.shutdown()
+            throw ExitCode(ControlCLIExitCode.hostExited.rawValue)
+        } catch ControlEventWaitFailure.streamEnded {
+            await client.shutdown()
+            throw ExitCode(ControlCLIExitCode.hostExited.rawValue)
+        }
+
     }
 
     private static func renderRepeatedScanResult(

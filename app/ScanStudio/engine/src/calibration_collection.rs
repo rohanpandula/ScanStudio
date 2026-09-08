@@ -1028,9 +1028,11 @@ fn validate_rgb_tiff(file: &File, infrared: bool) -> Result<(), String> {
     }
     if infrared
         && decoder
-            .get_tag_u8_vec(tiff::tags::Tag::Unknown(RAW_IR_TAG))
+            .get_tag_ascii_string(tiff::tags::Tag::Unknown(RAW_IR_TAG))
             .map_err(|error| format!("read raw infrared TIFF marker: {error}"))?
-            != RAW_IR_MARKER
+            .trim_end_matches('\0')
+            .as_bytes()
+            != RAW_IR_MARKER.strip_suffix(&[0]).unwrap_or(RAW_IR_MARKER)
     {
         return Err("raw infrared TIFF lacks the uint16 marker contract".into());
     }
@@ -1087,7 +1089,10 @@ mod tests {
                 };
                 image
                     .encoder()
-                    .write_tag(Tag::Unknown(RAW_IR_TAG), marker)
+                    .write_tag(
+                        Tag::Unknown(RAW_IR_TAG),
+                        std::str::from_utf8(marker).unwrap().trim_end_matches('\0'),
+                    )
                     .unwrap();
                 image.write_data(&[0x1234]).unwrap();
             } else {

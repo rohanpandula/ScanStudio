@@ -2036,7 +2036,11 @@ public final class SessionModel {
     /// Measures and durably stores one roll-wide RGB exposure authority
     /// inside the currently held real preview session.
     @discardableResult
-    public func solveExposure(frameIndex: Int) async -> RollExposureLock? {
+    public func solveExposure(
+        frameIndex: Int,
+        previewDerivedReference: Bool = false,
+        previewDerivedFrameIndices: Set<Int>? = nil
+    ) async -> RollExposureLock? {
         guard mutatingOperationInFlight == nil,
               pendingExposureSolve == nil,
               project != nil,
@@ -2048,6 +2052,21 @@ public final class SessionModel {
             lastErrorMessage = hardwareMotionReadiness.allowsMotion
                 ? "Exposure measurement requires an open project and a frame from the completed preview."
                 : hardwareMotionReadiness.guidance
+            return nil
+        }
+        if previewDerivedReference,
+           let previewDerivedFrameIndices,
+           let project,
+           let incompatible = project.frames.first(where: { frame in
+               guard previewDerivedFrameIndices.contains(frame.index),
+                     let override = frame.captureOverride else { return false }
+               return !PreviewDerivedExposurePolicy.hasCompatibleCaptureGeometry(
+                   override,
+                   with: captureRecipe
+               )
+           }) {
+            lastErrorMessage =
+                "Preview-derived exposure requires frame \(incompatible.index) to use the roll's capture geometry."
             return nil
         }
         let operationId = UUID().uuidString.lowercased()
@@ -2069,7 +2088,8 @@ public final class SessionModel {
                         "roll.solveExposure",
                         params: RollSolveExposureParams(
                             frameIndex: frameIndex,
-                            operationId: operationId
+                            operationId: operationId,
+                            previewDerivedReference: previewDerivedReference
                         )
                     )
                     if !ack.accepted {
@@ -2080,6 +2100,41 @@ public final class SessionModel {
                     self.finishExposureSolve(marker, result: nil, message: Self.describe(error))
                 }
             }
+        }
+    }
+
+    public func applyPreviewDerivedExposure(
+        _ evidence: [PreviewDerivedExposurePolicy.Evidence],
+        reference: RollExposureLock
+    ) async -> Bool {
+        guard reference.source == "previewDerivedReference" else {
+            lastErrorMessage = "An explicit calibration exposure lock takes precedence over preview-derived exposure."
+            return false
+        }
+        do {
+            let adjustments = try PreviewDerivedExposurePolicy.adjustments(
+                evidence: evidence,
+                referenceFrameIndex: reference.slot,
+                referenceRGBRaw10ns: reference.rgbExposuresRaw10ns
+            )
+            for frameIndex in adjustments.keys.sorted() {
+                guard let adjustment = adjustments[frameIndex] else { continue }
+                let base = project?.frames.first(where: { $0.index == frameIndex })?.captureOverride
+                    ?? captureRecipe
+                await setFrameCaptureOverride(frameIndex, to: CaptureRecipe(
+                    resolutionDpi: base.resolutionDpi,
+                    bitDepth: base.bitDepth,
+                    multisamplePasses: base.multisamplePasses,
+                    channels: base.channels,
+                    exposureOverride10ns: adjustment.appliedRgbExposuresRaw10ns,
+                    previewExposureAdjustment: adjustment
+                ))
+                guard lastErrorMessage == nil else { return false }
+            }
+            return true
+        } catch {
+            lastErrorMessage = "Preview-derived exposure was refused: \(error)."
+            return false
         }
     }
 

@@ -90,6 +90,9 @@ extension Roll {
         @Flag(name: .customLong("auto-approve"), help: "Auto-approve a paused manual review when every flagged frame's content confidence is >= 0.8.")
         var autoApprove = false
 
+        @Flag(name: .customLong("preview-derived-exposure"), help: "Meter one preview reference and apply a clamped positive-only RGB adjustment per frame. Experimental and off by default.")
+        var previewDerivedExposure = false
+
         /// On by default -- `--no-wait` returns immediately once the scan
         /// starts (or once a review is left pending) instead of blocking
         /// for a terminal job state.
@@ -140,6 +143,7 @@ extension Roll {
                     filmProcess: filmProcess,
                     skipBlank: skipBlank,
                     autoApprove: autoApprove,
+                    previewDerivedExposure: previewDerivedExposure,
                     wait: wait,
                     allowUnverifiedHardware: allowUnverifiedHardware,
                     options: options
@@ -153,6 +157,7 @@ extension Roll {
                 filmProcess: filmProcess,
                 skipBlank: skipBlank,
                 autoApprove: autoApprove,
+                previewDerivedExposure: previewDerivedExposure,
                 allowUnverifiedHardware: allowUnverifiedHardware,
                 options: options
             )
@@ -173,6 +178,7 @@ enum RollRun {
         filmProcess: FilmProcess,
         skipBlank: Bool,
         autoApprove: Bool,
+        previewDerivedExposure: Bool = false,
         wait: Bool,
         allowUnverifiedHardware: Bool,
         options: GlobalOptions,
@@ -213,6 +219,7 @@ enum RollRun {
         try await walk(
             name: name, carrier: carrier, requestedFrameCount: requestedFrameCount,
             filmProcess: filmProcess, skipBlank: skipBlank, autoApprove: autoApprove, wait: wait,
+            previewDerivedExposure: previewDerivedExposure,
             allowUnverifiedHardware: allowUnverifiedHardware, job: job,
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
         )
@@ -230,6 +237,7 @@ enum RollRun {
         skipBlank: Bool,
         autoApprove: Bool,
         wait: Bool,
+        previewDerivedExposure: Bool,
         allowUnverifiedHardware: Bool,
         job: ScanJobDocument?,
         command: String,
@@ -410,10 +418,55 @@ enum RollRun {
         receipt.frames.selected = selected
         receipt.frames.skipped = skippedSummaries.map(\.index)
 
+        let previewExposure: (reference: Int, evidence: [PreviewDerivedExposurePolicy.Evidence])?
+        if previewDerivedExposure {
+            let evidence = framesList.frames.filter { selected.contains($0.index) }.map {
+                PreviewDerivedExposurePolicy.Evidence(
+                    frameIndex: $0.index,
+                    thumbnailMean: $0.thumbnailMean,
+                    thumbnailStddev: $0.thumbnailStddev,
+                    blankConfidence: $0.blankConfidence,
+                    needsApproval: $0.needsApproval
+                )
+            }
+            do {
+                previewExposure = (try PreviewDerivedExposurePolicy.referenceFrame(in: evidence), evidence)
+            } catch {
+                let payload = ControlErrorPayload(
+                    .gateRefused,
+                    message: "Preview-derived exposure was refused: \(error)."
+                )
+                exitCode = recordRefusal(payload, step: "previewExposure", command: "frames.list", startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt)
+                return
+            }
+            guard let settingsData = try await sendStep(
+                "exposureSettings", method: "settings.get", params: EmptyParams(),
+                command: command, options: options, client: client,
+                receipt: &receipt, exitCode: &exitCode
+            ) else { return }
+            let settings = try JSONDecoder().decode(ControlSettingsResult.self, from: settingsData)
+            let processing = ProcessingRecipe(
+                filmProcess: settings.processing.filmProcess,
+                autofocusEachFrame: settings.processing.autofocusEachFrame,
+                autoExposureEachFrame: false,
+                digitalIceEnabled: settings.processing.digitalIceEnabled,
+                digitalIceMode: settings.processing.digitalIceMode,
+                softwareDustRemovalBw: settings.processing.softwareDustRemovalBw
+            )
+            guard try await sendStep(
+                "exposureSettingsApply", method: "settings.set",
+                params: ControlSettingsSetParams(capture: settings.capture, processing: processing),
+                command: command, options: options, client: client,
+                receipt: &receipt, exitCode: &exitCode
+            ) != nil else { return }
+        } else {
+            previewExposure = nil
+        }
+
         // Step 5: roll.save.
         guard let saveData = try await sendStep(
             "rollSave", method: "roll.save",
-            params: ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: job == nil, startScan: job == nil),
+            params: ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: job == nil, startScan: job == nil && previewExposure == nil),
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
         ) else { return }
         guard let saveResult = try? JSONDecoder().decode(ControlRollSaveResult.self, from: saveData) else {
@@ -423,21 +476,35 @@ enum RollRun {
 
         var scanOutcome = saveResult.outcome
         var activeMarker: (ActiveJobMarker, ActiveJobMarker.Context)?
-        if let job {
+        if job != nil || previewExposure != nil {
             guard let directory = saveResult.projectDirectory else {
                 try await CommandRunner.fail(
                     command: command, options: options, client: client,
                     error: ControlChannelClientError.malformedResponse
                 )
             }
-            let path = URL(fileURLWithPath: directory).appendingPathComponent("approved-job-" + UUID().uuidString + ".json")
-            do {
-                try job.normalizedJSON().write(to: path, options: .withoutOverwriting)
-                receipt.approvedJobPath = path.path
-            } catch { try await CommandRunner.fail(command: command, options: options, client: client, error: error) }
-            guard try await sendStep("outputs", method: "outputs.set", params: ControlOutputsSetParams(outputs: job.outputs),
-                                    command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) != nil,
-                  let gateData = try await sendStep("preflight", method: "scan.preflight", params: ControlScanPreflightParams(frames: selected),
+            if let job {
+                let path = URL(fileURLWithPath: directory).appendingPathComponent("approved-job-" + UUID().uuidString + ".json")
+                do {
+                    try job.normalizedJSON().write(to: path, options: .withoutOverwriting)
+                    receipt.approvedJobPath = path.path
+                } catch { try await CommandRunner.fail(command: command, options: options, client: client, error: error) }
+                guard try await sendStep("outputs", method: "outputs.set", params: ControlOutputsSetParams(outputs: job.outputs),
+                                        command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) != nil else { return }
+            }
+            if let previewExposure {
+                guard try await sendStep(
+                    "previewExposureSolve", method: "roll.solveExposure",
+                    params: ControlRollSolveExposureParams(
+                        frame: previewExposure.reference,
+                        motionConfirmed: true,
+                        previewDerivedFrames: previewExposure.evidence
+                    ),
+                    command: command, options: options, client: client,
+                    receipt: &receipt, exitCode: &exitCode
+                ) != nil else { return }
+            }
+            guard let gateData = try await sendStep("preflight", method: "scan.preflight", params: ControlScanPreflightParams(frames: selected),
                                                    command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) else { return }
             let gates = try JSONDecoder().decode(ScanPreflightReport.self, from: gateData)
             guard gates.ready else {
@@ -714,6 +781,7 @@ enum HopperRun {
         filmProcess: FilmProcess,
         skipBlank: Bool,
         autoApprove: Bool,
+        previewDerivedExposure: Bool,
         allowUnverifiedHardware: Bool,
         options: GlobalOptions
     ) async throws {
@@ -728,6 +796,7 @@ enum HopperRun {
                 filmProcess: filmProcess,
                 skipBlank: skipBlank,
                 autoApprove: autoApprove,
+                previewDerivedExposure: previewDerivedExposure,
                 wait: true,
                 allowUnverifiedHardware: allowUnverifiedHardware,
                 options: rollOptions

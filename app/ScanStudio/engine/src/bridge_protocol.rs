@@ -676,6 +676,8 @@ pub struct BridgeScanStartParams {
     pub output: BridgeOutputSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_meter_refusal_slots: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_exposure_overrides_10ns: Option<std::collections::HashMap<u32, [u32; 3]>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1236,7 +1238,12 @@ mod tests {
         assert_eq!(value["count"], json!(2));
         assert_eq!(value["fingerprint"], json!("stub-manual-fp"));
         assert_eq!(
-            value["thumbnails"].as_array().unwrap().iter().map(|t| t["slot"].clone()).collect::<Vec<_>>(),
+            value["thumbnails"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["slot"].clone())
+                .collect::<Vec<_>>(),
             vec![json!(1), json!(2)]
         );
         assert_eq!(value["thumbnails"][0]["boundaryRows"], json!([100, 300]));

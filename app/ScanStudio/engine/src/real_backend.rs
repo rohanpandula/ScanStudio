@@ -3608,14 +3608,32 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<ScannerStatus, EngineError> {
+        let preview_reader_owns_events = {
+            let state = self.preview_approval_state.lock().unwrap();
+            state.active.as_ref().is_some_and(|active| {
+                active.session_epoch == session_epoch
+                    && active.bridge_generation == bridge_generation
+            }) || state.poisoned.as_ref().is_some_and(|poisoned| {
+                poisoned.session_epoch == session_epoch
+                    && poisoned.bridge_generation == bridge_generation
+                    && !poisoned.terminal_drained
+            })
+        };
         self.fresh_status_for_session_with_options(
             session_epoch,
             bridge_generation,
-            SessionCallOptions {
-                // A held child's TEST UNIT READY may use the same bounded
-                // startup-attention settle loop as the pre-preview probe.
-                deadline: Some(PREVIEW_FILM_PROBE_DEADLINE),
-                ..SessionCallOptions::default()
+            if preview_reader_owns_events {
+                // A concurrent status read must not outlive the preview
+                // reader that gates reconnect. Keep the normal control-plane
+                // bound while that exact stream is active.
+                SessionCallOptions::default()
+            } else {
+                SessionCallOptions {
+                    // A held child's TEST UNIT READY may use the same bounded
+                    // startup-attention settle loop as the pre-preview probe.
+                    deadline: Some(PREVIEW_FILM_PROBE_DEADLINE),
+                    ..SessionCallOptions::default()
+                }
             },
         )
     }
@@ -3623,7 +3641,9 @@ impl RealLs5000 {
     /// `fresh_status_for_session` with a caller-supplied call bound. The
     /// pre-preview film probe passes [`PREVIEW_FILM_PROBE_DEADLINE`] because
     /// its status read can legitimately wait on the driver's settle loop;
-    /// ordinary status reads use that same bound via the wrapper above.
+    /// ordinary status reads use that same bound after preview; status while
+    /// an active preview owns the event stream keeps the generic control bound
+    /// so its failure cannot outlive and silently release the reader gate.
     fn fresh_status_for_session_with_options(
         &self,
         session_epoch: u64,
@@ -3865,6 +3885,7 @@ impl RealLs5000 {
         backend: &Arc<Self>,
         frame_index: u32,
         operation_id: String,
+        preview_derived_reference: bool,
         project_directory: std::fs::File,
         project_display_path: std::path::PathBuf,
         event_tx: mpsc::Sender<String>,
@@ -3984,7 +4005,11 @@ impl RealLs5000 {
                                     serde_json::from_value::<crate::bridge_protocol::BridgeExposureSolvedPayload>(payload)
                                         .map_err(|error| EngineError::new(ErrorCode::Internal, format!("malformed roll.exposureSolved payload: {error}")))
                                 })
-                                .and_then(|payload| validate_exposure_solution(payload.solution, frame_index))
+                                .and_then(|payload| validate_exposure_solution(
+                                    payload.solution,
+                                    frame_index,
+                                    preview_derived_reference,
+                                ))
                                 .and_then(|solution| {
                                     if !backend.session_identity_is_current(
                                         session_epoch,
@@ -5121,6 +5146,7 @@ fn prepare_real_scan_start(
 fn validate_exposure_solution(
     solution: crate::bridge_protocol::BridgeExposureSolution,
     expected_slot: u32,
+    preview_derived_reference: bool,
 ) -> Result<domain::RollExposureLock, EngineError> {
     let valid_digest = |value: &str| {
         value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -5149,6 +5175,7 @@ fn validate_exposure_solution(
         meter_evidence_sha256: solution.meter_evidence_sha256,
         journal_path: solution.journal_path,
         journal_sha256: solution.journal_sha256,
+        source: preview_derived_reference.then(|| "previewDerivedReference".to_string()),
     })
 }
 
@@ -5288,6 +5315,7 @@ fn dispatch_real_scan_with_output_authorities(
         allowed_meter_refusal_slots.clone(),
         &recipe,
         &processing,
+        preview_exposure_overrides(&frames, &overrides),
         capture_plan.bridge_output.clone(),
     );
     let params_value = serde_json::to_value(&bridge_params)
@@ -5750,6 +5778,7 @@ fn build_scan_start_params(
         vec![],
         recipe,
         processing,
+        None,
         BridgeOutputSpec {
             destination: output.archive.destination.clone(),
             filename_template: bridge_archive_template(&output.archive.filename_template),
@@ -5765,12 +5794,14 @@ fn build_scan_start_params_with_bridge_output(
     allowed_meter_refusal_slots: Vec<u32>,
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
+    frame_exposure_overrides_10ns: Option<std::collections::HashMap<u32, [u32; 3]>>,
     bridge_output: BridgeOutputSpec,
 ) -> BridgeScanStartParams {
     BridgeScanStartParams {
         job_id,
         slots,
         allowed_meter_refusal_slots,
+        frame_exposure_overrides_10ns,
         recipe: BridgeCaptureRecipe {
             resolution_dpi: recipe.resolution_dpi,
             bit_depth: recipe.bit_depth,
@@ -5786,6 +5817,20 @@ fn build_scan_start_params_with_bridge_output(
         // derivatives remain engine-rendered and have no bridge equivalent.
         output: bridge_output,
     }
+}
+
+fn preview_exposure_overrides(
+    slots: &[u32],
+    overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
+) -> Option<std::collections::HashMap<u32, [u32; 3]>> {
+    slots
+        .iter()
+        .map(|slot| {
+            let capture = overrides.get(slot)?.capture.as_ref()?;
+            capture.preview_exposure_adjustment.as_ref()?;
+            Some((*slot, capture.exposure_override_10ns?))
+        })
+        .collect()
 }
 
 fn generate_scan_operation_token() -> Result<String, EngineError> {
@@ -6177,6 +6222,7 @@ fn build_real_receipt(
             .exposure_authority
             .as_ref()
             .map(map_exposure_authority),
+        preview_exposure_adjustment: recipe.preview_exposure_adjustment.clone(),
         auto_crop: None,
         job_id: job_id.to_string(),
         pass_token: pass_token.map(str::to_string),
@@ -8017,6 +8063,9 @@ fn run_real_scan_job_inner(
                             .and_then(|value| value.processing.as_ref())
                             .unwrap_or(&processing)
                             .effective();
+                        let effective_recipe = frame_overrides
+                            .and_then(|value| value.capture.as_ref())
+                            .unwrap_or(&recipe);
                         let effective_alignment =
                             frame_overrides.and_then(|value| value.alignment.as_ref());
                         // The bridge already applies an approved spacing
@@ -8144,7 +8193,7 @@ fn run_real_scan_job_inner(
                             &job_id,
                             pass_token.as_deref(),
                             frame_completed.slot,
-                            &recipe,
+                            effective_recipe,
                             &effective_processing,
                             effective_output,
                             &frame_completed.receipt,
@@ -10354,6 +10403,37 @@ mod tests {
         let params = build_scan_start_params(vec![7], &recipe, &processing, &output, None);
 
         assert_eq!(params.output.filename_template, "ScanStudio#.tif");
+    }
+
+    #[test]
+    fn preview_exposure_map_uses_each_frames_applied_rgb_vector() {
+        let adjustment = |frame, ticks| domain::CaptureRecipe {
+            exposure_override_10ns: Some(ticks),
+            preview_exposure_adjustment: Some(domain::PreviewExposureAdjustment {
+                source: "previewThumbnailMean".into(),
+                reference_frame_index: 1,
+                reference_thumbnail_mean: 100.0,
+                frame_thumbnail_mean: if frame == 1 { 100.0 } else { 50.0 },
+                requested_positive_ev: if frame == 1 { 0.0 } else { 1.0 },
+                applied_positive_ev: if frame == 1 { 0.0 } else { 1.0 },
+                reference_rgb_exposures_raw_10ns: [100_000, 110_000, 120_000],
+                applied_rgb_exposures_raw_10ns: ticks,
+                device_bound_clamped_channels: vec![],
+            }),
+            ..CaptureRecipe::default()
+        };
+        let overrides = std::collections::HashMap::from([
+            (1, domain::FrameOverrides { capture: Some(adjustment(1, [100_000, 110_000, 120_000])), ..Default::default() }),
+            (2, domain::FrameOverrides { capture: Some(adjustment(2, [200_000, 220_000, 240_000])), ..Default::default() }),
+        ]);
+
+        assert_eq!(
+            preview_exposure_overrides(&[1, 2], &overrides),
+            Some(std::collections::HashMap::from([
+                (1, [100_000, 110_000, 120_000]),
+                (2, [200_000, 220_000, 240_000]),
+            ]))
+        );
     }
 
     #[test]

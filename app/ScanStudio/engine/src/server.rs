@@ -660,6 +660,7 @@ impl Backends {
         &self,
         frame_index: u32,
         operation_id: String,
+        preview_derived_reference: bool,
         project_root: &crate::render::ProjectOutputRootAuthority,
         event_tx: mpsc::Sender<String>,
     ) -> Result<(), EngineError> {
@@ -668,6 +669,7 @@ impl Backends {
                 self.real.as_ref().unwrap(),
                 frame_index,
                 operation_id,
+                preview_derived_reference,
                 project_root
                     .directory_handle()
                     .try_clone()
@@ -875,6 +877,17 @@ fn apply_roll_exposure_authority(
         return Ok(());
     }
     match project.roll_exposure_lock.as_ref() {
+        Some(exposure_lock)
+            if exposure_lock.source.as_deref() == Some("previewDerivedReference") =>
+        {
+            if recipe.exposure_override_10ns.is_some() {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "a preview-derived roll exposure uses per-frame overrides, not a roll-wide exposureOverride10ns",
+                ));
+            }
+            Ok(())
+        }
         Some(exposure_lock) => {
             if recipe
                 .exposure_override_10ns
@@ -894,6 +907,63 @@ fn apply_roll_exposure_authority(
         )),
         None => Ok(()),
     }
+}
+
+fn validate_preview_exposure_adjustment(
+    frame_index: u32,
+    capture: &domain::CaptureRecipe,
+    base: &domain::CaptureRecipe,
+    exposure_lock: &domain::RollExposureLock,
+) -> Result<(), EngineError> {
+    let adjustment = capture.preview_exposure_adjustment.as_ref().ok_or_else(|| {
+        EngineError::new(
+            ErrorCode::InvalidParams,
+            format!("frame {frame_index} is missing preview-derived exposure provenance"),
+        )
+    })?;
+    let expected_requested_ev = (adjustment.reference_thumbnail_mean
+        / adjustment.frame_thumbnail_mean)
+        .log2()
+        .max(0.0);
+    let expected_applied_ev = expected_requested_ev.min(1.0);
+    let channels = ["R", "G", "B"];
+    let mut expected_clamped_channels = Vec::new();
+    let expected_ticks = std::array::from_fn(|index| {
+        let requested = (exposure_lock.rgb_exposures_raw_10ns[index] as f64
+            * 2f64.powf(expected_applied_ev))
+        .round() as u32;
+        let applied = requested.clamp(50_000, 400_000);
+        if applied != requested {
+            expected_clamped_channels.push(channels[index].to_string());
+        }
+        applied
+    });
+    let valid = adjustment.source == "previewThumbnailMean"
+        && capture.resolution_dpi == base.resolution_dpi
+        && capture.bit_depth == base.bit_depth
+        && capture.multisample_passes == base.multisample_passes
+        && capture.channels == base.channels
+        && adjustment.reference_frame_index == exposure_lock.slot
+        && adjustment.reference_rgb_exposures_raw_10ns == exposure_lock.rgb_exposures_raw_10ns
+        && adjustment.reference_thumbnail_mean.is_finite()
+        && adjustment.reference_thumbnail_mean > 0.0
+        && adjustment.reference_thumbnail_mean <= 255.0
+        && adjustment.frame_thumbnail_mean.is_finite()
+        && adjustment.frame_thumbnail_mean > 0.0
+        && adjustment.frame_thumbnail_mean <= 255.0
+        && adjustment.requested_positive_ev.is_finite()
+        && (adjustment.requested_positive_ev - expected_requested_ev).abs() <= 1e-9
+        && (adjustment.applied_positive_ev - expected_applied_ev).abs() <= 1e-9
+        && adjustment.applied_rgb_exposures_raw_10ns == expected_ticks
+        && adjustment.device_bound_clamped_channels == expected_clamped_channels
+        && capture.exposure_override_10ns == Some(expected_ticks);
+    if !valid {
+        return Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            format!("frame {frame_index} has invalid preview-derived exposure provenance"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1509,6 +1579,12 @@ fn handle_request_with_correlation(
                 project_root.directory_handle(),
                 project_root.canonical_path(),
             )?;
+            if params.preview_derived_reference && project.roll_exposure_lock.is_some() {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "an explicit or previously measured roll exposure lock already exists",
+                ));
+            }
             if !project
                 .frames
                 .iter()
@@ -1526,6 +1602,7 @@ fn handle_request_with_correlation(
             backends.roll_solve_exposure(
                 params.frame_index,
                 params.operation_id,
+                params.preview_derived_reference,
                 &project_root,
                 tx.clone(),
             )?;
@@ -1640,6 +1717,12 @@ fn handle_request_with_correlation(
                 params.processing.film_process = project.film_process;
                 params.processing = params.processing.effective();
                 apply_roll_exposure_authority(project, &mut params.recipe, &params.processing)?;
+                if params.recipe.preview_exposure_adjustment.is_some() {
+                    return Err(EngineError::new(
+                        ErrorCode::InvalidParams,
+                        "preview-derived exposure provenance is permitted only on project frame overrides",
+                    ));
+                }
                 for &requested in &params.frames {
                     if let Some(frame) = project.frames.iter().find(|f| f.index == requested) {
                         if frame.excluded {
@@ -1658,20 +1741,45 @@ fn handle_request_with_correlation(
                                 ));
                             }
                         }
-                        if let Some(override_capture) = &frame.capture_override {
-                            if override_capture.exposure_override_10ns
-                                != params.recipe.exposure_override_10ns
-                            {
+                        let preview_lock = project.roll_exposure_lock.as_ref().filter(|lock| {
+                            lock.source.as_deref() == Some("previewDerivedReference")
+                        });
+                        let mut capture_override = frame.capture_override.clone();
+                        match (preview_lock, capture_override.as_ref()) {
+                            (Some(_), _) if params.processing.auto_exposure_each_frame => {
+                                // Turning ordinary per-frame metering back on disables
+                                // the stored heuristic without erasing its audit trail.
+                                capture_override = None;
+                            }
+                            (Some(lock), Some(capture)) if !params.processing.auto_exposure_each_frame => {
+                                validate_preview_exposure_adjustment(
+                                    requested,
+                                    capture,
+                                    &params.recipe,
+                                    lock,
+                                )?;
+                            }
+                            (Some(_), _) => {
+                                return Err(EngineError::new(
+                                    ErrorCode::InvalidParams,
+                                    format!("frame {requested} requires a complete preview-derived exposure override with autoExposureEachFrame=false"),
+                                ));
+                            }
+                            (None, Some(capture)) if capture.preview_exposure_adjustment.is_some() => {
+                                capture_override = None;
+                            }
+                            (None, Some(capture)) if capture.exposure_override_10ns != params.recipe.exposure_override_10ns => {
                                 return Err(EngineError::new(
                                     ErrorCode::InvalidParams,
                                     format!("frame {requested} exposure override conflicts with the roll-wide exposure authority"),
                                 ));
                             }
+                            _ => {}
                         }
                         if let Some(alignment) = frame.alignment.as_ref() {
                             validate_derivative_transform(alignment.derivative_transform)?;
                         }
-                        if frame.capture_override.is_some()
+                        if capture_override.is_some()
                             || frame.processing_override.is_some()
                             || frame.output_override.is_some()
                             || frame.alignment.is_some()
@@ -1679,7 +1787,7 @@ fn handle_request_with_correlation(
                             overrides.insert(
                                 requested,
                                 domain::FrameOverrides {
-                                    capture: frame.capture_override.clone(),
+                                    capture: capture_override,
                                     processing: frame.processing_override.clone(),
                                     output: frame.output_override.clone(),
                                     alignment: frame.alignment.clone(),
@@ -2162,6 +2270,7 @@ fn handle_request_with_correlation(
                     _ => domain::CaptureRecipe::default().channels,
                 },
                 exposure_override_10ns: None,
+                preview_exposure_adjustment: None,
             });
             let mut effective_processing = frame
                 .processing_override
@@ -3002,6 +3111,7 @@ mod tests {
             meter_evidence_sha256: "a".repeat(64),
             journal_path: "/tmp/journal.json".into(),
             journal_sha256: "b".repeat(64),
+            source: None,
         });
         let ae_off = domain::ProcessingRecipe {
             auto_exposure_each_frame: false,
@@ -3029,6 +3139,40 @@ mod tests {
             "AE must not clear the durable lock"
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preview_exposure_requires_complete_provenance_and_leaves_ir_metered() {
+        let lock = domain::RollExposureLock {
+            slot: 1,
+            rgb_exposures_raw_10ns: [200_000, 210_000, 220_000],
+            ir_metered_exposure_raw_10ns: 230_000,
+            meter_evidence_path: "/tmp/meter.tif".into(),
+            meter_evidence_sha256: "a".repeat(64),
+            journal_path: "/tmp/journal.json".into(),
+            journal_sha256: "b".repeat(64),
+            source: Some("previewDerivedReference".into()),
+        };
+        let mut recipe = domain::CaptureRecipe {
+            exposure_override_10ns: Some([400_000, 400_000, 400_000]),
+            preview_exposure_adjustment: Some(domain::PreviewExposureAdjustment {
+                source: "previewThumbnailMean".into(),
+                reference_frame_index: 1,
+                reference_thumbnail_mean: 100.0,
+                frame_thumbnail_mean: 50.0,
+                requested_positive_ev: 1.0,
+                applied_positive_ev: 1.0,
+                reference_rgb_exposures_raw_10ns: lock.rgb_exposures_raw_10ns,
+                applied_rgb_exposures_raw_10ns: [400_000, 400_000, 400_000],
+                device_bound_clamped_channels: vec!["G".into(), "B".into()],
+            }),
+            ..domain::CaptureRecipe::default()
+        };
+
+        validate_preview_exposure_adjustment(2, &recipe, &domain::CaptureRecipe::default(), &lock).unwrap();
+        recipe.preview_exposure_adjustment = None;
+        assert!(validate_preview_exposure_adjustment(2, &recipe, &domain::CaptureRecipe::default(), &lock).is_err());
+        assert_eq!(lock.ir_metered_exposure_raw_10ns, 230_000);
     }
 
     #[test]
@@ -4274,6 +4418,7 @@ mod tests {
     ) -> domain::ScanReceipt {
         domain::ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-smear-1".into(),
             pass_token: None,
@@ -4434,6 +4579,7 @@ mod tests {
     ) -> domain::ScanReceipt {
         domain::ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-real-1".into(),
             pass_token: None,
@@ -4939,6 +5085,7 @@ mod tests {
 
         let completed_receipt = domain::ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-resume-1".into(),
             pass_token: None,
@@ -5012,6 +5159,7 @@ mod tests {
     fn sample_receipt(job_id: &str, frame_index: u32) -> domain::ScanReceipt {
         domain::ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: job_id.into(),
             pass_token: None,

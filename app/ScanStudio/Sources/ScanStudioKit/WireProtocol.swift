@@ -717,10 +717,12 @@ public struct RollSetSpacingOffsetResult: Decodable, Sendable {
 public struct RollSolveExposureParams: Codable, Sendable {
     public let frameIndex: Int
     public let operationId: String
+    public let previewDerivedReference: Bool?
 
-    public init(frameIndex: Int, operationId: String) {
+    public init(frameIndex: Int, operationId: String, previewDerivedReference: Bool = false) {
         self.frameIndex = frameIndex
         self.operationId = operationId
+        self.previewDerivedReference = previewDerivedReference
     }
 }
 
@@ -848,19 +850,55 @@ public struct PreviewStripResult: Decodable, Sendable {
 
 // MARK: - scan.start / scan.stop / scan.skipCurrentFrame
 
+public struct PreviewExposureAdjustment: Codable, Equatable, Sendable {
+    public let source: String
+    public let referenceFrameIndex: Int
+    public let referenceThumbnailMean: Double
+    public let frameThumbnailMean: Double
+    public let requestedPositiveEv: Double
+    public let appliedPositiveEv: Double
+    public let referenceRgbExposuresRaw10ns: [Int]
+    public let appliedRgbExposuresRaw10ns: [Int]
+    public let deviceBoundClampedChannels: [String]
+
+    public init(
+        source: String = "previewThumbnailMean",
+        referenceFrameIndex: Int,
+        referenceThumbnailMean: Double,
+        frameThumbnailMean: Double,
+        requestedPositiveEv: Double,
+        appliedPositiveEv: Double,
+        referenceRgbExposuresRaw10ns: [Int],
+        appliedRgbExposuresRaw10ns: [Int],
+        deviceBoundClampedChannels: [String] = []
+    ) {
+        self.source = source
+        self.referenceFrameIndex = referenceFrameIndex
+        self.referenceThumbnailMean = referenceThumbnailMean
+        self.frameThumbnailMean = frameThumbnailMean
+        self.requestedPositiveEv = requestedPositiveEv
+        self.appliedPositiveEv = appliedPositiveEv
+        self.referenceRgbExposuresRaw10ns = referenceRgbExposuresRaw10ns
+        self.appliedRgbExposuresRaw10ns = appliedRgbExposuresRaw10ns
+        self.deviceBoundClampedChannels = deviceBoundClampedChannels
+    }
+}
+
 public struct CaptureRecipe: Codable, Equatable, Sendable {
     public let resolutionDpi: Int
     public let bitDepth: Int
     public let multisamplePasses: Int
     public let channels: String
     public let exposureOverride10ns: [Int]?
+    public let previewExposureAdjustment: PreviewExposureAdjustment?
 
-    public init(resolutionDpi: Int, bitDepth: Int, multisamplePasses: Int, channels: String, exposureOverride10ns: [Int]? = nil) {
+    public init(resolutionDpi: Int, bitDepth: Int, multisamplePasses: Int, channels: String, exposureOverride10ns: [Int]? = nil, previewExposureAdjustment: PreviewExposureAdjustment? = nil) {
         self.resolutionDpi = resolutionDpi
         self.bitDepth = bitDepth
         self.multisamplePasses = multisamplePasses
         self.channels = channels
         self.exposureOverride10ns = exposureOverride10ns
+        self.previewExposureAdjustment = previewExposureAdjustment
     }
 }
 
@@ -1457,6 +1495,7 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
     public let hardwareTelemetry: HardwareTelemetry?
     public let deviceModel: String?
     public let hardwareVerification: String?
+    public let previewExposureAdjustment: PreviewExposureAdjustment?
 
     public init(
         jobId: String, passToken: String? = nil, frameIndex: Int, startedAt: String, durationMs: Int, passes: Int,
@@ -1464,7 +1503,8 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
         deviceId: String, simulated: Bool, settingsFingerprint: String,
         processing: ProcessingRecipe?, output: OutputRecipe?, outputs: WrittenOutputs?,
         rgbPath: String?, irPath: String?, meterRgbiPath: String?, hardwareTelemetry: HardwareTelemetry?,
-        deviceModel: String? = nil, hardwareVerification: String? = nil
+        deviceModel: String? = nil, hardwareVerification: String? = nil,
+        previewExposureAdjustment: PreviewExposureAdjustment? = nil
     ) {
         self.jobId = jobId; self.passToken = passToken; self.frameIndex = frameIndex; self.startedAt = startedAt
         self.durationMs = durationMs; self.passes = passes; self.resolutionDpi = resolutionDpi
@@ -1474,6 +1514,7 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
         self.rgbPath = rgbPath; self.irPath = irPath; self.meterRgbiPath = meterRgbiPath
         self.hardwareTelemetry = hardwareTelemetry; self.deviceModel = deviceModel
         self.hardwareVerification = hardwareVerification
+        self.previewExposureAdjustment = previewExposureAdjustment
     }
 
     public var id: String { "\(jobId)#\(frameIndex)@\(startedAt)" }
@@ -1754,6 +1795,27 @@ public struct RollExposureLock: Codable, Equatable, Sendable {
     public let meterEvidenceSha256: String
     public let journalPath: String
     public let journalSha256: String
+    public let source: String?
+
+    public init(
+        slot: Int,
+        rgbExposuresRaw10ns: [Int],
+        irMeteredExposureRaw10ns: Int,
+        meterEvidencePath: String,
+        meterEvidenceSha256: String,
+        journalPath: String,
+        journalSha256: String,
+        source: String? = nil
+    ) {
+        self.slot = slot
+        self.rgbExposuresRaw10ns = rgbExposuresRaw10ns
+        self.irMeteredExposureRaw10ns = irMeteredExposureRaw10ns
+        self.meterEvidencePath = meterEvidencePath
+        self.meterEvidenceSha256 = meterEvidenceSha256
+        self.journalPath = journalPath
+        self.journalSha256 = journalSha256
+        self.source = source
+    }
 }
 
 /// Lightweight listing shape for `project.list` — everything in

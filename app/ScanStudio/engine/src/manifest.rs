@@ -1517,6 +1517,7 @@ mod tests {
             meter_evidence_sha256: "a".repeat(64),
             journal_path: "/tmp/journal.json".into(),
             journal_sha256: "b".repeat(64),
+            source: None,
         };
         persist_roll_exposure_lock_at(&authority, &directory, exposure_lock.clone()).unwrap();
 
@@ -1900,6 +1901,7 @@ mod tests {
             1,
             &ScanReceipt {
                 exposure_authority: None,
+            preview_exposure_adjustment: None,
                 auto_crop: None,
                 job_id: "job-issue99".into(),
                 pass_token: None,
@@ -2183,6 +2185,7 @@ mod tests {
         let dir = temp_project_dir();
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
             pass_token: None,
@@ -2705,6 +2708,7 @@ mod tests {
     fn sample_receipt(job_id: &str, frame_index: u32) -> ScanReceipt {
         ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: job_id.into(),
             pass_token: None,

@@ -2081,6 +2081,7 @@ def load_validated_batch_job(
     expected_plan_sha256: str,
     expected_continuation_sha256: str,
     frame_directory_prefix: str = "frame",
+    expected_frame_directory_suffix: str | None = None,
 ) -> LiveBatchJob:
     """Load an exact path-confined parent/child batch handshake contract."""
 
@@ -2215,6 +2216,13 @@ def load_validated_batch_job(
         )
     ):
         raise ProtocolError("batch job session_id is not filesystem-safe")
+    if (
+        expected_frame_directory_suffix is not None
+        and expected_frame_directory_suffix != session_id
+    ):
+        raise ProtocolError(
+            "batch frame directory suffix does not match the expected held session"
+        )
     try:
         reviewed_fingerprint = ReviewedRollFingerprint.from_payload(
             payload.get("reviewed_roll_fingerprint")
@@ -2320,6 +2328,8 @@ def load_validated_batch_job(
         ):
             raise ProtocolError("batch frame directory prefix is invalid")
         expected_directory = f"{frame_directory_prefix}-{slot:03d}"
+        if expected_frame_directory_suffix is not None:
+            expected_directory += f"-{expected_frame_directory_suffix}"
         expected_paths = {
             "output": f"{expected_directory}/capture.bin",
             "journal": f"{expected_directory}/journal.json",
@@ -6992,6 +7002,7 @@ def run_live_capture(
                             ).hexdigest(),
                             expected_plan_sha256=plan_sha256,
                             expected_continuation_sha256=continuation_plan_sha256,
+                            expected_frame_directory_suffix=hold_session_id,
                         )
                         if loaded_batch_job.session_id != hold_session_id:
                             raise ProtocolError(
@@ -8122,6 +8133,7 @@ def run_live_capture(
                     ).hexdigest(),
                     expected_plan_sha256=plan_sha256,
                     expected_continuation_sha256=continuation_plan_sha256,
+                    expected_frame_directory_suffix=round_hold_session_id,
                 )
                 if next_batch_job.session_id != round_hold_session_id:
                     raise ProtocolError(

@@ -41,7 +41,10 @@ private let confirmationProjectDirectory = "/tmp/confirmation-test-project"
 /// `project.setFrameAlignment` request (mirrors
 /// `ControlChannelMotionRoutingTests.swift`'s identical `motionRoutingProject`
 /// fixture and its own documented rationale).
-private func confirmationProject(frameIndex: Int = 1) -> ScanProject {
+private func confirmationProject(
+    frameIndex: Int = 1,
+    projectDirectory: String = confirmationProjectDirectory
+) -> ScanProject {
     ScanProject(
         schemaVersion: 1,
         id: "confirmation-project",
@@ -52,21 +55,21 @@ private func confirmationProject(frameIndex: Int = 1) -> ScanProject {
         recipes: OutputRecipe(
             archive: ArchiveRecipe(
                 filenameTemplate: "Archive_####",
-                destination: "/tmp/confirmation-test/archive"
+                destination: "\(projectDirectory)/outputs/archive"
             ),
             positive: PositiveRecipe(
                 enabled: true,
                 fileFormat: .tiff,
                 colorProfile: .adobeRgb1998,
                 filenameTemplate: "Positive_####",
-                destination: "/tmp/confirmation-test/positive"
+                destination: "\(projectDirectory)/outputs/positive"
             ),
             preview: PreviewRecipe(
                 enabled: true,
                 fileFormat: .jpeg,
                 maxLongEdgePx: 1_024,
                 filenameTemplate: "Preview_####",
-                destination: "/tmp/confirmation-test/preview"
+                destination: "\(projectDirectory)/outputs/preview"
             )
         ),
         rollMetadata: MetadataSet(),
@@ -98,6 +101,7 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
     private(set) var previewOperationId: String?
     private var scriptedFailures: [String: EngineRequestError] = [:]
     private var declarativeProjectDirectory: String?
+    private var scannerStatusOverride: ScannerStatus?
     private var holdNextScanStart = false
     private var heldScanStartContinuation: CheckedContinuation<Void, Never>?
 
@@ -114,6 +118,10 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
 
     func configureDeclarativeProject(directory: String) {
         declarativeProjectDirectory = directory
+    }
+
+    func setScannerStatus(_ status: ScannerStatus) {
+        scannerStatusOverride = status
     }
 
     func holdNextScanStartResponse() {
@@ -147,6 +155,9 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
                 )
             ), as: Result.self)
         case "scanner.status":
+            if let scannerStatusOverride {
+                return try cast(scannerStatusOverride, as: Result.self)
+            }
             return try cast(ScannerStatus(
                 connected: true, adapter: "SA-21", mediaLoaded: declarativeProjectDirectory != nil,
                 carrier: "strip6", frameCount: declarativeProjectDirectory == nil ? nil : 1,
@@ -181,7 +192,10 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
         case "project.open":
             let directory = (params as? ProjectOpenParams)?.directory ?? confirmationProjectDirectory
             return try cast(
-                ProjectOpenResult(project: confirmationProject(), directory: directory),
+                ProjectOpenResult(
+                    project: confirmationProject(projectDirectory: directory),
+                    directory: directory
+                ),
                 as: Result.self
             )
         case "scan.start":
@@ -337,6 +351,45 @@ private func driveConfirmationCompleted(_ model: SessionModel, jobId: String, fr
             #"{"event":"scan.completed","payload":{"jobId":"\#(jobId)","summary":{"completed":[\#(frameIndex)],"failed":[],"skipped":[],"stopped":false}}}"#.utf8
         )
     ))
+}
+
+@MainActor
+private func driveConfirmationScannerStatus(
+    _ model: SessionModel,
+    stub: ConfirmationEngineStub,
+    transport: String,
+    activeJobId: String?,
+    filmPresent: Bool?
+) async throws {
+    let status = ScannerStatus(
+        connected: true,
+        adapter: "MA-21",
+        mediaLoaded: true,
+        carrier: "mounted",
+        frameCount: 1,
+        lamp: "stable",
+        transport: transport,
+        activeJobId: activeJobId,
+        filmPresent: filmPresent,
+        motionArmed: true
+    )
+    await stub.setScannerStatus(status)
+    let statusObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(status))
+    let payload = try JSONSerialization.data(withJSONObject: [
+        "event": "scanner.status",
+        "payload": ["status": statusObject],
+    ])
+    model.handle(event: EngineEvent(name: "scanner.status", rawLine: payload))
+}
+
+private func confirmationActiveMarkerJobId(projectDirectory: String) -> String? {
+    let url = URL(fileURLWithPath: projectDirectory)
+        .appendingPathComponent(".scanstudio-active-job.json")
+    guard let data = try? Data(contentsOf: url),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return nil
+    }
+    return object["jobId"] as? String
 }
 
 @MainActor
@@ -911,6 +964,23 @@ struct ScanstudioCLIConfirmationTests {
         await host.server.stop()
     }
 
+    @Test("status --job without a marker emits one JOB_NOT_FOUND refusal")
+    func statusJobWithoutMarkerEmitsOneRefusal() async throws {
+        let host = try await ConfirmationHost.start(label: "status-no-marker")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+
+        let result = try await runConfirmationCLI(["status", "--job"], socketPath: host.socketPath)
+        #expect(result.exitCode == 65)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+        )
+        let error = try #require(object["error"] as? [String: Any])
+        #expect(error["code"] as? String == "JOB_NOT_FOUND")
+        #expect(!result.stdout.contains("\"INTERNAL\""))
+
+        await host.server.stop()
+    }
+
     @Test("a killed waiting CLI reattaches to its exact simulated scan job without a second scan.start")
     func killedWaitingCLIReattachesToExactJob() async throws {
         let host = try await ConfirmationHost.start(label: "scan-reattach")
@@ -1058,13 +1128,51 @@ struct ScanstudioCLIConfirmationTests {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
         #expect(await host.stub.requestCount("scan.start") == 1)
+        for _ in 0..<11_000 where confirmationActiveMarkerJobId(
+            projectDirectory: host.projectDirectory
+        ) != ConfirmationEngineStub.jobId {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(confirmationActiveMarkerJobId(projectDirectory: host.projectDirectory) == ConfirmationEngineStub.jobId)
         await driveConfirmationJobState(host.model, jobId: ConfirmationEngineStub.jobId, state: "scanning")
+        try await driveConfirmationScannerStatus(
+            host.model,
+            stub: host.stub,
+            transport: "locked",
+            activeJobId: ConfirmationEngineStub.jobId,
+            filmPresent: nil
+        )
         await driveConfirmationCompleted(host.model, jobId: ConfirmationEngineStub.jobId)
+        for _ in 0..<11_000 {
+            let startCount = await host.stub.requestCount("scan.start")
+            if confirmationActiveMarkerJobId(projectDirectory: host.projectDirectory) == nil
+                || startCount >= 2 {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(await host.stub.requestCount("scan.start") == 1)
+        #expect(await host.stub.requestCount("scanner.status") == 0)
+
+        try await driveConfirmationScannerStatus(
+            host.model,
+            stub: host.stub,
+            transport: "idle",
+            activeJobId: nil,
+            filmPresent: true
+        )
         for _ in 0..<11_000 where await host.stub.requestCount("scan.start") < 2 {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
         #expect(await host.stub.requestCount("scan.start") == 2)
+        #expect(await host.stub.requestCount("scanner.status") == 1)
         let secondJobId = "\(ConfirmationEngineStub.jobId)-2"
+        for _ in 0..<11_000 where confirmationActiveMarkerJobId(
+            projectDirectory: host.projectDirectory
+        ) != secondJobId {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(confirmationActiveMarkerJobId(projectDirectory: host.projectDirectory) == secondJobId)
         await driveConfirmationJobState(host.model, jobId: secondJobId, state: "scanning")
         await driveConfirmationCompleted(host.model, jobId: secondJobId)
 
@@ -1082,6 +1190,10 @@ struct ScanstudioCLIConfirmationTests {
         let starts = await host.stub.recordedScanStarts
         #expect(starts.map(\.frames) == [[1], [1]])
         #expect(starts.map(\.passToken) == ["Arep01", "Arep02"])
+        #expect(confirmationActiveMarkerJobId(projectDirectory: host.projectDirectory) == nil)
+        let markerArchives = try FileManager.default.contentsOfDirectory(atPath: host.projectDirectory)
+            .filter { $0.hasPrefix(".scanstudio-job-marker-") && $0.hasSuffix(".json") }
+        #expect(markerArchives.count == 2)
 
         await host.server.stop()
     }

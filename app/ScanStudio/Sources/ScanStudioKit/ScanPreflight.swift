@@ -53,12 +53,32 @@ public struct ScanPreflightReport: Codable, Equatable, Sendable {
         check("SCAN_NOT_READY", readiness.isReady, readiness.reason ?? "Scan readiness passed.")
         check("CONTROLLER_BUSY", status.mutatingOperationInFlight == nil, "Wait for the admitted operation to finish.")
 
-        let destinations = [
-            (outputs.archive.enabled, outputs.archive.destination),
-            (outputs.rawExport.enabled, outputs.rawExport.destination),
-            (outputs.positive.enabled, outputs.positive.destination),
-            (outputs.preview.enabled, outputs.preview.destination),
-        ].filter { $0.0 }.map { $0.1 }
+        let metadataDestinations = [
+            ("archive", outputs.archive.enabled, outputs.archive.destination),
+            ("positive", outputs.positive.enabled, outputs.positive.destination),
+            ("preview", outputs.preview.enabled, outputs.preview.destination),
+        ]
+        // Match the engine's admission rule early enough for --dry-run to be
+        // useful. This is an observational lexical check only; the engine's
+        // held directory authorities remain the final security boundary.
+        if let projectDirectory = status.projectDirectory {
+            let root = URL(fileURLWithPath: projectDirectory).standardizedFileURL.path
+            let rootPrefix = root == "/" ? "/" : root + "/"
+            for (role, enabled, destination) in metadataDestinations where enabled {
+                let path = URL(fileURLWithPath: destination).standardizedFileURL.path
+                let withinProject = path == root || path.hasPrefix(rootPrefix)
+                check(
+                    "DESTINATION_WITHIN_PROJECT",
+                    withinProject,
+                    withinProject
+                        ? destination
+                        : "\(role) destination must be beneath the active project's metadata-safe output root: \(destination)"
+                )
+            }
+        }
+        let destinations = metadataDestinations.map { ($0.1, $0.2) }
+            + [(outputs.rawExport.enabled, outputs.rawExport.destination)]
+        let writableDestinations = destinations.filter { $0.0 }.map { $0.1 }
         // ponytail: conservative full-frame 35mm estimate, including scratch
         // space; use measured per-format estimates if this rejects useful runs.
         let scale = Double(capture.resolutionDpi) / 4000
@@ -68,7 +88,7 @@ public struct ScanPreflightReport: Codable, Equatable, Sendable {
         var requiredByVolume: [UInt64: (required: UInt64, available: UInt64)] = [:]
         var total: UInt64 = 0
         var allocations: [String: UInt64] = [:]
-        for destination in destinations { allocations[destination, default: 0] += 1 }
+        for destination in writableDestinations { allocations[destination, default: 0] += 1 }
         if let project = status.projectDirectory { allocations[project, default: 0] += 2 }
         for path in allocations.keys.sorted() {
             let allocation = perDestination.multipliedReportingOverflow(by: allocations[path]!)

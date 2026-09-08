@@ -19,6 +19,10 @@ from coolscanpy.protocol.ls5000_single_pass import manual_frames
 from coolscanpy.protocol.ls5000_single_pass import packed as packed_module
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     ATTENDED_ROLL_BINDING_REASON,
+    CaptureBatchRequest,
+    CaptureMode,
+    CaptureProcessAdapter,
+    CaptureRequest,
     ManualFrameApproval,
     ReviewedRollFingerprint,
     build_reviewed_roll_fingerprint,
@@ -1612,6 +1616,69 @@ def test_batch_job_loader_parses_a_valid_exposure_override(tmp_path: Path) -> No
     )
 
     assert job.exposure_override_10ns == (97_482, 195_597, 180_705)
+
+
+def test_parent_serialized_held_batch_requires_its_exact_session_suffix(
+    tmp_path: Path,
+) -> None:
+    session_id = "held-round-0123456789abcdef"
+    request = CaptureBatchRequest(
+        frames=(
+            CaptureRequest(
+                mode=CaptureMode.FULL,
+                selected_slot=2,
+                expected_usb_bus=1,
+                expected_usb_address=2,
+            ),
+        ),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    payload = CaptureProcessAdapter._batch_job_bytes(
+        SimpleNamespace(),
+        request,
+        session_id=session_id,
+        frame_directory_suffix=session_id,
+    )
+    job_path = tmp_path / "hold-job.json"
+    job_path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+
+    with pytest.raises(ProtocolError, match="frame 1 output"):
+        load_validated_batch_job(
+            job_path,
+            expected_job_sha256=digest,
+            expected_plan_sha256=worker_module.CANONICAL_PLAN_SHA256,
+            expected_continuation_sha256=(
+                worker_module.CANONICAL_CONTINUATION_PLAN_SHA256
+            ),
+        )
+    with pytest.raises(ProtocolError, match="expected held session"):
+        load_validated_batch_job(
+            job_path,
+            expected_job_sha256=digest,
+            expected_plan_sha256=worker_module.CANONICAL_PLAN_SHA256,
+            expected_continuation_sha256=(
+                worker_module.CANONICAL_CONTINUATION_PLAN_SHA256
+            ),
+            expected_frame_directory_suffix="another-held-round",
+        )
+
+    job = load_validated_batch_job(
+        job_path,
+        expected_job_sha256=digest,
+        expected_plan_sha256=worker_module.CANONICAL_PLAN_SHA256,
+        expected_continuation_sha256=(
+            worker_module.CANONICAL_CONTINUATION_PLAN_SHA256
+        ),
+        expected_frame_directory_suffix=session_id,
+    )
+    directory = tmp_path / f"frame-002-{session_id}"
+    assert job.session_id == session_id
+    assert job.frames[0].output == directory / "capture.bin"
+    assert job.frames[0].journal == directory / "journal.json"
+    assert job.frames[0].ack == directory / "parent-ack.json"
 
 
 def test_batch_job_loader_parses_samples_per_scan(tmp_path: Path) -> None:

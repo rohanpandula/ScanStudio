@@ -1509,6 +1509,7 @@ fn build_receipt(
         .transpose()?;
     Ok(ScanReceipt {
         exposure_authority: None,
+        preview_exposure_adjustment: recipe.preview_exposure_adjustment.clone(),
         auto_crop: written.auto_crop.clone(),
         job_id: job_id.to_string(),
         pass_token: pass_token.map(str::to_string),
@@ -2264,6 +2265,7 @@ mod tests {
             multisample_passes: 2,
             channels: Channels::Rgbi,
             exposure_override_10ns: None,
+            preview_exposure_adjustment: None,
         };
         assert_eq!(settings_fingerprint(&recipe), "1a3d265e0b54bbd2");
     }
@@ -2989,6 +2991,18 @@ mod tests {
             FrameOverrides {
                 capture: Some(CaptureRecipe {
                     resolution_dpi: 1000,
+                    exposure_override_10ns: Some([200_000, 220_000, 240_000]),
+                    preview_exposure_adjustment: Some(crate::domain::PreviewExposureAdjustment {
+                        source: "previewThumbnailMean".into(),
+                        reference_frame_index: 1,
+                        reference_thumbnail_mean: 100.0,
+                        frame_thumbnail_mean: 50.0,
+                        requested_positive_ev: 1.0,
+                        applied_positive_ev: 1.0,
+                        reference_rgb_exposures_raw_10ns: [100_000, 110_000, 120_000],
+                        applied_rgb_exposures_raw_10ns: [200_000, 220_000, 240_000],
+                        device_bound_clamped_channels: vec![],
+                    }),
                     ..CaptureRecipe::default()
                 }),
                 processing: None,
@@ -3011,6 +3025,8 @@ mod tests {
         .expect("scan start");
 
         let mut receipt_resolutions: HashMap<u32, u32> = HashMap::new();
+        let mut receipt_adjustments = HashMap::new();
+        let mut settings_fingerprints = HashMap::new();
         while receipt_resolutions.len() < 2 {
             let line = rx
                 .recv_timeout(Duration::from_secs(30))
@@ -3022,6 +3038,19 @@ mod tests {
                     .as_u64()
                     .unwrap() as u32;
                 receipt_resolutions.insert(frame_index, resolution_dpi);
+                receipt_adjustments.insert(
+                    frame_index,
+                    value["payload"]["receipt"]["previewExposureAdjustment"]
+                        ["appliedRgbExposuresRaw10ns"]
+                        .clone(),
+                );
+                settings_fingerprints.insert(
+                    frame_index,
+                    value["payload"]["receipt"]["settingsFingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
             }
         }
 
@@ -3030,6 +3059,12 @@ mod tests {
             Some(&4000),
             "frame 1 has no override -- its receipt must reflect the roll-wide default"
         );
+        assert_eq!(receipt_adjustments[&1], serde_json::Value::Null);
+        assert_eq!(
+            receipt_adjustments[&2],
+            serde_json::json!([200_000, 220_000, 240_000])
+        );
+        assert_ne!(settings_fingerprints[&1], settings_fingerprints[&2]);
         assert_eq!(
             receipt_resolutions.get(&2),
             Some(&1000),

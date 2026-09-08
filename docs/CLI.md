@@ -316,7 +316,7 @@ retroactively certified. Neither verification nor collection moves film.
 roll run --name NAME --carrier mounted|strip6|roll36 [--frame-count N]
          --film-process PROCESS --film-loaded --confirm-motion
          [--skip-blank] [--auto-approve] [--wait|--no-wait]
-         [--hopper] [--allow-unverified-hardware]
+         [--hopper] [--preview-derived-exposure] [--allow-unverified-hardware]
          → scanner.refresh, status, preview.acquire, events.subscribe,
            frames.list, frames.select, roll.save, review.approve, job.get
 ```
@@ -326,6 +326,8 @@ preview, wait for `previewComplete`, select frames, save, resolve an optional
 review, and wait for the job. Both `--film-loaded` and `--confirm-motion` are
 required. It stops at the first refusal and never retries. Exits are `0, 64,
 65, 69, 70, 75, 77`.
+
+`--preview-derived-exposure` is experimental and off by default. It meters one median-brightness preview frame, keeps IR metered, and applies positive-only RGB adjustments capped at 1 EV and device limits. Blank, ambiguous, or missing preview evidence refuses the run. Receipts retain the requested adjustment and actual exposure evidence; this does not establish clipping or calibration quality.
 
 For repeated numbered rolls, add `--hopper`:
 
@@ -585,4 +587,4 @@ With a saved roll open, `render --frame 2-4 --profile sRGB --output /absolute/ne
 
 `metadata apply --frame 2 --frame 3 --to /absolute/new-directory --template 'Tagged_####.tif' --film-stock 'Example stock' --camera 'Example camera' --dry-run` previews the approved ExifTool arguments. Remove `--dry-run` to tag new copies. Optional fields are `--lens`, `--date`, and `--notes`; `--kind` selects the source output type. ExifTool works in a private staging directory; tagged copies are verified before create-only publication. Missing ExifTool is reported, and originals, manifests, and capture receipts remain unchanged. The GUI Batch Inspector exposes the same render and metadata operations.
 
-For automatic per-frame handoff, configure the roll's existing output route, for example `outputs set --raw-enabled --raw-destination /absolute/NegPy-inbox` or `outputs set --positive-enabled --positive-destination /absolute/Lightroom-inbox`. The scan publisher writes each frame there before reporting its completed receipt. This uses the same create-only publication path as other scan outputs; no second copy scheduler is required. Use `export` for copies of an already-scanned roll.
+For automatic per-frame handoff, configure the roll's existing output route. Raw export may target an external watched directory, for example `outputs set --raw-enabled --raw-destination /absolute/NegPy-inbox`. Archive, positive, and preview destinations must remain beneath the active project root; a project-contained folder can be watched directly, for example `outputs set --positive-enabled --positive-destination /absolute/project/Lightroom-inbox`. The scan publisher writes each frame there before reporting its completed receipt. For an external positive destination, use `export --to` after the roll is retained. This uses the existing create-only publication path; no second copy scheduler is required.

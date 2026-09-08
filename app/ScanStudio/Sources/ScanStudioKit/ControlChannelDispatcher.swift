@@ -1018,7 +1018,25 @@ public final class ControlChannelDispatcher {
                     message: sessionModel.hardwareMotionReadiness.guidance
                 ))
             }
-            guard let solution = await sessionModel.solveExposure(frameIndex: params.frame) else {
+            if let frames = params.previewDerivedFrames {
+                guard (try? PreviewDerivedExposurePolicy.referenceFrame(in: frames)) == params.frame else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "Preview-derived exposure requires unique evidence including the reference frame."
+                    ))
+                }
+            }
+            guard let solution = await sessionModel.solveExposure(
+                frameIndex: params.frame,
+                previewDerivedReference: params.previewDerivedFrames != nil,
+                previewDerivedFrameIndices: params.previewDerivedFrames.map {
+                    Set($0.map(\.frameIndex))
+                }
+            ) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            if let frames = params.previewDerivedFrames,
+               !(await sessionModel.applyPreviewDerivedExposure(frames, reference: solution)) {
                 return outcome(id: id, errorMessageBefore: nil)
             }
             return .success(

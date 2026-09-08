@@ -322,10 +322,16 @@ public struct ControlScanStartParams: Codable, Equatable, Sendable {
 public struct ControlRollSolveExposureParams: Codable, Equatable, Sendable {
     public let frame: Int
     public let motionConfirmed: Bool?
+    public let previewDerivedFrames: [PreviewDerivedExposurePolicy.Evidence]?
 
-    public init(frame: Int, motionConfirmed: Bool?) {
+    public init(
+        frame: Int,
+        motionConfirmed: Bool?,
+        previewDerivedFrames: [PreviewDerivedExposurePolicy.Evidence]? = nil
+    ) {
         self.frame = frame
         self.motionConfirmed = motionConfirmed
+        self.previewDerivedFrames = previewDerivedFrames
     }
 }
 
