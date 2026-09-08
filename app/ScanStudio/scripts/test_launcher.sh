@@ -23,6 +23,7 @@ chmod +x "$workdir/app/ScanStudioLauncher"
 
 cat > "$workdir/app/ScanStudio" <<'APP'
 #!/bin/zsh
+print -r -- "target=app"
 print -r -- "bridge=${SCANSTUDIO_BRIDGE_CMD:-<unset>}"
 print -r -- "motion=${SCANSTUDIO_HW_MOTION:-<unset>}"
 if [[ -n "${SCANSTUDIO_BRIDGE_BASE_DIR:-}" \
@@ -34,6 +35,20 @@ fi
 print -r -- "base=${SCANSTUDIO_BRIDGE_BASE_DIR:-<unset>}"
 APP
 chmod +x "$workdir/app/ScanStudio"
+
+cat > "$workdir/app/scanstudio-cli" <<'CLI'
+#!/bin/zsh
+print -r -- "target=cli"
+print -r -- "bootstrapped=${SCANSTUDIO_CLI_BOOTSTRAPPED:-<unset>}"
+print -r -- "bridge=${SCANSTUDIO_BRIDGE_CMD:-<unset>}"
+print -r -- "motion=${SCANSTUDIO_HW_MOTION:-<unset>}"
+print -r -- "base=${SCANSTUDIO_BRIDGE_BASE_DIR:-<unset>}"
+print -r -- "latch=$(<"$SCANSTUDIO_BRIDGE_BASE_DIR/hw-motion-armed")"
+for argument in "$@"; do
+    print -r -- "arg=$argument"
+done
+CLI
+chmod +x "$workdir/app/scanstudio-cli"
 
 cat > "$workdir/app/scanstudio-bridge" <<'BRIDGE'
 #!/bin/zsh
@@ -88,6 +103,25 @@ expect_output "bundled bridge wins over PATH" \
     $'bridge=scanstudio-bridge\nmotion=1\nlatch=scanstudio-app-session' \
     env -i HOME="$workdir/isolated home" PATH="$workdir/bin:/usr/bin:/bin" \
         "$workdir/app/ScanStudioLauncher"
+
+cli_output="$(env -i HOME="$workdir/cli home" PATH="/usr/bin:/bin" \
+    "$workdir/app/ScanStudioLauncher" --cli host --detach --log "$workdir/cli log")"
+for expected in \
+    "target=cli" \
+    "bootstrapped=1" \
+    "bridge=scanstudio-bridge" \
+    "motion=1" \
+    "base=$workdir/cli home/.scanstudio" \
+    "latch=scanstudio-app-session" \
+    "arg=host" \
+    "arg=--detach" \
+    "arg=--log" \
+    "arg=$workdir/cli log"; do
+    if [[ "$cli_output" != *"$expected"* ]]; then
+        print -u2 "launcher check failed (CLI dispatch): expected '$expected', got '$cli_output'"
+        exit 1
+    fi
+done
 
 mkdir -p "$workdir/existing home/.scanstudio"
 print -r -- "operator-existing-label" > "$workdir/existing home/.scanstudio/hw-motion-armed"

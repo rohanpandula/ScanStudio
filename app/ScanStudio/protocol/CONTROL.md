@@ -44,6 +44,7 @@ Filesystem permissions are the entire authentication boundary. Any process runni
 | `CONFIRMATION_REQUIRED` | A motion-capable command arrived without the explicit confirmation flag its params require (for example `motionConfirmed` or `filmLoadedConfirmed`). |
 | `GATE_REFUSED` | A physical-readiness gate (hardware motion, scan readiness, refeed, or a pending manual review) refused the command. |
 | `JOB_NOT_FOUND` | `job.get`/`status --job` named a `jobId` this host process never tracked -- neither the live job nor one of the last `SessionModel.maximumTerminalJobHistory` (8) archived jobs (D-19/HEAD-12). |
+| `HOST_ALREADY_RUNNING` | `host` found a live control socket already owned by another host. |
 
 When a failure originates in the engine or the bridge instead of the channel itself, the error body carries the engine's own `code` and `recoverable` flag verbatim rather than remapping them to one of the codes above — the same `NOT_CONNECTED`, `FEED_JAM`, or similar code the GUI would see reaches the caller unchanged.
 
@@ -58,7 +59,7 @@ Every entry below states `{params}` → `{result}` in inline code, the `SessionM
 Every code below is channel-level (D-03) unless marked "passthrough", meaning the engine's or bridge's own code and `recoverable` flag cross the channel verbatim (for example `NOT_CONNECTED`, `EJECT_FAILED`, `FEEDER_PARKED` — see `PROTOCOL.md`'s Error codes section for the full engine vocabulary). A channel-level code is always `recoverable: false`.
 
 ### `hello`
-`{schemaVersion: number, clientName: string, clientBuild?: string}` → `{schemaVersion: number, appName: string, appVersion?: string}`. Must be the first request on any connection; every other command sent first is refused with `HELLO_REQUIRED`. A second `hello` on an already-greeted connection is idempotent — it re-validates and returns the same shape, rather than being refused. Errors: `SCHEMA_VERSION_MISMATCH`.
+`{schemaVersion: number, clientName: string, clientBuild?: string}` → `{schemaVersion: number, appName: string, appVersion?: string, host: "gui" | "headless", hostPid: number}`. Must be the first request on any connection; every other command sent first is refused with `HELLO_REQUIRED`. A second `hello` on an already-greeted connection is idempotent — it re-validates and returns the same shape, rather than being refused. `host` identifies whether the GUI or resident headless process owns the socket, and `hostPid` is that process's pid. Both fields are additive at schema version 1, so clients may ignore them; they let callers distinguish hosts and cross-check a pidfile before signalling. Errors: `SCHEMA_VERSION_MISMATCH`.
 
 ### `status`
 `{}` → `{device?: DeviceInfo, scanner?: ScannerStatus, projectName?: string, projectDirectory?: string, jobId?: string, jobState?: JobState, previewComplete: boolean, progress?: {jobId: string, frameIndex: number, frameOrdinal: number, totalFrames: number, pass: number, totalPasses: number, framePercent: number, jobPercent: number, etaSeconds: number}, refeedRequired: boolean, hardwareMotionReadiness: string, motionAllowed: boolean, motionGuidance?: string, mutatingOperationInFlight?: string, selectedFrames: [number], pendingFrames: [number], scanReadiness: string, scanReadinessReason?: string, lastErrorMessage?: string, lastControlRefusal?: {command?: string, code: string, gate?: string, timestamp: string, sequence: number}, manualReviewPending?: {frames: [{index: number, reason: string, evidence: [string], contentConfidence?: number}]}}`. A full session snapshot built from `SessionModel` public state only — no `await`, no engine request. `mutatingOperationInFlight` is the D-07 arbitration signal, `nil` when idle. `progress` (D-17, additive) is `nil`, and omitted from the wire entirely, when no job is active; it is the same shape and the same measured `etaSeconds` `job.get` reports, present here so a subscriber sees it without a second request. `pendingFrames` (D-22/HEAD-12, additive) is the engine's own authoritative resume set (`SessionModel.pendingFrames`, refreshed from `project.pendingFrames`) — a script can see what `scan.resume` would scan before asking for motion, and excluding a frame after a failed batch is visible here immediately, without re-opening the roll. This is also the exact snapshot shape `events.subscribe` streams. Errors: none.
@@ -211,6 +212,14 @@ Shape: one JSON object, `{steps: [{step: string, command: string, exitCode: numb
 
 **Stopping.** One attempt per step; the first refused step stops the walk (SAFE-02) — nothing after it is ever attempted, and no step is ever retried. A `roll.save` that pauses at `manualReviewPending` with `--auto-approve` absent, or whose flagged frames do not clear the bar, is a legitimate stop at exit 0, not a refusal — the review is left pending for an operator to decide.
 
+## Host process
+
+`scanstudio-cli host` (equivalently `host run`) runs the resident headless host in the foreground until `SIGTERM` or `SIGINT`. It serves `~/.scanstudio/control.sock` by default; `--socket <path>` overrides it. `host --detach` starts a child, redirects its output to `~/.scanstudio/logs/host.log` (or `--log <path>`), and reports success only after that exact child answers `hello` as a headless host. The pidfile is `<socket>.pid` with mode `0600`; its parent directory is mode `0700`.
+
+The resident host probes the socket before constructing an engine. A live owner produces `HOST_ALREADY_RUNNING` and exit 75, so a second engine is never spawned. `host stop` signals a pidfile only after a live hello reports the same `hostPid`; an unanswered socket, mismatched pid, or GUI hello refuses to signal. Startup teardown stops the server first, terminates the engine second, then removes the pidfile and socket.
+
+`--engine <path>` is a development and test override that bypasses `EngineLocator`. Phase 4 must decide how a packaged, signed build constrains this override. Immediately after host startup, discovery may still be in flight; a first mutating command can therefore receive the expected `CONTROLLER_BUSY` refusal while `scanner.list` settles.
+
 ## Exit codes
 
 `scanstudio-cli` follows `sysexits.h`-style conventions (D-10). Exactly one function, `ControlCLIExitCode.forErrorCode(_:)`, decides a process exit value from an error `code` string; no command computes one inline except the parse-time `--confirm-motion`/`--film-loaded` gates below, whose value is fixed by D-11 rather than looked up.
@@ -222,7 +231,7 @@ Shape: one JSON object, `{steps: [{step: string, command: string, exitCode: numb
 | 65 | Typed engine or gate error | `GATE_REFUSED`, `JOB_NOT_FOUND`, and every other engine- or bridge-passthrough code this repository does not individually enumerate — the documented default, not a fallback for an unhandled case; also a `--wait`ed job whose terminal state is `failed`; also `frames include`/`frames exclude <range>`'s own **partial-application rule (D-24/HEAD-12, additive)**: a range spanning more than one index that stops at a refused index always exits 65 regardless of that index's own code (for example an `INVALID_PARAMS` refusal, which alone would map to 64) — the caller's *range as a whole* did not apply, a different fact than what a single-request refusal of that code would normally mean |
 | 69 | No host reachable | `HOST_UNREACHABLE` — the control socket could not be dialed at the given (or default) path |
 | 70 | Internal error | Channel `UNKNOWN_COMMAND`; CLI-originated `INTERNAL` (an unexpected condition after a request already succeeded, for example a response that failed to decode) |
-| 75 | Busy / conflict | `CONTROLLER_BUSY` |
+| 75 | Busy / conflict | `CONTROLLER_BUSY`, `HOST_ALREADY_RUNNING` |
 | 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
 | 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
 
@@ -251,6 +260,7 @@ One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen group
 | `eject --confirm-motion` | `scanner.eject` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
 | `diagnostics export --to <dir>` | `diagnostics.export` | — | 0, 64 (`directory` is relative, contains `..`, or does not exist), 69, 70 |
 | `events --follow` | `events.subscribe`, then every subsequent event on that connection | — | 0, 64 (`--follow` omitted), 69, 70 |
+| `host` / `host run` / `host stop` | Resident headless host lifecycle, or pidfile-verified stop | — | 0, 69, 70, 75 |
 
 Two facts about this table a reader will otherwise get wrong:
 

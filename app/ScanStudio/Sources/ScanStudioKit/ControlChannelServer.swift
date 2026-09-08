@@ -55,16 +55,84 @@ public enum ControlSocketPath {
     /// re-asserts this mode rather than trusting whatever it finds (D-02:
     /// never trust umask, and the directory's mode must not silently drift
     /// even if it already existed).
+    ///
+    /// CF-02: `mkdir` is attempted unconditionally rather than gated behind
+    /// a `fileExists` pre-check -- two first-ever starts at a brand-new
+    /// directory used to race the check-then-`mkdir` window, and the loser
+    /// got `EEXIST` and threw. `errno == EEXIST` (captured immediately
+    /// after the `mkdir` call, into a local, before any other libc call
+    /// -- including the `chmod` below -- can clobber the global `errno`)
+    /// is success: something is already there, which is exactly what this
+    /// function wants, and the unconditional `chmod` re-asserts its mode
+    /// regardless of which racer actually created it.
     public static func prepareDirectory(for path: String) throws {
         let directory = (path as NSString).deletingLastPathComponent
-        if !FileManager.default.fileExists(atPath: directory) {
-            guard mkdir(directory, 0o700) == 0 else {
-                throw ControlSocketError(context: "mkdir(\(directory))", errnoValue: errno)
+        if mkdir(directory, 0o700) != 0 {
+            let mkdirErrno = errno
+            guard mkdirErrno == EEXIST else {
+                throw ControlSocketError(context: "mkdir(\(directory))", errnoValue: mkdirErrno)
             }
+        }
+        var info = stat()
+        guard lstat(directory, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFDIR,
+              info.st_uid == geteuid() else {
+            throw ControlSocketError(context: "prepareDirectory(\(directory)): refusing a non-owned directory", errnoValue: EACCES)
         }
         guard chmod(directory, 0o700) == 0 else {
             throw ControlSocketError(context: "chmod(\(directory), 0o700)", errnoValue: errno)
         }
+    }
+
+    /// Claims the bind-time lock and proves no live listener owns `path`.
+    /// The descriptor stays held while a headless host constructs its engine
+    /// and model, then transfers to `ControlChannelServer.start`.
+    static func claim(_ path: String) throws -> Int32 {
+        try validate(path)
+        try prepareDirectory(for: path)
+        let descriptor = try acquireBindLock(forSocketPath: path)
+        if ControlSocketDialer.probeIsLive(path: path) {
+            releaseBindLock(descriptor)
+            throw ControlSocketError(
+                context: "start(\(path)): another host is already listening at this path",
+                errnoValue: EADDRINUSE
+            )
+        }
+        return descriptor
+    }
+
+    static func acquireBindLock(forSocketPath path: String) throws -> Int32 {
+        let lockPath = path + ".lock"
+        let fd = open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else {
+            throw ControlSocketError(context: "open(\(lockPath))", errnoValue: errno)
+        }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == geteuid(),
+              info.st_nlink == 1 else {
+            close(fd)
+            throw ControlSocketError(context: "start(\(path)): refusing unsafe bind lock", errnoValue: EACCES)
+        }
+        guard fchmod(fd, 0o600) == 0 else {
+            let chmodErrno = errno
+            close(fd)
+            throw ControlSocketError(context: "fchmod(\(lockPath), 0o600)", errnoValue: chmodErrno)
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            throw ControlSocketError(
+                context: "start(\(path)): another host is already starting at this path (lock \(lockPath) held)",
+                errnoValue: EADDRINUSE
+            )
+        }
+        return fd
+    }
+
+    static func releaseBindLock(_ fd: Int32) {
+        flock(fd, LOCK_UN)
+        close(fd)
     }
 
     /// D-02: refuses a path whose `sun_path` would not fit (counting the
@@ -170,6 +238,65 @@ public enum ControlSocketDialer {
     }
 }
 
+/// CF-01: a connection's ordered inbound FIFO. The old code spawned one
+/// independent `Task { feed(...) }` per readable chunk, with no ordering
+/// guarantee relative to arrival order -- several chunks arriving in quick
+/// succession could feed `LineFramer` out of order, corrupting its buffer
+/// and producing spurious `id: 0`/`INVALID_PARAMS` responses
+/// (`02-REVIEW-FIX.md` item 5). `append`/`markClosed` run synchronously
+/// *inside* the readability handler, which Foundation serializes per
+/// `FileHandle` -- that is the one place ordering is actually guaranteed;
+/// an `NSLock` (not actor isolation) guards the shared state because the
+/// handler closure is a plain synchronous callback, not an `async`
+/// context. `SingleResumeGuard` (`ControlSocketEndToEndTests.swift`) is
+/// this repository's existing `NSLock`-guarded `@unchecked Sendable`
+/// precedent for a small helper shared between a synchronous callback and
+/// an async caller.
+final class ControlConnectionInbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var chunks: [Data] = []
+    private var bufferedBytes = 0
+    private var closed = false
+    private var overflowed = false
+    private let maxBufferedBytes: Int
+
+    init(maxBufferedBytes: Int = ControlChannelDispatcher.maxRequestLineBytes * 4) {
+        self.maxBufferedBytes = maxBufferedBytes
+    }
+
+    @discardableResult
+    func append(_ data: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard data.count <= maxBufferedBytes - bufferedBytes else {
+            overflowed = true
+            return false
+        }
+        chunks.append(data)
+        bufferedBytes += data.count
+        return true
+    }
+
+    func markClosed() {
+        lock.lock()
+        closed = true
+        lock.unlock()
+    }
+
+    /// Drains everything buffered so far and reports the close flag under
+    /// one lock acquisition. The actor's drain loop calls this repeatedly
+    /// until it reports back empty-and-still-open, which is the only
+    /// condition that means "nothing left to do right now."
+    func take() -> (chunks: [Data], closed: Bool, overflowed: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        let drained = chunks
+        chunks.removeAll()
+        bufferedBytes = 0
+        return (drained, closed, overflowed)
+    }
+}
+
 /// One entry in a connection's outbound queue. `droppable == false` for a
 /// command response (D-04: a caller's own answer must never be dropped);
 /// `droppable == true` for an event line (`control.snapshot`/
@@ -178,6 +305,16 @@ public enum ControlSocketDialer {
 private struct OutboundEntry {
     let bytes: Data
     let droppable: Bool
+    /// CF-01: marks this entry as a close request rather than bytes to
+    /// write. `drainInbound(fd:)` enqueues one of these -- instead of
+    /// calling `closeConnection(fd)` directly -- once it observes EOF with
+    /// nothing left to feed, so the close is ordered *after* every
+    /// response already enqueued as a result of everything fed so far,
+    /// reusing this queue's own existing FIFO guarantee rather than a
+    /// second, independent synchronization mechanism. Never `droppable`,
+    /// so the overflow-eviction loop in `enqueue(fd:bytes:droppable:)` can
+    /// never discard it.
+    var isCloseSentinel = false
 }
 
 /// The real transport for Phase 1's `ControlChannelDispatcher`. One
@@ -189,9 +326,11 @@ private struct OutboundEntry {
 /// arbitration signal, already shared by construction.
 public actor ControlChannelServer {
     private let sessionModel: SessionModel
+    private let hostKind: ControlHostKind
     private var listenDescriptor: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private var boundPath: String?
+    private var boundSocketIdentity: SocketIdentity?
     /// WR-03: set at the very start of `stop()`, before it closes any
     /// existing connection -- `adopt(_:)` re-checks this after registering
     /// a newly-accepted connection so one that slips in after `stop()` has
@@ -204,6 +343,9 @@ public actor ControlChannelServer {
     /// `ControlChannelDispatcher` -- its `hello`/subscription state is per
     /// instance, never shared across connections (Pattern 1).
     private var connections: [Int32: FileHandle] = [:]
+    /// Generation token prevents an old in-flight dispatch from touching a
+    /// replacement connection that reuses the same descriptor number.
+    private var connectionTokens: [Int32: UUID] = [:]
     private var framers: [Int32: LineFramer] = [:]
     private var dispatchers: [Int32: ControlChannelDispatcher] = [:]
     /// Bytes accumulated since this connection's last complete line --
@@ -212,6 +354,27 @@ public actor ControlChannelServer {
     /// that framer's internal buffer past
     /// `ControlChannelDispatcher.maxRequestLineBytes`.
     private var pendingLineBytes: [Int32: Int] = [:]
+    /// CF-01: this connection's ordered inbound FIFO -- appended to
+    /// synchronously inside the readability handler, drained in order by
+    /// `drainInbound(fd:)`.
+    private var inboxes: [Int32: ControlConnectionInbox] = [:]
+    /// CF-01: guards against starting a second concurrent drain loop for
+    /// the same connection's inbox, mirroring the outbound side's own
+    /// `draining` set.
+    private var feedingInbound: Set<UUID> = []
+    /// CF-01: how many already-framed lines have been dispatched
+    /// (`dispatchLineConcurrently`) but have not yet finished enqueueing
+    /// their response, per connection. Framing finishing (EOF, nothing
+    /// left to frame) does not by itself mean every response owed for
+    /// what was framed has been written -- dispatch is intentionally
+    /// concurrent, not serialized behind framing.
+    private var inFlightDispatchCount: [UUID: Int] = [:]
+    /// CF-01: set by `drainInbound(fd:)` when framing alone finished (EOF
+    /// observed, inbox drained) while `inFlightDispatchCount[fd]` was
+    /// still non-zero. `finishDispatch(fd:)` is the only reader/consumer:
+    /// once the count it is independently tracking reaches zero, it
+    /// removes this and performs the actual close.
+    private var framingDoneAwaitingDispatch: Set<UUID> = []
 
     /// This connection's outbound queue (Pitfall 3 / locked judgment call
     /// 3): responses are never droppable, event lines always are. Lives on
@@ -225,7 +388,7 @@ public actor ControlChannelServer {
     private var writeQueues: [Int32: DispatchQueue] = [:]
     /// Guards against starting a second concurrent drain loop for the same
     /// connection.
-    private var draining: Set<Int32> = []
+    private var draining: Set<UUID> = []
     /// Events dropped since the last `control.dropped` notice was written
     /// for this connection -- surfaced immediately before the next event
     /// line (the locked judgment call's "surfaced in the next event"); CLI-
@@ -243,11 +406,15 @@ public actor ControlChannelServer {
     /// connection's queue at a few hundred kilobytes at most, never
     /// unbounded.
     static let outboundQueueBound = 256
+    static let inFlightRequestBound = 1_024
 
     private static let listenBacklog: Int32 = 8
 
-    public init(sessionModel: SessionModel) {
+    /// `hostKind` defaults to `.gui` so existing in-process servers keep
+    /// their wire identity; the resident CLI host passes `.headless` (D-04).
+    public init(sessionModel: SessionModel, hostKind: ControlHostKind = .gui) {
         self.sessionModel = sessionModel
+        self.hostKind = hostKind
         // Matches the subprocess client's own init-time rationale
         // verbatim: a write to a peer that has already closed its end (a
         // disconnected control client, or -- in a test process that never
@@ -286,10 +453,16 @@ public actor ControlChannelServer {
     /// exit path) -- it is never a liveness signal; liveness is, and
     /// remains, connect+hello only (documented in `CONTROL.md`).
     public func start(path: String) throws {
-        try ControlSocketPath.validate(path)
-        try ControlSocketPath.prepareDirectory(for: path)
-        let lockFD = try Self.acquireBindLock(forSocketPath: path)
-        defer { Self.releaseBindLock(lockFD) }
+        try start(path: path, bindLock: nil)
+    }
+
+    func start(path: String, bindLock: Int32?) throws {
+        if bindLock == nil {
+            try ControlSocketPath.validate(path)
+            try ControlSocketPath.prepareDirectory(for: path)
+        }
+        let lockFD = try bindLock ?? ControlSocketPath.acquireBindLock(forSocketPath: path)
+        defer { ControlSocketPath.releaseBindLock(lockFD) }
 
         if ControlSocketDialer.probeIsLive(path: path) {
             throw ControlSocketError(
@@ -305,6 +478,7 @@ public actor ControlChannelServer {
         }
         do {
             try bindListenAndChmod(fd: fd, path: path)
+            boundSocketIdentity = try Self.socketIdentity(at: path)
         } catch {
             close(fd)
             throw error
@@ -326,27 +500,6 @@ public actor ControlChannelServer {
     /// distinguish "lost the bind-time race" from "a live host already
     /// owns this path" -- both mean the same thing to `start(path:)`'s
     /// own caller: this attempt did not win the path.
-    private static func acquireBindLock(forSocketPath path: String) throws -> Int32 {
-        let lockPath = path + ".lock"
-        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else {
-            throw ControlSocketError(context: "open(\(lockPath))", errnoValue: errno)
-        }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            close(fd)
-            throw ControlSocketError(
-                context: "start(\(path)): another host is already starting at this path (lock \(lockPath) held)",
-                errnoValue: EADDRINUSE
-            )
-        }
-        return fd
-    }
-
-    private static func releaseBindLock(_ fd: Int32) {
-        flock(fd, LOCK_UN)
-        close(fd)
-    }
-
     private func bindListenAndChmod(fd: Int32, path: String) throws {
         var addr = try makeSockaddrUn(path)
         let bindResult = withUnsafePointer(to: &addr) { rawAddr -> Int32 in
@@ -384,9 +537,15 @@ public actor ControlChannelServer {
             close(listenDescriptor)
             listenDescriptor = -1
         }
-        if let path = boundPath {
-            unlink(path) // stop() is the only caller that unlinks the path it bound
+        if let path = boundPath,
+           let expected = boundSocketIdentity,
+           let current = try? Self.socketIdentity(at: path),
+           current == expected {
+            unlink(path)
+        }
+        if boundPath != nil {
             boundPath = nil
+            boundSocketIdentity = nil
         }
     }
 
@@ -442,10 +601,18 @@ public actor ControlChannelServer {
     /// `MainActor` hop, since the dispatcher's initializer is
     /// `MainActor`-isolated -- Pattern 1: one dispatcher per connection, all
     /// sharing the single `sessionModel` this server was handed), wraps the
-    /// descriptor in a `FileHandle`, and installs the same weak-self
-    /// immediate-`Task`-hop readability shape `armAcceptSource` uses: empty
-    /// data means the peer closed, anything else feeds this connection's
-    /// `LineFramer`.
+    /// descriptor in a `FileHandle`, and installs an ordered-inbound
+    /// readability handler: empty data means the peer closed, anything else
+    /// is this connection's next chunk.
+    ///
+    /// CF-01: the handler itself does only synchronous work --
+    /// `availableData`, then `inbox.append`/`markClosed` -- before hopping
+    /// into a `Task` to drain. Foundation serializes a `FileHandle`'s own
+    /// readability callbacks, so those appends are strictly ordered; the
+    /// old code instead spawned an independent `Task { feed(...) }` per
+    /// chunk, and the `Task` hop (not the callback) is exactly where
+    /// ordering was lost under a burst. See `drainInbound(fd:)` for the
+    /// FIFO drain this feeds.
     ///
     /// WR-03: `stop()` and this function can race -- `armAcceptSource`'s
     /// event handler spawns this function's own `Task` on a successful
@@ -460,24 +627,90 @@ public actor ControlChannelServer {
     /// every other teardown path uses if the server stopped meanwhile.
     private func adopt(_ fd: Int32) async {
         let dispatcher = await MainActor.run {
-            ControlChannelDispatcher(sessionModel: sessionModel)
+            ControlChannelDispatcher(sessionModel: sessionModel, hostKind: hostKind)
         }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        let inbox = ControlConnectionInbox()
+        let token = UUID()
         connections[fd] = handle
+        connectionTokens[fd] = token
         framers[fd] = LineFramer()
         dispatchers[fd] = dispatcher
         pendingLineBytes[fd] = 0
+        inboxes[fd] = inbox
         handle.readabilityHandler = { [weak self] fileHandle in
             let data = fileHandle.availableData
             guard let self else { return }
             if data.isEmpty {
-                Task { await self.closeConnection(fd) }
+                // EOF keeps a read source readable forever; disarm it before
+                // queuing the ordered close so EOF cannot flood Tasks while
+                // already-framed responses drain.
+                fileHandle.readabilityHandler = nil
+                inbox.markClosed()
             } else {
-                Task { await self.feed(fd: fd, chunk: data) }
+                inbox.append(data)
             }
+            Task { await self.drainInbound(fd: fd, token: token, inbox: inbox) }
         }
         if isStopped {
             closeConnection(fd)
+        }
+    }
+
+    /// CF-01: drains this connection's inbox in FIFO order, one `take()` at
+    /// a time, `await feed(fd:chunk:)`-ing every chunk before looping back
+    /// to check for more -- so a chunk appended *while* this loop is
+    /// awaiting an earlier `feed` call is still picked up by this same
+    /// loop's next iteration, never orphaned. `feedingInbound` admits only
+    /// one concurrently-running drain per connection: a second readability
+    /// firing while a drain is already in flight just appends and returns,
+    /// trusting the in-flight loop to notice on its own next `take()`.
+    ///
+    /// Requests a close only when a `take()` reports both an empty queue
+    /// and `closed == true` -- an EOF observed by the readability handler
+    /// can therefore never overtake request bytes that arrived (and were
+    /// appended) before it, even if both were coalesced into the same
+    /// `take()` call. The close itself is a sentinel on the *outbound*
+    /// queue (`enqueueCloseAfterOutboundDrains(fd:)`), not an immediate
+    /// `closeConnection(fd)` call: enqueueing a response and writing it
+    /// are two different asynchronous steps (`feed` only enqueues), so
+    /// closing immediately here could tear the connection down before the
+    /// outbound drain loop has actually written the last response out.
+    /// `while let inbox = inboxes[fd]` re-checks liveness every iteration,
+    /// so a connection `feed` itself closes (the oversized-line refusal
+    /// path) simply ends this loop on the next check -- no separate guard
+    /// needed, and `feedingInbound` is cleared on every exit via the one
+    /// `defer` below.
+    private func drainInbound(fd: Int32, token: UUID, inbox: ControlConnectionInbox) async {
+        guard connectionTokens[fd] == token, !feedingInbound.contains(token) else { return }
+        feedingInbound.insert(token)
+        defer { feedingInbound.remove(token) }
+        while connectionTokens[fd] == token {
+            let (chunks, closed, overflowed) = inbox.take()
+            if overflowed {
+                closeConnection(fd, token: token)
+                return
+            }
+            if chunks.isEmpty {
+                if closed {
+                    // Framing itself is done (nothing left to frame, EOF
+                    // observed) -- but dispatch of whatever *was* framed
+                    // runs concurrently, not sequentially inside this loop
+                    // (see `feed(fd:chunk:)`), so it may not have finished
+                    // yet. Close immediately only once it has; otherwise
+                    // defer to whichever dispatch finishes last
+                    // (`finishDispatch(fd:)`).
+                    if (inFlightDispatchCount[token] ?? 0) > 0 {
+                        framingDoneAwaitingDispatch.insert(token)
+                    } else {
+                        enqueueCloseAfterOutboundDrains(fd: fd, token: token)
+                    }
+                }
+                return
+            }
+            for chunk in chunks {
+                await feed(fd: fd, token: token, chunk: chunk)
+            }
         }
     }
 
@@ -514,12 +747,14 @@ public actor ControlChannelServer {
     /// (catches a not-yet-terminated line that has already grown too big
     /// before it ever completes, the original, still-correct case this
     /// guard has always covered).
-    private func feed(fd: Int32, chunk: Data) async {
-        guard var framer = framers[fd], let dispatcher = dispatchers[fd] else { return }
+    private func feed(fd: Int32, token: UUID, chunk: Data) async {
+        guard connectionTokens[fd] == token,
+              var framer = framers[fd],
+              let dispatcher = dispatchers[fd] else { return }
         let lines = framer.feed(chunk)
         framers[fd] = framer
         guard !lines.contains(where: { $0.utf8.count > ControlChannelDispatcher.maxRequestLineBytes }) else {
-            await refuseOversizedLine(fd: fd)
+            await refuseOversizedLine(fd: fd, token: token)
             return
         }
         // Bytes consumed by the lines just extracted (content + the
@@ -528,13 +763,76 @@ public actor ControlChannelServer {
         let consumed = lines.reduce(0) { $0 + $1.utf8.count + 1 }
         let totalPending = max(0, (pendingLineBytes[fd] ?? 0) + chunk.count - consumed)
         guard totalPending <= ControlChannelDispatcher.maxRequestLineBytes else {
-            await refuseOversizedLine(fd: fd)
+            await refuseOversizedLine(fd: fd, token: token)
             return
         }
         pendingLineBytes[fd] = totalPending
 
-        for line in lines {
-            await processLine(fd: fd, dispatcher: dispatcher, line: line)
+        // CF-01: framing (above) must stay strictly ordered -- it is the
+        // shared `LineFramer`/`pendingLineBytes` state a burst could
+        // corrupt -- but *dispatching* an already-framed line must not be.
+        // `dispatcher.handleLine(_:)` can take arbitrarily long (a held or
+        // slow `SessionModel` call); a later, independent request on this
+        // same connection must still resolve while an earlier one is still
+        // in flight, matched by id, not by arrival order
+        // (`ControlChannelClientTests
+        // .concurrentRequestsMatchByIdNotArrivalOrder`, pre-existing and
+        // unrelated to this fix). Once a line exists as an independent,
+        // immutable `String`, dispatching it concurrently touches none of
+        // the framing state above, so this cannot reintroduce CF-01.
+        var remainingLines = lines
+        // A first hello establishes per-connection state used by every
+        // following request. Complete it before dispatching pipelined lines;
+        // later independent requests remain concurrent as before.
+        if let first = remainingLines.first,
+           Self.methodName(of: Data(first.utf8)) == "hello" {
+            await processLine(fd: fd, token: token, dispatcher: dispatcher, line: first)
+            remainingLines.removeFirst()
+        }
+        for line in remainingLines {
+            dispatchLineConcurrently(fd: fd, token: token, dispatcher: dispatcher, line: line)
+        }
+    }
+
+    /// CF-01: dispatches one already-framed line as its own `Task`, tracked
+    /// by `inFlightDispatchCount` so `drainInbound(fd:)` can tell the
+    /// difference between "framing is done" and "every response owed for
+    /// what was framed has actually been enqueued" -- see
+    /// `finishDispatch(fd:)`, the only place that count is decremented.
+    private func dispatchLineConcurrently(fd: Int32, token: UUID, dispatcher: ControlChannelDispatcher, line: String) {
+        guard connectionTokens[fd] == token else { return }
+        guard (inFlightDispatchCount[token] ?? 0) < Self.inFlightRequestBound else {
+            closeConnection(fd, token: token)
+            return
+        }
+        inFlightDispatchCount[token, default: 0] += 1
+        Task {
+            guard await self.connectionTokens[fd] == token else { return }
+            await self.processLine(fd: fd, token: token, dispatcher: dispatcher, line: line)
+            await self.finishDispatch(fd: fd, token: token)
+        }
+    }
+
+    /// Runs after one dispatched line's response has been enqueued.
+    /// `drainInbound(fd:)` defers the close-after-EOF sentinel to here
+    /// (via `framingDoneAwaitingDispatch`) when framing finished while
+    /// dispatch was still catching up, so a connection can never close
+    /// while a response it already owes is still in flight.
+    private func finishDispatch(fd: Int32, token: UUID) {
+        guard connectionTokens[fd] == token else {
+            inFlightDispatchCount.removeValue(forKey: token)
+            framingDoneAwaitingDispatch.remove(token)
+            return
+        }
+        let remaining = (inFlightDispatchCount[token] ?? 1) - 1
+        if remaining <= 0 {
+            inFlightDispatchCount.removeValue(forKey: token)
+        } else {
+            inFlightDispatchCount[token] = remaining
+            return
+        }
+        if framingDoneAwaitingDispatch.remove(token) != nil {
+            enqueueCloseAfterOutboundDrains(fd: fd, token: token)
         }
     }
 
@@ -544,16 +842,17 @@ public actor ControlChannelServer {
     /// relay. The method-name and success sniffs are cheap, generic JSON
     /// shape checks (never a re-derivation of routing/gate logic, which
     /// stays entirely inside the dispatcher).
-    private func processLine(fd: Int32, dispatcher: ControlChannelDispatcher, line: String) async {
+    private func processLine(fd: Int32, token: UUID, dispatcher: ControlChannelDispatcher, line: String) async {
+        guard connectionTokens[fd] == token else { return }
         let lineData = Data(line.utf8)
         let isEventsSubscribeRequest = Self.methodName(of: lineData) == Self.eventsSubscribeMethod
         let responseData = await dispatcher.handleLine(lineData)
         if isEventsSubscribeRequest, Self.isSuccessResponse(responseData) {
-            startEventRelay(fd: fd, dispatcher: dispatcher)
+            startEventRelay(fd: fd, token: token, dispatcher: dispatcher)
         }
         var out = responseData
         out.append(0x0A)
-        enqueue(fd: fd, bytes: out, droppable: false)
+        enqueue(fd: fd, bytes: out, droppable: false, token: token)
     }
 
     private static let eventsSubscribeMethod = "events.subscribe"
@@ -578,7 +877,8 @@ public actor ControlChannelServer {
     /// the entry just appended) before the drain loop's own `Task` ever
     /// gets a turn to run it -- this refusal is the one write that must be
     /// on the wire *before* the descriptor closes, not merely queued.
-    private func refuseOversizedLine(fd: Int32) async {
+    private func refuseOversizedLine(fd: Int32, token: UUID) async {
+        guard connectionTokens[fd] == token else { return }
         let payload = ControlErrorPayload(
             .invalidParams,
             message: "Request line exceeded \(ControlChannelDispatcher.maxRequestLineBytes) bytes before a newline was seen."
@@ -586,9 +886,9 @@ public actor ControlChannelServer {
         if let data = try? JSONEncoder().encode(ControlResponseErrorEnvelope(id: 0, error: payload)) {
             var out = data
             out.append(0x0A)
-            await write(fd: fd, bytes: out)
+            await write(fd: fd, token: token, bytes: out)
         }
-        closeConnection(fd)
+        closeConnection(fd, token: token)
     }
 
     // MARK: Event relay (Task 3)
@@ -597,7 +897,7 @@ public actor ControlChannelServer {
     /// successfully, iterates the dispatcher's own event stream (snapshot
     /// first, then changes -- D-06) and enqueues each element as a
     /// droppable outbound entry. At most one relay task per connection.
-    private func startEventRelay(fd: Int32, dispatcher: ControlChannelDispatcher) {
+    private func startEventRelay(fd: Int32, token: UUID, dispatcher: ControlChannelDispatcher) {
         guard relayTasks[fd] == nil else { return }
         relayTasks[fd] = Task { [weak self] in
             let stream = await dispatcher.subscribeToEvents()
@@ -605,7 +905,7 @@ public actor ControlChannelServer {
                 guard let self else { return }
                 var out = eventData
                 out.append(0x0A)
-                await self.enqueue(fd: fd, bytes: out, droppable: true)
+                await self.enqueue(fd: fd, bytes: out, droppable: true, token: token)
             }
         }
     }
@@ -614,12 +914,16 @@ public actor ControlChannelServer {
     /// loop. When the queue exceeds `outboundQueueBound`, removes the
     /// *oldest droppable* entry (never a response) and counts it as
     /// dropped for this connection.
-    private func enqueue(fd: Int32, bytes: Data, droppable: Bool) {
-        guard connections[fd] != nil else { return }
+    private func enqueue(fd: Int32, bytes: Data, droppable: Bool, token: UUID? = nil) {
+        guard connections[fd] != nil,
+              token == nil || connectionTokens[fd] == token else { return }
         var queue = outboundQueues[fd] ?? []
         queue.append(OutboundEntry(bytes: bytes, droppable: droppable))
         while queue.count > Self.outboundQueueBound {
-            guard let dropIndex = queue.firstIndex(where: { $0.droppable }) else { break }
+            guard let dropIndex = queue.firstIndex(where: { $0.droppable }) else {
+                closeConnection(fd, token: token)
+                return
+            }
             queue.remove(at: dropIndex)
             droppedEventCounts[fd, default: 0] += 1
         }
@@ -627,21 +931,43 @@ public actor ControlChannelServer {
         kickDrain(fd: fd)
     }
 
+    /// CF-01: appends the close sentinel described on `OutboundEntry`
+    /// rather than closing directly -- see `drainInbound(fd:)`, the only
+    /// caller.
+    private func enqueueCloseAfterOutboundDrains(fd: Int32, token: UUID) {
+        guard connections[fd] != nil, connectionTokens[fd] == token else { return }
+        var queue = outboundQueues[fd] ?? []
+        queue.append(OutboundEntry(bytes: Data(), droppable: false, isCloseSentinel: true))
+        outboundQueues[fd] = queue
+        kickDrain(fd: fd)
+    }
+
     private func kickDrain(fd: Int32) {
-        guard !draining.contains(fd) else { return }
-        draining.insert(fd)
-        Task { await self.drainLoop(fd: fd) }
+        guard let token = connectionTokens[fd], !draining.contains(token) else { return }
+        draining.insert(token)
+        Task { await self.drainLoop(fd: fd, token: token) }
     }
 
     /// Pops one entry at a time, on the actor, then suspends on a
     /// continuation resumed from the connection's own write queue once the
     /// blocking write completes -- so a stalled peer suspends only its own
     /// connection's drain, never the actor and never another connection.
-    private func drainLoop(fd: Int32) async {
-        while connections[fd] != nil {
+    ///
+    /// CF-01: a popped close sentinel closes the connection right there
+    /// and returns, *before* attempting to write it (it carries no real
+    /// bytes) -- by the time it reaches the front of this FIFO queue,
+    /// every response enqueued before it has already been written.
+    private func drainLoop(fd: Int32, token: UUID) async {
+        defer { draining.remove(token) }
+        while connectionTokens[fd] == token, connections[fd] != nil {
             guard var queue = outboundQueues[fd], !queue.isEmpty else { break }
             let entry = queue.removeFirst()
             outboundQueues[fd] = queue
+
+            if entry.isCloseSentinel {
+                closeConnection(fd, token: token)
+                return
+            }
 
             if entry.droppable {
                 let dropped = droppedEventCounts[fd] ?? 0
@@ -649,21 +975,21 @@ public actor ControlChannelServer {
                     droppedEventCounts[fd] = 0
                     if var notice = Self.encodedDroppedNotice(droppedEvents: dropped) {
                         notice.append(0x0A)
-                        await write(fd: fd, bytes: notice)
+                        await write(fd: fd, token: token, bytes: notice)
                     }
                 }
             }
-            await write(fd: fd, bytes: entry.bytes)
+            await write(fd: fd, token: token, bytes: entry.bytes)
         }
-        draining.remove(fd)
     }
 
     /// The actual blocking `FileHandle.write(contentsOf:)`, performed on
     /// this connection's own dedicated serial queue -- never the actor,
     /// never `.main`. The actor only suspends on the continuation; it does
     /// not block.
-    private func write(fd: Int32, bytes: Data) async {
-        guard let handle = connections[fd] else { return }
+    private func write(fd: Int32, token: UUID? = nil, bytes: Data) async {
+        guard token == nil || connectionTokens[fd] == token,
+              let handle = connections[fd] else { return }
         let queue = outboundWriteQueue(for: fd)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async {
@@ -687,6 +1013,22 @@ public actor ControlChannelServer {
         )
     }
 
+    private struct SocketIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+    }
+
+    private static func socketIdentity(at path: String) throws -> SocketIdentity {
+        var info = stat()
+        guard lstat(path, &info) == 0 else {
+            throw ControlSocketError(context: "lstat(\(path))", errnoValue: errno)
+        }
+        guard (info.st_mode & S_IFMT) == S_IFSOCK else {
+            throw ControlSocketError(context: "\(path) is not a socket", errnoValue: EINVAL)
+        }
+        return SocketIdentity(device: info.st_dev, inode: info.st_ino)
+    }
+
     /// Closes a connection exactly once -- peer EOF, an oversized line, or
     /// `stop()` -- clearing the readability handler, closing the
     /// descriptor, and dropping every piece of this connection's state.
@@ -703,17 +1045,25 @@ public actor ControlChannelServer {
     /// busy suite a just-closed fd number is often already reassigned to
     /// an unrelated connection). Routing the close through the handle lets
     /// Foundation coordinate its own source teardown first.
-    private func closeConnection(_ fd: Int32) {
+    private func closeConnection(_ fd: Int32, token: UUID? = nil) {
+        if let token, connectionTokens[fd] != token { return }
         guard let handle = connections.removeValue(forKey: fd) else { return }
+        let currentToken = connectionTokens.removeValue(forKey: fd)
         handle.readabilityHandler = nil
         try? handle.close()
         framers.removeValue(forKey: fd)
         dispatchers.removeValue(forKey: fd)
         pendingLineBytes.removeValue(forKey: fd)
+        inboxes.removeValue(forKey: fd)
+        if let currentToken {
+            feedingInbound.remove(currentToken)
+            inFlightDispatchCount.removeValue(forKey: currentToken)
+            framingDoneAwaitingDispatch.remove(currentToken)
+        }
         outboundQueues.removeValue(forKey: fd)
         droppedEventCounts.removeValue(forKey: fd)
         writeQueues.removeValue(forKey: fd)
-        draining.remove(fd)
+        if let currentToken { draining.remove(currentToken) }
         relayTasks.removeValue(forKey: fd)?.cancel()
     }
 }

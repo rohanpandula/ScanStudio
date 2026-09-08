@@ -377,7 +377,7 @@ enum MotionStartRunner {
                     message: "\"\(command)\" was waiting on the job's event stream, but the control host went away.",
                     recoverable: false
                 )
-                let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human)
+                let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human, context: await client.cliEnvelopeContext)
                 print(text, terminator: "")
                 throw ExitCode(ControlCLIExitCode.noHostReachable.rawValue)
             }
@@ -386,7 +386,7 @@ enum MotionStartRunner {
                 return
             }
             let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
-            let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human)
+            let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human, context: await client.cliEnvelopeContext)
             print(text, terminator: "")
             await client.shutdown()
             let finalState = (try? JSONDecoder().decode(ControlJobResult.self, from: data))?.jobState

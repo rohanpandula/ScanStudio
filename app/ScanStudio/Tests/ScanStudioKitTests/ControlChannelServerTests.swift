@@ -9,6 +9,29 @@ private enum ControlServerStubError: Error {
     case unexpectedResultType
 }
 
+/// CF-02: an `NSLock`-guarded error collector for `DispatchQueue
+/// .concurrentPerform`'s multiple simultaneous worker closures --
+/// `E2ELineBuffer` (`ControlSocketEndToEndTests.swift`) is this
+/// repository's existing precedent for this exact shape (a small
+/// `@unchecked Sendable` type instead of a captured `var` mutated directly
+/// from concurrently-executing closures).
+private final class ControlServerErrorCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var errors: [Error] = []
+
+    func append(_ error: Error) {
+        lock.lock()
+        errors.append(error)
+        lock.unlock()
+    }
+
+    func snapshot() -> [Error] {
+        lock.lock()
+        defer { lock.unlock() }
+        return errors
+    }
+}
+
 /// `sim-ls5000-0`-shaped per the phase's hardware-safety constraint --
 /// `kind: "simulated"` keeps `hardwareMotionReadiness` at `.notApplicable`
 /// (`allowsMotion == true`), matching the real simulator this suite stands
@@ -169,7 +192,15 @@ private final class TestControlClient {
     func send(_ line: String) async throws {
         var mutableData = Data(line.utf8)
         mutableData.append(0x0A)
-        let data = mutableData
+        try await sendRawChunk(mutableData)
+    }
+
+    /// CF-01: writes exactly `data`'s bytes as their own `write(2)` call(s)
+    /// -- no newline appended -- so a burst test can split many request
+    /// lines into arbitrary, sub-line byte boundaries and issue each piece
+    /// as its own rapid, separate syscall, the shape that reproduces
+    /// out-of-order chunk feeding on the server side.
+    func sendRawChunk(_ data: Data) async throws {
         let fd = self.fd
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             ioQueue.async {
@@ -195,6 +226,15 @@ private final class TestControlClient {
                 }
             }
         }
+    }
+
+    /// CF-01: sends an EOF to the peer (`SHUT_WR`) while keeping this
+    /// client's own read side open, so a test can still read every
+    /// already-queued response back before the connection fully closes --
+    /// `close()` below tears down both directions at once and would
+    /// discard exactly the bytes such a test needs to observe.
+    func shutdownWriteSide() {
+        _ = Darwin.shutdown(fd, SHUT_WR)
     }
 
     /// Blocks (up to the receive timeout) until a full line is available;
@@ -312,6 +352,23 @@ struct ControlChannelServerTests {
         #expect(ControlSocketDialer.probeIsLive(path: path) == false)
     }
 
+    @Test("the bind lock refuses a symlink")
+    func bindLockRefusesSymlink() throws {
+        let path = shortSocketPath("lock-symlink")
+        let directory = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: false)
+        defer { removeSocketDirectory(for: path) }
+        try FileManager.default.createSymbolicLink(atPath: path + ".lock", withDestinationPath: path + ".target")
+
+        do {
+            _ = try ControlSocketPath.claim(path)
+            Issue.record("expected a symlinked bind lock to be refused")
+        } catch let error as ControlSocketError {
+            #expect(error.errnoValue == ELOOP)
+        }
+        #expect(FileManager.default.fileExists(atPath: path + ".target") == false)
+    }
+
     @MainActor
     @Test("A live listener is detected by probeIsLive, and a second start() at the same path refuses")
     func liveListenerRefusesSecondStart() async throws {
@@ -393,6 +450,40 @@ struct ControlChannelServerTests {
         await serverB.stop()
     }
 
+    @Test("CF-02: two first-ever prepareDirectory calls at a brand-new path both succeed, mkdir()'s EEXIST is success")
+    func concurrentPrepareDirectoryAtABrandNewPathAllSucceed() throws {
+        // Repeated against a fresh path each time -- CF-02 was a narrow
+        // check-then-`mkdir()` TOCTOU window, and a single lucky pass
+        // proves little about a race this tight.
+        for _ in 0..<20 {
+            let path = shortSocketPath("cf02-\(UInt32.random(in: 0..<UInt32.max))")
+            defer { removeSocketDirectory(for: path) }
+            let directory = (path as NSString).deletingLastPathComponent
+
+            let errors = ControlServerErrorCollector()
+            // Eight concurrent workers race `prepareDirectory(for:)` at a
+            // path that has never existed -- exactly the CF-02 window two
+            // first-ever `scanstudio-cli host` starters can hit. The old
+            // check-then-`mkdir()` let one loser observe `fileExists ==
+            // false`, lose the race to actually create it, and throw on
+            // `EEXIST`; `mkdir() == 0 || errno == EEXIST` being success
+            // closes it, so every worker here must return with no error.
+            DispatchQueue.concurrentPerform(iterations: 8) { _ in
+                do {
+                    try ControlSocketPath.prepareDirectory(for: path)
+                } catch {
+                    errors.append(error)
+                }
+            }
+            let collectedErrors = errors.snapshot()
+            #expect(collectedErrors.isEmpty, "expected every concurrent prepareDirectory call to succeed, got: \(collectedErrors)")
+
+            var info = stat()
+            #expect(stat(directory, &info) == 0, "the directory must exist after every racer returns")
+            #expect((info.st_mode & 0o777) == 0o700, "the unconditional chmod must still land regardless of which racer created the directory")
+        }
+    }
+
     @Test("WR-03: a connection accepted while stop() runs concurrently is closed too, never left open past stop()'s return")
     func adoptAfterStopClosesTheLateConnection() async throws {
         let path = shortSocketPath("adopt-after-stop")
@@ -461,6 +552,22 @@ struct ControlChannelServerTests {
     }
 
     @MainActor
+    @Test("stop leaves a replacement at the old socket path")
+    func stopPreservesReplacementPath() async throws {
+        let path = shortSocketPath("replacement")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        #expect(unlink(path) == 0)
+        let replacement = Data("replacement".utf8)
+        try replacement.write(to: URL(fileURLWithPath: path))
+        await server.stop()
+
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == replacement)
+    }
+
+    @MainActor
     @Test("start() sets the socket file to 0600 and its directory to 0700")
     func startSetsPermissions() async throws {
         let path = shortSocketPath("modes")
@@ -522,6 +629,61 @@ struct ControlChannelServerTests {
         }
         #expect(envelope.id == 1)
         #expect(envelope.result.schemaVersion == ControlSchema.version)
+        #expect(envelope.result.host == .gui)
+        #expect(envelope.result.hostPid == ProcessInfo.processInfo.processIdentifier)
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A headless server identifies itself in hello")
+    func headlessHelloReportsHostKindAndPid() async throws {
+        let path = shortSocketPath("hello-headless")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(
+            sessionModel: await makeIdleModel(ControlServerEngineStub()),
+            hostKind: .headless
+        )
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        guard let line = await client.readLine() else {
+            Issue.record("expected a hello response line")
+            return
+        }
+        struct HelloSuccessEnvelope: Decodable { let id: UInt64; let result: ControlHelloResult }
+        guard let envelope = try? JSONDecoder().decode(HelloSuccessEnvelope.self, from: Data(line.utf8)) else {
+            Issue.record("expected a decodable hello success envelope, got: \(line)")
+            return
+        }
+        #expect(envelope.result.host == .headless)
+        #expect(envelope.result.hostPid == ProcessInfo.processInfo.processIdentifier)
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("A pipelined hello is processed before the first status request")
+    func helloPrecedesPipelinedStatus() async throws {
+        let path = shortSocketPath("hello-pipeline")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        let hello = #"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#
+        let status = #"{"id":2,"method":"status","params":{}}"#
+        let pipelined = Data((hello + "\n" + status + "\n").utf8)
+        try await client.sendRawChunk(pipelined)
+        guard let helloLine = await client.readLine(), let statusLine = await client.readLine() else {
+            Issue.record("expected hello and status responses")
+            return
+        }
+        #expect(helloLine.contains(#""id":1"#), "hello must be the first response: \(helloLine)")
+        #expect(statusLine.contains(#""id":2"#), "status must be the second response: \(statusLine)")
+        let statusError = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(statusLine.utf8))
+        #expect(statusError?.error.code != ControlErrorCode.helloRequired.rawValue)
 
         client.close()
         await server.stop()
@@ -661,20 +823,16 @@ struct ControlChannelServerTests {
         // during this test's own development) caps a single `availableData`
         // read at 8,192 bytes -- nowhere near the 1 MiB bound, so a literal
         // single chunk exceeding it cannot be constructed through a real
-        // loopback socket here. Sending many small requests back-to-back
-        // without draining also risks a *separate*, pre-existing hazard
-        // this suite does not otherwise exercise: `availableData` firing
-        // several times in quick succession spawns one independent
-        // `Task { feed(...) }` per firing, and nothing serializes those
-        // Tasks relative to each other before they reach the shared
-        // `framers[fd]`/`pendingLineBytes[fd]` state, which (observed
-        // directly while developing this test) can corrupt framing under
-        // enough concurrent volume -- a real finding, but a different one,
-        // out of WR-01's own scope. Sending fully sequentially (one request
-        // round-tripped to completion before the next is sent) keeps
-        // exactly one `feed()` call in flight at a time, sidestepping that
-        // hazard entirely, while still proving WR-01's own claim: many
-        // small, complete lines whose bytes sum well past the 1 MiB bound
+        // loopback socket here. This test still sends fully sequentially
+        // (one request round-tripped to completion before the next is
+        // sent), which keeps exactly one `feed()` call in flight at a time
+        // -- not because of a still-open hazard (CF-01 now serializes
+        // every chunk through one ordered per-connection inbox regardless
+        // of how many `availableData` firings arrive back to back --
+        // `burstOfRequestsOnOneConnectionIsAnsweredInOrderWithNoSpuriousFailures`
+        // below is the dedicated proof of that), but because sequential
+        // round trips are simplest for what this test alone needs to show:
+        // WR-01's own claim -- many small, complete lines whose bytes sum well past the 1 MiB bound
         // over the connection's lifetime must never be refused, since
         // `pendingLineBytes` is the *current unterminated residual*, never
         // a running total of everything ever sent.
@@ -702,6 +860,121 @@ struct ControlChannelServerTests {
         #expect(
             totalBytesSent > ControlChannelDispatcher.maxRequestLineBytes,
             "test setup must actually exceed the bound in cumulative bytes sent"
+        )
+
+        client.close()
+        await server.stop()
+    }
+
+    /// Splits `data` into `pieceCount` roughly-even, byte-boundary (not
+    /// line-boundary) pieces -- several lines land inside one piece and
+    /// several pieces land inside one line, exercising both directions of
+    /// `LineFramer`'s own buffering rather than one write per line.
+    private func splitIntoChunks(_ data: Data, pieceCount: Int) -> [Data] {
+        let chunkSize = max(1, data.count / pieceCount)
+        var pieces: [Data] = []
+        var offset = data.startIndex
+        while offset < data.endIndex {
+            let end = data.index(offset, offsetBy: chunkSize, limitedBy: data.endIndex) ?? data.endIndex
+            pieces.append(data[offset..<end])
+            offset = end
+        }
+        return pieces
+    }
+
+    @Test("CF-01: a burst of request lines on one connection is answered in order, with no spurious id:0 or refusal")
+    func burstOfRequestsOnOneConnectionIsAnsweredInOrderWithNoSpuriousFailures() async throws {
+        let path = shortSocketPath("cf01-burst")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try await client.send(#"{"id":0,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        _ = await client.readLine() // hello response
+
+        let requestCount = 500
+        for burst in 0..<5 {
+            var combined = Data()
+            for id in 1...requestCount {
+                combined.append(Data(#"{"id":\#(id),"method":"status","params":{}}"#.utf8))
+                combined.append(0x0A)
+            }
+            // ~50 rapid separate write(2) calls, back to back with no
+            // delay -- the shape CF-01's old per-chunk `Task { feed(...) }`
+            // spawn could feed `LineFramer` out of order under.
+            for chunk in splitIntoChunks(combined, pieceCount: 50) {
+                try await client.sendRawChunk(chunk)
+            }
+
+            var seenIds: Set<UInt64> = []
+            for _ in 0..<requestCount {
+                guard let line = await client.readLine() else {
+                    Issue.record("burst \(burst): connection closed early, only \(seenIds.count)/\(requestCount) responses seen")
+                    break
+                }
+                guard let sniff = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(line.utf8)) else {
+                    Issue.record("burst \(burst): expected a decodable response envelope, got: \(line)")
+                    continue
+                }
+                #expect(sniff.id != 0, "burst \(burst): a spurious id:0 response means a request was mis-framed, got: \(line)")
+                if let errorEnvelope = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: Data(line.utf8)) {
+                    #expect(
+                        errorEnvelope.error.code != ControlErrorCode.invalidParams.rawValue
+                            && errorEnvelope.error.code != ControlErrorCode.unknownCommand.rawValue,
+                        "burst \(burst): request \(sniff.id) was spuriously refused: \(line)"
+                    )
+                }
+                seenIds.insert(sniff.id)
+            }
+            #expect(seenIds.count == requestCount, "burst \(burst): expected \(requestCount) distinct response ids, got \(seenIds.count)")
+            #expect(
+                seenIds == Set((1...requestCount).map(UInt64.init)),
+                "burst \(burst): response ids must be exactly 1...\(requestCount), missing: \(Set(1...requestCount).subtracting(seenIds.map { Int($0) }))"
+            )
+        }
+
+        client.close()
+        await server.stop()
+    }
+
+    @Test("CF-01: EOF on a connection never overtakes requests that arrived before it")
+    func endOfFileDoesNotOvertakeAlreadyReceivedRequests() async throws {
+        let path = shortSocketPath("cf01-eof")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path)
+        try await client.send(#"{"id":0,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"test"}}"#)
+        _ = await client.readLine() // hello response
+
+        let requestCount = 200
+        var combined = Data()
+        for id in 1...requestCount {
+            combined.append(Data(#"{"id":\#(id),"method":"status","params":{}}"#.utf8))
+            combined.append(0x0A)
+        }
+        for chunk in splitIntoChunks(combined, pieceCount: 40) {
+            try await client.sendRawChunk(chunk)
+        }
+        // Sent immediately after the last write, with no delay -- the
+        // exact race CF-01 closes: the old code's independent
+        // `Task { closeConnection(fd) }` for this EOF had no ordering
+        // guarantee relative to the still-in-flight `Task { feed(...) }`s
+        // for the requests just written, and could tear the connection
+        // down before every one of them was answered.
+        client.shutdownWriteSide()
+
+        var seenIds: Set<UInt64> = []
+        while let line = await client.readLine() {
+            if let sniff = try? JSONDecoder().decode(ControlServerResponseIdSniff.self, from: Data(line.utf8)) {
+                seenIds.insert(sniff.id)
+            }
+        }
+        #expect(
+            seenIds == Set((1...requestCount).map(UInt64.init)),
+            "every request sent before EOF must receive its response before the connection closes; got \(seenIds.count)/\(requestCount)"
         )
 
         client.close()
@@ -859,6 +1132,27 @@ struct ControlChannelServerTests {
 
         subscriber.close()
         bystander.close()
+        await server.stop()
+    }
+
+    @Test("an excessive request pipeline is disconnected at the in-flight bound")
+    func excessivePipelineIsDisconnected() async throws {
+        let path = shortSocketPath("pipeline-bound")
+        defer { removeSocketDirectory(for: path) }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlServerEngineStub()))
+        try await server.start(path: path)
+
+        let client = try TestControlClient(path: path, receiveTimeoutSeconds: 5)
+        try await client.send(#"{"id":1,"method":"hello","params":{"schemaVersion":\#(ControlSchema.version),"clientName":"pipeline"}}"#)
+        #expect(await client.readLine() != nil)
+
+        let lines = (0...ControlChannelServer.inFlightRequestBound)
+            .map { #"{"id":\#($0 + 2),"method":"status","params":{}}"# }
+            .joined(separator: "\n") + "\n"
+        try await client.sendRawChunk(Data(lines.utf8))
+        #expect(await client.readLine() == nil)
+
+        client.close()
         await server.stop()
     }
 

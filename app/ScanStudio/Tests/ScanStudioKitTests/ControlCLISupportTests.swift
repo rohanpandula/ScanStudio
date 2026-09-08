@@ -91,7 +91,7 @@ struct ControlCLISupportTests {
 
         #expect(object["schemaVersion"] as? Int == ControlSchema.version)
         #expect(object["command"] as? String == "status")
-        #expect(object["mode"] as? String == "attach")
+        #expect(object["mode"] as? String == "unreached")
         let result = try #require(object["result"] as? [String: Any])
         #expect(result["connected"] as? Bool == true)
     }

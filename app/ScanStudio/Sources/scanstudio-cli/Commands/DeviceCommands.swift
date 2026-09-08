@@ -156,7 +156,7 @@ struct Status: AsyncParsableCommand {
         }
         var object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
         object["reconnected"] = true
-        let text = try ControlCLIOutput.renderResult(command: "status", resultJSON: object, human: options.human)
+        let text = try ControlCLIOutput.renderResult(command: "status", resultJSON: object, human: options.human, context: await client.cliEnvelopeContext)
         print(text, terminator: "")
         await client.shutdown()
     }

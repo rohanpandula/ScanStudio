@@ -209,6 +209,7 @@ mkdir -p "$staged_app/Contents/MacOS" \
     "$staged_app/Contents/Frameworks/coolscanpy/_native" \
     "$staged_app/Contents/Resources"
 install -m 755 "$package_root/.build/release/ScanStudio" "$staged_app/Contents/MacOS/ScanStudio"
+install -m 755 "$package_root/.build/release/scanstudio-cli" "$staged_app/Contents/MacOS/scanstudio-cli"
 install -m 755 "$package_root/engine/target/release/scanstudio-engine" "$staged_app/Contents/MacOS/scanstudio-engine"
 install -m 755 "$package_root/packaging/ScanStudioLauncher" "$staged_app/Contents/MacOS/ScanStudioLauncher"
 install -m 755 "$package_root/packaging/ScanStudioBridge" "$staged_app/Contents/MacOS/scanstudio-bridge"
@@ -234,6 +235,10 @@ fi
 app_architectures="$(lipo -archs "$staged_app/Contents/MacOS/ScanStudio")"
 if [[ "$(lipo -archs "$staged_app/Contents/MacOS/scanstudio-engine")" != "arm64" ]]; then
     print -u2 "Refusing non-arm64 engine."
+    exit 1
+fi
+if [[ "$(lipo -archs "$staged_app/Contents/MacOS/scanstudio-cli")" != "arm64" ]]; then
+    print -u2 "Refusing non-arm64 scanstudio-cli."
     exit 1
 fi
 libusb_architectures="$(lipo -archs "$bundled_libusb")"
@@ -467,6 +472,43 @@ install -m 644 "$bundled_libusb_build/COPYING" "$staged_app/Contents/Resources/L
 install -m 644 "$bridge_runtime_prefix/lib/python3.13/LICENSE.txt" "$staged_app/Contents/Resources/Licenses/CPython-3.13.txt"
 install -m 644 "$package_root/../../THIRD_PARTY_NOTICES.md" "$staged_app/Contents/Resources/Licenses/THIRD_PARTY_NOTICES.md"
 install -m 644 "$package_root/engine/Cargo.lock" "$staged_app/Contents/Resources/Licenses/Rust-Cargo.lock"
+swift_resolved="$package_root/Package.resolved"
+if [[ ! -f "$swift_resolved" || -L "$swift_resolved" ]]; then
+    print -u2 "Refusing package: Package.resolved is missing, non-regular, or a symlink."
+    exit 1
+fi
+swift_argument_parser_pin="$("$bridge_python" -I -B - "$swift_resolved" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    pins = [pin for pin in json.load(stream).get("pins", [])
+            if pin.get("identity") == "swift-argument-parser"]
+if len(pins) != 1:
+    raise SystemExit("Package.resolved must contain exactly one swift-argument-parser pin")
+state = pins[0].get("state", {})
+version, revision = state.get("version"), state.get("revision")
+if not isinstance(version, str) or not version or not isinstance(revision, str) or not revision:
+    raise SystemExit("swift-argument-parser pin must contain a version and revision")
+print(f"{version}\t{revision}")
+PYTHON
+)"
+IFS=$'\t' read -r swift_argument_parser_version swift_argument_parser_revision <<< "$swift_argument_parser_pin"
+swift_argument_parser_license="$package_root/.build/checkouts/swift-argument-parser/LICENSE.txt"
+if [[ ! -f "$swift_argument_parser_license" || -L "$swift_argument_parser_license" ]]; then
+    print -u2 "Refusing package: resolved swift-argument-parser LICENSE.txt is missing, non-regular, or a symlink."
+    exit 1
+fi
+install -m 644 "$swift_argument_parser_license" \
+    "$staged_app/Contents/Resources/Licenses/swift-argument-parser-Apache-2.0.txt"
+cat > "$staged_app/Contents/Resources/Licenses/swift-argument-parser-NOTICE.txt" <<NOTICE
+swift-argument-parser
+Version: $swift_argument_parser_version
+Revision: $swift_argument_parser_revision
+License: Apache-2.0
+Upstream: https://github.com/apple/swift-argument-parser
+License text: swift-argument-parser-Apache-2.0.txt
+NOTICE
 mkdir -p "$staged_app/Contents/Resources/CorrespondingSource/libusb"
 install -m 644 \
     "$bundled_libusb_build/libusb-1.0.30.tar.bz2" \
@@ -611,9 +653,11 @@ The bundled hardware helper and CoolscanPy are GPL-3.0-only. Their complete
 corresponding source snapshots are in ../CorrespondingSource/scanstudio-bridge
 and ../CorrespondingSource/coolscanpy, with their GPL texts in this directory.
 CPython 3.13 and each included Python wheel's metadata/license material are
-listed in python-wheels. libusb 1.0.30 is dynamically loaded from the signed
-app bundle under LGPL-2.1-or-later; its license and notice are here and its
-complete pinned source archive is in ../CorrespondingSource/libusb. Normal
+listed in python-wheels. The statically linked swift-argument-parser license
+and resolved-version notice are in swift-argument-parser-*. libusb 1.0.30 is
+dynamically loaded from the signed app bundle under LGPL-2.1-or-later; its
+license and notice are here and its complete pinned source archive is in
+../CorrespondingSource/libusb. Normal
 LS-5000 color-roll detection, preview, and capture require no host driver.
 The python-sane 2.9.2 binding is built from the exact source and instructions
 in ../CorrespondingSource/python-sane against a private SANE 1.4.0 link SDK.
@@ -641,7 +685,9 @@ fi
 # build. Remove local symbol/debug tables after the source-path remap and
 # before signing so the distributed binary contains no builder filesystem
 # paths. This does not alter executable code.
-strip -S "$staged_app/Contents/MacOS/scanstudio-engine" "$staged_app/Contents/MacOS/ScanStudio"
+strip -S "$staged_app/Contents/MacOS/scanstudio-engine" \
+    "$staged_app/Contents/MacOS/scanstudio-cli" \
+    "$staged_app/Contents/MacOS/ScanStudio"
 
 # Signing identity: "-" (the default) keeps the ad-hoc signature every local
 # and PR-CI build has always produced. The release workflow exports the
@@ -695,6 +741,9 @@ codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "$bundled_li
 codesign --verify --strict "$bundled_libusb"
 codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "${runtime_flags[@]}" \
     "$staged_app/Contents/MacOS/scanstudio-engine"
+codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "${runtime_flags[@]}" \
+    "$staged_app/Contents/MacOS/scanstudio-cli"
+codesign --verify --strict "$staged_app/Contents/MacOS/scanstudio-cli"
 codesign --force --sign "$signing_identity" "${timestamp_flags[@]}" "${runtime_flags[@]}" \
     "$staged_app/Contents/MacOS/ScanStudio"
 codesign --force --deep --sign "$signing_identity" "${timestamp_flags[@]}" "${runtime_flags[@]}" \

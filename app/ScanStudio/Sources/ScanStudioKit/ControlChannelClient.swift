@@ -37,6 +37,7 @@ public enum ControlChannelClientError: Error, Equatable, Sendable {
     /// A response line matched a pending request's id but decoded as
     /// neither a success nor an error envelope.
     case malformedResponse
+    case helloTimedOut
 }
 
 // MARK: - Response
@@ -90,9 +91,14 @@ public actor ControlChannelClient {
     /// read the app's schema version and name after `open(path:)` returns,
     /// without re-deriving it from a second request.
     public private(set) var helloResult: ControlHelloResult?
+    public private(set) var cliEnvelopeContext: ControlCLIEnvelopeContext = .unreached
 
     private init(handle: FileHandle) {
         self.handle = handle
+    }
+
+    public func setCLIEnvelopeContext(_ context: ControlCLIEnvelopeContext) {
+        cliEnvelopeContext = context
     }
 
     /// Dials `path` via `ControlSocketDialer`'s own `dial(path:)` -- the
@@ -111,14 +117,23 @@ public actor ControlChannelClient {
     public static func open(
         path: String,
         clientName: String,
-        clientBuild: String? = nil
+        clientBuild: String? = nil,
+        helloTimeout: Duration = .seconds(2)
     ) async throws -> ControlChannelClient {
         let fd = try ControlSocketDialer.dial(path: path)
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
         let client = ControlChannelClient(handle: handle)
         await client.installReadabilityHandler()
         do {
-            try await client.sendHello(clientName: clientName, clientBuild: clientBuild)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { try await client.sendHello(clientName: clientName, clientBuild: clientBuild) }
+                group.addTask {
+                    try await Task.sleep(for: helloTimeout)
+                    throw ControlChannelClientError.helloTimedOut
+                }
+                defer { group.cancelAll() }
+                try await group.next()
+            }
         } catch {
             await client.shutdown()
             throw error
@@ -132,15 +147,30 @@ public actor ControlChannelClient {
     /// only synchronous work (`availableData`) happens in the handler
     /// itself; everything else hops into a `Task` immediately.
     private func installReadabilityHandler() {
+        let inbox = ControlConnectionInbox()
         handle.readabilityHandler = { [weak self] fileHandle in
             let data = fileHandle.availableData
-            guard let self else { return }
             if data.isEmpty {
-                Task { await self.shutdown() }
+                fileHandle.readabilityHandler = nil
+                inbox.markClosed()
             } else {
-                Task { await self.feed(data) }
+                inbox.append(data)
             }
+            Task { await self?.drain(inbox) }
         }
+    }
+
+    // Buffer synchronously before the actor hop. Independent Tasks cannot
+    // reorder stream fragments or let EOF discard the final response.
+    private func drain(_ inbox: ControlConnectionInbox) {
+        guard !isShutDown else { return }
+        let batch = inbox.take()
+        if batch.overflowed {
+            shutdown()
+            return
+        }
+        for chunk in batch.chunks { feed(chunk) }
+        if batch.closed { shutdown() }
     }
 
     private func sendHello(clientName: String, clientBuild: String?) async throws {
@@ -151,7 +181,11 @@ public actor ControlChannelClient {
         )
         switch try await performRequest(method: "hello", params: params) {
         case .result(let data):
-            helloResult = try? JSONDecoder().decode(ControlHelloResult.self, from: data)
+            guard let hello = try? JSONDecoder().decode(ControlHelloResult.self, from: data),
+                  hello.hostPid > 1 else {
+                throw ControlChannelClientError.malformedResponse
+            }
+            helloResult = hello
         case .failure(let payload):
             throw ControlChannelClientError.helloRefused(payload)
         }

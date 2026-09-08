@@ -108,6 +108,97 @@ class MacAcceptanceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'arm64 only'):
                 gate.verify_app(self.root)
 
+    def test_gate_socket_is_private_and_bounded(self):
+        for _ in range(20):
+            directory, socket_path = gate._gate_socket_directory()
+            try:
+                self.assertTrue(str(socket_path).startswith('/tmp/'))
+                self.assertNotEqual(socket_path.parent, Path('/tmp'))
+                self.assertLess(len(str(socket_path).encode()), 104)
+                self.assertTrue(directory.is_dir())
+            finally:
+                directory.rmdir()
+
+    def test_cli_json_reports_exit_and_output_context(self):
+        completed = type('Completed', (), {'returncode': 1, 'stdout': 'bad', 'stderr': 'diagnostic'})()
+        with patch.object(gate.subprocess, 'run', return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, 'scanstudio-cli.*stdout.*bad.*stderr.*diagnostic'):
+                gate._cli_json(Path('/tmp/scanstudio-cli'), Path('/tmp/s.sock'), self.root, 'status')
+            self.assertEqual(gate.subprocess.run.call_args.args[0],
+                             ['/tmp/scanstudio-cli', 'status', '--socket', '/tmp/s.sock'])
+            self.assertEqual(gate.subprocess.run.call_args.kwargs['env'], gate.isolated_environment(self.root))
+
+    def test_non_simulator_device_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'real-device'):
+            gate._require_simulator_devices({'result': {'devices': [{'deviceId': 'real-device'}]}})
+
+    def test_bundle_engine_pid_check_ignores_other_engine_paths(self):
+        output = ' 11 /Applications/Other.app/Contents/MacOS/scanstudio-engine\n 22 /tmp/Test App/scanstudio-engine --flag\n'
+        completed = type('Completed', (), {'stdout': output})()
+        with patch.object(gate.subprocess, 'run', return_value=completed):
+            self.assertEqual(gate._bundle_engine_pids(Path('/tmp/Test App/scanstudio-engine')), {22})
+
+    def test_cli_acceptance_stops_partial_batch_before_bounded_resume(self):
+        cli = self.root / 'ScanStudio.app/Contents/MacOS/scanstudio-cli'
+        cli.parent.mkdir(parents=True)
+        cli.write_bytes(b'packaged cli')
+        runtime = self.root / 'python3.13'
+        calls = []
+        statuses = iter([
+            {'mode': 'attach-headless', 'hostPid': 42, 'result': {}},
+            {'result': {'previewComplete': True}},
+            {'result': {'jobId': 'job-1', 'jobState': 'scanning', 'pendingFrames': [2, 3, 4, 5, 6]}},
+            {'result': {'jobId': None, 'jobState': 'stopped', 'pendingFrames': [2, 3, 4, 5, 6]}},
+            {'result': {'previewComplete': True}},
+        ])
+        roll = self.root / 'packaged-roll'
+        roll.mkdir()
+
+        def cli_json(_cli, socket_path, _root, *arguments, expect_exit=0):
+            calls.append((arguments, expect_exit, socket_path))
+            if arguments[:2] == ('host', '--detach'):
+                Path(arguments[-1]).touch()
+                Path(f'{socket_path}.pid').touch()
+                return {'result': {'hostPid': 42, 'logPath': arguments[-1]}}
+            if arguments == ('status',):
+                return next(statuses)
+            if arguments == ('rescan',):
+                return {'result': {'devices': [{'deviceId': 'sim-ls5000-0'}]}}
+            if arguments == ('frames', 'list'):
+                return {'result': {'frames': [{'index': index} for index in range(1, 7)]}}
+            if arguments[:2] == ('roll', 'save'):
+                return {'result': {'projectDirectory': str(roll)}}
+            if arguments[:1] == ('resume',):
+                return {'result': {'jobState': 'completed'}}
+            if arguments == ('eject',) and expect_exit == 77:
+                return {'error': {'code': 'CONFIRMATION_REQUIRED'}}
+            return {'result': {}}
+
+        preserved = {str(roll.resolve() / 'archive'): ['hash', 1, 2, 3]}
+        snapshots = {**preserved, str(roll.resolve() / 'positive'): ['hash2', 1, 3, 4]}
+        receipt_results = [({}, preserved, []), ({}, snapshots, [])]
+        with patch.object(gate, '_cli_json', side_effect=cli_json), \
+                patch.object(gate, '_bundle_engine_pids', side_effect=[{900}, {900, 901}, {900}]), \
+                patch.object(gate, 'verify_receipts', side_effect=receipt_results) as verify, \
+                patch.object(gate, 'decode_images'), patch.object(gate.time, 'sleep'):
+            report = gate.cli_acceptance(cli, runtime, self.root)
+
+        commands = [arguments for arguments, _, _ in calls]
+        self.assertIn('--simulator', commands[0])
+        save = next(command for command in commands if command[:2] == ('roll', 'save'))
+        self.assertNotIn('--wait', save)
+        self.assertLess(commands.index(save), commands.index(('stop',)))
+        self.assertIn(('status',), commands[commands.index(save) + 1:commands.index(('stop',))])
+        refresh = ('preview', '--film-loaded', '--intent', 'refreshSavedProject')
+        self.assertLess(commands.index(('stop',)), commands.index(refresh))
+        self.assertLess(commands.index(refresh), commands.index(('resume', '--confirm-motion', '--wait')))
+        self.assertLess(commands.index(('eject',)), commands.index(('eject', '--confirm-motion')))
+        self.assertLess(commands.index(('frames', 'exclude', '6')), commands.index(('frames', 'include', '6')))
+        self.assertEqual(verify.call_args_list[0].args[1], [1])
+        self.assertEqual(verify.call_args_list[1].args[1], list(range(1, 7)))
+        self.assertEqual(report['outputs'][str(Path('positive'))]['sha256'], 'hash2')
+        self.assertFalse(calls[0][2].parent.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

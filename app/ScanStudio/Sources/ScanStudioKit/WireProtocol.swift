@@ -438,9 +438,15 @@ public struct ConnectResult: Decodable, Sendable {
 
 public struct LoadMediaParams: Codable, Sendable {
     public let carrier: String
+    public let previewFixture: String?
+    public let abortAtFrame: Int?
+    public let abortCode: String?
 
-    public init(carrier: String) {
+    public init(carrier: String, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) {
         self.carrier = carrier
+        self.previewFixture = previewFixture
+        self.abortAtFrame = abortAtFrame
+        self.abortCode = abortCode
     }
 }
 

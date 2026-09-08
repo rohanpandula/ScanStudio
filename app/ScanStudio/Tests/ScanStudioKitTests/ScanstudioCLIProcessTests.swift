@@ -317,7 +317,7 @@ struct ScanstudioCLIProcessTests {
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         #expect(object["schemaVersion"] as? Int == ControlSchema.version)
         #expect(object["command"] as? String == "status")
-        #expect(object["mode"] as? String == "attach")
+        #expect(object["mode"] as? String == "attach-gui")
         #expect(object["result"] is [String: Any])
 
         await host.server.stop()

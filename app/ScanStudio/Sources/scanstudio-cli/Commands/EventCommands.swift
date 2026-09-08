@@ -49,20 +49,20 @@ struct Events: AsyncParsableCommand {
         }
         let subscribeObject = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
         let snapshot = subscribeObject["snapshot"] as? [String: Any] ?? [:]
-        try printEventLine(command: "events", eventName: "control.snapshot", payload: snapshot, human: options.human)
+        try await printEventLine(command: "events", eventName: "control.snapshot", payload: snapshot, human: options.human, context: await client.cliEnvelopeContext)
 
         for await line in await client.events() {
             let eventObject = ((try? JSONSerialization.jsonObject(with: line)) as? [String: Any]) ?? [:]
-            let text = try ControlCLIOutput.renderEvent(command: "events", eventJSON: eventObject, human: options.human)
+            let text = try ControlCLIOutput.renderEvent(command: "events", eventJSON: eventObject, human: options.human, context: await client.cliEnvelopeContext)
             print(text, terminator: "")
             fflush(stdout)
         }
         await client.shutdown()
     }
 
-    private func printEventLine(command: String, eventName: String, payload: [String: Any], human: Bool) throws {
+    private func printEventLine(command: String, eventName: String, payload: [String: Any], human: Bool, context: ControlCLIEnvelopeContext) throws {
         let eventJSON: [String: Any] = ["event": eventName, "payload": payload]
-        let text = try ControlCLIOutput.renderEvent(command: command, eventJSON: eventJSON, human: human)
+        let text = try ControlCLIOutput.renderEvent(command: command, eventJSON: eventJSON, human: human, context: context)
         print(text, terminator: "")
         fflush(stdout)
     }

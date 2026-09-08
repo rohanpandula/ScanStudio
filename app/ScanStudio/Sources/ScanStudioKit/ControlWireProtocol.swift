@@ -188,15 +188,31 @@ public struct ControlHelloParams: Codable, Equatable, Sendable {
     }
 }
 
+/// D-04: identifies which process owns a control socket.
+public enum ControlHostKind: String, Codable, Sendable, Equatable {
+    case gui
+    case headless
+}
+
 public struct ControlHelloResult: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let appName: String
     public let appVersion: String?
+    public let host: ControlHostKind
+    public let hostPid: Int32
 
-    public init(schemaVersion: Int, appName: String, appVersion: String? = nil) {
+    public init(
+        schemaVersion: Int,
+        appName: String,
+        appVersion: String? = nil,
+        host: ControlHostKind = .gui,
+        hostPid: Int32 = ProcessInfo.processInfo.processIdentifier
+    ) {
         self.schemaVersion = schemaVersion
         self.appName = appName
         self.appVersion = appVersion
+        self.host = host
+        self.hostPid = hostPid
     }
 }
 

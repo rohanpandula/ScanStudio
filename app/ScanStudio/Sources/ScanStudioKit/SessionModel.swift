@@ -1685,10 +1685,10 @@ public final class SessionModel {
 
     /// Loads a simulated carrier. Previewing remains an explicit next action
     /// after a roll project exists, matching the real scanner's honest flow.
-    public func loadCarrier(_ carrier: SimulatedFilmCarrier) async {
+    public func loadCarrier(_ carrier: SimulatedFilmCarrier, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async {
         lastErrorMessage = nil
         do {
-            let params = LoadMediaParams(carrier: carrier.rawValue)
+            let params = LoadMediaParams(carrier: carrier.rawValue, previewFixture: previewFixture, abortAtFrame: abortAtFrame, abortCode: abortCode)
             let newStatus: ScannerStatus = try await engineClient.request("sim.loadMedia", params: params)
             status = newStatus
             clearMediaState()

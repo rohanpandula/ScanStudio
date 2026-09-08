@@ -62,8 +62,10 @@
 # Environment overrides:
 #   HOST_MODE   which host the suite drives its CLI subprocesses against.
 #               Defaults to "in-process" (Phase 2's only value; Phase 3
-#               adds "headless", Phase 4 "bundle"). Read by the suite
-#               itself via the identically-named variable.
+#               adds "headless". `HOST_MODE=bundle` delegates to the packaged
+#               acceptance gate and requires `BUNDLE_APP`; it exercises the
+#               signed bundle's CLI and engine. None of these modes proves
+#               real hardware or the GUI.
 #
 # Exit code is nonzero on any failure; a green run ends with VERIFY_CLI_ATTACH OK.
 set -euo pipefail
@@ -74,9 +76,22 @@ ENGINE_DIR="$SWIFT_DIR/engine"
 
 HOST_MODE="${HOST_MODE:-in-process}"
 case "$HOST_MODE" in
-  in-process) ;;
+  bundle)
+    if [[ -z "${BUNDLE_APP:-}" ]]; then
+      printf 'FAIL HOST_MODE=bundle requires BUNDLE_APP\n' >&2
+      exit 1
+    fi
+    BUNDLE_CLI="$BUNDLE_APP/Contents/MacOS/scanstudio-cli"
+    [[ -x "$BUNDLE_CLI" ]] || { printf 'FAIL missing packaged CLI: %s\n' "$BUNDLE_CLI" >&2; exit 1; }
+    BUNDLE_PYTHON="$BUNDLE_APP/Contents/Resources/BridgeRuntime/python/bin/python3.13"
+    [[ -x "$BUNDLE_PYTHON" ]] || { printf 'FAIL missing bundled runtime Python: %s\n' "$BUNDLE_PYTHON" >&2; exit 1; }
+    "$BUNDLE_PYTHON" -I -S -B "$ROOT/scripts/verify_mac_acceptance.py" "$BUNDLE_APP"
+    printf 'VERIFY_CLI_ATTACH OK (host-mode=bundle, app=%s)\n' "$BUNDLE_APP"
+    exit 0
+    ;;
+  in-process|headless) ;;
   *)
-    printf 'FAIL unknown HOST_MODE "%s" (Phase 2 implements only "in-process"; Phase 3 adds "headless", Phase 4 adds "bundle")\n' "$HOST_MODE" >&2
+    printf 'FAIL unknown HOST_MODE "%s" (expected in-process, headless, or bundle)\n' "$HOST_MODE" >&2
     exit 1
     ;;
 esac

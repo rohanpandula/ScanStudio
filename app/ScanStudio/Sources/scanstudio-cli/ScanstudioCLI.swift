@@ -8,6 +8,7 @@
 // AsyncParsableCommand's own static entry-point method.
 
 import ArgumentParser
+import ScanStudioKit
 
 @main
 struct ScanstudioCLI: AsyncParsableCommand {
@@ -19,7 +20,7 @@ struct ScanstudioCLI: AsyncParsableCommand {
             Frames.self, Settings.self, Outputs.self, Roll.self, Diagnostics.self,
             Preview.self, Review.self, Eject.self,
             Scan.self, Stop.self, Resume.self,
-            Events.self
+            Events.self, Sim.self, Host.self
         ]
     )
 }
@@ -29,6 +30,11 @@ struct ScanstudioCLI: AsyncParsableCommand {
 /// `--socket` means the default attach path, `ControlSocketPath.defaultPath()`
 /// (`ScanStudioKit/ControlChannelServer.swift`).
 struct GlobalOptions: ParsableArguments {
+    @Flag(name: .customLong("attach"), help: "Require an existing host; never start one.")
+    var attach = false
+
+    @Flag(name: .customLong("headless"), help: "Require or start a headless host.")
+    var headless = false
     @Flag(
         name: .customLong("human"),
         help: "Render output as human-readable text instead of JSON."
@@ -52,4 +58,14 @@ struct GlobalOptions: ParsableArguments {
         help: "Suppress --wait's stderr progress lines. stdout is unaffected -- always exactly one JSON object."
     )
     var quiet = false
+
+    var hostPreference: ControlHostPreference {
+        headless ? .headlessOnly : (attach ? .attachOnly : .auto)
+    }
+
+    mutating func validate() throws {
+        if attach && headless {
+            throw ValidationError("--attach and --headless cannot be used together")
+        }
+    }
 }

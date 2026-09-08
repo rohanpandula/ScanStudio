@@ -1,122 +1,7 @@
-// Phase 2 plan 02-07: the end-to-end proof that a fresh agent with only
-// shell access can run a roll. Drives the real, built `scanstudio-cli`
-// binary as a genuine subprocess, over a real `AF_UNIX` socket, against an
-// in-process host bound to the real `scanstudio-engine` and `sim-ls5000-0`
-// -- no fake `EngineClientProtocol`, unlike every other suite in this
-// target. This is the one place in the phase a real engine subprocess runs.
-//
-// Opt-in via SCANSTUDIO_CLI_E2E=1: this suite needs a built debug engine
-// (`cargo build` in `app/ScanStudio/engine`) and a built CLI
-// (`swift build --product scanstudio-cli`), so a bare `swift test` (and
-// therefore `make test` and CI) must never pay that cost or require that
-// toolchain. `scripts/cli_attach_acceptance.sh` is how this suite is
-// actually run -- it builds both, exports SCANSTUDIO_ENGINE_PATH, and runs
-// this filtered target as its own mandatory, named phase gate.
-//
-// The host under test is a parameter (`EndToEndHostKind`) so Phase 3 can
-// point the same acceptance sequence at a headless host (HEAD-02) and
-// Phase 4 at the packaged bundle (PKG-02) as an addition to this enum, not
-// a rewrite of the sequence below -- every step only ever needs a socket
-// path to dial.
-//
-// ## Deviations from the plan's suggested order, and why
-//
-// D-17c's literal shape ("save -> scan --wait -> ...") and the plan's own
-// "suggested starting order" both put `frames list/exclude/include` BEFORE
-// `roll save`. Reading the shipped code (not just CONTROL.md's prose)
-// shows that is impossible: `ControlChannelDispatcher.validatedFrameIndex`
-// refuses `frames.include`/`frames.exclude` with `INVALID_PARAMS` unless
-// `sessionModel.project != nil` (`ControlChannelDispatcher.swift`'s own
-// "Frame selection validation" section), and `SessionModel.project` stays
-// `nil` until `createProject`/`roll.save`/`roll.open` runs -- a preview
-// alone never creates one. `frames.list` itself is literally driven by
-// `sessionModel.project?.frames ?? []`, so calling it before any project
-// exists would only prove it tolerates an empty project, not that frame
-// selection works. This suite therefore runs `frames list/exclude/include`
-// AFTER `roll save`, against the project `roll save` just created, which is
-// the only order the shipped code actually supports.
-//
-// A second finding, now CLOSED (CR-02, code-review fix): at the time this
-// suite was first written, `SessionModel.selectedFrameIndices` (what
-// `roll.save`/`scan.start` actually schedule) started empty and was
-// populated ONLY by GUI-only interactive methods (`selectFrame`,
-// `toggleFrameSelection`, `selectAllFrames`, `invertFrameSelection`) --
-// `scanner.thumbnail`'s event handler fills `thumbnails`, never
-// `selectedFrameIndices`. There was no D-08 channel command that selected a
-// frame before a project exists (`frames.include`/`frames.exclude` need the
-// project `roll.save` itself is waiting on a selection to create). A pure
-// CLI-only caller therefore had no way to make `roll save`'s selection
-// non-empty, and this suite's own host bridged the gap by calling
-// `SessionModel.selectAllFrames()` directly on the host process -- a
-// capability no real external CLI operator or agent has. The fix: a new
-// `frames.select` channel command (`ControlFramesSelectParams`, routed by
-// `ControlChannelDispatcher` to `SessionModel.setFrameSelection(_:)` /
-// `selectAllFrames()` / `clearFrameSelection()`) and its CLI counterpart
-// `frames select <ranges> | --all | --none`. This suite now drives frame
-// selection through the real CLI and socket (`frames select --all`, right
-// after the preview it drove through the real CLI completes), exactly like
-// every other step -- the host-side bridge below is gone.
-//
-// A third finding: `SessionModel`'s default capture recipe is 4000 DPI (the
-// real scanner's native resolution) -- a real, CPU-bound full-resolution
-// render whose cost `SCANSTUDIO_TIMESCALE` cannot touch (that variable only
-// scales simulated hardware motion delays). At the default, a single
-// simulated frame did not finish rendering within a generously bounded
-// wait. This suite exercises `settings set --resolution 100` before saving,
-// reaching the exact acceptance-testing resolution `scripts/
-// verify_mac_acceptance.py`'s own `RECIPE` already establishes as this
-// repository's sanctioned fast-path, over the real channel rather than
-// hand-copying the constant.
-//
-// A fourth finding: `SessionModel`'s scan-summary handler deliberately
-// clears `latestCompletedPreviewOperationId` whenever a job's summary
-// reports `stopped` ("never reuse interrupted transport registration to
-// authorize another run" -- the handler's own comment), and that same
-// signal gates both `scanReadiness`'s `hasTargetPreviews` decision and
-// `resumeBatch`'s own guard. A stopped job therefore cannot be resumed
-// without a fresh preview in between -- a genuine physical-safety property
-// (re-verify transport state before continuing an interrupted roll), not a
-// bug. This suite re-previews (`--intent refreshSavedProject`) after `stop`
-// and before `resume` to match what the shipped code actually requires.
-//
-// A fifth finding, in this suite's own harness rather than the shipped
-// product: `E2EEventsFollower.terminate()`'s original `process.terminate()`
-// + `process.waitUntilExit()` could hang indefinitely -- confirmed with
-// `sample` against a genuinely stuck run, which showed the whole suite
-// parked in `waitUntilExit()` after the SIGTERM had already been sent.
-// Fixed with the same bounded-wait-then-give-up shape this plan's own
-// constraints require of every subprocess teardown
-// (`AppDelegate.applicationWillTerminate`'s `DispatchSemaphore` +
-// `.wait(timeout:)` pattern), so a wedged reap can no longer hang the
-// suite.
-//
-// A sixth finding, in the shipped `--wait` mechanism itself: `sample`
-// against a second genuinely stuck run showed a `scan --confirm-motion
-// --wait` subprocess parked reading its own stdout (i.e. the CLI process
-// itself was still alive, waiting on `JobWaiter.waitForTerminalOutcome`'s
-// event loop), while a concurrent host-side poll showed the job had
-// already reached `jobId: nil, jobState: .completed`. `JobWaiter` requires
-// a terminal snapshot whose `jobId` is both non-nil and different from the
-// pre-start id; if `SessionModel` clears `jobId` back to `nil` in the same
-// update that reaches a terminal state, and the `@Observable`-driven event
-// relay coalesces that into one observed snapshot, the exact snapshot
-// `JobWaiter` needs never arrives. This reproduced intermittently, more
-// often for a fast-completing re-scan than a longer initial one, and
-// worse under this shared machine's own scheduling pressure. Not a bug
-// this plan's `files_modified` can fix. Every `runE2ECLI` call (see its
-// own doc comment) is therefore bounded and kills the subprocess on
-// timeout, converting a rare indefinite hang into a fast, diagnosable
-// failure -- exactly this plan's own "every subprocess gets a bounded
-// wait then a kill on teardown" constraint, applied to the one place it
-// was still missing.
-//
-// Coverage, not order, is otherwise exactly the plan's suggested shape:
-// connect -> status -> preview -> frames select --all (CR-02) -> settings/
-// outputs get -> roll save (starts job A) -> stop -> frames list/exclude/
-// include -> roll list -> re-preview -> resume --wait (drains what `stop`
-// left pending) -> scan --wait (a genuine re-scan of the now-fully-receipted
-// selection) -> eject -> diagnostics export -> events --follow, plus the two
-// negative paths.
+// Socket-only CLI acceptance against the real engine and simulated media.
+// Opt-in with SCANSTUDIO_CLI_E2E=1; HOST_MODE selects in-process or headless.
+// Uses 100 DPI to exercise real rendering cheaply. A stopped batch needs a
+// fresh preview before resume, matching the application's registration gate.
 
 import Foundation
 import Testing
@@ -130,171 +15,160 @@ import Darwin
 /// Exactly one case exists in Phase 2 -- Phase 3 adds a headless-host case
 /// (HEAD-02), Phase 4 a packaged-bundle case (PKG-02), each an addition to
 /// this enum rather than a rewrite of the sequence below.
-enum EndToEndHostKind: Sendable {
-    case inProcess
+enum EndToEndHostKind: String, Sendable {
+    case inProcess = "in-process", headless
 }
 
-/// Thrown when `HOST_MODE` (set by `scripts/cli_attach_acceptance.sh`,
-/// defaulting to `in-process` for a direct `swift test` invocation) names a
-/// host kind this phase does not implement yet.
-struct UnsupportedHostModeError: Error, CustomStringConvertible {
-    let hostMode: String
-    var description: String {
-        "HOST_MODE '\(hostMode)' is not supported in Phase 2 (only 'in-process' -- "
-            + "Phase 3 adds 'headless', Phase 4 adds 'bundle')."
-    }
-}
+struct UnsupportedHostModeError: Error { let hostMode: String }
 
-/// The `.inProcess` host: `EngineLocator.locate()` -> real `EngineClient` ->
-/// real `SessionModel` -> real `ControlChannelServer` on a short `/tmp`
-/// socket -- mirrors `AppDelegate.init()`/`applicationWillTerminate` minus
-/// AppKit (`ScanStudioApp.swift` lines ~176-201, ~255-269).
 @MainActor
 private struct EndToEndHost {
-    let kind = EndToEndHostKind.inProcess
-    let model: SessionModel
-    let engineClient: EngineClient
-    let server: ControlChannelServer
+    let kind: EndToEndHostKind
+    let handle: SessionHost.Handle?
+    let hostPid: Int32
     let socketPath: String
     let tempRoot: URL
-    private let originalHome: String?
-    private let originalTMPDIR: String?
-    private let originalTimeScale: String?
+    let enginePids: [Int32]
+    private let originalEnvironment: [String: String]
+    private static let isolatedKeys = [
+        "HOME", "TMPDIR", "SCANSTUDIO_TIMESCALE", "SCANSTUDIO_BRIDGE_CMD",
+        "SCANSTUDIO_HW_MOTION", "SCANSTUDIO_BRIDGE_SOURCE", "SCANSTUDIO_BRIDGE_PYTHON",
+        "SCANSTUDIO_BRIDGE_TRANSPORT", "SCANSTUDIO_BRIDGE_BASE_DIR", "SCANSTUDIO_TEST_PREFERENCES_SUITE"
+    ]
 
     static func start() async throws -> EndToEndHost {
-        // scripts/cli_attach_acceptance.sh sets HOST_MODE explicitly
-        // (defaulting to "in-process"); a direct `swift test` invocation
-        // leaves it unset, which defaults identically here. Phase 2
-        // implements exactly one host kind -- this is the seam Phase 3
-        // (HEAD-02, "headless") and Phase 4 (PKG-02, "bundle") extend.
-        let hostMode = ProcessInfo.processInfo.environment["HOST_MODE"] ?? "in-process"
-        guard hostMode == "in-process" else {
-            throw UnsupportedHostModeError(hostMode: hostMode)
+        let mode = ProcessInfo.processInfo.environment["HOST_MODE"] ?? "in-process"
+        guard let kind = EndToEndHostKind(rawValue: mode) else {
+            throw UnsupportedHostModeError(hostMode: mode)
         }
-
-        // Read SCANSTUDIO_ENGINE_PATH (if the caller set it) before this
-        // function touches any environment variable itself.
         let engineURL = try EngineLocator.locate()
-
-        let tempRoot = URL(
-            fileURLWithPath: "/tmp/ss-e2e-\(UInt32.random(in: 0..<UInt32.max))",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
-
-        let originalHome = ProcessInfo.processInfo.environment["HOME"]
-        let originalTMPDIR = ProcessInfo.processInfo.environment["TMPDIR"]
-        let originalTimeScale = ProcessInfo.processInfo.environment["SCANSTUDIO_TIMESCALE"]
-
-        // T-02-37/T-02-38: scrub before spawning the real engine, mirroring
-        // verify_mac_acceptance.py's isolated_environment(root). EngineClient
-        // (not in this plan's files_modified) has no environment-injection
-        // API -- its internal `Process` always inherits this test process's
-        // own ambient environment -- so this suite's own process environment
-        // is the only lever available; every child `Process()` this file or
-        // EngineClient spawns without an explicit `.environment` inherits it.
-        // Restored in `stop()`. Safe here only because this suite always
-        // runs in isolation (`.enabled(if:)` plus `--filter` in
-        // scripts/cli_attach_acceptance.sh) -- never concurrently with any
-        // other suite in the same `swift test` process.
-        setenv("HOME", tempRoot.path, 1)
-        setenv("TMPDIR", tempRoot.path, 1)
-        unsetenv("SCANSTUDIO_BRIDGE_CMD")
-        unsetenv("SCANSTUDIO_HW_MOTION")
-        // SessionModel.connect(deviceId:) reads this directly and passes it
-        // as the simulator's own ConnectOptions.timeScale -- no source
-        // change needed to make a 36-frame simulated roll fast. 0.1 matches
-        // this codebase's own engine/src/sim.rs #[test]s' convention
-        // (several use 0.01); 0.1 leaves headroom for this suite's own
-        // subprocess-spawn latency to reliably land `stop` mid-job rather
-        // than after the whole roll has already completed.
+        let root = URL(fileURLWithPath: "/tmp/ss-e2e-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let socket = root.appendingPathComponent("s.sock").path
+        let original = ProcessInfo.processInfo.environment
+        // The suite is serialized and runs alone. The in-process EngineClient
+        // inherits these values; every CLI child also gets an explicit copy.
+        for key in isolatedKeys { unsetenv(key) }
+        setenv("HOME", root.path, 1)
+        setenv("TMPDIR", root.path, 1)
         setenv("SCANSTUDIO_TIMESCALE", "0.1", 1)
-
-        let client = try EngineClient(engineURL: engineURL)
-        let model = SessionModel(
-            engineClient: client,
-            diagnosticsDirectory: tempRoot.appendingPathComponent("diagnostics", isDirectory: true)
-        )
-        let server = ControlChannelServer(sessionModel: model)
-
-        // Short /tmp path, never the app's own real default control socket
-        // location under the user's home directory -- mirrors
-        // ScanstudioCLIProcessTests.swift's shortSocketPath.
-        let socketDirectory = tempRoot.appendingPathComponent("sock", isDirectory: true)
-        try FileManager.default.createDirectory(at: socketDirectory, withIntermediateDirectories: true)
-        let socketPath = socketDirectory.appendingPathComponent("s.sock").path
-        precondition(
-            socketPath.utf8.count < 104,
-            "e2e socket path must be < 104 bytes, got \(socketPath.utf8.count): \(socketPath)"
-        )
-        try await server.start(path: socketPath)
-
-        // SessionModel.init() kicks off its own startup device discovery
-        // (mutatingOperationInFlight == "scanner.list", isDiscoveringDevices
-        // == true) before this function ever returns. A CLI step landing
-        // before that settles is refused CONTROLLER_BUSY -- found by
-        // running this suite against the real engine and reading the
-        // refusal's own message. Mirrors ScanstudioCLIProcessTests.swift's
-        // makeIdleModel, but with a bounded real sleep rather than a pure
-        // Task.yield() loop, since this is a real subprocess/engine timing
-        // domain, not a fake in-process stub.
-        for _ in 0..<3_000 where model.isDiscoveringDevices {
-            try? await Task.sleep(nanoseconds: 5_000_000)
+        setenv("SCANSTUDIO_TEST_PREFERENCES_SUITE", "dev.scanstudio.e2e.\(root.lastPathComponent)", 1)
+        var handle: SessionHost.Handle?
+        var pid = getpid()
+        do {
+            if kind == .inProcess {
+                handle = try await SessionHost.launch(
+                    engineURL: engineURL, socketPath: socket,
+                    diagnosticsDirectory: root.appendingPathComponent("diagnostics"), hostKind: .gui
+                )
+            } else {
+                let result = try await runE2ECLI([
+                    "host", "--detach", "--simulator", "--engine", engineURL.path,
+                    "--log", root.appendingPathComponent("host.log").path
+                ], socketPath: socket)
+                #expect(result.exitCode == 0, Comment(rawValue: result.context))
+                let envelope = try #require(try JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+                let body = try #require(envelope["result"] as? [String: Any])
+                pid = try #require((body["hostPid"] as? NSNumber)?.int32Value)
+            }
+            let enginePids = try childEngines(of: pid)
+            #expect(enginePids.count == 1, "expected exactly one engine under the host")
+            let host = EndToEndHost(kind: kind, handle: handle, hostPid: pid, socketPath: socket, tempRoot: root, enginePids: enginePids, originalEnvironment: original)
+            if let transcript = ProcessInfo.processInfo.environment["E2E_TRANSCRIPT"] {
+                try appendE2ETranscript(["mode": kind.rawValue, "hostPid": Int(pid)], to: transcript)
+            }
+            let idle = try await host.waitForStatus { $0["mutatingOperationInFlight"] == nil || $0["mutatingOperationInFlight"] is NSNull }
+            #expect(idle, "startup discovery did not settle")
+            return host
+        } catch {
+            if let handle { await SessionHost.shutdown(handle) }
+            if kind == .headless, pid > 1, pid != getpid() { kill(pid, SIGTERM) }
+            restoreEnvironment(original)
+            try? FileManager.default.removeItem(at: root)
+            throw error
         }
-
-        return EndToEndHost(
-            model: model,
-            engineClient: client,
-            server: server,
-            socketPath: socketPath,
-            tempRoot: tempRoot,
-            originalHome: originalHome,
-            originalTMPDIR: originalTMPDIR,
-            originalTimeScale: originalTimeScale
-        )
     }
 
-    /// Bounded wait then kill, mirroring `AppDelegate.applicationWillTerminate`'s
-    /// identical `server.stop()` + `client.terminate()` sequence, then
-    /// restores every environment variable `start()` touched and removes
-    /// this run's own temporary root. Safe to call even after a thrown
-    /// step -- every caller reaches this via `do`/`catch`.
-    func stop() async {
-        await server.stop()
-        await engineClient.terminate()
-        if let originalHome { setenv("HOME", originalHome, 1) } else { unsetenv("HOME") }
-        if let originalTMPDIR { setenv("TMPDIR", originalTMPDIR, 1) } else { unsetenv("TMPDIR") }
-        if let originalTimeScale {
-            setenv("SCANSTUDIO_TIMESCALE", originalTimeScale, 1)
-        } else {
-            unsetenv("SCANSTUDIO_TIMESCALE")
+    private static func restoreEnvironment(_ original: [String: String]) {
+        for key in isolatedKeys {
+            if let value = original[key] { setenv(key, value, 1) } else { unsetenv(key) }
         }
+    }
+
+    func stop() async {
+        if let handle { await SessionHost.shutdown(handle) }
+        else {
+            _ = try? await runE2ECLI(["host", "stop"], socketPath: socketPath, timeoutSeconds: 15)
+            if kill(hostPid, 0) == 0 { kill(hostPid, SIGKILL) }
+        }
+        for pid in enginePids {
+            let deadline = ContinuousClock.now + .seconds(3)
+            while kill(pid, 0) == 0 && ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(kill(pid, 0) != 0, "host shutdown leaked engine pid \(pid)")
+            if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        }
+        let suite = "dev.scanstudio.e2e.\(tempRoot.lastPathComponent)"
+        UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+        Self.restoreEnvironment(originalEnvironment)
         try? FileManager.default.removeItem(at: tempRoot)
     }
 
-    /// Bounded, real-sleep poll (never a pure `Task.yield()` loop -- plan
-    /// 02-06's own SUMMARY.md documents exactly why a yield-only loop can
-    /// starve against a real subprocess/engine timing domain) for the
-    /// preview this suite drove through the CLI to fully land, so
-    /// `selectAllFrames()` selects a fully-previewed set and `resume`'s own
-    /// later `latestCompletedPreviewOperationId` precondition is satisfied.
-    func waitUntilPreviewComplete() async -> Bool {
-        for _ in 0..<12_000 {
-            if model.latestCompletedPreviewOperationId != nil { return true }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        return model.latestCompletedPreviewOperationId != nil
+    private static func childEngines(of pid: Int32) throws -> [Int32] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-P", String(pid), "-f", "scanstudio-engine"]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (String(data: data, encoding: .utf8) ?? "").split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }
     }
 
-    /// Bounded, real-sleep poll for a requested stop to actually land
-    /// (`jobId` cleared, no job active) before `resume` -- which itself
-    /// requires `jobId == nil` -- is asked to run.
+    func assertSingleEngine() throws {
+        #expect(try Self.childEngines(of: hostPid) == enginePids)
+    }
+
+    func status() async throws -> [String: Any] {
+        let result = try await runE2ECLI(["status"], socketPath: socketPath)
+        #expect(result.exitCode == 0, Comment(rawValue: result.context))
+        let envelope = try #require(try JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        return try #require(envelope["result"] as? [String: Any])
+    }
+
+    func waitForStatus(_ predicate: ([String: Any]) -> Bool) async throws -> Bool {
+        let deadline = ContinuousClock.now + .seconds(60)
+        repeat {
+            if predicate(try await status()) { return true }
+            try await Task.sleep(for: .milliseconds(20))
+        } while ContinuousClock.now < deadline
+        return false
+    }
+
+    func waitUntilPreviewComplete() async -> Bool {
+        (try? await waitForStatus { $0["previewComplete"] as? Bool == true }) ?? false
+    }
+
+    func waitUntilScanReady() async -> Bool {
+        (try? await waitForStatus { $0["scanReadiness"] as? String == "ready" }) ?? false
+    }
+
     func waitUntilJobSettled() async -> Bool {
-        for _ in 0..<12_000 {
-            if model.jobId == nil && !model.isJobActive { return true }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        return model.jobId == nil && !model.isJobActive
+        (try? await waitForStatus { $0["jobId"] == nil || $0["jobId"] is NSNull }) ?? false
+    }
+
+    func loadMedia(previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async throws {
+        var args = ["sim", "load-media", "--carrier", "strip6"]
+        if let previewFixture { args += ["--preview-fixture", previewFixture] }
+        if let abortAtFrame { args += ["--abort-at-frame", String(abortAtFrame)] }
+        if let abortCode { args += ["--abort-code", abortCode] }
+        let result = try await runE2ECLI(args, socketPath: socketPath)
+        #expect(result.exitCode == 0, Comment(rawValue: result.context))
+        let body = try await status()
+        let scanner = try #require(body["scanner"] as? [String: Any])
+        #expect(scanner["mediaLoaded"] as? Bool == true)
     }
 }
 
@@ -342,6 +216,18 @@ private struct E2EStepResult {
         "step `scanstudio-cli \(arguments.joined(separator: " "))` exited \(exitCode)\n"
             + "stdout: \(stdout)\nstderr: \(stderr)"
     }
+}
+
+private func appendE2ETranscript(_ row: [String: Any], to path: String) throws {
+    var data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+    data.append(0x0a)
+    if !FileManager.default.fileExists(atPath: path) {
+        _ = FileManager.default.createFile(atPath: path, contents: nil)
+    }
+    let file = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+    defer { try? file.close() }
+    try file.seekToEnd()
+    try file.write(contentsOf: data)
 }
 
 /// Thrown when a CLI subprocess does not exit within `runE2ECLI`'s own
@@ -409,6 +295,7 @@ private func runE2ECLI(_ arguments: [String], socketPath: String, timeoutSeconds
     let process = Process()
     process.executableURL = binary
     process.arguments = allArguments
+    process.environment = ProcessInfo.processInfo.environment
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
     process.standardOutput = stdoutPipe
@@ -566,6 +453,7 @@ private final class E2EEventsFollower: @unchecked Sendable {
     .timeLimit(.minutes(10)),
     .serialized
 )
+@MainActor
 struct ControlSocketEndToEndTests {
     @Test("""
     the real scanstudio-cli binary drives a real EngineClient against sim-ls5000-0 through a real \
@@ -576,7 +464,16 @@ struct ControlSocketEndToEndTests {
         let host = try await EndToEndHost.start()
 
         func step(_ arguments: [String]) async throws -> E2EStepResult {
-            try await runE2ECLI(arguments, socketPath: host.socketPath)
+            let result = try await runE2ECLI(arguments, socketPath: host.socketPath)
+            if arguments.first == "resume" || Array(arguments.prefix(2)) == ["roll", "save"] {
+                try await host.assertSingleEngine()
+            }
+            if let path = ProcessInfo.processInfo.environment["E2E_TRANSCRIPT"] {
+                let body = (try? JSONSerialization.jsonObject(with: Data(result.stdout.utf8))) ?? result.stdout
+                let row: [String: Any] = ["args": arguments, "exit": result.exitCode, "stdout": body]
+                try appendE2ETranscript(row, to: path)
+            }
+            return result
         }
 
         func resultObject(_ result: E2EStepResult) throws -> [String: Any] {
@@ -628,12 +525,7 @@ struct ControlSocketEndToEndTests {
             let connectedDevice = try #require(statusBody["device"] as? [String: Any], Comment(rawValue: statusResult.context))
             #expect(connectedDevice["deviceId"] as? String == "sim-ls5000-0")
 
-            // -- Simulator media setup: no D-08 command loads simulated
-            // media (it is engine-level, not channel-level -- see this
-            // file's own header comment and this plan's <interfaces>).
-            // Reached directly on the host, exactly as sim.loadMedia is in
-            // verify_mac_acceptance.py's Engine.connect().
-            await host.model.loadCarrier(.strip6)
+            try await host.loadMedia()
 
             // -- preview --
             let previewResult = try await step(["preview", "--film-loaded"])
@@ -655,7 +547,7 @@ struct ControlSocketEndToEndTests {
             // directly.
             let selectAllResult = try await step(["frames", "select", "--all"])
             #expect(selectAllResult.exitCode == 0, Comment(rawValue: selectAllResult.context))
-            let selectedFrameCount = await host.model.selectedFrames.count
+            let selectedFrameCount = (try await host.status()["selectedFrames"] as? [Int])?.count ?? 0
             #expect(selectedFrameCount == 6, "frames select --all did not select all 6 previewed frames")
 
             // -- settings / outputs (read-only) --
@@ -729,14 +621,8 @@ struct ControlSocketEndToEndTests {
             #expect(stopResult.exitCode == 0, Comment(rawValue: stopResult.context))
             let stopped = await host.waitUntilJobSettled()
             if !stopped {
-                let jobId = await host.model.jobId
-                let isJobActive = await host.model.isJobActive
-                let jobState = await host.model.jobState
-                let pending = await host.model.pendingFrameCount
-                let completed = await host.model.completedFrameCount
-                let message: String = "job did not settle: jobId=\(String(describing: jobId)) isJobActive=\(isJobActive) "
-                    + "jobState=\(String(describing: jobState)) pending=\(pending) completed=\(completed)"
-                Issue.record(Comment(rawValue: message))
+                let status = try await host.status()
+                Issue.record("stop did not settle: \(status)")
             }
 
             // -- frames list / exclude / include: only meaningful once a
@@ -779,8 +665,8 @@ struct ControlSocketEndToEndTests {
             #expect(rePreviewResult.exitCode == 0, Comment(rawValue: rePreviewResult.context))
             let rePreviewBody = try resultObject(rePreviewResult)
             #expect(rePreviewBody["outcome"] as? String == "started", Comment(rawValue: rePreviewResult.context))
-            let rePreviewCompleted = await host.waitUntilPreviewComplete()
-            #expect(rePreviewCompleted, "re-preview after stop did not reach scanner.thumbnailsComplete within the bound")
+            let rePreviewCompleted = await host.waitUntilScanReady()
+            #expect(rePreviewCompleted, "re-preview after stop did not restore scan readiness within the bound")
 
             // -- resume --confirm-motion --wait: drains whatever `stop`
             // left pending. Blocks on the real event stream -- no polling,
@@ -875,25 +761,8 @@ struct ControlSocketEndToEndTests {
             try #require(try envelopeObject(result)["result"] as? [String: Any], Comment(rawValue: result.context))
         }
 
-        /// `SessionModel.loadCarrier(_:)` does not yet carry a
-        /// `previewFixture` argument -- plan 03-04 owns extending the
-        /// control-level `sim.loadMedia` wiring for that. This test drives
-        /// the engine's own `sim.loadMedia` a second time, directly
-        /// through the host's `engineClient`, with the fixture added.
-        /// Re-loading the identical carrier is idempotent for every field
-        /// `SessionModel.status` already holds from the `loadCarrier(_:)`
-        /// call that must precede this one -- so this call only arms the
-        /// fixture, it changes nothing `SessionModel`-observable.
-        struct FixtureLoadMediaParams: Encodable, Sendable {
-            let carrier: String
-            let previewFixture: String
-        }
         func armBoundaryAndBlankFixture(on host: EndToEndHost) async throws {
-            await host.model.loadCarrier(.strip6)
-            let _: ScannerStatus = try await host.engineClient.request(
-                "sim.loadMedia",
-                params: FixtureLoadMediaParams(carrier: SimulatedFilmCarrier.strip6.rawValue, previewFixture: "boundaryAndBlank")
-            )
+            try await host.loadMedia(previewFixture: "boundaryAndBlank")
         }
 
         // ---- Host A: status --refresh, pre-project blankConfidence,
@@ -1191,22 +1060,6 @@ struct ControlSocketEndToEndTests {
             try #require(try envelopeObject(result)["error"] as? [String: Any], Comment(rawValue: result.context))
         }
 
-        /// D-20/HEAD-12: the batch-abort test affordance. `LoadMediaParams`
-        /// (WireProtocol.swift) does not carry `abortAtFrame`/`abortCode`
-        /// -- mirrors `d18AutomationSurfaces`'s own `FixtureLoadMediaParams`
-        /// exactly: drives the engine's `sim.loadMedia` a second time
-        /// directly through the host's `engineClient`, since no D-08
-        /// channel command loads simulated media at all (this file's own
-        /// header comment). The first `loadCarrier(_:)` call establishes
-        /// `SessionModel.status` client-side; this second, raw call is
-        /// idempotent for every field that call already set and additive
-        /// only for the abort arm.
-        struct BatchAbortLoadMediaParams: Encodable, Sendable {
-            let carrier: String
-            let abortAtFrame: Int
-            let abortCode: String
-        }
-
         do {
             // -- Device enumeration guard (T-02-37), copied from
             // fullAcceptanceSequence: every enumerated deviceId is sim-
@@ -1228,13 +1081,7 @@ struct ControlSocketEndToEndTests {
 
             // Arms the abort at frame 3 with the exact bridge code the
             // 2026-09-07 incident itself raised.
-            await host.model.loadCarrier(.strip6)
-            let _: ScannerStatus = try await host.engineClient.request(
-                "sim.loadMedia",
-                params: BatchAbortLoadMediaParams(
-                    carrier: SimulatedFilmCarrier.strip6.rawValue, abortAtFrame: 3, abortCode: "ROLL_MISMATCH"
-                )
-            )
+            try await host.loadMedia(abortAtFrame: 3, abortCode: "ROLL_MISMATCH")
 
             let previewResult = try await step(["preview", "--film-loaded"])
             #expect(previewResult.exitCode == 0, Comment(rawValue: previewResult.context))

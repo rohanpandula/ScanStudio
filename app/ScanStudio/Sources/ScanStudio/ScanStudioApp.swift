@@ -172,27 +172,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let updateFlowModel: UpdateFlowModel
     /// Cancellable handle for the rolling 24 h background check task.
     private var backgroundUpdateTask: Task<Void, Never>?
-    /// D-05: the running app's control-channel server. Deliberately *not*
-    /// a `LaunchState` case -- a socket start failure must leave the GUI
-    /// fully functional, never flipping `launchState` to its failed case.
-    /// `nil` when `launchState` never reached `.ready` (no `SessionModel`
-    /// to serve).
-    private var controlServer: ControlChannelServer?
+    private var sessionHostHandle: SessionHost.Handle?
 
     override init() {
         do {
-            let engineURL = try EngineLocator.locate()
-            let client = try EngineClient(engineURL: engineURL)
-            let diagnosticsDirectory = FileManager.default
-                .homeDirectoryForCurrentUser
-                .appendingPathComponent(".scanstudio/diagnostics", isDirectory: true)
-            let model = SessionModel(
-                engineClient: client,
-                diagnosticsDirectory: diagnosticsDirectory
+            // Keep launchState synchronous for AppKit, while SessionHost
+            // owns the shared engine/model/server construction (D-01).
+            let handle = try SessionHost.prepare(
+                socketPath: ControlSocketPath.defaultPath(),
+                preferences: SessionHost.sharedPreferences(),
+                hostKind: .gui
             )
+            guard let client = handle.engineClient as? EngineClient else {
+                throw NSError(
+                    domain: "ScanStudio.SessionHost",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "SessionHost returned a non-production engine client."]
+                )
+            }
+            let model = handle.model
             launchState = .ready(client: client, model: model)
+            sessionHostHandle = handle
         } catch {
             launchState = .failed(message: AppDelegate.describe(error))
+            sessionHostHandle = nil
         }
 
         updateFlowModel = Self.makeUpdateFlowModel()
@@ -217,11 +220,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // filesystem probe, no path removal) -- a socket left behind by
             // a crash is reclaimed entirely by `ControlChannelServer`'s own
             // probe-then-reclaim (plan 02-02).
-            let server = ControlChannelServer(sessionModel: session)
-            controlServer = server
+            guard let handle = sessionHostHandle else { return }
             Task {
                 do {
-                    try await server.start(path: ControlSocketPath.defaultPath())
+                    try await SessionHost.serve(handle)
                 } catch {
                     NSLog("control.server.failed: %@", AppDelegate.describe(error))
                 }
@@ -252,17 +254,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         backgroundUpdateTask?.cancel()
-        guard case .ready(let client, _) = launchState else { return }
+        guard let handle = sessionHostHandle else { return }
         // D-05: the control server joins the same bounded wait the engine
         // client's own teardown already uses -- one detached task, one
         // semaphore, no extended deadline. Read onto a local `let` first
         // (rather than capturing `self`) so the detached task only closes
         // over `Sendable` actor references, matching `client` below.
-        let server = controlServer
         let finished = DispatchSemaphore(value: 0)
         Task.detached {
-            await server?.stop()
-            await client.terminate()
+            await SessionHost.shutdown(handle)
             finished.signal()
         }
         _ = finished.wait(timeout: .now() + 2)

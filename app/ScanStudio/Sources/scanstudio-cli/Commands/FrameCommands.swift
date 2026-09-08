@@ -243,7 +243,8 @@ private func applyFrameSelection(
             // refusal of that code would normally mean.
             let text = try renderFrameSelectionRefusal(
                 command: command, payload: payload, applied: applied,
-                failedIndex: index, human: options.human
+                failedIndex: index, human: options.human,
+                context: await client.cliEnvelopeContext
             )
             print(text, terminator: "")
             await client.shutdown()
@@ -268,9 +269,10 @@ private func renderFrameSelectionRefusal(
     payload: ControlErrorPayload,
     applied: [Int],
     failedIndex: Int,
-    human: Bool
+    human: Bool,
+    context: ControlCLIEnvelopeContext = .unreached
 ) throws -> String {
-    let base = try ControlCLIOutput.renderError(command: command, payload: payload, human: human)
+    let base = try ControlCLIOutput.renderError(command: command, payload: payload, human: human, context: context)
     guard !human else {
         let appliedLines = applied.map { "  - \($0)" }.joined(separator: "\n")
         return base
@@ -325,7 +327,7 @@ private func runSkipBlank(threshold: Double, options: GlobalOptions) async throw
         try renderSkipBlankRefusal(
             command: command,
             message: "\"frames select --skip-blank\" found no previewed frames -- no preview has completed yet.",
-            options: options
+            options: options, context: await client.cliEnvelopeContext
         )
         throw ExitCode(64)
     }
@@ -338,7 +340,7 @@ private func runSkipBlank(threshold: Double, options: GlobalOptions) async throw
         try renderSkipBlankRefusal(
             command: command,
             message: "\"frames select --skip-blank\" would select no frames: every previewed frame scored at or above the \(threshold) threshold (highest \(highestScore)).",
-            options: options
+            options: options, context: await client.cliEnvelopeContext
         )
         throw ExitCode(64)
     }
@@ -353,20 +355,20 @@ private func runSkipBlank(threshold: Double, options: GlobalOptions) async throw
     switch selectResponse {
     case .result(let data):
         let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
-        let base = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human)
+        let base = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human, context: await client.cliEnvelopeContext)
         print(try mergeSkippedIntoRenderedOutput(base, skipped: skipped, human: options.human), terminator: "")
         await client.shutdown()
     case .failure(let payload):
-        let base = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human)
+        let base = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human, context: await client.cliEnvelopeContext)
         print(try mergeSkippedIntoRenderedOutput(base, skipped: skipped, human: options.human), terminator: "")
         await client.shutdown()
         throw ExitCode(ControlCLIExitCode.forErrorCode(payload.code).rawValue)
     }
 }
 
-private func renderSkipBlankRefusal(command: String, message: String, options: GlobalOptions) throws {
+private func renderSkipBlankRefusal(command: String, message: String, options: GlobalOptions, context: ControlCLIEnvelopeContext = .unreached) throws {
     let payload = ControlErrorPayload(code: ControlCLIErrorCode.invalidRange.rawValue, message: message, recoverable: false)
-    let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human)
+    let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human, context: context)
     print(text, terminator: "")
 }
 

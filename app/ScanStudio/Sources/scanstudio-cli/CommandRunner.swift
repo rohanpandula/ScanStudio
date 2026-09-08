@@ -38,7 +38,20 @@ enum CommandRunner {
     static func openConnection(command: String, options: GlobalOptions) async throws -> ControlChannelClient {
         let path = socketPath(options)
         do {
-            return try await ControlChannelClient.open(path: path, clientName: clientName)
+            let resolution = try await ControlHostDecision.resolve(
+                command: command, socketPath: path, preference: options.hostPreference
+            )
+            let client = try await ControlChannelClient.open(path: path, clientName: clientName)
+            await client.setCLIEnvelopeContext(ControlCLIEnvelopeContext(
+                mode: resolution.mode,
+                hostStarted: resolution.hostStarted,
+                hostPid: resolution.hostPid,
+                logPath: resolution.logPath
+            ))
+            return client
+        } catch let error as ControlHostDecisionError {
+            try emitFailure(command: command, options: options, payload: error.payload)
+            throw ExitCode(error.exitCode.rawValue)
         } catch let error as ControlSocketError {
             try emitFailure(command: command, options: options, payload: hostUnreachablePayload(path: path, error: error))
             throw ExitCode(ControlCLIExitCode.noHostReachable.rawValue)
@@ -63,8 +76,9 @@ enum CommandRunner {
         do {
             return try await client.request(method: method, params: params)
         } catch {
+            let context = await client.cliEnvelopeContext
             await client.shutdown()
-            try emitFailure(command: command, options: options, payload: internalPayload(command: command, error: error))
+            try emitFailure(command: command, options: options, payload: internalPayload(command: command, error: error), context: context)
             throw ExitCode(ControlCLIExitCode.internalError.rawValue)
         }
     }
@@ -113,10 +127,12 @@ enum CommandRunner {
         switch response {
         case .result(let data):
             let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
-            try emitResult(command: command, options: options, resultJSON: object)
+            let context = await client.cliEnvelopeContext
+            try emitResult(command: command, options: options, resultJSON: object, context: context)
             await client.shutdown()
         case .failure(let payload):
-            try emitFailure(command: command, options: options, payload: payload)
+            let context = await client.cliEnvelopeContext
+            try emitFailure(command: command, options: options, payload: payload, context: context)
             await client.shutdown()
             throw ExitCode(ControlCLIExitCode.forErrorCode(payload.code).rawValue)
         }
@@ -128,18 +144,19 @@ enum CommandRunner {
     /// succeeded (for example, `status --job`'s job.get response failing
     /// to decode). Never returns.
     static func fail(command: String, options: GlobalOptions, client: ControlChannelClient, error: Error) async throws -> Never {
+        let context = await client.cliEnvelopeContext
         await client.shutdown()
-        try emitFailure(command: command, options: options, payload: internalPayload(command: command, error: error))
+        try emitFailure(command: command, options: options, payload: internalPayload(command: command, error: error), context: context)
         throw ExitCode(ControlCLIExitCode.internalError.rawValue)
     }
 
-    private static func emitResult(command: String, options: GlobalOptions, resultJSON: [String: Any]) throws {
-        let text = try ControlCLIOutput.renderResult(command: command, resultJSON: resultJSON, human: options.human)
+    private static func emitResult(command: String, options: GlobalOptions, resultJSON: [String: Any], context: ControlCLIEnvelopeContext = .unreached) throws {
+        let text = try ControlCLIOutput.renderResult(command: command, resultJSON: resultJSON, human: options.human, context: context)
         print(text, terminator: "")
     }
 
-    private static func emitFailure(command: String, options: GlobalOptions, payload: ControlErrorPayload) throws {
-        let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human)
+    private static func emitFailure(command: String, options: GlobalOptions, payload: ControlErrorPayload, context: ControlCLIEnvelopeContext = .unreached) throws {
+        let text = try ControlCLIOutput.renderError(command: command, payload: payload, human: options.human, context: context)
         print(text, terminator: "")
     }
 

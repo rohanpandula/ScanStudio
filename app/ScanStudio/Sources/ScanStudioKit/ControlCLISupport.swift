@@ -47,7 +47,8 @@ public enum ControlCLIExitCode: Int32, Sendable {
             return .internalError
         case ControlCLIErrorCode.hostUnreachable.rawValue:
             return .noHostReachable
-        case ControlErrorCode.controllerBusy.rawValue:
+        case ControlErrorCode.controllerBusy.rawValue,
+             ControlCLIErrorCode.hostAlreadyRunning.rawValue:
             return .busy
         case ControlErrorCode.confirmationRequired.rawValue:
             return .confirmationRequired
@@ -73,6 +74,7 @@ public enum ControlCLIErrorCode: String, Sendable {
     case invalidRange = "INVALID_RANGE"
     case jobNotFound = "JOB_NOT_FOUND"
     case internalCode = "INTERNAL"
+    case hostAlreadyRunning = "HOST_ALREADY_RUNNING"
 }
 
 // MARK: - Output envelope (D-09/OUT-01)
@@ -86,6 +88,24 @@ public struct ControlCLIOutputError: Error, Equatable, Sendable {
     public let reason: String
 }
 
+public struct ControlCLIEnvelopeContext: Sendable, Equatable {
+    public let mode: ControlHostMode
+    public let hostStarted: Bool
+    public let hostPid: Int32?
+    public let logPath: String?
+
+    public init(mode: ControlHostMode, hostStarted: Bool, hostPid: Int32?, logPath: String?) {
+        self.mode = mode
+        self.hostStarted = hostStarted
+        self.hostPid = hostPid
+        self.logPath = logPath
+    }
+
+    public static let unreached = ControlCLIEnvelopeContext(
+        mode: .unreached, hostStarted: false, hostPid: nil, logPath: nil
+    )
+}
+
 /// Renders every CLI command's output as one JSON envelope (`schemaVersion`,
 /// `command`, `mode: "attach"`, plus the command's own payload nested under
 /// `result`/`error`/`event`), or as indented human text when `--human` is
@@ -97,15 +117,15 @@ public enum ControlCLIOutput {
     /// Renders a successful command result. `resultJSON` is the
     /// already-decoded `result` payload for whichever command is running --
     /// this file has no per-command knowledge of its shape.
-    public static func renderResult(command: String, resultJSON: [String: Any], human: Bool) throws -> String {
-        try render(envelope(command: command, key: "result", value: resultJSON), human: human)
+    public static func renderResult(command: String, resultJSON: [String: Any], human: Bool, context: ControlCLIEnvelopeContext = .unreached) throws -> String {
+        try render(envelope(command: command, key: "result", value: resultJSON, context: context), human: human)
     }
 
     /// Renders a command failure. Carries `payload`'s `code`, `message`,
     /// `recoverable`, and -- only when non-nil -- `guidance` and `gate`,
     /// verbatim (D-14): never adds, renames, rewords, or drops a field, and
     /// never adds a field `ControlErrorPayload` does not have (T-02-14).
-    public static func renderError(command: String, payload: ControlErrorPayload, human: Bool) throws -> String {
+    public static func renderError(command: String, payload: ControlErrorPayload, human: Bool, context: ControlCLIEnvelopeContext = .unreached) throws -> String {
         var errorJSON: [String: Any] = [
             "code": payload.code,
             "message": payload.message,
@@ -117,23 +137,27 @@ public enum ControlCLIOutput {
         if let gate = payload.gate {
             errorJSON["gate"] = gate
         }
-        return try render(envelope(command: command, key: "error", value: errorJSON), human: human)
+        return try render(envelope(command: command, key: "error", value: errorJSON, context: context), human: human)
     }
 
     /// Renders one event line, for `events --follow` (D-08). `eventJSON` is
     /// the already-decoded event payload -- this file has no per-event-type
     /// knowledge of its shape.
-    public static func renderEvent(command: String, eventJSON: [String: Any], human: Bool) throws -> String {
-        try render(envelope(command: command, key: "event", value: eventJSON), human: human)
+    public static func renderEvent(command: String, eventJSON: [String: Any], human: Bool, context: ControlCLIEnvelopeContext = .unreached) throws -> String {
+        try render(envelope(command: command, key: "event", value: eventJSON, context: context), human: human)
     }
 
-    private static func envelope(command: String, key: String, value: [String: Any]) -> [String: Any] {
-        [
+    private static func envelope(command: String, key: String, value: [String: Any], context: ControlCLIEnvelopeContext) -> [String: Any] {
+        var envelope: [String: Any] = [
             "schemaVersion": ControlSchema.version,
             "command": command,
-            "mode": "attach",
+            "mode": context.mode.rawValue,
             key: value
         ]
+        envelope["hostStarted"] = context.hostStarted
+        if let hostPid = context.hostPid { envelope["hostPid"] = hostPid }
+        if let logPath = context.logPath { envelope["logPath"] = logPath }
+        return envelope
     }
 
     private static func render(_ envelope: [String: Any], human: Bool) throws -> String {

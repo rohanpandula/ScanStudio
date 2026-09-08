@@ -157,6 +157,54 @@ private func filmPresenceChangedEvent(filmPresent: Bool) -> EngineEvent {
 
 @Suite("Control channel client", .timeLimit(.minutes(1)))
 struct ControlChannelClientTests {
+    @Test("hello timeout closes a connection even when the listener never responds")
+    func silentListenerHasBoundedHello() async throws {
+        let path = shortSocketPath("silent")
+        try ControlSocketPath.prepareDirectory(for: path)
+        defer { removeSocketDirectory(for: path) }
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        #expect(descriptor >= 0)
+        defer { close(descriptor) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &address.sun_path) { bytes in
+            bytes.copyBytes(from: Array(path.utf8) + [0])
+        }
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        #expect(bound == 0)
+        #expect(listen(descriptor, 1) == 0)
+        await #expect(throws: ControlChannelClientError.helloTimedOut) {
+            _ = try await ControlChannelClient.open(path: path, clientName: "timeout-test", helloTimeout: .milliseconds(50))
+        }
+    }
+
+    @Test("stream inbox retains fragments and EOF together before actor delivery")
+    func fragmentsPrecedeEOF() {
+        let inbox = ControlConnectionInbox()
+        let fragments = ["{", "\"id\":1,", "\"result\":{}", "}\n"]
+        for fragment in fragments { inbox.append(Data(fragment.utf8)) }
+        inbox.markClosed()
+        let batch = inbox.take()
+        #expect(batch.chunks == fragments.map { Data($0.utf8) })
+        #expect(batch.closed)
+        #expect(!batch.overflowed)
+        #expect(inbox.take().chunks.isEmpty)
+    }
+
+    @Test("stream inbox rejects input beyond its byte bound")
+    func inboxByteBound() {
+        let inbox = ControlConnectionInbox(maxBufferedBytes: 3)
+        #expect(inbox.append(Data([1, 2])))
+        #expect(!inbox.append(Data([3, 4])))
+        let batch = inbox.take()
+        #expect(batch.chunks == [Data([1, 2])])
+        #expect(batch.overflowed)
+    }
+
     // MARK: Task 1 -- dial, hello, id-matched request/response
 
     @Test("open() against a path with no listener throws a socket error shaped like ENOENT/ECONNREFUSED")

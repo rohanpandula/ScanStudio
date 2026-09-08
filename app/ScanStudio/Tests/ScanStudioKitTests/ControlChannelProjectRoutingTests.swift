@@ -498,6 +498,18 @@ private func prepareColdSixFramePreview(_ model: SessionModel) async -> Bool {
 // (minutes is its minimum granularity).
 @Suite("Control channel project routing", .timeLimit(.minutes(1)))
 struct ControlChannelProjectRoutingTests {
+    @Test("sim.loadMedia rejects invalid carriers and absent simulator before any engine call")
+    @MainActor
+    func simulatedMediaRequiresSimulator() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        for carrier in ["invalid", "strip6"] {
+            let response = await dispatcher.handle(.simLoadMedia(id: 1, params: LoadMediaParams(carrier: carrier)))
+            expectFailure(response, id: 1, code: .invalidParams)
+        }
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
     // MARK: frames.include / frames.exclude
 
     @Test("frames.exclude with a valid index reaches project.setFrameExcluded and refuses a concurrent second request")

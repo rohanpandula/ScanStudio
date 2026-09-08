@@ -638,9 +638,9 @@ struct ScanstudioCLIConfirmationTests {
         await host.server.stop()
     }
 
-    @Test("eject --confirm-motion against a socket path with no listener exits 69 (HOST_UNREACHABLE), proving the 77 path above is not simply a connection failure")
+    @Test("eject --confirm-motion --attach against a socket path with no listener exits 69 (HOST_UNREACHABLE), proving the 77 path above is not simply a connection failure")
     func ejectAgainstMissingListenerExitsHostUnreachable() async throws {
-        let result = try await runConfirmationCLI(["eject", "--confirm-motion"], socketPath: confirmationSocketPath("eject-no-listener"))
+        let result = try await runConfirmationCLI(["eject", "--confirm-motion", "--attach"], socketPath: confirmationSocketPath("eject-no-listener"))
         #expect(result.exitCode == 69)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let error = try #require(object["error"] as? [String: Any])

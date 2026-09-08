@@ -514,7 +514,7 @@ enum RollRun {
         }
 
         let object = (try? JSONSerialization.jsonObject(with: try receipt.encodedJSON())) as? [String: Any] ?? [:]
-        let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human)
+        let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human, context: await client.cliEnvelopeContext)
         print(text, terminator: "")
         await client.shutdown()
 

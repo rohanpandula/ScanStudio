@@ -1,0 +1,336 @@
+# ScanStudio CLI
+
+`scanstudio-cli` drives the local ScanStudio control channel. It is a macOS
+Apple Silicon tool and uses the same session gates as the GUI.
+
+## Installation and running
+
+The signed application contains the executable at:
+
+```text
+/Applications/ScanStudio.app/Contents/MacOS/scanstudio-cli
+```
+
+Run that file in place. The executable resolves its sibling
+`scanstudio-engine` and its bundle identity together, so copying or symlinking
+the Mach-O out of the bundle is unsupported. A copy or symlink breaks sibling
+engine lookup and the binary's Gatekeeper story. To put the command on `PATH`,
+run the repository installer while releasing an app:
+
+```sh
+bash scripts/install_cli_shim.sh --app /Applications/ScanStudio.app
+```
+
+The installer accepts `--app PATH`, `--prefix DIR`, `--name NAME`, and
+`--uninstall`. Its default prefix is the first existing `$HOME/.local/bin` or
+`$HOME/bin`, otherwise it creates `$HOME/.local/bin`. It never needs `sudo`,
+never creates a symlink, and writes a small `exec` shim that keeps the signed
+CLI inside the app. A prefix outside `$HOME` must be supplied explicitly.
+
+Global options may be placed on every command:
+
+```text
+--socket PATH   use a control socket other than ~/.scanstudio/control.sock
+--attach        require an existing host; never start one
+--headless      require or start a headless host
+--human         print indented text instead of JSON
+--quiet         suppress --wait progress lines on stderr
+```
+
+## Output contract
+
+Without `--human`, each ordinary command writes exactly one JSON object. It has
+`schemaVersion`, `command`, and `mode`, plus exactly one of `result`, `error`,
+or `event`. The streaming `events --follow` command writes one event envelope
+per event until the host closes the connection.
+Successful commands may also carry `hostStarted`, `hostPid`, and `logPath`.
+`mode` is `attach-gui`, `attach-headless`, or `unreached`. An error carries
+`code`, `message`, `recoverable`, and optional `guidance` and `gate`.
+
+`--wait` writes changed `scan.progress` lines to stderr and leaves the final
+JSON object on stdout. `--quiet` suppresses those progress lines. The CLI
+never mixes progress text into JSON.
+
+The complete wire surface covered by this guide is: `hello`, `status`,
+`scanner.list`, `scanner.rescan`, `scanner.refresh`, `scanner.connect`,
+`scanner.disconnect`, `preview.acquire`, `frames.list`, `frames.select`,
+`frames.include`, `frames.exclude`, `review.approve`, `review.cancel`,
+`settings.get`, `settings.set`, `outputs.get`, `outputs.set`, `roll.save`,
+`roll.open`, `roll.list`, `scan.start`, `scan.stop`, `scan.resume`,
+`scanner.eject`, `diagnostics.export`, `events.subscribe`, and `job.get`.
+
+The following are exact simulator captures. Paths, timestamps, and PIDs are
+environment-specific; the field names and values show the wire shape.
+
+```json
+{"command":"status","hostPid":12596,"hostStarted":false,"mode":"attach-headless","result":{"hardwareMotionReadiness":"notApplicable","lastControlRefusal":{"code":"INVALID_PARAMS","command":"sim.loadMedia","sequence":2,"timestamp":"2026-09-08T02:52:31Z"},"motionAllowed":true,"motionGuidance":"","pendingFrames":[],"previewComplete":false,"refeedRequired":false,"scanReadiness":"scannerDisconnected","scanReadinessReason":"Connect the scanner to scan.","selectedFrames":[]},"schemaVersion":1}
+```
+
+## Command reference
+
+Each method name below is the wire method in `CONTROL.md`. Exit numbers are
+the process exit status; a refusal is also rendered as an `error` envelope.
+
+### `connect`, `disconnect`, and `rescan`
+
+```text
+connect [--device ID]       → scanner.connect
+disconnect                  → scanner.disconnect
+rescan                      → scanner.rescan
+```
+
+These commands have no motion confirmation flag. They use exits `0, 65, 69,
+70, 75`. `connect` may omit `--device`; `rescan` is the discovery operation.
+
+```json
+{"command":"scanner.rescan","hostPid":12596,"hostStarted":false,"mode":"attach-headless","result":{"devices":[{"connection":"USB (simulated)","deviceId":"sim-ls5000-0","firmware":"1.03-sim","kind":"simulated","model":"SUPER COOLSCAN 5000 ED","supported":true}]},"schemaVersion":1}
+```
+
+### `status`
+
+```text
+status [--refresh] [--job ID] → scanner.refresh, status, or job.get
+```
+
+Without `--refresh` this reads the in-memory `status` snapshot. `--refresh`
+performs one live `scanner.refresh` first and moves nothing. `--job ID` uses
+`job.get` and can query the live job or one of the last eight terminal jobs.
+There is no confirmation flag. Exits are `0, 65, 69, 70, 75`.
+
+### `preview`
+
+```text
+preview --film-loaded [--intent initial|replaceFilmProcess|refreshSavedProject]
+        [--film-process positive|c41ColorNegative|bwNegative|kodachrome]
+        → preview.acquire
+```
+
+`--film-loaded` is required. `--film-process` is required for
+`replaceFilmProcess`. Exits are `0, 64, 65, 69, 70, 75, 77`.
+
+```json
+{"command":"preview.acquire","error":{"code":"CONFIRMATION_REQUIRED","guidance":"Confirm film is physically loaded in the scanner, then retry with --film-loaded.","message":"\"preview\" requires --film-loaded.","recoverable":false},"hostStarted":false,"mode":"unreached","schemaVersion":1}
+```
+
+### `frames`
+
+```text
+frames list                                      → frames.list
+frames select RANGE|--all|--none                 → frames.select
+frames select --skip-blank [--blank-threshold 0..1]
+                                                  → frames.list, frames.select
+frames include RANGE                             → frames.include
+frames exclude RANGE                             → frames.exclude
+```
+
+`RANGE` uses CUPS syntax such as `1-6,9`. `select` requires exactly one of a
+range, `--all`, `--none`, or `--skip-blank`; `--blank-threshold` only applies
+with `--skip-blank`. Include/exclude apply a range one index at a time and
+report partial application; a range that stops at a refusal exits 65. These
+commands have no motion flag. The normal exits are `0, 64, 65, 69, 70, 75`.
+
+### `review`
+
+```text
+review approve --confirm-motion → review.approve
+review cancel                   → review.cancel
+```
+
+`review approve` starts the pending reviewed scan and requires
+`--confirm-motion`; `review cancel` clears the pending review without motion
+and takes no flag. Approve exits `0, 65, 69, 70, 75, 77`; cancel exits
+`0, 65, 69, 70, 75`.
+
+### `settings` and `outputs`
+
+```text
+settings get                   → settings.get
+settings set [recipe options]  → settings.set
+outputs get                    → outputs.get
+outputs set [recipe options]   → outputs.set
+```
+
+`settings set` and `outputs set` are read-modify-write operations. `settings
+set` accepts `--from-json`, `--resolution`, `--bit-depth`, `--multisample`,
+`--channels`, `--film-process`, `--autofocus`/`--no-autofocus`,
+`--auto-exposure`/`--no-auto-exposure`, `--digital-ice`/`--no-digital-ice`,
+and `--digital-ice-mode`. `outputs set` accepts `--from-json`,
+`--master-enabled`/`--no-master-enabled`, `--master-destination`,
+`--raw-enabled`/`--no-raw-enabled`, `--raw-destination`,
+`--positive-enabled`/`--no-positive-enabled`, `--positive-destination`,
+`--preview-enabled`/`--no-preview-enabled`, and `--preview-destination`.
+They take no motion flag and exit `0, 65, 69, 70, 75`.
+
+### `roll`
+
+```text
+roll save --name NAME --carrier mounted|strip6|roll36 --frame-count N
+           --film-process PROCESS --confirm-motion [--wait] [--auto-approve]
+           → roll.save, status, review.approve, job.get
+roll open DIRECTORY          → roll.open
+roll list                    → roll.list
+```
+
+`roll save` creates a project and starts scanning, so `--confirm-motion` is
+required. `--auto-approve` independently requires that flag and approves a
+paused review only when every flagged frame clears the confidence threshold.
+`--wait` returns the terminal job result; `--no-wait` returns after start.
+Save exits `0, 65, 69, 70, 75, 77`; open/list exit `0, 65, 69, 70, 75`.
+
+### `host`
+
+```text
+host [--simulator] [--detach] [--engine PATH] [--log PATH]
+                                               → resident headless host
+host run [--detach] [--engine PATH] [--log PATH] → explicit resident form
+host stop                                      → verified pidfile stop
+```
+
+`host` stays attached unless `--detach` is supplied. `--simulator` explicitly
+bypasses the real hardware bootstrap, scrubs bridge/hardware state, and is the
+only supported way to create an isolated simulator host. `--engine` is a
+development/test override and `--log` chooses the detached log path. `host`
+commands do not require motion flags. `host` exits `0, 65, 69, 70, 75`;
+`host stop` exits `0, 69, 70, 75`.
+
+### `roll run`
+
+```text
+roll run --name NAME --carrier mounted|strip6|roll36 [--frame-count N]
+         --film-process PROCESS --film-loaded --confirm-motion
+         [--skip-blank] [--auto-approve] [--wait|--no-wait]
+         → scanner.refresh, status, preview.acquire, events.subscribe,
+           frames.list, frames.select, roll.save, review.approve, job.get
+```
+
+This is the one-connection whole-roll walk: refresh/connect when needed,
+preview, wait for `previewComplete`, select frames, save, resolve an optional
+review, and wait for the job. Both `--film-loaded` and `--confirm-motion` are
+required. It stops at the first refusal and never retries. Exits are `0, 64,
+65, 69, 70, 75, 77`.
+
+### `scan`, `stop`, `resume`, and `eject`
+
+```text
+scan --confirm-motion [--wait] → scan.start, job.get
+stop [--immediate]             → scan.stop
+resume --confirm-motion [--wait] → scan.resume, job.get
+eject --confirm-motion         → scanner.eject
+```
+
+`scan`, `resume`, and `eject` require `--confirm-motion`. `stop` only stops an
+existing job and starts no motion. Scan/resume/eject exit `0, 65, 69, 70, 75,
+77`; stop exits `0, 65, 69, 70, 75`.
+
+### `diagnostics`, `events`, and `sim`
+
+```text
+diagnostics export --to DIRECTORY → diagnostics.export
+events --follow                   → events.subscribe
+sim load-media [--carrier strip6|roll36] [--preview-fixture NAME]
+                [--abort-at-frame N] [--abort-code CODE] → sim.loadMedia
+```
+
+Diagnostics requires an existing absolute directory with no `..` component.
+`events` requires `--follow` and streams event envelopes until the host closes
+the connection. `sim load-media` is simulator-only and never moves hardware.
+Diagnostics exits `0, 64, 69, 70`; events exits `0, 64, 69, 70`; simulator
+setup uses `0, 65, 69, 70, 75`.
+
+```json
+{"command":"scanner.connect","hostPid":12596,"hostStarted":false,"mode":"attach-headless","result":{"alreadyConnected":false},"schemaVersion":1}
+```
+
+## Exit codes
+
+| Exit | Meaning | Triggered by |
+|------|---------|--------------|
+| 0 | Success | |
+| 64 | Usage / validation | ArgumentParser's own usage errors; channel `INVALID_PARAMS`; CLI-originated `INVALID_RANGE` (a malformed CUPS frame range, rejected before any connection opens) |
+| 65 | Typed engine or gate error | `GATE_REFUSED`, `JOB_NOT_FOUND`, and every other engine- or bridge-passthrough code this repository does not individually enumerate — the documented default, not a fallback for an unhandled case; also a `--wait`ed job whose terminal state is `failed`; also `frames include`/`frames exclude <range>`'s own **partial-application rule (D-24/HEAD-12, additive)**: a range spanning more than one index that stops at a refused index always exits 65 regardless of that index's own code (for example an `INVALID_PARAMS` refusal, which alone would map to 64) — the caller's *range as a whole* did not apply, a different fact than what a single-request refusal of that code would normally mean |
+| 69 | No host reachable | `HOST_UNREACHABLE` — the control socket could not be dialed at the given (or default) path |
+| 70 | Internal error | Channel `UNKNOWN_COMMAND`; CLI-originated `INTERNAL` (an unexpected condition after a request already succeeded, for example a response that failed to decode) |
+| 75 | Busy / conflict | `CONTROLLER_BUSY`, `HOST_ALREADY_RUNNING` |
+| 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
+| 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
+
+`--wait` maps `completed` and `stopped` to 0 and a failed terminal job to 65.
+
+## Confirmation and safety
+
+The parse-time gates run before a socket opens and return 77: `preview` needs
+`--film-loaded`; `review approve`, `roll save`, `scan`, `resume`, and `eject`
+need `--confirm-motion`; `roll run` needs both flags. Each command repeats its
+check in `run()` and the wire dispatcher checks the corresponding boolean too.
+The CLI never retries, queues, ejects, power-cycles, or re-issues a physical
+operation after a refusal.
+
+## Attach, headless, and host lifecycle
+
+Host selection uses a live socket connect followed by `hello`; it never treats
+`stat` or a socket file's presence as proof of a host. The packaged default
+host bootstrap reuses the GUI ScanStudioLauncher initialization and may reach
+real hardware. The default is automatic: attach to a live GUI or headless host,
+or start a detached headless host for a mutating command. `--attach` refuses
+when no host answers. `--headless` refuses an existing GUI host and
+starts/attaches only to a headless host. Use `host --simulator` with a private
+socket for simulator work; do not use the default host bootstrap for that
+purpose. Read-only
+commands (`status`, `events`, `frames list`, settings/outputs get, `roll list`,
+and `job.get`) never auto-start a host.
+
+The envelope's `mode` names the host reached. `hostStarted` says this command
+started it; `hostPid` is the hello-verified process ID; `logPath` is the
+detached host log when one was started. `host --detach` starts a resident
+headless host, and `host stop` reads `<socket>.pid`, verifies the live hello
+reports the same headless PID, then signals it. The default files are
+`~/.scanstudio/control.sock`, `~/.scanstudio/control.sock.pid`, and
+`~/.scanstudio/logs/host.log`. Hardware scripts should attach this default
+socket rather than starting a second private hardware host.
+
+The host chmods the socket's containing directory to 0700 on every start and
+the socket to 0600. Therefore `--socket` must point inside a directory
+dedicated to this socket. Never point it at `/tmp` itself or a home directory;
+the host will change that shared directory's permissions.
+
+## Evidence locations
+
+Each saved roll has a `manifest.json` in its project directory. `roll run`
+writes a `cli-run-<timestamp>.json` receipt beside that manifest without
+overwriting an existing receipt. `diagnostics export --to DIRECTORY` writes a
+timestamped diagnostic bundle into the directory you provide. Host logs,
+pidfiles, sockets, previews, and app diagnostics live under `~/.scanstudio/`.
+Copy these files into a separate acceptance-evidence directory; never edit
+receipts, manifests, journals, or image originals.
+
+## Troubleshooting
+
+- Exit 69 (`HOST_UNREACHABLE`): start ScanStudio or run `host --detach`,
+  then retry with the same `--socket`; `--attach` intentionally never starts a
+  host.
+- Exit 75 (`CONTROLLER_BUSY`): read the error's `message` to see the operation
+  holding arbitration. Wait for that operation or stop it deliberately; the
+  CLI does not queue or retry the refused request.
+- Exit 65 (`GATE_REFUSED` or a passthrough code): inspect `error.code`,
+  `error.gate`, `error.guidance`, and `error.recoverable`; resolve the named
+  readiness or review condition before a new request.
+- Exit 77: supply the command's explicit motion flag. This is a local parse
+  refusal and did not contact the host.
+- Exit 78: the client and host schema versions disagree, or the connection
+  did not complete `hello`; use the matching app and CLI bundle.
+- After a crash, a stale socket is reclaimed only after a failed connect probe.
+  The next host launch replaces the stale socket and writes a fresh pidfile;
+  never remove a live host's socket by hand.
+- `ENGINE_NOT_BUNDLED`: the executable is outside its signed bundle and cannot
+  safely find the sibling engine. Run the CLI in place or install the supported
+  `scripts/install_cli_shim.sh` exec shim; do not copy or symlink the Mach-O.
+- `ENGINE_OVERRIDE_REFUSED`: a bundled CLI was given `--engine` or
+  `SCANSTUDIO_ENGINE_PATH` that is not the signed sibling
+  `Contents/MacOS/scanstudio-engine`. Remove the override and use the bundle.
+
+The packaged acceptance gate runs the documented simulator sequence against
+`sim-ls5000-0`; it does not establish a hardware or image-quality pass.
+The runbook's `strip6` simulator fixture produces six preview frames, so its
+bounded passing invocation uses `--frame-count 6`. `full_roll_cli.sh` preserves
+an explicitly requested count; a count that does not match the selected
+preview frames stops at `roll.save` and reports the failed receipt step.

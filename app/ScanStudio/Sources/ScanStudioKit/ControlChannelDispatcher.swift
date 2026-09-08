@@ -43,6 +43,7 @@ public enum ControlRequest: Sendable {
     case scannerRefresh(id: UInt64)
     case scannerConnect(id: UInt64, params: ControlScannerConnectParams)
     case scannerDisconnect(id: UInt64)
+    case simLoadMedia(id: UInt64, params: LoadMediaParams)
     case previewAcquire(id: UInt64, params: ControlPreviewAcquireParams)
     case framesList(id: UInt64)
     case framesSelect(id: UInt64, params: ControlFramesSelectParams)
@@ -81,6 +82,7 @@ extension ControlRequest {
         case .scannerRefresh(let id): id
         case .scannerConnect(let id, _): id
         case .scannerDisconnect(let id): id
+        case .simLoadMedia(let id, _): id
         case .previewAcquire(let id, _): id
         case .framesList(let id): id
         case .framesSelect(let id, _): id
@@ -115,6 +117,7 @@ extension ControlRequest {
         case .scannerRefresh: "scanner.refresh"
         case .scannerConnect: "scanner.connect"
         case .scannerDisconnect: "scanner.disconnect"
+        case .simLoadMedia: "sim.loadMedia"
         case .previewAcquire: "preview.acquire"
         case .framesList: "frames.list"
         case .framesSelect: "frames.select"
@@ -147,7 +150,7 @@ extension ControlRequest {
     /// specific check; this flag is what routes them through it).
     public var isMutating: Bool {
         switch self {
-        case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect,
+        case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect, .simLoadMedia,
              .previewAcquire, .framesSelect, .framesInclude, .framesExclude, .reviewApprove,
              .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList,
              .scanStart, .scanStop, .scanResume, .scannerEject, .reviewCancel:
@@ -247,6 +250,7 @@ public final class ControlChannelDispatcher {
     nonisolated public static let maxRequestLineBytes = 1 << 20
 
     private let sessionModel: SessionModel
+    private let hostKind: ControlHostKind
     private var greeted = false
     /// Subscriptions `subscribeToEvents()` still owns. `onTermination`
     /// removes a subscription's id here so a dropped subscriber's observer
@@ -254,8 +258,11 @@ public final class ControlChannelDispatcher {
     /// (T-01-15).
     private var activeEventSubscriptions: Set<UUID> = []
 
-    public init(sessionModel: SessionModel) {
+    /// The default keeps existing transports and tests attached to the GUI
+    /// identity; headless hosts pass `.headless` explicitly (D-04).
+    public init(sessionModel: SessionModel, hostKind: ControlHostKind = .gui) {
         self.sessionModel = sessionModel
+        self.hostKind = hostKind
     }
 
     // MARK: Two-phase decode
@@ -308,6 +315,7 @@ public final class ControlChannelDispatcher {
         case "scanner.refresh": return decoded(EmptyParams.self) { id, _ in .scannerRefresh(id: id) }
         case "scanner.connect": return decoded(ControlScannerConnectParams.self) { .scannerConnect(id: $0, params: $1) }
         case "scanner.disconnect": return decoded(EmptyParams.self) { id, _ in .scannerDisconnect(id: id) }
+        case "sim.loadMedia": return decoded(LoadMediaParams.self) { .simLoadMedia(id: $0, params: $1) }
         case "preview.acquire": return decoded(ControlPreviewAcquireParams.self) { .previewAcquire(id: $0, params: $1) }
         case "frames.list": return decoded(EmptyParams.self) { id, _ in .framesList(id: id) }
         case "frames.select": return decoded(ControlFramesSelectParams.self) { .framesSelect(id: $0, params: $1) }
@@ -401,7 +409,9 @@ public final class ControlChannelDispatcher {
         greeted = true
         return .success(id: id, result: .hello(ControlHelloResult(
             schemaVersion: ControlSchema.version,
-            appName: "ScanStudio"
+            appName: "ScanStudio",
+            host: hostKind,
+            hostPid: ProcessInfo.processInfo.processIdentifier
         )))
     }
 
@@ -493,6 +503,23 @@ public final class ControlChannelDispatcher {
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.refreshScannerStatus()
             return scannerRefreshResponse(id: id, errorMessageBefore: errorMessageBefore)
+        case .simLoadMedia(let id, let params):
+            guard let carrier = SimulatedFilmCarrier(rawValue: params.carrier),
+                  params.previewFixture == nil || ["textured", "boundaryAndBlank"].contains(params.previewFixture ?? ""),
+                  params.abortAtFrame == nil || (params.abortAtFrame ?? 0) > 0 else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "Invalid simulated media or fixture."))
+            }
+            // The engine independently refuses sim.loadMedia on real devices.
+            // Keep this refusal ahead of model mutation as well.
+            guard sessionModel.device?.deviceId.hasPrefix("sim-") == true else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "sim.loadMedia requires a connected simulator."))
+            }
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            await sessionModel.loadCarrier(carrier, previewFixture: params.previewFixture, abortAtFrame: params.abortAtFrame, abortCode: params.abortCode)
+            if case .failure(let failureId, let error) = outcome(id: id, errorMessageBefore: errorMessageBefore) {
+                return .failure(id: failureId, error: error)
+            }
+            return .success(id: id, result: .status(buildStatusResult()))
         case .scannerConnect(let id, let params):
             // A `nil` `deviceId` is legitimate: it means "let
             // `DeviceSelectionPolicy` resolve the target", the same as the
