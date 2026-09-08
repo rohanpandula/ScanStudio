@@ -2080,3 +2080,74 @@ def test_roll_manual_frames_rejects_non_integer_rows(tmp_path: Path) -> None:
         assert excinfo.value.code is ErrorCode.INVALID_PARAMS, bad
         assert "whole numbers" in str(excinfo.value), bad
     assert transport.manual_frames_calls == []
+
+
+def test_exposure_solve_requires_arming_and_serializes_motion(tmp_path, monkeypatch) -> None:
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    class MeterTransport(_StubTransport):
+        def solve_exposure(self, slot):
+            calls.append(slot)
+            entered.set()
+            assert release.wait(2)
+            return {"slot": slot, "rgbExposuresRaw10ns": [100_000] * 3}
+    svc = _opened_service(tmp_path, MeterTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    request = {"id": 8, "method": "roll.solveExposure", "params": {"slot": 2}}
+    events = []
+    with pytest.raises(BridgeError) as refused:
+        svc.dispatch(request, lambda *event: events.append(event))
+    assert refused.value.code == ErrorCode.HW_MOTION_NOT_ARMED
+    assert calls == []
+    _arm(monkeypatch, tmp_path)
+    try:
+        assert svc.dispatch(request, lambda *event: events.append(event)) == {"accepted": True}
+        assert entered.wait(2)
+        with pytest.raises(BridgeError) as busy:
+            svc.dispatch(request, lambda *_: None)
+        assert busy.value.code == ErrorCode.HARDWARE_LANE_BUSY
+    finally:
+        release.set()
+    _wait_for(lambda: not svc._motion_op_active)
+    assert calls == [2]
+    assert events == [("roll.exposureSolved", {"solution": {"slot": 2, "rgbExposuresRaw10ns": [100_000] * 3}})]
+    assert not svc._lane_held
+
+
+def test_exposure_solve_failure_releases_lane_and_reports_error(tmp_path, monkeypatch) -> None:
+    class MeterTransport(_StubTransport):
+        def solve_exposure(self, slot):
+            raise BridgeError(ErrorCode.METER_CONTROLLER_REFUSED, "refused meter authority")
+    svc = _opened_service(tmp_path, MeterTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    _arm(monkeypatch, tmp_path)
+    events = []
+    svc.dispatch({"id": 9, "method": "roll.solveExposure", "params": {"slot": 2}}, lambda *event: events.append(event))
+    _wait_for(lambda: not svc._motion_op_active)
+    assert events == [("roll.exposureError", {"code": "METER_CONTROLLER_REFUSED", "message": "refused meter authority", "slot": 2})]
+    assert svc._preview_material is None
+    assert not svc._lane_held
+
+
+def test_shutdown_does_not_abandon_meter_thread(tmp_path, monkeypatch) -> None:
+    entered, release = threading.Event(), threading.Event()
+    class MeterTransport(_StubTransport):
+        def solve_exposure(self, slot):
+            entered.set()
+            assert release.wait(2)
+            return {"slot": slot}
+    svc = _opened_service(tmp_path, MeterTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    _arm(monkeypatch, tmp_path)
+    svc.dispatch({"id": 8, "method": "roll.solveExposure", "params": {"slot": 2}}, lambda *_: None)
+    try:
+        assert entered.wait(2)
+        with pytest.raises(BridgeError) as refused:
+            svc._handle_shutdown(join_timeout=0)
+        assert refused.value.code == ErrorCode.HARDWARE_LANE_BUSY
+        assert svc._device_open
+    finally:
+        release.set()
+    svc._motion_thread.join(timeout=2)
+    assert svc._handle_shutdown(join_timeout=0) == {}
+    assert not svc._device_open

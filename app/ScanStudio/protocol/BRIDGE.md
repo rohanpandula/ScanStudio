@@ -421,6 +421,12 @@ Three methods are MOTION-CAPABLE: `roll.preview`, `scan.start`, `device.eject`.
 
 **Telemetry.** Every hardware-bound call appends one JSONL line under `~/.scanstudio/hw-telemetry/` before the call and one line after the outcome is known. Within `scan.start` specifically (additive, 2026-07-23), this is further subdivided per call the worker makes internally (`method: "scan.call"`, or for a coarser conceptual phase, `"scan.phase"` — additive, 2026-07-23, see "Phase-boundary telemetry" under `scan.start` above; `outcome: "enter"|"exit"|"timeout"`, a `call` field naming the specific operation, e.g. `roll.scan:slot4`, and on `"exit"`, `call_outcome: "return"|"raise"` plus `exception_class` when raised) — see "Scan-worker soft timeout" under `scan.start` above. A per-slot failure additionally gets its own `scan.frameFailed` entry (see "Durable per-frame failure reasons" under `scan.start` above), and the bridge records a one-time `bridge.provenance` entry at startup (see `bridge.hello` above).
 
+## Held-session exposure solve
+
+`roll.solveExposure` takes `{slot: 1..40}` after a completed preview and requires the existing motion arming and hardware lane. It returns `{accepted: true}`; the terminal event is `roll.exposureSolved` with `solution`, or `roll.exposureError` with `code`, `message`, and `slot`. No automatic retry occurs. Shutdown waits for the owned meter transaction before closing the device.
+
+The solution contains `slot`, `rgbExposuresRaw10ns`, `irMeteredExposureRaw10ns`, `meterEvidencePath`, `meterEvidenceSha256`, `journalPath`, and `journalSha256`. RGB uses guarded metered authority; IR is evidence, not an override. The evidence paths refer to immutable driver artifacts. This requires the held-session solver API; older drivers and mock transport return `NOT_IMPLEMENTED`, never a substituted full capture or fabricated metered result.
+
 ## Recipe constraints
 
 The wired `material: "colorNegative"` capture fixes `resolutionDpi: 4000`, `bitDepth: 16`, `channels: "rgbi"`, `autofocus: true` — fixed by the LS-5000's single-pass protocol, not client-configurable. Two fields are configurable within it (2026-09-06):

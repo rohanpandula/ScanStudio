@@ -4238,3 +4238,31 @@ def test_explicit_rgb_exposure_survives_separate_scan_calls(tmp_path, monkeypatc
     for pass_name in ("A1", "A2"):
         assert _scan(transport, [1], recipe, tmp_path / pass_name).completed == (1,)
     assert roll.scan_many_kwargs == [{"exposure_override_10ns": ticks}] * 2
+
+
+def test_exposure_solve_refuses_old_driver_without_capture(tmp_path, monkeypatch) -> None:
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    with pytest.raises(BridgeError) as refused:
+        transport.solve_exposure(1)
+    assert refused.value.code == ErrorCode.NOT_IMPLEMENTED
+    assert roll.scan_many_calls == []
+
+
+@pytest.mark.parametrize("error,code", [
+    (coolscanpy.MeterUnusableError("G"), ErrorCode.METER_UNUSABLE),
+    (coolscanpy.MeterControllerRefused(pass_number=2, reasons=(coolscanpy.MeterControllerRefusalReason(code="linearity_insufficient", message="insufficient signal", channel="R"),)), ErrorCode.METER_CONTROLLER_REFUSED),
+])
+def test_exposure_solve_preserves_typed_refusal_and_invalidates_preview(tmp_path, monkeypatch, error, code) -> None:
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
+    def refuse(slot):
+        raise error
+    roll.solve_exposure = refuse
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    with pytest.raises(BridgeError) as refused:
+        transport.solve_exposure(1)
+    assert refused.value.code == code
+    assert not transport._preview_established
+    assert roll.scan_many_calls == []

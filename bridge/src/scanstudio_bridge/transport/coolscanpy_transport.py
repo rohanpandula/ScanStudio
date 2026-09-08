@@ -738,6 +738,7 @@ class CoolscanPyTransport:
         self._scanning = False
         self._stop_lock = threading.RLock()
         self._scan_prepared = False
+        self._meter_active = False
         self._stop_requested = False
         # Plan 10-09 (attempts-root persistence): the exact `attempts_root`
         # passed to `Device.roll()` below, kept here purely for our own
@@ -1192,6 +1193,52 @@ class CoolscanPyTransport:
                     "requires a driver that supports it",
                 ) from exc
             raise
+
+    def solve_exposure(self, slot: int) -> dict[str, object]:
+        if self._device is None:
+            raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+        if not self._preview_established or self._roll is None:
+            raise BridgeError(ErrorCode.NO_PREVIEW, "exposure solving requires a completed preview")
+        solve = getattr(self._roll, "solve_exposure", None)
+        if not callable(solve):
+            raise BridgeError(ErrorCode.NOT_IMPLEMENTED, "this CoolscanPy build has no held-session exposure solver")
+        with self._stop_lock:
+            self._meter_active = True
+        try:
+            solution = solve(slot)
+        except coolscanpy.ManualReviewRequired as exc:
+            raise BridgeError(ErrorCode.MANUAL_REVIEW_REQUIRED, str(exc)) from exc
+        except coolscanpy.DeviceBusy as exc:
+            raise BridgeError(ErrorCode.HARDWARE_LANE_BUSY, str(exc)) from exc
+        except coolscanpy.RefeedRequired as exc:
+            self._preview_established = False
+            raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
+        except coolscanpy.MeterUnusableError as exc:
+            self._preview_established = False
+            raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
+        except coolscanpy.MeterControllerRefused as exc:
+            self._preview_established = False
+            raise BridgeError(
+                ErrorCode.METER_CONTROLLER_REFUSED, str(exc),
+                details={"pass": exc.pass_number, "reasons": [to_wire(reason) for reason in exc.reasons]},
+            ) from exc
+        except (ValueError, TypeError) as exc:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
+        except Exception:
+            self._preview_established = False
+            raise
+        finally:
+            with self._stop_lock:
+                self._meter_active = False
+        return {
+            "slot": solution.slot,
+            "rgbExposuresRaw10ns": list(solution.rgb_exposures_raw_10ns),
+            "irMeteredExposureRaw10ns": solution.ir_metered_exposure_raw_10ns,
+            "meterEvidencePath": str(solution.meter_evidence_path),
+            "meterEvidenceSha256": solution.meter_evidence_sha256,
+            "journalPath": str(solution.journal_path),
+            "journalSha256": solution.journal_sha256,
+        }
 
     def set_spacing_offset(
         self, slot: int, offset_rows: int
@@ -1863,7 +1910,7 @@ class CoolscanPyTransport:
 
     def request_stop(self) -> None:
         with self._stop_lock:
-            if self._scan_prepared:
+            if self._scan_prepared or self._meter_active:
                 self._stop_requested = True
                 if self._roll is not None:
                     self._roll.safe_stop()

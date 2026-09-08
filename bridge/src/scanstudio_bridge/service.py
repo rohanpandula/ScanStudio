@@ -66,6 +66,7 @@ _METHOD_PARAM_SCHEMAS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "device.close": ((), ()),
     "roll.preview": (("material",), ("slots",)),
     "roll.approve": (("slot",), ("fingerprint", "attended")),
+    "roll.solveExposure": (("slot",), ()),
     "roll.setSpacingOffset": (("slot", "offsetRows"), ()),
     "roll.manualFrames": (("rows",), ()),
     "roll.previewStrip": ((), ()),
@@ -366,6 +367,7 @@ class BridgeService:
         # device.status's laneHeld, which continues to describe the
         # hardware lane alone.
         self._motion_op_active = False
+        self._motion_thread: threading.Thread | None = None
 
     # -- status snapshot ----------------------------------------------------------
 
@@ -488,6 +490,8 @@ class BridgeService:
                 attended=attended,
             )
             return {}
+        if method == "roll.solveExposure":
+            return self._handle_solve_exposure(request, emit)
         if method == "roll.setSpacingOffset":
             if not self._device_open:
                 raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
@@ -548,6 +552,14 @@ class BridgeService:
         return result
 
     def _handle_shutdown(self, *, join_timeout: float | None = _JOIN_TIMEOUT_SECONDS) -> dict:
+        if self._motion_thread is not None and self._motion_thread.is_alive():
+            self._transport.request_stop()
+            self._motion_thread.join(timeout=join_timeout)
+            if self._motion_thread.is_alive():
+                raise BridgeError(
+                    ErrorCode.HARDWARE_LANE_BUSY,
+                    "shutdown not acknowledged: the owned motion worker is still active",
+                )
         if self._last_job is not None and not self._last_job["terminal"]:
             self._transport.request_stop()
             thread = self._last_job.get("thread")
@@ -852,7 +864,53 @@ class BridgeService:
                 # be a permanent HARDWARE_LANE_BUSY.
                 self._motion_op_active = False
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._motion_thread = threading.Thread(target=worker, daemon=True)
+        self._motion_thread.start()
+        return {"accepted": True}
+
+    def _handle_solve_exposure(self, request: dict, emit: Callable[[str, dict], None]) -> dict:
+        if not self._device_open:
+            raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+        if self._preview_material is None:
+            raise BridgeError(ErrorCode.NO_PREVIEW, "exposure solving requires a completed preview")
+        slot = _require_plain_int(request["params"]["slot"], "slot", minimum=1, maximum=40)
+        safety.require_armed(self._base_dir)
+        if self._motion_op_active:
+            raise BridgeError(ErrorCode.HARDWARE_LANE_BUSY, "a motion operation is still active")
+        lane = safety.HardwareLane(self._base_dir)
+        lane.__enter__()
+        self._lane_held = self._motion_op_active = True
+
+        def worker() -> None:
+            event = "roll.exposureError"
+            payload = {}
+            try:
+                self._telemetry.record("roll.solveExposure", "started", slot=slot)
+                solution = self._transport.solve_exposure(slot)
+                payload = {"solution": solution}
+                event = "roll.exposureSolved"
+                self._telemetry.record("roll.solveExposure", "ok", slot=slot)
+            except Exception as exc:
+                code = exc.code.value if isinstance(exc, BridgeError) else ErrorCode.INTERNAL.value
+                payload = {"code": code, "message": str(exc), "slot": slot}
+                if isinstance(exc, BridgeError) and exc.details is not None:
+                    payload["details"] = exc.details
+                if code not in {
+                    ErrorCode.NOT_IMPLEMENTED.value, ErrorCode.INVALID_PARAMS.value,
+                    ErrorCode.MANUAL_REVIEW_REQUIRED.value, ErrorCode.HARDWARE_LANE_BUSY.value,
+                }:
+                    self._preview_material = None
+                self._telemetry.record("roll.solveExposure", "error", **payload)
+            finally:
+                self._lane_held = False
+                lane.__exit__(None, None, None)
+                try:
+                    emit(event, payload)
+                finally:
+                    self._motion_op_active = False
+
+        self._motion_thread = threading.Thread(target=worker, daemon=True)
+        self._motion_thread.start()
         return {"accepted": True}
 
     # -- roll.manualFrames (Rung 4) --------------------------------------------------
