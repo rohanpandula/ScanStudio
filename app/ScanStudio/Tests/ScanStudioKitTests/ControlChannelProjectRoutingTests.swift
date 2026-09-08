@@ -548,7 +548,12 @@ struct ControlChannelProjectRoutingTests {
             Issue.record("expected frames.include to succeed, got \(response)")
             return
         }
-        #expect(await stub.recordedMethods == ["project.setFrameExcluded"])
+        // D-22/HEAD-12 (CF-12/CF-13, the 2026-09-07 batch abort):
+        // setFrameExcluded now refreshes pendingFrames from the engine
+        // immediately after a successful exclusion mutation, before
+        // returning -- so the dispatcher's next readiness read is never
+        // stale.
+        #expect(await stub.recordedMethods == ["project.setFrameExcluded", "project.pendingFrames"])
         #expect(await stub.recordedFrameExclusionFlags == [false])
     }
 

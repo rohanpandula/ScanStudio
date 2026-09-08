@@ -123,6 +123,15 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
                 recordedFrameExclusionFlags.append(excludedParams.excluded)
             }
             return try cast(SetFrameResult(project: cliProcessProject()), as: Result.self)
+        case "project.pendingFrames":
+            // D-22/HEAD-12: setFrameExcluded now refreshes pendingFrames
+            // before returning -- this fixture's single-frame project has
+            // nothing pending once excluded, but these tests only assert
+            // the exclude call itself, not this read's own result.
+            return try cast(
+                PendingFramesResult(frames: [], totalFrames: 1, completedCount: 0, excludedCount: 1),
+                as: Result.self
+            )
         case "project.list":
             return try cast(ProjectListResult(projects: [cliProcessRecentProject]), as: Result.self)
         default:

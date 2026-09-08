@@ -857,7 +857,11 @@ struct ControlChannelMotionRoutingTests {
         #expect(error.code == "GATE_REFUSED")
         #expect(error.gate == ControlGate.scanReadiness.rawValue)
         #expect(error.guidance == ScanReadinessPolicy.Decision.targetRequired.reason)
-        #expect(await stub.recordedMethods.isEmpty)
+        // D-22/HEAD-12 (CF-12/CF-13, the 2026-09-07 batch abort): the arm
+        // now refreshes pendingFrames from the engine before evaluating
+        // readiness, so exactly that one read reaches the engine -- never
+        // a motion-capable call, and never more than the one refresh.
+        #expect(await stub.recordedMethods == ["project.pendingFrames"])
     }
 
     // WR-01: `resumeBatch()`'s own guard reads three `private` flags plus

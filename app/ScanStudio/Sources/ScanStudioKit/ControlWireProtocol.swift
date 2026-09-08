@@ -529,6 +529,12 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     /// comment for why this reaches `status`/`control.snapshot`/
     /// `control.changed` from a single source.
     public let manualReviewPending: ControlManualReviewPending?
+    /// D-22/HEAD-12: the engine's own authoritative resume set
+    /// (`SessionModel.pendingFrames`, refreshed from `project.pendingFrames`)
+    /// -- so a script can see what a `resume` would scan before asking for
+    /// motion, and so excluding a frame after a failed batch is visible
+    /// here immediately, without re-opening the roll.
+    public let pendingFrames: [Int]
 
     public init(
         device: DeviceInfo? = nil,
@@ -549,7 +555,8 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         scanReadinessReason: String? = nil,
         lastErrorMessage: String? = nil,
         lastControlRefusal: ControlRefusalRecord? = nil,
-        manualReviewPending: ControlManualReviewPending? = nil
+        manualReviewPending: ControlManualReviewPending? = nil,
+        pendingFrames: [Int] = []
     ) {
         self.device = device
         self.scanner = scanner
@@ -570,6 +577,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.lastErrorMessage = lastErrorMessage
         self.lastControlRefusal = lastControlRefusal
         self.manualReviewPending = manualReviewPending
+        self.pendingFrames = pendingFrames
     }
 }
 
@@ -594,6 +602,10 @@ public struct ControlFrameSummary: Codable, Equatable, Sendable {
     public let state: String?
     public let manualReviewDecision: String?
     public let errorCode: String?
+    /// D-20/HEAD-12: the bridge's own message text for `errorCode`, codes
+    /// and messages only -- never `details`/`evidence`/`diagnosticEvidence`
+    /// (T-01-05 still holds).
+    public let errorMessage: String?
     public let blankConfidence: Double?
     public let thumbnailStddev: Double?
     public let thumbnailMean: Double?
@@ -610,6 +622,7 @@ public struct ControlFrameSummary: Codable, Equatable, Sendable {
         state: String? = nil,
         manualReviewDecision: String? = nil,
         errorCode: String? = nil,
+        errorMessage: String? = nil,
         blankConfidence: Double? = nil,
         thumbnailStddev: Double? = nil,
         thumbnailMean: Double? = nil,
@@ -625,6 +638,7 @@ public struct ControlFrameSummary: Codable, Equatable, Sendable {
         self.state = state
         self.manualReviewDecision = manualReviewDecision
         self.errorCode = errorCode
+        self.errorMessage = errorMessage
         self.blankConfidence = blankConfidence
         self.thumbnailStddev = thumbnailStddev
         self.thumbnailMean = thumbnailMean
@@ -693,6 +707,18 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
     public let pendingFrameCount: Int
     public let receiptCount: Int
     public let frameErrorCodes: [String: String]
+    /// D-20/HEAD-12: mirrors `frameErrorCodes`, keyed the same way -- the
+    /// bridge's own message text, codes and messages only (T-03-46: never
+    /// `details`/`evidence`/`diagnosticEvidence`).
+    public let frameErrorMessages: [String: String]
+    /// D-19/HEAD-12: ISO-8601, `nil` for a still-live job -- when this job
+    /// finished, from the archived `TerminalJobRecord` (or the live job's
+    /// own values once it reaches a terminal `jobState`, via the same
+    /// `buildJobResult()` path a still-running job uses).
+    public let finishedAt: String?
+    /// D-20/HEAD-12: 1-based indices the batch never reached -- `[]` for a
+    /// still-live job.
+    public let notAttemptedFrames: [Int]
 
     public init(
         jobId: String? = nil,
@@ -701,7 +727,10 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
         completedFrameCount: Int,
         pendingFrameCount: Int,
         receiptCount: Int,
-        frameErrorCodes: [String: String] = [:]
+        frameErrorCodes: [String: String] = [:],
+        frameErrorMessages: [String: String] = [:],
+        finishedAt: String? = nil,
+        notAttemptedFrames: [Int] = []
     ) {
         self.jobId = jobId
         self.jobState = jobState
@@ -710,6 +739,22 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
         self.pendingFrameCount = pendingFrameCount
         self.receiptCount = receiptCount
         self.frameErrorCodes = frameErrorCodes
+        self.frameErrorMessages = frameErrorMessages
+        self.finishedAt = finishedAt
+        self.notAttemptedFrames = notAttemptedFrames
+    }
+}
+
+/// D-19/HEAD-12: `job.get`'s optional filter -- an absent/`null` `jobId`
+/// keeps the historical "the job this session is currently tracking"
+/// behavior byte-for-byte; a supplied `jobId` asks for that specific job
+/// (the live one, or one of the last `SessionModel.maximumTerminalJobHistory`
+/// terminal jobs), refusing `JOB_NOT_FOUND` for any other id.
+public struct ControlJobGetParams: Codable, Equatable, Sendable {
+    public let jobId: String?
+
+    public init(jobId: String? = nil) {
+        self.jobId = jobId
     }
 }
 

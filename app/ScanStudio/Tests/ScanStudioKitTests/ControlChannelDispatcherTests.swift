@@ -814,7 +814,7 @@ struct ControlChannelDispatcherTests {
         await greet(dispatcher)
         model.jobId = "job-get-test"
 
-        let response = await dispatcher.handle(.jobGet(id: 19))
+        let response = await dispatcher.handle(.jobGet(id: 19, params: ControlJobGetParams()))
         guard case .success(_, let result) = response, case .job(let job) = result else {
             Issue.record("expected a job success result")
             return
@@ -833,7 +833,8 @@ struct ControlChannelDispatcherTests {
         await model.openProject(directory: "/tmp/control-dispatcher-test")
 
         let requests: [ControlRequest] = [
-            .status(id: 20), .framesList(id: 21), .settingsGet(id: 22), .outputsGet(id: 23), .jobGet(id: 24),
+            .status(id: 20), .framesList(id: 21), .settingsGet(id: 22), .outputsGet(id: 23),
+            .jobGet(id: 24, params: ControlJobGetParams()),
         ]
         for request in requests {
             let before = await stub.requestCount

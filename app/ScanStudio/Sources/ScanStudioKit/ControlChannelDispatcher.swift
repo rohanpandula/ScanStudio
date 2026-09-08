@@ -62,7 +62,7 @@ public enum ControlRequest: Sendable {
     case scannerEject(id: UInt64, params: ControlScannerEjectParams)
     case diagnosticsExport(id: UInt64, params: ControlDiagnosticsExportParams)
     case eventsSubscribe(id: UInt64)
-    case jobGet(id: UInt64)
+    case jobGet(id: UInt64, params: ControlJobGetParams)
 }
 
 extension ControlRequest {
@@ -94,7 +94,7 @@ extension ControlRequest {
         case .scannerEject(let id, _): id
         case .diagnosticsExport(let id, _): id
         case .eventsSubscribe(let id): id
-        case .jobGet(let id): id
+        case .jobGet(let id, _): id
         }
     }
 
@@ -317,7 +317,7 @@ public final class ControlChannelDispatcher {
         case "scanner.eject": return decoded(ControlScannerEjectParams.self) { .scannerEject(id: $0, params: $1) }
         case "diagnostics.export": return decoded(ControlDiagnosticsExportParams.self) { .diagnosticsExport(id: $0, params: $1) }
         case "events.subscribe": return decoded(EmptyParams.self) { id, _ in .eventsSubscribe(id: id) }
-        case "job.get": return decoded(EmptyParams.self) { id, _ in .jobGet(id: id) }
+        case "job.get": return decoded(ControlJobGetParams.self) { .jobGet(id: $0, params: $1) }
         default:
             return .failure(ControlDecodeFailure(
                 id: sniff.id,
@@ -745,6 +745,14 @@ public final class ControlChannelDispatcher {
             }
             return outcome(id: id, errorMessageBefore: errorMessageBefore)
         case .scanResume(let id, _):
+            // D-22/HEAD-12 (CF-12/CF-13, the 2026-09-07 batch abort): reads
+            // the engine's authoritative pendingFrames before evaluating
+            // readiness, not the cache -- excluding a frame after a failed
+            // batch must never brick Resume until something else happens to
+            // refresh it. `resumeBatch()` below performs its own second
+            // refresh and re-verification (T-03-53): this pre-check exists
+            // to give the caller a typed refusal, not to be the gate.
+            await sessionModel.refreshPendingFrames()
             // Confirmation already checked. Mirrors `ScanPanelView.swift`'s
             // own Resume Batch `.disabled` binding.
             let decision = sessionModel.scanReadiness(for: sessionModel.pendingFrames)
@@ -854,8 +862,29 @@ public final class ControlChannelDispatcher {
                 subscribed: true,
                 snapshot: buildStatusResult()
             )))
-        case .jobGet(let id):
-            return .success(id: id, result: .job(buildJobResult()))
+        case .jobGet(let id, let params):
+            // D-19/HEAD-12 (the 2026-09-07 batch abort): no jobId keeps the
+            // historical "the job this session is currently tracking"
+            // behavior byte-for-byte. A jobId matching the live job is the
+            // identical answer under a different name. Only a jobId this
+            // process genuinely never tracked (neither live nor in the last
+            // `SessionModel.maximumTerminalJobHistory` archived jobs) is
+            // `JOB_NOT_FOUND` -- a job that finished seconds ago must not
+            // read as unknown.
+            guard let requestedJobId = params.jobId else {
+                return .success(id: id, result: .job(buildJobResult()))
+            }
+            if let liveJobId = sessionModel.jobId, liveJobId == requestedJobId {
+                return .success(id: id, result: .job(buildJobResult()))
+            }
+            if let archived = sessionModel.terminalJob(id: requestedJobId) {
+                return .success(id: id, result: .job(buildJobResult(from: archived)))
+            }
+            return .failure(id: id, error: ControlErrorPayload(
+                code: "JOB_NOT_FOUND",
+                message: "No job with id \"\(requestedJobId)\" is tracked by this host.",
+                recoverable: false
+            ))
         }
     }
 
@@ -1118,7 +1147,8 @@ public final class ControlChannelDispatcher {
             scanReadinessReason: readiness.reason,
             lastErrorMessage: sessionModel.lastErrorMessage,
             lastControlRefusal: sessionModel.lastControlRefusal,
-            manualReviewPending: buildManualReviewPending()
+            manualReviewPending: buildManualReviewPending(),
+            pendingFrames: sessionModel.pendingFrames
         )
     }
 
@@ -1190,6 +1220,7 @@ public final class ControlChannelDispatcher {
             state: sessionModel.frameStates[index]?.rawValue,
             manualReviewDecision: sessionModel.manualReviewDecisions[index].map(Self.manualReviewDecisionName),
             errorCode: sessionModel.frameErrors[index]?.code,
+            errorMessage: sessionModel.frameErrors[index]?.message,
             blankConfidence: hint?.blankConfidence,
             thumbnailStddev: hint?.thumbnailStddev,
             thumbnailMean: hint?.thumbnailMean,
@@ -1213,6 +1244,9 @@ public final class ControlChannelDispatcher {
         let frameErrorCodes = Dictionary(
             uniqueKeysWithValues: sessionModel.frameErrors.map { (String($0.key), $0.value.code) }
         )
+        let frameErrorMessages = Dictionary(
+            uniqueKeysWithValues: sessionModel.frameErrors.map { (String($0.key), $0.value.message) }
+        )
         return ControlJobResult(
             jobId: sessionModel.jobId,
             jobState: sessionModel.jobState,
@@ -1220,7 +1254,35 @@ public final class ControlChannelDispatcher {
             completedFrameCount: sessionModel.completedFrameCount,
             pendingFrameCount: sessionModel.pendingFrameCount,
             receiptCount: sessionModel.receipts.count,
-            frameErrorCodes: frameErrorCodes
+            frameErrorCodes: frameErrorCodes,
+            frameErrorMessages: frameErrorMessages
+            // finishedAt/notAttemptedFrames stay at their nil/[] defaults:
+            // by the time jobId is non-nil again for a *different* job,
+            // applyCompleted has already archived and cleared the
+            // previous one (SessionModel never holds a live jobId whose
+            // jobState is already terminal).
+        )
+    }
+
+    /// D-19/HEAD-12: the `.jobGet` arm's "found in the ring" branch --
+    /// `TerminalJobRecord` already carries exactly what `ControlJobResult`
+    /// exposes for a finished job (T-03-46: no `details`/`evidence`).
+    private func buildJobResult(from record: TerminalJobRecord) -> ControlJobResult {
+        ControlJobResult(
+            jobId: record.jobId,
+            jobState: record.jobState,
+            progress: nil,
+            completedFrameCount: record.completedFrameCount,
+            pendingFrameCount: record.pendingFrameCount,
+            receiptCount: record.receiptCount,
+            frameErrorCodes: Dictionary(
+                uniqueKeysWithValues: record.frameErrorCodes.map { (String($0.key), $0.value) }
+            ),
+            frameErrorMessages: Dictionary(
+                uniqueKeysWithValues: record.frameErrorMessages.map { (String($0.key), $0.value) }
+            ),
+            finishedAt: record.finishedAt,
+            notAttemptedFrames: record.notAttemptedFrames
         )
     }
 

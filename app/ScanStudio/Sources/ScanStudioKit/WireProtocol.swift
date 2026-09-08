@@ -178,6 +178,25 @@ public struct EventEnvelope<Payload: Decodable>: Decodable {
     public let payload: Payload
 }
 
+/// The `Encodable` direction of the same `{"event": .., "payload": ..}`
+/// shape -- used only for `EngineClient`'s own synthetic events (D-24/
+/// HEAD-12's `engine.request.timeout`), which it constructs itself rather
+/// than receiving over a wire.
+struct EncodableEventEnvelope<Payload: Encodable>: Encodable {
+    let event: String
+    let payload: Payload
+}
+
+/// D-24/HEAD-12 (CF-14): `EngineClient.timeoutRequest`'s own synthetic
+/// event payload -- the method name, request id, and elapsed seconds only,
+/// never this request's own `params` (T-03-52: a project path or
+/// caller-supplied directory could be in scope there).
+struct EngineRequestTimeoutPayload: Codable, Sendable {
+    let method: String
+    let id: UInt64
+    let elapsedSeconds: Double
+}
+
 /// Typed error thrown out of `EngineClient.request` for both engine-reported
 /// errors (`{"id", "error": {...}}`) and local failures (e.g. the engine
 /// process exiting unexpectedly).
@@ -1110,6 +1129,9 @@ public enum FrameState: String, Codable, Equatable, Sendable {
     case completed
     case failed
     case skipped
+    /// D-20/HEAD-12: the batch never reached this frame. Reachable only
+    /// from `waiting` (`SessionEventPolicy.allowsFrameTransition`).
+    case notAttempted
 }
 
 // MARK: - ScanReceipt
@@ -1901,21 +1923,43 @@ public struct ScanSummary: Decodable, Equatable, Sendable {
     public let completed: [Int]
     public let failed: [Int]
     public let skipped: [Int]
+    /// D-20/HEAD-12: frames the batch never reached -- distinct from
+    /// `failed`, which names only the frame(s) the engine actually
+    /// attributed a typed failure to. A custom `init(from:)` defaults this
+    /// to `[]` so an older engine's summary (which never sent this key)
+    /// still decodes.
+    public let notAttempted: [Int]
     public let stopped: Bool
     public let evidencePackageStatus: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case completed, failed, skipped, notAttempted, stopped, evidencePackageStatus
+    }
 
     public init(
         completed: [Int],
         failed: [Int],
         skipped: [Int],
+        notAttempted: [Int] = [],
         stopped: Bool,
         evidencePackageStatus: String? = nil
     ) {
         self.completed = completed
         self.failed = failed
         self.skipped = skipped
+        self.notAttempted = notAttempted
         self.stopped = stopped
         self.evidencePackageStatus = evidencePackageStatus
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        completed = try container.decode([Int].self, forKey: .completed)
+        failed = try container.decode([Int].self, forKey: .failed)
+        skipped = try container.decode([Int].self, forKey: .skipped)
+        notAttempted = try container.decodeIfPresent([Int].self, forKey: .notAttempted) ?? []
+        stopped = try container.decode(Bool.self, forKey: .stopped)
+        evidencePackageStatus = try container.decodeIfPresent(String.self, forKey: .evidencePackageStatus)
     }
 }
 

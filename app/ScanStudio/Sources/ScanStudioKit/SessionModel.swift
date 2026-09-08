@@ -379,6 +379,25 @@ public enum ScanSizeEstimator {
     }
 }
 
+/// D-19/HEAD-12: one finished job's aggregate, archived by `SessionModel`
+/// just before `jobId`/`jobState` are cleared -- `job.get`/`status --job`'s
+/// only source for a job that finished seconds ago. Retains only what
+/// `ControlJobResult` already exposes for a live job (T-03-46): scalars,
+/// two small per-frame code/message maps, and `notAttemptedFrames` --
+/// never `details`/`evidence`/`diagnosticEvidence`, and never a receipt or
+/// output path.
+struct TerminalJobRecord: Equatable, Sendable {
+    let jobId: String
+    let jobState: JobState
+    let completedFrameCount: Int
+    let pendingFrameCount: Int
+    let receiptCount: Int
+    let frameErrorCodes: [Int: String]
+    let frameErrorMessages: [Int: String]
+    let notAttemptedFrames: [Int]
+    let finishedAt: String
+}
+
 @MainActor
 @Observable
 public final class SessionModel {
@@ -665,6 +684,32 @@ public final class SessionModel {
     public private(set) var frameStates: [Int: FrameState] = [:]
     public private(set) var receipts: [ScanReceipt] = []
     public private(set) var frameErrors: [Int: ErrorPayload] = [:]
+    /// D-19/HEAD-12: the last `maximumTerminalJobHistory` jobs this process
+    /// has seen finish, oldest evicted first. Archived in `applyCompleted`
+    /// before `jobId`/`jobState` are cleared, so `job.get`/`status --job`
+    /// can still answer for a job that finished seconds ago -- the
+    /// 2026-09-07 case where the finished job became `JOB_NOT_FOUND` almost
+    /// immediately. Deliberately never cleared by `resetProjectScopedScanState`
+    /// (called on both disconnect and project change): D-19 frames this as
+    /// "the last 8 jobs of the process," not of the current project or
+    /// connection, so it survives both -- only the 8-entry bound evicts
+    /// anything, and a genuinely new process starts with an empty ring for
+    /// free (it is plain instance state).
+    private(set) var terminalJobHistory: [TerminalJobRecord] = []
+    static let maximumTerminalJobHistory = 8
+
+    /// The ring's own job ids, oldest first -- the live job (if any) is
+    /// deliberately excluded, matching `terminalJobHistory`'s "already
+    /// finished" contract.
+    var trackedJobIds: [String] { terminalJobHistory.map(\.jobId) }
+
+    /// `ControlChannelDispatcher`'s `.jobGet` arm calls this only after its
+    /// own "no id, or id matches the live job" cases have already been
+    /// handled -- this looks at the ring alone.
+    func terminalJob(id: String) -> TerminalJobRecord? {
+        terminalJobHistory.first { $0.jobId == id }
+    }
+
     /// A fine-scan request paused before `scan.start` because one or more
     /// current preview boundaries need an explicit operator confirmation.
     public private(set) var pendingManualReviewScan: ManualReviewScanRequest?
@@ -3048,6 +3093,15 @@ public final class SessionModel {
             let params = SetFrameExcludedParams(frameIndex: frameIndex, excluded: excluded)
             let result: SetFrameResult = try await engineClient.request("project.setFrameExcluded", params: params)
             project = result.project
+            // D-22/HEAD-12 (CF-12/CF-13, the 2026-09-07 batch abort): the
+            // engine's own pendingFrames is refreshed here, before this
+            // method returns, so the dispatcher's next readiness read (and
+            // the GUI's own Resume button) is never stale -- excluding a
+            // frame after a failed batch must not brick Resume until
+            // something else happens to refresh the cache. Skipped when the
+            // mutation itself failed, so a failure is not masked by a
+            // second, unrelated error from this read.
+            await refreshPendingFrames()
         } catch {
             recordOperationFailure(error, operation: "project.setFrameExcluded")
             lastErrorMessage = Self.describe(error)
@@ -4494,6 +4548,21 @@ public final class SessionModel {
             decodeAndApply(event, as: FrameCompletedPayload.self) { self.applyReceipt($0, source: event) }
         case "scan.completed":
             decodeAndApply(event, as: ScanCompletedPayload.self) { self.applyCompleted($0, source: event) }
+        case "engine.request.timeout":
+            // D-24/HEAD-12 (CF-14): a synthetic event `EngineClient` yields
+            // on its own stream when a request times out -- no `jobId` to
+            // filter on, unlike every other case here. Method and id only,
+            // never this request's own params.
+            decodeAndApply(event, as: EngineRequestTimeoutPayload.self) {
+                self.recordDiagnostic(
+                    event: "engine.request.timeout",
+                    fields: [
+                        "method": $0.method,
+                        "id": String($0.id),
+                        "elapsedSeconds": String($0.elapsedSeconds),
+                    ]
+                )
+            }
         case "engine.terminated":
             handleUnexpectedEngineTermination()
         default:
@@ -5098,6 +5167,19 @@ public final class SessionModel {
             }
         } else {
             attendedScanRecoveryAuthorization = nil
+            // D-20/HEAD-12 (the 2026-09-07 batch abort): a partially-
+            // completed batch abort (e.g. 9 frames done, frame 10 raised
+            // ROLL_MISMATCH, 11-36 never attempted) previously left
+            // lastErrorMessage untouched here -- this branch only ever ran
+            // the line above. The bridge's own text, taken from the
+            // frameErrors entry of the failed frame; never synthesized.
+            // Post-Task-1's notAttempted split, a batch-abort summary
+            // names exactly one frame under `failed` (the frame the batch
+            // actually attributed), so "the failed frame" is unambiguous.
+            if let failedFrame = payload.summary.failed.first,
+               let error = frameErrors[failedFrame] {
+                lastErrorMessage = "\(error.code): \(error.message)"
+            }
         }
         if let transportFailure {
             requirePhysicalRefeed(
@@ -5105,6 +5187,27 @@ public final class SessionModel {
                 message: transportFailure.message,
                 preservingActiveJob: true
             )
+        }
+        // D-19/HEAD-12: archive this job's aggregate before jobId/jobState
+        // are cleared below -- job.get/status --job's only source for a job
+        // that finished seconds ago.
+        if let currentJobId = jobId {
+            let frameErrorCodes = Dictionary(uniqueKeysWithValues: frameErrors.map { ($0.key, $0.value.code) })
+            let frameErrorMessages = Dictionary(uniqueKeysWithValues: frameErrors.map { ($0.key, $0.value.message) })
+            terminalJobHistory.append(TerminalJobRecord(
+                jobId: currentJobId,
+                jobState: jobState ?? .failed,
+                completedFrameCount: completedFrameCount,
+                pendingFrameCount: pendingFrames.count,
+                receiptCount: receipts.count,
+                frameErrorCodes: frameErrorCodes,
+                frameErrorMessages: frameErrorMessages,
+                notAttemptedFrames: payload.summary.notAttempted,
+                finishedAt: ISO8601DateFormatter().string(from: Date())
+            ))
+            if terminalJobHistory.count > Self.maximumTerminalJobHistory {
+                terminalJobHistory.removeFirst(terminalJobHistory.count - Self.maximumTerminalJobHistory)
+            }
         }
         activeScanAuthorization = nil
         jobId = nil
@@ -5556,10 +5659,12 @@ enum SessionEventPolicy {
     static func allowsFrameTransition(from current: FrameState, to next: FrameState) -> Bool {
         if current == next { return true }
         switch current {
-        case .waiting: return next == .active || next == .completed || next == .failed || next == .skipped
+        case .waiting:
+            return next == .active || next == .completed || next == .failed || next == .skipped
+                || next == .notAttempted
         case .active: return next == .completed || next == .failed || next == .skipped
         case .failed: return next == .active
-        case .completed, .skipped: return false
+        case .completed, .skipped, .notAttempted: return false
         }
     }
 }

@@ -328,7 +328,12 @@ struct AttendedScanRecoveryTests {
         )
         emitCompletion(model, completed: [1], failed: [2])
 
-        #expect(model.lastErrorMessage == nil)
+        // D-20/HEAD-12 (the 2026-09-07 batch abort): a partial success must
+        // still surface the bridge's own text -- this is the exact bug
+        // (9 frames completed, lastErrorMessage stayed null) D-20 exists to
+        // fix. It must never, however, be treated as the zero-completed
+        // attended-recovery case (the very next assertion).
+        #expect(model.lastErrorMessage == "ATTENDED_BINDING_REQUIRED: typed but only one frame failed")
         #expect(!model.canApproveEveryFrameAndScan)
     }
 
