@@ -524,6 +524,14 @@ public final class SessionModel {
         let connectionEpoch: UInt64
     }
 
+    private struct PendingExposureSolve {
+        let id: UUID
+        let operationId: String
+        let frameIndex: Int
+        let connectionEpoch: UInt64
+        let continuation: CheckedContinuation<RollExposureLock?, Never>
+    }
+
     private struct PersistedFrameAlignmentTarget: Sendable {
         let frameIndex: Int
         let offsetRows: Int
@@ -569,6 +577,8 @@ public final class SessionModel {
     private var pendingFrameAlignmentAdjustment: PendingFrameAlignmentAdjustment?
     @ObservationIgnored
     private var pendingFrameAlignmentRestore: PendingFrameAlignmentRestore?
+    @ObservationIgnored
+    private var pendingExposureSolve: PendingExposureSolve?
 
     @ObservationIgnored
     private var projectSnapshotGeneration: UInt64 = 0
@@ -1169,7 +1179,10 @@ public final class SessionModel {
             resolutionDpi: scanResolutionDpi,
             bitDepth: scanBitDepth,
             multisamplePasses: scanMultisamplePasses,
-            channels: scanChannels
+            channels: scanChannels,
+            exposureOverride10ns: autoExposureEachFrame
+                ? nil
+                : project?.rollExposureLock?.rgbExposuresRaw10ns
         )
     }
     public var processingRecipe: ProcessingRecipe {
@@ -1876,6 +1889,97 @@ public final class SessionModel {
     /// recipe currently shown in the Batch Settings inspector.
     public func startMockScan() async {
         await startMockScan(frames: selectedFrames, passToken: nil)
+    }
+
+    /// Measures and durably stores one roll-wide RGB exposure authority
+    /// inside the currently held real preview session.
+    @discardableResult
+    public func solveExposure(frameIndex: Int) async -> RollExposureLock? {
+        guard mutatingOperationInFlight == nil,
+              pendingExposureSolve == nil,
+              project != nil,
+              hardwareMotionReadiness.allowsMotion,
+              hasCompletePreviewRegistration,
+              thumbnails[frameIndex] != nil,
+              validFrameIndices.contains(frameIndex)
+        else {
+            lastErrorMessage = hardwareMotionReadiness.allowsMotion
+                ? "Exposure measurement requires an open project and a frame from the completed preview."
+                : hardwareMotionReadiness.guidance
+            return nil
+        }
+        let operationId = UUID().uuidString.lowercased()
+        mutatingOperationInFlight = "roll.solveExposure"
+        lastErrorMessage = nil
+        return await withCheckedContinuation { continuation in
+            let marker = PendingExposureSolve(
+                id: UUID(),
+                operationId: operationId,
+                frameIndex: frameIndex,
+                connectionEpoch: connectionEpoch,
+                continuation: continuation
+            )
+            pendingExposureSolve = marker
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let ack: RollSolveExposureAck = try await self.engineClient.request(
+                        "roll.solveExposure",
+                        params: RollSolveExposureParams(
+                            frameIndex: frameIndex,
+                            operationId: operationId
+                        )
+                    )
+                    if !ack.accepted {
+                        self.finishExposureSolve(marker, result: nil, message: "The engine did not accept exposure measurement.")
+                    }
+                } catch {
+                    self.recordOperationFailure(error, operation: "roll.solveExposure")
+                    self.finishExposureSolve(marker, result: nil, message: Self.describe(error))
+                }
+            }
+        }
+    }
+
+    public func verifyRoll(_ params: ControlRollVerifyParams) async -> CalibrationVerificationReport? {
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.verify", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.verify")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    public func collectRoll(_ params: ControlRollCollectParams) async -> CalibrationCollectionResult? {
+        let previous = beginMutatingOperation("roll.collect")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            var resolved = params
+            resolved.metadata.appVersion = Self.releaseStamp
+            resolved.metadata.host = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString) (\(HostArchitectureProvider.currentHostArchitecture.rawValue))"
+            resolved.metadata.firmware = device?.firmware
+            resolved.metadata.adapter = status?.adapter
+            return try await engineClient.request("roll.collect", params: resolved)
+        } catch {
+            recordOperationFailure(error, operation: "roll.collect")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    private func finishExposureSolve(
+        _ marker: PendingExposureSolve,
+        result: RollExposureLock?,
+        message: String? = nil
+    ) {
+        guard pendingExposureSolve?.id == marker.id else { return }
+        pendingExposureSolve = nil
+        mutatingOperationInFlight = nil
+        if let message { lastErrorMessage = message }
+        marker.continuation.resume(returning: result)
     }
 
     /// Control-channel entry point for an explicit frame set and optional
@@ -4824,6 +4928,37 @@ public final class SessionModel {
                     self.refeedRequired = true
                 }
             }
+        case "roll.exposureSolved":
+            decodeAndApply(event, as: RollExposureSolvedPayload.self) { payload in
+                guard let marker = self.pendingExposureSolve,
+                      marker.operationId == payload.operationId,
+                      marker.frameIndex == payload.solution.slot,
+                      marker.connectionEpoch == self.connectionEpoch,
+                      payload.project.id == self.project?.id
+                else { return }
+                self.project = payload.project
+                self.finishExposureSolve(marker, result: payload.solution)
+            }
+        case "roll.exposureError":
+            decodeAndApply(event, as: RollExposureErrorPayload.self) { payload in
+                guard let marker = self.pendingExposureSolve,
+                      marker.operationId == payload.operationId,
+                      marker.frameIndex == payload.frameIndex,
+                      marker.connectionEpoch == self.connectionEpoch
+                else { return }
+                let error = EngineRequestError(
+                    code: payload.code,
+                    message: payload.message,
+                recoverable: payload.recoverable,
+                    details: payload.details
+                )
+                self.recordOperationFailure(error, operation: "roll.solveExposure")
+                self.finishExposureSolve(
+                    marker,
+                    result: nil,
+                    message: "\(payload.code): \(payload.message)"
+                )
+            }
         case "scan.jobState":
             decodeAndApply(event, as: JobStatePayload.self) { self.applyJobState($0, source: event) }
         case "scan.progress":
@@ -5856,6 +5991,11 @@ public final class SessionModel {
     /// bridge owner. This is local bookkeeping only: it never opens a device,
     /// retries motion, or sends a scanner command.
     private func advanceConnectionEpoch() {
+        if let marker = pendingExposureSolve {
+            pendingExposureSolve = nil
+            mutatingOperationInFlight = nil
+            marker.continuation.resume(returning: nil)
+        }
         connectionEpoch &+= 1
         projectSnapshotGeneration &+= 1
         pendingFramesRequestID = nil

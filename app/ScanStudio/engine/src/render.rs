@@ -3018,6 +3018,20 @@ pub(crate) fn acquire_job_output_authorities_with_project_root(
                 }
                 _ => authorize_independent_leaf(raw_path.clone(), "raw negative")?,
             };
+            // Raw-only calibration still retains the measured meter raster.
+            if frame.archive_meter.is_none() {
+                let meter_path = archive_sidecar_path(&raw.final_path, "METER")?;
+                frame.archive_meter = Some(
+                    raw.with_sibling_name(
+                        meter_path
+                            .file_name()
+                            .expect("raw meter sidecar has leaf")
+                            .to_os_string(),
+                        meter_path,
+                        "raw meter sidecar",
+                    )?,
+                );
+            }
             if effective_recipe.channels == domain::Channels::Rgbi
                 && effective_output.raw_export.tiff_infrared == domain::RawTiffInfrared::Sidecar
             {
@@ -3124,6 +3138,9 @@ impl PublishedFileProof {
 /// these proofs.
 #[derive(Debug, Default)]
 pub(crate) struct MetadataPublicationProofs {
+    // Retained for read-only capture bindings, never ExifTool write targets.
+    pub(crate) raw: Option<PublishedFileProof>,
+    pub(crate) raw_ir: Option<PublishedFileProof>,
     pub(crate) archive: Option<PublishedFileProof>,
     /// Retained with the receipt lifetime so a sidecar publication can never
     /// lose its identity proof before the frame outcome is finalized. These
@@ -6086,7 +6103,11 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
         .unwrap_or_default();
     validate_derivative_transform(derivative_transform)?;
 
-    if !recipes.archive.enabled && !recipes.positive.enabled && !recipes.preview.enabled {
+    if !recipes.archive.enabled
+        && !recipes.positive.enabled
+        && !recipes.preview.enabled
+        && !(archive_meter_path.is_some() && authorities.archive_meter.is_some())
+    {
         return Ok(WrittenPaths {
             archive_path: None,
             positive_path: None,
@@ -6105,9 +6126,15 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
     // private workspace, then publish byte-exact retained masters through
     // the project-root-held authority. Low-level callers whose source is
     // already the authorized final leaf retain that exact proof in place.
-    let archive_source_proof = open_existing_file_proof(archive_rgb_path)?;
+    let archive_source_proof =
+        (recipes.archive.enabled || recipes.positive.enabled || recipes.preview.enabled)
+            .then(|| open_existing_file_proof(archive_rgb_path))
+            .transpose()?;
     let mut archive_existing_proof = None;
     let archive_staged = if let Some(output) = authorities.archive.as_ref() {
+        let archive_source_proof = archive_source_proof
+            .as_ref()
+            .expect("archive output requires RGB source");
         if source_matches_authorized_final(archive_rgb_path, output)? {
             archive_existing_proof = Some(PublishedFileProof {
                 final_path: output.final_path.clone(),
@@ -6178,6 +6205,8 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
             raw_negative_path: None,
             raw_negative_ir_path: None,
             metadata_publications: MetadataPublicationProofs {
+                raw: None,
+                raw_ir: None,
                 archive: archive_proof,
                 archive_ir: archive_ir_proof,
                 archive_meter: archive_meter_proof,
@@ -6188,6 +6217,8 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
             derivative_transform,
         });
     }
+
+    let archive_source_proof = archive_source_proof.expect("derivatives require RGB source");
 
     // Validate against the bridge receipt's actual archive authority before
     // opening that source or creating any derivative. A recipe-predicted
@@ -6471,6 +6502,8 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
         raw_negative_path: None,
         raw_negative_ir_path: None,
         metadata_publications: MetadataPublicationProofs {
+            raw: None,
+            raw_ir: None,
             archive: archive_proof,
             archive_ir: archive_ir_proof,
             archive_meter: archive_meter_proof,
@@ -8272,7 +8305,7 @@ fn publish_authorized_raw_pair_with_hook<Hook>(
     sidecar: AuthorizedStagedFile,
     marker_output: &AuthorizedOutputLeaf,
     mut after_step: Hook,
-) -> Result<Option<PathBuf>, domain::EngineError>
+) -> Result<MetadataPublicationProofs, domain::EngineError>
 where
     Hook: FnMut(RawPairCommitStep) -> Result<(), domain::EngineError>,
 {
@@ -8320,7 +8353,7 @@ where
         marker_proof = Some(marker_staged.publish()?);
         after_step(RawPairCommitStep::MarkerPublished)?;
         after_step(RawPairCommitStep::CommitDirectorySynced)?;
-        Ok(Some(sidecar.output.final_path.clone()))
+        Ok(())
     })();
     if result.is_err() {
         rollback_authorized_publication(marker_output, marker_proof.as_ref());
@@ -8330,7 +8363,11 @@ where
     main.cleanup_temporary();
     sidecar.cleanup_temporary();
     marker_staged.cleanup_temporary();
-    result
+    result.map(|()| MetadataPublicationProofs {
+        raw: main_proof,
+        raw_ir: sidecar_proof,
+        ..Default::default()
+    })
 }
 
 fn write_raw_export_create_only_authorized_with_hook<Hook>(
@@ -8342,7 +8379,7 @@ fn write_raw_export_create_only_authorized_with_hook<Hook>(
     ir_available: bool,
     authorities: &FrameOutputAuthorities,
     after_step: Hook,
-) -> Result<Option<PathBuf>, domain::EngineError>
+) -> Result<MetadataPublicationProofs, domain::EngineError>
 where
     Hook: FnMut(RawPairCommitStep) -> Result<(), domain::EngineError>,
 {
@@ -8352,7 +8389,10 @@ where
     let encoded = encoded_simulated_raw(raw, width, height, dpi, recipe, ir_available)?;
     let main = stage_authorized_bytes(main_output, &encoded, "raw")?;
     if !(ir_available && recipe.tiff_infrared == domain::RawTiffInfrared::Sidecar) {
-        let result = main.publish().map(|_| None);
+        let result = main.publish().map(|proof| MetadataPublicationProofs {
+            raw: Some(proof),
+            ..Default::default()
+        });
         main.cleanup_temporary();
         return result;
     }
@@ -8382,7 +8422,7 @@ fn write_raw_export_create_only_authorized(
     recipe: &domain::RawExportRecipe,
     ir_available: bool,
     authorities: &FrameOutputAuthorities,
-) -> Result<Option<PathBuf>, domain::EngineError> {
+) -> Result<MetadataPublicationProofs, domain::EngineError> {
     write_raw_export_create_only_authorized_with_hook(
         raw,
         width,
@@ -8395,18 +8435,18 @@ fn write_raw_export_create_only_authorized(
     )
 }
 
-pub(crate) fn publish_real_raw_export_authorized(
+pub(crate) fn publish_real_raw_export_authorized_with_proofs(
     main_source: Option<&Path>,
     sidecar_source: Option<&Path>,
     authorities: &FrameOutputAuthorities,
-) -> Result<(Option<PathBuf>, Option<PathBuf>), domain::EngineError> {
+) -> Result<MetadataPublicationProofs, domain::EngineError> {
     let Some(main_source) = main_source else {
         if authorities.raw.is_some() {
             return Err(output_authority_error(
                 "enabled raw export was omitted by the bridge",
             ));
         }
-        return Ok((None, None));
+        return Ok(MetadataPublicationProofs::default());
     };
     let main_output = authorities.raw.as_ref().ok_or_else(|| {
         output_authority_error("bridge produced raw output without held destination authority")
@@ -8420,9 +8460,10 @@ pub(crate) fn publish_real_raw_export_authorized(
                 "raw sidecar mode was enabled but the bridge omitted its infrared file",
             ));
         }
-        let result = main
-            .publish()
-            .map(|_| (Some(main_output.final_path.clone()), None));
+        let result = main.publish().map(|proof| MetadataPublicationProofs {
+            raw: Some(proof),
+            ..Default::default()
+        });
         main.cleanup_temporary();
         return result;
     };
@@ -8441,7 +8482,6 @@ pub(crate) fn publish_real_raw_export_authorized(
         }
     };
     publish_authorized_raw_pair_with_hook(main, sidecar, marker_output, |_| Ok(()))
-        .map(|sidecar| (Some(main_output.final_path.clone()), sidecar))
 }
 
 #[derive(Debug, Default)]
@@ -9388,8 +9428,30 @@ pub(crate) fn render_and_write_frame_with_processing_authorized(
         .archive
         .as_ref()
         .map(|archive| archive.final_path.clone());
-    let (raw_negative_path, raw_negative_ir_path) = if preflight_raw_path.is_some() {
-        let written_ir_path = write_raw_export_create_only_authorized(
+    // Synthetic RGBI fixture pixels only; simulator receipts retain simulated=true
+    // and never gain measured exposure/clipping authority from this raster.
+    let meter_proof = authorities
+        .archive_meter
+        .as_ref()
+        .map(|output| {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            {
+                let mut encoder =
+                    tiff::encoder::TiffEncoder::new(&mut encoded).map_err(metadata_encode_error)?;
+                encoder
+                    .write_image::<tiff::encoder::colortype::RGBA16>(
+                        1,
+                        1,
+                        &[12000, 16000, 20000, 24000],
+                    )
+                    .map_err(metadata_encode_error)?;
+            }
+            let staged = stage_authorized_bytes(output, &encoded.into_inner(), "sim-meter")?;
+            staged.publish()
+        })
+        .transpose()?;
+    let raw_proofs = if preflight_raw_path.is_some() {
+        write_raw_export_create_only_authorized(
             &raw,
             width,
             height,
@@ -9397,18 +9459,13 @@ pub(crate) fn render_and_write_frame_with_processing_authorized(
             &recipes.raw_export,
             raw_ir_available,
             authorities,
-        )?;
-        let _ = preflight_raw_ir_path.as_ref();
-        (
-            authorities
-                .raw
-                .as_ref()
-                .map(|output| output.final_path.clone()),
-            written_ir_path,
-        )
+        )?
     } else {
-        (None, None)
+        MetadataPublicationProofs::default()
     };
+    let _ = preflight_raw_ir_path;
+    let raw_negative_path = raw_proofs.raw.as_ref().map(|p| p.final_path.clone());
+    let raw_negative_ir_path = raw_proofs.raw_ir.as_ref().map(|p| p.final_path.clone());
 
     let mut positive_path: Option<std::path::PathBuf> = None;
     let mut preview_path: Option<std::path::PathBuf> = None;
@@ -9526,9 +9583,11 @@ pub(crate) fn render_and_write_frame_with_processing_authorized(
         raw_negative_path,
         raw_negative_ir_path,
         metadata_publications: MetadataPublicationProofs {
+            raw: raw_proofs.raw,
+            raw_ir: raw_proofs.raw_ir,
             archive: archive_proof,
             archive_ir: None,
-            archive_meter: None,
+            archive_meter: meter_proof,
             positive: positive_proof,
             preview: preview_proof,
         },
@@ -10040,6 +10099,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    #[test]
+    fn raw_pair_publications_mint_separate_read_only_bindings() {
+        let project = unique_test_dir();
+        std::fs::create_dir_all(&project).unwrap();
+        let mut output = domain::OutputRecipe::default();
+        output.archive.enabled = false;
+        output.archive.full_capture_package = false;
+        output.positive.enabled = false;
+        output.preview.enabled = false;
+        output.raw_export.enabled = true;
+        output.raw_export.destination = project.join("Raw").display().to_string();
+        output.raw_export.filename_template = "frame-####".into();
+        output.raw_export.file_format = domain::RawExportFormat::LinearTiff;
+        output.raw_export.tiff_infrared = domain::RawTiffInfrared::Sidecar;
+        let authorities = acquire_job_output_authorities(
+            Some(&project),
+            &[1],
+            &domain::CaptureRecipe::default(),
+            &output,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let mut proofs = write_raw_export_create_only_authorized(
+            &vec![[0.3, 0.4, 0.5]; 48],
+            8,
+            6,
+            4000,
+            &output.raw_export,
+            true,
+            authorities.frame(1).unwrap(),
+        )
+        .unwrap();
+        let meter_source = project.join("meter-source.tif");
+        std::fs::write(&meter_source, b"retained meter bytes").unwrap();
+        let retained = render_derivative_from_archive_with_processing_authorized(
+            &project.join("absent-rgb.tif"),
+            None,
+            Some(&meter_source),
+            1,
+            &domain::ProcessingRecipe::default(),
+            &output,
+            None,
+            None,
+            None,
+            None,
+            None,
+            4000,
+            domain::HardwareVerification::Verified,
+            None,
+            authorities.frame(1).unwrap(),
+        )
+        .unwrap();
+        assert!(retained.archive_path.is_none());
+        proofs.archive_meter = retained.metadata_publications.archive_meter;
+        let root = authorities.project_root().unwrap();
+        let bind = || {
+            crate::exiftool::bind_capture_output_publications_at(
+                root.directory_handle(),
+                root.requested_path(),
+                root.canonical_path(),
+                &proofs,
+            )
+        };
+        let bindings = bind().unwrap();
+        assert!(bindings.raw_negative.as_ref().unwrap().byte_length > 0);
+        assert!(bindings.raw_negative_ir.as_ref().unwrap().byte_length > 0);
+        assert_eq!(bindings.meter.as_ref().unwrap().byte_length, 20);
+        let metadata = crate::exiftool::bind_metadata_output_publications_at(
+            root.directory_handle(),
+            root.requested_path(),
+            root.canonical_path(),
+            &proofs,
+        )
+        .unwrap();
+        assert_eq!(metadata, domain::MetadataOutputBindings::default());
+        let path = proofs.raw.as_ref().unwrap().final_path();
+        std::fs::rename(path, path.with_extension("original")).unwrap();
+        std::fs::write(path, b"replacement").unwrap();
+        assert!(
+            bind().is_err(),
+            "replacement path cannot mint an original-file binding"
+        );
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn held_raw_pair_destination_refuses_swap_before_commit_marker_publication() {
@@ -10363,9 +10507,15 @@ mod tests {
         let first = project.join("Σ_0001.tif");
         let second = project.join("ς_0001.tif");
         std::fs::write(&first, b"oracle").unwrap();
-        let oracle = std::fs::OpenOptions::new().write(true).create_new(true).open(&second);
+        let oracle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&second);
         let collision = match oracle {
-            Ok(file) => { drop(file); false }
+            Ok(file) => {
+                drop(file);
+                false
+            }
             Err(error) => {
                 assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
                 true
@@ -10377,8 +10527,7 @@ mod tests {
             &domain::CaptureRecipe::default(),
             &output,
             &std::collections::HashMap::new(),
-        )
-        ;
+        );
         if collision {
             let error = result.expect_err("filesystem aliases must collide before capture");
             assert_eq!(error.code, protocol::ErrorCode::InvalidParams);
@@ -11670,7 +11819,9 @@ mod tests {
         let mut decoder =
             tiff::decoder::Decoder::new(std::fs::File::open(&derivative).unwrap()).unwrap();
         assert_eq!(
-            decoder.get_tag_ascii_string(tiff::tags::Tag::Model).unwrap(),
+            decoder
+                .get_tag_ascii_string(tiff::tags::Tag::Model)
+                .unwrap(),
             "LS-50 ED"
         );
         assert_eq!(
@@ -12021,9 +12172,15 @@ mod tests {
         let displaced = root.join("engine-authored-positive.tif");
         let renamed = std::fs::rename(positive, &displaced);
         if cfg!(windows) {
-            assert!(renamed.is_err(), "held Windows output must deny replacement");
-            crate::exiftool::bind_metadata_output_publications(&root, &written.metadata_publications)
-                .expect("denied replacement retains the original binding");
+            assert!(
+                renamed.is_err(),
+                "held Windows output must deny replacement"
+            );
+            crate::exiftool::bind_metadata_output_publications(
+                &root,
+                &written.metadata_publications,
+            )
+            .expect("denied replacement retains the original binding");
             drop(written);
             let _ = std::fs::remove_dir_all(root);
             return;

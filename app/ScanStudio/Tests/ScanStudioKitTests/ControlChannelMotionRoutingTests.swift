@@ -61,7 +61,11 @@ private let motionRoutingEmptyProjectDirectory = "/tmp/motion-routing-test-no-fr
 /// immediately, exactly the input a `scan.resume` "nothing pending" test
 /// needs; `selectedFrames`-driven tests are unaffected since they never
 /// read `pendingFrames`.
-private func motionRoutingProject(frameIndex: Int = 1, includeFrames: Bool = true) -> ScanProject {
+private func motionRoutingProject(
+    frameIndex: Int = 1,
+    includeFrames: Bool = true,
+    rollExposureLock: RollExposureLock? = nil
+) -> ScanProject {
     ScanProject(
         schemaVersion: 1,
         id: "motion-routing-project",
@@ -90,6 +94,7 @@ private func motionRoutingProject(frameIndex: Int = 1, includeFrames: Bool = tru
             )
         ),
         rollMetadata: MetadataSet(),
+        rollExposureLock: rollExposureLock,
         createdAt: "2026-09-07T00:00:00Z",
         frames: includeFrames ? [ProjectFrame(index: frameIndex, excluded: false, receipts: [])] : []
     )
@@ -107,8 +112,15 @@ private func motionRoutingProject(frameIndex: Int = 1, includeFrames: Bool = tru
 /// own incidental `scanner.list` discovery request is never accidentally
 /// gated.
 private actor MotionRoutingEngineStub: EngineClientProtocol {
-    nonisolated let events: AsyncStream<EngineEvent> = AsyncStream { _ in }
+    nonisolated let events: AsyncStream<EngineEvent>
+    private let eventsContinuation: AsyncStream<EngineEvent>.Continuation
     var engineVersion: String? = "motion-routing-stub"
+
+    init() {
+        var continuation: AsyncStream<EngineEvent>.Continuation!
+        events = AsyncStream { continuation = $0 }
+        eventsContinuation = continuation
+    }
 
     /// Every request this stub has received since the last `clearLog()`, in
     /// order -- the CTRL-03 proof that a routing arm invoked the one
@@ -195,6 +207,25 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
                 ProjectOpenResult(project: openedProject, directory: requestedDirectory),
                 as: Result.self
             )
+        case "roll.solveExposure":
+            let solve = params as! RollSolveExposureParams
+            let solution = RollExposureLock(
+                slot: solve.frameIndex,
+                rgbExposuresRaw10ns: [120_000, 130_000, 140_000],
+                irMeteredExposureRaw10ns: 150_000,
+                meterEvidencePath: "/tmp/motion-routing/meter.tif",
+                meterEvidenceSha256: String(repeating: "a", count: 64),
+                journalPath: "/tmp/motion-routing/journal.json",
+                journalSha256: String(repeating: "b", count: 64)
+            )
+            let payload = RollExposureSolvedPayload(
+                operationId: solve.operationId,
+                solution: solution,
+                project: motionRoutingProject(rollExposureLock: solution)
+            )
+            let data = try JSONEncoder().encode(TestEvent(event: "roll.exposureSolved", payload: payload))
+            eventsContinuation.yield(EngineEvent(name: "roll.exposureSolved", rawLine: data))
+            return try cast(RollSolveExposureAck(accepted: true), as: Result.self)
         case "scan.start":
             return try cast(ScanStartResult(jobId: "motion-routing-job"), as: Result.self)
         case "scan.stop":
@@ -224,6 +255,11 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
         guard let result = value as? Result else { throw MotionRoutingStubError.unexpectedResultType }
         return result
     }
+}
+
+private struct TestEvent<Payload: Encodable>: Encodable {
+    let event: String
+    let payload: Payload
 }
 
 /// Bounded `Task.yield()` polling, per this codebase's established idiom
@@ -969,6 +1005,44 @@ struct ControlChannelMotionRoutingTests {
 
         await stub.release("project.pendingFrames")
         _ = await first.value
+    }
+
+    @Test("roll.solveExposure requires explicit motion confirmation")
+    @MainActor
+    func solveExposureRequiresConfirmation() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.rollSolveExposure(
+            id: 41,
+            params: ControlRollSolveExposureParams(frame: 1, motionConfirmed: false)
+        ))
+        expectFailure(response, id: 41, code: .confirmationRequired)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
+    @Test("roll.solveExposure waits for terminal evidence and installs the persisted project lock")
+    @MainActor
+    func solveExposurePersistsReturnedProject() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        #expect(await prepareMotionRoutingScanReadiness(model))
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.rollSolveExposure(
+            id: 42,
+            params: ControlRollSolveExposureParams(frame: 1, motionConfirmed: true)
+        ))
+        guard case .success(let id, let result) = response,
+              case .rollExposure(let exposure) = result
+        else {
+            Issue.record("expected exposure solution, got \(response)")
+            return
+        }
+        #expect(id == 42)
+        #expect(exposure.solution.rgbExposuresRaw10ns == [120_000, 130_000, 140_000])
+        #expect(model.project?.rollExposureLock == exposure.solution)
+        #expect(model.mutatingOperationInFlight == nil)
+        #expect(await stub.recordedMethods == ["roll.solveExposure"])
     }
 
     // MARK: - D-23/HEAD-12: review.cancel (CF-10/CF-11)

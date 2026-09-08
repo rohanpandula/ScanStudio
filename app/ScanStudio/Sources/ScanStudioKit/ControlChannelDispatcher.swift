@@ -58,6 +58,9 @@ public enum ControlRequest: Sendable {
     case rollSave(id: UInt64, params: ControlRollSaveParams)
     case rollOpen(id: UInt64, params: ControlRollOpenParams)
     case rollList(id: UInt64)
+    case rollSolveExposure(id: UInt64, params: ControlRollSolveExposureParams)
+    case rollVerify(id: UInt64, params: ControlRollVerifyParams)
+    case rollCollect(id: UInt64, params: ControlRollCollectParams)
     case scanStart(id: UInt64, params: ControlScanStartParams)
     case scanStop(id: UInt64, params: ControlScanStopParams)
     case scanResume(id: UInt64, params: ControlScanResumeParams)
@@ -98,6 +101,8 @@ extension ControlRequest {
         case .rollSave(let id, _): id
         case .rollOpen(let id, _): id
         case .rollList(let id): id
+        case .rollSolveExposure(let id, _): id
+        case .rollVerify(let id, _), .rollCollect(let id, _): id
         case .scanStart(let id, _): id
         case .scanStop(let id, _): id
         case .scanResume(let id, _): id
@@ -134,6 +139,9 @@ extension ControlRequest {
         case .rollSave: "roll.save"
         case .rollOpen: "roll.open"
         case .rollList: "roll.list"
+        case .rollSolveExposure: "roll.solveExposure"
+        case .rollVerify: "roll.verify"
+        case .rollCollect: "roll.collect"
         case .scanStart: "scan.start"
         case .scanStop: "scan.stop"
         case .scanResume: "scan.resume"
@@ -155,11 +163,11 @@ extension ControlRequest {
         switch self {
         case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect, .simLoadMedia,
              .previewAcquire, .framesSelect, .framesPlace, .framesInclude, .framesExclude, .reviewApprove,
-             .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList,
+             .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList, .rollSolveExposure, .rollCollect,
              .scanStart, .scanStop, .scanResume, .scannerEject, .reviewCancel:
             true
         case .hello, .status, .framesList, .settingsGet, .outputsGet,
-             .diagnosticsExport, .eventsSubscribe, .jobGet:
+             .diagnosticsExport, .eventsSubscribe, .jobGet, .rollVerify:
             false
         }
     }
@@ -185,6 +193,9 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case scannerConnect(ControlScannerConnectResult)
     case rollList(ControlRollListResult)
     case rollSave(ControlRollSaveResult)
+    case rollExposure(ControlRollSolveExposureResult)
+    case rollVerification(CalibrationVerificationReport)
+    case rollCollection(CalibrationCollectionResult)
     case previewAcquire(ControlPreviewAcquireResult)
     case diagnosticsExport(ControlDiagnosticsExportResult)
     case eventsSubscribe(ControlEventsSubscribeResult)
@@ -206,6 +217,9 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .scannerConnect(let value): try container.encode(value)
         case .rollList(let value): try container.encode(value)
         case .rollSave(let value): try container.encode(value)
+        case .rollExposure(let value): try container.encode(value)
+        case .rollVerification(let value): try container.encode(value)
+        case .rollCollection(let value): try container.encode(value)
         case .previewAcquire(let value): try container.encode(value)
         case .diagnosticsExport(let value): try container.encode(value)
         case .eventsSubscribe(let value): try container.encode(value)
@@ -336,6 +350,9 @@ public final class ControlChannelDispatcher {
         case "roll.save": return decoded(ControlRollSaveParams.self) { .rollSave(id: $0, params: $1) }
         case "roll.open": return decoded(ControlRollOpenParams.self) { .rollOpen(id: $0, params: $1) }
         case "roll.list": return decoded(EmptyParams.self) { id, _ in .rollList(id: id) }
+        case "roll.solveExposure": return decoded(ControlRollSolveExposureParams.self) { .rollSolveExposure(id: $0, params: $1) }
+        case "roll.verify": return decoded(ControlRollVerifyParams.self) { .rollVerify(id: $0, params: $1) }
+        case "roll.collect": return decoded(ControlRollCollectParams.self) { .rollCollect(id: $0, params: $1) }
         case "scan.start": return decoded(ControlScanStartParams.self) { .scanStart(id: $0, params: $1) }
         case "scan.stop": return decoded(ControlScanStopParams.self) { .scanStop(id: $0, params: $1) }
         case "scan.resume": return decoded(ControlScanResumeParams.self) { .scanResume(id: $0, params: $1) }
@@ -475,6 +492,14 @@ public final class ControlChannelDispatcher {
                 return .failure(id: id, error: ControlErrorPayload(
                     .confirmationRequired,
                     message: "\"roll.save\" requires motionConfirmed: true (it creates the project and starts the scan).",
+                    guidance: "Confirm scanner motion is authorized, then resend with motionConfirmed: true."
+                ))
+            }
+        case .rollSolveExposure(let id, let params):
+            guard params.motionConfirmed == true else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .confirmationRequired,
+                    message: "\"roll.solveExposure\" requires motionConfirmed: true.",
                     guidance: "Confirm scanner motion is authorized, then resend with motionConfirmed: true."
                 ))
             }
@@ -880,6 +905,36 @@ public final class ControlChannelDispatcher {
             case .failure(let failureId, let error):
                 return .failure(id: failureId, error: error)
             }
+        case .rollSolveExposure(let id, let params):
+            guard params.frame > 0 else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.solveExposure frame must be positive."
+                ))
+            }
+            guard sessionModel.hardwareMotionReadiness.allowsMotion else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .gateRefused,
+                    message: sessionModel.hardwareMotionReadiness.guidance
+                ))
+            }
+            guard let solution = await sessionModel.solveExposure(frameIndex: params.frame) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(
+                id: id,
+                result: .rollExposure(ControlRollSolveExposureResult(solution: solution))
+            )
+        case .rollVerify(let id, let params):
+            guard let report = await sessionModel.verifyRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollVerification(report))
+        case .rollCollect(let id, let params):
+            guard let result = await sessionModel.collectRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollCollection(result))
         case .scanStart(let id, let params):
             let requestedFrames = params.frames ?? sessionModel.selectedFrames
             if params.frames != nil

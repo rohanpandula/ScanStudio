@@ -12,7 +12,7 @@ struct Roll: AsyncParsableCommand {
         // file -- it composes Save's own request shape plus five other
         // already-shipped commands into one unattended walk, so it earns a
         // file of its own rather than crowding this one.
-        subcommands: [Save.self, Open.self, List.self, Run.self]
+        subcommands: [Save.self, Open.self, List.self, SolveExposure.self, Verify.self, Collect.self, Run.self]
     )
 
     /// `roll save` -> `roll.save`.
@@ -183,6 +183,46 @@ struct Roll: AsyncParsableCommand {
 
         func run() async throws {
             try await CommandRunner.runWithoutParams(command: "roll.list", method: "roll.list", options: options)
+        }
+    }
+
+    struct SolveExposure: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "solve-exposure",
+            abstract: "Meter one previewed frame and persist the roll RGB exposure. Requires --confirm-motion."
+        )
+
+        @OptionGroup var options: GlobalOptions
+        @Option(name: .customLong("frame"), help: "One-based preview frame.")
+        var frame: Int
+        @Flag(name: .customLong("confirm-motion"), help: "Required: metering moves the scanner.")
+        var confirmMotion = false
+
+        mutating func validate() throws {
+            guard frame > 0 else { throw ValidationError("--frame must be positive") }
+            guard confirmMotion else {
+                let payload = ControlErrorPayload(
+                    .confirmationRequired,
+                    message: "\"roll solve-exposure\" requires --confirm-motion.",
+                    guidance: "Confirm scanner motion is authorized, then retry with --confirm-motion."
+                )
+                let text = try ControlCLIOutput.renderError(
+                    command: "roll.solveExposure",
+                    payload: payload,
+                    human: options.human
+                )
+                print(text, terminator: "")
+                throw ExitCode(77)
+            }
+        }
+
+        func run() async throws {
+            try await CommandRunner.run(
+                command: "roll.solveExposure",
+                method: "roll.solveExposure",
+                params: ControlRollSolveExposureParams(frame: frame, motionConfirmed: true),
+                options: options
+            )
         }
     }
 }

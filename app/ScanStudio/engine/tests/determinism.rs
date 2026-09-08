@@ -79,6 +79,7 @@ fn settings_fingerprint_golden() {
         bit_depth: 16,
         multisample_passes: 2,
         channels: Channels::Rgbi,
+        exposure_override_10ns: None,
     };
     assert_eq!(settings_fingerprint(&recipe), "1a3d265e0b54bbd2");
 }
@@ -90,6 +91,7 @@ fn settings_fingerprint_changes_with_any_field() {
         bit_depth: 16,
         multisample_passes: 2,
         channels: Channels::Rgbi,
+        exposure_override_10ns: None,
     };
     let base_fp = settings_fingerprint(&base);
 

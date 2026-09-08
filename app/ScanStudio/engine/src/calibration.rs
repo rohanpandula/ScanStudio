@@ -36,6 +36,41 @@ pub struct VerificationReport {
     pub issues: Vec<VerificationIssue>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VerifyParams {
+    pub pass: Option<String>,
+    #[serde(default)]
+    pub exposure_identical: bool,
+    #[serde(default)]
+    pub no_clipping: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectParams {
+    pub to: String,
+    pub metadata: crate::calibration_collection::CollectionMetadata,
+}
+
+pub fn verify_pass(project: &ScanProject, params: &VerifyParams) -> VerificationReport {
+    let selected_jobs = params.pass.as_ref().map(|pass| {
+        project
+            .frames
+            .iter()
+            .flat_map(|frame| &frame.receipts)
+            .filter(|receipt| receipt.pass_token.as_ref() == Some(pass))
+            .map(|receipt| receipt.job_id.clone())
+            .collect::<Vec<_>>()
+    });
+    verify(
+        project,
+        selected_jobs.as_deref(),
+        params.exposure_identical,
+        params.no_clipping,
+    )
+}
+
 /// Verifies the requested receipt properties without changing the project.
 /// `selected_job_ids` is an optional caller-resolved pass selection; `None`
 /// checks every receipt in the project. An empty selection is unknown rather
@@ -98,7 +133,8 @@ pub fn verify(
 }
 
 fn verify_exposure(receipts: &[&ScanReceipt], issues: &mut Vec<VerificationIssue>) {
-    let mut baseline: Option<(&ScanReceipt, [u32; 3])> = None;
+    let mut baselines: std::collections::BTreeMap<Option<&str>, (&ScanReceipt, [u32; 3])> =
+        std::collections::BTreeMap::new();
     for receipt in receipts {
         let Some(authority) = receipt.exposure_authority.as_ref() else {
             issues.push(issue(
@@ -114,7 +150,7 @@ fn verify_exposure(receipts: &[&ScanReceipt], issues: &mut Vec<VerificationIssue
         let Some(values) = rgb_commanded(authority, receipt, issues) else {
             continue;
         };
-        if let Some((first, expected)) = baseline {
+        if let Some(&(first, expected)) = baselines.get(&receipt.pass_token.as_deref()) {
             for (channel, actual, expected) in [
                 ("R", values[0], expected[0]),
                 ("G", values[1], expected[1]),
@@ -134,7 +170,7 @@ fn verify_exposure(receipts: &[&ScanReceipt], issues: &mut Vec<VerificationIssue
                 }
             }
         } else {
-            baseline = Some((receipt, values));
+            baselines.insert(receipt.pass_token.as_deref(), (*receipt, values));
         }
     }
 }
@@ -272,8 +308,8 @@ mod tests {
     use super::*;
     use crate::domain::{
         CaptureRecipe, ClippingTelemetry, ExposureAuthority, ExposureVector, FilmProcess,
-        FocusDetailTelemetry, FrameAlignment, HardwareVerification, MetadataSet, OutputRecipe,
-        ProjectFrame, ScanProject, TransportSmearAssessment,
+        FocusDetailTelemetry, FrameAlignment, MetadataSet, OutputRecipe, ProjectFrame, ScanProject,
+        TransportSmearAssessment,
     };
     use std::collections::BTreeMap;
 
@@ -334,34 +370,18 @@ mod tests {
         rgb: Option<[u32; 3]>,
         clipping_warning: bool,
     ) -> ScanReceipt {
-        ScanReceipt {
-            job_id: job_id.into(),
-            pass_token: None,
-            frame_index,
-            started_at: "2026-09-08T00:00:00Z".into(),
-            duration_ms: 1,
-            passes: 1,
-            resolution_dpi: 4000,
-            bit_depth: 16,
-            channels: "rgbi".into(),
-            engine_version: "test".into(),
-            device_id: "sim-ls5000-0".into(),
-            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
-            hardware_verification: HardwareVerification::Verified,
-            simulated: false,
-            settings_fingerprint: "settings".into(),
-            processing: None,
-            output: None,
-            outputs: None,
-            rgb_path: None,
-            ir_path: None,
-            storage_transform: None,
-            meter_rgbi_path: None,
-            hardware_telemetry: Some(telemetry(clipping_warning)),
-            nikonlook: None,
-            auto_crop: None,
-            exposure_authority: rgb.map(authority),
-        }
+        let event: serde_json::Value = serde_json::from_str(include_str!(
+            "../../protocol/fixtures/09-frame-completed-event.json"
+        ))
+        .unwrap();
+        let mut receipt: ScanReceipt =
+            serde_json::from_value(event["payload"]["receipt"].clone()).unwrap();
+        receipt.job_id = job_id.into();
+        receipt.frame_index = frame_index;
+        receipt.simulated = false;
+        receipt.hardware_telemetry = Some(telemetry(clipping_warning));
+        receipt.exposure_authority = rgb.map(authority);
+        receipt
     }
 
     fn project(receipts: Vec<ScanReceipt>) -> ScanProject {
@@ -374,6 +394,7 @@ mod tests {
             film_process: FilmProcess::C41ColorNegative,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-09-08T00:00:00Z".into(),
             frames: receipts
                 .into_iter()
@@ -400,6 +421,15 @@ mod tests {
         let report = verify(&matching, None, true, true);
         assert_eq!(report.status, VerificationStatus::Pass);
         assert_eq!(report.checked_receipts, 2);
+
+        let mut other_pass = matching.clone();
+        other_pass.frames[0].receipts[0].pass_token = Some("A1".into());
+        other_pass.frames[1].receipts[0].pass_token = Some("B".into());
+        other_pass.frames[1].receipts[0].exposure_authority = Some(authority([11, 21, 31]));
+        assert_eq!(
+            verify(&other_pass, None, true, false).status,
+            VerificationStatus::Pass
+        );
 
         let mismatch = project(vec![
             receipt("job-a", 1, Some([10, 20, 30]), false),

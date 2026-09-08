@@ -686,6 +686,59 @@ struct ControlSocketEndToEndTests {
             let scanBody = try resultObject(scanResult)
             #expect(scanBody["jobState"] as? String == "completed", Comment(rawValue: scanResult.context))
 
+            // Exercise the CLI repeat loop across real subprocess/socket boundaries.
+            let projectDirectory = try #require(saveBody["projectDirectory"] as? String)
+            let manifestURL = URL(fileURLWithPath: projectDirectory).appendingPathComponent("manifest.json")
+            func retainedReceipts() throws -> [[String: Any]] {
+                let manifest = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
+                let frames = try #require(manifest["frames"] as? [[String: Any]])
+                return frames.flatMap { $0["receipts"] as? [[String: Any]] ?? [] }
+            }
+            let beforeRepeat = try retainedReceipts()
+            var originalFiles: [String: Data] = [:]
+            for receipt in beforeRepeat {
+                for value in (receipt["outputs"] as? [String: Any] ?? [:]).filter({ $0.key.hasSuffix("Path") }).values {
+                    if let path = value as? String {
+                        originalFiles[path] = try Data(contentsOf: URL(fileURLWithPath: path))
+                    }
+                }
+            }
+            let repeated = try await step(["scan", "--frames", "1", "--repeat", "2", "--pass", "Arep", "--confirm-motion", "--wait"])
+            #expect(repeated.exitCode == 0, Comment(rawValue: repeated.context))
+            let afterRepeat = try retainedReceipts()
+            #expect(afterRepeat.count == beforeRepeat.count + 2)
+            for original in beforeRepeat {
+                #expect(afterRepeat.contains { NSDictionary(dictionary: $0).isEqual(to: original) })
+            }
+            let repetitions = afterRepeat.filter { ($0["passToken"] as? String)?.hasPrefix("Arep") == true }
+            #expect(Set(repetitions.compactMap { $0["passToken"] as? String }) == ["Arep01", "Arep02"])
+            #expect(Set(repetitions.compactMap { $0["jobId"] as? String }).count == 2)
+            #expect(repetitions.allSatisfy { $0["frameIndex"] as? Int == 1 })
+            for (path, bytes) in originalFiles {
+                #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+            }
+
+            let verified = try await step(["roll", "verify", "--pass", "Arep01"])
+            #expect(verified.exitCode == 0, Comment(rawValue: verified.context))
+            #expect(try resultObject(verified)["status"] as? String == "pass")
+            let simulatedClipping = try await step(["roll", "verify", "--pass", "Arep01", "--no-clipping"])
+            #expect(simulatedClipping.exitCode == 65, Comment(rawValue: simulatedClipping.context))
+            #expect(try resultObject(simulatedClipping)["status"] as? String == "unknown")
+
+            let slotMapURL = host.tempRoot.appendingPathComponent("slot-map.json")
+            try Data(#"{"1":1}"#.utf8).write(to: slotMapURL)
+            let collectionURL = host.tempRoot.appendingPathComponent("calibration-export")
+            let collectArguments = ["roll", "collect", "--to", collectionURL.path, "--stock", "sim-test", "--pass", "Arep01", "--slot-map", slotMapURL.path]
+            let collected = try await step(collectArguments)
+            #expect(collected.exitCode == 0, Comment(rawValue: collected.context))
+            #expect(FileManager.default.fileExists(atPath: collectionURL.appendingPathComponent("file-hashes.txt").path))
+            #expect(FileManager.default.fileExists(atPath: collectionURL.appendingPathComponent("sim-test_01_Arep01-receipt.json").path))
+            let collision = try await step(collectArguments)
+            #expect(collision.exitCode == 64, Comment(rawValue: collision.context))
+            for (path, bytes) in originalFiles {
+                #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+            }
+
             // -- eject --confirm-motion --
             let ejectResult = try await step(["eject", "--confirm-motion"])
             #expect(ejectResult.exitCode == 0, Comment(rawValue: ejectResult.context))

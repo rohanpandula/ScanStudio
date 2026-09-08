@@ -242,6 +242,10 @@ pub struct CaptureRecipe {
     pub multisample_passes: u32,
     #[serde(default = "default_channels")]
     pub channels: Channels,
+    /// Exact roll-wide RGB exposure authority in scanner-native 10 ns ticks.
+    /// Infrared is deliberately absent and remains metered by the scanner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_override_10ns: Option<[u32; 3]>,
 }
 
 impl Default for CaptureRecipe {
@@ -251,6 +255,7 @@ impl Default for CaptureRecipe {
             bit_depth: default_bit_depth(),
             multisample_passes: default_multisample_passes(),
             channels: default_channels(),
+            exposure_override_10ns: None,
         }
     }
 }
@@ -834,6 +839,19 @@ pub struct MetadataOutputBindings {
     pub preview: Option<WrittenFileBinding>,
 }
 
+/// Read-only capture evidence authorities. These never grant metadata-write
+/// access; they only bind later collection work to bytes the engine wrote.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureOutputBindings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_negative: Option<WrittenFileBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_negative_ir: Option<WrittenFileBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meter: Option<WrittenFileBinding>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WrittenOutputs {
@@ -853,6 +871,8 @@ pub struct WrittenOutputs {
     /// authorize ExifTool writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_bindings: Option<MetadataOutputBindings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_bindings: Option<CaptureOutputBindings>,
     /// Exact presentation transform used for the finished derivatives.
     /// Identity on legacy receipts whose `outputs` object predates this key.
     #[serde(default)]
@@ -960,8 +980,24 @@ pub struct ScanProject {
     /// every frame without its own `metadataOverride` inherits this set.
     #[serde(default)]
     pub roll_metadata: MetadataSet,
+    /// Durable roll-wide RGB exposure authority. It survives recipe edits
+    /// and reopen; AE-enabled passes simply do not consume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_exposure_lock: Option<RollExposureLock>,
     pub created_at: String,
     pub frames: Vec<ProjectFrame>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollExposureLock {
+    pub slot: u32,
+    pub rgb_exposures_raw_10ns: [u32; 3],
+    pub ir_metered_exposure_raw_10ns: u32,
+    pub meter_evidence_path: String,
+    pub meter_evidence_sha256: String,
+    pub journal_path: String,
+    pub journal_sha256: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1542,6 +1578,7 @@ mod tests {
             bit_depth: 16,
             multisample_passes: 2,
             channels: Channels::Rgbi,
+            exposure_override_10ns: None,
         };
         round_trip(&recipe);
     }
@@ -1723,6 +1760,7 @@ mod tests {
             film_process: FilmProcess::C41ColorNegative,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-22T09:00:00Z".into(),
             frames: vec![
                 ProjectFrame {
@@ -1774,6 +1812,7 @@ mod tests {
                 date: Some(PartialDate::YearOnly { year: 2026 }),
                 ..MetadataSet::default()
             },
+            roll_exposure_lock: None,
             created_at: "2026-07-22T09:00:00Z".into(),
             frames: vec![ProjectFrame {
                 index: 1,

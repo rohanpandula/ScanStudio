@@ -464,6 +464,38 @@ pub struct RollSetSpacingOffsetResult {
     pub thumbnail: Thumbnail,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollSolveExposureParams {
+    pub frame_index: u32,
+    pub operation_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RollSolveExposureAck {
+    pub accepted: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollExposureSolvedPayload {
+    pub operation_id: String,
+    pub solution: domain::RollExposureLock,
+    pub project: domain::ScanProject,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollExposureErrorPayload {
+    pub operation_id: String,
+    pub code: ErrorCode,
+    pub message: String,
+    pub recoverable: bool,
+    pub frame_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
 /// Wire contract: exactly one of `imagePath` or the `{brightness, tint}`
 /// pair is populated per instance — never both, never neither (T-10-07).
 /// The simulator populates `brightness`/`tint` and omits `imagePath`; a
@@ -1137,6 +1169,7 @@ mod tests {
             film_process: domain::FilmProcess::C41ColorNegative,
             recipes: domain::OutputRecipe::default(),
             roll_metadata: domain::MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-22T09:00:00Z".into(),
             frames: vec![
                 domain::ProjectFrame {

@@ -961,6 +961,52 @@ where
 {
     after_snapshot()?;
     let mut output = create_package_file(package, destination)?;
+    let source_hash = copy_held_contents(&mut input, snapshot, source, &mut output, destination)?;
+    Ok((
+        FileDigest {
+            path: source.display().to_string(),
+            package_path: destination
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            sha256: source_hash,
+        },
+        PackageFileProof {
+            relative_path: destination.to_path_buf(),
+            file: output,
+        },
+    ))
+}
+
+/// Shared immutable-artifact copy path for capture packages and calibration collection.
+/// The caller owns the source/destination directory capabilities and checks any
+/// expected receipt hash against the returned digest before reporting success.
+pub(crate) fn copy_held_file(
+    mut input: std::fs::File,
+    source: &Path,
+    output: &mut std::fs::File,
+    destination: &Path,
+    expected_length: u64,
+) -> Result<String, String> {
+    let snapshot = held_source_snapshot(&input, source, expected_length)?;
+    if snapshot.length != expected_length {
+        return Err(format!(
+            "bound artifact length changed: {}",
+            source.display()
+        ));
+    }
+    input
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| format!("rewind bound artifact {}: {error}", source.display()))?;
+    copy_held_contents(&mut input, snapshot, source, output, destination)
+}
+
+fn copy_held_contents(
+    input: &mut std::fs::File,
+    snapshot: SourceSnapshot,
+    source: &Path,
+    output: &mut std::fs::File,
+    destination: &Path,
+) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut remaining = snapshot.length;
@@ -1003,7 +1049,7 @@ where
         .metadata()
         .map_err(|e| format!("reinspect held evidence source {}: {e}", source.display()))?;
     let (after_identity, after_length) =
-        validate_source_snapshot(&input, &after_metadata, source, snapshot.length)?;
+        validate_source_snapshot(input, &after_metadata, source, snapshot.length)?;
     if after_identity != snapshot.identity || after_length != snapshot.length {
         return Err(format!(
             "capture artifact identity or length changed during copy: {}",
@@ -1026,7 +1072,7 @@ where
     output
         .seek(std::io::SeekFrom::Start(0))
         .map_err(|e| format!("rewind packaged artifact {}: {e}", destination.display()))?;
-    let copied_hash = digest_reader_exact(&mut output, snapshot.length, destination)?;
+    let copied_hash = digest_reader_exact(output, snapshot.length, destination)?;
     if copied_hash != source_hash {
         return Err(format!(
             "capture artifact hash changed during copy: {}",
@@ -1039,17 +1085,7 @@ where
             destination.display()
         )
     })?;
-    Ok((
-        FileDigest {
-            path: source.display().to_string(),
-            package_path: destination.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"),
-            sha256: source_hash,
-        },
-        PackageFileProof {
-            relative_path: destination.to_path_buf(),
-            file: output,
-        },
-    ))
+    Ok(source_hash)
 }
 
 fn copy_artifact(

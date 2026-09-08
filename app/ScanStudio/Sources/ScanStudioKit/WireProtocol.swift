@@ -660,6 +660,35 @@ public struct RollSetSpacingOffsetResult: Decodable, Sendable {
     public let thumbnail: Thumbnail
 }
 
+public struct RollSolveExposureParams: Codable, Sendable {
+    public let frameIndex: Int
+    public let operationId: String
+
+    public init(frameIndex: Int, operationId: String) {
+        self.frameIndex = frameIndex
+        self.operationId = operationId
+    }
+}
+
+public struct RollSolveExposureAck: Decodable, Sendable {
+    public let accepted: Bool
+}
+
+public struct RollExposureSolvedPayload: Codable, Sendable {
+    public let operationId: String
+    public let solution: RollExposureLock
+    public let project: ScanProject
+}
+
+public struct RollExposureErrorPayload: Decodable, Sendable {
+    public let operationId: String
+    public let code: String
+    public let message: String
+    public let recoverable: Bool
+    public let frameIndex: Int
+    public let details: MeterControllerRefusalDetails?
+}
+
 // MARK: - roll.approve
 
 /// Explicit operator approval for one preview boundary that the engine
@@ -770,12 +799,14 @@ public struct CaptureRecipe: Codable, Equatable, Sendable {
     public let bitDepth: Int
     public let multisamplePasses: Int
     public let channels: String
+    public let exposureOverride10ns: [Int]?
 
-    public init(resolutionDpi: Int, bitDepth: Int, multisamplePasses: Int, channels: String) {
+    public init(resolutionDpi: Int, bitDepth: Int, multisamplePasses: Int, channels: String, exposureOverride10ns: [Int]? = nil) {
         self.resolutionDpi = resolutionDpi
         self.bitDepth = bitDepth
         self.multisamplePasses = multisamplePasses
         self.channels = channels
+        self.exposureOverride10ns = exposureOverride10ns
     }
 }
 
@@ -1193,6 +1224,20 @@ public enum FrameState: String, Codable, Equatable, Sendable {
 
 // MARK: - ScanReceipt
 
+public struct WrittenFileBinding: Codable, Equatable, Sendable {
+    public let relativePath: String
+    public let sha256: String
+    public let byteLength: UInt64
+    public let volumeId: UInt64?
+    public let fileId: UInt64?
+}
+
+public struct CaptureOutputBindings: Codable, Equatable, Sendable {
+    public let rawNegative: WrittenFileBinding?
+    public let rawNegativeIr: WrittenFileBinding?
+    public let meter: WrittenFileBinding?
+}
+
 /// Where a completed frame's files actually landed. Populated once Plan
 /// 03-02's real file-writing lands on the engine side; every field is a
 /// path that build actually wrote, never a template or destination
@@ -1203,6 +1248,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
     public let previewPath: String?
     public let rawNegativePath: String?
     public let rawNegativeIrPath: String?
+    public let captureBindings: CaptureOutputBindings?
     /// Exact presentation transform applied to positive/preview derivatives.
     /// The archive/IR/meter capture files are never transformed.
     public let derivativeTransform: DerivativeTransform
@@ -1213,6 +1259,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         previewPath: String?,
         rawNegativePath: String? = nil,
         rawNegativeIrPath: String? = nil,
+        captureBindings: CaptureOutputBindings? = nil,
         derivativeTransform: DerivativeTransform = .identity
     ) {
         self.archivePath = archivePath
@@ -1220,11 +1267,12 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         self.previewPath = previewPath
         self.rawNegativePath = rawNegativePath
         self.rawNegativeIrPath = rawNegativeIrPath
+        self.captureBindings = captureBindings
         self.derivativeTransform = derivativeTransform
     }
 
     private enum CodingKeys: String, CodingKey {
-        case archivePath, positivePath, previewPath, rawNegativePath, rawNegativeIrPath, derivativeTransform
+        case archivePath, positivePath, previewPath, rawNegativePath, rawNegativeIrPath, captureBindings, derivativeTransform
     }
 
     public init(from decoder: Decoder) throws {
@@ -1234,6 +1282,7 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         previewPath = try values.decodeIfPresent(String.self, forKey: .previewPath)
         rawNegativePath = try values.decodeIfPresent(String.self, forKey: .rawNegativePath)
         rawNegativeIrPath = try values.decodeIfPresent(String.self, forKey: .rawNegativeIrPath)
+        captureBindings = try values.decodeIfPresent(CaptureOutputBindings.self, forKey: .captureBindings)
         derivativeTransform = try values.decodeIfPresent(
             DerivativeTransform.self,
             forKey: .derivativeTransform
@@ -1563,6 +1612,7 @@ public struct ScanProject: Codable, Equatable, Sendable {
     /// on the wire, even when every field inside it is nil/empty. Mirrors
     /// `domain.rs::ScanProject.roll_metadata`.
     public let rollMetadata: MetadataSet
+    public let rollExposureLock: RollExposureLock?
     public let createdAt: String
     public let frames: [ProjectFrame]
 
@@ -1575,6 +1625,7 @@ public struct ScanProject: Codable, Equatable, Sendable {
         filmProcess: FilmProcess,
         recipes: OutputRecipe,
         rollMetadata: MetadataSet,
+        rollExposureLock: RollExposureLock? = nil,
         createdAt: String,
         frames: [ProjectFrame]
     ) {
@@ -1586,9 +1637,20 @@ public struct ScanProject: Codable, Equatable, Sendable {
         self.filmProcess = filmProcess
         self.recipes = recipes
         self.rollMetadata = rollMetadata
+        self.rollExposureLock = rollExposureLock
         self.createdAt = createdAt
         self.frames = frames
     }
+}
+
+public struct RollExposureLock: Codable, Equatable, Sendable {
+    public let slot: Int
+    public let rgbExposuresRaw10ns: [Int]
+    public let irMeteredExposureRaw10ns: Int
+    public let meterEvidencePath: String
+    public let meterEvidenceSha256: String
+    public let journalPath: String
+    public let journalSha256: String
 }
 
 /// Lightweight listing shape for `project.list` — everything in

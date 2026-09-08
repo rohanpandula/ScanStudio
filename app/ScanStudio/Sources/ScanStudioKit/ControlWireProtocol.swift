@@ -277,6 +277,16 @@ public struct ControlScanStartParams: Codable, Equatable, Sendable {
     }
 }
 
+public struct ControlRollSolveExposureParams: Codable, Equatable, Sendable {
+    public let frame: Int
+    public let motionConfirmed: Bool?
+
+    public init(frame: Int, motionConfirmed: Bool?) {
+        self.frame = frame
+        self.motionConfirmed = motionConfirmed
+    }
+}
+
 public struct ControlScanResumeParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
 
@@ -948,6 +958,14 @@ public struct ControlRollSaveResult: Codable, Equatable, Sendable {
         self.projectName = projectName
         self.projectDirectory = projectDirectory
         self.outcome = outcome
+    }
+}
+
+public struct ControlRollSolveExposureResult: Codable, Equatable, Sendable {
+    public let solution: RollExposureLock
+
+    public init(solution: RollExposureLock) {
+        self.solution = solution
     }
 }
 

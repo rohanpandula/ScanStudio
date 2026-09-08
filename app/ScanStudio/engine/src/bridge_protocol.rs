@@ -227,6 +227,8 @@ pub struct BridgeCaptureRecipe {
     pub channels: BridgeChannels,
     pub autofocus: bool,
     pub auto_exposure: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_override_10ns: Option<[u32; 3]>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -628,6 +630,16 @@ pub struct BridgeRollApproveParams {
     pub attended: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct BridgeRollSolveExposureParams {
+    pub slot: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct BridgeRollSolveExposureAck {
+    pub accepted: bool,
+}
+
 // ---------------------------------------------------------------------
 // scan.start / scan.stop
 // ---------------------------------------------------------------------
@@ -684,6 +696,34 @@ pub struct BridgePreviewCompletePayload {
     /// The roll's bound identity, later compared against a fresh read at
     /// scan time (`FINGERPRINT_REFUSED` on mismatch).
     pub fingerprint: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeExposureSolution {
+    pub slot: u32,
+    pub rgb_exposures_raw_10ns: [u32; 3],
+    pub ir_metered_exposure_raw_10ns: u32,
+    pub meter_evidence_path: String,
+    pub meter_evidence_sha256: String,
+    pub journal_path: String,
+    pub journal_sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeExposureSolvedPayload {
+    pub solution: BridgeExposureSolution,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeExposureErrorPayload {
+    pub code: String,
+    pub message: String,
+    pub slot: u32,
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

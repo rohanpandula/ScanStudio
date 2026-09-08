@@ -218,6 +218,7 @@ fn sim_batch_scan_peak_memory_stays_within_a_few_frames_worth_not_the_whole_roll
         bit_depth: 16,
         multisample_passes: 1,
         channels: Channels::Rgbi,
+        exposure_override_10ns: None,
     };
 
     let mut output = OutputRecipe::default();

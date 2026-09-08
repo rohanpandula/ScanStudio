@@ -926,6 +926,8 @@ pub struct RealLs5000 {
     /// of issuing `device.status`, which could itself time out and quarantine
     /// the bridge session while the scanner is mid-USB transaction.
     active_scan_job_id: Arc<Mutex<Option<String>>>,
+    /// The sole reader of an accepted roll.solveExposure terminal event.
+    active_exposure_operation_id: Arc<Mutex<Option<String>>>,
     /// Frontend build identity reported by the one successful engine.hello
     /// for this process. It is metadata only: never used for hardware policy,
     /// and absent/invalid values merely make #106 evidence unavailable.
@@ -2521,7 +2523,7 @@ impl StableBridgeInputs {
         } else {
             None
         };
-        let meter = if output.archive.enabled {
+        let meter = if output.archive.enabled || output.raw_export.enabled {
             receipt
                 .meter_rgbi_path
                 .as_deref()
@@ -2718,6 +2720,7 @@ impl RealLs5000 {
             preview_reader_detach_delay: Duration::ZERO,
             preview_terminal_session_loss_test_hook: false,
             active_scan_job_id: Arc::new(Mutex::new(None)),
+            active_exposure_operation_id: Arc::new(Mutex::new(None)),
             client_build: Mutex::new(None),
             active_device: Mutex::new(None),
             device_id: bridge_device.device_id,
@@ -2945,6 +2948,12 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<u64, EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "an exposure measurement still owns the bridge event stream",
+            ));
+        }
         let mut state = self.preview_approval_state.lock().unwrap();
         if state.active.is_some() {
             return Err(EngineError::new(
@@ -3138,6 +3147,12 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<(), EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "an exposure measurement still owns the bridge event stream",
+            ));
+        }
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.as_ref().is_some_and(|active| {
             active.session_epoch == session_epoch && active.bridge_generation == bridge_generation
@@ -3158,6 +3173,12 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<(), EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "the exposure measurement has not emitted a terminal result",
+            ));
+        }
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.as_ref().is_some_and(|active| {
             active.session_epoch == session_epoch && active.bridge_generation == bridge_generation
@@ -3181,6 +3202,12 @@ impl RealLs5000 {
     }
 
     fn ensure_preview_stream_allows_connect_or_eject(&self) -> Result<(), EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "an exposure measurement still owns the bridge event stream",
+            ));
+        }
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.is_some() || state.poisoned.is_some() {
             return Err(EngineError::new(
@@ -3688,6 +3715,236 @@ impl RealLs5000 {
         };
         let value = serde_json::to_value(params).expect("BridgeRollApproveParams serializes");
         self.call_session_scoped(session_epoch, bridge_generation, "roll.approve", value)?;
+        Ok(())
+    }
+
+    /// Starts the driver's meter-only continuation inside the exact held
+    /// preview session. One worker owns the untagged terminal event until it
+    /// either persists the resulting roll authority or emits a typed error.
+    pub fn roll_solve_exposure(
+        backend: &Arc<Self>,
+        frame_index: u32,
+        operation_id: String,
+        project_directory: std::fs::File,
+        project_display_path: std::path::PathBuf,
+        event_tx: mpsc::Sender<String>,
+    ) -> Result<(), EngineError> {
+        let (session_epoch, bridge_generation) = backend.active_session_identity()?;
+        let binding = backend.preview_approval_state.lock().unwrap().completed.clone();
+        if !binding.as_ref().is_some_and(|binding| {
+            binding.session_epoch == session_epoch
+                && binding.bridge_generation == bridge_generation
+                && binding.thumbnails.contains_key(&frame_index)
+        }) {
+            return Err(EngineError::new(
+                ErrorCode::NoPreview,
+                "frameIndex must identify a frame in the completed preview for this session",
+            ));
+        }
+        if backend.active_scan_job_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(ErrorCode::ScannerBusy, "a scan job is active"));
+        }
+        {
+            let mut active = backend.active_exposure_operation_id.lock().unwrap();
+            if active.is_some() {
+                return Err(EngineError::new(
+                    ErrorCode::ScannerBusy,
+                    "an exposure measurement is already active",
+                ));
+            }
+            *active = Some(operation_id.clone());
+        }
+
+        let params = serde_json::to_value(crate::bridge_protocol::BridgeRollSolveExposureParams {
+            slot: frame_index,
+        })
+        .expect("serializing roll.solveExposure params cannot fail");
+        let accepted = backend.call_session_scoped(
+            session_epoch,
+            bridge_generation,
+            "roll.solveExposure",
+            params,
+        );
+        let accepted_value = match accepted {
+            Ok(value) => value,
+            Err(error) => {
+                *backend.active_exposure_operation_id.lock().unwrap() = None;
+                return Err(error);
+            }
+        };
+        let accepted: crate::bridge_protocol::BridgeRollSolveExposureAck =
+            serde_json::from_value(accepted_value).map_err(|error| {
+                backend.invalidate_current_session();
+                EngineError::new(
+                    ErrorCode::Internal,
+                    format!("malformed roll.solveExposure result: {error}; reconnect required"),
+                )
+            })?;
+        if !accepted.accepted {
+            backend.invalidate_current_session();
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                "roll.solveExposure returned an invalid non-acceptance; reconnect required",
+            ));
+        }
+
+        let backend = Arc::clone(backend);
+        thread::spawn(move || {
+            let deadline = Instant::now() + backend.preview_silence_deadline;
+            let mut release_event_reader = false;
+            loop {
+                if !backend.session_identity_is_current(session_epoch, bridge_generation) {
+                    backend.invalidate_async_session(
+                        session_epoch,
+                        &event_tx,
+                        Some(operation_id.clone()),
+                    );
+                    emit_exposure_error(
+                        &event_tx,
+                        &operation_id,
+                        frame_index,
+                        backend.session_ownership_lost_error(
+                            "roll.solveExposure",
+                            session_epoch,
+                            bridge_generation,
+                            "session ownership changed before the terminal event",
+                        ),
+                    );
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    backend.invalidate_async_session(
+                        session_epoch,
+                        &event_tx,
+                        Some(operation_id.clone()),
+                    );
+                    emit_exposure_error(
+                        &event_tx,
+                        &operation_id,
+                        frame_index,
+                        EngineError::new(
+                            ErrorCode::Internal,
+                            "roll.solveExposure timed out before a terminal event",
+                        ),
+                    );
+                    break;
+                }
+                match backend
+                    .bridge
+                    .recv_event(remaining.min(EVENT_STREAM_OWNERSHIP_RECHECK))
+                {
+                    Ok(value) => match value.get("event").and_then(|value| value.as_str()) {
+                        Some("roll.exposureSolved") => {
+                            let result = value
+                                .get("payload")
+                                .cloned()
+                                .ok_or_else(|| EngineError::new(ErrorCode::Internal, "roll.exposureSolved omitted payload"))
+                                .and_then(|payload| {
+                                    serde_json::from_value::<crate::bridge_protocol::BridgeExposureSolvedPayload>(payload)
+                                        .map_err(|error| EngineError::new(ErrorCode::Internal, format!("malformed roll.exposureSolved payload: {error}")))
+                                })
+                                .and_then(|payload| validate_exposure_solution(payload.solution, frame_index))
+                                .and_then(|solution| {
+                                    if !backend.session_identity_is_current(
+                                        session_epoch,
+                                        bridge_generation,
+                                    ) {
+                                        return Err(backend.session_ownership_lost_error(
+                                            "roll.solveExposure",
+                                            session_epoch,
+                                            bridge_generation,
+                                            "session ownership changed before exposure persistence",
+                                        ));
+                                    }
+                                    crate::manifest::persist_roll_exposure_lock_at(
+                                        &project_directory,
+                                        &project_display_path,
+                                        solution.clone(),
+                                    )
+                                    .map(|project| (solution, project))
+                                });
+                            match result {
+                                Ok((solution, project)) => {
+                                    release_event_reader = true;
+                                    emit(
+                                        &event_tx,
+                                        "roll.exposureSolved",
+                                        crate::protocol::RollExposureSolvedPayload {
+                                            operation_id: operation_id.clone(),
+                                            solution,
+                                            project,
+                                        },
+                                    );
+                                }
+                                Err(error) => {
+                                    backend.invalidate_async_session(
+                                        session_epoch,
+                                        &event_tx,
+                                        Some(operation_id.clone()),
+                                    );
+                                    emit_exposure_error(
+                                        &event_tx,
+                                        &operation_id,
+                                        frame_index,
+                                        error,
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                        Some("roll.exposureError") => {
+                            let parsed = value
+                                .get("payload")
+                                .cloned()
+                                .and_then(|payload| serde_json::from_value::<crate::bridge_protocol::BridgeExposureErrorPayload>(payload).ok());
+                            let error = parsed
+                                .as_ref()
+                                .map(|payload| {
+                                    EngineError::new(
+                                        map_bridge_error_code_str(&payload.code),
+                                        payload.message.clone(),
+                                    )
+                                    .with_recoverable(map_bridge_error_code_recoverable(&payload.code))
+                                    .with_details(payload.details.clone())
+                                })
+                                .unwrap_or_else(|| EngineError::new(ErrorCode::Internal, "malformed roll.exposureError payload"));
+                            if parsed.is_some() {
+                                backend.clear_completed_preview_approval_for_epoch(session_epoch);
+                                release_event_reader = true;
+                            } else {
+                                backend.invalidate_async_session(
+                                    session_epoch,
+                                    &event_tx,
+                                    Some(operation_id.clone()),
+                                );
+                            }
+                            emit_exposure_error(&event_tx, &operation_id, frame_index, error);
+                            break;
+                        }
+                        _ => continue,
+                    },
+                    Err(BridgeCallError::Timeout) => continue,
+                    Err(error) => {
+                        backend.invalidate_async_session(
+                            session_epoch,
+                            &event_tx,
+                            Some(operation_id.clone()),
+                        );
+                        emit_exposure_error(
+                            &event_tx,
+                            &operation_id,
+                            frame_index,
+                            map_bridge_error(error),
+                        );
+                        break;
+                    }
+                }
+            }
+            if release_event_reader {
+                *backend.active_exposure_operation_id.lock().unwrap() = None;
+            }
+        });
         Ok(())
     }
 
@@ -4683,6 +4940,23 @@ fn prepare_real_scan_start(
     }
     let processing = processing.effective();
     let recipe = recipe.effective_for_process(processing.film_process);
+    if processing.auto_exposure_each_frame && recipe.exposure_override_10ns.is_some() {
+        return Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            "exposureOverride10ns requires autoExposureEachFrame=false",
+        ));
+    }
+    if let Some(exposures) = recipe.exposure_override_10ns {
+        if exposures
+            .iter()
+            .any(|value| !(50_000..=400_000).contains(value))
+        {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                "exposureOverride10ns values must be within 50000...400000",
+            ));
+        }
+    }
     // A false `multiSample` transport capability means no variable control,
     // not that this LS-5000 cannot multisample. Validate against the exact
     // device-sourced pass set and keep the reason honest in the error.
@@ -4699,6 +4973,61 @@ fn prepare_real_scan_start(
         ));
     }
     Ok((session_epoch, bridge_generation, recipe, processing))
+}
+
+fn validate_exposure_solution(
+    solution: crate::bridge_protocol::BridgeExposureSolution,
+    expected_slot: u32,
+) -> Result<domain::RollExposureLock, EngineError> {
+    let valid_digest = |value: &str| {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if solution.slot != expected_slot
+        || solution
+            .rgb_exposures_raw_10ns
+            .iter()
+            .any(|value| !(50_000..=400_000).contains(value))
+        || !(50_000..=400_000).contains(&solution.ir_metered_exposure_raw_10ns)
+        || !std::path::Path::new(&solution.meter_evidence_path).is_absolute()
+        || !std::path::Path::new(&solution.journal_path).is_absolute()
+        || !valid_digest(&solution.meter_evidence_sha256)
+        || !valid_digest(&solution.journal_sha256)
+    {
+        return Err(EngineError::new(
+            ErrorCode::Internal,
+            "roll.exposureSolved returned invalid or mismatched evidence",
+        ));
+    }
+    Ok(domain::RollExposureLock {
+        slot: solution.slot,
+        rgb_exposures_raw_10ns: solution.rgb_exposures_raw_10ns,
+        ir_metered_exposure_raw_10ns: solution.ir_metered_exposure_raw_10ns,
+        meter_evidence_path: solution.meter_evidence_path,
+        meter_evidence_sha256: solution.meter_evidence_sha256,
+        journal_path: solution.journal_path,
+        journal_sha256: solution.journal_sha256,
+    })
+}
+
+fn emit_exposure_error(
+    event_tx: &mpsc::Sender<String>,
+    operation_id: &str,
+    frame_index: u32,
+    error: EngineError,
+) {
+    let recoverable = error.recoverable();
+    emit(
+        event_tx,
+        "roll.exposureError",
+        crate::protocol::RollExposureErrorPayload {
+            operation_id: operation_id.to_string(),
+            code: error.code,
+            message: error.message,
+            recoverable,
+            frame_index,
+            details: error.details,
+        },
+    );
 }
 
 fn with_private_workspace_rollback(
@@ -5300,6 +5629,7 @@ fn build_scan_start_params_with_bridge_output(
             channels: map_channels(recipe.channels),
             autofocus: processing.autofocus_each_frame,
             auto_exposure: processing.auto_exposure_each_frame,
+            exposure_override_10ns: recipe.exposure_override_10ns,
         },
         // The bridge always writes one full-fidelity TIFF capture per slot.
         // The supplied plan is either the retained master route or a
@@ -7621,13 +7951,21 @@ fn run_real_scan_job_inner(
                                         Some(frame_completed.receipt.device_model.as_str()),
                                         authorities,
                                     )
-                                    .and_then(|written| {
-                                        crate::render::publish_real_raw_export_authorized(
+                                    .and_then(|mut written| {
+                                        crate::render::publish_real_raw_export_authorized_with_proofs(
                                             sources.raw_path(),
                                             sources.raw_ir_path(),
                                             authorities,
                                         )
-                                        .map(|raw_paths| (written, raw_paths))
+                                        .map(|raw_proofs| {
+                                            let raw_paths = (
+                                                raw_proofs.raw.as_ref().map(|proof| proof.final_path().to_path_buf()),
+                                                raw_proofs.raw_ir.as_ref().map(|proof| proof.final_path().to_path_buf()),
+                                            );
+                                            written.metadata_publications.raw = raw_proofs.raw;
+                                            written.metadata_publications.raw_ir = raw_proofs.raw_ir;
+                                            (written, raw_paths)
+                                        })
                                     })
                                 });
                             let stability = sources.verify_unchanged(working);
@@ -7648,11 +7986,22 @@ fn run_real_scan_job_inner(
                                     )
                                 })
                                 .transpose()?;
-                            Ok((written, raw_paths, metadata_bindings))
+                            let capture_bindings = output_authorities
+                                .project_root()
+                                .map(|root| {
+                                    crate::exiftool::bind_capture_output_publications_at(
+                                        root.directory_handle(),
+                                        root.requested_path(),
+                                        root.canonical_path(),
+                                        &written.metadata_publications,
+                                    )
+                                })
+                                .transpose()?;
+                            Ok((written, raw_paths, metadata_bindings, capture_bindings))
                         });
 
                         match derivative {
-                            Ok((written, raw_paths, metadata_bindings)) => {
+                            Ok((written, raw_paths, metadata_bindings, capture_bindings)) => {
                                 let mut receipt = base_receipt;
                                 if effective_output.archive.enabled {
                                     let authorities =
@@ -7669,13 +8018,13 @@ fn run_real_scan_job_inner(
                                         .as_ref()
                                         .and_then(|_| authorities.archive_ir.as_ref())
                                         .map(|output| output.final_path().display().to_string());
-                                    receipt.meter_rgbi_path = frame_completed
-                                        .receipt
-                                        .meter_rgbi_path
-                                        .as_ref()
-                                        .and_then(|_| authorities.archive_meter.as_ref())
-                                        .map(|output| output.final_path().display().to_string());
                                 }
+                                receipt.meter_rgbi_path = frame_completed
+                                    .receipt
+                                    .meter_rgbi_path
+                                    .as_ref()
+                                    .and_then(|_| written.metadata_publications.archive_meter.as_ref())
+                                    .map(|proof| proof.final_path().display().to_string());
                                 receipt.outputs = Some(domain::WrittenOutputs {
                                     archive_path: written
                                         .archive_path
@@ -7700,6 +8049,7 @@ fn run_real_scan_job_inner(
                                         .and(raw_paths.1.as_ref())
                                         .map(|path| path.display().to_string()),
                                     metadata_bindings,
+                                    capture_bindings,
                                     derivative_transform: written.derivative_transform,
                                 });
                                 // Which nikonlook bundle/path/gains actually

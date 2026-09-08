@@ -788,9 +788,12 @@ impl SimulatedLs5000 {
             ));
         }
         let state = self.state.lock().unwrap();
-        let approvable = state.manual_approval_binding.as_ref().is_some_and(|binding| {
-            binding.operation_id == operation_id && binding.frame_indices.contains(&frame_index)
-        });
+        let approvable = state
+            .manual_approval_binding
+            .as_ref()
+            .is_some_and(|binding| {
+                binding.operation_id == operation_id && binding.frame_indices.contains(&frame_index)
+            });
         if approvable {
             return Ok(());
         }
@@ -1486,6 +1489,16 @@ fn build_receipt(
             )
         })
         .transpose()?;
+    let capture_bindings = project_root
+        .map(|root| {
+            crate::exiftool::bind_capture_output_publications_at(
+                root.directory_handle(),
+                root.requested_path(),
+                root.canonical_path(),
+                &written.metadata_publications,
+            )
+        })
+        .transpose()?;
     Ok(ScanReceipt {
         exposure_authority: None,
         auto_crop: written.auto_crop.clone(),
@@ -1528,14 +1541,19 @@ fn build_receipt(
                 .as_ref()
                 .map(|p| p.display().to_string()),
             metadata_bindings,
+            capture_bindings,
             derivative_transform: written.derivative_transform,
         }),
-        // Bridge-only concepts — the simulator has no bridge subprocess to
-        // source a capture-file location or hardware telemetry from.
+        // The meter is an explicit synthetic raster; hardware telemetry
+        // remains absent and simulated remains true.
         rgb_path: None,
         ir_path: None,
         storage_transform: None,
-        meter_rgbi_path: None,
+        meter_rgbi_path: written
+            .metadata_publications
+            .archive_meter
+            .as_ref()
+            .map(|proof| proof.final_path().display().to_string()),
         hardware_telemetry: None,
         nikonlook: written.nikonlook.clone(),
     })
@@ -1980,12 +1998,8 @@ fn run_scan_job(
                     match output_authorities.frame(frame_index) {
                         Ok(authority) => authority,
                         Err(error) => {
-                            let _ = set_frame_state(
-                                &backend,
-                                &job_id,
-                                frame_index,
-                                FrameState::Failed,
-                            );
+                            let _ =
+                                set_frame_state(&backend, &job_id, frame_index, FrameState::Failed);
                             emit(
                                 &event_tx,
                                 "scan.frameState",
@@ -2224,6 +2238,7 @@ mod tests {
             bit_depth: 16,
             multisample_passes: 2,
             channels: Channels::Rgbi,
+            exposure_override_10ns: None,
         };
         assert_eq!(settings_fingerprint(&recipe), "1a3d265e0b54bbd2");
     }
@@ -2274,8 +2289,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt.nikonlook, Some(provenance));
-        let outputs = receipt.outputs.as_ref().expect("simulated receipt has outputs");
-        assert_eq!(outputs.raw_negative_path.as_deref(), Some("/tmp/negative.dng"));
+        let outputs = receipt
+            .outputs
+            .as_ref()
+            .expect("simulated receipt has outputs");
+        assert_eq!(
+            outputs.raw_negative_path.as_deref(),
+            Some("/tmp/negative.dng")
+        );
         assert_eq!(
             outputs.raw_negative_ir_path.as_deref(),
             Some("/tmp/negative-ir.tif")
@@ -2339,11 +2360,23 @@ mod tests {
         let positive = written.positive_path.as_ref().unwrap();
         let renamed = std::fs::rename(positive, root.join("engine-positive.tif"));
         if cfg!(windows) {
-            assert!(renamed.is_err(), "held Windows output must deny replacement");
+            assert!(
+                renamed.is_err(),
+                "held Windows output must deny replacement"
+            );
             build_receipt(
-                "job-binding-replacement", None, 1, 1000, &recipe, &processing, &output,
-                &SimulatedLs5000::new().device_info(), &written, Some(&project_root),
-            ).expect("denied replacement retains valid receipt evidence");
+                "job-binding-replacement",
+                None,
+                1,
+                1000,
+                &recipe,
+                &processing,
+                &output,
+                &SimulatedLs5000::new().device_info(),
+                &written,
+                Some(&project_root),
+            )
+            .expect("denied replacement retains valid receipt evidence");
             drop((written, project_root));
             let _ = std::fs::remove_dir_all(root);
             return;
@@ -2691,8 +2724,7 @@ mod tests {
             }
         }
         let mean = values.iter().sum::<f64>() / values.len() as f64;
-        let variance =
-            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
         variance.sqrt()
     }
 
@@ -2767,14 +2799,12 @@ mod tests {
                 .expect("timed out waiting for a thumbnail");
             let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
             assert_eq!(event["event"], "scanner.thumbnail");
-            let frame_index = event["payload"]["frameIndex"]
-                .as_u64()
-                .expect("frameIndex");
+            let frame_index = event["payload"]["frameIndex"].as_u64().expect("frameIndex");
             let thumbnail = &event["payload"]["thumbnail"];
 
-            let image_path = thumbnail["imagePath"]
-                .as_str()
-                .unwrap_or_else(|| panic!("frame {frame_index} must carry a fixture tile's imagePath"));
+            let image_path = thumbnail["imagePath"].as_str().unwrap_or_else(|| {
+                panic!("frame {frame_index} must carry a fixture tile's imagePath")
+            });
             assert!(
                 std::path::Path::new(image_path).is_file(),
                 "imagePath must name an existing, readable file, frame {frame_index}"
@@ -3468,7 +3498,8 @@ mod tests {
             .expect("start repeat");
             loop {
                 let value: serde_json::Value = serde_json::from_str(
-                    &rx.recv_timeout(Duration::from_secs(30)).expect("terminal event"),
+                    &rx.recv_timeout(Duration::from_secs(30))
+                        .expect("terminal event"),
                 )
                 .expect("event json");
                 if value["event"] == "scan.completed" {
@@ -3692,8 +3723,7 @@ mod tests {
         let first = sim.manual_frames(vec![0, 135, 270]).expect("first call");
         let second = sim.manual_frames(vec![0, 135, 270]).expect("second call");
         assert_eq!(
-            first.thumbnails[0].thumbnail.brightness,
-            second.thumbnails[0].thumbnail.brightness,
+            first.thumbnails[0].thumbnail.brightness, second.thumbnails[0].thumbnail.brightness,
             "D-08/SIM-03 determinism: identical rows must hash to identical simulated tiles"
         );
         assert_ne!(
@@ -3813,7 +3843,9 @@ mod tests {
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
         sim.roll_approve(1, &result.operation_id, false)
             .expect("a frame this placement returned must be approvable");
         sim.roll_approve(2, &result.operation_id, false)
@@ -3842,8 +3874,12 @@ mod tests {
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("2-frame placement");
-        let err = sim.roll_approve(99, &result.operation_id, false).unwrap_err();
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("2-frame placement");
+        let err = sim
+            .roll_approve(99, &result.operation_id, false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -3854,8 +3890,11 @@ mod tests {
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
-        sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
-        let err = sim.roll_approve(1, "not-the-real-operation-id", false).unwrap_err();
+        sim.manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
+        let err = sim
+            .roll_approve(1, "not-the-real-operation-id", false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -3865,14 +3904,18 @@ mod tests {
         sim.connect(DEVICE_ID, &ConnectOptions::default())
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
 
         // A different carrier loaded afterward invalidates the old binding
         // (S2's own "stale frame-indexed state must never survive a
         // materially different registration" principle, applied here to
         // the simulator's session-scoped approval binding).
         sim.load_media(MediaCarrier::Strip6).expect("reload media");
-        let err = sim.roll_approve(1, &result.operation_id, false).unwrap_err();
+        let err = sim
+            .roll_approve(1, &result.operation_id, false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -3882,13 +3925,17 @@ mod tests {
         sim.connect(DEVICE_ID, &ConnectOptions::default())
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
 
         sim.disconnect().expect("disconnect");
         sim.connect(DEVICE_ID, &ConnectOptions::default())
             .expect("reconnect");
         sim.load_media(MediaCarrier::Roll36).expect("reload media");
-        let err = sim.roll_approve(1, &result.operation_id, false).unwrap_err();
+        let err = sim
+            .roll_approve(1, &result.operation_id, false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 }

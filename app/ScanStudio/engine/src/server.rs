@@ -311,8 +311,7 @@ impl Backends {
                     "another device is already connected; disconnect first",
                 ));
             }
-            if active_device.hardware_verification
-                == domain::HardwareVerification::Unverified
+            if active_device.hardware_verification == domain::HardwareVerification::Unverified
                 && !options.allow_unverified_hardware
             {
                 return Err(EngineError::new(
@@ -546,11 +545,12 @@ impl Backends {
             ));
         }
         match self.active {
-            Some(ActiveDevice::Real) => self
-                .real
-                .as_ref()
-                .unwrap()
-                .roll_approve(frame_index, operation_id, attended),
+            Some(ActiveDevice::Real) => {
+                self.real
+                    .as_ref()
+                    .unwrap()
+                    .roll_approve(frame_index, operation_id, attended)
+            }
             // S7a (adversarial review, 2026-08-08): the simulator now has
             // exactly one manual-review gate -- a frame its own last
             // successful `manual_frames()` call returned, under that exact
@@ -608,6 +608,41 @@ impl Backends {
             Some(ActiveDevice::Sim) => Err(EngineError::new(
                 ErrorCode::InvalidParams,
                 "roll.setSpacingOffset is available only for an active real-device preview",
+            )),
+            None => Err(EngineError::new(
+                ErrorCode::NotConnected,
+                "scanner is not connected",
+            )),
+        }
+    }
+
+    fn roll_solve_exposure(
+        &self,
+        frame_index: u32,
+        operation_id: String,
+        project_root: &crate::render::ProjectOutputRootAuthority,
+        event_tx: mpsc::Sender<String>,
+    ) -> Result<(), EngineError> {
+        match self.active {
+            Some(ActiveDevice::Real) => RealLs5000::roll_solve_exposure(
+                self.real.as_ref().unwrap(),
+                frame_index,
+                operation_id,
+                project_root
+                    .directory_handle()
+                    .try_clone()
+                    .map_err(|error| {
+                        EngineError::new(
+                            ErrorCode::Internal,
+                            format!("failed to retain project authority: {error}"),
+                        )
+                    })?,
+                project_root.canonical_path().to_path_buf(),
+                event_tx,
+            ),
+            Some(ActiveDevice::Sim) => Err(EngineError::new(
+                ErrorCode::NotSupported,
+                "roll.solveExposure requires a real held preview session",
             )),
             None => Err(EngineError::new(
                 ErrorCode::NotConnected,
@@ -782,6 +817,42 @@ fn validate_output_retention(
     Ok(())
 }
 
+fn apply_roll_exposure_authority(
+    project: &domain::ScanProject,
+    recipe: &mut domain::CaptureRecipe,
+    processing: &domain::ProcessingRecipe,
+) -> Result<(), EngineError> {
+    if processing.auto_exposure_each_frame {
+        if recipe.exposure_override_10ns.is_some() {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                "exposureOverride10ns requires autoExposureEachFrame=false",
+            ));
+        }
+        return Ok(());
+    }
+    match project.roll_exposure_lock.as_ref() {
+        Some(exposure_lock) => {
+            if recipe
+                .exposure_override_10ns
+                .is_some_and(|requested| requested != exposure_lock.rgb_exposures_raw_10ns)
+            {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "exposureOverride10ns conflicts with the project's durable roll exposure lock",
+                ));
+            }
+            recipe.exposure_override_10ns = Some(exposure_lock.rgb_exposures_raw_10ns);
+            Ok(())
+        }
+        None if recipe.exposure_override_10ns.is_some() => Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            "exposureOverride10ns requires a durable roll exposure lock",
+        )),
+        None => Ok(()),
+    }
+}
+
 #[cfg(windows)]
 fn destination_component_is_reparse(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt as _;
@@ -836,9 +907,7 @@ fn validate_metadata_destinations_under_project(
         if !destination.is_absolute() {
             return Err(EngineError::new(
                 ErrorCode::InvalidParams,
-                format!(
-                    "{role} destination must be an absolute folder beneath the active project"
-                ),
+                format!("{role} destination must be an absolute folder beneath the active project"),
             ));
         }
         let relative = destination
@@ -853,9 +922,10 @@ fn validate_metadata_destinations_under_project(
                     ),
                 )
             })?;
-        if relative.components().any(|component| {
-            !matches!(component, std::path::Component::Normal(_))
-        }) {
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
             return Err(EngineError::new(
                 ErrorCode::InvalidParams,
                 format!("{role} destination contains an unsafe path component"),
@@ -1226,6 +1296,103 @@ fn handle_request(
             )?;
             to_json(&protocol::RollSetSpacingOffsetResult { thumbnail })
         }
+        "roll.verify" | "roll.collect" => {
+            let directory = project_state.directory.as_deref().ok_or_else(|| {
+                EngineError::new(
+                    ErrorCode::ProjectNotFound,
+                    "open a project before verifying or collecting a roll",
+                )
+            })?;
+            let authority = crate::render::acquire_project_output_root_authority(Some(directory))?
+                .expect("a project path always produces an authority");
+            let project = crate::manifest::read_project_at(
+                authority.directory_handle(),
+                authority.canonical_path(),
+            )?;
+            if request.method == "roll.verify" {
+                let params: crate::calibration::VerifyParams = parse_params(&request.params)?;
+                let mut report = crate::calibration::verify_pass(&project, &params);
+                report
+                    .issues
+                    .extend(crate::calibration_collection::verify_artifacts(
+                        authority.canonical_path(),
+                        &project,
+                        params.pass.as_deref(),
+                    ));
+                report.status =
+                    if report
+                        .issues
+                        .iter()
+                        .any(|issue| issue.status == crate::calibration::VerificationStatus::Fail)
+                    {
+                        crate::calibration::VerificationStatus::Fail
+                    } else if report.issues.iter().any(|issue| {
+                        issue.status == crate::calibration::VerificationStatus::Unknown
+                    }) {
+                        crate::calibration::VerificationStatus::Unknown
+                    } else {
+                        crate::calibration::VerificationStatus::Pass
+                    };
+                authority.verify_namespace()?;
+                to_json(&report)
+            } else {
+                let params: crate::calibration::CollectParams = parse_params(&request.params)?;
+                let result = crate::calibration_collection::collect(
+                    authority.canonical_path(),
+                    &project,
+                    None,
+                    std::path::Path::new(&params.to),
+                    &params.metadata,
+                )
+                .map_err(|message| EngineError::new(ErrorCode::InvalidParams, message))?;
+                authority.verify_namespace()?;
+                to_json(&result)
+            }
+        }
+        "roll.solveExposure" => {
+            let params: protocol::RollSolveExposureParams = parse_params(&request.params)?;
+            if params.frame_index == 0 || params.operation_id.trim().is_empty() {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "frameIndex must be positive and operationId must be non-empty",
+                ));
+            }
+            let directory = project_state.directory.as_deref().ok_or_else(|| {
+                EngineError::new(
+                    ErrorCode::ProjectNotFound,
+                    "open a project before solving exposure",
+                )
+            })?;
+            let project_root =
+                crate::render::acquire_project_output_root_authority(Some(directory))?
+                    .expect("a project path always produces an authority");
+            project_root.verify_namespace()?;
+            let project = crate::manifest::read_project_at(
+                project_root.directory_handle(),
+                project_root.canonical_path(),
+            )?;
+            if !project
+                .frames
+                .iter()
+                .any(|frame| frame.index == params.frame_index)
+            {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "frame index {} does not exist in this project",
+                        params.frame_index
+                    ),
+                ));
+            }
+            project_state.active = Some(project);
+            backends.roll_solve_exposure(
+                params.frame_index,
+                params.operation_id,
+                &project_root,
+                tx.clone(),
+            )?;
+            to_json(&protocol::RollSolveExposureAck { accepted: true })
+        }
         "roll.manualFrames" => {
             let params: protocol::RollManualFramesParams = parse_params(&request.params)?;
             let result = backends.roll_manual_frames(params.rows)?;
@@ -1241,9 +1408,9 @@ fn handle_request(
                 let valid = !pass_token.is_empty()
                     && pass_token.len() <= 64
                     && !matches!(pass_token, "." | "..")
-                    && pass_token
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+                    && pass_token.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    });
                 if !valid {
                     return Err(EngineError::new(
                         ErrorCode::InvalidParams,
@@ -1257,10 +1424,16 @@ fn handle_request(
             // destination validation. This exact capability is retained
             // through backend publication; later code must not canonicalize
             // and bless whatever happens to occupy the project pathname.
-            let project_root_authority =
-                crate::render::acquire_project_output_root_authority(
-                    project_state.directory.as_deref(),
-                )?;
+            let project_root_authority = crate::render::acquire_project_output_root_authority(
+                project_state.directory.as_deref(),
+            )?;
+            if let Some(project_root) = project_root_authority.as_ref() {
+                project_root.verify_namespace()?;
+                project_state.active = Some(crate::manifest::read_project_at(
+                    project_root.directory_handle(),
+                    project_root.canonical_path(),
+                )?);
+            }
             if let Some(project_root) = project_root_authority.as_ref() {
                 crate::render::normalize_output_recipe_project_aliases(
                     project_root,
@@ -1284,6 +1457,7 @@ fn handle_request(
                 // honored safely and is rejected below before capture.
                 params.processing.film_process = project.film_process;
                 params.processing = params.processing.effective();
+                apply_roll_exposure_authority(project, &mut params.recipe, &params.processing)?;
                 for &requested in &params.frames {
                     if let Some(frame) = project.frames.iter().find(|f| f.index == requested) {
                         if frame.excluded {
@@ -1302,10 +1476,18 @@ fn handle_request(
                                 ));
                             }
                         }
+                        if let Some(override_capture) = &frame.capture_override {
+                            if override_capture.exposure_override_10ns
+                                != params.recipe.exposure_override_10ns
+                            {
+                                return Err(EngineError::new(
+                                    ErrorCode::InvalidParams,
+                                    format!("frame {requested} exposure override conflicts with the roll-wide exposure authority"),
+                                ));
+                            }
+                        }
                         if let Some(alignment) = frame.alignment.as_ref() {
-                            validate_derivative_transform(
-                                alignment.derivative_transform,
-                            )?;
+                            validate_derivative_transform(alignment.derivative_transform)?;
                         }
                         if frame.capture_override.is_some()
                             || frame.processing_override.is_some()
@@ -1340,15 +1522,14 @@ fn handle_request(
                 validate_metadata_destinations_under_project(project_root, &params.output)?;
                 for (frame_index, override_values) in &overrides {
                     if let Some(output) = override_values.output.as_ref() {
-                        validate_metadata_destinations_under_project(project_root, output).map_err(
-                            |mut error| {
+                        validate_metadata_destinations_under_project(project_root, output)
+                            .map_err(|mut error| {
                                 error.message = format!(
                                     "frame {frame_index} output override is not metadata-safe: {}",
                                     error.message
                                 );
                                 error
-                            },
-                        )?;
+                            })?;
                     }
                 }
             }
@@ -1384,9 +1565,9 @@ fn handle_request(
             // drifting further from it.
             if let Some(project) = project_state.active.as_mut() {
                 project.recipes = params.output.clone();
-                let project_root = project_root_authority.as_ref().expect(
-                    "a project-root authority exists whenever project state is active",
-                );
+                let project_root = project_root_authority
+                    .as_ref()
+                    .expect("a project-root authority exists whenever project state is active");
                 // This verification is the pre-motion refusal boundary. The
                 // persistence API below also uses only the held handle, so a
                 // later namespace race can never redirect manifest bytes.
@@ -1535,12 +1716,12 @@ fn handle_request(
             // can only cause a typed refusal; it can never redirect a write.
             let output_authorities =
                 crate::render::acquire_job_output_authorities_with_project_root(
-                project_root_authority.as_ref(),
-                &params.frames,
-                &authority_recipe,
-                &effective_output,
-                &authority_overrides,
-            )?;
+                    project_root_authority.as_ref(),
+                    &params.frames,
+                    &authority_recipe,
+                    &effective_output,
+                    &authority_overrides,
+                )?;
             // The held graph acquisition above performs the decisive
             // physical dir-identity+leaf collision check and exact
             // handle-relative create-only vacancy check. Do not follow it
@@ -1643,20 +1824,15 @@ fn handle_request(
                     validate_derivative_transform(alignment.derivative_transform)?;
                 }
             }
-            let project = project_state.set(
-                project,
-                std::path::PathBuf::from(&params.directory),
-            )?;
+            let project =
+                project_state.set(project, std::path::PathBuf::from(&params.directory))?;
             let directory = project_state
                 .directory
                 .as_ref()
                 .expect("set stores a canonical project directory")
                 .display()
                 .to_string();
-            to_json(&protocol::ProjectOpenResult {
-                project,
-                directory,
-            })
+            to_json(&protocol::ProjectOpenResult { project, directory })
         }
         "project.list" => {
             let params: protocol::ProjectListParams = parse_params(&request.params)?;
@@ -1800,6 +1976,7 @@ fn handle_request(
                     "rgbi" => domain::Channels::Rgbi,
                     _ => domain::CaptureRecipe::default().channels,
                 },
+                exposure_override_10ns: None,
             });
             let mut effective_processing = frame
                 .processing_override
@@ -2622,6 +2799,54 @@ mod tests {
     }
 
     #[test]
+    fn durable_roll_exposure_is_reused_for_repeated_ae_off_calls_and_omitted_for_ae_on() {
+        let directory = temp_test_dir("roll-exposure-authority");
+        let (mut project, _) = crate::manifest::create_project(
+            "Exposure Authority",
+            domain::MediaCarrier::Mounted,
+            1,
+            domain::FilmProcess::C41ColorNegative,
+            Some(&directory),
+        )
+        .unwrap();
+        project.roll_exposure_lock = Some(domain::RollExposureLock {
+            slot: 1,
+            rgb_exposures_raw_10ns: [120_000, 130_000, 140_000],
+            ir_metered_exposure_raw_10ns: 150_000,
+            meter_evidence_path: "/tmp/meter.tif".into(),
+            meter_evidence_sha256: "a".repeat(64),
+            journal_path: "/tmp/journal.json".into(),
+            journal_sha256: "b".repeat(64),
+        });
+        let ae_off = domain::ProcessingRecipe {
+            auto_exposure_each_frame: false,
+            ..domain::ProcessingRecipe::default()
+        };
+        for _ in 0..2 {
+            let mut recipe = domain::CaptureRecipe::default();
+            apply_roll_exposure_authority(&project, &mut recipe, &ae_off).unwrap();
+            assert_eq!(
+                recipe.exposure_override_10ns,
+                Some([120_000, 130_000, 140_000])
+            );
+        }
+
+        let mut ae_on_recipe = domain::CaptureRecipe::default();
+        apply_roll_exposure_authority(
+            &project,
+            &mut ae_on_recipe,
+            &domain::ProcessingRecipe::default(),
+        )
+        .unwrap();
+        assert_eq!(ae_on_recipe.exposure_override_10ns, None);
+        assert!(
+            project.roll_exposure_lock.is_some(),
+            "AE must not clear the durable lock"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn project_create_then_open_round_trips_through_handle_request() {
         let mut backends = Backends {
             sim: Arc::new(SimulatedLs5000::new()),
@@ -2864,7 +3089,10 @@ mod tests {
 
         // The active in-memory project did not move to the refused target.
         assert_eq!(
-            project_state.active.as_ref().map(|project| project.id.clone()),
+            project_state
+                .active
+                .as_ref()
+                .map(|project| project.id.clone()),
             Some(active_before.id.clone()),
             "a refused create must not switch the active project"
         );
@@ -3664,8 +3892,7 @@ mod tests {
                 "directory": directory.display().to_string(),
             }),
         };
-        handle_request(&mut backends, &tx, &create, &mut project_state)
-            .expect("project.create");
+        handle_request(&mut backends, &tx, &create, &mut project_state).expect("project.create");
 
         let capture_override = Request {
             id: 2,
@@ -3680,13 +3907,8 @@ mod tests {
                 }
             }),
         };
-        handle_request(
-            &mut backends,
-            &tx,
-            &capture_override,
-            &mut project_state,
-        )
-        .expect("capture override");
+        handle_request(&mut backends, &tx, &capture_override, &mut project_state)
+            .expect("capture override");
 
         let processing_override = Request {
             id: 3,
@@ -3703,13 +3925,8 @@ mod tests {
                 }
             }),
         };
-        handle_request(
-            &mut backends,
-            &tx,
-            &processing_override,
-            &mut project_state,
-        )
-        .expect("processing override");
+        handle_request(&mut backends, &tx, &processing_override, &mut project_state)
+            .expect("processing override");
 
         let analyze = Request {
             id: 4,
@@ -4314,7 +4531,9 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::InvalidParams);
         assert!(error.message.contains("0, 90, 180, or 270"));
-        assert!(project_state.active.as_ref().unwrap().frames[0].alignment.is_none());
+        assert!(project_state.active.as_ref().unwrap().frames[0]
+            .alignment
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -4927,11 +5146,10 @@ mod tests {
             .to_string();
         output.positive.enabled = false;
         output.preview.enabled = false;
-        let project_root = crate::render::acquire_project_output_root_authority(Some(
-            &project_directory,
-        ))
-        .unwrap()
-        .unwrap();
+        let project_root =
+            crate::render::acquire_project_output_root_authority(Some(&project_directory))
+                .unwrap()
+                .unwrap();
         let error = validate_metadata_destinations_under_project(&project_root, &output)
             .expect_err("linked destination must fail closed");
         assert_eq!(error.code, ErrorCode::InvalidParams);
@@ -5069,7 +5287,10 @@ mod tests {
             .expect("canonical active root remains authoritative");
         let persisted = crate::manifest::read_manifest(&physical).unwrap();
         assert_eq!(persisted.roll_metadata.camera.as_deref(), Some("Nikon F3"));
-        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside unchanged");
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"outside unchanged"
+        );
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
 
         let _ = std::fs::remove_file(&alias_parent);
@@ -5454,7 +5675,10 @@ mod tests {
 
         assert_eq!(result["pixelsPerRow"], serde_json::json!(1));
         let row_count = result["rowCount"].as_u64().expect("rowCount is a number");
-        assert!(row_count > 0, "a loaded 36-frame roll must report a positive rowCount");
+        assert!(
+            row_count > 0,
+            "a loaded 36-frame roll must report a positive rowCount"
+        );
         let image_path = result["imagePath"].as_str().expect("imagePath is a string");
         assert!(
             std::path::Path::new(image_path).is_file(),
@@ -5477,11 +5701,16 @@ mod tests {
             .expect("roll.manualFrames with structurally valid rows");
 
         assert_eq!(result["count"], serde_json::json!(2));
-        assert!(result["operationId"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(result["operationId"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
         let thumbnails = result["thumbnails"].as_array().expect("thumbnails array");
         assert_eq!(thumbnails.len(), 2);
         assert_eq!(thumbnails[0]["frameIndex"], serde_json::json!(1));
-        assert_eq!(thumbnails[0]["thumbnail"]["needsApproval"], serde_json::json!(true));
+        assert_eq!(
+            thumbnails[0]["thumbnail"]["needsApproval"],
+            serde_json::json!(true)
+        );
         assert_eq!(
             thumbnails[0]["thumbnail"]["warnings"],
             serde_json::json!(["user-picked"])

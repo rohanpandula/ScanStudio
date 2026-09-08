@@ -56,7 +56,8 @@ The complete wire surface covered by this guide is: `hello`, `status`,
 `scanner.disconnect`, `preview.acquire`, `frames.list`, `frames.select`,
 `frames.place`, `frames.include`, `frames.exclude`, `review.approve`, `review.cancel`,
 `settings.get`, `settings.set`, `outputs.get`, `outputs.set`, `roll.save`,
-`roll.open`, `roll.list`, `scan.start`, `scan.stop`, `scan.resume`,
+`roll.open`, `roll.list`, `roll.solveExposure`, `roll.verify`, `roll.collect`,
+`scan.start`, `scan.stop`, `scan.resume`,
 `scanner.eject`, `diagnostics.export`, `events.subscribe`, and `job.get`.
 
 The following are retained Phase 4 simulator captures, before the additive
@@ -225,6 +226,37 @@ development/test override and `--log` chooses the detached log path. `host`
 commands do not require motion flags. `host` exits `0, 65, 69, 70, 75`;
 `host stop` exits `0, 69, 70, 75`.
 
+### Calibration commands
+
+```text
+roll solve-exposure --frame N --confirm-motion → roll.solveExposure
+roll verify [--pass TOKEN] [--exposure-identical] [--no-clipping] → roll.verify
+roll collect --to NEW_DIRECTORY --stock STOCK --pass TOKEN --slot-map MAP.json
+             [--operator NAME] → roll.collect
+```
+
+`solve-exposure` measures inside the current real held preview session and
+waits for its terminal result. A successful measurement persists the RGB
+exposure lock in the open project. Scans with auto exposure disabled reuse
+that lock across separate CLI invocations; enabling auto exposure omits the
+override and preserves the saved lock for later use. IR remains metered.
+The simulator and older drivers without held metering refuse this command.
+
+`verify` reads retained file bindings, lengths and SHA-256 hashes. Optional
+exposure checks compare commanded RGB ticks within each pass; clipping checks
+use receipt telemetry. Missing evidence is `unknown`, never a fabricated
+pass. It prints the complete report and exits 65 for `fail` or `unknown`.
+
+`collect` copies one exact pass into a fresh directory, preserving originals.
+The slot map is a JSON object such as `{"1":1,"2":2}` with unique positive
+slots and physical frame numbers. Raw-enabled receipts require RGB16 TIFF
+and its tagged Gray16 IR sidecar; raw-disabled Pass B collects its available
+positive, meter and receipt. The output includes `roll-metadata.json` and
+`file-hashes.txt`. Missing or changed bound evidence and existing destinations
+are refused. Collection requires project-relative capture bindings; older
+receipts and independent raw destinations without those bindings cannot be
+retroactively certified. Neither verification nor collection moves film.
+
 ### `roll run`
 
 ```text
@@ -244,7 +276,8 @@ required. It stops at the first refusal and never retries. Exits are `0, 64,
 ### `scan`, `stop`, `resume`, and `eject`
 
 ```text
-scan --confirm-motion [--wait] → scan.start, job.get
+scan --confirm-motion [--wait] [--frames RANGE] [--repeat COUNT] [--pass TOKEN]
+                               → scan.start, job.get
 stop [--immediate]             → scan.stop
 resume --confirm-motion [--wait] → scan.resume, job.get
 eject --confirm-motion         → scanner.eject
@@ -253,6 +286,21 @@ eject --confirm-motion         → scanner.eject
 `scan`, `resume`, and `eject` require `--confirm-motion`. `stop` only stops an
 existing job and starts no motion. Scan/resume/eject exit `0, 65, 69, 70, 75,
 77`; stop exits `0, 65, 69, 70, 75`.
+
+`--frames` accepts comma-separated indices and ranges, including previously
+completed frames for an explicit rescan. `--repeat` accepts 1–100 and requires
+`--pass` above 1. Repeats always wait: each starts only after the prior job
+completed without frame errors. A refusal or stopped/failed job ends the
+sequence without retrying it. Omitted frames use one snapshot of the initial
+selection throughout the sequence.
+
+A single pass keeps its token exactly. Repeats append a two-digit ordinal:
+`--frames 20 --repeat 10 --pass Arep` produces `Arep01` through `Arep10`.
+Receipts retain `passToken`; filename templates support `{stock}` and `{pass}`
+(and `$Pass`). Existing `$Frame` keeps its four-digit width. All captures use
+create-only output reservation and append receipts. Pass tokens allow 1–64
+ASCII letters, digits, `.`, `_`, or `-`, excluding `.` and `..`. Invalid scan
+ranges/repeat arguments exit 64 before connecting.
 
 ### `diagnostics`, `events`, and `sim`
 

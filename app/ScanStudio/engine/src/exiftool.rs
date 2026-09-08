@@ -2044,7 +2044,10 @@ pub(crate) fn ensure_supported_metadata_filesystem(file: &File) -> std::io::Resu
     };
     if result == 0 {
         let error = std::io::Error::last_os_error();
-        return Err(std::io::Error::new(error.kind(), format!("GetVolumeInformationByHandleW: {error}")));
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("GetVolumeInformationByHandleW: {error}"),
+        ));
     }
     if !windows_metadata_filesystem_name_is_supported(&filesystem_name) {
         let name = String::from_utf16_lossy(&filesystem_name)
@@ -3167,7 +3170,10 @@ pub(crate) mod metadata_publish_sys {
         if status < 0 {
             let windows_error = unsafe { RtlNtStatusToDosError(status) };
             let error = io::Error::from_raw_os_error(windows_error as i32);
-            return Err(io::Error::new(error.kind(), format!("NtCreateFile metadata entry: {error}")));
+            return Err(io::Error::new(
+                error.kind(),
+                format!("NtCreateFile metadata entry: {error}"),
+            ));
         }
         if handle.is_null() || handle as isize == -1 {
             return Err(io::Error::other(
@@ -3224,12 +3230,14 @@ pub(crate) mod metadata_publish_sys {
                 "Windows rename name is too long",
             )
         })?;
-        let total = size_of::<FileRenameInformation>().checked_add(byte_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Windows rename buffer overflow",
-            )
-        })?;
+        let total = size_of::<FileRenameInformation>()
+            .checked_add(byte_len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows rename buffer overflow",
+                )
+            })?;
         let words = total.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; words];
         let info = storage.as_mut_ptr().cast::<FileRenameInformation>();
@@ -3246,7 +3254,10 @@ pub(crate) mod metadata_publish_sys {
         // Use the native handle-relative operation, matching NtCreateFile above.
         // The Win32 rename wrapper rejects this directory-relative request with
         // ERROR_INVALID_PARAMETER on supported Windows hosts.
-        let mut status_block = IoStatusBlock { status_or_pointer: 0, information: 0 };
+        let mut status_block = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
         let status = unsafe {
             NtSetInformationFile(
                 source.as_raw_handle(),
@@ -3257,8 +3268,12 @@ pub(crate) mod metadata_publish_sys {
             )
         };
         if status < 0 {
-            let error = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
-            Err(io::Error::new(error.kind(), format!("NtSetInformationFile rename: {error}")))
+            let error =
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+            Err(io::Error::new(
+                error.kind(),
+                format!("NtSetInformationFile rename: {error}"),
+            ))
         } else {
             Ok(())
         }
@@ -3821,7 +3836,7 @@ fn relative_publication_path_at(
     )
 }
 
-fn open_regular_beneath(root: &File, relative: &Path) -> Result<File, EngineError> {
+pub(crate) fn open_regular_beneath(root: &File, relative: &Path) -> Result<File, EngineError> {
     let components = relative
         .components()
         .map(|component| match component {
@@ -4113,6 +4128,36 @@ pub(crate) fn bind_metadata_output_publications(
     };
     reject_publication_aliases(&bindings)?;
     Ok(bindings)
+}
+
+/// Mint read-only capture bindings from the files held at publication.
+/// These fields never enter the metadata target set.
+pub(crate) fn bind_capture_output_publications_at(
+    root: &File,
+    requested_root: &Path,
+    canonical_root: &Path,
+    proofs: &crate::render::MetadataPublicationProofs,
+) -> Result<crate::domain::CaptureOutputBindings, EngineError> {
+    let bind = |proof: &crate::render::PublishedFileProof| {
+        // Independent raw destinations remain supported, but cannot grant a
+        // project-relative collection capability.
+        if !proof.final_path().starts_with(requested_root)
+            && !proof.final_path().starts_with(canonical_root)
+        {
+            return Ok(None);
+        }
+        bind_publication_proof_at(root, requested_root, canonical_root, proof).map(Some)
+    };
+    Ok(crate::domain::CaptureOutputBindings {
+        raw_negative: proofs.raw.as_ref().map(bind).transpose()?.flatten(),
+        raw_negative_ir: proofs.raw_ir.as_ref().map(bind).transpose()?.flatten(),
+        meter: proofs
+            .archive_meter
+            .as_ref()
+            .map(bind)
+            .transpose()?
+            .flatten(),
+    })
 }
 
 /// Proof-aware receipt binder beneath a project directory capability captured
@@ -6704,6 +6749,7 @@ mod tests {
             film_process: FilmProcess::Positive,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-24T00:00:00Z".to_string(),
             frames: vec![ProjectFrame {
                 index: 1,
@@ -6748,6 +6794,7 @@ mod tests {
             processing: None,
             output: None,
             outputs: Some(WrittenOutputs {
+                capture_bindings: None,
                 archive_path: archive.map(|path| path.display().to_string()),
                 positive_path: positive.map(|path| path.display().to_string()),
                 preview_path: preview.map(|path| path.display().to_string()),
@@ -7477,6 +7524,7 @@ mod tests {
         let bindings =
             bind_metadata_outputs(&root, Some(&archive), None, Some(&positive), None).unwrap();
         let outputs = WrittenOutputs {
+            capture_bindings: None,
             archive_path: Some(archive.display().to_string()),
             positive_path: Some(positive.display().to_string()),
             preview_path: None,
@@ -7532,6 +7580,7 @@ mod tests {
         std::fs::write(&outside_target, b"outside-sentinel").unwrap();
         let bindings = bind_metadata_outputs(&root, None, None, Some(&positive), None).unwrap();
         let outputs = WrittenOutputs {
+            capture_bindings: None,
             archive_path: None,
             positive_path: Some(positive.display().to_string()),
             preview_path: None,
@@ -7590,6 +7639,7 @@ mod tests {
         std::fs::write(&archive, b"immutable-archive").unwrap();
         let bindings = bind_metadata_outputs(&root, Some(&archive), None, None, None).unwrap();
         let outputs = WrittenOutputs {
+            capture_bindings: None,
             archive_path: Some(archive.display().to_string()),
             positive_path: None,
             preview_path: None,

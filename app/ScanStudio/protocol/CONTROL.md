@@ -159,10 +159,38 @@ Errors: `INVALID_PARAMS` (not exactly one of `indices`/`all`/`none`; pre-project
 ### `roll.list`
 `{}` → `{projects: [{id: string, name: string, carrier: SimulatedFilmCarrier, frameCount: number, filmProcess: FilmProcess, createdAt: string, directory: string}]}`. Routes to `refreshRecentProjects()`, refreshing `SessionModel.recentProjects` from the engine's default projects root. An empty list on success is a valid, displayable state. Errors: `CONTROLLER_BUSY`; passthrough.
 
+### `roll.solveExposure`
+`{frame: number, motionConfirmed: true}` → `{solution: RollExposureLock}`.
+Requires an open project, completed preview registration and the same motion
+readiness gate as capture. Waits for the engine's correlated terminal event.
+The successful solution is persisted roll-wide; AE-off scan calls reuse its
+RGB ticks, while AE-on calls omit the override without clearing the lock.
+IR remains metered. Simulator/unsupported drivers refuse measured exposure.
+Errors: `CONFIRMATION_REQUIRED`, `CONTROLLER_BUSY`, `GATE_REFUSED`, typed engine errors.
+
+### `roll.verify`
+`{pass?: string, exposureIdentical: boolean, noClipping: boolean}` →
+`{status: "pass"|"fail"|"unknown", exposureIdentical, noClipping, checkedReceipts, issues: [{status, jobId?, frameIndex?, field, detail}]}`.
+Reads the durable project and checks selected capture file bindings, lengths
+and hashes. Exposure comparisons are grouped by pass. Missing evidence is
+unknown. No scanner request or project mutation is made.
+
+### `roll.collect`
+`{to: string, metadata: {stock: string, pass: string, slotMap: {slot: physicalFrame}, operator?: string, firmware?: string, adapter?: string, host?: string}}` →
+`{destination, files: [{path, byteLength, sha256}], metadataPath, hashesPath}`.
+Copies one exact receipt pass into a fresh destination using held source and
+destination handles, then verifies its file identities and hashes. Raw-enabled
+receipts require raw RGB and tagged IR; raw-disabled receipts retain their
+available positives, meter and receipt. No original is modified and no scanner
+operation is invoked. Missing/changed evidence or an existing destination is
+refused. The project exposure lock takes precedence over supplied metadata.
+
 ### `scan.start`
-`{motionConfirmed: boolean}` → `{outcome: "started"|"manualReviewPending"}`. **Requires `motionConfirmed: true`.** Pre-checks `scanReadiness(for: selectedFrames)` — verbatim the expression `ScanPanelView`'s Scan button binds its `.disabled` state to — then routes to `startMockScan()`, the one entry point for both real and simulated devices. `CONTROLLER_BUSY` also covers the window while the GUI-only attended-scan-recovery approval (`approveEveryFrameAndScan()` — see Not yet implemented) is in flight: that approval now participates in the same D-07 busy indicator as every other mutating action, so `scan.start` can never report a typed success for a request that approval silently absorbed instead. Emits `scan.jobState`/`scan.progress`/`scan.frameState` as the job proceeds. Errors: `CONFIRMATION_REQUIRED`; `GATE_REFUSED`, gate `scanReadiness`; `CONTROLLER_BUSY`; passthrough.
+`{motionConfirmed: boolean, frames?: number[], passToken?: string}` → `{outcome: "started"|"manualReviewPending"}`. **Requires `motionConfirmed: true`.** Pre-checks `scanReadiness(for: requestedFrames)` — verbatim the expression `ScanPanelView`'s Scan button binds its `.disabled` state to — then routes to `startMockScan(frames:passToken:)`, the one entry point for both real and simulated devices. `CONTROLLER_BUSY` also covers the window while the GUI-only attended-scan-recovery approval (`approveEveryFrameAndScan()` — see Not yet implemented) is in flight: that approval now participates in the same D-07 busy indicator as every other mutating action, so `scan.start` can never report a typed success for a request that approval silently absorbed instead. Emits `scan.jobState`/`scan.progress`/`scan.frameState` as the job proceeds. Errors: `CONFIRMATION_REQUIRED`; `GATE_REFUSED`, gate `scanReadiness`; `CONTROLLER_BUSY`; passthrough.
 
 `outcome` (D-23/HEAD-12, additive — the 2026-09-07 batch abort) matches `roll.save`'s own vocabulary: `"started"` (the scan actually began) or `"manualReviewPending"` (a flagged boundary paused it at the review gate instead, from the exact frames this call requested — see `status.manualReviewPending`). Never `"failed"` here: a failure is the `.failure` response above, not a success carrying a failure string. This closes the 2026-09-07 gap where a paused start was indistinguishable, on the wire, from an outright started job.
+
+Optional `frames` is an explicit, unique positive frame set; omission uses the current selection. It follows the same readiness and manual-review gates, including explicit rescans. Optional `passToken` is 1–64 ASCII letters/digits/`.`/`_`/`-`, excluding `.` and `..`; it is preserved in each receipt and materialized in `{pass}`/`$Pass` filename tokens. CLI repeats send separate sequential starts after terminal success; the control method itself starts exactly one job.
 
 ### `scan.stop`
 `{mode?: "afterCurrentFrame"|"immediate"}` (absent `mode` = `"afterCurrentFrame"`) → `{}`. Routes to `stopAfterCurrentFrame()` or `stopImmediately()`. Refused with `GATE_REFUSED` when no job is active, rather than silently reporting success for nothing having happened. Errors: `INVALID_PARAMS` (unrecognized `mode`); `GATE_REFUSED` with no `gate` (no active job); `CONTROLLER_BUSY`; passthrough.
@@ -261,6 +289,9 @@ One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen group
 
 | Subcommand | Channel method(s) | Confirmation flag | Exit codes |
 |---|---|---|---|
+| `roll solve-exposure --frame N --confirm-motion` | `roll.solveExposure` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
+| `roll verify [--pass TOKEN] [--exposure-identical] [--no-clipping]` | `roll.verify` | — | 0, 65, 69, 70, 75 |
+| `roll collect --to PATH --stock STOCK --pass TOKEN --slot-map MAP.json [--operator NAME]` | `roll.collect` | — | 0, 64, 65, 69, 70, 75 |
 | `connect [--device <id>]` | `scanner.connect` | — | 0, 65, 69, 70, 75 |
 | `disconnect` | `scanner.disconnect` | — | 0, 65, 69, 70, 75 |
 | `rescan` | `scanner.rescan` | — | 0, 65, 69, 70, 75 |
