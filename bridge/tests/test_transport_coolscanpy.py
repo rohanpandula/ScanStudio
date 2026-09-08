@@ -4226,3 +4226,15 @@ def test_start_scan_holds_the_first_frames_exposure_when_auto_exposure_is_off(
         {},
         {"exposure_override_10ns": (120_000, 95_000, 140_000)},
     ]
+
+
+def test_explicit_rgb_exposure_survives_separate_scan_calls(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
+    roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)], scan_results={1: [_fake_frame(1), _fake_frame(1)]})
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    ticks = (100_000, 110_000, 120_000)
+    recipe = dataclasses.replace(domain.FIXED_COLOR_NEGATIVE_RECIPE, auto_exposure=False, exposure_override_10ns=ticks)
+    for pass_name in ("A1", "A2"):
+        assert _scan(transport, [1], recipe, tmp_path / pass_name).completed == (1,)
+    assert roll.scan_many_kwargs == [{"exposure_override_10ns": ticks}] * 2

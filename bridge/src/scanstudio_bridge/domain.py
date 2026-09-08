@@ -114,6 +114,8 @@ class CaptureRecipe:
     channels: Channels
     autofocus: bool
     auto_exposure: bool
+    # Fixed LS-5000 protocol limits are validated before motion; IR stays metered.
+    exposure_override_10ns: tuple[int, int, int] | None = None
 
 
 class RawExportFormat(StrEnum):
@@ -460,7 +462,9 @@ def validate_capture_recipe(
     traced capture every earlier release accepted. `multisample_passes` must
     be a member of it. `auto_exposure` may be either boolean: `True` meters
     every frame, `False` meters the lowest requested slot and holds that
-    exposure for the rest of the batch (CoolscanPyTransport.start_scan).
+    exposure for the rest of the batch (CoolscanPyTransport.start_scan). An
+    explicit exposure_override_10ns supplies RGB authority from the first slot
+    onward, including across separate requests.
 
     Plan 10-09 debug-recipe gate: when env `SCANSTUDIO_BRIDGE_DEBUG_RECIPE`
     is exactly `"1"`, a `material=colorNegative` recipe ALSO validates
@@ -471,6 +475,19 @@ def validate_capture_recipe(
     is short-circuited before any recipe comparison runs, so behavior with
     the env unset (or set to anything other than exactly `"1"`) is
     byte-identical to before this override existed."""
+    override = recipe.exposure_override_10ns
+    if override is not None:
+        if (
+            type(override) is not tuple
+            or len(override) != 3
+            or any(type(tick) is not int or not 50_000 <= tick <= 400_000 for tick in override)
+            or recipe.auto_exposure is not False
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "recipe.exposureOverride10ns requires three integer RGB values in "
+                "50000..400000 (10ns ticks) and autoExposure=false; IR stays metered",
+            )
     if material is Material.BLACK_AND_WHITE_NEGATIVE:
         raise BridgeError(
             ErrorCode.NOT_IMPLEMENTED,

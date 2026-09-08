@@ -1520,11 +1520,11 @@ class CoolscanPyTransport:
             # Only a driver that declared single-sample support takes the
             # keyword; the traced default is byte-identical either way.
             scan_kwargs["samples_per_scan"] = recipe.multisample_passes
-        # autoExposure false: meter the lowest requested slot on its own
-        # batch, then hold its metered RGB exposure for every other slot
-        # through CoolscanPy's exposure_override_10ns (IR stays metered).
+        # An explicit roll authority applies from the first slot on every call.
+        # Otherwise autoExposure false retains the legacy first-frame hold.
+        # IR remains metered in both paths.
         hold_exposure = not recipe.auto_exposure
-        held_ticks: tuple[int, int, int] | None = None
+        held_ticks = recipe.exposure_override_10ns
 
         total = len(slots)
         completed: list[int] = []

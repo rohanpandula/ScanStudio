@@ -496,3 +496,24 @@ def test_validate_capture_recipe_rejects_wrong_multisample_passes_still_works_wh
         validate_capture_recipe(bad_recipe, Material.COLOR_NEGATIVE)
     assert excinfo.value.code == ErrorCode.INVALID_PARAMS
     assert "multisamplePasses" in excinfo.value.message
+
+
+@pytest.mark.parametrize("ticks", [(50_000, 100_000, 400_000), (120_000, 95_000, 140_000)])
+def test_explicit_rgb_exposure_round_trip(ticks) -> None:
+    recipe = dataclasses.replace(FIXED_COLOR_NEGATIVE_RECIPE, auto_exposure=False, exposure_override_10ns=ticks)
+    decoded = from_wire(to_wire(recipe), CaptureRecipe)
+    assert decoded == recipe
+    validate_capture_recipe(decoded, Material.COLOR_NEGATIVE)
+
+
+@pytest.mark.parametrize("ticks", [(49_999, 100_000, 100_000), (100_000, 400_001, 100_000), (True, 100_000, 100_000), (100_000.0, 100_000, 100_000), (100_000, 100_000), (float("nan"), 100_000, 100_000)])
+def test_invalid_explicit_rgb_exposure_is_refused(ticks) -> None:
+    recipe = dataclasses.replace(FIXED_COLOR_NEGATIVE_RECIPE, auto_exposure=False, exposure_override_10ns=ticks)
+    with pytest.raises(BridgeError, match="exposureOverride10ns"):
+        validate_capture_recipe(recipe, Material.COLOR_NEGATIVE)
+
+
+def test_explicit_rgb_exposure_refuses_auto_exposure() -> None:
+    recipe = dataclasses.replace(FIXED_COLOR_NEGATIVE_RECIPE, exposure_override_10ns=(100_000, 100_000, 100_000))
+    with pytest.raises(BridgeError, match="autoExposure=false"):
+        validate_capture_recipe(recipe, Material.COLOR_NEGATIVE)
