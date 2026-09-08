@@ -210,6 +210,7 @@ def _patch_continuation_common(
         monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
         monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
 
     accepted_proposal = SimpleNamespace(
         accepted=True,

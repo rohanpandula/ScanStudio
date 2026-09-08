@@ -42,11 +42,12 @@ runtime identity tables. It is not an unverified capture candidate. Native
 resolution, bit depth, infrared, multisampling, and adapter capabilities for
 unverified models have not been established by ScanStudio evidence.
 
-One-frame 1x capture validated — **No.** The 2026-09-06 attempt failed with
-`LIBUSB_ERROR_OVERFLOW` at the first fine READ and needed a power-cycle.
-Evidence: `~/ScanStudio-QA/single-sample-20260906/single-sample-failure-1949Z/`.
-The single-sample gate remains closed pending an attended junk-strip run; see
-[beta.17 notes](releases/v0.7.0-beta.17.md).
+One-frame 1x capture validated — **Yes, LS-5000 ED firmware 1.03 / SA-30 only.**
+Run `cli-single-sample-20260908T091904Z` used the signed CLI/headless host with
+4000 dpi, 16-bit RGBI, one sample. It retained one receipt, all 189194240 fine
+bytes, and matching uint16 RGB/IR images, without overflow or recovery.
+The source gate is bound to this run. This does not qualify other scanners,
+color rendering, or a full-roll 1x run. See [beta.17 notes](releases/v0.7.0-beta.17.md).
 
 ## Testing an unverified scanner
 

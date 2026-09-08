@@ -301,20 +301,16 @@ class _ScanPhase:
             )
 
 
-# This stays locked until an attended 4000 dpi, 16-bit, RGBI, 1-pass short-strip
-# run records settingsFingerprint 42ac10bb4c4b88e9 with no
-# LIBUSB_ERROR_OVERFLOW or required power-cycle. The commit that sets it must
-# copy the exact run string into docs/releases/v0.7.0-beta.17.md. It is a source
-# evidence gate, never environment- or file-controlled. The 2026-09-06 run at
-# ~/ScanStudio-QA/single-sample-20260906/single-sample-failure-1949Z failed its
-# first fine READ at completed_bytes 0 of 619458560 and required a power-cycle.
-SINGLE_SAMPLE_VALIDATED_RUN: str | None = None
-
+# Attended LS-5000 ED/SA-30 CLI evidence: one 4000dpi/16-bit/RGBI/1x frame,
+# fingerprint 42ac10bb4c4b88e9, 189194240 fine bytes, no overflow or recovery.
+# The exact retained run is also recorded in the beta.17 release notes.
+# This source evidence gate is never environment- or file-controlled.
+SINGLE_SAMPLE_VALIDATED_RUN: str | None = "cli-single-sample-20260908T091904Z"
 
 def supported_samples_per_scan() -> tuple[int, ...]:
     """Fine-scan samples-per-line values this bridge advertises and accepts.
 
-    CoolscanPy 0.7.7 declares `SUPPORTED_SAMPLES_PER_SCAN == (1, 4)` and
+    CoolscanPy 0.7.8 declares `SUPPORTED_SAMPLES_PER_SCAN == (1, 4)` and
     takes `Roll.scan_many(samples_per_scan=...)`; an older driver has neither
     and only ever commands the traced 4-sample capture, so the bridge
     advertises and accepts `(4,)` against it rather than passing a keyword
@@ -326,8 +322,8 @@ def supported_samples_per_scan() -> tuple[int, ...]:
     1-sample window and metered normally, but the first fine READ then
     failed with LIBUSB_ERROR_OVERFLOW and wedged the transport -- the
     single-sample data phase is framed differently from the traced 4-sample
-    transaction. Until a verified single-sample trace exists, production
-    advertises `(4,)` whatever the driver supports.
+    transaction. The recorded 2026-09-08 run validates the corrected 1-sample framing.
+    Without that source evidence binding, production advertises `(4,)`.
     """
 
     traced = domain.FIXED_COLOR_NEGATIVE_RECIPE.multisample_passes

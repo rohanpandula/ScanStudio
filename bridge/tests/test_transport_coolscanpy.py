@@ -702,7 +702,10 @@ def test_list_devices_passes_through_supported_from_coolscanpy(
     assert devices[0].hardware_verification is domain.HardwareVerification.UNVERIFIED
 
 
-def test_capabilities_from_coolscanpy_reports_fixed_supported_multisample_passes() -> None:
+def test_capabilities_from_coolscanpy_reports_fixed_supported_multisample_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
     assert _capabilities_from_coolscanpy(_fake_capabilities()).supported_multisample_passes == (4,)
 
 
@@ -4151,6 +4154,7 @@ def test_supported_samples_per_scan_stays_closed_without_driver_capability(
 def test_device_info_reports_the_drivers_samples_per_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
     roll = _FakeRoll(thumbnails=[_fake_thumbnail(1)])
     transport, _device = _opened_transport(monkeypatch, roll)
     assert transport.list_devices()[0].capabilities.supported_multisample_passes == (4,)
@@ -4161,6 +4165,7 @@ def test_device_info_reports_the_drivers_samples_per_scan(
 def test_start_scan_passes_samples_per_scan_only_when_the_driver_supports_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
     roll = _FakeRoll(
         thumbnails=[_fake_thumbnail(1)],
         scan_results={1: [_fake_frame(1), _fake_frame(1)]},
@@ -4195,6 +4200,7 @@ def test_start_scan_holds_the_first_frames_exposure_when_auto_exposure_is_off(
     100 ticks per microsecond) is forced onto every remaining slot through
     the driver's exposure_override_10ns; the first batch carries no override."""
 
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
     roll = _FakeRoll(
         thumbnails=[_fake_thumbnail(1), _fake_thumbnail(2), _fake_thumbnail(3)],
         scan_results={1: [_fake_frame(1)], 2: [_fake_frame(2)], 3: [_fake_frame(3)]},

@@ -382,6 +382,7 @@ def _install_fake_hardware(
     monkeypatch.setattr(
         worker_module, "validate_plan", lambda _plan, *_manifest: tiny_target
     )
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
     # ... and the identical shrink on the parent side, so its own
     # frame-completion invariants describe the same capture. Faking only one
     # side is the failure mode this whole file is about.
