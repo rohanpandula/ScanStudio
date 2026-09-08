@@ -68,8 +68,9 @@ enum CommandRunner {
     /// Issues one request on an already-open `client`. A typed refusal
     /// (`ControlErrorPayload`) comes back as a `.result`/`.failure` value,
     /// never thrown (D-14) -- only a transport-level throw (connection
-    /// closed, malformed response, a cancellation) reaches this `catch`,
-    /// mapped to the same INTERNAL/70 handling `openConnection` performs.
+    /// closed, malformed response, a cancellation) reaches this `catch`.
+    /// A peer close is HOST_UNREACHABLE/69; malformed protocol and local
+    /// failures remain INTERNAL/70.
     static func request<Params: Encodable & Sendable>(
         command: String,
         method: String,
@@ -82,8 +83,9 @@ enum CommandRunner {
         } catch {
             let context = await client.cliEnvelopeContext
             await client.shutdown()
-            try emitFailure(command: command, options: options, payload: internalPayload(command: command, error: error), context: context)
-            throw ExitCode(ControlCLIExitCode.internalError.rawValue)
+            let failure = postConnectionFailure(command: command, error: error)
+            try emitFailure(command: command, options: options, payload: failure.payload, context: context)
+            throw ExitCode(failure.exitCode.rawValue)
         }
     }
 
@@ -150,8 +152,9 @@ enum CommandRunner {
     static func fail(command: String, options: GlobalOptions, client: ControlChannelClient, error: Error) async throws -> Never {
         let context = await client.cliEnvelopeContext
         await client.shutdown()
-        try emitFailure(command: command, options: options, payload: internalPayload(command: command, error: error), context: context)
-        throw ExitCode(ControlCLIExitCode.internalError.rawValue)
+        let failure = postConnectionFailure(command: command, error: error)
+        try emitFailure(command: command, options: options, payload: failure.payload, context: context)
+        throw ExitCode(failure.exitCode.rawValue)
     }
 
     private static func emitResult(command: String, options: GlobalOptions, resultJSON: [String: Any], context: ControlCLIEnvelopeContext = .unreached) throws {
@@ -179,5 +182,24 @@ enum CommandRunner {
             message: "\"\(command)\" failed: \(String(describing: error))",
             recoverable: false
         )
+    }
+
+    private static func postConnectionFailure(
+        command: String,
+        error: Error
+    ) -> (payload: ControlErrorPayload, exitCode: ControlCLIExitCode) {
+        if let clientError = error as? ControlChannelClientError,
+           clientError == .connectionClosed {
+            return (
+                ControlErrorPayload(
+                    code: ControlCLIErrorCode.hostUnreachable.rawValue,
+                    message: "Lost the ScanStudio control-host connection before \"\(command)\" completed.",
+                    recoverable: false,
+                    guidance: "Reconnect to the host and determine the operation state before retrying."
+                ),
+                .noHostReachable
+            )
+        }
+        return (internalPayload(command: command, error: error), .internalError)
     }
 }

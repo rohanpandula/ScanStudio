@@ -96,6 +96,8 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
     private(set) var recordedScanStopModes: [String] = []
     private(set) var recordedScanStarts: [ScanStartParams] = []
     private var scriptedFailures: [String: EngineRequestError] = [:]
+    private var holdNextScanStart = false
+    private var heldScanStartContinuation: CheckedContinuation<Void, Never>?
 
     /// Scripts the next call to `method` to throw `error` instead of
     /// answering normally -- removed from the schedule once consumed, so a
@@ -106,6 +108,15 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
 
     func requestCount(_ method: String) -> Int {
         requestCounts[method, default: 0]
+    }
+
+    func holdNextScanStartResponse() {
+        holdNextScanStart = true
+    }
+
+    func releaseHeldScanStartResponse() {
+        heldScanStartContinuation?.resume()
+        heldScanStartContinuation = nil
     }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
@@ -142,6 +153,12 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
                 throw ConfirmationStubError.unexpectedResultType
             }
             recordedScanStarts.append(scan)
+            if holdNextScanStart {
+                holdNextScanStart = false
+                await withCheckedContinuation { continuation in
+                    heldScanStartContinuation = continuation
+                }
+            }
             let count = requestCounts[method] ?? 1
             let jobId = count == 1 ? Self.jobId : "\(Self.jobId)-\(count)"
             return try cast(ScanStartResult(jobId: jobId), as: Result.self)
@@ -916,16 +933,21 @@ struct ScanstudioCLIConfirmationTests {
         await host.server.stop()
     }
 
-    @Test("scan --confirm-motion --wait whose host is shut down mid-wait exits 69 rather than hanging")
+    @Test("scan --confirm-motion --wait whose host closes before scan.start acknowledgement exits 69")
     func scanWaitHostGoneMidWaitExitsHostUnreachable() async throws {
         let host = try await ConfirmationHost.start(label: "scan-wait-host-gone")
         defer { removeConfirmationSocketDirectory(for: host.socketPath) }
         let ready = await prepareConfirmationScanReadiness(host.model, projectDirectory: host.projectDirectory)
         #expect(ready)
+        await host.stub.holdNextScanStartResponse()
 
         async let outcome = runConfirmationCLI(["scan", "--confirm-motion", "--wait"], socketPath: host.socketPath)
-        await waitForConfirmationJobToBegin(host.model)
+        for _ in 0..<11_000 where await host.stub.requestCount("scan.start") == 0 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(await host.stub.requestCount("scan.start") == 1)
         await host.server.stop()
+        await host.stub.releaseHeldScanStartResponse()
 
         let result = try await outcome
         #expect(result.exitCode == 69)
