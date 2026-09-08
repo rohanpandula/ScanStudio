@@ -202,9 +202,21 @@ class TelemetryLog:
         self.hardware_verification = "notConnected"
         path = base_dir / _TELEMETRY_DIRNAME / f"{self.session_id}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.root = base_dir.resolve()
+        self.path = path.resolve()
         self._fh = path.open("a")
 
-    def record(self, method: str, outcome: str, **fields: object) -> None:
+    def correlated(self, correlation_token: str | None) -> "TelemetryLog | _CorrelatedTelemetryLog":
+        return self if correlation_token is None else _CorrelatedTelemetryLog(self, correlation_token)
+
+    def record(
+        self,
+        method: str,
+        outcome: str,
+        *,
+        correlation_token: str | None = None,
+        **fields: object,
+    ) -> None:
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "method": method,
@@ -212,9 +224,25 @@ class TelemetryLog:
             **fields,
             "hardware_verification": self.hardware_verification,
         }
+        if correlation_token is not None:
+            entry["correlationToken"] = correlation_token
         self._fh.write(json.dumps(entry))
         self._fh.write("\n")
         self._fh.flush()
+
+
+class _CorrelatedTelemetryLog:
+    def __init__(self, log: TelemetryLog, correlation_token: str) -> None:
+        self._log = log
+        self._correlation_token = correlation_token
+
+    def record(self, method: str, outcome: str, **fields: object) -> None:
+        self._log.record(
+            method,
+            outcome,
+            correlation_token=self._correlation_token,
+            **fields,
+        )
 
 
 def anomaly_halt(

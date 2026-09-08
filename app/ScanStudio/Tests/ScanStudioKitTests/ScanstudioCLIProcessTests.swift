@@ -103,15 +103,59 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
 
     private(set) var requestCounts: [String: Int] = [:]
     private(set) var recordedFrameExclusionFlags: [Bool] = []
+    private var heldMethods: Set<String> = []
+    private var heldMethodWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var requestCountWaiters: [(method: String, count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var holdSessionInventory = false
+    private var sessionInventoryWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func holdSessionInventoryRequests() {
+        holdSessionInventory = true
+    }
+
+    func releaseSessionInventoryRequests() {
+        holdSessionInventory = false
+        let waiters = sessionInventoryWaiters
+        sessionInventoryWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func holdRequests(_ method: String) {
+        heldMethods.insert(method)
+    }
+
+    func releaseRequests(_ method: String) {
+        heldMethods.remove(method)
+        let waiters = heldMethodWaiters.removeValue(forKey: method) ?? []
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func waitForRequestCount(_ method: String, count: Int) async {
+        guard requestCounts[method, default: 0] < count else { return }
+        await withCheckedContinuation { continuation in
+            requestCountWaiters.append((method, count, continuation))
+        }
+    }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
         _ method: String, params: Params
     ) async throws -> Result {
         requestCounts[method, default: 0] += 1
+        let ready = requestCountWaiters.filter { requestCounts[$0.method, default: 0] >= $0.count }
+        requestCountWaiters.removeAll { requestCounts[$0.method, default: 0] >= $0.count }
+        for waiter in ready { waiter.continuation.resume() }
         switch method {
-        case "scanner.list", "scanner.rescan":
+        case "scanner.list":
+            return try cast(ScannerListResult(devices: [cliProcessDevice]), as: Result.self)
+        case "scanner.rescan":
+            if heldMethods.contains(method) {
+                await withCheckedContinuation { heldMethodWaiters[method, default: []].append($0) }
+            }
             return try cast(ScannerListResult(devices: [cliProcessDevice]), as: Result.self)
         case "scanner.connect":
+            if heldMethods.contains(method) {
+                await withCheckedContinuation { heldMethodWaiters[method, default: []].append($0) }
+            }
             return try cast(ConnectResult(
                 device: cliProcessDevice,
                 status: ScannerStatus(
@@ -188,6 +232,11 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
             )
         case "project.list":
             return try cast(ProjectListResult(projects: [cliProcessRecentProject]), as: Result.self)
+        case "session.inventory":
+            if holdSessionInventory {
+                await withCheckedContinuation { sessionInventoryWaiters.append($0) }
+            }
+            throw CLIProcessStubError.unexpectedMethod(method)
         default:
             throw CLIProcessStubError.unexpectedMethod(method)
         }
@@ -239,6 +288,7 @@ private struct CLIProcessHost {
     let stub: CLIProcessEngineStub
     let server: ControlChannelServer
     let socketPath: String
+    let projectDirectory: String
 
     static func start(label: String) async throws -> CLIProcessHost {
         let stub = CLIProcessEngineStub()
@@ -246,7 +296,15 @@ private struct CLIProcessHost {
         let server = ControlChannelServer(sessionModel: model)
         let path = shortSocketPath(label)
         try await server.start(path: path)
-        return CLIProcessHost(model: model, stub: stub, server: server, socketPath: path)
+        let projectDirectory = (path as NSString).deletingLastPathComponent + "/project"
+        try FileManager.default.createDirectory(atPath: projectDirectory, withIntermediateDirectories: false)
+        return CLIProcessHost(
+            model: model,
+            stub: stub,
+            server: server,
+            socketPath: path,
+            projectDirectory: projectDirectory
+        )
     }
 }
 
@@ -284,6 +342,16 @@ private struct CLIProcessResult {
     let stderr: String
 }
 
+private func decodeDoctorReport(_ output: String) throws -> DoctorReport {
+    let data = Data(output.utf8)
+    let envelope = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let result = try #require(envelope["result"] as? [String: Any])
+    return try JSONDecoder().decode(
+        DoctorReport.self,
+        from: JSONSerialization.data(withJSONObject: result)
+    )
+}
+
 /// Runs the real built binary with `arguments` plus `--socket socketPath`
 /// (when given), and returns its exit status, stdout, and stderr.
 ///
@@ -302,7 +370,8 @@ private struct CLIProcessResult {
 private func runCLI(
     _ arguments: [String],
     socketPath: String?,
-    homeDirectory: String? = nil
+    homeDirectory: String? = nil,
+    environmentOverrides: [String: String] = [:]
 ) async throws -> CLIProcessResult {
     let binary = try CLIProcessLocator.resolve()
     let allArguments: [String] = if let socketPath {
@@ -316,10 +385,16 @@ private func runCLI(
                 let process = Process()
                 process.executableURL = binary
                 process.arguments = allArguments
-                if let homeDirectory {
+                let isolatedHome = homeDirectory ?? socketPath.map {
+                    ($0 as NSString).deletingLastPathComponent
+                }
+                if isolatedHome != nil || !environmentOverrides.isEmpty {
                     var environment = ProcessInfo.processInfo.environment
-                    environment["HOME"] = homeDirectory
-                    environment["CFFIXED_USER_HOME"] = homeDirectory
+                    if let isolatedHome {
+                        environment["HOME"] = isolatedHome
+                        environment["CFFIXED_USER_HOME"] = isolatedHome
+                    }
+                    for (key, value) in environmentOverrides { environment[key] = value }
                     process.environment = environment
                 }
 
@@ -349,6 +424,157 @@ private func runCLI(
 struct ScanstudioCLIProcessTests {
     // MARK: Task 1 -- the shared runner, and connect/disconnect/rescan/status
 
+    @Test("controller hello label and environment defaults obey explicit precedence")
+    func controllerAndEnvironmentDefaults() async throws {
+        let host = try await CLIProcessHost.start(label: "controller-defaults")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let home = (host.socketPath as NSString).deletingLastPathComponent
+        let environment = [
+            "SCANSTUDIO_SOCKET": host.socketPath,
+            "SCANSTUDIO_CONTROLLER": "ignored-environment-controller",
+            "SCANSTUDIO_OUTPUT": "human",
+        ]
+        await host.stub.holdRequests("scanner.rescan")
+        let holder = Task {
+            try await runCLI(
+                ["rescan", "--controller-name", "explicit-holder", "--json"],
+                socketPath: nil, homeDirectory: home, environmentOverrides: environment
+            )
+        }
+        await host.stub.waitForRequestCount("scanner.rescan", count: 1)
+
+        let humanStatus = try await runCLI(
+            ["status"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        #expect(humanStatus.stdout.contains("controller: explicit-holder"))
+
+        let status = try await runCLI(
+            ["status", "--json"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        let statusEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(status.stdout.utf8)) as? [String: Any]
+        )
+        let statusResult = try #require(statusEnvelope["result"] as? [String: Any])
+        #expect(statusResult["controller"] as? String == "explicit-holder")
+        #expect(statusResult["mutatingOperationInFlight"] as? String == "scanner.rescan")
+
+        let busy = try await runCLI(
+            ["rescan", "--json"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        let busyEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(busy.stdout.utf8)) as? [String: Any]
+        )
+        let busyError = try #require(busyEnvelope["error"] as? [String: Any])
+        #expect(busy.exitCode == ControlCLIExitCode.busy.rawValue)
+        #expect((busyError["message"] as? String)?.contains("explicit-holder") == true)
+
+        let wrongSocket = shortSocketPath("explicit-socket-wins")
+        let unreachable = try await runCLI(
+            ["status", "--socket", wrongSocket, "--json"], socketPath: nil,
+            homeDirectory: home, environmentOverrides: environment
+        )
+        #expect(unreachable.exitCode == ControlCLIExitCode.noHostReachable.rawValue)
+
+        await host.stub.releaseRequests("scanner.rescan")
+        #expect(try await holder.value.exitCode == 0)
+        await host.server.stop()
+    }
+
+    @Test("same idempotency key awaits one execution and payload mismatch is refused")
+    func idempotencyAdmissionAcrossConnections() async throws {
+        let host = try await CLIProcessHost.start(label: "idempotency")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let home = (host.socketPath as NSString).deletingLastPathComponent
+        let environment = ["SCANSTUDIO_SOCKET": host.socketPath]
+        let common = [
+            "connect", "--device", cliProcessDevice.deviceId,
+            "--controller-name", "idempotency-fixture", "--key", "connect-once",
+        ]
+        await host.stub.holdRequests("scanner.connect")
+        let first = Task {
+            try await runCLI(
+                common, socketPath: nil, homeDirectory: home,
+                environmentOverrides: environment
+            )
+        }
+        await host.stub.waitForRequestCount("scanner.connect", count: 1)
+        let duplicate = Task {
+            try await runCLI(
+                common, socketPath: nil, homeDirectory: home,
+                environmentOverrides: environment
+            )
+        }
+
+        let mismatch = try await runCLI(
+            [
+                "connect", "--device", "sim-other-0",
+                "--controller-name", "idempotency-fixture", "--key", "connect-once",
+            ],
+            socketPath: nil, homeDirectory: home, environmentOverrides: environment
+        )
+        let mismatchEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(mismatch.stdout.utf8)) as? [String: Any]
+        )
+        let mismatchError = try #require(mismatchEnvelope["error"] as? [String: Any])
+        #expect(mismatch.exitCode == ControlCLIExitCode.usage.rawValue)
+        #expect(mismatchError["code"] as? String == ControlErrorCode.invalidParams.rawValue)
+        #expect((mismatchError["message"] as? String)?.contains("different operation payload") == true)
+
+        await host.stub.releaseRequests("scanner.connect")
+        let firstResult = try await first.value
+        let duplicateResult = try await duplicate.value
+        #expect(firstResult.exitCode == 0)
+        #expect(duplicateResult.exitCode == 0)
+        let firstEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(firstResult.stdout.utf8)) as? [String: Any]
+        )
+        let duplicateEnvelope = try #require(
+            JSONSerialization.jsonObject(with: Data(duplicateResult.stdout.utf8)) as? [String: Any]
+        )
+        #expect((firstEnvelope["result"] as? NSDictionary) == (duplicateEnvelope["result"] as? NSDictionary))
+        #expect(await host.stub.requestCounts["scanner.connect"] == 1)
+        await host.server.stop()
+    }
+
+    @Test("doctor is repeatable against an absent isolated socket and creates no state")
+    func doctorAbsentSocketIsReadOnlyAndRepeatable() async throws {
+        let socket = shortSocketPath("doctor-absent")
+        let directory = (socket as NSString).deletingLastPathComponent
+        #expect(!FileManager.default.fileExists(atPath: directory))
+
+        let first = try await runCLI(["doctor"], socketPath: socket)
+        let second = try await runCLI(["doctor"], socketPath: socket)
+        #expect(first.exitCode == 0)
+        #expect(second.exitCode == 0)
+        #expect(try decodeDoctorReport(first.stdout).checks == decodeDoctorReport(second.stdout).checks)
+        #expect(!FileManager.default.fileExists(atPath: directory))
+    }
+
+    @Test("doctor closes a hello-success connection whose inventory never replies")
+    func doctorBoundsHostResponses() async throws {
+        let host = try await CLIProcessHost.start(label: "doctor-timeout")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.stub.holdSessionInventoryRequests()
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let result = try await runCLI(["doctor"], socketPath: host.socketPath)
+        let elapsed = started.duration(to: clock.now)
+        await host.stub.releaseSessionInventoryRequests()
+        await host.server.stop()
+
+        #expect(result.exitCode == 0)
+        #expect(elapsed < .seconds(6))
+        let report = try decodeDoctorReport(result.stdout)
+        let requestCounts = await host.stub.requestCounts
+        #expect(report.checks.first { $0.id == "socket.liveness" }?.status == .pass)
+        #expect(report.checks.first { $0.id == "bridge.liveVersion" }?.status == .warn)
+        #expect(requestCounts["session.inventory"] == 1)
+    }
+
     @Test("--help exits 0")
     func rootHelpExitsZero() async throws {
         let result = try await runCLI(["--help"], socketPath: shortSocketPath("root-help"))
@@ -360,6 +586,14 @@ struct ScanstudioCLIProcessTests {
         let result = try await runCLI(["status", "--help"], socketPath: shortSocketPath("status-help"))
         #expect(result.exitCode == 0)
         #expect(result.stdout.contains("--job"))
+        #expect(result.stdout.contains("--watch"))
+    }
+
+    @Test("status --watch rejects refresh before opening the control socket")
+    func statusWatchRejectsRefreshBeforeConnecting() async throws {
+        let result = try await runCLI(["status", "--watch", "--refresh"], socketPath: shortSocketPath("status-watch-usage"))
+        #expect(result.exitCode == 64)
+        #expect(result.stderr.contains("cannot be combined with --refresh"))
     }
 
     @Test("status with --socket pointing at a path with no listener exits 69 with a HOST_UNREACHABLE JSON body")
@@ -452,7 +686,7 @@ struct ScanstudioCLIProcessTests {
     func framesListReturnsFramesArray() async throws {
         let host = try await CLIProcessHost.start(label: "frames-list")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "list"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
@@ -467,7 +701,7 @@ struct ScanstudioCLIProcessTests {
     func framesExcludeValidIndexReachesEngineOnce() async throws {
         let host = try await CLIProcessHost.start(label: "frames-exclude")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "exclude", "1"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
@@ -481,7 +715,7 @@ struct ScanstudioCLIProcessTests {
     func framesIncludePartialRangeReportsAppliedIndices() async throws {
         let host = try await CLIProcessHost.start(label: "frames-partial")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "include", "1-2"], socketPath: host.socketPath)
         // D-24/HEAD-12 (CF-14, the 2026-09-07 batch abort): a partial
@@ -598,7 +832,7 @@ struct ScanstudioCLIProcessTests {
         // dispatcher-level coverage of the excluded/completed refusals.
         let host = try await CLIProcessHost.start(label: "frames-select-post-project")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
 
         let result = try await runCLI(["frames", "select", "--all"], socketPath: host.socketPath)
         #expect(result.exitCode == 0)
@@ -613,7 +847,7 @@ struct ScanstudioCLIProcessTests {
     func framesPlaceFromFileAppliesRowsAndOffset() async throws {
         let host = try await CLIProcessHost.start(label: "frames-place-file")
         defer { removeSocketDirectory(for: host.socketPath) }
-        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.openProject(directory: host.projectDirectory)
         await host.model.handle(event: EngineEvent(
             name: "scanner.status",
             rawLine: Data(
@@ -785,6 +1019,42 @@ struct ScanstudioCLIProcessTests {
             c41Render: before.c41Render
         )
         #expect(after == expected)
+
+        await host.server.stop()
+    }
+
+    @Test("preset save/list/apply round-trips through the mock host and the GUI store path")
+    func presetRoundTripUsesSharedStorePath() async throws {
+        let host = try await CLIProcessHost.start(label: "preset-roundtrip")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("ss-cli-preset-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let originalCapture = await host.model.captureRecipe
+        let originalOutput = await host.model.outputRecipe
+        let saved = try await runCLI(["preset", "save", "shared"], socketPath: host.socketPath, homeDirectory: home.path)
+        #expect(saved.exitCode == 0)
+        let listed = try await runCLI(["preset", "list"], socketPath: nil, homeDirectory: home.path)
+        #expect(listed.exitCode == 0)
+        #expect(listed.stdout.contains("shared"))
+
+        let loaded = try ScanRecipePresetStore(directory: home.appendingPathComponent(".scanstudio/presets"))
+            .load(named: "shared")
+        await host.model.applySettingsRecipes(
+            capture: CaptureRecipe(
+                resolutionDpi: 1_000,
+                bitDepth: originalCapture.bitDepth,
+                multisamplePasses: originalCapture.multisamplePasses,
+                channels: originalCapture.channels
+            ),
+            processing: loaded.processing
+        )
+        await host.model.applyOutputRecipe(loaded.output)
+        let applied = try await runCLI(["preset", "apply", "shared"], socketPath: host.socketPath, homeDirectory: home.path)
+        #expect(applied.exitCode == 0)
+        #expect(await host.model.captureRecipe == originalCapture)
+        #expect(await host.model.outputRecipe == originalOutput)
 
         await host.server.stop()
     }

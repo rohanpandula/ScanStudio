@@ -19,6 +19,7 @@
 // artifact of its own and never opens any of the project's existing ones.
 
 import ArgumentParser
+import CryptoKit
 import Foundation
 import ScanStudioKit
 
@@ -89,11 +90,17 @@ extension Roll {
         @Flag(name: .customLong("auto-approve"), help: "Auto-approve a paused manual review when every flagged frame's content confidence is >= 0.8.")
         var autoApprove = false
 
+        @Flag(name: .customLong("preview-derived-exposure"), help: "Meter one preview reference and apply a clamped positive-only RGB adjustment per frame. Experimental and off by default.")
+        var previewDerivedExposure = false
+
         /// On by default -- `--no-wait` returns immediately once the scan
         /// starts (or once a review is left pending) instead of blocking
         /// for a terminal job state.
         @Flag(name: .customLong("wait"), inversion: .prefixedNo, help: "Wait for the job to reach a terminal state before returning. On by default; pass --no-wait to return immediately once the scan starts (or once a review is left pending).")
         var wait = true
+
+        @Flag(name: .customLong("hopper"), help: "After each completed roll, eject and wait for freshly loaded film before running the next numbered roll.")
+        var hopper = false
 
         /// Two independent statements, exactly like `Roll.Save`'s own gate
         /// (RollCommands.swift) and `Preview`'s own gate
@@ -122,17 +129,35 @@ extension Roll {
                 print(text, terminator: "")
                 throw ExitCode(77)
             }
+            guard !hopper || wait else {
+                throw ValidationError("--hopper requires --wait; remove --no-wait")
+            }
         }
 
         func run() async throws {
-            try await RollRun.run(
+            guard hopper else {
+                _ = try await RollRun.run(
+                    name: name,
+                    carrier: carrier,
+                    requestedFrameCount: frameCount,
+                    filmProcess: filmProcess,
+                    skipBlank: skipBlank,
+                    autoApprove: autoApprove,
+                    previewDerivedExposure: previewDerivedExposure,
+                    wait: wait,
+                    allowUnverifiedHardware: allowUnverifiedHardware,
+                    options: options
+                )
+                return
+            }
+            try await HopperRun.run(
                 name: name,
                 carrier: carrier,
                 requestedFrameCount: frameCount,
                 filmProcess: filmProcess,
                 skipBlank: skipBlank,
                 autoApprove: autoApprove,
-                wait: wait,
+                previewDerivedExposure: previewDerivedExposure,
                 allowUnverifiedHardware: allowUnverifiedHardware,
                 options: options
             )
@@ -153,23 +178,53 @@ enum RollRun {
         filmProcess: FilmProcess,
         skipBlank: Bool,
         autoApprove: Bool,
+        previewDerivedExposure: Bool = false,
         wait: Bool,
         allowUnverifiedHardware: Bool,
-        options: GlobalOptions
-    ) async throws {
-        let command = "roll.run"
+        options: GlobalOptions,
+        job: ScanJobDocument? = nil
+    ) async throws -> ControlRunReceipt {
+        let command = job == nil ? "roll.run" : "run"
         let client = try await CommandRunner.openConnection(command: command, options: options)
         var receipt = ControlRunReceipt()
         var exitCode: Int32 = 0
+        if let job {
+            guard let initialData = try await sendStep(
+                "initialStatus", method: "status", params: EmptyParams(),
+                command: command, options: options, client: client,
+                receipt: &receipt, exitCode: &exitCode
+            ) else {
+                return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
+            }
+            guard let initialStatus = try? JSONDecoder().decode(ControlStatusResult.self, from: initialData) else {
+                try await CommandRunner.fail(command: command, options: options, client: client, error: ControlChannelClientError.malformedResponse)
+            }
+            guard initialStatus.projectDirectory == nil else {
+                let payload = ControlErrorPayload(
+                    .gateRefused,
+                    message: "A declarative new-roll job requires a host with no open project."
+                )
+                exitCode = recordRefusal(
+                    payload, step: "initialProject", command: "status",
+                    startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt
+                )
+                return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
+            }
+            guard try await sendStep("connect", method: "scanner.connect", params: ControlScannerConnectParams(deviceId: job.deviceId, allowUnverifiedHardware: allowUnverifiedHardware),
+                                    command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) != nil else {
+                return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
+            }
+        }
 
         try await walk(
             name: name, carrier: carrier, requestedFrameCount: requestedFrameCount,
             filmProcess: filmProcess, skipBlank: skipBlank, autoApprove: autoApprove, wait: wait,
-            allowUnverifiedHardware: allowUnverifiedHardware,
+            previewDerivedExposure: previewDerivedExposure,
+            allowUnverifiedHardware: allowUnverifiedHardware, job: job,
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
         )
 
-        try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
+        return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
     }
 
     // MARK: - The walk itself (D-15's seven numbered steps)
@@ -182,7 +237,9 @@ enum RollRun {
         skipBlank: Bool,
         autoApprove: Bool,
         wait: Bool,
+        previewDerivedExposure: Bool,
         allowUnverifiedHardware: Bool,
+        job: ScanJobDocument?,
         command: String,
         options: GlobalOptions,
         client: ControlChannelClient,
@@ -210,6 +267,15 @@ enum RollRun {
         ) else { return }
         guard let status = try? JSONDecoder().decode(ControlStatusResult.self, from: statusData) else {
             try await CommandRunner.fail(command: command, options: options, client: client, error: ControlChannelClientError.malformedResponse)
+        }
+
+        if job != nil {
+            let filmLoaded = status.device?.kind == "simulated" ? status.scanner?.mediaLoaded == true : status.scanner?.filmPresent == true
+            guard status.projectDirectory == nil, filmLoaded, status.motionAllowed else {
+                let payload = ControlErrorPayload(.gateRefused, message: "A declarative new-roll job requires a host with no open project, loaded film, and motion readiness.")
+                exitCode = recordRefusal(payload, step: "initialReadiness", command: "status", startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt)
+                return
+            }
         }
 
         // `refreshScanner` can succeed without reconnecting when the GUI
@@ -242,6 +308,35 @@ enum RollRun {
             )
             exitCode = recordRefusal(payload, step: "frameCount", command: "frameCount", startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt)
             return
+        }
+
+        if let job {
+            // A new roll has no registration/project yet. Check everything
+            // else, including output space, before acquiring its preview;
+            // the complete report is checked again before capture below.
+            guard let data = try await sendStep(
+                "previewPreflight", method: "scan.preflight",
+                params: ControlScanPreflightParams(frames: job.frames, capture: job.capture, outputs: job.outputs, deviceId: job.deviceId),
+                command: command, options: options, client: client,
+                receipt: &receipt, exitCode: &exitCode
+            ) else { return }
+            let report = try JSONDecoder().decode(ScanPreflightReport.self, from: data)
+            if let failed = report.checks.first(where: {
+                !$0.passed && $0.code != "REGISTRATION_REQUIRED" && $0.code != "SCAN_NOT_READY"
+            }) {
+                exitCode = recordRefusal(
+                    ControlErrorPayload(.gateRefused, message: failed.guidance),
+                    step: failed.code, command: "scan.preflight",
+                    startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt
+                )
+                return
+            }
+            guard try await sendStep(
+                "settings", method: "settings.set",
+                params: ControlSettingsSetParams(capture: job.capture, processing: job.processing),
+                command: command, options: options, client: client,
+                receipt: &receipt, exitCode: &exitCode
+            ) != nil else { return }
         }
 
         // Step 2: preview.acquire.
@@ -288,7 +383,15 @@ enum RollRun {
 
         let selected: [Int]
         let skippedSummaries: [ControlFrameSummary]
-        if skipBlank {
+        if let job {
+            selected = job.frames
+            skippedSummaries = []
+            guard Set(selected).isSubset(of: Set(framesList.frames.map(\.index))) else {
+                let payload = ControlErrorPayload(.gateRefused, message: "The preview does not contain every frame in the approved job.")
+                exitCode = recordRefusal(payload, step: "framesSelect", command: "frames.select", startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt)
+                return
+            }
+        } else if skipBlank {
             (selected, skippedSummaries) = SkipBlankSelection.select(from: framesList.frames, threshold: BlankFrameHint.defaultSkipThreshold)
         } else {
             selected = framesList.frames.map(\.index)
@@ -307,7 +410,7 @@ enum RollRun {
             return
         }
 
-        let selectParams = skipBlank ? ControlFramesSelectParams(indices: selected) : ControlFramesSelectParams(all: true)
+        let selectParams = (skipBlank || job != nil) ? ControlFramesSelectParams(indices: selected) : ControlFramesSelectParams(all: true)
         guard (try await sendStep(
             "framesSelect", method: "frames.select", params: selectParams,
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
@@ -315,10 +418,55 @@ enum RollRun {
         receipt.frames.selected = selected
         receipt.frames.skipped = skippedSummaries.map(\.index)
 
+        let previewExposure: (reference: Int, evidence: [PreviewDerivedExposurePolicy.Evidence])?
+        if previewDerivedExposure {
+            let evidence = framesList.frames.filter { selected.contains($0.index) }.map {
+                PreviewDerivedExposurePolicy.Evidence(
+                    frameIndex: $0.index,
+                    thumbnailMean: $0.thumbnailMean,
+                    thumbnailStddev: $0.thumbnailStddev,
+                    blankConfidence: $0.blankConfidence,
+                    needsApproval: $0.needsApproval
+                )
+            }
+            do {
+                previewExposure = (try PreviewDerivedExposurePolicy.referenceFrame(in: evidence), evidence)
+            } catch {
+                let payload = ControlErrorPayload(
+                    .gateRefused,
+                    message: "Preview-derived exposure was refused: \(error)."
+                )
+                exitCode = recordRefusal(payload, step: "previewExposure", command: "frames.list", startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt)
+                return
+            }
+            guard let settingsData = try await sendStep(
+                "exposureSettings", method: "settings.get", params: EmptyParams(),
+                command: command, options: options, client: client,
+                receipt: &receipt, exitCode: &exitCode
+            ) else { return }
+            let settings = try JSONDecoder().decode(ControlSettingsResult.self, from: settingsData)
+            let processing = ProcessingRecipe(
+                filmProcess: settings.processing.filmProcess,
+                autofocusEachFrame: settings.processing.autofocusEachFrame,
+                autoExposureEachFrame: false,
+                digitalIceEnabled: settings.processing.digitalIceEnabled,
+                digitalIceMode: settings.processing.digitalIceMode,
+                softwareDustRemovalBw: settings.processing.softwareDustRemovalBw
+            )
+            guard try await sendStep(
+                "exposureSettingsApply", method: "settings.set",
+                params: ControlSettingsSetParams(capture: settings.capture, processing: processing),
+                command: command, options: options, client: client,
+                receipt: &receipt, exitCode: &exitCode
+            ) != nil else { return }
+        } else {
+            previewExposure = nil
+        }
+
         // Step 5: roll.save.
         guard let saveData = try await sendStep(
             "rollSave", method: "roll.save",
-            params: ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: true),
+            params: ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: job == nil, startScan: job == nil && previewExposure == nil),
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
         ) else { return }
         guard let saveResult = try? JSONDecoder().decode(ControlRollSaveResult.self, from: saveData) else {
@@ -326,10 +474,76 @@ enum RollRun {
         }
         receipt.project = ControlRunReceipt.Project(name: saveResult.projectName, directory: saveResult.projectDirectory)
 
-        var jobStarted = saveResult.outcome == "started"
+        var scanOutcome = saveResult.outcome
+        var activeMarker: (ActiveJobMarker, ActiveJobMarker.Context)?
+        if job != nil || previewExposure != nil {
+            guard let directory = saveResult.projectDirectory else {
+                try await CommandRunner.fail(
+                    command: command, options: options, client: client,
+                    error: ControlChannelClientError.malformedResponse
+                )
+            }
+            if let job {
+                let path = URL(fileURLWithPath: directory).appendingPathComponent("approved-job-" + UUID().uuidString + ".json")
+                do {
+                    try job.normalizedJSON().write(to: path, options: .withoutOverwriting)
+                    receipt.approvedJobPath = path.path
+                } catch { try await CommandRunner.fail(command: command, options: options, client: client, error: error) }
+                guard try await sendStep("outputs", method: "outputs.set", params: ControlOutputsSetParams(outputs: job.outputs),
+                                        command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) != nil else { return }
+            }
+            if let previewExposure {
+                guard try await sendStep(
+                    "previewExposureSolve", method: "roll.solveExposure",
+                    params: ControlRollSolveExposureParams(
+                        frame: previewExposure.reference,
+                        motionConfirmed: true,
+                        previewDerivedFrames: previewExposure.evidence
+                    ),
+                    command: command, options: options, client: client,
+                    receipt: &receipt, exitCode: &exitCode
+                ) != nil else { return }
+            }
+            guard let gateData = try await sendStep("preflight", method: "scan.preflight", params: ControlScanPreflightParams(frames: selected),
+                                                   command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) else { return }
+            let gates = try JSONDecoder().decode(ScanPreflightReport.self, from: gateData)
+            guard gates.ready else {
+                let failed = gates.checks.first { !$0.passed }
+                let payload = ControlErrorPayload(.gateRefused, message: failed?.guidance ?? "Preflight refused the scan.")
+                exitCode = recordRefusal(payload, step: failed?.code ?? "preflight", command: "scan.preflight", startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt)
+                return
+            }
+            guard let data = try await sendStep("scan", method: "scan.start", params: ControlScanStartParams(motionConfirmed: true, frames: selected),
+                                               command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) else { return }
+            let outcome = try JSONDecoder().decode(ControlScanOutcomeResult.self, from: data)
+            scanOutcome = outcome.outcome
+            receipt.jobId = outcome.jobId
+            if scanOutcome == "started" {
+                guard let jobId = outcome.jobId,
+                      let context = try await ActiveJobMarker.context(
+                        client: client,
+                        socketPath: CommandRunner.socketPath(options),
+                        projectDirectory: directory
+                      ) else {
+                    try await CommandRunner.fail(
+                        command: command, options: options, client: client,
+                        error: ControlChannelClientError.malformedResponse
+                    )
+                }
+                activeMarker = (
+                    try ActiveJobMarker.write(
+                        jobId: jobId,
+                        context: context,
+                        correlationToken: await client.lastCorrelationToken(for: "scan.start")
+                    ),
+                    context
+                )
+            }
+        }
+        var jobStarted = scanOutcome == "started"
 
         // Step 6: manual review, only when roll.save itself paused for one.
-        if saveResult.outcome == "manualReviewPending" {
+        if scanOutcome == "manualReviewPending" {
             guard let statusData2 = try await sendStep(
                 "reviewStatus", method: "status", params: EmptyParams(),
                 command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
@@ -380,6 +594,9 @@ enum RollRun {
             let jobResult = try? JSONDecoder().decode(ControlJobResult.self, from: data)
             receipt.jobId = jobResult?.jobId
             receipt.jobState = jobResult?.jobState.map { String(describing: $0) }
+            if let activeMarker {
+                try ActiveJobMarker.retire(activeMarker.0, from: activeMarker.1)
+            }
             guard jobResult?.jobState != .failed else {
                 // The wire call itself succeeded -- only the job's own
                 // terminal state was a failure -- mirroring
@@ -534,7 +751,7 @@ enum RollRun {
         command: String,
         options: GlobalOptions,
         client: ControlChannelClient
-    ) async throws {
+    ) async throws -> ControlRunReceipt {
         var receipt = receipt
         if let directory = receipt.project?.directory {
             do {
@@ -546,11 +763,162 @@ enum RollRun {
 
         let object = (try? JSONSerialization.jsonObject(with: try receipt.encodedJSON())) as? [String: Any] ?? [:]
         let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human, context: await client.cliEnvelopeContext)
-        print(text, terminator: "")
+        FileHandle.standardOutput.write(Data(text.utf8))
         await client.shutdown()
 
         guard exitCode == 0 else {
             throw ExitCode(exitCode)
         }
+        return receipt
+    }
+}
+
+enum HopperRun {
+    static func run(
+        name: String,
+        carrier: SimulatedFilmCarrier,
+        requestedFrameCount: Int?,
+        filmProcess: FilmProcess,
+        skipBlank: Bool,
+        autoApprove: Bool,
+        previewDerivedExposure: Bool,
+        allowUnverifiedHardware: Bool,
+        options: GlobalOptions
+    ) async throws {
+        var sequence = 1
+        while true {
+            var rollOptions = options
+            rollOptions.idempotencyKey = sequenceKey(base: options.idempotencyKey, sequence: sequence)
+            let receipt = try await RollRun.run(
+                name: rollName(base: name, sequence: sequence),
+                carrier: carrier,
+                requestedFrameCount: requestedFrameCount,
+                filmProcess: filmProcess,
+                skipBlank: skipBlank,
+                autoApprove: autoApprove,
+                previewDerivedExposure: previewDerivedExposure,
+                wait: true,
+                allowUnverifiedHardware: allowUnverifiedHardware,
+                options: rollOptions
+            )
+            guard receipt.jobState == String(describing: JobState.completed) else {
+                try await emitFailure(
+                    ControlErrorPayload(
+                        .gateRefused,
+                        message: "Hopper mode stopped because roll \(sequence) did not complete."
+                    ),
+                    options: rollOptions
+                )
+            }
+            try await awaitFreshFilm(options: rollOptions)
+            sequence += 1
+        }
+    }
+
+    static func rollName(base: String, sequence: Int) -> String {
+        "\(base)-\(String(format: "%03d", sequence))"
+    }
+
+    static func sequenceKey(base: String?, sequence: Int) -> String? {
+        guard let base else { return nil }
+        let suffix = ":hopper:\(sequence)"
+        if (base + suffix).utf8.count <= 128 { return base + suffix }
+        let digest = SHA256.hash(data: Data(base.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "hopper:\(digest):\(sequence)"
+    }
+
+    private static func awaitFreshFilm(options: GlobalOptions) async throws {
+        let command = "roll.run"
+        let client = try await CommandRunner.openConnection(command: command, options: options)
+        let subscribe = try await CommandRunner.request(
+            command: command,
+            method: "events.subscribe",
+            params: EmptyParams(),
+            options: options,
+            client: client
+        )
+        guard case .result(let data) = subscribe else {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: subscribe)
+            return
+        }
+        guard let subscribed = try? JSONDecoder().decode(ControlEventsSubscribeResult.self, from: data) else {
+            try await CommandRunner.fail(
+                command: command,
+                options: options,
+                client: client,
+                error: ControlChannelClientError.malformedResponse
+            )
+        }
+        let events = await client.events()
+        do {
+            let idle = try await ControlEventWaiter.wait(
+                initial: subscribed.snapshot,
+                events: events,
+                condition: .idle,
+                timeout: 86_400
+            )
+            let eject = try await CommandRunner.request(
+                command: command,
+                method: "scanner.eject",
+                params: ControlScannerEjectParams(motionConfirmed: true),
+                options: options,
+                client: client
+            )
+            guard case .result = eject else {
+                try await CommandRunner.finish(command: command, options: options, client: client, response: eject)
+                return
+            }
+            let absent = try await ControlEventWaiter.wait(
+                initial: idle,
+                events: events,
+                condition: .filmAbsent,
+                timeout: 86_400
+            )
+            let close = try await CommandRunner.request(
+                command: command,
+                method: "roll.closeCompleted",
+                params: EmptyParams(),
+                options: options,
+                client: client
+            )
+            guard case .result = close else {
+                try await CommandRunner.finish(command: command, options: options, client: client, response: close)
+                return
+            }
+            _ = try await ControlEventWaiter.wait(
+                initial: absent,
+                events: events,
+                condition: .filmPresent,
+                timeout: 86_400
+            )
+            await client.shutdown()
+        } catch ControlEventWaitFailure.timeout {
+            try await CommandRunner.finish(
+                command: command,
+                options: options,
+                client: client,
+                response: .failure(ControlErrorPayload(
+                    code: ControlCLIErrorCode.waitTimeout.rawValue,
+                    message: "Hopper mode timed out waiting for the scanner state to advance.",
+                    recoverable: false
+                ))
+            )
+        } catch ControlEventWaitFailure.hostExited, ControlEventWaitFailure.streamEnded {
+            await client.shutdown()
+            throw ExitCode(ControlCLIExitCode.hostExited.rawValue)
+        }
+    }
+
+    private static func emitFailure(_ payload: ControlErrorPayload, options: GlobalOptions) async throws -> Never {
+        let client = try await CommandRunner.openConnection(command: "roll.run", options: options)
+        try await CommandRunner.finish(
+            command: "roll.run",
+            options: options,
+            client: client,
+            response: .failure(payload)
+        )
+        fatalError("failure response unexpectedly returned")
     }
 }

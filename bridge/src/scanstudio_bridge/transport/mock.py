@@ -347,6 +347,11 @@ class MockTransport:
             raise BridgeError(ErrorCode.INVALID_PARAMS, f"slot {slot} does not need approval")
         self._approved_slots.add(slot)
 
+    def solve_exposure(self, slot: int) -> dict[str, object]:
+        self._require_connected()
+        # Simulator evidence must never masquerade as measured scanner authority.
+        raise BridgeError(ErrorCode.NOT_IMPLEMENTED, "mock transport has no measured exposure authority")
+
     def set_spacing_offset(
         self, slot: int, offset_rows: int
     ) -> domain.Thumbnail:
@@ -518,7 +523,25 @@ class MockTransport:
         on_retry: Callable[[int, int, str], None],
         on_frame: Callable[[int, domain.ScanReceipt], None],
         on_call: OnCall | None = None,
+        *,
+        allowed_meter_refusal_slots: tuple[int, ...] = (),
+        on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
+        frame_exposure_overrides_10ns: dict[int, tuple[int, int, int]] | None = None,
     ) -> domain.ScanSummary:
+        del on_meter_refusal_skipped
+        if frame_exposure_overrides_10ns is not None:
+            domain.validate_frame_exposure_overrides_10ns(
+                slots, recipe, frame_exposure_overrides_10ns
+            )
+            raise BridgeError(
+                ErrorCode.NOT_IMPLEMENTED,
+                "the simulator cannot apply per-frame hardware exposure overrides",
+            )
+        if allowed_meter_refusal_slots:
+            raise BridgeError(
+                ErrorCode.NOT_IMPLEMENTED,
+                "the simulator cannot produce verified meter-refusal skip evidence",
+            )
         self._require_connected()
         if self._enforce_fixed_recipe:
             if self._last_preview_material is None:

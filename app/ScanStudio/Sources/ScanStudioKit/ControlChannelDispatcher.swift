@@ -17,6 +17,7 @@
 // now routed -- D-05.
 
 import Foundation
+import CryptoKit
 import Observation
 
 // MARK: - Decode failure
@@ -56,13 +57,22 @@ public enum ControlRequest: Sendable {
     case outputsGet(id: UInt64)
     case outputsSet(id: UInt64, params: ControlOutputsSetParams)
     case rollSave(id: UInt64, params: ControlRollSaveParams)
+    case rollCloseCompleted(id: UInt64)
     case rollOpen(id: UInt64, params: ControlRollOpenParams)
     case rollList(id: UInt64)
+    case rollSolveExposure(id: UInt64, params: ControlRollSolveExposureParams)
+    case rollRender(id: UInt64, params: ControlRollRenderParams)
+    case rollExport(id: UInt64, params: ControlRollExportParams)
+    case rollMetadataApply(id: UInt64, params: ControlRollMetadataApplyParams)
+    case rollVerify(id: UInt64, params: ControlRollVerifyParams)
+    case rollCollect(id: UInt64, params: ControlRollCollectParams)
+    case scanPreflight(id: UInt64, params: ControlScanPreflightParams)
     case scanStart(id: UInt64, params: ControlScanStartParams)
     case scanStop(id: UInt64, params: ControlScanStopParams)
     case scanResume(id: UInt64, params: ControlScanResumeParams)
     case scannerEject(id: UInt64, params: ControlScannerEjectParams)
     case diagnosticsExport(id: UInt64, params: ControlDiagnosticsExportParams)
+    case sessionInventory(id: UInt64)
     case eventsSubscribe(id: UInt64)
     case jobGet(id: UInt64, params: ControlJobGetParams)
     /// D-23/HEAD-12: dismisses a pending manual review without starting
@@ -74,6 +84,14 @@ public enum ControlRequest: Sendable {
 }
 
 extension ControlRequest {
+    public static let mutatingMethodNames: Set<String> = [
+        "scanner.list", "scanner.rescan", "scanner.refresh", "scanner.connect", "scanner.disconnect",
+        "sim.loadMedia", "preview.acquire", "frames.select", "frames.place", "frames.include",
+        "frames.exclude", "review.approve", "settings.set", "outputs.set", "roll.save", "roll.closeCompleted", "roll.open",
+        "roll.list", "roll.solveExposure", "roll.render", "roll.export", "roll.metadataApply", "roll.collect", "scan.start",
+        "scan.stop", "scan.resume", "scanner.eject", "review.cancel",
+    ]
+
     public var id: UInt64 {
         switch self {
         case .hello(let id, _): id
@@ -96,13 +114,18 @@ extension ControlRequest {
         case .outputsGet(let id): id
         case .outputsSet(let id, _): id
         case .rollSave(let id, _): id
+        case .rollCloseCompleted(let id): id
         case .rollOpen(let id, _): id
         case .rollList(let id): id
+        case .rollSolveExposure(let id, _), .rollRender(let id, _), .rollExport(let id, _), .rollMetadataApply(let id, _): id
+        case .rollVerify(let id, _), .rollCollect(let id, _): id
+        case .scanPreflight(let id, _): id
         case .scanStart(let id, _): id
         case .scanStop(let id, _): id
         case .scanResume(let id, _): id
         case .scannerEject(let id, _): id
         case .diagnosticsExport(let id, _): id
+        case .sessionInventory(let id): id
         case .eventsSubscribe(let id): id
         case .jobGet(let id, _): id
         case .reviewCancel(let id): id
@@ -132,13 +155,22 @@ extension ControlRequest {
         case .outputsGet: "outputs.get"
         case .outputsSet: "outputs.set"
         case .rollSave: "roll.save"
+        case .rollCloseCompleted: "roll.closeCompleted"
         case .rollOpen: "roll.open"
         case .rollList: "roll.list"
+        case .rollSolveExposure: "roll.solveExposure"
+        case .rollRender: "roll.render"
+        case .rollExport: "roll.export"
+        case .rollMetadataApply: "roll.metadataApply"
+        case .rollVerify: "roll.verify"
+        case .rollCollect: "roll.collect"
+        case .scanPreflight: "scan.preflight"
         case .scanStart: "scan.start"
         case .scanStop: "scan.stop"
         case .scanResume: "scan.resume"
         case .scannerEject: "scanner.eject"
         case .diagnosticsExport: "diagnostics.export"
+        case .sessionInventory: "session.inventory"
         case .eventsSubscribe: "events.subscribe"
         case .jobGet: "job.get"
         case .reviewCancel: "review.cancel"
@@ -152,16 +184,7 @@ extension ControlRequest {
     /// control caller must meet the same bar -- Plan 06 implements the
     /// specific check; this flag is what routes them through it).
     public var isMutating: Bool {
-        switch self {
-        case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect, .simLoadMedia,
-             .previewAcquire, .framesSelect, .framesPlace, .framesInclude, .framesExclude, .reviewApprove,
-             .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList,
-             .scanStart, .scanStop, .scanResume, .scannerEject, .reviewCancel:
-            true
-        case .hello, .status, .framesList, .settingsGet, .outputsGet,
-             .diagnosticsExport, .eventsSubscribe, .jobGet:
-            false
-        }
+        Self.mutatingMethodNames.contains(methodName)
     }
 }
 
@@ -185,9 +208,16 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case scannerConnect(ControlScannerConnectResult)
     case rollList(ControlRollListResult)
     case rollSave(ControlRollSaveResult)
+    case rollExposure(ControlRollSolveExposureResult)
+    case rollRenderExport(ControlRenderExportResult)
+    case rollMetadataApply(ControlMetadataApplyResult)
+    case rollVerification(CalibrationVerificationReport)
+    case rollCollection(CalibrationCollectionResult)
     case previewAcquire(ControlPreviewAcquireResult)
     case diagnosticsExport(ControlDiagnosticsExportResult)
+    case sessionInventory(ControlSessionInventoryResult)
     case eventsSubscribe(ControlEventsSubscribeResult)
+    case scanPreflight(ScanPreflightReport)
     case scanOutcome(ControlScanOutcomeResult)
 
     public func encode(to encoder: Encoder) throws {
@@ -206,9 +236,16 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .scannerConnect(let value): try container.encode(value)
         case .rollList(let value): try container.encode(value)
         case .rollSave(let value): try container.encode(value)
+        case .rollExposure(let value): try container.encode(value)
+        case .rollRenderExport(let value): try container.encode(value)
+        case .rollMetadataApply(let value): try container.encode(value)
+        case .rollVerification(let value): try container.encode(value)
+        case .rollCollection(let value): try container.encode(value)
         case .previewAcquire(let value): try container.encode(value)
         case .diagnosticsExport(let value): try container.encode(value)
+        case .sessionInventory(let value): try container.encode(value)
         case .eventsSubscribe(let value): try container.encode(value)
+        case .scanPreflight(let value): try container.encode(value)
         case .scanOutcome(let value): try container.encode(value)
         }
     }
@@ -239,6 +276,15 @@ public enum ControlResponse: Equatable, Sendable {
     }
 }
 
+extension ControlResponse {
+    func replacingID(_ id: UInt64) -> ControlResponse {
+        switch self {
+        case .success(_, let result): .success(id: id, result: result)
+        case .failure(_, let error): .failure(id: id, error: error)
+        }
+    }
+}
+
 // MARK: - Dispatcher
 
 /// Accepts a decoded request and returns an encodable response, plus a
@@ -258,6 +304,7 @@ public final class ControlChannelDispatcher {
     private let sessionModel: SessionModel
     private let hostKind: ControlHostKind
     private var greeted = false
+    private var controllerName = "unidentified controller"
     /// Subscriptions `subscribeToEvents()` still owns. `onTermination`
     /// removes a subscription's id here so a dropped subscriber's observer
     /// chain stops re-arming instead of running for the process lifetime
@@ -334,13 +381,22 @@ public final class ControlChannelDispatcher {
         case "outputs.get": return decoded(EmptyParams.self) { id, _ in .outputsGet(id: id) }
         case "outputs.set": return decoded(ControlOutputsSetParams.self) { .outputsSet(id: $0, params: $1) }
         case "roll.save": return decoded(ControlRollSaveParams.self) { .rollSave(id: $0, params: $1) }
+        case "roll.closeCompleted": return decoded(EmptyParams.self) { id, _ in .rollCloseCompleted(id: id) }
         case "roll.open": return decoded(ControlRollOpenParams.self) { .rollOpen(id: $0, params: $1) }
         case "roll.list": return decoded(EmptyParams.self) { id, _ in .rollList(id: id) }
+        case "roll.solveExposure": return decoded(ControlRollSolveExposureParams.self) { .rollSolveExposure(id: $0, params: $1) }
+        case "roll.render": return decoded(ControlRollRenderParams.self) { .rollRender(id: $0, params: $1) }
+        case "roll.export": return decoded(ControlRollExportParams.self) { .rollExport(id: $0, params: $1) }
+        case "roll.metadataApply": return decoded(ControlRollMetadataApplyParams.self) { .rollMetadataApply(id: $0, params: $1) }
+        case "roll.verify": return decoded(ControlRollVerifyParams.self) { .rollVerify(id: $0, params: $1) }
+        case "roll.collect": return decoded(ControlRollCollectParams.self) { .rollCollect(id: $0, params: $1) }
+        case "scan.preflight": return decoded(ControlScanPreflightParams.self) { .scanPreflight(id: $0, params: $1) }
         case "scan.start": return decoded(ControlScanStartParams.self) { .scanStart(id: $0, params: $1) }
         case "scan.stop": return decoded(ControlScanStopParams.self) { .scanStop(id: $0, params: $1) }
         case "scan.resume": return decoded(ControlScanResumeParams.self) { .scanResume(id: $0, params: $1) }
         case "scanner.eject": return decoded(ControlScannerEjectParams.self) { .scannerEject(id: $0, params: $1) }
         case "diagnostics.export": return decoded(ControlDiagnosticsExportParams.self) { .diagnosticsExport(id: $0, params: $1) }
+        case "session.inventory": return decoded(EmptyParams.self) { id, _ in .sessionInventory(id: id) }
         case "events.subscribe": return decoded(EmptyParams.self) { id, _ in .eventsSubscribe(id: id) }
         case "job.get": return decoded(ControlJobGetParams.self) { .jobGet(id: $0, params: $1) }
         case "review.cancel": return decoded(EmptyParams.self) { id, _ in .reviewCancel(id: id) }
@@ -392,13 +448,20 @@ public final class ControlChannelDispatcher {
         if let refusal = confirmationRefusal(for: request) {
             return refusal
         }
+        if request.isMutating {
+            await sessionModel.waitForPendingStatusRefresh()
+        }
         if request.isMutating, let inFlight = sessionModel.mutatingOperationInFlight {
+            let controller = sessionModel.mutatingOperationController ?? "unknown controller"
             return .failure(id: request.id, error: ControlErrorPayload(
                 .controllerBusy,
-                message: "\"\(request.methodName)\" was refused: \"\(inFlight)\" is already in flight.",
+                message: "\"\(request.methodName)\" was refused: \"\(inFlight)\" is held by controller \"\(controller)\".",
                 guidance: inFlight
             ))
         }
+        guard request.isMutating else { return await route(request) }
+        sessionModel.setControlRequestController(controllerName)
+        defer { sessionModel.setControlRequestController(nil) }
         return await route(request)
     }
 
@@ -413,12 +476,25 @@ public final class ControlChannelDispatcher {
                 message: "Client requested schema version \(params.schemaVersion); this app speaks schema version \(ControlSchema.version)."
             ))
         }
+        if let validationError = ControlControllerName.validationError(params.clientName) {
+            return .failure(id: id, error: ControlErrorPayload(
+                .invalidParams,
+                message: "Client controller name is invalid: \(validationError)."
+            ))
+        }
+        // Display/arbitration provenance only; a controller label grants no
+        // permission and does not satisfy any confirmation or safety gate.
+        controllerName = params.clientName
         greeted = true
         return .success(id: id, result: .hello(ControlHelloResult(
             schemaVersion: ControlSchema.version,
             appName: "ScanStudio",
             host: hostKind,
-            hostPid: ProcessInfo.processInfo.processIdentifier
+            hostPid: ProcessInfo.processInfo.processIdentifier,
+            diagnosticSessionId: sessionModel.diagnosticSessionId,
+            projectDirectory: sessionModel.projectDirectory,
+            engineVersion: sessionModel.engineVersion,
+            availableDevices: sessionModel.availableDevices
         )))
     }
 
@@ -471,10 +547,18 @@ public final class ControlChannelDispatcher {
                 ))
             }
         case .rollSave(let id, let params):
-            guard params.motionConfirmed == true else {
+            guard params.startScan == false || params.motionConfirmed == true else {
                 return .failure(id: id, error: ControlErrorPayload(
                     .confirmationRequired,
                     message: "\"roll.save\" requires motionConfirmed: true (it creates the project and starts the scan).",
+                    guidance: "Confirm scanner motion is authorized, then resend with motionConfirmed: true."
+                ))
+            }
+        case .rollSolveExposure(let id, let params):
+            guard params.motionConfirmed == true else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .confirmationRequired,
+                    message: "\"roll.solveExposure\" requires motionConfirmed: true.",
                     guidance: "Confirm scanner motion is authorized, then resend with motionConfirmed: true."
                 ))
             }
@@ -492,6 +576,22 @@ public final class ControlChannelDispatcher {
             preconditionFailure("`.hello` is intercepted in handle(_:) before reaching route(_:).")
         case .status(let id):
             return .success(id: id, result: .status(buildStatusResult()))
+        case .scanPreflight(let id, let params):
+            let frames = params.resume == true ? sessionModel.pendingFrames : (params.frames ?? sessionModel.selectedFrames)
+            guard params.resume != true || params.frames == nil,
+                  frames.count <= 10_000, frames.allSatisfy({ $0 > 0 }), Set(frames).count == frames.count else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "Preflight frames must be unique positive indices; resume uses the cached pending set."))
+            }
+            let capture = params.capture ?? sessionModel.captureRecipe
+            let outputs = params.outputs ?? sessionModel.outputRecipe
+            do { try ScanRecipePresetStore.validateRecipes(capture: capture, output: outputs) }
+            catch { return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "Invalid preflight recipe: \(error)")) }
+            return .success(id: id, result: .scanPreflight(ScanPreflightReport.evaluate(
+                status: buildStatusResult(), frames: frames,
+                readiness: sessionModel.scanReadiness(for: frames),
+                capture: capture, outputs: outputs,
+                expectedDeviceId: params.deviceId
+            )))
         case .scannerList(let id):
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.refreshAvailableDevices(rescan: false)
@@ -522,7 +622,7 @@ public final class ControlChannelDispatcher {
                 return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "sim.loadMedia requires a connected simulator."))
             }
             let errorMessageBefore = sessionModel.lastErrorMessage
-            await sessionModel.loadCarrier(carrier, previewFixture: params.previewFixture, abortAtFrame: params.abortAtFrame, abortCode: params.abortCode)
+            await sessionModel.loadCarrier(carrier, previewFixture: params.previewFixture, abortAtFrame: params.abortAtFrame, abortCode: params.abortCode, stallAtFrame: params.stallAtFrame)
             if case .failure(let failureId, let error) = outcome(id: id, errorMessageBefore: errorMessageBefore) {
                 return .failure(id: failureId, error: error)
             }
@@ -830,6 +930,27 @@ public final class ControlChannelDispatcher {
             sessionModel.applyOutputRecipe(params.outputs)
             return .success(id: id, result: .empty(ControlEmptyResult()))
         case .rollSave(let id, let params):
+            if params.startScan == false {
+                if let refusal = jobActiveBusyRefusal(method: "roll.save") {
+                    return .failure(id: id, error: refusal)
+                }
+                guard sessionModel.project == nil else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams, message: "This roll is already saved. Open or scan the existing project."
+                    ))
+                }
+                let errorMessageBefore = sessionModel.lastErrorMessage
+                await sessionModel.createProject(name: params.name, carrier: params.carrier, frameCount: params.frameCount, filmProcess: params.filmProcess)
+                guard sessionModel.project != nil, sessionModel.lastErrorMessage == nil else {
+                    return outcome(id: id, errorMessageBefore: errorMessageBefore)
+                }
+                return .success(id: id, result: .rollSave(ControlRollSaveResult(
+                    saved: true,
+                    projectName: sessionModel.project?.name,
+                    projectDirectory: sessionModel.projectDirectory,
+                    outcome: "saved"
+                )))
+            }
             // `saveRollAndScanSelectedFrames` sets `lastErrorMessage` on
             // both its synchronous refusal branches (`project != nil`,
             // `selectedFrames.isEmpty`) before its own busy flag would even
@@ -865,6 +986,10 @@ public final class ControlChannelDispatcher {
                 projectDirectory: sessionModel.projectDirectory,
                 outcome: isPendingReview ? "manualReviewPending" : "started"
             )))
+        case .rollCloseCompleted(let id):
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            sessionModel.closeCompletedProjectAfterEject()
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
         case .rollOpen(let id, let params):
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.openProject(directory: params.directory)
@@ -880,22 +1005,164 @@ public final class ControlChannelDispatcher {
             case .failure(let failureId, let error):
                 return .failure(id: failureId, error: error)
             }
-        case .scanStart(let id, _):
+        case .rollSolveExposure(let id, let params):
+            guard params.frame > 0 else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.solveExposure frame must be positive."
+                ))
+            }
+            guard sessionModel.hardwareMotionReadiness.allowsMotion else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .gateRefused,
+                    message: sessionModel.hardwareMotionReadiness.guidance
+                ))
+            }
+            if let frames = params.previewDerivedFrames {
+                guard (try? PreviewDerivedExposurePolicy.referenceFrame(in: frames)) == params.frame else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "Preview-derived exposure requires unique evidence including the reference frame."
+                    ))
+                }
+            }
+            guard let solution = await sessionModel.solveExposure(
+                frameIndex: params.frame,
+                previewDerivedReference: params.previewDerivedFrames != nil,
+                previewDerivedFrameIndices: params.previewDerivedFrames.map {
+                    Set($0.map(\.frameIndex))
+                }
+            ) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            if let frames = params.previewDerivedFrames,
+               !(await sessionModel.applyPreviewDerivedExposure(frames, reference: solution)) {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(
+                id: id,
+                result: .rollExposure(ControlRollSolveExposureResult(solution: solution))
+            )
+        case .rollRender(let id, let params):
+            guard !params.frames.isEmpty, params.frames.allSatisfy({ $0 > 0 }) else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.render frames must contain positive frame indices."
+                ))
+            }
+            guard !params.output.isEmpty else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.render output is required."))
+            }
+            guard let result = await sessionModel.renderRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollRenderExport(result))
+        case .rollExport(let id, let params):
+            guard !params.to.isEmpty, !params.template.isEmpty else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.export requires to and template."))
+            }
+            guard ["positive", "raw", "master"].contains(params.kind.lowercased()) else {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.export kind must be positive, raw, or master."))
+            }
+            if let frames = params.frames, (frames.isEmpty || frames.contains(where: { $0 <= 0 })) {
+                return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "roll.export frames must contain positive frame indices."))
+            }
+            guard let result = await sessionModel.exportRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollRenderExport(result))
+        case .rollMetadataApply(let id, let params):
+            guard !params.frames.isEmpty, params.frames.allSatisfy({ $0 > 0 }) else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.metadataApply frames must contain positive frame indices."
+                ))
+            }
+            guard !params.to.isEmpty, !params.template.isEmpty else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.metadataApply requires to and template."
+                ))
+            }
+            guard ["positive", "raw", "master"].contains(params.kind.lowercased()) else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "roll.metadataApply kind must be positive, raw, or master."
+                ))
+            }
+            guard let result = await sessionModel.applyMetadataCopies(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollMetadataApply(result))
+        case .rollVerify(let id, let params):
+            guard let report = await sessionModel.verifyRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollVerification(report))
+        case .rollCollect(let id, let params):
+            guard let result = await sessionModel.collectRoll(params) else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .rollCollection(result))
+        case .scanStart(let id, let params):
+            let requestedFrames = params.frames ?? sessionModel.selectedFrames
+            if params.frames != nil
+                && (requestedFrames.isEmpty || Set(requestedFrames).count != requestedFrames.count
+                    || requestedFrames.contains(where: { $0 < 1 })) {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "scan.start frames must be unique positive indices."
+                ))
+            }
+            if let passToken = params.passToken {
+                let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+                if passToken.isEmpty || passToken.utf8.count > 64
+                    || passToken == "." || passToken == ".."
+                    || passToken.unicodeScalars.contains(where: { !allowed.contains($0) }) {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "passToken must be 1...64 ASCII letters, digits, '.', '_', or '-' (and not '.' or '..')."
+                    ))
+                }
+            }
+            let onFrameFailure = params.onFrameFailure ?? .stop
+            let allowedMeterRefusalSlots = params.allowedMeterRefusalSlots ?? []
+            if onFrameFailure == .stop, !allowedMeterRefusalSlots.isEmpty {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "allowedMeterRefusalSlots requires onFrameFailure=skip."
+                ))
+            }
+            if onFrameFailure == .skip {
+                guard !allowedMeterRefusalSlots.isEmpty,
+                      allowedMeterRefusalSlots == Array(Set(allowedMeterRefusalSlots)).sorted(),
+                      allowedMeterRefusalSlots.allSatisfy(requestedFrames.contains)
+                else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "onFrameFailure=skip requires allowedMeterRefusalSlots as a sorted unique subset of frames."
+                    ))
+                }
+            }
             // Confirmation already checked in the preamble. This is
             // verbatim the expression `ScanPanelView.swift` computes for
             // its own Scan button's `.disabled` binding.
-            let decision = sessionModel.scanReadiness(for: sessionModel.selectedFrames)
+            let decision = sessionModel.scanReadiness(for: requestedFrames)
             if let refusal = gateRefusal(scanReadiness: decision) {
                 return .failure(id: id, error: refusal)
             }
             let errorMessageBefore = sessionModel.lastErrorMessage
-            let requestedFrames = sessionModel.selectedFrames
             // RESEARCH Pitfall 4: `startMockScan()` is the real GUI Scan
             // button entry point for both real and simulated devices. Route
             // here and nowhere else -- a second "real" scan-start method
             // would duplicate its manual-review branching, exactly what
             // D-04 forbids.
-            await sessionModel.startMockScan()
+            await sessionModel.startMockScan(
+                frames: requestedFrames,
+                passToken: params.passToken,
+                onFrameFailure: onFrameFailure,
+                allowedMeterRefusalSlots: allowedMeterRefusalSlots
+            )
             return scanOutcomeResponse(id: id, errorMessageBefore: errorMessageBefore, requestedFrames: requestedFrames)
         case .scanStop(let id, let params):
             let mode: String
@@ -1045,6 +1312,11 @@ public final class ControlChannelDispatcher {
                 path: url.path,
                 entries: entries
             )))
+        case .sessionInventory(let id):
+            return .success(
+                id: id,
+                result: .sessionInventory(await sessionModel.sessionEvidenceInventory())
+            )
         case .eventsSubscribe(let id):
             return .success(id: id, result: .eventsSubscribe(ControlEventsSubscribeResult(
                 subscribed: true,
@@ -1180,7 +1452,8 @@ public final class ControlChannelDispatcher {
         case .success:
             let isPendingReview = sessionModel.pendingManualReviewScan?.frames == requestedFrames
             return .success(id: id, result: .scanOutcome(ControlScanOutcomeResult(
-                outcome: isPendingReview ? "manualReviewPending" : "started"
+                outcome: isPendingReview ? "manualReviewPending" : "started",
+                jobId: isPendingReview ? nil : sessionModel.jobId
             )))
         case .failure(let failureId, let error):
             return .failure(id: failureId, error: error)
@@ -1361,17 +1634,29 @@ public final class ControlChannelDispatcher {
             // pre-project branch and every preview-completion gate in this
             // file already read.
             previewComplete: sessionModel.latestCompletedPreviewOperationId != nil,
+            previewOperationId: sessionModel.latestCompletedPreviewOperationId,
             // D-17: reading sessionModel.progress here (not only in
             // buildJobResult() below) is what makes withObservationTracking
             // re-emit control.changed on a progress-only update, and what
             // gives JobWaiter's stderr progress sink something to read
             // without a second job.get request.
             progress: sessionModel.progress.map(Self.mapScanProgress),
+            completedReceipts: sessionModel.receipts.isEmpty ? nil : sessionModel.receipts.map {
+                ControlCompletedReceipt(
+                    jobId: $0.jobId,
+                    frameIndex: $0.frameIndex,
+                    receiptKey: $0.id,
+                    receiptPath: sessionModel.projectDirectory.map {
+                        URL(fileURLWithPath: $0).appendingPathComponent("manifest.json").path
+                    }
+                )
+            },
             refeedRequired: sessionModel.refeedRequired,
             hardwareMotionReadiness: String(describing: motion),
             motionAllowed: motion.allowsMotion,
             motionGuidance: motion.guidance,
             mutatingOperationInFlight: sessionModel.mutatingOperationInFlight,
+            controller: sessionModel.mutatingOperationController,
             selectedFrames: sessionModel.selectedFrames,
             scanReadiness: String(describing: readiness),
             scanReadinessReason: readiness.reason,
@@ -1485,7 +1770,8 @@ public final class ControlChannelDispatcher {
             pendingFrameCount: sessionModel.pendingFrameCount,
             receiptCount: sessionModel.receipts.count,
             frameErrorCodes: frameErrorCodes,
-            frameErrorMessages: frameErrorMessages
+            frameErrorMessages: frameErrorMessages,
+            skippedFrames: sessionModel.scanSummary?.skipped ?? []
             // finishedAt/notAttemptedFrames stay at their nil/[] defaults:
             // by the time jobId is non-nil again for a *different* job,
             // applyCompleted has already archived and cleared the
@@ -1512,7 +1798,8 @@ public final class ControlChannelDispatcher {
                 uniqueKeysWithValues: record.frameErrorMessages.map { (String($0.key), $0.value) }
             ),
             finishedAt: record.finishedAt,
-            notAttemptedFrames: record.notAttemptedFrames
+            notAttemptedFrames: record.notAttemptedFrames,
+            skippedFrames: record.skippedFrames
         )
     }
 
@@ -1577,6 +1864,7 @@ public final class ControlChannelDispatcher {
     public func subscribeToEvents() -> AsyncStream<Data> {
         let subscriptionId = UUID()
         activeEventSubscriptions.insert(subscriptionId)
+        sessionModel.beginIdleScannerStatusObservation()
         return AsyncStream { continuation in
             if let data = Self.encodedEvent(name: Self.snapshotEventName, snapshot: buildStatusResult(), hardwareVerification: currentHardwareVerification) {
                 continuation.yield(data)
@@ -1584,7 +1872,10 @@ public final class ControlChannelDispatcher {
             armEventObservation(subscriptionId: subscriptionId, continuation: continuation)
             continuation.onTermination = { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.activeEventSubscriptions.remove(subscriptionId)
+                    guard let self,
+                          self.activeEventSubscriptions.remove(subscriptionId) != nil
+                    else { return }
+                    self.sessionModel.endIdleScannerStatusObservation()
                 }
             }
         }
@@ -1636,18 +1927,138 @@ public final class ControlChannelDispatcher {
     /// for example an oversized line or invalid JSON).
     public func handleLine(_ line: Data) async -> Data {
         let response: ControlResponse
-        switch Self.decode(line) {
-        case .success(let request):
-            response = await handle(request)
-        case .failure(let failure):
-            response = .failure(id: failure.id, error: failure.error)
-            let recoveredMethod = try? JSONDecoder().decode(ControlMethodSniff.self, from: line).method
-            sessionModel.recordControlRefusal(command: recoveredMethod, code: failure.error.code, gate: failure.error.gate)
+        let sniff = try? JSONDecoder().decode(ControlMethodSniff.self, from: line)
+        let correlationToken = sniff?.metadata?.correlationToken
+        if let correlationToken, !Self.validCorrelationToken(correlationToken) {
+            response = .failure(id: sniff?.id ?? 0, error: ControlErrorPayload(
+                .invalidParams,
+                message: "metadata.correlationToken is invalid."
+            ))
+            sessionModel.recordControlRefusal(
+                command: sniff?.method,
+                code: ControlErrorCode.invalidParams.rawValue,
+                gate: nil
+            )
+        } else {
+            switch Self.decode(line) {
+            case .success(let request):
+                if let correlationToken {
+                    sessionModel.recordControlRequest(
+                        command: request.methodName,
+                        requestID: request.id,
+                        correlationToken: correlationToken
+                    )
+                }
+                response = await RequestCorrelationContext.$token.withValue(correlationToken) {
+                    await handleWithIdempotency(
+                        request,
+                        key: sniff?.metadata?.idempotencyKey,
+                        originalLine: line
+                    )
+                }
+            case .failure(let failure):
+                response = .failure(id: failure.id, error: failure.error)
+                let recoveredMethod = sniff?.method
+                sessionModel.recordControlRefusal(command: recoveredMethod, code: failure.error.code, gate: failure.error.gate)
+            }
         }
         if let data = try? response.encoded(hardwareVerification: sessionModel.envelopeHardwareVerification) {
             return data
         }
         return Self.fallbackInvalidParamsLine(id: response.id, hardwareVerification: sessionModel.envelopeHardwareVerification)
+    }
+
+    private func handleWithIdempotency(
+        _ request: ControlRequest,
+        key: String?,
+        originalLine: Data
+    ) async -> ControlResponse {
+        guard greeted, request.isMutating, let key else { return await handle(request) }
+        guard let keyError = Self.idempotencyKeyValidationError(key) else {
+            guard let fingerprint = Self.idempotencyFingerprint(
+                method: request.methodName,
+                originalLine: originalLine
+            ) else {
+                return .failure(id: request.id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "Could not normalize the idempotent request payload."
+                ))
+            }
+            // The Unix socket is owner-only; controller + host diagnostic
+            // lifetime is the originating scope. Project paths are excluded
+            // because roll.save can create/change one during the operation.
+            let scope = "\(sessionModel.diagnosticSessionId):\(controllerName)"
+            switch sessionModel.admitIdempotentRequest(
+                scope: scope,
+                key: key,
+                fingerprint: fingerprint
+            ) {
+            case .execute(let token):
+                let response = await handle(request)
+                sessionModel.completeIdempotentRequest(token: token, response: response)
+                return response
+            case .replay(let cached):
+                return recordIdempotentRefusalIfNeeded(cached.replacingID(request.id), request: request)
+            case .wait(let token):
+                let response = await sessionModel.waitForIdempotentRequest(token: token).replacingID(request.id)
+                return recordIdempotentRefusalIfNeeded(response, request: request)
+            case .conflict:
+                return recordIdempotentRefusalIfNeeded(.failure(id: request.id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "Idempotency key \"\(key)\" is already bound to a different operation payload in this controller scope."
+                )), request: request)
+            case .capacity:
+                return recordIdempotentRefusalIfNeeded(.failure(id: request.id, error: ControlErrorPayload(
+                    .controllerBusy,
+                    message: "The host's bounded idempotency cache is full; no keyed operation was started.",
+                    guidance: "Inspect existing work before restarting the host, which clears this in-memory cache."
+                )), request: request)
+            }
+        }
+        return recordIdempotentRefusalIfNeeded(.failure(id: request.id, error: ControlErrorPayload(
+            .invalidParams,
+            message: "metadata.idempotencyKey is invalid: \(keyError)."
+        )), request: request)
+    }
+
+    private func recordIdempotentRefusalIfNeeded(
+        _ response: ControlResponse,
+        request: ControlRequest
+    ) -> ControlResponse {
+        if case .failure(_, let error) = response {
+            sessionModel.recordControlRefusal(command: request.methodName, code: error.code, gate: error.gate)
+        }
+        return response
+    }
+
+    private nonisolated static func idempotencyKeyValidationError(_ key: String) -> String? {
+        guard !key.isEmpty else { return "it is empty" }
+        guard key.utf8.count <= 256 else { return "it exceeds 256 UTF-8 bytes" }
+        guard key.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            return "it contains a non-printable control character"
+        }
+        return nil
+    }
+
+    private nonisolated static func idempotencyFingerprint(
+        method: String,
+        originalLine: Data
+    ) -> String? {
+        guard let envelope = try? JSONSerialization.jsonObject(with: originalLine) as? [String: Any],
+              let params = envelope["params"],
+              JSONSerialization.isValidJSONObject(params),
+              let canonical = try? JSONSerialization.data(
+                withJSONObject: ["method": method, "params": params],
+                options: [.sortedKeys]
+              ) else { return nil }
+        return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private nonisolated static func validCorrelationToken(_ token: String) -> Bool {
+        !token.isEmpty && token.utf8.count <= 128 && token.utf8.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
+                || $0 == 45 || $0 == 46 || $0 == 58 || $0 == 95
+        }
     }
 
     private static func fallbackInvalidParamsLine(id: UInt64, hardwareVerification: String) -> Data {

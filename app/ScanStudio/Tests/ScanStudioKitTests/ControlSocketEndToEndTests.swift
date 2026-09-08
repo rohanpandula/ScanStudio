@@ -161,8 +161,8 @@ private struct EndToEndHost {
         (try? await waitForStatus { $0["jobId"] == nil || $0["jobId"] is NSNull }) ?? false
     }
 
-    func loadMedia(previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async throws {
-        var args = ["sim", "load-media", "--carrier", "strip6"]
+    func loadMedia(carrier: String = "strip6", previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async throws {
+        var args = ["sim", "load-media", "--carrier", carrier]
         if let previewFixture { args += ["--preview-fixture", previewFixture] }
         if let abortAtFrame { args += ["--abort-at-frame", String(abortAtFrame)] }
         if let abortCode { args += ["--abort-code", abortCode] }
@@ -365,11 +365,11 @@ private final class E2EEventsFollower: @unchecked Sendable {
     private let process: Process
     private let buffer = E2ELineBuffer()
 
-    init(socketPath: String) throws {
+    init(socketPath: String, commandArguments: [String] = ["events", "--follow"]) throws {
         let binary = try EndToEndCLILocator.resolve()
         let process = Process()
         process.executableURL = binary
-        process.arguments = ["events", "--follow", "--socket", socketPath]
+        process.arguments = commandArguments + ["--socket", socketPath]
         let stdoutPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = Pipe()
@@ -403,14 +403,51 @@ private final class E2EEventsFollower: @unchecked Sendable {
     /// its whole budget without ever giving that thread a scheduling slice.
     @MainActor
     func waitForFirstLine() async -> [String: Any]? {
-        for _ in 0..<2_000 {
-            if let first = buffer.snapshot().first,
-               let object = try? JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any] {
-                return object
+        await waitForLine { _ in true }
+    }
+
+    /// Bounded matching-line wait for commands whose first event is only a
+    /// baseline. The same reader and timeout as `waitForFirstLine` keep the
+    /// process test deterministic without adding another harness.
+    @MainActor
+    func waitForLine(attempts: Int = 2_000, where predicate: ([String: Any]) -> Bool) async -> [String: Any]? {
+        for _ in 0..<attempts {
+            for line in buffer.snapshot() {
+                if let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                   predicate(object) {
+                    return object
+                }
             }
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
         return nil
+    }
+
+    /// Waits for the watcher process itself to observe the host-exit event
+    /// and terminate with its distinct OPS exit code. A separate background
+    /// waiter keeps the Swift cooperative pool free while `waitUntilExit()`
+    /// reaps the real subprocess.
+    func waitForExit(timeoutSeconds: Double = 15) async -> Int32? {
+        if !process.isRunning { return process.terminationStatus }
+        let process = self.process
+        return await withCheckedContinuation { continuation in
+            let guardBox = SingleResumeGuard()
+            DispatchQueue.global(qos: .userInitiated).async {
+                process.waitUntilExit()
+                guard guardBox.tryClaim() else { return }
+                continuation.resume(returning: process.terminationStatus)
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds) {
+                guard guardBox.tryClaim() else { return }
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+
+    func parsedLines() -> [[String: Any]] {
+        buffer.snapshot().compactMap { line in
+            try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        }
     }
 
     /// Bounded wait then give up, mirroring `AppDelegate
@@ -425,6 +462,7 @@ private final class E2EEventsFollower: @unchecked Sendable {
     /// subprocess to exit; this bound only prevents that from becoming an
     /// unbounded hang for the suite itself.
     func terminate() {
+        guard process.isRunning else { return }
         process.terminate()
         let finished = DispatchSemaphore(value: 0)
         let process = self.process
@@ -681,10 +719,68 @@ struct ControlSocketEndToEndTests {
 
             // -- scan --confirm-motion --wait: a genuine re-scan of the
             // now-fully-receipted selection (D-17c's "re-scan" step). --
+            let dryRun = try await step(["scan", "--dry-run"])
+            #expect(dryRun.exitCode == 0, Comment(rawValue: dryRun.context))
+            #expect(try resultObject(dryRun)["ready"] as? Bool == true)
+            let registered = try await step(["wait", "--for", "registered", "--timeout", "1"])
+            #expect(registered.exitCode == 0, Comment(rawValue: registered.context))
             let scanResult = try await step(["scan", "--confirm-motion", "--wait"])
             #expect(scanResult.exitCode == 0, Comment(rawValue: scanResult.context))
             let scanBody = try resultObject(scanResult)
             #expect(scanBody["jobState"] as? String == "completed", Comment(rawValue: scanResult.context))
+
+            // Exercise the CLI repeat loop across real subprocess/socket boundaries.
+            let projectDirectory = try #require(saveBody["projectDirectory"] as? String)
+            let manifestURL = URL(fileURLWithPath: projectDirectory).appendingPathComponent("manifest.json")
+            func retainedReceipts() throws -> [[String: Any]] {
+                let manifest = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
+                let frames = try #require(manifest["frames"] as? [[String: Any]])
+                return frames.flatMap { $0["receipts"] as? [[String: Any]] ?? [] }
+            }
+            let beforeRepeat = try retainedReceipts()
+            var originalFiles: [String: Data] = [:]
+            for receipt in beforeRepeat {
+                for value in (receipt["outputs"] as? [String: Any] ?? [:]).filter({ $0.key.hasSuffix("Path") }).values {
+                    if let path = value as? String {
+                        originalFiles[path] = try Data(contentsOf: URL(fileURLWithPath: path))
+                    }
+                }
+            }
+            let repeated = try await step(["scan", "--frames", "1", "--repeat", "2", "--pass", "Arep", "--confirm-motion", "--wait"])
+            #expect(repeated.exitCode == 0, Comment(rawValue: repeated.context))
+            let afterRepeat = try retainedReceipts()
+            #expect(afterRepeat.count == beforeRepeat.count + 2)
+            for original in beforeRepeat {
+                #expect(afterRepeat.contains { NSDictionary(dictionary: $0).isEqual(to: original) })
+            }
+            let repetitions = afterRepeat.filter { ($0["passToken"] as? String)?.hasPrefix("Arep") == true }
+            #expect(Set(repetitions.compactMap { $0["passToken"] as? String }) == ["Arep01", "Arep02"])
+            #expect(Set(repetitions.compactMap { $0["jobId"] as? String }).count == 2)
+            #expect(repetitions.allSatisfy { $0["frameIndex"] as? Int == 1 })
+            for (path, bytes) in originalFiles {
+                #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+            }
+
+            let verified = try await step(["roll", "verify", "--pass", "Arep01"])
+            #expect(verified.exitCode == 0, Comment(rawValue: verified.context))
+            #expect(try resultObject(verified)["status"] as? String == "pass")
+            let simulatedClipping = try await step(["roll", "verify", "--pass", "Arep01", "--no-clipping"])
+            #expect(simulatedClipping.exitCode == 65, Comment(rawValue: simulatedClipping.context))
+            #expect(try resultObject(simulatedClipping)["status"] as? String == "unknown")
+
+            let slotMapURL = host.tempRoot.appendingPathComponent("slot-map.json")
+            try Data(#"{"1":1}"#.utf8).write(to: slotMapURL)
+            let collectionURL = host.tempRoot.appendingPathComponent("calibration-export")
+            let collectArguments = ["roll", "collect", "--to", collectionURL.path, "--stock", "sim-test", "--pass", "Arep01", "--slot-map", slotMapURL.path]
+            let collected = try await step(collectArguments)
+            #expect(collected.exitCode == 0, Comment(rawValue: collected.context))
+            #expect(FileManager.default.fileExists(atPath: collectionURL.appendingPathComponent("file-hashes.txt").path))
+            #expect(FileManager.default.fileExists(atPath: collectionURL.appendingPathComponent("sim-test_01_Arep01-receipt.json").path))
+            let collision = try await step(collectArguments)
+            #expect(collision.exitCode == 64, Comment(rawValue: collision.context))
+            for (path, bytes) in originalFiles {
+                #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+            }
 
             // -- eject --confirm-motion --
             let ejectResult = try await step(["eject", "--confirm-motion"])
@@ -729,6 +825,104 @@ struct ControlSocketEndToEndTests {
             throw error
         }
 
+        await host.stop()
+    }
+
+    @Test("CLI creates a calibration roll without a scanner connection or motion confirmation")
+    func calibrationBootstrapWithoutScan() async throws {
+        let host = try await EndToEndHost.start()
+        let watcher = try E2EEventsFollower(
+            socketPath: host.socketPath,
+            commandArguments: ["status", "--watch", "--attach"]
+        )
+        do {
+            let baseline = await watcher.waitForFirstLine()
+            let baselineObject = try #require(baseline, "status --watch produced no baseline within the bound")
+            #expect(baselineObject["command"] as? String == "status")
+            let baselineEvent = try #require(baselineObject["event"] as? [String: Any])
+            #expect(baselineEvent["event"] as? String == "control.snapshot")
+
+            let saved = try await runE2ECLI([
+                "roll", "save", "--name", "calibration-bootstrap", "--carrier", "strip6",
+                "--frame-count", "6", "--film-process", "c41ColorNegative", "--no-scan"
+            ], socketPath: host.socketPath)
+            #expect(saved.exitCode == 0, Comment(rawValue: saved.context))
+            let body = try #require(JSONSerialization.jsonObject(with: Data(saved.stdout.utf8)) as? [String: Any])
+            let result = try #require(body["result"] as? [String: Any])
+            #expect(result["outcome"] as? String == "saved")
+            #expect(result["saved"] as? Bool == true)
+            let directory = try #require(result["projectDirectory"] as? String)
+            #expect(FileManager.default.fileExists(atPath: directory))
+            let changed = await watcher.waitForLine { object in
+                guard let event = object["event"] as? [String: Any],
+                      event["event"] as? String == "control.changed",
+                      let payload = event["payload"] as? [String: Any]
+                else { return false }
+                return payload["projectDirectory"] as? String == directory
+            }
+            #expect(changed != nil, "status --watch did not report the saved project identity")
+
+            let status = try await runE2ECLI(["status"], socketPath: host.socketPath)
+            #expect(status.exitCode == 0, Comment(rawValue: status.context))
+            let statusBody = try #require(JSONSerialization.jsonObject(with: Data(status.stdout.utf8)) as? [String: Any])
+            let state = try #require(statusBody["result"] as? [String: Any])
+            #expect(state["jobId"] == nil || state["jobId"] is NSNull)
+            #expect(state["device"] == nil || state["device"] is NSNull)
+            #expect(state["previewComplete"] as? Bool == false)
+
+            let dryRun = try await runE2ECLI(["scan", "--dry-run"], socketPath: host.socketPath)
+            #expect(dryRun.exitCode == 65, Comment(rawValue: dryRun.context))
+            let dryRunEnvelope = try #require(
+                JSONSerialization.jsonObject(with: Data(dryRun.stdout.utf8)) as? [String: Any]
+            )
+            let dryRunResult = try #require(dryRunEnvelope["result"] as? [String: Any])
+            #expect(dryRunResult["ready"] as? Bool == false)
+            let stateAfterDryRun = try await host.status()
+            #expect(stateAfterDryRun["jobId"] == nil || stateAfterDryRun["jobId"] is NSNull)
+            #expect(stateAfterDryRun["device"] == nil || stateAfterDryRun["device"] is NSNull)
+            #expect(stateAfterDryRun["previewComplete"] as? Bool == false)
+
+            let linkHealth = try await runE2ECLI(["link", "health"], socketPath: host.socketPath)
+            #expect(linkHealth.exitCode == 0, Comment(rawValue: linkHealth.context))
+            let linkEnvelope = try #require(
+                JSONSerialization.jsonObject(with: Data(linkHealth.stdout.utf8)) as? [String: Any]
+            )
+            let linkResult = try #require(linkEnvelope["result"] as? [String: Any])
+            #expect(linkResult["status"] as? String == "unknown")
+
+            let sessionArchive = host.tempRoot.appendingPathComponent("session-evidence.zip")
+            let exported = try await runE2ECLI(
+                ["session", "export", "--to", sessionArchive.path],
+                socketPath: host.socketPath
+            )
+            #expect(exported.exitCode == 0, Comment(rawValue: exported.context))
+            let exportEnvelope = try #require(
+                JSONSerialization.jsonObject(with: Data(exported.stdout.utf8)) as? [String: Any]
+            )
+            let exportResult = try #require(exportEnvelope["result"] as? [String: Any])
+            #expect(exportResult["path"] as? String == sessionArchive.path)
+            #expect(exportResult["includedEntryCount"] as? Int == 2)
+            #expect(exportResult["missingEntryCount"] as? Int == 2)
+            let archiveBytes = try Data(contentsOf: sessionArchive)
+            #expect(archiveBytes.starts(with: [0x50, 0x4b, 0x03, 0x04]))
+            #expect(archiveBytes.range(of: Data("manifest.json".utf8)) != nil)
+            #expect(archiveBytes.range(of: Data("diagnostics.jsonl".utf8)) != nil)
+            #expect(archiveBytes.range(of: Data("control-transcript.ndjson".utf8)) != nil)
+
+            await host.stop()
+            let watcherExit = await watcher.waitForExit()
+            #expect(watcherExit == 76, "status --watch exited (String(describing: watcherExit)), expected host-exit 76")
+            let hostExitEvents = watcher.parsedLines().filter { object in
+                guard let event = object["event"] as? [String: Any] else { return false }
+                return event["event"] as? String == "control.hostExited"
+            }
+            #expect(hostExitEvents.count == 1, "expected exactly one control.hostExited event")
+        } catch {
+            watcher.terminate()
+            await host.stop()
+            throw error
+        }
+        watcher.terminate()
         await host.stop()
     }
 
@@ -1288,6 +1482,83 @@ struct ControlSocketEndToEndTests {
             await host.stop()
             throw error
         }
+        await host.stop()
+    }
+
+    @Test("hopper waits for a newly loaded roll, creates distinct jobs, and stops on the first refusal")
+    func hopperFreshFilmSequence() async throws {
+        let host = try await EndToEndHost.start()
+        var hopper: E2EEventsFollower?
+        do {
+            let connected = try await runE2ECLI(
+                ["connect", "--device", "sim-ls5000-0"],
+                socketPath: host.socketPath
+            )
+            #expect(connected.exitCode == 0, Comment(rawValue: connected.context))
+            let settings = try await runE2ECLI(
+                ["settings", "set", "--resolution", "100"],
+                socketPath: host.socketPath
+            )
+            #expect(settings.exitCode == 0, Comment(rawValue: settings.context))
+            try await host.loadMedia(carrier: "mounted", previewFixture: "textured")
+
+            let process = try E2EEventsFollower(
+                socketPath: host.socketPath,
+                commandArguments: [
+                    "roll", "run", "--hopper", "--name", "hopper",
+                    "--carrier", "mounted", "--frame-count", "1",
+                    "--film-process", "positive", "--film-loaded",
+                    "--confirm-motion", "--quiet", "--key", "hopper-test"
+                ]
+            )
+            hopper = process
+
+            func receiptLine(named name: String) async -> [String: Any]? {
+                await process.waitForLine(attempts: 12_000) { envelope in
+                    guard let result = envelope["result"] as? [String: Any],
+                          let project = result["project"] as? [String: Any] else { return false }
+                    return project["name"] as? String == name
+                }
+            }
+
+            let first = try #require(
+                await receiptLine(named: "hopper-001"),
+                Comment(rawValue: "hopper output: \(process.parsedLines())")
+            )
+            #expect((first["result"] as? [String: Any])?["jobState"] as? String == "completed")
+            #expect(try await host.waitForStatus {
+                ($0["scanner"] as? [String: Any])?["mediaLoaded"] as? Bool == false
+            })
+            try await host.loadMedia(carrier: "mounted", previewFixture: "textured")
+
+            let second = try #require(await receiptLine(named: "hopper-002"))
+            #expect((second["result"] as? [String: Any])?["jobState"] as? String == "completed")
+            #expect(try await host.waitForStatus {
+                ($0["scanner"] as? [String: Any])?["mediaLoaded"] as? Bool == false
+            })
+            try await host.loadMedia(
+                carrier: "mounted",
+                previewFixture: "textured",
+                abortAtFrame: 1,
+                abortCode: "FEED_JAM"
+            )
+
+            let third = try #require(await receiptLine(named: "hopper-003"))
+            #expect((third["result"] as? [String: Any])?["jobState"] as? String == "failed")
+            let exit = await process.waitForExit()
+            #expect(exit != nil && exit != 0)
+
+            let receipts = process.parsedLines().compactMap { $0["result"] as? [String: Any] }
+                .filter { $0["project"] != nil }
+            #expect(receipts.count == 3)
+            #expect(Set(receipts.compactMap { $0["jobId"] as? String }).count == 3)
+            #expect(Set(receipts.compactMap { $0["receiptPath"] as? String }).count == 3)
+        } catch {
+            hopper?.terminate()
+            await host.stop()
+            throw error
+        }
+        hopper?.terminate()
         await host.stop()
     }
 }

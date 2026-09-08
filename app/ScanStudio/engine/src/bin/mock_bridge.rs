@@ -132,7 +132,7 @@ struct MockState {
 }
 
 impl MockState {
-    fn record_call(&self, method: &str) {
+    fn record_call(&self, request: &BridgeRequest) {
         let Some(path) = self.call_log_path.as_ref() else {
             return;
         };
@@ -140,7 +140,13 @@ impl MockState {
             .create(true)
             .append(true)
             .open(path)
-            .and_then(|mut file| writeln!(file, "{method}"))
+            .and_then(|mut file| {
+                if let Some(metadata) = &request.metadata {
+                    writeln!(file, "{} {}", request.method, metadata.correlation_token)
+                } else {
+                    writeln!(file, "{}", request.method)
+                }
+            })
         {
             eprintln!("mock_bridge: could not append call log {}: {error}", path.display());
         }
@@ -455,7 +461,7 @@ fn main() {
             }
         };
 
-        state.record_call(&request.method);
+        state.record_call(&request);
 
         // Simulated hard crash: checked first, before any other handling
         // of this request (including the hello gate below), so it fires
@@ -608,6 +614,9 @@ fn handle_request(
                 bridge_version: "0.0.1-mock".to_string(),
                 protocol_version: 1,
                 capabilities: vec!["ls5000-coolscanpy".to_string()],
+                telemetry_session_id: None,
+                telemetry_path: None,
+                telemetry_root: None,
             })
         }
         "device.list" => {
@@ -827,6 +836,7 @@ fn handle_request(
                     params.slots,
                     params.recipe.channels,
                     params.output,
+                    params.allowed_meter_refusal_slots,
                     state
                         .opened_device
                         .clone()
@@ -1085,6 +1095,7 @@ fn spawn_scan_worker(
     slots: Vec<u32>,
     channels: BridgeChannels,
     output: BridgeOutputSpec,
+    allowed_meter_refusal_slots: Vec<u32>,
     device: BridgeDeviceInfo,
     scan_error_code: Option<String>,
     scan_failed_slots: Vec<u32>,
@@ -1145,6 +1156,7 @@ fn spawn_scan_worker(
                     summary: BridgeScanCompletedSummary {
                         completed: completed_slots,
                         failed: vec![],
+                        skipped: vec![],
                         stopped: false,
                     },
                 },
@@ -1178,6 +1190,7 @@ fn spawn_scan_worker(
                     summary: BridgeScanCompletedSummary {
                         completed: vec![],
                         failed: slots,
+                        skipped: vec![],
                         stopped: false,
                     },
                 },
@@ -1205,6 +1218,7 @@ fn spawn_scan_worker(
                     summary: BridgeScanCompletedSummary {
                         completed: vec![],
                         failed: vec![1],
+                        skipped: vec![],
                         stopped: false,
                     },
                 },
@@ -1215,8 +1229,32 @@ fn spawn_scan_worker(
         let total_slots = slots.len() as u32;
         let mut completed_slots: Vec<u32> = Vec::new();
         let mut failed_slots: Vec<u32> = Vec::new();
+        let mut skipped_slots: Vec<u32> = Vec::new();
         for (index, slot) in slots.iter().copied().enumerate() {
             thread::sleep(Duration::from_millis(15 + inter_frame_delay_extra_ms));
+
+            if allowed_meter_refusal_slots.contains(&slot) {
+                emit_event(
+                    &tx,
+                    "scan.frameSkipped",
+                    BridgeFrameSkippedPayload {
+                        job_id: job_id.clone(),
+                        slot,
+                        code: "METER_CONTROLLER_REFUSED".to_string(),
+                        details: Some(serde_json::json!({
+                            "pass": 2,
+                            "reasons": [{
+                                "code": "insufficient_valid_samples",
+                                "message": "mock blank slot"
+                            }],
+                        })),
+                        journal_path: None,
+                        journal_sha256: None,
+                    },
+                );
+                skipped_slots.push(slot);
+                continue;
+            }
 
             if scan_anomaly_slot == Some(slot) {
                 // 10-08: live BRIDGE.md SAFE-02 anomaly-halt shape — a
@@ -1296,6 +1334,7 @@ fn spawn_scan_worker(
                 summary: BridgeScanCompletedSummary {
                     completed: completed_slots,
                     failed: failed_slots,
+                    skipped: skipped_slots,
                     stopped: false,
                 },
             },

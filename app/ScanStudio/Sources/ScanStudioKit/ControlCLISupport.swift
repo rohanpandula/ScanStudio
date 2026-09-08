@@ -26,8 +26,10 @@ public enum ControlCLIExitCode: Int32, Sendable {
     case noHostReachable = 69
     case internalError = 70
     case busy = 75
+    case hostExited = 76
     case confirmationRequired = 77
     case schemaVersionMismatch = 78
+    case waitTimedOut = 124
 
     /// Maps a wire-level error `code` (either `ControlErrorPayload.code`
     /// from the channel, or one of `ControlCLIErrorCode`'s own strings) onto
@@ -55,6 +57,8 @@ public enum ControlCLIExitCode: Int32, Sendable {
         case ControlErrorCode.schemaVersionMismatch.rawValue,
              ControlErrorCode.helloRequired.rawValue:
             return .schemaVersionMismatch
+        case ControlCLIErrorCode.waitTimeout.rawValue:
+            return .waitTimedOut
         default:
             // GATE_REFUSED, JOB_NOT_FOUND, and every engine/bridge
             // passthrough code land here (65) -- see the doc comment above.
@@ -75,6 +79,7 @@ public enum ControlCLIErrorCode: String, Sendable {
     case jobNotFound = "JOB_NOT_FOUND"
     case internalCode = "INTERNAL"
     case hostAlreadyRunning = "HOST_ALREADY_RUNNING"
+    case waitTimeout = "WAIT_TIMEOUT"
 }
 
 // MARK: - Output envelope (D-09/OUT-01)
@@ -445,6 +450,7 @@ public struct ControlRunReceipt: Codable, Equatable, Sendable {
     /// attempted or the write failed, so a caller can tell "no project
     /// directory yet" and "write failed" apart from "here is the file."
     public var receiptPath: String?
+    public var approvedJobPath: String?
 
     public init() {}
 

@@ -15,13 +15,14 @@ struct Sim: AsyncParsableCommand {
         @Option(help: "Preview fixture: textured or boundaryAndBlank.") var previewFixture: String?
         @Option(help: "Simulate a batch failure at this frame.") var abortAtFrame: Int?
         @Option(help: "Typed simulator failure code.") var abortCode: String?
+        @Option(help: "Stall once after this simulated frame's first progress tick; use stop --immediate.") var stallAtFrame: Int?
 
         func run() async throws {
             try await CommandRunner.run(
                 command: "sim.loadMedia", method: "sim.loadMedia",
                 params: LoadMediaParams(
                     carrier: carrier, previewFixture: previewFixture,
-                    abortAtFrame: abortAtFrame, abortCode: abortCode
+                    abortAtFrame: abortAtFrame, abortCode: abortCode, stallAtFrame: stallAtFrame
                 ), options: options
             )
         }

@@ -469,7 +469,9 @@ def _scan_receipt_from_coolscanpy(
     raw_export_path: str | None = None,
     raw_export_ir_path: str | None = None,
 ) -> domain.ScanReceipt:
-    exposure_authority = build_exposure_authority(attempts_root=attempts_root, slot=receipt.slot)
+    exposure_authority = build_exposure_authority(
+        attempts_root=attempts_root, slot=receipt.slot, started_at=receipt.started_at
+    )
     exposure = receipt.exposure
     clipping = receipt.clipping
     focus_detail = receipt.focus_detail
@@ -738,6 +740,7 @@ class CoolscanPyTransport:
         self._scanning = False
         self._stop_lock = threading.RLock()
         self._scan_prepared = False
+        self._meter_active = False
         self._stop_requested = False
         # Plan 10-09 (attempts-root persistence): the exact `attempts_root`
         # passed to `Device.roll()` below, kept here purely for our own
@@ -863,7 +866,16 @@ class CoolscanPyTransport:
         # exception means the session itself is gone, classified here at
         # this boundary since the driver draws no such distinction itself --
         # matched on exception type, never a message string.
-        film_present_attr = getattr(self._device, "film_present", None)
+        roll_film_present_attr = (
+            getattr(self._roll, "film_present", None)
+            if self._roll is not None
+            else None
+        )
+        film_present_attr = (
+            roll_film_present_attr
+            if callable(roll_film_present_attr)
+            else getattr(self._device, "film_present", None)
+        )
         if callable(film_present_attr):
             try:
                 film_present = film_present_attr()
@@ -1193,6 +1205,52 @@ class CoolscanPyTransport:
                 ) from exc
             raise
 
+    def solve_exposure(self, slot: int) -> dict[str, object]:
+        if self._device is None:
+            raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+        if not self._preview_established or self._roll is None:
+            raise BridgeError(ErrorCode.NO_PREVIEW, "exposure solving requires a completed preview")
+        solve = getattr(self._roll, "solve_exposure", None)
+        if not callable(solve):
+            raise BridgeError(ErrorCode.NOT_IMPLEMENTED, "this CoolscanPy build has no held-session exposure solver")
+        with self._stop_lock:
+            self._meter_active = True
+        try:
+            solution = solve(slot)
+        except coolscanpy.ManualReviewRequired as exc:
+            raise BridgeError(ErrorCode.MANUAL_REVIEW_REQUIRED, str(exc)) from exc
+        except coolscanpy.DeviceBusy as exc:
+            raise BridgeError(ErrorCode.HARDWARE_LANE_BUSY, str(exc)) from exc
+        except coolscanpy.RefeedRequired as exc:
+            self._preview_established = False
+            raise BridgeError(ErrorCode.REFEED_REQUIRED, str(exc)) from exc
+        except coolscanpy.MeterUnusableError as exc:
+            self._preview_established = False
+            raise BridgeError(ErrorCode.METER_UNUSABLE, str(exc)) from exc
+        except coolscanpy.MeterControllerRefused as exc:
+            self._preview_established = False
+            raise BridgeError(
+                ErrorCode.METER_CONTROLLER_REFUSED, str(exc),
+                details={"pass": exc.pass_number, "reasons": [to_wire(reason) for reason in exc.reasons]},
+            ) from exc
+        except (ValueError, TypeError) as exc:
+            raise BridgeError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
+        except Exception:
+            self._preview_established = False
+            raise
+        finally:
+            with self._stop_lock:
+                self._meter_active = False
+        return {
+            "slot": solution.slot,
+            "rgbExposuresRaw10ns": list(solution.rgb_exposures_raw_10ns),
+            "irMeteredExposureRaw10ns": solution.ir_metered_exposure_raw_10ns,
+            "meterEvidencePath": str(solution.meter_evidence_path),
+            "meterEvidenceSha256": solution.meter_evidence_sha256,
+            "journalPath": str(solution.journal_path),
+            "journalSha256": solution.journal_sha256,
+        }
+
     def set_spacing_offset(
         self, slot: int, offset_rows: int
     ) -> domain.Thumbnail:
@@ -1497,8 +1555,12 @@ class CoolscanPyTransport:
         on_retry: Callable[[int, int, str], None],
         on_frame: Callable[[int, domain.ScanReceipt], None],
         on_call: OnCall | None = None,
+        *,
+        allowed_meter_refusal_slots: tuple[int, ...] = (),
+        on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
+        frame_exposure_overrides_10ns: dict[int, tuple[int, int, int]] | None = None,
     ) -> domain.ScanSummary:
-        """Fine-scan the requested slots using one ``Roll.scan_many`` batch.
+        """Fine-scan requested slots under one output reservation.
 
         ``on_retry`` is retained for ``Transport`` contract compatibility
         but is no longer invoked: the bridge now delegates the whole slot
@@ -1515,20 +1577,45 @@ class CoolscanPyTransport:
         domain.validate_capture_recipe(
             recipe, self._material, supported_multisample_passes=samples_supported
         )
+        domain.validate_frame_exposure_overrides_10ns(
+            slots, recipe, frame_exposure_overrides_10ns
+        )
+        allowed_skips = tuple(allowed_meter_refusal_slots)
+        if (
+            any(type(slot) is not int for slot in allowed_skips)
+            or tuple(sorted(set(allowed_skips))) != allowed_skips
+            or not set(allowed_skips).issubset(slots)
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "allowed meter-refusal slots must be a unique sorted subset of scan slots",
+            )
+        if allowed_skips:
+            try:
+                scan_many_parameters = inspect.signature(self._roll.scan_many).parameters
+            except (TypeError, ValueError):
+                scan_many_parameters = {}
+            required = {"allowed_meter_refusal_slots", "on_meter_refusal_skipped"}
+            if not required.issubset(scan_many_parameters):
+                raise BridgeError(
+                    ErrorCode.NOT_IMPLEMENTED,
+                    "the installed CoolscanPy does not support verified meter-refusal skips",
+                )
         scan_kwargs: dict[str, object] = {}
         if len(samples_supported) > 1:
             # Only a driver that declared single-sample support takes the
             # keyword; the traced default is byte-identical either way.
             scan_kwargs["samples_per_scan"] = recipe.multisample_passes
-        # autoExposure false: meter the lowest requested slot on its own
-        # batch, then hold its metered RGB exposure for every other slot
-        # through CoolscanPy's exposure_override_10ns (IR stays metered).
+        # An explicit roll authority applies from the first slot on every call.
+        # Otherwise autoExposure false retains the legacy first-frame hold.
+        # IR remains metered in both paths.
         hold_exposure = not recipe.auto_exposure
-        held_ticks: tuple[int, int, int] | None = None
+        held_ticks = recipe.exposure_override_10ns
 
         total = len(slots)
         completed: list[int] = []
         failed: list[int] = []
+        skipped: list[int] = []
         # Plan 10-09 (per-frame failure reasons, coordinator scope
         # addition): see ManualReviewRequired below and ScanSummary's own
         # docstring (domain.py).
@@ -1555,6 +1642,23 @@ class CoolscanPyTransport:
                     completed=(), failed=(), stopped=False, failure_reasons={}
                 )
             remaining: list[int] = list(sorted_slots)
+
+            def record_meter_refusal_skip(
+                slot: int, refusal: coolscanpy.MeterControllerRefused
+            ) -> None:
+                if slot not in allowed_skips or slot not in remaining:
+                    raise BridgeError(
+                        ErrorCode.INTERNAL,
+                        "CoolscanPy reported an unbound meter-refusal skip",
+                    )
+                details = {
+                    "pass": refusal.pass_number,
+                    "reasons": [reason.to_dict() for reason in refusal.reasons],
+                }
+                if on_meter_refusal_skipped is not None:
+                    on_meter_refusal_skipped(slot, details)
+                skipped.append(slot)
+                remaining.remove(slot)
 
             # Reserve every possible artifact before progress callbacks or
             # CoolscanPy motion.  This rejects RGB, IR, and potential meter
@@ -1597,12 +1701,24 @@ class CoolscanPyTransport:
                                 raise coolscanpy.SafeStopRequested("scan job stopped before batch reservation")
                             batch_slots = (
                                 remaining[:1]
-                                if hold_exposure and held_ticks is None
+                                if frame_exposure_overrides_10ns is not None
+                                or (hold_exposure and held_ticks is None)
                                 else remaining
                             )
                             batch_kwargs = dict(scan_kwargs)
-                            if held_ticks is not None:
+                            if frame_exposure_overrides_10ns is not None:
+                                batch_kwargs["exposure_override_10ns"] = (
+                                    frame_exposure_overrides_10ns[batch_slots[0]]
+                                )
+                            elif held_ticks is not None:
                                 batch_kwargs["exposure_override_10ns"] = held_ticks
+                            if allowed_skips:
+                                batch_kwargs["allowed_meter_refusal_slots"] = tuple(
+                                    slot for slot in batch_slots if slot in allowed_skips
+                                )
+                                batch_kwargs["on_meter_refusal_skipped"] = (
+                                    record_meter_refusal_skip
+                                )
                             batch_iterator = self._roll.scan_many(
                                 batch_slots, on_progress=None, **batch_kwargs
                             )
@@ -1707,7 +1823,11 @@ class CoolscanPyTransport:
                                 on_frame(slot, receipt)
                                 completed.append(slot)
                                 remaining.remove(slot)
-                                if hold_exposure and held_ticks is None:
+                                if (
+                                    frame_exposure_overrides_10ns is None
+                                    and hold_exposure
+                                    and held_ticks is None
+                                ):
                                     held_ticks = _held_exposure_ticks(frame.receipt.exposure)
                         except coolscanpy.TransportSmearDetected as exc:
                             # scan_many processes slots in order; the first
@@ -1847,6 +1967,7 @@ class CoolscanPyTransport:
                 completed=tuple(completed),
                 failed=tuple(failed),
                 stopped=stopped,
+                skipped=tuple(skipped),
                 failure_reasons=failure_reasons,
             )
         except BaseException:
@@ -1863,7 +1984,7 @@ class CoolscanPyTransport:
 
     def request_stop(self) -> None:
         with self._stop_lock:
-            if self._scan_prepared:
+            if self._scan_prepared or self._meter_active:
                 self._stop_requested = True
                 if self._roll is not None:
                     self._roll.safe_stop()

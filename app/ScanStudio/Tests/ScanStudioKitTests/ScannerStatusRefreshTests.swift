@@ -8,6 +8,11 @@ private enum ScannerStatusRefreshStubError: Error {
     case unexpectedResultType
 }
 
+private struct ScannerStatusEventEnvelope<Payload: Decodable>: Decodable {
+    let event: String
+    let payload: Payload
+}
+
 private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
     nonisolated let events: AsyncStream<EngineEvent> = AsyncStream { _ in }
     var engineVersion: String? = "scanner-status-refresh-stub"
@@ -21,6 +26,7 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
         supported: true, supportedMultisamplePasses: [4]
     )
     private var statusRequestCount = 0
+    private var disconnectRequestCount = 0
     private var movementCalls: [String] = []
     private let holdStatusResponse: Bool
     private var statusMediaLoadedResponses: [Bool]
@@ -31,6 +37,7 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
     /// so every pre-existing test in this file (none of which sets this
     /// parameter) is unaffected.
     private var statusConnectedResponses: [Bool]
+    private var physicalFilmPresent: Bool?
     private var statusContinuation: CheckedContinuation<Void, Never>?
     private var statusWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -38,12 +45,14 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
         holdStatusResponse: Bool = false,
         statusMediaLoadedResponses: [Bool] = [false],
         statusFilmPresentResponses: [Bool?] = [true],
-        statusConnectedResponses: [Bool] = [true]
+        statusConnectedResponses: [Bool] = [true],
+        physicalFilmPresent: Bool? = true
     ) {
         self.holdStatusResponse = holdStatusResponse
         self.statusMediaLoadedResponses = statusMediaLoadedResponses
         self.statusFilmPresentResponses = statusFilmPresentResponses
         self.statusConnectedResponses = statusConnectedResponses
+        self.physicalFilmPresent = physicalFilmPresent
     }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
@@ -57,7 +66,7 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
         case "scanner.connect":
             value = ConnectResult(
                 device: device,
-                status: status(motionArmed: false)
+                status: status(motionArmed: false, filmPresent: physicalFilmPresent)
             )
         case "scanner.status":
             statusRequestCount += 1
@@ -73,7 +82,7 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
                 ? false
                 : statusMediaLoadedResponses.removeFirst()
             let filmPresent: Bool? = statusFilmPresentResponses.isEmpty
-                ? true
+                ? physicalFilmPresent
                 : statusFilmPresentResponses.removeFirst()
             let connected = statusConnectedResponses.isEmpty
                 ? true
@@ -84,6 +93,9 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
                 mediaLoaded: mediaLoaded,
                 filmPresent: filmPresent
             )
+        case "scanner.disconnect":
+            disconnectRequestCount += 1
+            value = EmptyResult()
         case "scanner.acquireThumbnails":
             movementCalls.append(method)
             value = AcquireThumbnailsAck(accepted: true, frames: [])
@@ -113,6 +125,10 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
         movementCalls
     }
 
+    func numberOfDisconnectRequests() -> Int {
+        disconnectRequestCount
+    }
+
     func waitForStatusRequest() async {
         guard statusRequestCount == 0 else { return }
         await withCheckedContinuation { continuation in
@@ -123,6 +139,10 @@ private actor ScannerStatusRefreshEngineStub: EngineClientProtocol {
     func resumeStatusResponse() {
         statusContinuation?.resume()
         statusContinuation = nil
+    }
+
+    func setPhysicalFilmPresent(_ filmPresent: Bool?) {
+        physicalFilmPresent = filmPresent
     }
 
     private func status(
@@ -175,6 +195,70 @@ private func establishPreviewBoundState(
 
 @Suite("Scanner status refresh")
 struct ScannerStatusRefreshTests {
+    @Test("a mutating control request waits for the host's admitted idle probe")
+    @MainActor
+    func mutationWaitsForIdleProbe() async throws {
+        let client = ScannerStatusRefreshEngineStub(holdStatusResponse: true)
+        let model = SessionModel(
+            engineClient: client,
+            idleStatusRefreshInterval: .milliseconds(5)
+        )
+        await model.connect(deviceId: "real-ls5000-status-test")
+        let dispatcher = ControlChannelDispatcher(sessionModel: model, hostKind: .headless)
+        _ = await dispatcher.handle(.hello(
+            id: 1,
+            params: ControlHelloParams(
+                schemaVersion: ControlSchema.version,
+                clientName: "status-probe-test"
+            )
+        ))
+        var events = dispatcher.subscribeToEvents().makeAsyncIterator()
+        _ = await events.next()
+        await client.waitForStatusRequest()
+
+        let disconnect = Task { @MainActor in
+            await dispatcher.handle(.scannerDisconnect(id: 2))
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(await client.numberOfDisconnectRequests() == 0)
+
+        await client.resumeStatusResponse()
+        guard case .success = await disconnect.value else {
+            Issue.record("expected scanner.disconnect after the probe completed")
+            return
+        }
+        #expect(await client.numberOfDisconnectRequests() == 1)
+    }
+
+    @Test("an event observer receives an independently changed real film state from the host's idle probe")
+    @MainActor
+    func observerReceivesPhysicalFilmChangeWithoutRequestingRefresh() async throws {
+        let client = ScannerStatusRefreshEngineStub(
+            statusFilmPresentResponses: [],
+            physicalFilmPresent: false
+        )
+        let model = SessionModel(
+            engineClient: client,
+            idleStatusRefreshInterval: .milliseconds(5)
+        )
+        await model.connect(deviceId: "real-ls5000-status-test")
+        let dispatcher = ControlChannelDispatcher(sessionModel: model, hostKind: .headless)
+        var events = dispatcher.subscribeToEvents().makeAsyncIterator()
+        _ = await events.next()
+
+        await client.setPhysicalFilmPresent(true)
+        await client.waitForStatusRequest()
+
+        let changed = try #require(await events.next())
+        let envelope = try JSONDecoder().decode(
+            ScannerStatusEventEnvelope<ControlStatusResult>.self,
+            from: changed
+        )
+        #expect(envelope.event == "control.changed")
+        #expect(envelope.payload.scanner?.filmPresent == true)
+        #expect(await client.recordedMovementCalls().isEmpty)
+    }
+
     @Test("refreshScannerStatus performs one read-only status request and adopts its readiness")
     @MainActor
     func refreshAdoptsCurrentStatus() async {

@@ -141,6 +141,8 @@ pub trait ScannerBackend: Send + Sync + Sized {
         Self::scan_start_with_output_authorities(
             backend,
             frames,
+            vec![],
+            None,
             recipe,
             processing,
             output,
@@ -158,6 +160,8 @@ pub trait ScannerBackend: Send + Sync + Sized {
     fn scan_start_with_output_authorities(
         backend: &std::sync::Arc<Self>,
         frames: Vec<u32>,
+        allowed_meter_refusal_slots: Vec<u32>,
+        pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
         output: OutputRecipe,
@@ -231,6 +235,21 @@ pub enum Channels {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct PreviewExposureAdjustment {
+    pub source: String,
+    pub reference_frame_index: u32,
+    pub reference_thumbnail_mean: f64,
+    pub frame_thumbnail_mean: f64,
+    pub requested_positive_ev: f64,
+    pub applied_positive_ev: f64,
+    pub reference_rgb_exposures_raw_10ns: [u32; 3],
+    pub applied_rgb_exposures_raw_10ns: [u32; 3],
+    #[serde(default)]
+    pub device_bound_clamped_channels: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptureRecipe {
     #[serde(default = "default_resolution_dpi")]
     pub resolution_dpi: u32,
@@ -240,6 +259,13 @@ pub struct CaptureRecipe {
     pub multisample_passes: u32,
     #[serde(default = "default_channels")]
     pub channels: Channels,
+    /// Exact roll-wide RGB exposure authority in scanner-native 10 ns ticks.
+    /// Infrared is deliberately absent and remains metered by the scanner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_override_10ns: Option<[u32; 3]>,
+    /// Present only on an explicit preview-derived per-frame override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_exposure_adjustment: Option<PreviewExposureAdjustment>,
 }
 
 impl Default for CaptureRecipe {
@@ -249,6 +275,8 @@ impl Default for CaptureRecipe {
             bit_depth: default_bit_depth(),
             multisample_passes: default_multisample_passes(),
             channels: default_channels(),
+            exposure_override_10ns: None,
+            preview_exposure_adjustment: None,
         }
     }
 }
@@ -832,6 +860,19 @@ pub struct MetadataOutputBindings {
     pub preview: Option<WrittenFileBinding>,
 }
 
+/// Read-only capture evidence authorities. These never grant metadata-write
+/// access; they only bind later collection work to bytes the engine wrote.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureOutputBindings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_negative: Option<WrittenFileBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_negative_ir: Option<WrittenFileBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meter: Option<WrittenFileBinding>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WrittenOutputs {
@@ -851,6 +892,8 @@ pub struct WrittenOutputs {
     /// authorize ExifTool writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_bindings: Option<MetadataOutputBindings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_bindings: Option<CaptureOutputBindings>,
     /// Exact presentation transform used for the finished derivatives.
     /// Identity on legacy receipts whose `outputs` object predates this key.
     #[serde(default)]
@@ -958,8 +1001,27 @@ pub struct ScanProject {
     /// every frame without its own `metadataOverride` inherits this set.
     #[serde(default)]
     pub roll_metadata: MetadataSet,
+    /// Durable roll-wide RGB exposure authority. It survives recipe edits
+    /// and reopen; AE-enabled passes simply do not consume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_exposure_lock: Option<RollExposureLock>,
     pub created_at: String,
     pub frames: Vec<ProjectFrame>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollExposureLock {
+    pub slot: u32,
+    pub rgb_exposures_raw_10ns: [u32; 3],
+    pub ir_metered_exposure_raw_10ns: u32,
+    pub meter_evidence_path: String,
+    pub meter_evidence_sha256: String,
+    pub journal_path: String,
+    pub journal_sha256: String,
+    /// Missing on legacy manifests and ordinary calibration solves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -992,7 +1054,42 @@ pub struct ProjectFrame {
     /// the roll-wide `rollMetadata` for this frame, with no per-field merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_override: Option<MetadataSet>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_records: Vec<ScanSkipRecord>,
     pub receipts: Vec<ScanReceipt>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanSkipRecord {
+    pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_token: Option<String>,
+    pub slot: u32,
+    pub code: String,
+    pub details: MeterControllerRefusalDetails,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeterControllerRefusalDetails {
+    pub pass: u32,
+    pub reasons: Vec<MeterControllerRefusalReason>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeterControllerRefusalReason {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_raw_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_raw_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_aggregate_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_aggregate_samples: Option<u32>,
 }
 
 /// Lightweight listing shape for `project.list` — everything in
@@ -1209,6 +1306,8 @@ pub struct HardwareTelemetry {
 #[serde(rename_all = "camelCase")]
 pub struct ScanReceipt {
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_token: Option<String>,
     pub frame_index: u32,
     pub started_at: String,
     pub duration_ms: u64,
@@ -1245,8 +1344,8 @@ pub struct ScanReceipt {
     /// simulated receipts and legacy real receipts that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_transform: Option<String>,
-    /// CoolscanPy's `Frame.meter_rgbi` auto-exposure prepass file, when the
-    /// bridge supplies one. `None` on every simulated receipt.
+    /// CoolscanPy's `Frame.meter_rgbi` auto-exposure prepass file, or the
+    /// simulator's explicitly synthetic meter fixture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meter_rgbi_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1267,6 +1366,10 @@ pub struct ScanReceipt {
     /// simulated and legacy receipts, or when the journal read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure_authority: Option<ExposureAuthority>,
+    /// Preview heuristic which requested this frame's RGB vector. Hardware
+    /// authority above remains the source for what the scanner accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_exposure_adjustment: Option<PreviewExposureAdjustment>,
 }
 
 /// Result of the non-destructive auto-crop decision for one frame's
@@ -1538,6 +1641,8 @@ mod tests {
             bit_depth: 16,
             multisample_passes: 2,
             channels: Channels::Rgbi,
+            exposure_override_10ns: None,
+            preview_exposure_adjustment: None,
         };
         round_trip(&recipe);
     }
@@ -1719,6 +1824,7 @@ mod tests {
             film_process: FilmProcess::C41ColorNegative,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-22T09:00:00Z".into(),
             frames: vec![
                 ProjectFrame {
@@ -1729,6 +1835,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
                 ProjectFrame {
@@ -1739,6 +1846,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
                 ProjectFrame {
@@ -1749,6 +1857,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
             ],
@@ -1770,6 +1879,7 @@ mod tests {
                 date: Some(PartialDate::YearOnly { year: 2026 }),
                 ..MetadataSet::default()
             },
+            roll_exposure_lock: None,
             created_at: "2026-07-22T09:00:00Z".into(),
             frames: vec![ProjectFrame {
                 index: 1,
@@ -1779,6 +1889,7 @@ mod tests {
                 output_override: None,
                 alignment: None,
                 metadata_override: None,
+                skip_records: vec![],
                 receipts: vec![],
             }],
         });
@@ -1804,6 +1915,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         });
 
@@ -1812,8 +1924,10 @@ mod tests {
         // round trip exactly, including the nested receipt.
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1900,
@@ -1845,6 +1959,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![receipt],
         });
     }
@@ -1865,6 +1980,7 @@ mod tests {
             output_override: Some(OutputRecipe::default()),
             alignment: Some(FrameAlignment::approved(5)),
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         });
     }
@@ -1879,6 +1995,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         };
         let value = serde_json::to_value(&frame).unwrap();
@@ -1902,6 +2019,7 @@ mod tests {
                 location: Some("Home".into()),
                 ..MetadataSet::default()
             }),
+            skip_records: vec![],
             receipts: vec![],
         });
 
@@ -1913,6 +2031,7 @@ mod tests {
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         };
         let value = serde_json::to_value(&frame).unwrap();
@@ -2049,8 +2168,10 @@ mod tests {
     fn scan_receipt_matches_golden_fixture_shape() {
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1900,
@@ -2087,8 +2208,10 @@ mod tests {
         // being silently dropped by `skip_serializing_if`.
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1900,

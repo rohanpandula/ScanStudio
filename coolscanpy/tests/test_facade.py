@@ -1346,6 +1346,8 @@ class _FakeHeldWorkerProcess:
     # artifact stays self-consistent, so the refusal surfaces exactly where
     # the live 2026-08-08 failure did -- decode_full_index_bytes.
     corrupt_framing_at_row: int | None = None
+    film_present_result: bool | None = True
+    film_status_overrides: dict[str, Any] | None = None
     hold_session_id: str = field(default_factory=lambda: secrets.token_hex(16))
     _delegate: Any = field(default=None, init=False, repr=False)
     _returncode: int | None = field(default=None, init=False)
@@ -1543,6 +1545,40 @@ class _FakeHeldWorkerProcess:
             return None
         ack = json.loads(self.hold_ack_path.read_text(encoding="utf-8"))
         self.events.append(f"hold-ack-{ack['action']}")
+        if ack["action"] == "status":
+            old_session_id = self.hold_session_id
+            next_session_id = secrets.token_hex(16)
+            next_job_path = self.hold_job_path.parent / f"hold-job-{next_session_id}.json"
+            next_ack_path = self.hold_job_path.parent / f"hold-ack-{next_session_id}.json"
+            raw_status = {
+                True: "000000",
+                False: "023a00",
+                None: "020401",
+            }[self.film_present_result]
+            payload = {
+                "schema_version": 1,
+                "status": "film-status-complete-held",
+                "hold_session_id": old_session_id,
+                "film_present": self.film_present_result,
+                "raw_status": raw_status,
+                "sense_history": [],
+                "device_id": f"usb:{self.expected_usb_bus}:{self.expected_usb_address}",
+                "unit_released": False,
+                "hold_resume": {
+                    "hold_session_id": next_session_id,
+                    "hold_job_path": str(next_job_path),
+                    "hold_ack_path": str(next_ack_path),
+                },
+            }
+            if self.film_status_overrides is not None:
+                payload.update(self.film_status_overrides)
+            status_path = self.hold_job_path.parent / f"hold-status-{old_session_id}.json"
+            status_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.hold_job_path = next_job_path
+            self.hold_ack_path = next_ack_path
+            self.hold_session_id = next_session_id
+            self.events.append(f"film-status-{self.film_present_result}")
+            return None
         if ack["action"] == "release":
             journal = (
                 json.loads(self._release_journal_path.read_text(encoding="utf-8"))
@@ -3708,7 +3744,7 @@ class TestRollScanMany:
 
             assert frame.slot == 2
             assert len(observed_jobs) == 1
-            assert observed_jobs[0]["schema_version"] == 3
+            assert observed_jobs[0]["schema_version"] == 4
             assert observed_jobs[0]["expected_usb_bus"] == 1
             assert observed_jobs[0]["expected_usb_address"] == 2
             assert observed_jobs[0]["expected_usb_vendor_id"] == 0x04B0
@@ -5240,6 +5276,59 @@ class TestRollMultiBatchHold:
     test_capture_process.py's identical idiom for the original
     preview-then-first-batch resume."""
 
+    @pytest.mark.parametrize("verdict", (True, False, None))
+    def test_film_status_uses_the_held_child_and_keeps_one_reservation(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+        verdict: bool | None,
+    ) -> None:
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            processes[0].film_present_result = verdict
+
+            assert roll.film_present() is verdict
+            assert roll.film_present() is verdict
+            assert len(processes) == 1
+            assert events.count(f"film-status-{verdict}") == 2
+            assert roll._held_session is not None
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_film_status_refuses_a_verdict_that_disagrees_with_raw_status(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+    ) -> None:
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(events, processes, _success_spawner(events)),
+        )
+        try:
+            roll.preview()
+            processes[0].film_status_overrides = {"film_present": False}
+
+            assert roll.film_present() is None
+            assert len(processes) == 1
+            assert processes[0].poll() == 0
+            assert roll._held_session is None
+        finally:
+            roll.close()
+            dev.close()
+
     def test_second_scan_many_resumes_the_first_without_a_new_spawn(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
@@ -5274,6 +5363,40 @@ class TestRollMultiBatchHold:
             assert "hold-ack-release" not in events
             # Still held after two batches -- available for a third.
             assert roll._held_session is not None
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_repeated_same_slot_uses_fresh_held_round_artifacts(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_success_spawner(events),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(2):
+                roll.approve(2)
+
+            assert [frame.slot for frame in roll.scan_many([2])] == [2]
+            held = roll._held_session
+            assert held is not None
+            first_journals = sorted(held.directory.glob("frame-002-*/journal.json"))
+            assert len(first_journals) == 1
+            first_bytes = first_journals[0].read_bytes()
+            first_ack = first_journals[0].with_name("parent-ack.json")
+            first_ack_bytes = first_ack.read_bytes()
+
+            assert [frame.slot for frame in roll.scan_many([2])] == [2]
+            journals = sorted(held.directory.glob("frame-002-*/journal.json"))
+            assert len(journals) == 2
+            assert first_journals[0].read_bytes() == first_bytes
+            assert first_ack.read_bytes() == first_ack_bytes
+            assert len(list(held.directory.glob("frame-002-*/parent-ack.json"))) == 2
         finally:
             roll.close()
             dev.close()

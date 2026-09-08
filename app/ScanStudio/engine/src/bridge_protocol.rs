@@ -32,6 +32,14 @@ pub struct BridgeRequest {
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BridgeRequestMetadata>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeRequestMetadata {
+    pub correlation_token: String,
 }
 
 /// Outbound success shape (bridge -> engine): `{"id": .., "result": ..}`.
@@ -227,6 +235,8 @@ pub struct BridgeCaptureRecipe {
     pub channels: BridgeChannels,
     pub autofocus: bool,
     pub auto_exposure: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_override_10ns: Option<[u32; 3]>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +557,20 @@ pub struct BridgeHelloResult {
     pub bridge_version: String,
     pub protocol_version: u32,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_root: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeTelemetryEvidenceIdentity {
+    pub session_id: String,
+    pub path: String,
+    pub allowed_root: String,
 }
 
 // ---------------------------------------------------------------------
@@ -628,6 +652,16 @@ pub struct BridgeRollApproveParams {
     pub attended: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct BridgeRollSolveExposureParams {
+    pub slot: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct BridgeRollSolveExposureAck {
+    pub accepted: bool,
+}
+
 // ---------------------------------------------------------------------
 // scan.start / scan.stop
 // ---------------------------------------------------------------------
@@ -640,6 +674,10 @@ pub struct BridgeScanStartParams {
     pub slots: Vec<u32>,
     pub recipe: BridgeCaptureRecipe,
     pub output: BridgeOutputSpec,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_meter_refusal_slots: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_exposure_overrides_10ns: Option<std::collections::HashMap<u32, [u32; 3]>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -688,6 +726,34 @@ pub struct BridgePreviewCompletePayload {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct BridgeExposureSolution {
+    pub slot: u32,
+    pub rgb_exposures_raw_10ns: [u32; 3],
+    pub ir_metered_exposure_raw_10ns: u32,
+    pub meter_evidence_path: String,
+    pub meter_evidence_sha256: String,
+    pub journal_path: String,
+    pub journal_sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeExposureSolvedPayload {
+    pub solution: BridgeExposureSolution,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeExposureErrorPayload {
+    pub code: String,
+    pub message: String,
+    pub slot: u32,
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeFrameRetryingPayload {
     pub job_id: String,
     pub slot: u32,
@@ -705,9 +771,25 @@ pub struct BridgeFrameCompletedPayload {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct BridgeFrameSkippedPayload {
+    pub job_id: String,
+    pub slot: u32,
+    pub code: String,
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
+    #[serde(default)]
+    pub journal_path: Option<String>,
+    #[serde(default)]
+    pub journal_sha256: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeScanCompletedSummary {
     pub completed: Vec<u32>,
     pub failed: Vec<u32>,
+    #[serde(default)]
+    pub skipped: Vec<u32>,
     pub stopped: bool,
 }
 
@@ -1156,7 +1238,12 @@ mod tests {
         assert_eq!(value["count"], json!(2));
         assert_eq!(value["fingerprint"], json!("stub-manual-fp"));
         assert_eq!(
-            value["thumbnails"].as_array().unwrap().iter().map(|t| t["slot"].clone()).collect::<Vec<_>>(),
+            value["thumbnails"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["slot"].clone())
+                .collect::<Vec<_>>(),
             vec![json!(1), json!(2)]
         );
         assert_eq!(value["thumbnails"][0]["boundaryRows"], json!([100, 300]));

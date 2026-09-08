@@ -158,6 +158,7 @@ class _StubTransport:
         self.manual_frames_calls: list[tuple[int, ...]] = []
         self.preview_strip_calls = 0
         self._manual_frames_raises = manual_frames_raises
+        self.frame_exposure_overrides_10ns = None
 
     def list_devices(self) -> list[domain.DeviceInfo]:
         return [_device_info()]
@@ -244,7 +245,11 @@ class _StubTransport:
             image_path="/tmp/stub-preview/strip.tif", row_count=4800, pixels_per_row=1
         )
 
-    def start_scan(self, slots, recipe, output, on_progress, on_retry, on_frame, on_call=None):
+    def start_scan(
+        self, slots, recipe, output, on_progress, on_retry, on_frame, on_call=None,
+        *, frame_exposure_overrides_10ns=None,
+    ):
+        self.frame_exposure_overrides_10ns = frame_exposure_overrides_10ns
         if self._start_scan_raises is not None:
             raise self._start_scan_raises
         return domain.ScanSummary(completed=tuple(slots), failed=(), stopped=False)
@@ -270,6 +275,42 @@ class _BlockingStartScanTransport(_StubTransport):
         self.started.set()
         self.release.wait(timeout=2.0)
         return domain.ScanSummary(completed=tuple(slots), failed=(), stopped=False)
+
+
+class _MeterSkipTransport(_StubTransport):
+    def start_scan(
+        self,
+        slots,
+        recipe,
+        output,
+        on_progress,
+        on_retry,
+        on_frame,
+        on_call=None,
+        *,
+        allowed_meter_refusal_slots=(),
+        on_meter_refusal_skipped=None,
+    ):
+        del recipe, output, on_progress, on_retry, on_call
+        assert slots == [1, 2]
+        assert allowed_meter_refusal_slots == (1,)
+        assert on_meter_refusal_skipped is not None
+        on_meter_refusal_skipped(
+            1,
+            {
+                "pass": 2,
+                "reasons": [
+                    {
+                        "code": "all_channels_near_black",
+                        "message": "known blank frame has no usable RGB density",
+                    }
+                ],
+            },
+        )
+        on_frame(2, _stub_receipt(2))
+        return domain.ScanSummary(
+            completed=(2,), failed=(), stopped=False, skipped=(1,)
+        )
 
 
 def _wire_recipe() -> dict:
@@ -634,8 +675,16 @@ def test_device_eject_bridge_error_from_transport_records_error_telemetry(
     svc = _opened_service(tmp_path, _ParkedTransport())
     _arm(monkeypatch, tmp_path)
 
+    correlation_token = "trace-fixture:3"
     with pytest.raises(BridgeError) as excinfo:
-        svc.dispatch({"id": 2, "method": "device.eject"}, lambda *_a: None)
+        svc.dispatch(
+            {
+                "id": 2,
+                "method": "device.eject",
+                "metadata": {"correlationToken": correlation_token},
+            },
+            lambda *_a: None,
+        )
 
     assert excinfo.value.code == ErrorCode.FEEDER_PARKED
     error_entry = next(
@@ -645,6 +694,7 @@ def test_device_eject_bridge_error_from_transport_records_error_telemetry(
     )
     assert error_entry["code"] == ErrorCode.FEEDER_PARKED.value
     assert "power cycle" in error_entry["message"]
+    assert error_entry["correlationToken"] == correlation_token
 
 
 def test_device_eject_unmapped_transport_exception_is_eject_failed_not_internal(
@@ -1319,6 +1369,40 @@ def test_scan_start_echoes_engine_operation_token_and_refuses_reuse(
     assert "already used" in excinfo.value.message
 
 
+def test_scan_start_forwards_exact_per_frame_exposure_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm(monkeypatch, tmp_path)
+    transport = _StubTransport()
+    svc = _opened_service(tmp_path, transport)
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    emit = _RecordingEmit()
+    svc.dispatch(
+        {
+            "id": 3,
+            "method": "scan.start",
+            "params": {
+                "slots": [1, 2],
+                "recipe": {**_wire_recipe(), "autoExposure": False},
+                "output": {
+                    "destination": str(tmp_path / "out"),
+                    "filenameTemplate": "frame-####.tif",
+                },
+                "frameExposureOverrides10ns": {
+                    "1": [100_000, 110_000, 120_000],
+                    "2": [130_000, 140_000, 150_000],
+                },
+            },
+        },
+        emit,
+    )
+    _wait_for(lambda: emit.has("scan.completed"))
+    assert transport.frame_exposure_overrides_10ns == {
+        1: (100_000, 110_000, 120_000),
+        2: (130_000, 140_000, 150_000),
+    }
+
+
 def test_scan_start_ingress_rejects_coercible_nonfinite_missing_and_unknown_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1331,6 +1415,8 @@ def test_scan_start_ingress_rejects_coercible_nonfinite_missing_and_unknown_valu
     }
     missing_recipe_field = _wire_recipe()
     del missing_recipe_field["bitDepth"]
+    per_frame_recipe = {**_wire_recipe(), "autoExposure": False}
+    ticks = [100_000, 110_000, 120_000]
     bad_params = [
         {"slots": [True], "recipe": _wire_recipe(), "output": output},
         {"slots": ["1"], "recipe": _wire_recipe(), "output": output},
@@ -1360,6 +1446,32 @@ def test_scan_start_ingress_rejects_coercible_nonfinite_missing_and_unknown_valu
             "recipe": _wire_recipe(),
             "output": output,
             "unexpected": 1,
+        },
+        {
+            "slots": [1], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"01": ticks},
+        },
+        {
+            "slots": [1], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"1": [True, 110_000, 120_000]},
+        },
+        {
+            "slots": [1], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"1": [49_999, 110_000, 120_000]},
+        },
+        {
+            "slots": [1, 2], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"1": ticks},
+        },
+        {
+            "slots": [1], "recipe": _wire_recipe(), "output": output,
+            "frameExposureOverrides10ns": {"1": ticks},
+        },
+        {
+            "slots": [1],
+            "recipe": {**per_frame_recipe, "exposureOverride10ns": ticks},
+            "output": output,
+            "frameExposureOverrides10ns": {"1": ticks},
         },
         {"slots": [1], "recipe": _wire_recipe()},
     ]
@@ -1867,6 +1979,55 @@ def test_scan_start_empty_summary_from_transport_emits_internal_scan_error_then_
     assert completed_summary["stopped"] is False
 
 
+def test_scan_start_emits_verified_meter_skip_without_a_frame_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm(monkeypatch, tmp_path)
+    svc = _opened_service(tmp_path, _MeterSkipTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    emit = _RecordingEmit()
+
+    svc.dispatch(
+        {
+            "id": 3,
+            "method": "scan.start",
+            "params": {
+                "slots": [1, 2],
+                "allowedMeterRefusalSlots": [1],
+                "recipe": _wire_recipe(),
+                "output": {
+                    "destination": str(tmp_path / "out"),
+                    "filenameTemplate": "frame-####.tif",
+                },
+            },
+        },
+        emit,
+    )
+    _wait_for(lambda: emit.has("scan.completed"))
+
+    assert emit.payload_of("scan.frameSkipped") == {
+        "jobId": emit.payload_of("scan.completed")["jobId"],
+        "slot": 1,
+        "code": "METER_CONTROLLER_REFUSED",
+        "details": {
+            "pass": 2,
+            "reasons": [
+                {
+                    "code": "all_channels_near_black",
+                    "message": "known blank frame has no usable RGB density",
+                }
+            ],
+        },
+    }
+    assert [payload["slot"] for payload in emit.payloads_of("scan.frameCompleted")] == [2]
+    assert emit.payload_of("scan.completed")["summary"] == {
+        "completed": [2],
+        "failed": [],
+        "skipped": [1],
+        "stopped": False,
+    }
+
+
 # -- scan.start: lane released before the terminal event reaches anyone -------------
 #
 # Same 2026-07-25 live race as the roll.preview section above, checked on
@@ -2080,3 +2241,74 @@ def test_roll_manual_frames_rejects_non_integer_rows(tmp_path: Path) -> None:
         assert excinfo.value.code is ErrorCode.INVALID_PARAMS, bad
         assert "whole numbers" in str(excinfo.value), bad
     assert transport.manual_frames_calls == []
+
+
+def test_exposure_solve_requires_arming_and_serializes_motion(tmp_path, monkeypatch) -> None:
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    class MeterTransport(_StubTransport):
+        def solve_exposure(self, slot):
+            calls.append(slot)
+            entered.set()
+            assert release.wait(2)
+            return {"slot": slot, "rgbExposuresRaw10ns": [100_000] * 3}
+    svc = _opened_service(tmp_path, MeterTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    request = {"id": 8, "method": "roll.solveExposure", "params": {"slot": 2}}
+    events = []
+    with pytest.raises(BridgeError) as refused:
+        svc.dispatch(request, lambda *event: events.append(event))
+    assert refused.value.code == ErrorCode.HW_MOTION_NOT_ARMED
+    assert calls == []
+    _arm(monkeypatch, tmp_path)
+    try:
+        assert svc.dispatch(request, lambda *event: events.append(event)) == {"accepted": True}
+        assert entered.wait(2)
+        with pytest.raises(BridgeError) as busy:
+            svc.dispatch(request, lambda *_: None)
+        assert busy.value.code == ErrorCode.HARDWARE_LANE_BUSY
+    finally:
+        release.set()
+    _wait_for(lambda: not svc._motion_op_active)
+    assert calls == [2]
+    assert events == [("roll.exposureSolved", {"solution": {"slot": 2, "rgbExposuresRaw10ns": [100_000] * 3}})]
+    assert not svc._lane_held
+
+
+def test_exposure_solve_failure_releases_lane_and_reports_error(tmp_path, monkeypatch) -> None:
+    class MeterTransport(_StubTransport):
+        def solve_exposure(self, slot):
+            raise BridgeError(ErrorCode.METER_CONTROLLER_REFUSED, "refused meter authority")
+    svc = _opened_service(tmp_path, MeterTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    _arm(monkeypatch, tmp_path)
+    events = []
+    svc.dispatch({"id": 9, "method": "roll.solveExposure", "params": {"slot": 2}}, lambda *event: events.append(event))
+    _wait_for(lambda: not svc._motion_op_active)
+    assert events == [("roll.exposureError", {"code": "METER_CONTROLLER_REFUSED", "message": "refused meter authority", "slot": 2})]
+    assert svc._preview_material is None
+    assert not svc._lane_held
+
+
+def test_shutdown_does_not_abandon_meter_thread(tmp_path, monkeypatch) -> None:
+    entered, release = threading.Event(), threading.Event()
+    class MeterTransport(_StubTransport):
+        def solve_exposure(self, slot):
+            entered.set()
+            assert release.wait(2)
+            return {"slot": slot}
+    svc = _opened_service(tmp_path, MeterTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    _arm(monkeypatch, tmp_path)
+    svc.dispatch({"id": 8, "method": "roll.solveExposure", "params": {"slot": 2}}, lambda *_: None)
+    try:
+        assert entered.wait(2)
+        with pytest.raises(BridgeError) as refused:
+            svc._handle_shutdown(join_timeout=0)
+        assert refused.value.code == ErrorCode.HARDWARE_LANE_BUSY
+        assert svc._device_open
+    finally:
+        release.set()
+    svc._motion_thread.join(timeout=2)
+    assert svc._handle_shutdown(join_timeout=0) == {}
+    assert not svc._device_open

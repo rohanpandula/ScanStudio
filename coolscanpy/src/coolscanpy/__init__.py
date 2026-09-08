@@ -66,6 +66,7 @@ from coolscanpy.types import (
     DigitalIceAcquisition,
     DigitalIceAcquisitionEvidence,
     ExposureVector,
+    ExposureSolution,
     FingerprintComparison,
     FocusDetailTelemetry,
     Frame,
@@ -108,6 +109,7 @@ __all__ = [
     # receipts
     "Receipt",
     "ExposureVector",
+    "ExposureSolution",
     "SplitAlignment",
     "ClippingTelemetry",
     "FocusDetailTelemetry",

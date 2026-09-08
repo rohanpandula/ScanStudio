@@ -17,6 +17,26 @@ import Foundation
 
 // MARK: - Wire envelope
 
+/// Additive transport tracing carried by request envelopes. It identifies
+/// one CLI request across the control, engine, and bridge boundaries without
+/// changing any operation or domain identifier.
+public struct RequestMetadata: Codable, Equatable, Sendable {
+    public let correlationToken: String?
+    public let idempotencyKey: String?
+
+    public init(correlationToken: String? = nil, idempotencyKey: String? = nil) {
+        self.correlationToken = correlationToken
+        self.idempotencyKey = idempotencyKey
+    }
+}
+
+/// The dispatcher scopes metadata to the exact request task. Child tasks
+/// created while an asynchronous operation is admitted inherit the value;
+/// unrelated concurrent requests cannot overwrite it.
+public enum RequestCorrelationContext {
+    @TaskLocal public static var token: String?
+}
+
 /// Inbound shape (app -> engine): `{"id": .., "method": .., "params": ..}`.
 /// Used by `EngineClient` to serialize outgoing requests. `Encodable`-only
 /// (matching `EngineClient.request`'s `Params: Encodable` constraint) —
@@ -25,11 +45,23 @@ public struct RequestEnvelope<Params: Encodable>: Encodable {
     public let id: UInt64
     public let method: String
     public let params: Params
+    public let metadata: RequestMetadata?
 
-    public init(id: UInt64, method: String, params: Params) {
+    public init(id: UInt64, method: String, params: Params, metadata: RequestMetadata? = nil) {
         self.id = id
         self.method = method
         self.params = params
+        self.metadata = metadata
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, method, params, metadata }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(method, forKey: .method)
+        try container.encode(params, forKey: .params)
+        try container.encodeIfPresent(metadata, forKey: .metadata)
     }
 }
 
@@ -40,6 +72,7 @@ public struct DecodedRequestEnvelope<Params: Decodable>: Decodable {
     public let id: UInt64
     public let method: String
     public let params: Params
+    public let metadata: RequestMetadata?
 }
 
 /// Outbound success shape (engine -> app): `{"id": .., "result": ..}`.
@@ -275,6 +308,25 @@ public struct HelloResult: Decodable, Sendable {
     public let capabilities: [String]
 }
 
+public struct EngineSessionEvidenceAuthority: Decodable, Equatable, Sendable {
+    public let sessionId: String
+    public let path: String
+    public let allowedRoot: String
+}
+
+public struct EngineSessionEvidenceFileAuthority: Decodable, Equatable, Sendable {
+    public let entryName: String
+    public let path: String
+    public let allowedRoot: String
+    public let sha256: String
+}
+
+public struct EngineSessionInventoryResult: Decodable, Equatable, Sendable {
+    public let bridgeTelemetry: EngineSessionEvidenceAuthority?
+    public let attemptJournals: [EngineSessionEvidenceFileAuthority]?
+    public let bridgeVersion: String?
+}
+
 // MARK: - scanner.list
 
 public struct ScannerListResult: Decodable, Sendable {
@@ -489,12 +541,14 @@ public struct LoadMediaParams: Codable, Sendable {
     public let previewFixture: String?
     public let abortAtFrame: Int?
     public let abortCode: String?
+    public let stallAtFrame: Int?
 
-    public init(carrier: String, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) {
+    public init(carrier: String, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil, stallAtFrame: Int? = nil) {
         self.carrier = carrier
         self.previewFixture = previewFixture
         self.abortAtFrame = abortAtFrame
         self.abortCode = abortCode
+        self.stallAtFrame = stallAtFrame
     }
 }
 
@@ -660,6 +714,37 @@ public struct RollSetSpacingOffsetResult: Decodable, Sendable {
     public let thumbnail: Thumbnail
 }
 
+public struct RollSolveExposureParams: Codable, Sendable {
+    public let frameIndex: Int
+    public let operationId: String
+    public let previewDerivedReference: Bool?
+
+    public init(frameIndex: Int, operationId: String, previewDerivedReference: Bool = false) {
+        self.frameIndex = frameIndex
+        self.operationId = operationId
+        self.previewDerivedReference = previewDerivedReference
+    }
+}
+
+public struct RollSolveExposureAck: Decodable, Sendable {
+    public let accepted: Bool
+}
+
+public struct RollExposureSolvedPayload: Codable, Sendable {
+    public let operationId: String
+    public let solution: RollExposureLock
+    public let project: ScanProject
+}
+
+public struct RollExposureErrorPayload: Decodable, Sendable {
+    public let operationId: String
+    public let code: String
+    public let message: String
+    public let recoverable: Bool
+    public let frameIndex: Int
+    public let details: MeterControllerRefusalDetails?
+}
+
 // MARK: - roll.approve
 
 /// Explicit operator approval for one preview boundary that the engine
@@ -765,17 +850,55 @@ public struct PreviewStripResult: Decodable, Sendable {
 
 // MARK: - scan.start / scan.stop / scan.skipCurrentFrame
 
+public struct PreviewExposureAdjustment: Codable, Equatable, Sendable {
+    public let source: String
+    public let referenceFrameIndex: Int
+    public let referenceThumbnailMean: Double
+    public let frameThumbnailMean: Double
+    public let requestedPositiveEv: Double
+    public let appliedPositiveEv: Double
+    public let referenceRgbExposuresRaw10ns: [Int]
+    public let appliedRgbExposuresRaw10ns: [Int]
+    public let deviceBoundClampedChannels: [String]
+
+    public init(
+        source: String = "previewThumbnailMean",
+        referenceFrameIndex: Int,
+        referenceThumbnailMean: Double,
+        frameThumbnailMean: Double,
+        requestedPositiveEv: Double,
+        appliedPositiveEv: Double,
+        referenceRgbExposuresRaw10ns: [Int],
+        appliedRgbExposuresRaw10ns: [Int],
+        deviceBoundClampedChannels: [String] = []
+    ) {
+        self.source = source
+        self.referenceFrameIndex = referenceFrameIndex
+        self.referenceThumbnailMean = referenceThumbnailMean
+        self.frameThumbnailMean = frameThumbnailMean
+        self.requestedPositiveEv = requestedPositiveEv
+        self.appliedPositiveEv = appliedPositiveEv
+        self.referenceRgbExposuresRaw10ns = referenceRgbExposuresRaw10ns
+        self.appliedRgbExposuresRaw10ns = appliedRgbExposuresRaw10ns
+        self.deviceBoundClampedChannels = deviceBoundClampedChannels
+    }
+}
+
 public struct CaptureRecipe: Codable, Equatable, Sendable {
     public let resolutionDpi: Int
     public let bitDepth: Int
     public let multisamplePasses: Int
     public let channels: String
+    public let exposureOverride10ns: [Int]?
+    public let previewExposureAdjustment: PreviewExposureAdjustment?
 
-    public init(resolutionDpi: Int, bitDepth: Int, multisamplePasses: Int, channels: String) {
+    public init(resolutionDpi: Int, bitDepth: Int, multisamplePasses: Int, channels: String, exposureOverride10ns: [Int]? = nil, previewExposureAdjustment: PreviewExposureAdjustment? = nil) {
         self.resolutionDpi = resolutionDpi
         self.bitDepth = bitDepth
         self.multisamplePasses = multisamplePasses
         self.channels = channels
+        self.exposureOverride10ns = exposureOverride10ns
+        self.previewExposureAdjustment = previewExposureAdjustment
     }
 }
 
@@ -1094,22 +1217,51 @@ public struct OutputRecipe: Codable, Equatable, Sendable {
     }
 }
 
+public enum ScanFrameFailurePolicy: String, Codable, Equatable, Sendable {
+    case stop
+    case skip
+}
+
 public struct ScanStartParams: Codable, Sendable {
     public let frames: [Int]
+    public let onFrameFailure: ScanFrameFailurePolicy
+    public let allowedMeterRefusalSlots: [Int]
+    public let passToken: String?
     public let recipe: CaptureRecipe
     public let processing: ProcessingRecipe?
     public let output: OutputRecipe?
 
     public init(
         frames: [Int],
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = [],
+        passToken: String? = nil,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe? = nil,
         output: OutputRecipe? = nil
     ) {
         self.frames = frames
+        self.onFrameFailure = onFrameFailure
+        self.allowedMeterRefusalSlots = allowedMeterRefusalSlots
+        self.passToken = passToken
         self.recipe = recipe
         self.processing = processing
         self.output = output
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case frames, onFrameFailure, allowedMeterRefusalSlots, passToken, recipe, processing, output
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        frames = try values.decode([Int].self, forKey: .frames)
+        onFrameFailure = try values.decodeIfPresent(ScanFrameFailurePolicy.self, forKey: .onFrameFailure) ?? .stop
+        allowedMeterRefusalSlots = try values.decodeIfPresent([Int].self, forKey: .allowedMeterRefusalSlots) ?? []
+        passToken = try values.decodeIfPresent(String.self, forKey: .passToken)
+        recipe = try values.decode(CaptureRecipe.self, forKey: .recipe)
+        processing = try values.decodeIfPresent(ProcessingRecipe.self, forKey: .processing)
+        output = try values.decodeIfPresent(OutputRecipe.self, forKey: .output)
     }
 }
 
@@ -1190,6 +1342,39 @@ public enum FrameState: String, Codable, Equatable, Sendable {
 
 // MARK: - ScanReceipt
 
+public struct WrittenFileBinding: Codable, Equatable, Sendable {
+    public let relativePath: String
+    public let sha256: String
+    public let byteLength: UInt64
+    public let volumeId: UInt64?
+    public let fileId: UInt64?
+}
+
+public struct MetadataOutputBindings: Codable, Equatable, Sendable {
+    public let archive: WrittenFileBinding?
+    public let archiveXmp: WrittenFileBinding?
+    public let positive: WrittenFileBinding?
+    public let preview: WrittenFileBinding?
+
+    public init(
+        archive: WrittenFileBinding? = nil,
+        archiveXmp: WrittenFileBinding? = nil,
+        positive: WrittenFileBinding? = nil,
+        preview: WrittenFileBinding? = nil
+    ) {
+        self.archive = archive
+        self.archiveXmp = archiveXmp
+        self.positive = positive
+        self.preview = preview
+    }
+}
+
+public struct CaptureOutputBindings: Codable, Equatable, Sendable {
+    public let rawNegative: WrittenFileBinding?
+    public let rawNegativeIr: WrittenFileBinding?
+    public let meter: WrittenFileBinding?
+}
+
 /// Where a completed frame's files actually landed. Populated once Plan
 /// 03-02's real file-writing lands on the engine side; every field is a
 /// path that build actually wrote, never a template or destination
@@ -1200,6 +1385,8 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
     public let previewPath: String?
     public let rawNegativePath: String?
     public let rawNegativeIrPath: String?
+    public let metadataBindings: MetadataOutputBindings?
+    public let captureBindings: CaptureOutputBindings?
     /// Exact presentation transform applied to positive/preview derivatives.
     /// The archive/IR/meter capture files are never transformed.
     public let derivativeTransform: DerivativeTransform
@@ -1210,6 +1397,8 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         previewPath: String?,
         rawNegativePath: String? = nil,
         rawNegativeIrPath: String? = nil,
+        metadataBindings: MetadataOutputBindings? = nil,
+        captureBindings: CaptureOutputBindings? = nil,
         derivativeTransform: DerivativeTransform = .identity
     ) {
         self.archivePath = archivePath
@@ -1217,11 +1406,13 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         self.previewPath = previewPath
         self.rawNegativePath = rawNegativePath
         self.rawNegativeIrPath = rawNegativeIrPath
+        self.metadataBindings = metadataBindings
+        self.captureBindings = captureBindings
         self.derivativeTransform = derivativeTransform
     }
 
     private enum CodingKeys: String, CodingKey {
-        case archivePath, positivePath, previewPath, rawNegativePath, rawNegativeIrPath, derivativeTransform
+        case archivePath, positivePath, previewPath, rawNegativePath, rawNegativeIrPath, metadataBindings, captureBindings, derivativeTransform
     }
 
     public init(from decoder: Decoder) throws {
@@ -1231,6 +1422,8 @@ public struct WrittenOutputs: Codable, Equatable, Sendable {
         previewPath = try values.decodeIfPresent(String.self, forKey: .previewPath)
         rawNegativePath = try values.decodeIfPresent(String.self, forKey: .rawNegativePath)
         rawNegativeIrPath = try values.decodeIfPresent(String.self, forKey: .rawNegativeIrPath)
+        metadataBindings = try values.decodeIfPresent(MetadataOutputBindings.self, forKey: .metadataBindings)
+        captureBindings = try values.decodeIfPresent(CaptureOutputBindings.self, forKey: .captureBindings)
         derivativeTransform = try values.decodeIfPresent(
             DerivativeTransform.self,
             forKey: .derivativeTransform
@@ -1281,6 +1474,7 @@ public struct HardwareTelemetry: Codable, Equatable, Sendable {
 
 public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
     public let jobId: String
+    public let passToken: String?
     public let frameIndex: Int
     public let startedAt: String
     public let durationMs: Int
@@ -1301,16 +1495,18 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
     public let hardwareTelemetry: HardwareTelemetry?
     public let deviceModel: String?
     public let hardwareVerification: String?
+    public let previewExposureAdjustment: PreviewExposureAdjustment?
 
     public init(
-        jobId: String, frameIndex: Int, startedAt: String, durationMs: Int, passes: Int,
+        jobId: String, passToken: String? = nil, frameIndex: Int, startedAt: String, durationMs: Int, passes: Int,
         resolutionDpi: Int, bitDepth: Int, channels: String, engineVersion: String,
         deviceId: String, simulated: Bool, settingsFingerprint: String,
         processing: ProcessingRecipe?, output: OutputRecipe?, outputs: WrittenOutputs?,
         rgbPath: String?, irPath: String?, meterRgbiPath: String?, hardwareTelemetry: HardwareTelemetry?,
-        deviceModel: String? = nil, hardwareVerification: String? = nil
+        deviceModel: String? = nil, hardwareVerification: String? = nil,
+        previewExposureAdjustment: PreviewExposureAdjustment? = nil
     ) {
-        self.jobId = jobId; self.frameIndex = frameIndex; self.startedAt = startedAt
+        self.jobId = jobId; self.passToken = passToken; self.frameIndex = frameIndex; self.startedAt = startedAt
         self.durationMs = durationMs; self.passes = passes; self.resolutionDpi = resolutionDpi
         self.bitDepth = bitDepth; self.channels = channels; self.engineVersion = engineVersion
         self.deviceId = deviceId; self.simulated = simulated; self.settingsFingerprint = settingsFingerprint
@@ -1318,6 +1514,7 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
         self.rgbPath = rgbPath; self.irPath = irPath; self.meterRgbiPath = meterRgbiPath
         self.hardwareTelemetry = hardwareTelemetry; self.deviceModel = deviceModel
         self.hardwareVerification = hardwareVerification
+        self.previewExposureAdjustment = previewExposureAdjustment
     }
 
     public var id: String { "\(jobId)#\(frameIndex)@\(startedAt)" }
@@ -1559,6 +1756,7 @@ public struct ScanProject: Codable, Equatable, Sendable {
     /// on the wire, even when every field inside it is nil/empty. Mirrors
     /// `domain.rs::ScanProject.roll_metadata`.
     public let rollMetadata: MetadataSet
+    public let rollExposureLock: RollExposureLock?
     public let createdAt: String
     public let frames: [ProjectFrame]
 
@@ -1571,6 +1769,7 @@ public struct ScanProject: Codable, Equatable, Sendable {
         filmProcess: FilmProcess,
         recipes: OutputRecipe,
         rollMetadata: MetadataSet,
+        rollExposureLock: RollExposureLock? = nil,
         createdAt: String,
         frames: [ProjectFrame]
     ) {
@@ -1582,8 +1781,40 @@ public struct ScanProject: Codable, Equatable, Sendable {
         self.filmProcess = filmProcess
         self.recipes = recipes
         self.rollMetadata = rollMetadata
+        self.rollExposureLock = rollExposureLock
         self.createdAt = createdAt
         self.frames = frames
+    }
+}
+
+public struct RollExposureLock: Codable, Equatable, Sendable {
+    public let slot: Int
+    public let rgbExposuresRaw10ns: [Int]
+    public let irMeteredExposureRaw10ns: Int
+    public let meterEvidencePath: String
+    public let meterEvidenceSha256: String
+    public let journalPath: String
+    public let journalSha256: String
+    public let source: String?
+
+    public init(
+        slot: Int,
+        rgbExposuresRaw10ns: [Int],
+        irMeteredExposureRaw10ns: Int,
+        meterEvidencePath: String,
+        meterEvidenceSha256: String,
+        journalPath: String,
+        journalSha256: String,
+        source: String? = nil
+    ) {
+        self.slot = slot
+        self.rgbExposuresRaw10ns = rgbExposuresRaw10ns
+        self.irMeteredExposureRaw10ns = irMeteredExposureRaw10ns
+        self.meterEvidencePath = meterEvidencePath
+        self.meterEvidenceSha256 = meterEvidenceSha256
+        self.journalPath = journalPath
+        self.journalSha256 = journalSha256
+        self.source = source
     }
 }
 

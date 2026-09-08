@@ -215,6 +215,37 @@ def test_probe_surfaces_only_proven_presence_states(
     assert usb_util.disposed == [device]
 
 
+def test_claimed_interface_probe_sends_only_test_unit_ready_without_reopening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        adapter_status,
+        "_connect_device",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an already-claimed interface must not be reopened")
+        ),
+    )
+    calls = _install_transaction_sequence(monkeypatch, ["000000"])
+    ep_out, ep_in = object(), object()
+
+    result = adapter_status.probe_claimed_adapter_status(
+        ep_out,
+        ep_in,
+        device_id="usb:1:2",
+    )
+
+    assert result.film_present is True
+    assert result.device_id == "usb:1:2"
+    assert len(calls) == 1
+    assert calls[0]["ep_out"] is ep_out
+    assert calls[0]["ep_in"] is ep_in
+    assert calls[0]["entry"] == {
+        "seq": "adapter-status-probe",
+        "name": "TEST_UNIT_READY",
+        "cdb": "000000000000",
+    }
+
+
 def test_startup_unit_attention_chain_is_drained_before_classification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

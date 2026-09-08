@@ -28,6 +28,9 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-08: held-child non-motion film-status rendezvous.
+    # 0.7.9 preview: held metering/explicit refusal skips plus retained local
+    # timing, required scanner identity and adapter-conditional replay.
     # Resealed 2026-09-07 (CoolscanPy 0.7.8): worker.py derives the 1-sample
     # fine READ and binds the selected USB identity; capture_process.py
     # validates the derived byte total and carries that identity; packed.py
@@ -59,8 +62,8 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
     # Resealed 2026-08-11: capture descendants remain in the bridge-owned
     # process group and inherit its exclusive process-ownership fence.
-    "capture_process.py": "5861212d175a4869699a0385e11237582f1eb1fd34556e2f6f165b1c28db4539",
-    "worker.py": "eadc1e86e25b9d759dfb4c9787943bb9f54ce35d558961b33b0436fa2340d08d",
+    "capture_process.py": "e66a50d07a4704a10f38f3d477432e0e2b3853c23c43a70e740950bd2dccb2ea",
+    "worker.py": "41588f69eb75ac67c2f8a2bb86f8bf175ae9949109c06ca9256115a7362ecd41",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",

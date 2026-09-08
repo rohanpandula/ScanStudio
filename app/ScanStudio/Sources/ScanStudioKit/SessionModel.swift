@@ -395,6 +395,7 @@ struct TerminalJobRecord: Equatable, Sendable {
     let frameErrorCodes: [Int: String]
     let frameErrorMessages: [Int: String]
     let notAttemptedFrames: [Int]
+    let skippedFrames: [Int]
     let finishedAt: String
 }
 
@@ -423,6 +424,9 @@ public final class SessionModel {
         let connectionEpoch: UInt64
         let previewOperationId: String
         let frames: [Int]
+        let passToken: String?
+        let onFrameFailure: ScanFrameFailurePolicy
+        let allowedMeterRefusalSlots: [Int]
     }
 
     /// Immutable authority for the accepted scan whose terminal summary may
@@ -477,6 +481,9 @@ public final class SessionModel {
     private struct PendingManualReviewScanAuthorization {
         let requestId: UUID
         let frames: [Int]
+        let passToken: String?
+        let onFrameFailure: ScanFrameFailurePolicy
+        let allowedMeterRefusalSlots: [Int]
         /// Every flagged frame the bridge must approve before scan.start.
         let requirements: [ManualReviewRequirement]
         /// The subset not already resolved with "Use Frame Anyway" when the
@@ -520,6 +527,14 @@ public final class SessionModel {
         let previewOperationId: String
         let projectId: String
         let connectionEpoch: UInt64
+    }
+
+    private struct PendingExposureSolve {
+        let id: UUID
+        let operationId: String
+        let frameIndex: Int
+        let connectionEpoch: UInt64
+        let continuation: CheckedContinuation<RollExposureLock?, Never>
     }
 
     private struct PersistedFrameAlignmentTarget: Sendable {
@@ -567,6 +582,8 @@ public final class SessionModel {
     private var pendingFrameAlignmentAdjustment: PendingFrameAlignmentAdjustment?
     @ObservationIgnored
     private var pendingFrameAlignmentRestore: PendingFrameAlignmentRestore?
+    @ObservationIgnored
+    private var pendingExposureSolve: PendingExposureSolve?
 
     @ObservationIgnored
     private var projectSnapshotGeneration: UInt64 = 0
@@ -632,6 +649,10 @@ public final class SessionModel {
     /// state and to reject overlapping button presses.
     public private(set) var isConnectingDevice = false
     public private(set) var isRefreshingScannerStatus = false
+    private let idleStatusRefreshInterval: Duration
+    private var idleStatusObserverCount = 0
+    private var idleStatusMonitorTask: Task<Void, Never>?
+    private var pendingStatusRefreshWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
     /// The single explicit signal naming whichever mutating operation (if
     /// any) is currently in flight. `nil` when idle; otherwise the D-05
     /// command name of the operation currently running (for example
@@ -643,7 +664,24 @@ public final class SessionModel {
     /// `isResumingBatch`, etc.) -- those stay because each drives its own
     /// progress affordance; this one only answers "is any mutation in
     /// flight right now."
-    public private(set) var mutatingOperationInFlight: String?
+    public private(set) var mutatingOperationController: String?
+    private var controlRequestController: String?
+    public private(set) var mutatingOperationInFlight: String? {
+        didSet {
+            if mutatingOperationInFlight == nil {
+                mutatingOperationController = nil
+            } else if oldValue == nil {
+                mutatingOperationController = controlRequestController ?? "ScanStudio GUI"
+            }
+        }
+    }
+
+    /// Installs the informational controller label for the next control
+    /// mutation. The dispatcher clears it after routing; confirmations and
+    /// all authorization gates remain separate and unchanged.
+    func setControlRequestController(_ name: String?) {
+        controlRequestController = name
+    }
     /// Saves and returns the previous value of `mutatingOperationInFlight`,
     /// then assigns `name` -- but only when no mutating operation is already
     /// in flight. `connect()` calls `await refreshAvailableDevices()`
@@ -665,6 +703,57 @@ public final class SessionModel {
     }
     public private(set) var status: ScannerStatus?
     public private(set) var engineVersion: String?
+
+    enum IdempotentRequestAdmission {
+        case execute(token: String)
+        case replay(ControlResponse)
+        case wait(token: String)
+        case conflict
+        case capacity
+    }
+
+    private struct IdempotentRequestEntry {
+        let fingerprint: String
+        var response: ControlResponse?
+        var waiters: [CheckedContinuation<ControlResponse, Never>] = []
+    }
+
+    private static let maximumIdempotentRequests = 256
+    private var idempotentRequests: [String: IdempotentRequestEntry] = [:]
+
+    /// Host-memory-only admission. Restarting the host deliberately loses
+    /// this bounded cache; durable active-job markers remain the separate
+    /// authority for scan reattachment after restart.
+    func admitIdempotentRequest(
+        scope: String,
+        key: String,
+        fingerprint: String
+    ) -> IdempotentRequestAdmission {
+        let token = "\(scope)\u{0}\(key)"
+        if let entry = idempotentRequests[token] {
+            guard entry.fingerprint == fingerprint else { return .conflict }
+            return entry.response.map(IdempotentRequestAdmission.replay) ?? .wait(token: token)
+        }
+        guard idempotentRequests.count < Self.maximumIdempotentRequests else { return .capacity }
+        idempotentRequests[token] = IdempotentRequestEntry(fingerprint: fingerprint)
+        return .execute(token: token)
+    }
+
+    func waitForIdempotentRequest(token: String) async -> ControlResponse {
+        if let response = idempotentRequests[token]?.response { return response }
+        return await withCheckedContinuation { continuation in
+            idempotentRequests[token]?.waiters.append(continuation)
+        }
+    }
+
+    func completeIdempotentRequest(token: String, response: ControlResponse) {
+        guard var entry = idempotentRequests[token], entry.response == nil else { return }
+        entry.response = response
+        let waiters = entry.waiters
+        entry.waiters.removeAll()
+        idempotentRequests[token] = entry
+        for waiter in waiters { waiter.resume(returning: response) }
+    }
     public private(set) var thumbnails: [Int: Thumbnail] = [:]
     /// `BlankFrameHint.Score` per frame index, computed once per arriving
     /// thumbnail (`"scanner.thumbnail"`) and once more when the whole preview
@@ -1167,7 +1256,10 @@ public final class SessionModel {
             resolutionDpi: scanResolutionDpi,
             bitDepth: scanBitDepth,
             multisamplePasses: scanMultisamplePasses,
-            channels: scanChannels
+            channels: scanChannels,
+            exposureOverride10ns: autoExposureEachFrame
+                ? nil
+                : project?.rollExposureLock?.rgbExposuresRaw10ns
         )
     }
     public var processingRecipe: ProcessingRecipe {
@@ -1447,10 +1539,12 @@ public final class SessionModel {
     public init(
         engineClient: any EngineClientProtocol,
         preferences: UserDefaults = .standard,
-        diagnosticsDirectory: URL? = nil
+        diagnosticsDirectory: URL? = nil,
+        idleStatusRefreshInterval: Duration = .seconds(1)
     ) {
         self.engineClient = engineClient
         self.preferences = preferences
+        self.idleStatusRefreshInterval = idleStatusRefreshInterval
         self.allowUnverifiedHardware = preferences.bool(forKey: Self.allowUnverifiedHardwareKey)
         self.diagnosticTimeline = SessionDiagnosticTimeline(
             sessionID: UUID().uuidString.lowercased(),
@@ -1530,10 +1624,7 @@ public final class SessionModel {
         pendingStatusRefresh = marker
         isRefreshingScannerStatus = true
         defer {
-            if pendingStatusRefresh?.id == marker.id {
-                pendingStatusRefresh = nil
-                isRefreshingScannerStatus = false
-            }
+            finishStatusRefresh(marker)
         }
 
         do {
@@ -1569,6 +1660,8 @@ public final class SessionModel {
             if !refeedRequired {
                 lastErrorMessage = nil
             }
+        } catch is CancellationError {
+            return
         } catch {
             guard pendingStatusRefresh?.id == marker.id,
                   connectionEpoch == marker.connectionEpoch
@@ -1578,6 +1671,67 @@ public final class SessionModel {
             recordOperationFailure(error, operation: "scanner.status")
             lastErrorMessage = Self.describe(error)
         }
+    }
+
+    /// One host-owned liveness probe serves every control event observer.
+    /// It is active only for an idle real scanner; simulator state already
+    /// arrives as events from explicit simulator operations.
+    func beginIdleScannerStatusObservation() {
+        idleStatusObserverCount += 1
+        scheduleIdleStatusRefreshIfNeeded()
+    }
+
+    func endIdleScannerStatusObservation() {
+        idleStatusObserverCount = max(0, idleStatusObserverCount - 1)
+        guard idleStatusObserverCount == 0 else { return }
+        // EngineClient cancellation stops waiting locally; it cannot retract
+        // a request the engine already received. Let an admitted probe finish
+        // so a following mutation cannot overlap it on the scanner.
+        guard !isRefreshingScannerStatus else { return }
+        idleStatusMonitorTask?.cancel()
+        idleStatusMonitorTask = nil
+    }
+
+    /// Mutating control requests wait for an already-admitted read-only
+    /// probe. This avoids both overlapping scanner requests and a transient
+    /// CONTROLLER_BUSY refusal caused solely by observation.
+    func waitForPendingStatusRefresh() async {
+        guard let marker = pendingStatusRefresh else { return }
+        await withCheckedContinuation { continuation in
+            pendingStatusRefreshWaiters[marker.id, default: []].append(continuation)
+        }
+    }
+
+    private func scheduleIdleStatusRefreshIfNeeded() {
+        guard idleStatusObserverCount > 0,
+              idleStatusMonitorTask == nil,
+              diagnosticUIConnected,
+              device?.kind == "real" else { return }
+        idleStatusMonitorTask = Task { @MainActor [weak self] in
+            guard let interval = self?.idleStatusRefreshInterval else { return }
+            do {
+                try await Task.sleep(for: interval)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            if self.mutatingOperationInFlight == nil,
+               self.status?.transport == "idle" {
+                await self.refreshScannerStatus()
+            }
+            guard !Task.isCancelled else { return }
+            self.idleStatusMonitorTask = nil
+            self.scheduleIdleStatusRefreshIfNeeded()
+        }
+    }
+
+    private func finishStatusRefresh(_ marker: PendingStatusRefresh) {
+        if pendingStatusRefresh?.id == marker.id {
+            pendingStatusRefresh = nil
+            isRefreshingScannerStatus = false
+        }
+        let waiters = pendingStatusRefreshWaiters.removeValue(forKey: marker.id) ?? []
+        for waiter in waiters { waiter.resume() }
     }
 
     /// Connects to a specific device by id. A nil target reuses the previous
@@ -1671,6 +1825,7 @@ public final class SessionModel {
                     "transport": result.status.transport,
                 ]
             )
+            scheduleIdleStatusRefreshIfNeeded()
         } catch is CancellationError {
             // A cancelled connect should silently restore the idle affordance.
             recordDiagnostic(event: "device.connect.cancelled")
@@ -1696,6 +1851,8 @@ public final class SessionModel {
             multisampleCoercionNote = nil
             refeedRequired = false
             clearMediaState()
+            idleStatusMonitorTask?.cancel()
+            idleStatusMonitorTask = nil
             recordDiagnostic(event: "device.disconnect.succeeded")
         } catch {
             recordOperationFailure(error, operation: "device.disconnect")
@@ -1725,10 +1882,10 @@ public final class SessionModel {
 
     /// Loads a simulated carrier. Previewing remains an explicit next action
     /// after a roll project exists, matching the real scanner's honest flow.
-    public func loadCarrier(_ carrier: SimulatedFilmCarrier, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async {
+    public func loadCarrier(_ carrier: SimulatedFilmCarrier, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil, stallAtFrame: Int? = nil) async {
         lastErrorMessage = nil
         do {
-            let params = LoadMediaParams(carrier: carrier.rawValue, previewFixture: previewFixture, abortAtFrame: abortAtFrame, abortCode: abortCode)
+            let params = LoadMediaParams(carrier: carrier.rawValue, previewFixture: previewFixture, abortAtFrame: abortAtFrame, abortCode: abortCode, stallAtFrame: stallAtFrame)
             let newStatus: ScannerStatus = try await engineClient.request("sim.loadMedia", params: params)
             status = newStatus
             clearMediaState()
@@ -1873,9 +2030,214 @@ public final class SessionModel {
     /// Starts a batch for the selected frames using the editable capture
     /// recipe currently shown in the Batch Settings inspector.
     public func startMockScan() async {
+        await startMockScan(frames: selectedFrames, passToken: nil)
+    }
+
+    /// Measures and durably stores one roll-wide RGB exposure authority
+    /// inside the currently held real preview session.
+    @discardableResult
+    public func solveExposure(
+        frameIndex: Int,
+        previewDerivedReference: Bool = false,
+        previewDerivedFrameIndices: Set<Int>? = nil
+    ) async -> RollExposureLock? {
+        guard mutatingOperationInFlight == nil,
+              pendingExposureSolve == nil,
+              project != nil,
+              hardwareMotionReadiness.allowsMotion,
+              hasCompletePreviewRegistration,
+              thumbnails[frameIndex] != nil,
+              validFrameIndices.contains(frameIndex)
+        else {
+            lastErrorMessage = hardwareMotionReadiness.allowsMotion
+                ? "Exposure measurement requires an open project and a frame from the completed preview."
+                : hardwareMotionReadiness.guidance
+            return nil
+        }
+        if previewDerivedReference,
+           let previewDerivedFrameIndices,
+           let project,
+           let incompatible = project.frames.first(where: { frame in
+               guard previewDerivedFrameIndices.contains(frame.index),
+                     let override = frame.captureOverride else { return false }
+               return !PreviewDerivedExposurePolicy.hasCompatibleCaptureGeometry(
+                   override,
+                   with: captureRecipe
+               )
+           }) {
+            lastErrorMessage =
+                "Preview-derived exposure requires frame \(incompatible.index) to use the roll's capture geometry."
+            return nil
+        }
+        let operationId = UUID().uuidString.lowercased()
+        mutatingOperationInFlight = "roll.solveExposure"
+        lastErrorMessage = nil
+        return await withCheckedContinuation { continuation in
+            let marker = PendingExposureSolve(
+                id: UUID(),
+                operationId: operationId,
+                frameIndex: frameIndex,
+                connectionEpoch: connectionEpoch,
+                continuation: continuation
+            )
+            pendingExposureSolve = marker
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let ack: RollSolveExposureAck = try await self.engineClient.request(
+                        "roll.solveExposure",
+                        params: RollSolveExposureParams(
+                            frameIndex: frameIndex,
+                            operationId: operationId,
+                            previewDerivedReference: previewDerivedReference
+                        )
+                    )
+                    if !ack.accepted {
+                        self.finishExposureSolve(marker, result: nil, message: "The engine did not accept exposure measurement.")
+                    }
+                } catch {
+                    self.recordOperationFailure(error, operation: "roll.solveExposure")
+                    self.finishExposureSolve(marker, result: nil, message: Self.describe(error))
+                }
+            }
+        }
+    }
+
+    public func applyPreviewDerivedExposure(
+        _ evidence: [PreviewDerivedExposurePolicy.Evidence],
+        reference: RollExposureLock
+    ) async -> Bool {
+        guard reference.source == "previewDerivedReference" else {
+            lastErrorMessage = "An explicit calibration exposure lock takes precedence over preview-derived exposure."
+            return false
+        }
+        do {
+            let adjustments = try PreviewDerivedExposurePolicy.adjustments(
+                evidence: evidence,
+                referenceFrameIndex: reference.slot,
+                referenceRGBRaw10ns: reference.rgbExposuresRaw10ns
+            )
+            for frameIndex in adjustments.keys.sorted() {
+                guard let adjustment = adjustments[frameIndex] else { continue }
+                let base = project?.frames.first(where: { $0.index == frameIndex })?.captureOverride
+                    ?? captureRecipe
+                await setFrameCaptureOverride(frameIndex, to: CaptureRecipe(
+                    resolutionDpi: base.resolutionDpi,
+                    bitDepth: base.bitDepth,
+                    multisamplePasses: base.multisamplePasses,
+                    channels: base.channels,
+                    exposureOverride10ns: adjustment.appliedRgbExposuresRaw10ns,
+                    previewExposureAdjustment: adjustment
+                ))
+                guard lastErrorMessage == nil else { return false }
+            }
+            return true
+        } catch {
+            lastErrorMessage = "Preview-derived exposure was refused: \(error)."
+            return false
+        }
+    }
+
+    public func verifyRoll(_ params: ControlRollVerifyParams) async -> CalibrationVerificationReport? {
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.verify", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.verify")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    public func collectRoll(_ params: ControlRollCollectParams) async -> CalibrationCollectionResult? {
+        let previous = beginMutatingOperation("roll.collect")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            var resolved = params
+            resolved.metadata.appVersion = Self.releaseStamp
+            resolved.metadata.host = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString) (\(HostArchitectureProvider.currentHostArchitecture.rawValue))"
+            resolved.metadata.firmware = device?.firmware
+            resolved.metadata.adapter = status?.adapter
+            return try await engineClient.request("roll.collect", params: resolved)
+        } catch {
+            recordOperationFailure(error, operation: "roll.collect")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    public func renderRoll(_ params: ControlRollRenderParams) async -> ControlRenderExportResult? {
+        let previous = beginMutatingOperation("roll.render")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.render", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.render")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    public func exportRoll(_ params: ControlRollExportParams) async -> ControlRenderExportResult? {
+        let previous = beginMutatingOperation("roll.export")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.export", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.export")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    /// Applies the current roll metadata to create-only derivative/export
+    /// copies. This deliberately does not call the legacy project metadata
+    /// transaction, which updates authoritative receipt bindings.
+    public func applyMetadataCopies(_ params: ControlRollMetadataApplyParams) async -> ControlMetadataApplyResult? {
+        let previous = beginMutatingOperation("roll.metadataApply")
+        defer { mutatingOperationInFlight = previous }
+        lastErrorMessage = nil
+        do {
+            return try await engineClient.request("roll.metadataApply", params: params)
+        } catch {
+            recordOperationFailure(error, operation: "roll.metadataApply")
+            lastErrorMessage = Self.describe(error)
+            return nil
+        }
+    }
+
+    private func finishExposureSolve(
+        _ marker: PendingExposureSolve,
+        result: RollExposureLock?,
+        message: String? = nil
+    ) {
+        guard pendingExposureSolve?.id == marker.id else { return }
+        pendingExposureSolve = nil
+        mutatingOperationInFlight = nil
+        if let message { lastErrorMessage = message }
+        marker.continuation.resume(returning: result)
+    }
+
+    /// Control-channel entry point for an explicit frame set and optional
+    /// calibration pass token. It shares the GUI's complete readiness and
+    /// manual-review path rather than issuing a second scan-start flow.
+    public func startMockScan(
+        frames: [Int],
+        passToken: String?,
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = []
+    ) async {
         let previous = beginMutatingOperation("scan.start")
         defer { mutatingOperationInFlight = previous }
-        _ = await startScanOrRequestManualReview(frames: selectedFrames)
+        _ = await startScanOrRequestManualReview(
+            frames: frames,
+            passToken: passToken,
+            onFrameFailure: onFrameFailure,
+            allowedMeterRefusalSlots: allowedMeterRefusalSlots
+        )
     }
 
     /// Scans exactly one frame regardless of the grid's current selection —
@@ -2251,7 +2613,10 @@ public final class SessionModel {
 
         do {
             guard let result = try await dispatchScanStart(
-                frames: authorization.frames
+                frames: authorization.frames,
+                passToken: authorization.passToken,
+                onFrameFailure: authorization.onFrameFailure,
+                allowedMeterRefusalSlots: authorization.allowedMeterRefusalSlots
             ) else {
                 return false
             }
@@ -2285,7 +2650,11 @@ public final class SessionModel {
     /// forgotten or delayed UI confirmation cannot bypass it.
     @discardableResult
     private func startScanOrRequestManualReview(
-        frames: [Int], resumingBatch: Bool = false
+        frames: [Int],
+        resumingBatch: Bool = false,
+        passToken: String? = nil,
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = []
     ) async -> Bool {
         guard !isChangingProject, !isResumingBatch || resumingBatch else { return false }
         guard pendingAttendedScanApproval == nil else { return false }
@@ -2337,6 +2706,9 @@ public final class SessionModel {
 
             if let current = pendingManualReviewScanAuthorization,
                current.frames == frames,
+               current.passToken == passToken,
+               current.onFrameFailure == onFrameFailure,
+               current.allowedMeterRefusalSlots == allowedMeterRefusalSlots,
                current.requirements == requirements,
                current.confirmationRequirements == confirmationRequirements,
                current.previewOperationId == previewOperationId,
@@ -2357,6 +2729,9 @@ public final class SessionModel {
                 PendingManualReviewScanAuthorization(
                     requestId: request.id,
                     frames: request.frames,
+                    passToken: passToken,
+                    onFrameFailure: onFrameFailure,
+                    allowedMeterRefusalSlots: allowedMeterRefusalSlots,
                     requirements: requirements,
                     confirmationRequirements: confirmationRequirements,
                     previewOperationId: previewOperationId,
@@ -2383,7 +2758,12 @@ public final class SessionModel {
 
         clearPendingManualReviewScan()
         do {
-            guard let result = try await dispatchScanStart(frames: frames) else {
+            guard let result = try await dispatchScanStart(
+                frames: frames,
+                passToken: passToken,
+                onFrameFailure: onFrameFailure,
+                allowedMeterRefusalSlots: allowedMeterRefusalSlots
+            ) else {
                 return false
             }
             beginJob(id: result.jobId, frames: frames)
@@ -2796,6 +3176,8 @@ public final class SessionModel {
     public func createProject(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess) async {
         guard beginProjectLifecycleChange() else { return }
         defer { isChangingProject = false }
+        let previous = beginMutatingOperation("project.create")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         // Save Roll attaches the preview already on screen to its first
         // project. Keep that preview's scan choices across this one boundary;
@@ -2971,6 +3353,31 @@ public final class SessionModel {
             frames: requestedFrames
         )
         return started || pendingManualReviewScan?.frames == requestedFrames
+    }
+
+    /// Releases only the in-memory project selection used by hopper mode.
+    /// The completed manifest and its evidence remain untouched on disk.
+    /// `project.create` replaces the engine's active project only after the
+    /// next manifest is created, so no separate engine mutation is needed.
+    public func closeCompletedProjectAfterEject() {
+        lastErrorMessage = nil
+        guard project != nil else {
+            lastErrorMessage = "There is no completed roll to close."
+            return
+        }
+        guard jobId == nil, !isJobActive,
+              status?.connected == true,
+              status?.transport == "idle",
+              status?.mediaLoaded == false,
+              device?.kind == "simulated" || status?.filmPresent == false else {
+            lastErrorMessage = "The completed roll can close only after its job is terminal, the scanner is idle, and eject has confirmed film absent."
+            return
+        }
+        guard beginProjectLifecycleChange() else { return }
+        defer { isChangingProject = false }
+        resetProjectScopedScanState()
+        project = nil
+        projectDirectory = nil
     }
 
     /// Moves contact-sheet crop and presentation geometry chosen before Save
@@ -4809,6 +5216,37 @@ public final class SessionModel {
                     self.refeedRequired = true
                 }
             }
+        case "roll.exposureSolved":
+            decodeAndApply(event, as: RollExposureSolvedPayload.self) { payload in
+                guard let marker = self.pendingExposureSolve,
+                      marker.operationId == payload.operationId,
+                      marker.frameIndex == payload.solution.slot,
+                      marker.connectionEpoch == self.connectionEpoch,
+                      payload.project.id == self.project?.id
+                else { return }
+                self.project = payload.project
+                self.finishExposureSolve(marker, result: payload.solution)
+            }
+        case "roll.exposureError":
+            decodeAndApply(event, as: RollExposureErrorPayload.self) { payload in
+                guard let marker = self.pendingExposureSolve,
+                      marker.operationId == payload.operationId,
+                      marker.frameIndex == payload.frameIndex,
+                      marker.connectionEpoch == self.connectionEpoch
+                else { return }
+                let error = EngineRequestError(
+                    code: payload.code,
+                    message: payload.message,
+                recoverable: payload.recoverable,
+                    details: payload.details
+                )
+                self.recordOperationFailure(error, operation: "roll.solveExposure")
+                self.finishExposureSolve(
+                    marker,
+                    result: nil,
+                    message: "\(payload.code): \(payload.message)"
+                )
+            }
         case "scan.jobState":
             decodeAndApply(event, as: JobStatePayload.self) { self.applyJobState($0, source: event) }
         case "scan.progress":
@@ -5034,7 +5472,12 @@ public final class SessionModel {
     /// connection that authorized it still owns the session. Events may race
     /// ahead of the response and are buffered during this exact interval;
     /// outside it, unknown-job events are dropped.
-    func dispatchScanStart(frames: [Int]) async throws -> ScanStartResult? {
+    func dispatchScanStart(
+        frames: [Int],
+        passToken: String? = nil,
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = []
+    ) async throws -> ScanStartResult? {
         guard pendingScanStart == nil else {
             recordDiagnostic(
                 event: "scan.start.ignored",
@@ -5051,7 +5494,10 @@ public final class SessionModel {
             id: UUID(),
             connectionEpoch: connectionEpoch,
             previewOperationId: previewOperationId,
-            frames: frames
+            frames: frames,
+            passToken: passToken,
+            onFrameFailure: onFrameFailure,
+            allowedMeterRefusalSlots: allowedMeterRefusalSlots
         )
         pendingScanStart = marker
         defer {
@@ -5074,6 +5520,9 @@ public final class SessionModel {
 
         let params = ScanStartParams(
             frames: frames,
+            onFrameFailure: onFrameFailure,
+            allowedMeterRefusalSlots: allowedMeterRefusalSlots,
+            passToken: passToken,
             recipe: captureRecipe,
             processing: processingRecipe,
             output: outputRecipe
@@ -5114,6 +5563,9 @@ public final class SessionModel {
             && pendingScanStart.connectionEpoch == marker.connectionEpoch
             && pendingScanStart.previewOperationId == marker.previewOperationId
             && pendingScanStart.frames == marker.frames
+            && pendingScanStart.passToken == marker.passToken
+            && pendingScanStart.onFrameFailure == marker.onFrameFailure
+            && pendingScanStart.allowedMeterRefusalSlots == marker.allowedMeterRefusalSlots
             && marker.frames == frames
             && connectionEpoch == marker.connectionEpoch
             && diagnosticUIConnected
@@ -5218,6 +5670,9 @@ public final class SessionModel {
               pendingScanStart.connectionEpoch == marker.connectionEpoch,
               pendingScanStart.previewOperationId == marker.previewOperationId,
               pendingScanStart.frames == marker.frames,
+              pendingScanStart.passToken == marker.passToken,
+              pendingScanStart.onFrameFailure == marker.onFrameFailure,
+              pendingScanStart.allowedMeterRefusalSlots == marker.allowedMeterRefusalSlots,
               marker.frames == frames,
               connectionEpoch == marker.connectionEpoch,
               diagnosticUIConnected,
@@ -5372,6 +5827,7 @@ public final class SessionModel {
         jobState = ScanCompletionPolicy.resolveJobState(current: jobState, summary: payload.summary)
 
         if payload.summary.completed.isEmpty,
+           payload.summary.skipped.isEmpty,
            completedAuthorization?.frames.isEmpty == false {
             let failedErrors = payload.summary.failed.compactMap {
                 frameErrors[$0]
@@ -5474,6 +5930,7 @@ public final class SessionModel {
                 frameErrorCodes: frameErrorCodes,
                 frameErrorMessages: frameErrorMessages,
                 notAttemptedFrames: payload.summary.notAttempted,
+                skippedFrames: payload.summary.skipped,
                 finishedAt: ISO8601DateFormatter().string(from: Date())
             ))
             if terminalJobHistory.count > Self.maximumTerminalJobHistory {
@@ -5543,6 +6000,8 @@ public final class SessionModel {
         ].joined(separator: "; ")
     }
 
+    public var diagnosticSessionId: String { diagnosticTimeline.sessionID }
+
     private var diagnosticLogRelativePath: String? {
         guard let logURL = diagnosticTimeline.logURL else { return nil }
         return "~/.scanstudio/diagnostics/\(logURL.lastPathComponent)"
@@ -5553,6 +6012,87 @@ public final class SessionModel {
     /// public issue draft -- see `diagnosticLogRelativePath` for that form.
     private var diagnosticLogPath: String? {
         diagnosticTimeline.logURL?.path
+    }
+
+    /// Read-only evidence authorities for this host session. Every present
+    /// path comes from the component that created it; unavailable optional
+    /// sources stay explicit rather than being guessed from a basename or a
+    /// newest-file search.
+    public func sessionEvidenceInventory() async -> ControlSessionInventoryResult {
+        let diagnostics: ControlSessionEvidenceEntry
+        if let logURL = diagnosticTimeline.logURL {
+            diagnostics = .init(
+                entryName: "diagnostics.jsonl",
+                sourceKind: "appDiagnostics",
+                path: logURL.path,
+                allowedRoot: logURL.deletingLastPathComponent().path
+            )
+        } else {
+            diagnostics = .init(
+                entryName: "diagnostics.jsonl",
+                sourceKind: "appDiagnostics",
+                missingReason: "this host session has no persisted diagnostic log"
+            )
+        }
+        let telemetry: ControlSessionEvidenceEntry
+        let attemptJournals: [ControlSessionEvidenceEntry]
+        let bridgeVersion: String?
+        do {
+            let engineInventory: EngineSessionInventoryResult = try await engineClient.request(
+                "session.inventory",
+                params: EmptyParams()
+            )
+            if let authority = engineInventory.bridgeTelemetry {
+                telemetry = .init(
+                    entryName: "bridge-telemetry.jsonl",
+                    sourceKind: "bridgeTelemetry",
+                    path: authority.path,
+                    allowedRoot: authority.allowedRoot
+                )
+            } else {
+                telemetry = .init(
+                    entryName: "bridge-telemetry.jsonl",
+                    sourceKind: "bridgeTelemetry",
+                    missingReason: "this engine session has no bridge telemetry authority"
+                )
+            }
+            let retainedJournals = engineInventory.attemptJournals ?? []
+            bridgeVersion = engineInventory.bridgeVersion
+            if retainedJournals.isEmpty {
+                attemptJournals = [.init(
+                    entryName: "attempt-journals",
+                    sourceKind: "attemptJournals",
+                    missingReason: "no finalized capture-evidence journal is retained by this host session"
+                )]
+            } else {
+                attemptJournals = retainedJournals.map { authority in
+                    .init(
+                        entryName: authority.entryName,
+                        sourceKind: "attemptJournals",
+                        path: authority.path,
+                        allowedRoot: authority.allowedRoot,
+                        expectedSha256: authority.sha256
+                    )
+                }
+            }
+        } catch {
+            bridgeVersion = nil
+            telemetry = .init(
+                entryName: "bridge-telemetry.jsonl",
+                sourceKind: "bridgeTelemetry",
+                missingReason: "the engine did not expose an exact bridge telemetry authority"
+            )
+            attemptJournals = [.init(
+                entryName: "attempt-journals",
+                sourceKind: "attemptJournals",
+                missingReason: "the engine did not expose an exact finalized capture-evidence journal inventory"
+            )]
+        }
+        return ControlSessionInventoryResult(
+            diagnosticSessionId: diagnosticTimeline.sessionID,
+            entries: [diagnostics, telemetry] + attemptJournals,
+            bridgeVersion: bridgeVersion
+        )
     }
 
     /// The one preview tile that can be explicitly opted into for the next
@@ -5690,6 +6230,21 @@ public final class SessionModel {
         )
     }
 
+    public func recordControlRequest(
+        command: String,
+        requestID: UInt64,
+        correlationToken: String
+    ) {
+        recordDiagnostic(
+            event: "control.request",
+            fields: [
+                "command": command,
+                "controlRequestId": String(requestID),
+                "correlationToken": correlationToken,
+            ]
+        )
+    }
+
     /// A scanner operation can prove that the bridge has no live device
     /// owner even while the app still holds an older successful connection
     /// result. That refusal is authoritative: clear the stale READY state and
@@ -5815,6 +6370,8 @@ public final class SessionModel {
                 + previousDetail
         }
         advanceConnectionEpoch()
+        idleStatusMonitorTask?.cancel()
+        idleStatusMonitorTask = nil
         device = nil
         status = nil
         multisampleCoercionNote = nil
@@ -5834,6 +6391,11 @@ public final class SessionModel {
     /// bridge owner. This is local bookkeeping only: it never opens a device,
     /// retries motion, or sends a scanner command.
     private func advanceConnectionEpoch() {
+        if let marker = pendingExposureSolve {
+            pendingExposureSolve = nil
+            mutatingOperationInFlight = nil
+            marker.continuation.resume(returning: nil)
+        }
         connectionEpoch &+= 1
         projectSnapshotGeneration &+= 1
         pendingFramesRequestID = nil
@@ -5846,8 +6408,9 @@ public final class SessionModel {
         clearFrameAlignmentSessionState()
         pendingManualReviewApproval = nil
         approvingFrameIndex = nil
-        pendingStatusRefresh = nil
-        isRefreshingScannerStatus = false
+        if let marker = pendingStatusRefresh {
+            finishStatusRefresh(marker)
+        }
         bufferedJobEvents.removeAll()
     }
 

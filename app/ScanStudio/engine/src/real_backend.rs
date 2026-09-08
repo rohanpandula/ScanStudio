@@ -22,7 +22,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::bridge_protocol::{BridgeHelloParams, BridgeHelloResult, BridgeRequest};
+use crate::bridge_protocol::{
+    BridgeHelloParams, BridgeHelloResult, BridgeRequest, BridgeRequestMetadata,
+};
 
 /// Fixed, short timeout for the best-effort `bridge.shutdown` attempted on
 /// drop — independent of whatever `request_timeout` the client was
@@ -501,6 +503,9 @@ impl BridgeClient {
                 bridge_version: String::new(),
                 protocol_version: 0,
                 capabilities: vec![],
+                telemetry_session_id: None,
+                telemetry_path: None,
+                telemetry_root: None,
             }),
             alive,
             generation,
@@ -558,7 +563,16 @@ impl BridgeClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, BridgeCallError> {
-        self.call_with_timeout(method, params, self.request_timeout)
+        self.call_correlated(method, params, None)
+    }
+
+    fn call_correlated(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        metadata: Option<BridgeRequestMetadata>,
+    ) -> Result<serde_json::Value, BridgeCallError> {
+        self.call_with_timeout(method, params, self.request_timeout, metadata)
     }
 
     /// Like [`call`](Self::call), but bounded by an explicit `deadline`
@@ -574,7 +588,17 @@ impl BridgeClient {
         params: serde_json::Value,
         deadline: Duration,
     ) -> Result<serde_json::Value, BridgeCallError> {
-        self.call_with_timeout(method, params, deadline)
+        self.call_with_deadline_correlated(method, params, deadline, None)
+    }
+
+    fn call_with_deadline_correlated(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: Duration,
+        metadata: Option<BridgeRequestMetadata>,
+    ) -> Result<serde_json::Value, BridgeCallError> {
+        self.call_with_timeout(method, params, deadline, metadata)
     }
 
     fn call_with_timeout(
@@ -582,6 +606,7 @@ impl BridgeClient {
         method: &str,
         params: serde_json::Value,
         timeout: Duration,
+        metadata: Option<BridgeRequestMetadata>,
     ) -> Result<serde_json::Value, BridgeCallError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel::<serde_json::Value>();
@@ -594,6 +619,7 @@ impl BridgeClient {
             id,
             method: method.to_string(),
             params,
+            metadata,
         }) {
             Ok(l) => l,
             Err(err) => {
@@ -849,7 +875,12 @@ impl Drop for BridgeClient {
         // worker has exited. If it cannot acknowledge in this short window,
         // leave it alive with its inherited ownership fence rather than
         // killing a potentially in-flight USB transaction.
-        let _ = self.call_with_timeout("bridge.shutdown", serde_json::json!({}), SHUTDOWN_TIMEOUT);
+        let _ = self.call_with_timeout(
+            "bridge.shutdown",
+            serde_json::json!({}),
+            SHUTDOWN_TIMEOUT,
+            None,
+        );
         let _ = self.reap_child_if_exited();
     }
 }
@@ -883,8 +914,18 @@ use serde::Serialize;
 /// `ScannerBackend` method translates the engine's PROTOCOL.md-shaped call
 /// into a BRIDGE.md request/event sequence, and translates the response
 /// back.
+#[derive(Debug, Clone)]
+struct SessionEvidencePackage {
+    job_id: String,
+    result: crate::evidence_package::EvidencePackageResult,
+}
+
 pub struct RealLs5000 {
     bridge: BridgeClient,
+    /// Updated by the engine's single request-dispatch thread and consumed
+    /// synchronously by bridge calls admitted for that request. Preview,
+    /// exposure, and scan workers only consume events and never read it.
+    request_correlation: Mutex<Option<String>>,
     /// Monotonic identity for each successful explicit `device.open`.
     /// Async workers capture it so a late worker from an old connection can
     /// never invalidate a newer connection.
@@ -926,6 +967,11 @@ pub struct RealLs5000 {
     /// of issuing `device.status`, which could itself time out and quarantine
     /// the bridge session while the scanner is mid-USB transaction.
     active_scan_job_id: Arc<Mutex<Option<String>>>,
+    /// The sole reader of an accepted roll.solveExposure terminal event.
+    active_exposure_operation_id: Arc<Mutex<Option<String>>>,
+    /// Journal identities retained only after the package manifest commits.
+    /// Project changes clear this; no historical pathname discovery occurs.
+    session_evidence_packages: Mutex<Vec<SessionEvidencePackage>>,
     /// Frontend build identity reported by the one successful engine.hello
     /// for this process. It is metadata only: never used for hardware policy,
     /// and absent/invalid values merely make #106 evidence unavailable.
@@ -2521,7 +2567,7 @@ impl StableBridgeInputs {
         } else {
             None
         };
-        let meter = if output.archive.enabled {
+        let meter = if output.archive.enabled || output.raw_export.enabled {
             receipt
                 .meter_rgbi_path
                 .as_deref()
@@ -2621,6 +2667,89 @@ impl StableBridgeInputs {
 }
 
 impl RealLs5000 {
+    pub(crate) fn set_request_correlation(&self, correlation_token: Option<&str>) {
+        *self.request_correlation.lock().unwrap() = correlation_token.map(str::to_string);
+    }
+
+    fn request_metadata(&self) -> Option<BridgeRequestMetadata> {
+        self.request_correlation
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|correlation_token| BridgeRequestMetadata { correlation_token })
+    }
+
+    pub(crate) fn telemetry_evidence_identity(
+        &self,
+    ) -> Option<BridgeTelemetryEvidenceIdentity> {
+        let hello = self.bridge.hello_info();
+        Some(BridgeTelemetryEvidenceIdentity {
+            session_id: hello.telemetry_session_id?,
+            path: hello.telemetry_path?,
+            allowed_root: hello.telemetry_root?,
+        })
+    }
+
+    pub(crate) fn bridge_version(&self) -> String {
+        self.bridge.hello_info().bridge_version
+    }
+
+    pub(crate) fn attempt_journal_evidence(
+        &self,
+    ) -> Vec<crate::protocol::SessionEvidenceFileAuthority> {
+        let packages = self.session_evidence_packages.lock().unwrap();
+        let mut files = Vec::new();
+        for (package_index, package) in packages.iter().enumerate() {
+            let Some(root) = package.result.path.as_deref() else {
+                continue;
+            };
+            let root = std::path::Path::new(root);
+            if !root.is_absolute() {
+                continue;
+            }
+            for journal in &package.result.journal_files {
+                let relative = std::path::Path::new(&journal.package_path);
+                if relative.is_absolute()
+                    || relative.components().any(|component| {
+                        !matches!(component, std::path::Component::Normal(_))
+                    })
+                {
+                    continue;
+                }
+                files.push(crate::protocol::SessionEvidenceFileAuthority {
+                    entry_name: format!(
+                        "attempt-journals/{}/package-{:04}/{}",
+                        package.job_id,
+                        package_index + 1,
+                        journal.package_path
+                    ),
+                    path: root.join(relative).display().to_string(),
+                    allowed_root: root.display().to_string(),
+                    sha256: journal.sha256.clone(),
+                });
+            }
+        }
+        files.sort_by(|left, right| left.entry_name.cmp(&right.entry_name));
+        files
+    }
+
+    pub(crate) fn clear_session_evidence(&self) {
+        self.session_evidence_packages.lock().unwrap().clear();
+    }
+
+    fn retain_session_evidence(
+        &self,
+        job_id: &str,
+        results: &[crate::evidence_package::EvidencePackageResult],
+    ) {
+        let mut packages = self.session_evidence_packages.lock().unwrap();
+        packages.retain(|package| package.job_id != job_id);
+        packages.extend(results.iter().cloned().map(|result| SessionEvidencePackage {
+            job_id: job_id.to_string(),
+            result,
+        }));
+    }
+
     /// Spawns `bridge_cmd`, completes the `bridge.hello` handshake (via
     /// `BridgeClient::spawn`), and resolves the one device `device.list`
     /// reports. Never returns a partially-initialized backend — every
@@ -2709,6 +2838,7 @@ impl RealLs5000 {
         let detected_holder = derive_detected_holder(&bridge_device.capabilities);
         Ok(RealLs5000 {
             bridge,
+            request_correlation: Mutex::new(None),
             next_session_epoch: AtomicU64::new(0),
             active_session_epoch: AtomicU64::new(0),
             active_session_bridge_generation: AtomicU64::new(0),
@@ -2718,6 +2848,8 @@ impl RealLs5000 {
             preview_reader_detach_delay: Duration::ZERO,
             preview_terminal_session_loss_test_hook: false,
             active_scan_job_id: Arc::new(Mutex::new(None)),
+            active_exposure_operation_id: Arc::new(Mutex::new(None)),
+            session_evidence_packages: Mutex::new(Vec::new()),
             client_build: Mutex::new(None),
             active_device: Mutex::new(None),
             device_id: bridge_device.device_id,
@@ -2945,6 +3077,12 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<u64, EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "an exposure measurement still owns the bridge event stream",
+            ));
+        }
         let mut state = self.preview_approval_state.lock().unwrap();
         if state.active.is_some() {
             return Err(EngineError::new(
@@ -3138,6 +3276,12 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<(), EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "an exposure measurement still owns the bridge event stream",
+            ));
+        }
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.as_ref().is_some_and(|active| {
             active.session_epoch == session_epoch && active.bridge_generation == bridge_generation
@@ -3158,6 +3302,12 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<(), EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "the exposure measurement has not emitted a terminal result",
+            ));
+        }
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.as_ref().is_some_and(|active| {
             active.session_epoch == session_epoch && active.bridge_generation == bridge_generation
@@ -3181,6 +3331,12 @@ impl RealLs5000 {
     }
 
     fn ensure_preview_stream_allows_connect_or_eject(&self) -> Result<(), EngineError> {
+        if self.active_exposure_operation_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(
+                ErrorCode::ScannerBusy,
+                "an exposure measurement still owns the bridge event stream",
+            ));
+        }
         let state = self.preview_approval_state.lock().unwrap();
         if state.active.is_some() || state.poisoned.is_some() {
             return Err(EngineError::new(
@@ -3311,8 +3467,15 @@ impl RealLs5000 {
             .flatten()
             .map(str::to_string);
         let call_result = match options.deadline {
-            Some(deadline) => self.bridge.call_with_deadline(method, params, deadline),
-            None => self.bridge.call(method, params),
+            Some(deadline) => self.bridge.call_with_deadline_correlated(
+                method,
+                params,
+                deadline,
+                self.request_metadata(),
+            ),
+            None => self
+                .bridge
+                .call_correlated(method, params, self.request_metadata()),
         };
         let result = match call_result {
             Ok(result) => result,
@@ -3445,18 +3608,42 @@ impl RealLs5000 {
         session_epoch: u64,
         bridge_generation: u64,
     ) -> Result<ScannerStatus, EngineError> {
+        let preview_reader_owns_events = {
+            let state = self.preview_approval_state.lock().unwrap();
+            state.active.as_ref().is_some_and(|active| {
+                active.session_epoch == session_epoch
+                    && active.bridge_generation == bridge_generation
+            }) || state.poisoned.as_ref().is_some_and(|poisoned| {
+                poisoned.session_epoch == session_epoch
+                    && poisoned.bridge_generation == bridge_generation
+                    && !poisoned.terminal_drained
+            })
+        };
         self.fresh_status_for_session_with_options(
             session_epoch,
             bridge_generation,
-            SessionCallOptions::default(),
+            if preview_reader_owns_events {
+                // A concurrent status read must not outlive the preview
+                // reader that gates reconnect. Keep the normal control-plane
+                // bound while that exact stream is active.
+                SessionCallOptions::default()
+            } else {
+                SessionCallOptions {
+                    // A held child's TEST UNIT READY may use the same bounded
+                    // startup-attention settle loop as the pre-preview probe.
+                    deadline: Some(PREVIEW_FILM_PROBE_DEADLINE),
+                    ..SessionCallOptions::default()
+                }
+            },
         )
     }
 
     /// `fresh_status_for_session` with a caller-supplied call bound. The
     /// pre-preview film probe passes [`PREVIEW_FILM_PROBE_DEADLINE`] because
     /// its status read can legitimately wait on the driver's settle loop;
-    /// everything else keeps the generic control-plane bound via the
-    /// zero-argument wrapper above.
+    /// ordinary status reads use that same bound after preview; status while
+    /// an active preview owns the event stream keeps the generic control bound
+    /// so its failure cannot outlive and silently release the reader gate.
     fn fresh_status_for_session_with_options(
         &self,
         session_epoch: u64,
@@ -3688,6 +3875,241 @@ impl RealLs5000 {
         };
         let value = serde_json::to_value(params).expect("BridgeRollApproveParams serializes");
         self.call_session_scoped(session_epoch, bridge_generation, "roll.approve", value)?;
+        Ok(())
+    }
+
+    /// Starts the driver's meter-only continuation inside the exact held
+    /// preview session. One worker owns the untagged terminal event until it
+    /// either persists the resulting roll authority or emits a typed error.
+    pub fn roll_solve_exposure(
+        backend: &Arc<Self>,
+        frame_index: u32,
+        operation_id: String,
+        preview_derived_reference: bool,
+        project_directory: std::fs::File,
+        project_display_path: std::path::PathBuf,
+        event_tx: mpsc::Sender<String>,
+    ) -> Result<(), EngineError> {
+        let (session_epoch, bridge_generation) = backend.active_session_identity()?;
+        let binding = backend.preview_approval_state.lock().unwrap().completed.clone();
+        if !binding.as_ref().is_some_and(|binding| {
+            binding.session_epoch == session_epoch
+                && binding.bridge_generation == bridge_generation
+                && binding.thumbnails.contains_key(&frame_index)
+        }) {
+            return Err(EngineError::new(
+                ErrorCode::NoPreview,
+                "frameIndex must identify a frame in the completed preview for this session",
+            ));
+        }
+        if backend.active_scan_job_id.lock().unwrap().is_some() {
+            return Err(EngineError::new(ErrorCode::ScannerBusy, "a scan job is active"));
+        }
+        {
+            let mut active = backend.active_exposure_operation_id.lock().unwrap();
+            if active.is_some() {
+                return Err(EngineError::new(
+                    ErrorCode::ScannerBusy,
+                    "an exposure measurement is already active",
+                ));
+            }
+            *active = Some(operation_id.clone());
+        }
+
+        let params = serde_json::to_value(crate::bridge_protocol::BridgeRollSolveExposureParams {
+            slot: frame_index,
+        })
+        .expect("serializing roll.solveExposure params cannot fail");
+        let accepted = backend.call_session_scoped(
+            session_epoch,
+            bridge_generation,
+            "roll.solveExposure",
+            params,
+        );
+        let accepted_value = match accepted {
+            Ok(value) => value,
+            Err(error) => {
+                *backend.active_exposure_operation_id.lock().unwrap() = None;
+                return Err(error);
+            }
+        };
+        let accepted: crate::bridge_protocol::BridgeRollSolveExposureAck =
+            serde_json::from_value(accepted_value).map_err(|error| {
+                backend.invalidate_current_session();
+                EngineError::new(
+                    ErrorCode::Internal,
+                    format!("malformed roll.solveExposure result: {error}; reconnect required"),
+                )
+            })?;
+        if !accepted.accepted {
+            backend.invalidate_current_session();
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                "roll.solveExposure returned an invalid non-acceptance; reconnect required",
+            ));
+        }
+
+        let backend = Arc::clone(backend);
+        thread::spawn(move || {
+            let deadline = Instant::now() + backend.preview_silence_deadline;
+            let mut release_event_reader = false;
+            loop {
+                if !backend.session_identity_is_current(session_epoch, bridge_generation) {
+                    backend.invalidate_async_session(
+                        session_epoch,
+                        &event_tx,
+                        Some(operation_id.clone()),
+                    );
+                    emit_exposure_error(
+                        &event_tx,
+                        &operation_id,
+                        frame_index,
+                        backend.session_ownership_lost_error(
+                            "roll.solveExposure",
+                            session_epoch,
+                            bridge_generation,
+                            "session ownership changed before the terminal event",
+                        ),
+                    );
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    backend.invalidate_async_session(
+                        session_epoch,
+                        &event_tx,
+                        Some(operation_id.clone()),
+                    );
+                    emit_exposure_error(
+                        &event_tx,
+                        &operation_id,
+                        frame_index,
+                        EngineError::new(
+                            ErrorCode::Internal,
+                            "roll.solveExposure timed out before a terminal event",
+                        ),
+                    );
+                    break;
+                }
+                match backend
+                    .bridge
+                    .recv_event(remaining.min(EVENT_STREAM_OWNERSHIP_RECHECK))
+                {
+                    Ok(value) => match value.get("event").and_then(|value| value.as_str()) {
+                        Some("roll.exposureSolved") => {
+                            let result = value
+                                .get("payload")
+                                .cloned()
+                                .ok_or_else(|| EngineError::new(ErrorCode::Internal, "roll.exposureSolved omitted payload"))
+                                .and_then(|payload| {
+                                    serde_json::from_value::<crate::bridge_protocol::BridgeExposureSolvedPayload>(payload)
+                                        .map_err(|error| EngineError::new(ErrorCode::Internal, format!("malformed roll.exposureSolved payload: {error}")))
+                                })
+                                .and_then(|payload| validate_exposure_solution(
+                                    payload.solution,
+                                    frame_index,
+                                    preview_derived_reference,
+                                ))
+                                .and_then(|solution| {
+                                    if !backend.session_identity_is_current(
+                                        session_epoch,
+                                        bridge_generation,
+                                    ) {
+                                        return Err(backend.session_ownership_lost_error(
+                                            "roll.solveExposure",
+                                            session_epoch,
+                                            bridge_generation,
+                                            "session ownership changed before exposure persistence",
+                                        ));
+                                    }
+                                    crate::manifest::persist_roll_exposure_lock_at(
+                                        &project_directory,
+                                        &project_display_path,
+                                        solution.clone(),
+                                    )
+                                    .map(|project| (solution, project))
+                                });
+                            match result {
+                                Ok((solution, project)) => {
+                                    release_event_reader = true;
+                                    emit(
+                                        &event_tx,
+                                        "roll.exposureSolved",
+                                        crate::protocol::RollExposureSolvedPayload {
+                                            operation_id: operation_id.clone(),
+                                            solution,
+                                            project,
+                                        },
+                                    );
+                                }
+                                Err(error) => {
+                                    backend.invalidate_async_session(
+                                        session_epoch,
+                                        &event_tx,
+                                        Some(operation_id.clone()),
+                                    );
+                                    emit_exposure_error(
+                                        &event_tx,
+                                        &operation_id,
+                                        frame_index,
+                                        error,
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                        Some("roll.exposureError") => {
+                            let parsed = value
+                                .get("payload")
+                                .cloned()
+                                .and_then(|payload| serde_json::from_value::<crate::bridge_protocol::BridgeExposureErrorPayload>(payload).ok());
+                            let error = parsed
+                                .as_ref()
+                                .map(|payload| {
+                                    EngineError::new(
+                                        map_bridge_error_code_str(&payload.code),
+                                        payload.message.clone(),
+                                    )
+                                    .with_recoverable(map_bridge_error_code_recoverable(&payload.code))
+                                    .with_details(payload.details.clone())
+                                })
+                                .unwrap_or_else(|| EngineError::new(ErrorCode::Internal, "malformed roll.exposureError payload"));
+                            if parsed.is_some() {
+                                backend.clear_completed_preview_approval_for_epoch(session_epoch);
+                                release_event_reader = true;
+                            } else {
+                                backend.invalidate_async_session(
+                                    session_epoch,
+                                    &event_tx,
+                                    Some(operation_id.clone()),
+                                );
+                            }
+                            emit_exposure_error(&event_tx, &operation_id, frame_index, error);
+                            break;
+                        }
+                        _ => continue,
+                    },
+                    Err(BridgeCallError::Timeout) => continue,
+                    Err(error) => {
+                        backend.invalidate_async_session(
+                            session_epoch,
+                            &event_tx,
+                            Some(operation_id.clone()),
+                        );
+                        emit_exposure_error(
+                            &event_tx,
+                            &operation_id,
+                            frame_index,
+                            map_bridge_error(error),
+                        );
+                        break;
+                    }
+                }
+            }
+            if release_event_reader {
+                *backend.active_exposure_operation_id.lock().unwrap() = None;
+            }
+        });
         Ok(())
     }
 
@@ -3967,10 +4389,11 @@ impl ScannerBackend for RealLs5000 {
         };
         let result_value = self
             .bridge
-            .call_with_deadline(
+            .call_with_deadline_correlated(
                 "device.open",
                 open_params,
                 DEVICE_OPEN_CALL_DEADLINE,
+                self.request_metadata(),
             )
             .map_err(|error| match error {
                 bridge_error @ BridgeCallError::BridgeError { .. } => {
@@ -4553,6 +4976,8 @@ impl ScannerBackend for RealLs5000 {
     fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
+        allowed_meter_refusal_slots: Vec<u32>,
+        pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
         output: OutputRecipe,
@@ -4598,6 +5023,8 @@ impl ScannerBackend for RealLs5000 {
         dispatch_real_scan_with_output_authorities(
             backend,
             frames,
+            allowed_meter_refusal_slots,
+            pass_token,
             recipe,
             processing,
             output,
@@ -4681,6 +5108,23 @@ fn prepare_real_scan_start(
     }
     let processing = processing.effective();
     let recipe = recipe.effective_for_process(processing.film_process);
+    if processing.auto_exposure_each_frame && recipe.exposure_override_10ns.is_some() {
+        return Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            "exposureOverride10ns requires autoExposureEachFrame=false",
+        ));
+    }
+    if let Some(exposures) = recipe.exposure_override_10ns {
+        if exposures
+            .iter()
+            .any(|value| !(50_000..=400_000).contains(value))
+        {
+            return Err(EngineError::new(
+                ErrorCode::InvalidParams,
+                "exposureOverride10ns values must be within 50000...400000",
+            ));
+        }
+    }
     // A false `multiSample` transport capability means no variable control,
     // not that this LS-5000 cannot multisample. Validate against the exact
     // device-sourced pass set and keep the reason honest in the error.
@@ -4697,6 +5141,63 @@ fn prepare_real_scan_start(
         ));
     }
     Ok((session_epoch, bridge_generation, recipe, processing))
+}
+
+fn validate_exposure_solution(
+    solution: crate::bridge_protocol::BridgeExposureSolution,
+    expected_slot: u32,
+    preview_derived_reference: bool,
+) -> Result<domain::RollExposureLock, EngineError> {
+    let valid_digest = |value: &str| {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if solution.slot != expected_slot
+        || solution
+            .rgb_exposures_raw_10ns
+            .iter()
+            .any(|value| !(50_000..=400_000).contains(value))
+        || !(50_000..=400_000).contains(&solution.ir_metered_exposure_raw_10ns)
+        || !std::path::Path::new(&solution.meter_evidence_path).is_absolute()
+        || !std::path::Path::new(&solution.journal_path).is_absolute()
+        || !valid_digest(&solution.meter_evidence_sha256)
+        || !valid_digest(&solution.journal_sha256)
+    {
+        return Err(EngineError::new(
+            ErrorCode::Internal,
+            "roll.exposureSolved returned invalid or mismatched evidence",
+        ));
+    }
+    Ok(domain::RollExposureLock {
+        slot: solution.slot,
+        rgb_exposures_raw_10ns: solution.rgb_exposures_raw_10ns,
+        ir_metered_exposure_raw_10ns: solution.ir_metered_exposure_raw_10ns,
+        meter_evidence_path: solution.meter_evidence_path,
+        meter_evidence_sha256: solution.meter_evidence_sha256,
+        journal_path: solution.journal_path,
+        journal_sha256: solution.journal_sha256,
+        source: preview_derived_reference.then(|| "previewDerivedReference".to_string()),
+    })
+}
+
+fn emit_exposure_error(
+    event_tx: &mpsc::Sender<String>,
+    operation_id: &str,
+    frame_index: u32,
+    error: EngineError,
+) {
+    let recoverable = error.recoverable();
+    emit(
+        event_tx,
+        "roll.exposureError",
+        crate::protocol::RollExposureErrorPayload {
+            operation_id: operation_id.to_string(),
+            code: error.code,
+            message: error.message,
+            recoverable,
+            frame_index,
+            details: error.details,
+        },
+    );
 }
 
 fn with_private_workspace_rollback(
@@ -4766,6 +5267,8 @@ fn with_ambiguous_scan_start_recovery_holds(
 fn dispatch_real_scan_with_output_authorities(
     backend: &Arc<RealLs5000>,
     frames: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -4809,8 +5312,10 @@ fn dispatch_real_scan_with_output_authorities(
     let bridge_params = build_scan_start_params_with_bridge_output(
         Some(requested_job_id.clone()),
         frames.clone(),
+        allowed_meter_refusal_slots.clone(),
         &recipe,
         &processing,
+        preview_exposure_overrides(&frames, &overrides),
         capture_plan.bridge_output.clone(),
     );
     let params_value = serde_json::to_value(&bridge_params)
@@ -4920,6 +5425,8 @@ fn dispatch_real_scan_with_output_authorities(
             backend_for_thread,
             thread_job_id,
             frames,
+            allowed_meter_refusal_slots,
+            pass_token,
             recipe,
             processing,
             output,
@@ -5268,8 +5775,10 @@ fn build_scan_start_params(
     build_scan_start_params_with_bridge_output(
         None,
         slots,
+        vec![],
         recipe,
         processing,
+        None,
         BridgeOutputSpec {
             destination: output.archive.destination.clone(),
             filename_template: bridge_archive_template(&output.archive.filename_template),
@@ -5282,13 +5791,17 @@ fn build_scan_start_params(
 fn build_scan_start_params_with_bridge_output(
     job_id: Option<String>,
     slots: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
+    frame_exposure_overrides_10ns: Option<std::collections::HashMap<u32, [u32; 3]>>,
     bridge_output: BridgeOutputSpec,
 ) -> BridgeScanStartParams {
     BridgeScanStartParams {
         job_id,
         slots,
+        allowed_meter_refusal_slots,
+        frame_exposure_overrides_10ns,
         recipe: BridgeCaptureRecipe {
             resolution_dpi: recipe.resolution_dpi,
             bit_depth: recipe.bit_depth,
@@ -5296,6 +5809,7 @@ fn build_scan_start_params_with_bridge_output(
             channels: map_channels(recipe.channels),
             autofocus: processing.autofocus_each_frame,
             auto_exposure: processing.auto_exposure_each_frame,
+            exposure_override_10ns: recipe.exposure_override_10ns,
         },
         // The bridge always writes one full-fidelity TIFF capture per slot.
         // The supplied plan is either the retained master route or a
@@ -5303,6 +5817,20 @@ fn build_scan_start_params_with_bridge_output(
         // derivatives remain engine-rendered and have no bridge equivalent.
         output: bridge_output,
     }
+}
+
+fn preview_exposure_overrides(
+    slots: &[u32],
+    overrides: &std::collections::HashMap<u32, domain::FrameOverrides>,
+) -> Option<std::collections::HashMap<u32, [u32; 3]>> {
+    slots
+        .iter()
+        .map(|slot| {
+            let capture = overrides.get(slot)?.capture.as_ref()?;
+            capture.preview_exposure_adjustment.as_ref()?;
+            Some((*slot, capture.exposure_override_10ns?))
+        })
+        .collect()
 }
 
 fn generate_scan_operation_token() -> Result<String, EngineError> {
@@ -5682,6 +6210,7 @@ fn map_exposure_authority(authority: &BridgeExposureAuthority) -> domain::Exposu
 /// receipt-arrival time.
 fn build_real_receipt(
     job_id: &str,
+    pass_token: Option<&str>,
     slot: u32,
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
@@ -5693,8 +6222,10 @@ fn build_real_receipt(
             .exposure_authority
             .as_ref()
             .map(map_exposure_authority),
+        preview_exposure_adjustment: recipe.preview_exposure_adjustment.clone(),
         auto_crop: None,
         job_id: job_id.to_string(),
+        pass_token: pass_token.map(str::to_string),
         frame_index: slot,
         started_at: bridge_receipt.started_at.clone().unwrap_or_default(),
         duration_ms: bridge_receipt.capture_duration_ms.unwrap_or_default(),
@@ -5858,8 +6389,13 @@ fn compute_duty_cycle_report(samples: &[FrameIdleSample]) -> Option<DutyCycleRep
 /// is instead called after every point `completed`/`failed` actually
 /// change (see `run_real_scan_job_inner`'s `emit_frame_progress`), so
 /// the ordinal it returns tracks frames actually started/completed.
-fn compute_frame_ordinal(completed: &[u32], failed: &[u32], total_frames: u32) -> u32 {
-    let resolved = (completed.len() + failed.len()) as u32;
+fn compute_frame_ordinal(
+    completed: &[u32],
+    failed: &[u32],
+    skipped: &[u32],
+    total_frames: u32,
+) -> u32 {
+    let resolved = (completed.len() + failed.len() + skipped.len()) as u32;
     (resolved + 1).min(total_frames.max(1))
 }
 
@@ -5919,6 +6455,7 @@ fn emit_terminal_job_failure(
     remaining: &mut Vec<u32>,
     completed: &[u32],
     failed: &mut Vec<u32>,
+    skipped: &[u32],
     // Kept for call-site/signature stability even though the new
     // NotAttempted shape below no longer attaches it to anything: the
     // frame this error actually describes was already reported by the
@@ -5958,7 +6495,7 @@ fn emit_terminal_job_failure(
             summary: ScanSummary {
                 completed: completed.to_vec(),
                 failed: failed.clone(),
-                skipped: vec![],
+                skipped: skipped.to_vec(),
                 not_attempted: untouched,
                 stopped: false,
                 duty_cycle,
@@ -5988,6 +6525,7 @@ fn finalize_evidence_status_after_bridge_terminal(
         return EvidenceFinalization {
             summary: "disabled".to_string(),
             cleanup_gate: EvidenceCleanupGate::NotRequested,
+            packages: Vec::new(),
         };
     }
 
@@ -6000,6 +6538,7 @@ fn finalize_evidence_status_after_bridge_terminal(
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
     let mut failures = Vec::new();
     let mut finalized = Vec::new();
+    let mut package_results = Vec::new();
     let mut every_package_verified_complete = true;
     for package in packages {
         let (frames, coverage_error) =
@@ -6020,6 +6559,7 @@ fn finalize_evidence_status_after_bridge_terminal(
             Ok(result) => {
                 every_package_verified_complete &= result.status == "complete";
                 finalized.push(format!("{}: {}", result.status, result.detail));
+                package_results.push(result);
             }
             Err(error) => {
                 every_package_verified_complete = false;
@@ -6035,6 +6575,7 @@ fn finalize_evidence_status_after_bridge_terminal(
         } else {
             EvidenceCleanupGate::Hold
         },
+        packages: package_results,
     }
 }
 
@@ -6129,6 +6670,7 @@ enum EvidenceCleanupGate {
 struct EvidenceFinalization {
     summary: String,
     cleanup_gate: EvidenceCleanupGate,
+    packages: Vec<crate::evidence_package::EvidencePackageResult>,
 }
 
 /// Synthetic engine-side termination (panic, watchdog, or a bridge
@@ -6933,6 +7475,7 @@ fn bridge_event_belongs_to_scan_job(value: &serde_json::Value, job_id: &str) -> 
         event_name,
         "scan.progress"
             | "scan.frameRetrying"
+            | "scan.frameSkipped"
             | "scan.frameCompleted"
             | "hardware.anomaly"
             | "scan.frameFailed"
@@ -6982,6 +7525,8 @@ fn run_real_scan_job(
     backend: Arc<RealLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -6996,7 +7541,8 @@ fn run_real_scan_job(
     // whatever real progress was already reported to the client must still
     // be wrapped in an honest terminal scan.completed. Shared progress is
     // updated incrementally so it survives a caught panic.
-    let shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>)>> = Arc::new(Mutex::new((vec![], vec![])));
+    let shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>, Vec<u32>)>> =
+        Arc::new(Mutex::new((vec![], vec![], vec![])));
     let shared_evidence: Arc<Mutex<Vec<crate::evidence_package::EvidenceFrame>>> =
         Arc::new(Mutex::new(Vec::new()));
 
@@ -7015,6 +7561,7 @@ fn run_real_scan_job(
     let shared_evidence_for_inner = Arc::clone(&shared_evidence);
     let event_tx_for_inner = event_tx.clone();
     let frames_for_inner = frames.clone();
+    let pass_token_for_inner = pass_token.clone();
     let recipe_for_inner = recipe.clone();
     let processing_for_inner = processing.clone();
     let output_for_inner = output.clone();
@@ -7027,6 +7574,8 @@ fn run_real_scan_job(
             backend_for_inner,
             job_id_for_inner,
             frames_for_inner,
+            allowed_meter_refusal_slots,
+            pass_token_for_inner,
             recipe_for_inner,
             processing_for_inner,
             output_for_inner,
@@ -7046,16 +7595,20 @@ fn run_real_scan_job(
             "scanstudio-engine: scan worker thread panicked for job {job_id}; \
              emitting honest terminal failure with best-known progress"
         );
-        let (known_completed, known_failed) = shared_progress
+        let (known_completed, known_failed, known_skipped) = shared_progress
             .lock()
-            .map(|guard| (guard.0.clone(), guard.1.clone()))
+            .map(|guard| (guard.0.clone(), guard.1.clone(), guard.2.clone()))
             .unwrap_or_else(|poisoned| {
                 let guard = poisoned.into_inner();
-                (guard.0.clone(), guard.1.clone())
+                (guard.0.clone(), guard.1.clone(), guard.2.clone())
             });
         let mut remaining: Vec<u32> = frames
             .into_iter()
-            .filter(|f| !known_completed.contains(f) && !known_failed.contains(f))
+            .filter(|f| {
+                !known_completed.contains(f)
+                    && !known_failed.contains(f)
+                    && !known_skipped.contains(f)
+            })
             .collect();
         let mut failed = known_failed;
         let error = EngineError::new(
@@ -7075,6 +7628,7 @@ fn run_real_scan_job(
             &mut remaining,
             &known_completed,
             &mut failed,
+            &known_skipped,
             &error_payload,
             None,
             Some(evidence_package_status),
@@ -7120,6 +7674,8 @@ fn run_real_scan_job_inner(
     backend: Arc<RealLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    allowed_meter_refusal_slots: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -7127,7 +7683,7 @@ fn run_real_scan_job_inner(
     output_authorities: crate::render::JobOutputAuthorities,
     capture_plan: RealCapturePlan,
     event_tx: mpsc::Sender<String>,
-    shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>)>>,
+    shared_progress: Arc<Mutex<(Vec<u32>, Vec<u32>, Vec<u32>)>>,
     shared_evidence: Arc<Mutex<Vec<crate::evidence_package::EvidenceFrame>>>,
     session_epoch: u64,
     bridge_generation: u64,
@@ -7160,9 +7716,15 @@ fn run_real_scan_job_inner(
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
+    let allowed_meter_refusal_slots = allowed_meter_refusal_slots
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     let mut remaining: Vec<u32> = frames;
     let mut completed: Vec<u32> = Vec::new();
     let mut failed: Vec<u32> = Vec::new();
+    let mut skipped: Vec<u32> = Vec::new();
+    let mut skip_event_invalid = false;
+    let mut skip_persistence_failed = false;
     // Frames captured successfully by the bridge whose engine-side
     // derivative render failed. The terminal bridge summary must not
     // re-label these frames completed.
@@ -7179,10 +7741,11 @@ fn run_real_scan_job_inner(
     let mut evidence_admission_error: Option<String> = None;
     // Collected only after a frame's bridge capture and engine receipt have
     // both succeeded. Packaging waits for terminal scan.completed below.
-    let sync_progress = |completed: &[u32], failed: &[u32]| {
+    let sync_progress = |completed: &[u32], failed: &[u32], skipped: &[u32]| {
         if let Ok(mut guard) = shared_progress.lock() {
             guard.0 = completed.to_vec();
             guard.1 = failed.to_vec();
+            guard.2 = skipped.to_vec();
         }
     };
     // 2026-07-26 fix (frame-ordinal display bug, live 2026-07-25):
@@ -7202,12 +7765,13 @@ fn run_real_scan_job_inner(
     // this closure need not borrow the enclosing loop's own
     // `frame_durations_ms` (declared below, alongside `idle_samples`) —
     // every call site passes its own up-to-date slice explicitly.
-    let emit_frame_progress = |completed: &[u32], failed: &[u32], remaining: &[u32], durations_ms: &[u64]| {
+    let emit_frame_progress = |completed: &[u32], failed: &[u32], skipped: &[u32], remaining: &[u32], durations_ms: &[u64]| {
         let frame_index = remaining
             .first()
             .copied()
             .or_else(|| completed.last().copied())
             .or_else(|| failed.last().copied())
+            .or_else(|| skipped.last().copied())
             .unwrap_or(0);
         emit(
             &event_tx,
@@ -7215,7 +7779,7 @@ fn run_real_scan_job_inner(
             ScanProgressPayload {
                 job_id: job_id.clone(),
                 frame_index,
-                frame_ordinal: compute_frame_ordinal(completed, failed, total_frames),
+                frame_ordinal: compute_frame_ordinal(completed, failed, skipped, total_frames),
                 total_frames,
                 pass: 1,
                 total_passes: recipe.multisample_passes,
@@ -7223,7 +7787,7 @@ fn run_real_scan_job_inner(
                 // job end, nothing remains) — never a fabricated
                 // sub-frame fraction.
                 frame_percent: 0.0,
-                job_percent: (completed.len() + failed.len()) as f64 * 100.0
+                job_percent: (completed.len() + failed.len() + skipped.len()) as f64 * 100.0
                     / total_frames.max(1) as f64,
                 // D-17: measured from this job's own resolved-frame
                 // durations (mean × frames remaining); 0.0 only before the
@@ -7325,6 +7889,7 @@ fn run_real_scan_job_inner(
                                 frame_ordinal: compute_frame_ordinal(
                                     &completed,
                                     &failed,
+                                    &skipped,
                                     total_frames,
                                 ),
                                 total_frames,
@@ -7341,7 +7906,7 @@ fn run_real_scan_job_inner(
                                 // this event does not itself resolve a
                                 // frame, so it reads the samples gathered
                                 // so far rather than pushing a new one.
-                                job_percent: (completed.len() + failed.len()) as f64 * 100.0
+                                job_percent: (completed.len() + failed.len() + skipped.len()) as f64 * 100.0
                                     / total_frames.max(1) as f64,
                                 eta_seconds: eta_seconds_from_samples(&frame_durations_ms, remaining.len()),
                             },
@@ -7370,6 +7935,109 @@ fn run_real_scan_job_inner(
                             },
                         );
                     }
+                    "scan.frameSkipped" => {
+                        let Some(payload) = value.get("payload").cloned() else {
+                            skip_event_invalid = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                "bridge emitted scan.frameSkipped without a payload".to_string()
+                            });
+                            continue;
+                        };
+                        let Ok(frame_skipped) =
+                            serde_json::from_value::<BridgeFrameSkippedPayload>(payload)
+                        else {
+                            skip_event_invalid = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                "bridge emitted malformed scan.frameSkipped payload".to_string()
+                            });
+                            continue;
+                        };
+                        let details = frame_skipped.details.as_ref().and_then(|value| {
+                            serde_json::from_value::<domain::MeterControllerRefusalDetails>(
+                                value.clone(),
+                            )
+                            .ok()
+                        });
+                        if frame_skipped.code != "METER_CONTROLLER_REFUSED"
+                            || !allowed_meter_refusal_slots.contains(&frame_skipped.slot)
+                            || !remaining.contains(&frame_skipped.slot)
+                            || details.is_none()
+                        {
+                            skip_event_invalid = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                format!(
+                                    "bridge emitted an unauthorized or duplicate frameSkipped slot {}",
+                                    frame_skipped.slot
+                                )
+                            });
+                            continue;
+                        }
+                        let record = domain::ScanSkipRecord {
+                            job_id: job_id.clone(),
+                            pass_token: pass_token.clone(),
+                            slot: frame_skipped.slot,
+                            code: frame_skipped.code.clone(),
+                            details: details.expect("validated above"),
+                        };
+                        let persist_result = output_authorities
+                            .project_root()
+                            .ok_or_else(|| {
+                                EngineError::new(
+                                    ErrorCode::ProjectNotFound,
+                                    "the open project authority is unavailable for the skip record",
+                                )
+                            })
+                            .and_then(|project_root| {
+                                crate::manifest::persist_frame_skip_at(
+                                    project_root.directory_handle(),
+                                    project_root.canonical_path(),
+                                    frame_skipped.slot,
+                                    &record,
+                                )
+                            });
+                        if let Err(error) = persist_result {
+                            skip_persistence_failed = true;
+                            evidence_admission_error.get_or_insert_with(|| {
+                                format!("failed to persist meter-refusal skip record: {error}")
+                            });
+                        }
+                        let error = EngineError::new(
+                            ErrorCode::MeterControllerRefused,
+                            format!(
+                                "meter controller refused allowed blank slot {}",
+                                frame_skipped.slot
+                            ),
+                        )
+                        .with_recoverable(false)
+                        .with_details(frame_skipped.details);
+                        emit(
+                            &event_tx,
+                            "scan.frameState",
+                            FrameStatePayload {
+                                job_id: job_id.clone(),
+                                frame_index: frame_skipped.slot,
+                                state: FrameState::Skipped,
+                                attempt: 1,
+                                error: Some(ErrorPayload::from(&error)),
+                            },
+                        );
+                        remaining.retain(|&slot| slot != frame_skipped.slot);
+                        skipped.push(frame_skipped.slot);
+                        sync_progress(&completed, &failed, &skipped);
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(
+                            &completed,
+                            &failed,
+                            &skipped,
+                            &remaining,
+                            &frame_durations_ms,
+                        );
+                        last_resolved_at = Some(event_arrived_at);
+                    }
                     "scan.frameCompleted" => {
                         let Some(payload) = value.get("payload").cloned() else {
                             continue;
@@ -7395,6 +8063,9 @@ fn run_real_scan_job_inner(
                             .and_then(|value| value.processing.as_ref())
                             .unwrap_or(&processing)
                             .effective();
+                        let effective_recipe = frame_overrides
+                            .and_then(|value| value.capture.as_ref())
+                            .unwrap_or(&recipe);
                         let effective_alignment =
                             frame_overrides.and_then(|value| value.alignment.as_ref());
                         // The bridge already applies an approved spacing
@@ -7499,7 +8170,7 @@ fn run_real_scan_job_inner(
                             if !derivative_failed.contains(&frame_completed.slot) {
                                 derivative_failed.push(frame_completed.slot);
                             }
-                            sync_progress(&completed, &failed);
+                            sync_progress(&completed, &failed, &skipped);
                             // D-17: pushed BEFORE last_resolved_at is
                             // reassigned below, so this frame's own
                             // duration is included in the ETA
@@ -7509,7 +8180,7 @@ fn run_real_scan_job_inner(
                                     .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                     .as_millis() as u64,
                             );
-                            emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                            emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                             last_resolved_at = Some(event_arrived_at);
                             continue;
                         }
@@ -7520,8 +8191,9 @@ fn run_real_scan_job_inner(
                         // the exact RGB/IR/meter provenance.
                         let base_receipt = build_real_receipt(
                             &job_id,
+                            pass_token.as_deref(),
                             frame_completed.slot,
-                            &recipe,
+                            effective_recipe,
                             &effective_processing,
                             effective_output,
                             &frame_completed.receipt,
@@ -7609,14 +8281,23 @@ fn run_real_scan_job_inner(
                                         frame_completed.receipt.hardware_verification,
                                         Some(frame_completed.receipt.device_model.as_str()),
                                         authorities,
+                                        None,
                                     )
-                                    .and_then(|written| {
-                                        crate::render::publish_real_raw_export_authorized(
+                                    .and_then(|mut written| {
+                                        crate::render::publish_real_raw_export_authorized_with_proofs(
                                             sources.raw_path(),
                                             sources.raw_ir_path(),
                                             authorities,
                                         )
-                                        .map(|raw_paths| (written, raw_paths))
+                                        .map(|raw_proofs| {
+                                            let raw_paths = (
+                                                raw_proofs.raw.as_ref().map(|proof| proof.final_path().to_path_buf()),
+                                                raw_proofs.raw_ir.as_ref().map(|proof| proof.final_path().to_path_buf()),
+                                            );
+                                            written.metadata_publications.raw = raw_proofs.raw;
+                                            written.metadata_publications.raw_ir = raw_proofs.raw_ir;
+                                            (written, raw_paths)
+                                        })
                                     })
                                 });
                             let stability = sources.verify_unchanged(working);
@@ -7637,11 +8318,22 @@ fn run_real_scan_job_inner(
                                     )
                                 })
                                 .transpose()?;
-                            Ok((written, raw_paths, metadata_bindings))
+                            let capture_bindings = output_authorities
+                                .project_root()
+                                .map(|root| {
+                                    crate::exiftool::bind_capture_output_publications_at(
+                                        root.directory_handle(),
+                                        root.requested_path(),
+                                        root.canonical_path(),
+                                        &written.metadata_publications,
+                                    )
+                                })
+                                .transpose()?;
+                            Ok((written, raw_paths, metadata_bindings, capture_bindings))
                         });
 
                         match derivative {
-                            Ok((written, raw_paths, metadata_bindings)) => {
+                            Ok((written, raw_paths, metadata_bindings, capture_bindings)) => {
                                 let mut receipt = base_receipt;
                                 if effective_output.archive.enabled {
                                     let authorities =
@@ -7658,13 +8350,13 @@ fn run_real_scan_job_inner(
                                         .as_ref()
                                         .and_then(|_| authorities.archive_ir.as_ref())
                                         .map(|output| output.final_path().display().to_string());
-                                    receipt.meter_rgbi_path = frame_completed
-                                        .receipt
-                                        .meter_rgbi_path
-                                        .as_ref()
-                                        .and_then(|_| authorities.archive_meter.as_ref())
-                                        .map(|output| output.final_path().display().to_string());
                                 }
+                                receipt.meter_rgbi_path = frame_completed
+                                    .receipt
+                                    .meter_rgbi_path
+                                    .as_ref()
+                                    .and_then(|_| written.metadata_publications.archive_meter.as_ref())
+                                    .map(|proof| proof.final_path().display().to_string());
                                 receipt.outputs = Some(domain::WrittenOutputs {
                                     archive_path: written
                                         .archive_path
@@ -7689,6 +8381,7 @@ fn run_real_scan_job_inner(
                                         .and(raw_paths.1.as_ref())
                                         .map(|path| path.display().to_string()),
                                     metadata_bindings,
+                                    capture_bindings,
                                     derivative_transform: written.derivative_transform,
                                 });
                                 // Which nikonlook bundle/path/gains actually
@@ -7866,7 +8559,7 @@ fn run_real_scan_job_inner(
                                 }
                             }
                         }
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // D-17: pushed BEFORE last_resolved_at is
                         // reassigned below, so this frame's own duration
                         // is included in the ETA emit_frame_progress
@@ -7876,7 +8569,7 @@ fn run_real_scan_job_inner(
                                 .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                 .as_millis() as u64,
                         );
-                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                        emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "hardware.anomaly" => {
@@ -7952,7 +8645,7 @@ fn run_real_scan_job_inner(
                                 failed.push(frame);
                             }
                         }
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // D-17: pushed BEFORE last_resolved_at is
                         // reassigned below, so this frame's own duration
                         // is included in the ETA emit_frame_progress
@@ -7962,7 +8655,7 @@ fn run_real_scan_job_inner(
                                 .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                 .as_millis() as u64,
                         );
-                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                        emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.frameFailed" => {
@@ -8020,7 +8713,7 @@ fn run_real_scan_job_inner(
                                 }
                             }
                         }
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // D-17: pushed BEFORE last_resolved_at is
                         // reassigned below, so this frame's own duration
                         // is included in the ETA emit_frame_progress
@@ -8030,7 +8723,7 @@ fn run_real_scan_job_inner(
                                 .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
                                 .as_millis() as u64,
                         );
-                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
+                        emit_frame_progress(&completed, &failed, &skipped, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.error" => {
@@ -8112,6 +8805,10 @@ fn run_real_scan_job_inner(
                                     &settings,
                                     Some(&evidence_terminal_error),
                                 );
+                            backend.retain_session_evidence(
+                                &job_id,
+                                &package_finalization.packages,
+                            );
                             if let Some(working) = capture_plan.private_working_directory.as_ref() {
                                 format!("{}; {}", package_finalization.summary, working.recovery_message("scan.error ended this engine job before derivative/terminal reconciliation"))
                             } else {
@@ -8131,11 +8828,12 @@ fn run_real_scan_job_inner(
                             &mut remaining,
                             &completed,
                             &mut failed,
+                            &skipped,
                             &error_payload,
                             compute_duty_cycle_report(&idle_samples),
                             Some(evidence_package_status),
                         );
-                        sync_progress(&completed, &failed);
+                        sync_progress(&completed, &failed, &skipped);
                         // 2026-07-25 incident fix (stale SCANNING after a
                         // zero-completed batch): a job that failed via
                         // scan.error left the app showing scanner.status
@@ -8184,6 +8882,23 @@ fn run_real_scan_job_inner(
                         else {
                             continue;
                         };
+                        let mut terminal_skipped = scan_completed.summary.skipped.clone();
+                        let mut observed_skipped = skipped.clone();
+                        terminal_skipped.sort_unstable();
+                        observed_skipped.sort_unstable();
+                        let skip_summary_mismatch = terminal_skipped != observed_skipped
+                            || scan_completed
+                                .summary
+                                .completed
+                                .iter()
+                                .chain(scan_completed.summary.failed.iter())
+                                .any(|slot| observed_skipped.contains(slot));
+                        if skip_summary_mismatch && evidence_admission_error.is_none() {
+                            evidence_admission_error = Some(format!(
+                                "bridge scan.completed skipped summary {:?} did not match observed frameSkipped events {:?}",
+                                terminal_skipped, observed_skipped
+                            ));
+                        }
                         let (completed_after_derivatives, failed_after_derivatives) =
                             reconcile_derivative_failures(
                                 scan_completed.summary.completed,
@@ -8205,6 +8920,10 @@ fn run_real_scan_job_inner(
                             &settings,
                             evidence_admission_error.as_deref(),
                         );
+                        backend.retain_session_evidence(
+                            &job_id,
+                            &package_finalization.packages,
+                        );
                         let private_capture_status = finalize_private_capture_workspace(
                             &capture_plan,
                             &completed_after_derivatives,
@@ -8221,12 +8940,33 @@ fn run_real_scan_job_inner(
                         } else {
                             package_finalization.summary
                         };
+                        let not_attempted_after_terminal = if skip_summary_mismatch
+                            || skip_event_invalid
+                        {
+                            remaining
+                                .iter()
+                                .copied()
+                                .filter(|slot| {
+                                    !completed_after_derivatives.contains(slot)
+                                        && !failed_after_derivatives.contains(slot)
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        };
                         emit(
                             &event_tx,
                             "scan.jobState",
                             JobStatePayload {
                                 job_id: job_id.clone(),
-                                state: JobState::Completed,
+                                state: if skip_summary_mismatch
+                                    || skip_event_invalid
+                                    || skip_persistence_failed
+                                {
+                                    JobState::Failed
+                                } else {
+                                    JobState::Completed
+                                },
                             },
                         );
                         emit(
@@ -8237,12 +8977,8 @@ fn run_real_scan_job_inner(
                                 summary: ScanSummary {
                                     completed: completed_after_derivatives,
                                     failed: failed_after_derivatives,
-                                    not_attempted: vec![],
-                                    // BRIDGE.md's scan.completed summary
-                                    // has no "skipped" list at all — a
-                                    // requested-but-unattempted slot is
-                                    // simply absent from both arrays.
-                                    skipped: vec![],
+                                    skipped: observed_skipped,
+                                    not_attempted: not_attempted_after_terminal,
                                     stopped: scan_completed.summary.stopped,
                                     duty_cycle: compute_duty_cycle_report(&idle_samples),
                                     evidence_package_status: Some(evidence_package_status),
@@ -8318,6 +9054,7 @@ fn run_real_scan_job_inner(
                     &mut remaining,
                     &completed,
                     &mut failed,
+                    &skipped,
                     &error_payload,
                     compute_duty_cycle_report(&idle_samples),
                     Some(deferred_evidence_status(
@@ -8327,7 +9064,7 @@ fn run_real_scan_job_inner(
                         "the silence watchdog fired without a real bridge scan.completed closure",
                     )),
                 );
-                sync_progress(&completed, &failed);
+                sync_progress(&completed, &failed, &skipped);
                 if ownership_lost {
                     // Pure in-process ownership transition: no device call,
                     // process restart, automatic open, or motion retry.
@@ -9499,12 +10236,12 @@ mod tests {
     fn compute_frame_ordinal_matches_session_journal_active_frame_index() {
         let completed: Vec<u32> = (5..17).collect(); // slots 5..16: 12 completed
         assert_eq!(completed.len(), 12);
-        assert_eq!(compute_frame_ordinal(&completed, &[], 34), 13);
+        assert_eq!(compute_frame_ordinal(&completed, &[], &[], 34), 13);
     }
 
     #[test]
     fn compute_frame_ordinal_starts_at_one_before_any_frame_resolves() {
-        assert_eq!(compute_frame_ordinal(&[], &[], 34), 1);
+        assert_eq!(compute_frame_ordinal(&[], &[], &[], 34), 1);
     }
 
     #[test]
@@ -9513,13 +10250,13 @@ mod tests {
         // regardless of which of the 12 succeeded vs failed.
         let completed: Vec<u32> = (1..=10).collect();
         let failed = vec![11, 12];
-        assert_eq!(compute_frame_ordinal(&completed, &failed, 34), 13);
+        assert_eq!(compute_frame_ordinal(&completed, &failed, &[], 34), 13);
     }
 
     #[test]
     fn compute_frame_ordinal_caps_at_total_once_every_frame_is_resolved() {
         let completed: Vec<u32> = (1..=34).collect();
-        assert_eq!(compute_frame_ordinal(&completed, &[], 34), 34);
+        assert_eq!(compute_frame_ordinal(&completed, &[], &[], 34), 34);
     }
 
     #[test]
@@ -9666,6 +10403,37 @@ mod tests {
         let params = build_scan_start_params(vec![7], &recipe, &processing, &output, None);
 
         assert_eq!(params.output.filename_template, "ScanStudio#.tif");
+    }
+
+    #[test]
+    fn preview_exposure_map_uses_each_frames_applied_rgb_vector() {
+        let adjustment = |frame, ticks| domain::CaptureRecipe {
+            exposure_override_10ns: Some(ticks),
+            preview_exposure_adjustment: Some(domain::PreviewExposureAdjustment {
+                source: "previewThumbnailMean".into(),
+                reference_frame_index: 1,
+                reference_thumbnail_mean: 100.0,
+                frame_thumbnail_mean: if frame == 1 { 100.0 } else { 50.0 },
+                requested_positive_ev: if frame == 1 { 0.0 } else { 1.0 },
+                applied_positive_ev: if frame == 1 { 0.0 } else { 1.0 },
+                reference_rgb_exposures_raw_10ns: [100_000, 110_000, 120_000],
+                applied_rgb_exposures_raw_10ns: ticks,
+                device_bound_clamped_channels: vec![],
+            }),
+            ..CaptureRecipe::default()
+        };
+        let overrides = std::collections::HashMap::from([
+            (1, domain::FrameOverrides { capture: Some(adjustment(1, [100_000, 110_000, 120_000])), ..Default::default() }),
+            (2, domain::FrameOverrides { capture: Some(adjustment(2, [200_000, 220_000, 240_000])), ..Default::default() }),
+        ]);
+
+        assert_eq!(
+            preview_exposure_overrides(&[1, 2], &overrides),
+            Some(std::collections::HashMap::from([
+                (1, [100_000, 110_000, 120_000]),
+                (2, [200_000, 220_000, 240_000]),
+            ]))
+        );
     }
 
     #[test]
@@ -9871,6 +10639,7 @@ mod tests {
             &mut remaining,
             &completed,
             &mut failed,
+            &[],
             &error_payload,
             None,
             None,
@@ -9969,6 +10738,7 @@ mod tests {
             &mut remaining,
             &known_completed,
             &mut failed,
+            &[],
             &error_payload,
             None,
             None,

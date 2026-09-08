@@ -31,10 +31,14 @@ enum JobWaiter {
     /// `control.changed` after it are what this file reads; nothing here
     /// asks for a fresh snapshot on its own.
     static func subscribe(client: ControlChannelClient) async throws -> String? {
+        try await subscribeSnapshot(client: client).snapshot.jobId
+    }
+
+    static func subscribeSnapshot(client: ControlChannelClient) async throws -> ControlEventsSubscribeResult {
         let response = try await client.requestWithoutParams(method: "events.subscribe")
         switch response {
         case .result(let data):
-            return try JSONDecoder().decode(ControlEventsSubscribeResult.self, from: data).snapshot.jobId
+            return try JSONDecoder().decode(ControlEventsSubscribeResult.self, from: data)
         case .failure(let payload):
             // Subscribing has no documented failure mode -- a `.failure`
             // here is an unexpected protocol condition, not a wait
@@ -77,24 +81,36 @@ enum JobWaiter {
     static func waitForTerminalOutcome(
         client: ControlChannelClient,
         preStartJobId: String?,
-        onProgress: (@Sendable (ControlScanProgress) -> Void)? = nil
+        targetJobId: String? = nil,
+        initialSnapshot: ControlStatusResult? = nil,
+        onProgress: (@Sendable (ControlScanProgress) -> Void)? = nil,
+        onSnapshot: (@Sendable (ControlStatusResult) -> Void)? = nil
     ) async throws -> ControlClientResponse? {
-        var observedJobId: String?
+        var observedJobId = targetJobId
+        var observedTarget = targetJobId == nil || initialSnapshot?.jobId == targetJobId
         var lastProgress: ControlScanProgress?
         for await line in await client.events() {
             guard let snapshot = ControlChannelClient.decodeStatusSnapshot(fromEventLine: line) else {
                 continue
             }
+            onSnapshot?(snapshot)
             if let progress = snapshot.progress, progress != lastProgress {
                 lastProgress = progress
                 onProgress?(progress)
             }
-            if let jobId = snapshot.jobId, jobId != preStartJobId {
+            if observedJobId == nil, let jobId = snapshot.jobId, jobId != preStartJobId {
                 observedJobId = jobId
             }
+            if snapshot.jobId == targetJobId { observedTarget = true }
             guard observedJobId != nil else { continue }
+            if let targetJobId {
+                guard observedTarget, snapshot.jobId == targetJobId || snapshot.jobId == nil else { continue }
+            }
             guard let jobState = snapshot.jobState, jobState.isTerminal else { continue }
-            return try await client.requestWithoutParams(method: "job.get")
+            return try await client.request(
+                method: "job.get",
+                params: ControlJobGetParams(jobId: observedJobId)
+            )
         }
         return nil
     }

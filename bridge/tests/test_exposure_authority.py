@@ -66,3 +66,24 @@ def test_exposure_authority_rejects_malformed_block_without_escaping(
     with pytest.raises(ExposureAuthorityRefused, match="malformed"):
         _build_exposure_authority(attempts_root=tmp_path, slot=3)
     assert build_exposure_authority(attempts_root=tmp_path, slot=3) is None
+
+
+def test_held_capture_authority_matches_receipt_time_not_newest_journal(tmp_path: Path) -> None:
+    test_exposure_authority_forwards_the_completed_journal_block(tmp_path)
+    cold = tmp_path / "batch-slot03-slot03-test" / "frame-003" / "journal.json"
+    journal = json.loads(cold.read_text())
+    journal["started_at"] = "2026-09-08T17:16:25.767411+00:00"
+    held = tmp_path / "preview-held" / "frame-003-fresh-round"
+    held.mkdir(parents=True)
+    (held / "journal.json").write_text(json.dumps(journal))
+    # The newer unrelated capture must not replace this receipt's evidence.
+    cold.write_text(json.dumps({**journal, "started_at": "2026-09-08T18:00:00+00:00"}))
+    result = build_exposure_authority(
+        attempts_root=tmp_path, slot=3, started_at=journal["started_at"]
+    )
+    assert result is not None
+    assert result.commanded_channels_raw_10ns["IR"] == 311725
+    assert build_exposure_authority(attempts_root=tmp_path, slot=3) is None
+    assert build_exposure_authority(
+        attempts_root=tmp_path, slot=3, started_at="2026-09-08T19:00:00+00:00"
+    ) is None

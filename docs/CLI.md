@@ -56,7 +56,8 @@ The complete wire surface covered by this guide is: `hello`, `status`,
 `scanner.disconnect`, `preview.acquire`, `frames.list`, `frames.select`,
 `frames.place`, `frames.include`, `frames.exclude`, `review.approve`, `review.cancel`,
 `settings.get`, `settings.set`, `outputs.get`, `outputs.set`, `roll.save`,
-`roll.open`, `roll.list`, `scan.start`, `scan.stop`, `scan.resume`,
+`roll.open`, `roll.list`, `roll.solveExposure`, `roll.verify`, `roll.collect`,
+`scan.start`, `scan.stop`, `scan.resume`,
 `scanner.eject`, `diagnostics.export`, `events.subscribe`, and `job.get`.
 
 The following are retained Phase 4 simulator captures, before the additive
@@ -193,18 +194,71 @@ and `--digital-ice-mode`. `outputs set` accepts `--from-json`,
 `--preview-enabled`/`--no-preview-enabled`, and `--preview-destination`.
 They take no motion flag and exit `0, 65, 69, 70, 75`.
 
+### `preset`
+
+```text
+preset save NAME    → settings.get, outputs.get, local JSON write
+preset list          → local JSON read only
+preset apply NAME    → settings.get, settings.set, outputs.set
+scan --preset NAME   → preset apply, then scan.start
+```
+
+Presets are versioned JSON files in `~/.scanstudio/presets/`. They contain
+the existing capture, processing, and output recipes; confirmations, scanner
+identity, and unverified-hardware authorization are never stored. `save`
+reads settings and outputs through the control socket but sends no scanner
+request. `list` is entirely local. `apply` changes settings and outputs
+without moving film. Applying a preset preserves the currently persisted
+manual exposure lock; the preset cannot replace that authority. `scan
+--preset` still requires `--confirm-motion` and applies the preset before the
+existing scan readiness and motion workflow. The GUI Scan Settings panel
+lists the same files and uses the same recipe application path. The two
+existing set requests are sequential, so a later refusal can leave the first
+recipe applied; the command reports that refusal and never starts a scan.
+
+### `wait`
+
+```text
+wait --for film-present|film-absent|idle|job-done|registered [--timeout SECONDS]
+```
+
+`wait` subscribes once to the control event stream, evaluates the subscribe
+snapshot, and then waits on later typed snapshots. It never polls, refreshes,
+or starts a host for an observational command. A satisfied condition exits
+`0`; an expired timeout emits `WAIT_TIMEOUT` and exits `124`; an established
+host connection that reaches EOF emits the existing `control.hostExited`
+terminal and exits `76`. Unknown status values never satisfy a condition.
+
+### `link health` and `session export`
+
+```text
+link health [--minutes 15]
+session export --to /existing/parent/new.zip
+```
+
+`link health` summarizes retained bridge telemetry from the session inventory
+without probing the scanner; missing telemetry is reported as unknown. The
+window is 1–1440 minutes and defaults to 15. `session export` writes a
+create-only ZIP whose parent directory already exists, preserving source
+hashes and explicit missing-source reasons; it refuses an existing archive.
+
 ### `roll`
 
 ```text
 roll save --name NAME --carrier mounted|strip6|roll36 --frame-count N
            --film-process PROCESS --confirm-motion [--wait] [--auto-approve]
            → roll.save, status, review.approve, job.get
+roll save --name NAME --carrier CARRIER --frame-count N
+           --film-process PROCESS --no-scan → roll.save
 roll open DIRECTORY          → roll.open
 roll list                    → roll.list
 ```
 
 `roll save` creates a project and starts scanning, so `--confirm-motion` is
-required. `--auto-approve` independently requires that flag and approves a
+required. With `--no-scan`, it only creates the project and returns
+`outcome: "saved"`; no motion confirmation is needed. `--no-scan` cannot be
+combined with `--wait` or `--auto-approve`.
+`--auto-approve` independently requires that flag and approves a
 paused review only when every flagged frame clears the confidence threshold.
 `--wait` returns the terminal job result; `--no-wait` returns after start.
 Save exits `0, 65, 69, 70, 75, 77`; open/list exit `0, 65, 69, 70, 75`.
@@ -222,8 +276,39 @@ host stop                                      → verified pidfile stop
 bypasses the real hardware bootstrap, scrubs bridge/hardware state, and is the
 only supported way to create an isolated simulator host. `--engine` is a
 development/test override and `--log` chooses the detached log path. `host`
-commands do not require motion flags. `host` exits `0, 65, 69, 70, 75`;
-`host stop` exits `0, 69, 70, 75`.
+commands do not require motion flags. `host` exits `0, 64, 65, 69, 70, 75`;
+`host stop` exits `0, 64, 69, 70, 75`.
+
+### Calibration commands
+
+```text
+roll solve-exposure --frame N --confirm-motion → roll.solveExposure
+roll verify [--pass TOKEN] [--exposure-identical] [--no-clipping] → roll.verify
+roll collect --to NEW_DIRECTORY --stock STOCK --pass TOKEN --slot-map MAP.json
+             [--operator NAME] → roll.collect
+```
+
+`solve-exposure` measures inside the current real held preview session and
+waits for its terminal result. A successful measurement persists the RGB
+exposure lock in the open project. Scans with auto exposure disabled reuse
+that lock across separate CLI invocations; enabling auto exposure omits the
+override and preserves the saved lock for later use. IR remains metered.
+The simulator and older drivers without held metering refuse this command.
+
+`verify` reads retained file bindings, lengths and SHA-256 hashes. Optional
+exposure checks compare commanded RGB ticks within each pass; clipping checks
+use receipt telemetry. Missing evidence is `unknown`, never a fabricated
+pass. It prints the complete report and exits 65 for `fail` or `unknown`.
+
+`collect` copies one exact pass into a fresh directory, preserving originals.
+The slot map is a JSON object such as `{"1":1,"2":2}` with unique positive
+slots and physical frame numbers. Raw-enabled receipts require RGB16 TIFF
+and its tagged Gray16 IR sidecar; raw-disabled Pass B collects its available
+positive, meter and receipt. The output includes `roll-metadata.json` and
+`file-hashes.txt`. Missing or changed bound evidence and existing destinations
+are refused. Collection requires project-relative capture bindings; older
+receipts and independent raw destinations without those bindings cannot be
+retroactively certified. Neither verification nor collection moves film.
 
 ### `roll run`
 
@@ -231,28 +316,67 @@ commands do not require motion flags. `host` exits `0, 65, 69, 70, 75`;
 roll run --name NAME --carrier mounted|strip6|roll36 [--frame-count N]
          --film-process PROCESS --film-loaded --confirm-motion
          [--skip-blank] [--auto-approve] [--wait|--no-wait]
+         [--hopper] [--preview-derived-exposure] [--allow-unverified-hardware]
          → scanner.refresh, status, preview.acquire, events.subscribe,
            frames.list, frames.select, roll.save, review.approve, job.get
 ```
 
-This is the one-connection whole-roll walk: refresh/connect when needed,
+This is the whole-roll workflow: refresh/connect when needed,
 preview, wait for `previewComplete`, select frames, save, resolve an optional
 review, and wait for the job. Both `--film-loaded` and `--confirm-motion` are
 required. It stops at the first refusal and never retries. Exits are `0, 64,
 65, 69, 70, 75, 77`.
 
+`--preview-derived-exposure` is experimental and off by default. It meters one median-brightness preview frame, keeps IR metered, and applies positive-only RGB adjustments capped at 1 EV and device limits. Blank, ambiguous, or missing preview evidence refuses the run. Receipts retain the requested adjustment and actual exposure evidence; this does not establish clipping or calibration quality.
+
+For repeated numbered rolls, add `--hopper`:
+
+```text
+roll run --hopper --name NAME --carrier CARRIER --film-process PROCESS
+         --film-loaded --confirm-motion [--frame-count N]
+```
+
+Hopper mode names rolls `NAME-001`, `NAME-002`, and so on, ejects after each
+completed roll, waits for the next film, and stops on the first refusal. It
+requires waiting; `--no-wait` is refused.
+
 ### `scan`, `stop`, `resume`, and `eject`
 
 ```text
-scan --confirm-motion [--wait] → scan.start, job.get
+scan --confirm-motion [--wait] [--frames RANGE] [--repeat COUNT] [--pass TOKEN]
+     [--preset NAME]
+                               → scan.start, job.get
+scan --dry-run [--frames RANGE] → scan.preflight (no scan.start)
 stop [--immediate]             → scan.stop
 resume --confirm-motion [--wait] → scan.resume, job.get
+resume --dry-run               → scan.preflight (no scan.resume)
 eject --confirm-motion         → scanner.eject
 ```
 
-`scan`, `resume`, and `eject` require `--confirm-motion`. `stop` only stops an
-existing job and starts no motion. Scan/resume/eject exit `0, 65, 69, 70, 75,
-77`; stop exits `0, 65, 69, 70, 75`.
+The motion forms of `scan`, `resume`, and `eject` require `--confirm-motion`;
+the two `--dry-run` forms are observational and do not open a motion request.
+They report film, registration, readiness, writable destinations, and a
+conservative space estimate (256 MiB per frame at 4000 dpi, scaled by
+resolution, plus project/output headroom). A ready report exits `0`; a failed
+gate report exits `65`. `scan --dry-run --preset NAME` is rejected locally;
+apply the preset first, then inspect the effective settings. `stop` only stops
+an existing job and starts no motion. Scan/resume/eject exit `0, 65, 69, 70,
+75, 77`; stop exits `0, 65, 69, 70, 75`.
+
+`--frames` accepts comma-separated indices and ranges, including previously
+completed frames for an explicit rescan. `--repeat` accepts 1–100 and requires
+`--pass` above 1. Repeats always wait: each starts only after the prior job
+completed without frame errors. A refusal or stopped/failed job ends the
+sequence without retrying it. Omitted frames use one snapshot of the initial
+selection throughout the sequence.
+
+A single pass keeps its token exactly. Repeats append a two-digit ordinal:
+`--frames 20 --repeat 10 --pass Arep` produces `Arep01` through `Arep10`.
+Receipts retain `passToken`; filename templates support `{stock}` and `{pass}`
+(and `$Pass`). Existing `$Frame` keeps its four-digit width. All captures use
+create-only output reservation and append receipts. Pass tokens allow 1–64
+ASCII letters, digits, `.`, `_`, or `-`, excluding `.` and `..`. Invalid scan
+ranges/repeat arguments exit 64 before connecting.
 
 ### `diagnostics`, `events`, and `sim`
 
@@ -260,13 +384,14 @@ existing job and starts no motion. Scan/resume/eject exit `0, 65, 69, 70, 75,
 diagnostics export --to DIRECTORY → diagnostics.export
 events --follow                   → events.subscribe
 sim load-media [--carrier strip6|roll36] [--preview-fixture NAME]
-                [--abort-at-frame N] [--abort-code CODE] → sim.loadMedia
+                [--abort-at-frame N] [--abort-code CODE]
+                [--stall-at-frame N] → sim.loadMedia
 ```
 
 Diagnostics requires an existing absolute directory with no `..` component.
 `events` requires `--follow` and streams event envelopes until the host closes
 the connection. `sim load-media` is simulator-only and never moves hardware.
-Diagnostics exits `0, 64, 69, 70`; events exits `0, 64, 69, 70`; simulator
+Diagnostics exits `0, 64, 69, 70`; events exits `0, 64, 69, 70, 76`; simulator
 setup uses `0, 65, 69, 70, 75`.
 
 ```json
@@ -283,8 +408,10 @@ setup uses `0, 65, 69, 70, 75`.
 | 69 | No host reachable | `HOST_UNREACHABLE` — the control socket could not be dialed at the given (or default) path |
 | 70 | Internal error | Channel `UNKNOWN_COMMAND`; CLI-originated `INTERNAL` (an unexpected condition after a request already succeeded, for example a response that failed to decode) |
 | 75 | Busy / conflict | `CONTROLLER_BUSY`, `HOST_ALREADY_RUNNING` |
+| 76 | Established host connection closed | `control.hostExited` for streaming observers |
 | 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
 | 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
+| 124 | Wait timeout | `WAIT_TIMEOUT` from `wait --for … --timeout …` |
 
 `--wait` maps `completed` and `stopped` to 0 and a failed terminal job to 65.
 
@@ -366,3 +493,98 @@ The runbook's `strip6` simulator fixture produces six preview frames, so its
 bounded passing invocation uses `--frame-count 6`. `full_roll_cli.sh` preserves
 an explicitly requested count; a count that does not match the selected
 preview frames stops at `roll.save` and reports the failed receipt step.
+
+Calibration scans can explicitly permit known blank slots with
+`scan --on-frame-failure skip --allow-meter-refusal-slots RANGE`. The default
+is stop. Only synchronized typed meter-controller refusals may be skipped;
+other failures stop the job. Each skip is retained separately from capture
+receipts and included by `roll collect`; an all-skipped pass has no measured
+exposure/clipping result. Simulator scans refuse this hardware-only option.
+
+`status --watch` emits an initial snapshot and subsequent film/registration
+changes from one event subscription. The client sends no polling requests; the
+host performs one shared, non-motion status check while an idle real scanner is
+actively observed. `--job` and `--refresh` cannot be combined with it. A new `previewOperationId`
+distinguishes replacement previews. Both `status --watch` and `events --follow`
+retain `control.dropped` notices. Established connection EOF emits one local
+`control.hostExited` event and exits **76**. This means observation was lost;
+it does not claim that an in-flight scan succeeded or failed. Ordinary local
+shutdown after a finite command does not synthesize that event.
+
+## Shell completion
+
+The CLI's existing argument parser generates completion scripts; no plugin or
+separate completion implementation is needed:
+
+```sh
+scanstudio-cli --generate-completion-script zsh > /tmp/_scanstudio-cli
+scanstudio-cli --generate-completion-script fish > /tmp/scanstudio-cli.fish
+```
+
+Load the generated file through your shell's normal completion configuration.
+Generation is offline and never connects to the scanner.
+
+## Retained roll reports and host services
+
+`roll report DIRECTORY --to /absolute/path/report.html` produces a self-contained
+HTML contact sheet without connecting to a host. It verifies retained artifact
+hashes, embeds available preview images, and refuses destination collisions.
+Missing review evidence is labeled Unknown. Non-thumbnail files are verified
+with streaming reads (1 GiB per artifact); embedded previews have a 32 MiB total
+limit. The receipt hash describes the normalized decoded receipt, not the bytes
+of the original manifest.
+
+`host service generate --bundle /absolute/ScanStudio.app --to /absolute/host.plist`
+only writes a new plist. `host service install --bundle /absolute/ScanStudio.app`
+explicitly installs and bootstraps `com.scanstudio.headless` in the current
+user's LaunchAgents directory; `host service remove` unloads and removes only
+that marked service. Existing plists are never overwritten. Failed launchctl
+operations retain the plist for inspection. The service starts the resident
+host at login and uses private logs; it does not restart failed hosts or run a
+scan job. Motion still requires an explicit CLI request and its confirmations.
+
+## Declarative jobs and diagnostics
+
+`schema` returns an offline command inventory, current help, exit codes, and a
+versioned job example. Use `schema | jq '.result.job.example' > job.json` as a
+starting point. Set the scanner ID, selected frames, recipes, and destinations
+before setting the document's film/motion confirmations to true.
+
+`run job.json --dry-run` validates the document and reads cached host gates
+without starting a host or changing settings. It includes the requested device
+identity and hypothetical output recipe. Registration can still be unavailable
+before preview; a dry-run is not a guarantee that a later scan will succeed.
+`run job.json --film-loaded --confirm-motion` connects the named scanner,
+checks readiness and output space, acquires a preview, creates the roll, and
+starts its selected frames through the existing scan path. It requires a host
+with no open project, rechecks the complete preflight before capture, and saves
+the approved normalized job beside the run receipt. Imported exposure locks
+are refused because they belong to an already identified scanner/project.
+
+`doctor` reports independent installation, socket, cached host/scanner, and
+IORegistry USB topology checks. It does not start a host, refresh a scanner,
+open USB, or remove stale files. Unknown facts are warnings; proven failures
+produce exit 65. A stalled host query stops after two seconds so the other
+diagnostic rows can still be returned.
+
+
+### Reliable observers and automation defaults
+
+`scan --wait` and `resume --wait` save an active-job marker in the roll directory. A later waiting command or bare `status --job` uses the recorded host/session/job identity to attach to that job. A marker from a different host session refuses; inspect it before starting new work. Terminal markers are retired, with hook delivery records retained separately.
+
+`--controller-name LABEL` identifies the caller in status/events and busy refusals. Its default is `SCANSTUDIO_CONTROLLER`, then `scanstudio-cli`. This is a display label, not authentication. `--socket` overrides `SCANSTUDIO_SOCKET`. Explicit `--json`, `--ndjson`, or `--human` overrides `SCANSTUDIO_OUTPUT=json|ndjson|human`. These environment defaults never grant film or motion confirmation.
+
+`--key KEY` deduplicates mutating requests for the same controller within one host diagnostic session. Reusing a key with a different payload refuses. Concurrent duplicates await the original result; composed commands derive separate keys per method and occurrence. The cache holds at most 256 operations and refuses new keys when full. Restarting the host clears it; use the saved job marker to recover an observer.
+
+`scan --wait` and `resume --wait` accept `--on-frame 'command'` and `--on-fail 'command'`. Hooks receive `SCANSTUDIO_JOB_ID`, `SCANSTUDIO_CORRELATION_TOKEN`, `SCANSTUDIO_FRAME_INDEX`, `SCANSTUDIO_RECEIPT_KEY`, `SCANSTUDIO_RECEIPT_PATH`, `SCANSTUDIO_ERROR_JSON`, and `SCANSTUDIO_HOOK_KIND`. Delivery is recorded before launch, so observer reattachment does not launch it again. A crash between recording and launch can miss a delivery. Hook commands are not persisted. Hooks run independently with null stdio and a ten-second lifetime limit; failures do not retry or stop the scan.
+
+`selftest` creates private temporary simulator hosts and reports pass/fail plus evidence directories for stalled-frame stop, feed-jam resume, and killed-observer reattachment. It uses no real scanner. Development builds accept `selftest --engine /absolute/path/to/scanstudio-engine`; packaged builds resolve their bundled engine.
+
+
+### Offline copies from retained outputs
+
+With a saved roll open, `render --frame 2-4 --profile sRGB --output /absolute/new-output` re-renders positives from verified retained masters. Profiles are sRGB, AdobeRGB1998, and ProPhotoRGB. `export --to /absolute/new-directory --template 'Frame_####.tif' --kind positive` copies receipt-bound outputs; kinds are positive, raw, and master. Existing filename metadata/pass tokens are supported. Output files and result sidecars are create-only.
+
+`metadata apply --frame 2 --frame 3 --to /absolute/new-directory --template 'Tagged_####.tif' --film-stock 'Example stock' --camera 'Example camera' --dry-run` previews the approved ExifTool arguments. Remove `--dry-run` to tag new copies. Optional fields are `--lens`, `--date`, and `--notes`; `--kind` selects the source output type. ExifTool works in a private staging directory; tagged copies are verified before create-only publication. Missing ExifTool is reported, and originals, manifests, and capture receipts remain unchanged. The GUI Batch Inspector exposes the same render and metadata operations.
+
+For automatic per-frame handoff, configure the roll's existing output route. Raw export may target an external watched directory, for example `outputs set --raw-enabled --raw-destination /absolute/NegPy-inbox`. Archive, positive, and preview destinations must remain beneath the active project root; a project-contained folder can be watched directly, for example `outputs set --positive-enabled --positive-destination /absolute/project/Lightroom-inbox`. The scan publisher writes each frame there before reporting its completed receipt. For an external positive destination, use `export --to` after the roll is retained. This uses the existing create-only publication path; no second copy scheduler is required.

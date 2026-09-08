@@ -20,7 +20,7 @@ struct HostDecisionTests {
 
     @Test("read-only commands never auto-start")
     func readOnlyCommands() {
-        for command in ["status", "events", "frames.list", "settings.get", "outputs.get", "roll.list", "diagnostics.export", "job.get"] {
+        for command in ["status", "events", "frames.list", "settings.get", "outputs.get", "roll.list", "diagnostics.export", "job.get", "wait", "scan.preflight", "link.health", "session.export"] {
             #expect(ControlHostDecision.isReadOnly(command))
             #expect(ControlHostDecision.plan(command: command, preference: .auto, hello: nil) == .refuseUnreachable(startable: true))
         }

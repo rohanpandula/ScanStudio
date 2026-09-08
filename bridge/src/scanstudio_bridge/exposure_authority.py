@@ -46,38 +46,33 @@ def _load_json(path: Path) -> dict:
     return value
 
 
-def _find_frame_attempt_directory(attempts_root: Path, slot: int) -> Path:
+def _find_frame_attempt_directory(
+    attempts_root: Path, slot: int, started_at: str | None = None
+) -> Path:
     frame_dirname = f"frame-{slot:03d}"
-    candidates = sorted(
-        attempts_root.glob(f"batch-slot*/{frame_dirname}/journal.json"),
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not candidates:
+    candidates = [
+        path
+        for prefix in ("batch-slot*", "preview-*")
+        for path in attempts_root.glob(f"{prefix}/{frame_dirname}*/journal.json")
+        if started_at is None or _load_json(path).get("started_at") == started_at
+    ]
+    if len(candidates) != 1:
         raise ExposureAuthorityRefused(
-            f"no {frame_dirname}/journal.json evidence found under any "
-            f"batch-slot*/ directory in {attempts_root}"
+            f"{len(candidates)} matching {frame_dirname}/journal.json candidates "
+            f"under {attempts_root}; refusing to guess this receipt's capture"
         )
-    if (
-        len(candidates) > 1
-        and candidates[-1].stat().st_mtime == candidates[-2].stat().st_mtime
-    ):
-        raise ExposureAuthorityRefused(
-            f"{len(candidates)} {frame_dirname}/journal.json candidates found under "
-            f"{attempts_root}, and the two newest are mtime-indistinguishable; "
-            "refusing to guess which attempt is this frame's own"
-        )
-    return candidates[-1].parent
+    return candidates[0].parent
 
 
 def _build_exposure_authority(
-    *, attempts_root: Path | None, slot: int
+    *, attempts_root: Path | None, slot: int, started_at: str | None = None
 ) -> domain.ExposureAuthority:
     if attempts_root is None:
         raise ExposureAuthorityRefused(
             "no attempts_root for this transport/route; cannot locate capture evidence"
         )
 
-    journal_path = _find_frame_attempt_directory(attempts_root, slot) / "journal.json"
+    journal_path = _find_frame_attempt_directory(attempts_root, slot, started_at) / "journal.json"
     authority = _load_json(journal_path).get("active_exposure_authority")
     if not isinstance(authority, dict):
         raise ExposureAuthorityRefused(
@@ -106,11 +101,13 @@ def _build_exposure_authority(
 
 
 def build_exposure_authority(
-    *, attempts_root: Path | None, slot: int
+    *, attempts_root: Path | None, slot: int, started_at: str | None = None
 ) -> domain.ExposureAuthority | None:
     """Return the frame's authority block, or ``None`` on any failure."""
     try:
-        authority = _build_exposure_authority(attempts_root=attempts_root, slot=slot)
+        authority = _build_exposure_authority(
+            attempts_root=attempts_root, slot=slot, started_at=started_at
+        )
     except ExposureAuthorityRefused as error:
         _log(f"slot {slot}: unavailable: {error}")
         return None

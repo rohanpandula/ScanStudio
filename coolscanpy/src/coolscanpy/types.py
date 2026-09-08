@@ -16,6 +16,7 @@ import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Literal
 
@@ -43,6 +44,7 @@ __all__ = [
     "Progress",
     "ProgressCallback",
     "ExposureVector",
+    "ExposureSolution",
     "SplitAlignment",
     "ClippingTelemetry",
     "FocusDetailTelemetry",
@@ -178,6 +180,24 @@ class ExposureVector:
     red_exposure_us: float
     green_exposure_us: float
     blue_exposure_us: float
+
+
+@dataclass(frozen=True)
+class ExposureSolution:
+    """Metered fine-scan authority from one preview-bound roll slot.
+
+    RGB values are the guarded command authority in raw 10ns ticks. Infrared
+    remains the meter's value and is evidence only; callers cannot override it.
+    ``journal_sha256`` binds this result to the immutable held-meter journal.
+    """
+
+    slot: int
+    rgb_exposures_raw_10ns: tuple[int, int, int]
+    ir_metered_exposure_raw_10ns: int
+    meter_evidence_path: Path
+    meter_evidence_sha256: str
+    journal_path: Path
+    journal_sha256: str
 
 
 @dataclass(frozen=True)

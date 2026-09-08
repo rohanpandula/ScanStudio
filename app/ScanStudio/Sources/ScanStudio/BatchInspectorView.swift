@@ -10,6 +10,13 @@ struct BatchInspectorView: View {
     @State private var rawSettingsExpanded = false
     @State private var positiveTiffSettingsExpanded = false
     @State private var positiveJPEGSettingsExpanded = false
+    @State private var namedPresetNames: [String] = []
+    @State private var presetError: String?
+    @State private var reportError: String?
+    @State private var renderError: String?
+    @State private var metadataCopyPreview: ControlMetadataApplyResult?
+    @State private var metadataCopyResult: ControlMetadataApplyResult?
+    @State private var renderProfile = "sRGB"
     @FocusState private var focusedGearField: GearField?
     @State private var presentedRecentGear: GearField?
 
@@ -56,6 +63,7 @@ struct BatchInspectorView: View {
         // project) so `sessionModel.exifToolDetection` is already populated
         // before the user ever opens a frame detail view's ExifTool panel.
         .task { await sessionModel.detectExifTool() }
+        .task { refreshNamedPresets() }
         .alert("Saved file unavailable", isPresented: Binding(
             get: { missingSavedOutput != nil },
             set: { if !$0 { missingSavedOutput = nil } }
@@ -63,6 +71,30 @@ struct BatchInspectorView: View {
             Button("OK", role: .cancel) { missingSavedOutput = nil }
         } message: {
             Text("The recorded file is no longer at this location. It may have been moved or deleted.\n\(missingSavedOutput ?? "")")
+        }
+        .alert("Preset unavailable", isPresented: Binding(
+            get: { presetError != nil },
+            set: { if !$0 { presetError = nil } }
+        )) {
+            Button("OK", role: .cancel) { presetError = nil }
+        } message: {
+            Text(presetError ?? "The preset could not be loaded.")
+        }
+        .alert("Roll report unavailable", isPresented: Binding(
+            get: { reportError != nil },
+            set: { if !$0 { reportError = nil } }
+        )) {
+            Button("OK", role: .cancel) { reportError = nil }
+        } message: {
+            Text(reportError ?? "The HTML report could not be written.")
+        }
+        .alert("Re-render unavailable", isPresented: Binding(
+            get: { renderError != nil },
+            set: { if !$0 { renderError = nil } }
+        )) {
+            Button("OK", role: .cancel) { renderError = nil }
+        } message: {
+            Text(renderError ?? "The retained master could not be rendered.")
         }
     }
 
@@ -81,6 +113,26 @@ struct BatchInspectorView: View {
                     revealSavedFile(URL(fileURLWithPath: directory))
                 }
                 .controlSize(.small)
+                Button("Generate HTML Report") {
+                    generateRollReport(directory: directory)
+                }
+                .controlSize(.small)
+                if let frameIndex = sessionModel.detailFrameIndex ?? sessionModel.frameTransformTargetIndex {
+                    HStack(spacing: 6) {
+                        Menu {
+                            ForEach(["sRGB", "AdobeRGB1998", "ProPhotoRGB"], id: \.self) { profile in
+                                Button(profile) { renderProfile = profile }
+                            }
+                        } label: {
+                            Label("Profile: \(renderProfile)", systemImage: "paintpalette")
+                        }
+                        .controlSize(.small)
+                        Button("Re-render selected") {
+                            renderSelected(frameIndex: frameIndex, projectDirectory: directory)
+                        }
+                        .controlSize(.small)
+                    }
+                }
                 if let frameIndex = sessionModel.detailFrameIndex ?? sessionModel.frameTransformTargetIndex {
                     let receipt = sessionModel.receipts.last(where: { $0.frameIndex == frameIndex })
                         ?? sessionModel.project?.frames.first(where: { $0.index == frameIndex })?.receipts.last
@@ -115,6 +167,50 @@ struct BatchInspectorView: View {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    private func generateRollReport(directory: String) {
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try RollHTMLReport.write(projectDirectory: URL(fileURLWithPath: directory))
+                }.value
+                NSWorkspace.shared.open(URL(fileURLWithPath: result.path))
+            } catch {
+                reportError = error.localizedDescription
+            }
+        }
+    }
+
+    private func renderSelected(frameIndex: Int, projectDirectory: String) {
+        let output = URL(fileURLWithPath: projectDirectory).appendingPathComponent("Rendered-\(renderProfile)")
+        Task {
+            guard let result = await sessionModel.renderRoll(ControlRollRenderParams(
+                frames: [frameIndex], profile: renderProfile, output: output.path
+            )) else {
+                renderError = sessionModel.lastErrorMessage ?? "The retained master could not be rendered."
+                return
+            }
+            if let first = result.files.first {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: first.path)])
+            }
+        }
+    }
+
+    private func refreshNamedPresets() {
+        namedPresetNames = (try? ScanRecipePresetStore().list()) ?? []
+    }
+
+    private func applyNamedPreset(_ name: String) {
+        do {
+            let preset = try ScanRecipePresetStore().load(named: name)
+            // The shared SessionModel path applies capture settings while
+            // retaining the project's persisted exposure lock.
+            sessionModel.applySettingsRecipes(capture: preset.capture, processing: preset.processing)
+            sessionModel.applyOutputRecipe(preset.output)
+        } catch {
+            presetError = String(describing: error)
+        }
+    }
+
     private var setupInspector: some View {
         Group {
             InspectorSection(title: "Scan Settings") {
@@ -127,6 +223,21 @@ struct BatchInspectorView: View {
                         ForEach(ScanRecipePreset.allCases) { preset in
                             Text(preset.label).tag(preset)
                         }
+                    }
+                }
+                InspectorSettingRow(label: "Saved preset") {
+                    Menu {
+                        if namedPresetNames.isEmpty {
+                            Text("No saved presets")
+                        } else {
+                            ForEach(namedPresetNames, id: \.self) { name in
+                                Button(name) { applyNamedPreset(name) }
+                            }
+                        }
+                        Divider()
+                        Button("Refresh") { refreshNamedPresets() }
+                    } label: {
+                        Label("Choose…", systemImage: "bookmark")
                     }
                 }
                 if sessionModel.scanRecipePreset == .custom {
@@ -304,6 +415,32 @@ struct BatchInspectorView: View {
                 .padding(.bottom, 6)
 
                 InspectorRow(label: "ExifTool", value: exifToolStatusSummary)
+                HStack(spacing: 8) {
+                    Button("Preview copy metadata") {
+                        Task { metadataCopyPreview = await sessionModel.applyMetadataCopies(metadataCopyParams(dryRun: true)) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(sessionModel.exifToolDetection?.available != true || metadataCopyFrames.isEmpty)
+                    Button("Apply to new copies") {
+                        Task { metadataCopyResult = await sessionModel.applyMetadataCopies(metadataCopyParams(dryRun: false)) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.scanStudioAmber)
+                    .controlSize(.small)
+                    .disabled(metadataCopyPreview == nil)
+                }
+                if let preview = metadataCopyPreview {
+                    Text(preview.arguments.isEmpty ? "No metadata fields are set." : preview.arguments.joined(separator: " "))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Color.scanStudioSecondaryText)
+                        .textSelection(.enabled)
+                }
+                if let result = metadataCopyResult {
+                    Text("Created \(result.files.count) metadata cop\(result.files.count == 1 ? "y" : "ies") in a new directory.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.scanStudioCyan)
+                }
             }
             InspectorSection(title: "Estimated Size") {
                 InspectorRow(
@@ -359,6 +496,24 @@ struct BatchInspectorView: View {
                     .padding(.top, 8)
             }
         }
+    }
+
+    private var metadataCopyFrames: [Int] {
+        sessionModel.project?.frames.filter { !$0.receipts.isEmpty }.map(\.index) ?? []
+    }
+
+    private func metadataCopyParams(dryRun: Bool) -> ControlRollMetadataApplyParams {
+        let destination = URL(fileURLWithPath: sessionModel.positiveDestination)
+            .appendingPathComponent("Metadata Copies", isDirectory: true)
+            .standardizedFileURL.path
+        return ControlRollMetadataApplyParams(
+            frames: metadataCopyFrames,
+            to: destination,
+            template: sessionModel.positiveFilenameTemplate,
+            kind: "positive",
+            metadata: sessionModel.rollMetadataDraft,
+            dryRun: dryRun
+        )
     }
 
     private var saveOutputsSection: some View {

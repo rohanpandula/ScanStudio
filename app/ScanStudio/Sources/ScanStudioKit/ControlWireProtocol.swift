@@ -186,6 +186,7 @@ public struct ControlEmptyResult: Codable, Equatable, Sendable {
 public struct ControlMethodSniff: Decodable, Sendable {
     public let id: UInt64
     public let method: String
+    public let metadata: RequestMetadata?
 }
 
 // MARK: - hello
@@ -202,6 +203,25 @@ public struct ControlHelloParams: Codable, Equatable, Sendable {
     }
 }
 
+/// Human-readable control-session label only. It is deliberately not an
+/// authentication or authorization identity.
+public enum ControlControllerName {
+    public static let maximumUTF8Bytes = 128
+
+    public static func validationError(_ name: String) -> String? {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "controller name must contain a printable non-whitespace character"
+        }
+        guard name.utf8.count <= maximumUTF8Bytes else {
+            return "controller name exceeds the \(maximumUTF8Bytes)-byte limit"
+        }
+        guard name.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            return "controller name contains a non-printable control character"
+        }
+        return nil
+    }
+}
+
 /// D-04: identifies which process owns a control socket.
 public enum ControlHostKind: String, Codable, Sendable, Equatable {
     case gui
@@ -214,19 +234,31 @@ public struct ControlHelloResult: Codable, Equatable, Sendable {
     public let appVersion: String?
     public let host: ControlHostKind
     public let hostPid: Int32
+    public let diagnosticSessionId: String?
+    public let projectDirectory: String?
+    public let engineVersion: String?
+    public let availableDevices: [DeviceInfo]?
 
     public init(
         schemaVersion: Int,
         appName: String,
         appVersion: String? = nil,
         host: ControlHostKind = .gui,
-        hostPid: Int32 = ProcessInfo.processInfo.processIdentifier
+        hostPid: Int32 = ProcessInfo.processInfo.processIdentifier,
+        diagnosticSessionId: String? = nil,
+        projectDirectory: String? = nil,
+        engineVersion: String? = nil,
+        availableDevices: [DeviceInfo]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.appName = appName
         self.appVersion = appVersion
         self.host = host
         self.hostPid = hostPid
+        self.diagnosticSessionId = diagnosticSessionId
+        self.projectDirectory = projectDirectory
+        self.engineVersion = engineVersion
+        self.availableDevices = availableDevices
     }
 }
 
@@ -267,10 +299,111 @@ public struct ControlPreviewAcquireParams: Codable, Equatable, Sendable {
 
 public struct ControlScanStartParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
+    public let frames: [Int]?
+    public let passToken: String?
+    public let onFrameFailure: ScanFrameFailurePolicy?
+    public let allowedMeterRefusalSlots: [Int]?
 
-    public init(motionConfirmed: Bool?) {
+    public init(
+        motionConfirmed: Bool?,
+        frames: [Int]? = nil,
+        passToken: String? = nil,
+        onFrameFailure: ScanFrameFailurePolicy? = nil,
+        allowedMeterRefusalSlots: [Int]? = nil
+    ) {
         self.motionConfirmed = motionConfirmed
+        self.frames = frames
+        self.passToken = passToken
+        self.onFrameFailure = onFrameFailure
+        self.allowedMeterRefusalSlots = allowedMeterRefusalSlots
     }
+}
+
+public struct ControlRollSolveExposureParams: Codable, Equatable, Sendable {
+    public let frame: Int
+    public let motionConfirmed: Bool?
+    public let previewDerivedFrames: [PreviewDerivedExposurePolicy.Evidence]?
+
+    public init(
+        frame: Int,
+        motionConfirmed: Bool?,
+        previewDerivedFrames: [PreviewDerivedExposurePolicy.Evidence]? = nil
+    ) {
+        self.frame = frame
+        self.motionConfirmed = motionConfirmed
+        self.previewDerivedFrames = previewDerivedFrames
+    }
+}
+
+public struct ControlRollRenderParams: Codable, Equatable, Sendable {
+    public let frames: [Int]
+    public let profile: String
+    public let output: String
+
+    public init(frames: [Int], profile: String, output: String) {
+        self.frames = frames
+        self.profile = profile
+        self.output = output
+    }
+}
+
+public struct ControlRollExportParams: Codable, Equatable, Sendable {
+    public let to: String
+    public let template: String
+    public let kind: String
+    public let frames: [Int]?
+
+    public init(to: String, template: String, kind: String, frames: [Int]? = nil) {
+        self.to = to
+        self.template = template
+        self.kind = kind
+        self.frames = frames
+    }
+}
+
+public struct ControlRollMetadataApplyParams: Codable, Equatable, Sendable {
+    public let frames: [Int]
+    public let to: String
+    public let template: String
+    public let kind: String
+    public let metadata: MetadataSet
+    public let dryRun: Bool
+
+    public init(
+        frames: [Int],
+        to: String,
+        template: String,
+        kind: String,
+        metadata: MetadataSet,
+        dryRun: Bool = false
+    ) {
+        self.frames = frames
+        self.to = to
+        self.template = template
+        self.kind = kind
+        self.metadata = metadata
+        self.dryRun = dryRun
+    }
+}
+
+public struct ControlMetadataApplyFile: Codable, Equatable, Sendable {
+    public let frameIndex: Int
+    public let path: String
+    public let sourceSha256: String
+    public let outputSha256: String
+    public let readbackVerified: Bool
+}
+
+public struct ControlMetadataApplyResult: Codable, Equatable, Sendable {
+    public let operation: String
+    public let dryRun: Bool
+    public let exiftoolAvailable: Bool
+    public let exiftoolPath: String?
+    public let targets: [String]
+    public let arguments: [String]
+    public let fingerprint: String
+    public let files: [ControlMetadataApplyFile]
+    public let resultSidecar: String?
 }
 
 public struct ControlScanResumeParams: Codable, Equatable, Sendable {
@@ -420,12 +553,16 @@ public struct ControlRollSaveParams: Codable, Equatable, Sendable {
     public let filmProcess: FilmProcess
     public let motionConfirmed: Bool?
 
-    public init(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess, motionConfirmed: Bool?) {
+    /// Omitted preserves the original save-and-scan behavior.
+    public let startScan: Bool?
+
+    public init(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess, motionConfirmed: Bool?, startScan: Bool? = nil) {
         self.name = name
         self.carrier = carrier
         self.frameCount = frameCount
         self.filmProcess = filmProcess
         self.motionConfirmed = motionConfirmed
+        self.startScan = startScan
     }
 }
 
@@ -568,6 +705,23 @@ public struct ControlRefusalRecord: Codable, Equatable, Sendable {
     }
 }
 
+/// Durable receipt identities already committed to the open project's
+/// manifest. This compact summary lets a waiting CLI catch up after dropped
+/// events or process reattachment without polling or copying a receipt.
+public struct ControlCompletedReceipt: Codable, Equatable, Sendable {
+    public let jobId: String
+    public let frameIndex: Int
+    public let receiptKey: String
+    public let receiptPath: String?
+
+    public init(jobId: String, frameIndex: Int, receiptKey: String, receiptPath: String?) {
+        self.jobId = jobId
+        self.frameIndex = frameIndex
+        self.receiptKey = receiptKey
+        self.receiptPath = receiptPath
+    }
+}
+
 /// A full session snapshot built from `SessionModel` public state only.
 /// `hardwareMotionReadiness` and `scanReadiness` carry their enum case
 /// names as stable strings (computed by the dispatcher) so a caller can
@@ -587,6 +741,10 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     /// that point regardless, so it cannot stand in for this. Defaults to
     /// `false` so every existing construction site keeps compiling.
     public let previewComplete: Bool
+    /// Additive identity for the completed physical registration represented
+    /// by this snapshot. It is nil until a preview completes, and changes for
+    /// every replacement preview; legacy clients may omit it.
+    public let previewOperationId: String?
     /// D-17: additive. `control.changed`'s snapshot previously carried
     /// `jobId`/`jobState` but not live progress, leaving `--wait`'s stderr
     /// progress sink with no way to observe it without an extra `job.get`
@@ -598,11 +756,15 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     /// (`encodeIfPresent`), so an older client parsing this envelope is
     /// unaffected.
     public let progress: ControlScanProgress?
+    public let completedReceipts: [ControlCompletedReceipt]?
     public let refeedRequired: Bool
     public let hardwareMotionReadiness: String
     public let motionAllowed: Bool
     public let motionGuidance: String?
     public let mutatingOperationInFlight: String?
+    /// Informational label supplied by the controller that currently owns
+    /// `mutatingOperationInFlight`; nil while no operation is held.
+    public let controller: String?
     public let selectedFrames: [Int]
     public let scanReadiness: String
     public let scanReadinessReason: String?
@@ -628,12 +790,15 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         jobId: String? = nil,
         jobState: JobState? = nil,
         previewComplete: Bool = false,
+        previewOperationId: String? = nil,
         progress: ControlScanProgress? = nil,
+        completedReceipts: [ControlCompletedReceipt]? = nil,
         refeedRequired: Bool,
         hardwareMotionReadiness: String,
         motionAllowed: Bool,
         motionGuidance: String? = nil,
         mutatingOperationInFlight: String? = nil,
+        controller: String? = nil,
         selectedFrames: [Int],
         scanReadiness: String,
         scanReadinessReason: String? = nil,
@@ -649,12 +814,15 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.jobId = jobId
         self.jobState = jobState
         self.previewComplete = previewComplete
+        self.previewOperationId = previewOperationId
         self.progress = progress
+        self.completedReceipts = completedReceipts
         self.refeedRequired = refeedRequired
         self.hardwareMotionReadiness = hardwareMotionReadiness
         self.motionAllowed = motionAllowed
         self.motionGuidance = motionGuidance
         self.mutatingOperationInFlight = mutatingOperationInFlight
+        self.controller = controller
         self.selectedFrames = selectedFrames
         self.scanReadiness = scanReadiness
         self.scanReadinessReason = scanReadinessReason
@@ -819,6 +987,7 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
     /// D-20/HEAD-12: 1-based indices the batch never reached -- `[]` for a
     /// still-live job.
     public let notAttemptedFrames: [Int]
+    public let skippedFrames: [Int]?
 
     public init(
         jobId: String? = nil,
@@ -830,7 +999,8 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
         frameErrorCodes: [String: String] = [:],
         frameErrorMessages: [String: String] = [:],
         finishedAt: String? = nil,
-        notAttemptedFrames: [Int] = []
+        notAttemptedFrames: [Int] = [],
+        skippedFrames: [Int]? = nil
     ) {
         self.jobId = jobId
         self.jobState = jobState
@@ -842,6 +1012,7 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
         self.frameErrorMessages = frameErrorMessages
         self.finishedAt = finishedAt
         self.notAttemptedFrames = notAttemptedFrames
+        self.skippedFrames = skippedFrames
     }
 }
 
@@ -917,7 +1088,8 @@ public struct ControlRollListResult: Codable, Equatable, Sendable {
     }
 }
 
-/// `outcome` (D-13/HEAD-07) names which of three things actually happened,
+/// `"saved"` means explicit `startScan: false` created the project without motion.
+/// Otherwise `outcome` (D-13/HEAD-07) names which of three things happened,
 /// since a `true` `saved` alone cannot distinguish them --
 /// `SessionModel.saveRollAndScanSelectedFrames`'s own `return started ||
 /// pendingManualReviewScan?.frames == requestedFrames` line is exactly why:
@@ -947,6 +1119,27 @@ public struct ControlRollSaveResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct ControlRollSolveExposureResult: Codable, Equatable, Sendable {
+    public let solution: RollExposureLock
+
+    public init(solution: RollExposureLock) {
+        self.solution = solution
+    }
+}
+
+public struct ControlRenderExportFile: Codable, Equatable, Sendable {
+    public let frameIndex: Int
+    public let path: String
+    public let byteLength: UInt64
+    public let sha256: String
+}
+
+public struct ControlRenderExportResult: Codable, Equatable, Sendable {
+    public let operation: String
+    public let files: [ControlRenderExportFile]
+    public let resultSidecar: String
+}
+
 /// D-23/HEAD-12: `scan.start`/`scan.resume`'s own result, matching
 /// `ControlRollSaveResult.outcome`'s vocabulary (`"started"` |
 /// `"manualReviewPending"`) so a paused resume is never reported as a bare
@@ -956,9 +1149,11 @@ public struct ControlRollSaveResult: Codable, Equatable, Sendable {
 /// `.failure` response, not a success carrying a failure string.
 public struct ControlScanOutcomeResult: Codable, Equatable, Sendable {
     public let outcome: String
+    public let jobId: String?
 
-    public init(outcome: String) {
+    public init(outcome: String, jobId: String? = nil) {
         self.outcome = outcome
+        self.jobId = jobId
     }
 }
 
@@ -984,6 +1179,50 @@ public struct ControlDiagnosticsExportResult: Codable, Equatable, Sendable {
     }
 }
 
+/// Exact host-owned evidence authority for `session.inventory`. A present
+/// source carries both its path and the root against which the exporter must
+/// revalidate it; an unavailable optional carries only `missingReason`.
+public struct ControlSessionEvidenceEntry: Codable, Equatable, Sendable {
+    public let entryName: String
+    public let sourceKind: String
+    public let path: String?
+    public let allowedRoot: String?
+    public let expectedSha256: String?
+    public let missingReason: String?
+
+    public init(
+        entryName: String,
+        sourceKind: String,
+        path: String? = nil,
+        allowedRoot: String? = nil,
+        expectedSha256: String? = nil,
+        missingReason: String? = nil
+    ) {
+        self.entryName = entryName
+        self.sourceKind = sourceKind
+        self.path = path
+        self.allowedRoot = allowedRoot
+        self.expectedSha256 = expectedSha256
+        self.missingReason = missingReason
+    }
+}
+
+public struct ControlSessionInventoryResult: Codable, Equatable, Sendable {
+    public let diagnosticSessionId: String
+    public let entries: [ControlSessionEvidenceEntry]
+    public let bridgeVersion: String?
+
+    public init(
+        diagnosticSessionId: String,
+        entries: [ControlSessionEvidenceEntry],
+        bridgeVersion: String? = nil
+    ) {
+        self.diagnosticSessionId = diagnosticSessionId
+        self.entries = entries
+        self.bridgeVersion = bridgeVersion
+    }
+}
+
 public struct ControlEventsSubscribeResult: Codable, Equatable, Sendable {
     public let subscribed: Bool
     public let snapshot: ControlStatusResult
@@ -991,5 +1230,17 @@ public struct ControlEventsSubscribeResult: Codable, Equatable, Sendable {
     public init(subscribed: Bool, snapshot: ControlStatusResult) {
         self.subscribed = subscribed
         self.snapshot = snapshot
+    }
+}
+
+/// Local observer terminal: the established host connection reached EOF.
+/// This reports loss of observation, not whether an in-flight scan succeeded.
+public struct ControlHostExitedPayload: Codable, Equatable, Sendable {
+    public let reason: String
+    public let hostPid: Int32?
+
+    public init(reason: String = "peerEOF", hostPid: Int32?) {
+        self.reason = reason
+        self.hostPid = hostPid
     }
 }

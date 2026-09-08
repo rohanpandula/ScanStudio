@@ -45,6 +45,7 @@ __all__ = [
     "DEBUG_RECIPE_ENV_VAR",
     "DEBUG_COLOR_NEGATIVE_RECIPE",
     "validate_capture_recipe",
+    "validate_frame_exposure_overrides_10ns",
 ]
 
 
@@ -114,6 +115,8 @@ class CaptureRecipe:
     channels: Channels
     autofocus: bool
     auto_exposure: bool
+    # Fixed LS-5000 protocol limits are validated before motion; IR stays metered.
+    exposure_override_10ns: tuple[int, int, int] | None = None
 
 
 class RawExportFormat(StrEnum):
@@ -360,6 +363,9 @@ class ScanSummary:
     completed: tuple[int, ...]
     failed: tuple[int, ...]
     stopped: bool
+    # Explicit meter refusals the caller allowed as known-blank skips.
+    # These slots were attempted, but produced no capture receipt.
+    skipped: tuple[int, ...] = ()
     # Plan 10-09 (per-frame failure reasons, coordinator scope addition):
     # slot -> {"reason_class": str, "reason_message": str, "code": str} for
     # any slot in `failed` whose cause is already known when this
@@ -372,9 +378,8 @@ class ScanSummary:
     # stopped=...)` call site (this codebase's own test suite included)
     # keeps working unchanged. Deliberately NOT included when this
     # ScanSummary crosses the wire (service.py builds `scan.completed`'s
-    # `summary` payload by hand rather than via `to_wire(summary)`) --
-    # BRIDGE.md's documented `{completed, failed, stopped}` shape is
-    # unchanged; this field is consumed only internally, translated into
+    # `summary` payload by hand rather than via `to_wire(summary)`) -- this
+    # field is consumed only internally, translated into
     # `scan.frameFailed` telemetry/wire events instead (see service.py).
     failure_reasons: dict[int, dict[str, str]] = field(default_factory=dict)
 
@@ -460,7 +465,9 @@ def validate_capture_recipe(
     traced capture every earlier release accepted. `multisample_passes` must
     be a member of it. `auto_exposure` may be either boolean: `True` meters
     every frame, `False` meters the lowest requested slot and holds that
-    exposure for the rest of the batch (CoolscanPyTransport.start_scan).
+    exposure for the rest of the batch (CoolscanPyTransport.start_scan). An
+    explicit exposure_override_10ns supplies RGB authority from the first slot
+    onward, including across separate requests.
 
     Plan 10-09 debug-recipe gate: when env `SCANSTUDIO_BRIDGE_DEBUG_RECIPE`
     is exactly `"1"`, a `material=colorNegative` recipe ALSO validates
@@ -471,6 +478,19 @@ def validate_capture_recipe(
     is short-circuited before any recipe comparison runs, so behavior with
     the env unset (or set to anything other than exactly `"1"`) is
     byte-identical to before this override existed."""
+    override = recipe.exposure_override_10ns
+    if override is not None:
+        if (
+            type(override) is not tuple
+            or len(override) != 3
+            or any(type(tick) is not int or not 50_000 <= tick <= 400_000 for tick in override)
+            or recipe.auto_exposure is not False
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "recipe.exposureOverride10ns requires three integer RGB values in "
+                "50000..400000 (10ns ticks) and autoExposure=false; IR stays metered",
+            )
     if material is Material.BLACK_AND_WHITE_NEGATIVE:
         raise BridgeError(
             ErrorCode.NOT_IMPLEMENTED,
@@ -511,3 +531,47 @@ def validate_capture_recipe(
             )
         return None
     raise BridgeError(ErrorCode.INVALID_PARAMS, f"unknown material: {material!r}")
+
+
+def validate_frame_exposure_overrides_10ns(
+    slots: list[int],
+    recipe: CaptureRecipe,
+    overrides: dict[int, tuple[int, int, int]] | None,
+) -> None:
+    """Validate one complete per-slot RGB exposure authority before motion."""
+    if overrides is None:
+        return
+    if type(overrides) is not dict or any(type(slot) is not int for slot in overrides):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns must map integer slots to RGB tick arrays",
+        )
+    if set(overrides) != set(slots):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns keys must exactly match scan slots",
+        )
+    if recipe.auto_exposure is not False:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns requires recipe.autoExposure=false",
+        )
+    if recipe.exposure_override_10ns is not None:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns conflicts with recipe.exposureOverride10ns",
+        )
+    for slot, ticks in overrides.items():
+        if (
+            type(ticks) is not tuple
+            or len(ticks) != 3
+            or any(
+                type(tick) is not int or not 50_000 <= tick <= 400_000
+                for tick in ticks
+            )
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                f"frameExposureOverrides10ns[{slot}] requires three integer RGB values "
+                "in 50000..400000 (10ns ticks); IR stays metered",
+            )

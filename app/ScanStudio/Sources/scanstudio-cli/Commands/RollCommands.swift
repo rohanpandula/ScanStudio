@@ -12,7 +12,7 @@ struct Roll: AsyncParsableCommand {
         // file -- it composes Save's own request shape plus five other
         // already-shipped commands into one unattended walk, so it earns a
         // file of its own rather than crowding this one.
-        subcommands: [Save.self, Open.self, List.self, Run.self]
+        subcommands: [Save.self, Open.self, List.self, SolveExposure.self, Verify.self, Collect.self, Run.self, Report.self]
     )
 
     /// `roll save` -> `roll.save`.
@@ -36,7 +36,7 @@ struct Roll: AsyncParsableCommand {
     struct Save: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "save",
-            abstract: "Create the project from the current preview and scan the selected frames. Requires --confirm-motion."
+            abstract: "Create a roll and scan selected frames, or use --no-scan to save without motion."
         )
 
         @OptionGroup var options: GlobalOptions
@@ -63,7 +63,10 @@ struct Roll: AsyncParsableCommand {
         })
         var filmProcess: FilmProcess
 
-        @Flag(name: .customLong("confirm-motion"), help: "Required: this command starts a scan.")
+        @Flag(name: .customLong("no-scan"), help: "Create the project without scanning, for calibration or later capture.")
+        var noScan = false
+
+        @Flag(name: .customLong("confirm-motion"), help: "Required unless --no-scan is used.")
         var confirmMotion = false
 
         @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
@@ -94,6 +97,12 @@ struct Roll: AsyncParsableCommand {
         static let autoApproveMinimumContentConfidence: Double = 0.8
 
         mutating func validate() throws {
+            if noScan {
+                guard !wait && !autoApprove else {
+                    throw ValidationError("--no-scan cannot be combined with --wait or --auto-approve")
+                }
+                return
+            }
             guard confirmMotion else {
                 let payload = ControlErrorPayload(
                     .confirmationRequired,
@@ -143,7 +152,8 @@ struct Roll: AsyncParsableCommand {
         /// once their own single request resolves -- so it runs through
         /// `runAutoApprove` below instead, never through either of those.
         func run() async throws {
-            let params = ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: true)
+            // Older hosts may ignore startScan; never give them motion authority in --no-scan mode.
+            let params = ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: noScan ? false : confirmMotion, startScan: noScan ? false : nil)
             guard autoApprove else {
                 guard wait else {
                     try await CommandRunner.run(command: "roll.save", method: "roll.save", params: params, options: options)
@@ -183,6 +193,46 @@ struct Roll: AsyncParsableCommand {
 
         func run() async throws {
             try await CommandRunner.runWithoutParams(command: "roll.list", method: "roll.list", options: options)
+        }
+    }
+
+    struct SolveExposure: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "solve-exposure",
+            abstract: "Meter one previewed frame and persist the roll RGB exposure. Requires --confirm-motion."
+        )
+
+        @OptionGroup var options: GlobalOptions
+        @Option(name: .customLong("frame"), help: "One-based preview frame.")
+        var frame: Int
+        @Flag(name: .customLong("confirm-motion"), help: "Required: metering moves the scanner.")
+        var confirmMotion = false
+
+        mutating func validate() throws {
+            guard frame > 0 else { throw ValidationError("--frame must be positive") }
+            guard confirmMotion else {
+                let payload = ControlErrorPayload(
+                    .confirmationRequired,
+                    message: "\"roll solve-exposure\" requires --confirm-motion.",
+                    guidance: "Confirm scanner motion is authorized, then retry with --confirm-motion."
+                )
+                let text = try ControlCLIOutput.renderError(
+                    command: "roll.solveExposure",
+                    payload: payload,
+                    human: options.human
+                )
+                print(text, terminator: "")
+                throw ExitCode(77)
+            }
+        }
+
+        func run() async throws {
+            try await CommandRunner.run(
+                command: "roll.solveExposure",
+                method: "roll.solveExposure",
+                params: ControlRollSolveExposureParams(frame: frame, motionConfirmed: true),
+                options: options
+            )
         }
     }
 }

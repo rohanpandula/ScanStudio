@@ -191,78 +191,14 @@ def probe_adapter_status(
     )
 
     try:
-        initial_transaction_deadline = time.monotonic() + data_timeout_ms / 1_000
-        settle_deadline: float | None = None
-        sense_history: list[str] = []
-        while True:
-            if settle_deadline is not None and time.monotonic() >= settle_deadline:
-                return AdapterStatus(
-                    film_present=None,
-                    frame_capacity=None,
-                    raw_status=sense_history[-1],
-                    sense_history=tuple(sense_history),
-                    device_id=claimed_device_id,
-                )
-
-            try:
-                result = _perform_transaction(
-                    ep_out,
-                    ep_in,
-                    {
-                        "seq": "adapter-status-probe",
-                        "name": "TEST_UNIT_READY",
-                        "cdb": _TEST_UNIT_READY_CDB,
-                    },
-                    data_timeout_ms=data_timeout_ms,
-                    deadline_monotonic=(
-                        initial_transaction_deadline
-                        if settle_deadline is None
-                        else settle_deadline
-                    ),
-                )
-                sense = _validated_transaction_sense(result)
-            except Exception as error:
-                logger.debug(f"adapter status probe transaction failed: {error}")
-                return AdapterStatus(
-                    film_present=None,
-                    frame_capacity=None,
-                    raw_status=sense_history[-1] if sense_history else None,
-                    sense_history=tuple(sense_history),
-                    device_id=claimed_device_id,
-                )
-
-            sense_history.append(sense)
-            if sense not in _STARTUP_UNIT_ATTENTION_SENSES:
-                present = _classify_film_presence(sense)
-                return AdapterStatus(
-                    film_present=present,
-                    frame_capacity=(
-                        _ADAPTER_FRAME_CAPACITY if present is True else None
-                    ),
-                    raw_status=sense,
-                    sense_history=(
-                        tuple(sense_history) if len(sense_history) > 1 else ()
-                    ),
-                    device_id=claimed_device_id,
-                )
-
-            if settle_deadline is None:
-                settle_deadline = time.monotonic() + settle_deadline_seconds
-            now = time.monotonic()
-            if now >= settle_deadline:
-                return AdapterStatus(
-                    film_present=None,
-                    frame_capacity=None,
-                    raw_status=sense,
-                    sense_history=tuple(sense_history),
-                    device_id=claimed_device_id,
-                )
-            time.sleep(
-                min(
-                    settle_poll_seconds,
-                    max(0.0, settle_deadline - now),
-                )
-            )
+        return probe_claimed_adapter_status(
+            ep_out,
+            ep_in,
+            device_id=claimed_device_id,
+            data_timeout_ms=data_timeout_ms,
+            settle_deadline_seconds=settle_deadline_seconds,
+            settle_poll_seconds=settle_poll_seconds,
+        )
     finally:
         try:
             usb_util.release_interface(device, interface.bInterfaceNumber)
@@ -274,4 +210,104 @@ def probe_adapter_status(
             logger.debug(f"adapter status probe could not dispose resources: {error}")
 
 
-__all__ = ["AdapterStatus", "probe_adapter_status"]
+def probe_claimed_adapter_status(
+    ep_out,
+    ep_in,
+    *,
+    device_id: str | None = None,
+    data_timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    settle_deadline_seconds: float = _SETTLE_DEADLINE_SECONDS,
+    settle_poll_seconds: float = _SETTLE_POLL_SECONDS,
+) -> AdapterStatus:
+    """Read film presence through an interface the caller already owns.
+
+    This is the same motion-free TEST UNIT READY classification as
+    :func:`probe_adapter_status`, without opening, claiming, or releasing
+    the USB interface.  A retained preview worker uses it because a second
+    process cannot truthfully probe an interface that worker still owns.
+    """
+
+    _validate_timing(
+        "data_timeout_ms",
+        data_timeout_ms,
+        integer=True,
+        strictly_positive=True,
+    )
+    _validate_timing("settle_deadline_seconds", settle_deadline_seconds)
+    _validate_timing("settle_poll_seconds", settle_poll_seconds)
+
+    initial_transaction_deadline = time.monotonic() + data_timeout_ms / 1_000
+    settle_deadline: float | None = None
+    sense_history: list[str] = []
+    while True:
+        if settle_deadline is not None and time.monotonic() >= settle_deadline:
+            return AdapterStatus(
+                film_present=None,
+                frame_capacity=None,
+                raw_status=sense_history[-1],
+                sense_history=tuple(sense_history),
+                device_id=device_id,
+            )
+
+        try:
+            result = _perform_transaction(
+                ep_out,
+                ep_in,
+                {
+                    "seq": "adapter-status-probe",
+                    "name": "TEST_UNIT_READY",
+                    "cdb": _TEST_UNIT_READY_CDB,
+                },
+                data_timeout_ms=data_timeout_ms,
+                deadline_monotonic=(
+                    initial_transaction_deadline
+                    if settle_deadline is None
+                    else settle_deadline
+                ),
+            )
+            sense = _validated_transaction_sense(result)
+        except Exception as error:
+            logger.debug(f"adapter status probe transaction failed: {error}")
+            return AdapterStatus(
+                film_present=None,
+                frame_capacity=None,
+                raw_status=sense_history[-1] if sense_history else None,
+                sense_history=tuple(sense_history),
+                device_id=device_id,
+            )
+
+        sense_history.append(sense)
+        if sense not in _STARTUP_UNIT_ATTENTION_SENSES:
+            present = _classify_film_presence(sense)
+            return AdapterStatus(
+                film_present=present,
+                frame_capacity=(
+                    _ADAPTER_FRAME_CAPACITY if present is True else None
+                ),
+                raw_status=sense,
+                sense_history=(
+                    tuple(sense_history) if len(sense_history) > 1 else ()
+                ),
+                device_id=device_id,
+            )
+
+        if settle_deadline is None:
+            settle_deadline = time.monotonic() + settle_deadline_seconds
+        now = time.monotonic()
+        if now >= settle_deadline:
+            return AdapterStatus(
+                film_present=None,
+                frame_capacity=None,
+                raw_status=sense,
+                sense_history=tuple(sense_history),
+                device_id=device_id,
+            )
+        time.sleep(
+            min(
+                settle_poll_seconds,
+                max(0.0, settle_deadline - now),
+            )
+        )
+
+
+__all__ = ["AdapterStatus", "probe_adapter_status", "probe_claimed_adapter_status"]

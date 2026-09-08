@@ -146,6 +146,21 @@ Errors: `INVALID_PARAMS` (not exactly one of `indices`/`all`/`none`; pre-project
 ### `outputs.set`
 `{outputs: OutputRecipe}` → `{}`. Routes to `applyOutputRecipe(_:)`, which delegates to the same private path `roll.open` already uses to seed a project's recipes. Same `isJobActive`/`isResumingBatch` busy rule as `settings.set`. Errors: `CONTROLLER_BUSY`.
 
+### CLI named presets
+
+`preset save NAME`, `preset list`, and `preset apply NAME` are CLI
+compositions over these existing methods, not additional control-channel
+methods. Presets are versioned JSON under `~/.scanstudio/presets/` and contain
+only `CaptureRecipe`, `ProcessingRecipe`, and `OutputRecipe`. Saving reads
+`settings.get` and `outputs.get`; listing is local; applying reads the current
+settings, then sends `settings.set` and `outputs.set`. Applying retains the
+current project's persisted manual exposure lock rather than accepting an
+exposure override from the file. `scan --preset NAME` performs the same apply
+composition before `scan.start`; it retains the scan command's independent
+`motionConfirmed` gate. No preset operation sends a scanner request before
+the scan itself. The two existing set requests are sequential, so a later
+refusal can leave the first recipe applied; the refusal prevents scan start.
+
 ### `roll.save`
 `{name: string, carrier: SimulatedFilmCarrier, frameCount: number, filmProcess: FilmProcess, motionConfirmed: boolean}` → `{saved: boolean, projectName?: string, projectDirectory?: string, outcome: "started"|"manualReviewPending"|"failed"}`. **Requires `motionConfirmed: true`** — it creates the project and immediately starts the scan of the selected frames, even though its name does not say so. Routes to `saveRollAndScanSelectedFrames(name:carrier:frameCount:filmProcess:)`, which creates the project from the current preview and starts (or pauses for manual review) the currently selected frames in one step. Errors: `CONFIRMATION_REQUIRED`; `GATE_REFUSED` with no `gate` (a project is already open, or no frames are selected — both app-level preconditions); `CONTROLLER_BUSY`; passthrough.
 
@@ -159,10 +174,38 @@ Errors: `INVALID_PARAMS` (not exactly one of `indices`/`all`/`none`; pre-project
 ### `roll.list`
 `{}` → `{projects: [{id: string, name: string, carrier: SimulatedFilmCarrier, frameCount: number, filmProcess: FilmProcess, createdAt: string, directory: string}]}`. Routes to `refreshRecentProjects()`, refreshing `SessionModel.recentProjects` from the engine's default projects root. An empty list on success is a valid, displayable state. Errors: `CONTROLLER_BUSY`; passthrough.
 
+### `roll.solveExposure`
+`{frame: number, motionConfirmed: true}` → `{solution: RollExposureLock}`.
+Requires an open project, completed preview registration and the same motion
+readiness gate as capture. Waits for the engine's correlated terminal event.
+The successful solution is persisted roll-wide; AE-off scan calls reuse its
+RGB ticks, while AE-on calls omit the override without clearing the lock.
+IR remains metered. Simulator/unsupported drivers refuse measured exposure.
+Errors: `CONFIRMATION_REQUIRED`, `CONTROLLER_BUSY`, `GATE_REFUSED`, typed engine errors.
+
+### `roll.verify`
+`{pass?: string, exposureIdentical: boolean, noClipping: boolean}` →
+`{status: "pass"|"fail"|"unknown", exposureIdentical, noClipping, checkedReceipts, issues: [{status, jobId?, frameIndex?, field, detail}]}`.
+Reads the durable project and checks selected capture file bindings, lengths
+and hashes. Exposure comparisons are grouped by pass. Missing evidence is
+unknown. No scanner request or project mutation is made.
+
+### `roll.collect`
+`{to: string, metadata: {stock: string, pass: string, slotMap: {slot: physicalFrame}, operator?: string, firmware?: string, adapter?: string, host?: string}}` →
+`{destination, files: [{path, byteLength, sha256}], metadataPath, hashesPath}`.
+Copies one exact receipt pass into a fresh destination using held source and
+destination handles, then verifies its file identities and hashes. Raw-enabled
+receipts require raw RGB and tagged IR; raw-disabled receipts retain their
+available positives, meter and receipt. No original is modified and no scanner
+operation is invoked. Missing/changed evidence or an existing destination is
+refused. The project exposure lock takes precedence over supplied metadata.
+
 ### `scan.start`
-`{motionConfirmed: boolean}` → `{outcome: "started"|"manualReviewPending"}`. **Requires `motionConfirmed: true`.** Pre-checks `scanReadiness(for: selectedFrames)` — verbatim the expression `ScanPanelView`'s Scan button binds its `.disabled` state to — then routes to `startMockScan()`, the one entry point for both real and simulated devices. `CONTROLLER_BUSY` also covers the window while the GUI-only attended-scan-recovery approval (`approveEveryFrameAndScan()` — see Not yet implemented) is in flight: that approval now participates in the same D-07 busy indicator as every other mutating action, so `scan.start` can never report a typed success for a request that approval silently absorbed instead. Emits `scan.jobState`/`scan.progress`/`scan.frameState` as the job proceeds. Errors: `CONFIRMATION_REQUIRED`; `GATE_REFUSED`, gate `scanReadiness`; `CONTROLLER_BUSY`; passthrough.
+`{motionConfirmed: boolean, frames?: number[], passToken?: string}` → `{outcome: "started"|"manualReviewPending"}`. **Requires `motionConfirmed: true`.** Pre-checks `scanReadiness(for: requestedFrames)` — verbatim the expression `ScanPanelView`'s Scan button binds its `.disabled` state to — then routes to `startMockScan(frames:passToken:)`, the one entry point for both real and simulated devices. `CONTROLLER_BUSY` also covers the window while the GUI-only attended-scan-recovery approval (`approveEveryFrameAndScan()` — see Not yet implemented) is in flight: that approval now participates in the same D-07 busy indicator as every other mutating action, so `scan.start` can never report a typed success for a request that approval silently absorbed instead. Emits `scan.jobState`/`scan.progress`/`scan.frameState` as the job proceeds. Errors: `CONFIRMATION_REQUIRED`; `GATE_REFUSED`, gate `scanReadiness`; `CONTROLLER_BUSY`; passthrough.
 
 `outcome` (D-23/HEAD-12, additive — the 2026-09-07 batch abort) matches `roll.save`'s own vocabulary: `"started"` (the scan actually began) or `"manualReviewPending"` (a flagged boundary paused it at the review gate instead, from the exact frames this call requested — see `status.manualReviewPending`). Never `"failed"` here: a failure is the `.failure` response above, not a success carrying a failure string. This closes the 2026-09-07 gap where a paused start was indistinguishable, on the wire, from an outright started job.
+
+Optional `frames` is an explicit, unique positive frame set; omission uses the current selection. It follows the same readiness and manual-review gates, including explicit rescans. Optional `passToken` is 1–64 ASCII letters/digits/`.`/`_`/`-`, excluding `.` and `..`; it is preserved in each receipt and materialized in `{pass}`/`$Pass` filename tokens. CLI repeats send separate sequential starts after terminal success; the control method itself starts exactly one job.
 
 ### `scan.stop`
 `{mode?: "afterCurrentFrame"|"immediate"}` (absent `mode` = `"afterCurrentFrame"`) → `{}`. Routes to `stopAfterCurrentFrame()` or `stopImmediately()`. Refused with `GATE_REFUSED` when no job is active, rather than silently reporting success for nothing having happened. Errors: `INVALID_PARAMS` (unrecognized `mode`); `GATE_REFUSED` with no `gate` (no active job); `CONTROLLER_BUSY`; passthrough.
@@ -250,8 +293,10 @@ The resident host probes the socket before constructing an engine. A live owner 
 | 69 | No host reachable | `HOST_UNREACHABLE` — the control socket could not be dialed at the given (or default) path |
 | 70 | Internal error | Channel `UNKNOWN_COMMAND`; CLI-originated `INTERNAL` (an unexpected condition after a request already succeeded, for example a response that failed to decode) |
 | 75 | Busy / conflict | `CONTROLLER_BUSY`, `HOST_ALREADY_RUNNING` |
+| 76 | Established host connection closed | `control.hostExited` for streaming observers |
 | 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
 | 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
+| 124 | Wait timeout | `WAIT_TIMEOUT` from `wait --for … --timeout …` |
 
 `--wait`'s own exit code is decided the same way, from the job's final aggregate rather than a second table: `completed` and `stopped` both exit 0 (the job reached a terminal state without error — a caller who asked to stop gets a clean exit, not a failure), `failed` exits 65.
 
@@ -261,6 +306,9 @@ One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen group
 
 | Subcommand | Channel method(s) | Confirmation flag | Exit codes |
 |---|---|---|---|
+| `roll solve-exposure --frame N --confirm-motion` | `roll.solveExposure` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
+| `roll verify [--pass TOKEN] [--exposure-identical] [--no-clipping]` | `roll.verify` | — | 0, 65, 69, 70, 75 |
+| `roll collect --to PATH --stock STOCK --pass TOKEN --slot-map MAP.json [--operator NAME]` | `roll.collect` | — | 0, 64, 65, 69, 70, 75 |
 | `connect [--device <id>]` | `scanner.connect` | — | 0, 65, 69, 70, 75 |
 | `disconnect` | `scanner.disconnect` | — | 0, 65, 69, 70, 75 |
 | `rescan` | `scanner.rescan` | — | 0, 65, 69, 70, 75 |
@@ -270,9 +318,14 @@ One row per `scanstudio-cli` subcommand group (the full D-08 tree, sixteen group
 | `review approve --confirm-motion` / `review cancel` | `review.approve` / `review.cancel` | `--confirm-motion` (`approve` only; `cancel` authorizes no motion and takes none) | 0, 65, 69, 70, 75, 77 (`approve` only) |
 | `settings get` / `settings set […]` | `settings.get` / `settings.set` | — | 0, 65, 69, 70, 75 |
 | `outputs get` / `outputs set […]` | `outputs.get` / `outputs.set` | — | 0, 65, 69, 70, 75 |
+| `wait --for CONDITION [--timeout SECONDS]` | `events.subscribe` and the existing event stream | — | 0, 65, 69, 70, 75, 76, 124 |
+| `link health [--minutes N]` | `session.inventory` | — | 0, 64, 65, 69, 70, 75 |
+| `session export --to PATH` | `session.inventory` plus create-only local ZIP | — | 0, 64, 65, 69, 70, 75 |
+| `preset save NAME` / `preset list` / `preset apply NAME` | `settings.get` + `outputs.get` / local store / `settings.get` + `settings.set` + `outputs.set` | — | 0, 64, 65, 69, 70, 75 |
 | `roll save --name … --carrier … --frame-count … --film-process … --confirm-motion [--wait] [--auto-approve]` / `roll open <directory>` / `roll list` | `roll.save`, then (only when its `outcome` is `manualReviewPending` and `--auto-approve` was given) `status` and, only if every flagged frame clears the bar, `review.approve` — all on the same connection / `roll.open` / `roll.list` | `--confirm-motion` (`save` only; `--auto-approve` requires it too, checked independently) | 0, 65, 69, 70, 75, 77 (`save`, also a `--wait`ed `failed` terminal state); 0, 65, 69, 70, 75 (`open`/`list`) |
 | `roll run --name … --carrier … [--frame-count …] --film-process … --film-loaded --confirm-motion [--skip-blank] [--auto-approve] [--wait\|--no-wait]` (D-15/HEAD-09; see Run receipt, above) | `scanner.refresh`+`status` (with D-16's one permitted non-motion reconnect on `NOT_CONNECTED`) → `preview.acquire` → a bounded wait for `status.previewComplete` off the already-subscribed event stream → `frames.list`+`frames.select` → `roll.save` → (only when its `outcome` is `manualReviewPending`) `status` and, only when `--auto-approve` resolves it, `review.approve` → (when `--wait`, the default, and a job actually started) a wait for the job's terminal state — one connection throughout, stopping dead at the first refused step | `--film-loaded` **and** `--confirm-motion` (two independent parse-time gates) | 0, 64 (`--skip-blank` would select nothing, or no previewed frames exist), 65 (also a missing `--frame-count` with no scanner-reported default, and a `--wait`ed `failed` terminal state), 69 (also the event stream ending mid-wait), 70 (also a preview that never signals completion within the bound), 75, 77 |
-| `scan --confirm-motion [--wait]` | `scan.start` | `--confirm-motion` | 0, 65 (also a `--wait`ed `failed` terminal state), 69, 70, 75, 77 |
+| `scan --dry-run [--frames RANGE]` / `resume --dry-run` | `scan.preflight` | — (observational; no motion request) | 0, 65, 69, 70, 75 |
+| `scan --confirm-motion [--wait] [--preset NAME]` | `settings.get` + `settings.set` + `outputs.set` when a preset is supplied, then `scan.start` | `--confirm-motion` | 0, 64, 65 (also a `--wait`ed `failed` terminal state), 69, 70, 75, 77 |
 | `stop [--immediate]` | `scan.stop` | — (stopping never starts motion) | 0, 65 (`GATE_REFUSED` when no job is active), 69, 70, 75 |
 | `resume --confirm-motion [--wait]` | `scan.resume` | `--confirm-motion` | 0, 65 (also a `--wait`ed `failed` terminal state), 69, 70, 75, 77 |
 | `eject --confirm-motion` | `scanner.eject` | `--confirm-motion` | 0, 65, 69, 70, 75, 77 |
@@ -290,3 +343,20 @@ Two facts about this table a reader will otherwise get wrong:
 Recorded here so both gaps stay visible in the spec, not only in a plan:
 
 - **Attended-scan-recovery approval** (`SessionModel.approveEveryFrameAndScan()`, the path behind `ContentView.swift`'s attended-retry banner) has no channel command yet. It approves every frame in the roll against a different confirmation contract than `review.approve`'s single-boundary approval and needs its own command; D-08's command tree does not include it, so this work is carried past Phase 2 to a later phase.
+
+### Calibration project bootstrap
+
+`roll.save` accepts optional `startScan: false` to create the project without
+starting a preview or capture. This form does not require `motionConfirmed`;
+it refuses an already saved roll or an active job and returns the normal save
+result with `outcome: "saved"`. An omitted or true `startScan` preserves the
+existing save-and-scan behavior and confirmation requirement.
+
+### Observer EOF
+
+`ControlChannelClient` synthesizes one `control.hostExited` event when an
+established host connection reaches EOF. Payload: `{reason: "peerEOF",
+hostPid: number}`. Ordinary local client shutdown emits no host-loss event.
+CLI streaming observers report exit 76 after forwarding this event; finite
+commands retain their actual response semantics. Status snapshots include
+nullable `previewOperationId` for registration change detection.

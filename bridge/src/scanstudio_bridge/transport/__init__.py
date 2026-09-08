@@ -95,6 +95,8 @@ class Transport(Protocol):
         default, and every pre-existing caller) is unchanged behavior."""
         ...
 
+    def solve_exposure(self, slot: int) -> dict[str, object]: ...
+
     def set_spacing_offset(
         self, slot: int, offset_rows: int
     ) -> domain.Thumbnail: ...
@@ -136,6 +138,10 @@ class Transport(Protocol):
         on_retry: Callable[[int, int, str], None],  # slot, attempt, reason
         on_frame: Callable[[int, domain.ScanReceipt], None],
         on_call: OnCall | None = None,
+        *,
+        allowed_meter_refusal_slots: tuple[int, ...] = (),
+        on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
+        frame_exposure_overrides_10ns: dict[int, tuple[int, int, int]] | None = None,
     ) -> domain.ScanSummary: ...
 
     def request_stop(self) -> None: ...  # stop between transfers, per BRIDGE.md scan.stop

@@ -204,8 +204,42 @@ struct Scan: AsyncParsableCommand {
     @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
     var wait = false
 
+    @Option(name: .customLong("on-frame"), help: "Run a bounded shell command once for each durable completed-frame receipt. Requires --wait.")
+    var onFrame: String?
+
+    @Option(name: .customLong("on-fail"), help: "Run a bounded shell command once if the job fails. Requires --wait.")
+    var onFail: String?
+
+    @Option(name: .customLong("frames"), help: "Scan explicit frame indices or ranges, for example 20 or 1-6,9.")
+    var frameRanges: String?
+
+    @Option(name: .customLong("repeat"), help: "Run this exact scan sequentially 1...100 times. Repeats always wait for each job.")
+    var repeatCount = 1
+
+    @Option(name: .customLong("pass"), help: "Filename/receipt pass prefix. With repeats, TOKEN becomes TOKEN01, TOKEN02, and so on.")
+    var passToken: String?
+
+    @Option(name: .customLong("on-frame-failure"), help: "Frame failure policy: stop (default) or skip for explicitly allowed meter refusals.")
+    var onFrameFailure = "stop"
+
+    @Option(name: .customLong("allow-meter-refusal-slots"), help: "Known blank frame indices or ranges eligible for a metering-refusal skip.")
+    var allowedMeterRefusalRanges: String?
+
+    @Option(name: .customLong("preset"), help: "Apply a saved scan and output preset before starting the scan.")
+    var presetName: String?
+
+    @Flag(name: .customLong("dry-run"), help: "Report cached readiness and destination gates without starting a scan.")
+    var dryRun = false
+
+    private var repeatPlan = ScanRepeatPlan(
+        frames: nil,
+        passTokens: [nil],
+        onFrameFailure: .stop,
+        allowedMeterRefusalSlots: []
+    )
+
     mutating func validate() throws {
-        guard confirmMotion else {
+        guard confirmMotion || dryRun else {
             let payload = ControlErrorPayload(
                 .confirmationRequired,
                 message: "\"scan\" requires --confirm-motion.",
@@ -215,17 +249,150 @@ struct Scan: AsyncParsableCommand {
             print(text, terminator: "")
             throw ExitCode(77)
         }
+        if (onFrame != nil || onFail != nil), !wait {
+            throw ValidationError("--on-frame and --on-fail require --wait.")
+        }
+        if (onFrame != nil || onFail != nil), repeatCount != 1 {
+            throw ValidationError("Hooks currently require a single scan job; omit --repeat.")
+        }
+        if [onFrame, onFail].compactMap({ $0 }).contains(where: { $0.isEmpty || $0.utf8.count > 4_096 }) {
+            throw ValidationError("Hook commands must contain 1...4096 UTF-8 bytes.")
+        }
+        if let presetName {
+            do { _ = try ScanRecipePresetStore().load(named: presetName) }
+            catch { try PresetCommandSupport.failLocal(command: "scan.start", options: options, error: error) }
+            if dryRun { throw ValidationError("Apply the preset first, then run scan --dry-run to inspect the effective settings.") }
+        }
+        do {
+            repeatPlan = try ScanRepeatPlan.make(
+                frameRanges: frameRanges,
+                repeatCount: repeatCount,
+                passToken: passToken,
+                onFrameFailure: onFrameFailure,
+                allowedMeterRefusalRanges: allowedMeterRefusalRanges
+            )
+        } catch let error as ScanRepeatPlan.ValidationError {
+            let payload = ControlErrorPayload(
+                code: ControlCLIErrorCode.invalidRange.rawValue,
+                message: error.message,
+                recoverable: false
+            )
+            let text = try ControlCLIOutput.renderError(command: "scan.start", payload: payload, human: options.human)
+            print(text, terminator: "")
+            throw ExitCode(64)
+        } catch let error as ControlFrameRangeError {
+            let payload = ControlErrorPayload(
+                code: ControlCLIErrorCode.invalidRange.rawValue,
+                message: error.message,
+                recoverable: false
+            )
+            let text = try ControlCLIOutput.renderError(command: "scan.start", payload: payload, human: options.human)
+            print(text, terminator: "")
+            throw ExitCode(64)
+        }
     }
 
     func run() async throws {
+        if dryRun {
+            try await MotionStartRunner.runDryRun(frames: repeatPlan.frames, resume: false, options: options)
+            return
+        }
+        if repeatPlan.passTokens.count > 1 {
+            try await MotionStartRunner.runRepeatedScan(
+                frames: repeatPlan.frames,
+                passTokens: repeatPlan.passTokens.compactMap { $0 },
+                onFrameFailure: repeatPlan.onFrameFailure,
+                allowedMeterRefusalSlots: repeatPlan.allowedMeterRefusalSlots,
+                options: options,
+                quiet: options.quiet, presetName: presetName
+            )
+            return
+        }
         try await MotionStartRunner.run(
             command: "scan.start",
             method: "scan.start",
-            params: ControlScanStartParams(motionConfirmed: true),
+            params: ControlScanStartParams(
+                motionConfirmed: true,
+                frames: repeatPlan.frames,
+                passToken: repeatPlan.passTokens[0],
+                onFrameFailure: repeatPlan.onFrameFailure,
+                allowedMeterRefusalSlots: repeatPlan.allowedMeterRefusalSlots
+            ),
             options: options,
             wait: wait,
-            quiet: options.quiet
+            quiet: options.quiet, presetName: presetName,
+            onFrame: onFrame,
+            onFail: onFail
         )
+    }
+}
+
+struct ScanRepeatPlan: Codable, Equatable {
+    struct ValidationError: Error {
+        let message: String
+    }
+
+    let frames: [Int]?
+    let passTokens: [String?]
+    let onFrameFailure: ScanFrameFailurePolicy
+    let allowedMeterRefusalSlots: [Int]
+
+    static func make(
+        frameRanges: String?,
+        repeatCount: Int,
+        passToken: String?,
+        onFrameFailure: String,
+        allowedMeterRefusalRanges: String?
+    ) throws -> Self {
+        guard (1...100).contains(repeatCount) else {
+            throw ValidationError(message: "--repeat must be within 1...100, got \(repeatCount).")
+        }
+        if repeatCount > 1, passToken == nil {
+            throw ValidationError(message: "--pass is required when --repeat is greater than 1.")
+        }
+        let frames = try frameRanges.map(ControlFrameRangeParser.parse)
+        guard let policy = ScanFrameFailurePolicy(rawValue: onFrameFailure) else {
+            throw ValidationError(message: "--on-frame-failure must be stop or skip.")
+        }
+        let allowedSlots = try allowedMeterRefusalRanges.map(ControlFrameRangeParser.parse) ?? []
+        if policy == .stop, !allowedSlots.isEmpty {
+            throw ValidationError(message: "--allow-meter-refusal-slots requires --on-frame-failure skip.")
+        }
+        if policy == .skip {
+            guard !allowedSlots.isEmpty else {
+                throw ValidationError(message: "--on-frame-failure skip requires --allow-meter-refusal-slots.")
+            }
+            if let frames, !allowedSlots.allSatisfy(frames.contains) {
+                throw ValidationError(message: "--allow-meter-refusal-slots must be a subset of --frames.")
+            }
+        }
+        let tokens: [String?]
+        if repeatCount == 1 {
+            tokens = [passToken]
+        } else {
+            tokens = (1...repeatCount).map { "\(passToken!)\(String(format: "%02d", $0))" }
+        }
+        for token in tokens.compactMap({ $0 }) {
+            guard validPassToken(token) else {
+                throw ValidationError(
+                    message: "--pass must produce 1...64 ASCII letters, digits, '.', '_', or '-' (and not '.' or '..')."
+                )
+            }
+        }
+        return Self(
+            frames: frames,
+            passTokens: tokens,
+            onFrameFailure: policy,
+            allowedMeterRefusalSlots: allowedSlots
+        )
+    }
+
+    private static func validPassToken(_ token: String) -> Bool {
+        !token.isEmpty && token.utf8.count <= 64 && token != "." && token != ".."
+            && token.utf8.allSatisfy {
+                (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0)
+                    || $0 == 46 || $0 == 95 || $0 == 45
+            }
     }
 }
 
@@ -272,8 +439,17 @@ struct Resume: AsyncParsableCommand {
     @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
     var wait = false
 
+    @Option(name: .customLong("on-frame"), help: "Run a bounded shell command once for each durable completed-frame receipt. Requires --wait.")
+    var onFrame: String?
+
+    @Option(name: .customLong("on-fail"), help: "Run a bounded shell command once if the job fails. Requires --wait.")
+    var onFail: String?
+
+    @Flag(name: .customLong("dry-run"), help: "Report cached pending-frame gates without resuming.")
+    var dryRun = false
+
     mutating func validate() throws {
-        guard confirmMotion else {
+        guard confirmMotion || dryRun else {
             let payload = ControlErrorPayload(
                 .confirmationRequired,
                 message: "\"resume\" requires --confirm-motion.",
@@ -283,16 +459,28 @@ struct Resume: AsyncParsableCommand {
             print(text, terminator: "")
             throw ExitCode(77)
         }
+        if (onFrame != nil || onFail != nil), !wait {
+            throw ValidationError("--on-frame and --on-fail require --wait.")
+        }
+        if [onFrame, onFail].compactMap({ $0 }).contains(where: { $0.isEmpty || $0.utf8.count > 4_096 }) {
+            throw ValidationError("Hook commands must contain 1...4096 UTF-8 bytes.")
+        }
     }
 
     func run() async throws {
+        if dryRun {
+            try await MotionStartRunner.runDryRun(frames: nil, resume: true, options: options)
+            return
+        }
         try await MotionStartRunner.run(
             command: "scan.resume",
             method: "scan.resume",
             params: ControlScanResumeParams(motionConfirmed: true),
             options: options,
             wait: wait,
-            quiet: options.quiet
+            quiet: options.quiet,
+            onFrame: onFrame,
+            onFail: onFail
         )
     }
 }
@@ -307,49 +495,380 @@ struct Resume: AsyncParsableCommand {
 /// suppresses a stderr write that `JobWaiter` itself never performs (see
 /// its own header).
 enum MotionStartRunner {
+    static func runDryRun(frames: [Int]?, resume: Bool, options: GlobalOptions) async throws {
+        let command = "scan.preflight"
+        let client = try await CommandRunner.openConnection(command: command, options: options)
+        try await preflight(command: command, client: client, frames: frames, resume: resume, options: options, dryRun: true)
+    }
+
+    static func preflight(
+        command: String, client: ControlChannelClient, frames: [Int]?, resume: Bool,
+        options: GlobalOptions, dryRun: Bool = false
+    ) async throws {
+        let response = try await CommandRunner.request(
+            command: command, method: "scan.preflight",
+            params: ControlScanPreflightParams(frames: frames, resume: resume), options: options, client: client
+        )
+        guard case .result(let data) = response else {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+            return
+        }
+        let report: ScanPreflightReport
+        do { report = try JSONDecoder().decode(ScanPreflightReport.self, from: data) }
+        catch { try await CommandRunner.fail(command: command, options: options, client: client, error: error) }
+        if dryRun || !report.ready {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+            if !report.ready { throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue) }
+        }
+    }
+
+    static func runRepeatedScan(
+        frames: [Int]?,
+        passTokens: [String],
+        onFrameFailure: ScanFrameFailurePolicy,
+        allowedMeterRefusalSlots: [Int],
+        options: GlobalOptions,
+        quiet: Bool,
+        presetName: String? = nil
+    ) async throws {
+        let command = "scan.start"
+        let client = try await CommandRunner.openConnection(command: command, options: options)
+        if let presetName {
+            try await PresetCommandSupport.apply(name: presetName, options: options, command: command, emitResult: false, existingClient: client)
+        }
+        let onProgress: (@Sendable (ControlScanProgress) -> Void)?
+        if quiet {
+            onProgress = nil
+        } else {
+            onProgress = { (progress: ControlScanProgress) in
+                FileHandle.standardError.write(Data((ControlProgressLine.render(progress) + "\n").utf8))
+            }
+        }
+
+        do {
+            let resolvedFrames: [Int]
+            if let frames {
+                resolvedFrames = frames
+            } else {
+                let response = try await CommandRunner.requestWithoutParams(
+                    command: command,
+                    method: "frames.list",
+                    options: options,
+                    client: client
+                )
+                guard case .result(let data) = response else {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                    return
+                }
+                resolvedFrames = try JSONDecoder().decode(
+                    ControlFramesListResult.self,
+                    from: data
+                ).selectedFrames
+            }
+            var preStartSnapshot = try await JobWaiter.subscribeSnapshot(client: client).snapshot
+            let markerContext: ActiveJobMarker.Context?
+            switch try await resolveMarker(command: command, options: options, client: client) {
+            case .none(let context):
+                markerContext = context
+            case .refusal(let response), .active(_, _, let response):
+                try await CommandRunner.finish(
+                    command: command, options: options, client: client, response: response
+                )
+                return
+            }
+            var jobs: [[String: Any]] = []
+            for (passIndex, passToken) in passTokens.enumerated() {
+                try await preflight(command: command, client: client, frames: resolvedFrames, resume: false, options: options)
+                let response = try await CommandRunner.request(
+                    command: command,
+                    method: "scan.start",
+                    params: ControlScanStartParams(
+                        motionConfirmed: true,
+                        frames: resolvedFrames,
+                        passToken: passToken,
+                        onFrameFailure: onFrameFailure,
+                        allowedMeterRefusalSlots: allowedMeterRefusalSlots
+                    ),
+                    options: options,
+                    client: client
+                )
+                guard case .result(let startData) = response else {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                    return
+                }
+                let startObject = ((try? JSONSerialization.jsonObject(with: startData)) as? [String: Any]) ?? [:]
+                if startObject["outcome"] as? String == "manualReviewPending" {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                    return
+                }
+                guard let outcome = try? JSONDecoder().decode(
+                    ControlScanOutcomeResult.self, from: startData
+                ), let jobId = outcome.jobId, let markerContext else {
+                    try await CommandRunner.fail(
+                        command: command, options: options, client: client,
+                        error: ControlChannelClientError.malformedResponse
+                    )
+                }
+                let marker: ActiveJobMarker
+                do {
+                    marker = try ActiveJobMarker.write(
+                        jobId: jobId,
+                        context: markerContext,
+                        correlationToken: await client.lastCorrelationToken(for: command)
+                    )
+                } catch {
+                    try await CommandRunner.fail(
+                        command: command, options: options, client: client, error: error
+                    )
+                }
+                guard let terminal = try await JobWaiter.waitForTerminalOutcome(
+                    client: client,
+                    preStartJobId: preStartSnapshot.jobId,
+                    targetJobId: jobId,
+                    initialSnapshot: preStartSnapshot,
+                    onProgress: onProgress
+                ) else {
+                    await client.shutdown()
+                    let payload = ControlErrorPayload(
+                        code: ControlCLIErrorCode.hostUnreachable.rawValue,
+                        message: "\"scan.start\" was waiting on the job's event stream, but the control host went away.",
+                        recoverable: false
+                    )
+                    let text = try ControlCLIOutput.renderError(
+                        command: command,
+                        payload: payload,
+                        human: options.human,
+                        context: await client.cliEnvelopeContext
+                    )
+                    print(text, terminator: "")
+                    throw ExitCode(ControlCLIExitCode.noHostReachable.rawValue)
+                }
+                guard case .result(let data) = terminal else {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: terminal)
+                    return
+                }
+                let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+                jobs.append(object)
+                let result = try JSONDecoder().decode(ControlJobResult.self, from: data)
+                try ActiveJobMarker.retire(marker, from: markerContext)
+                let skippedKeys = Set((result.skippedFrames ?? []).map(String.init))
+                let fatalFrameErrors = result.frameErrorCodes.keys.contains {
+                    !skippedKeys.contains($0)
+                }
+                if result.jobState != .completed || fatalFrameErrors {
+                    try await renderRepeatedScanResult(
+                        frames: resolvedFrames,
+                        passTokens: passTokens,
+                        jobs: jobs,
+                        options: options,
+                        client: client
+                    )
+                    throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
+                }
+                if passIndex < passTokens.count - 1 {
+                    preStartSnapshot = try await waitForIdleThenRefresh(
+                        command: command, client: client, options: options
+                    )
+                }
+            }
+            try await renderRepeatedScanResult(
+                frames: resolvedFrames,
+                passTokens: passTokens,
+                jobs: jobs,
+                options: options,
+                client: client
+            )
+        } catch let exitCode as ExitCode {
+            throw exitCode
+        } catch {
+            try await CommandRunner.fail(command: command, options: options, client: client, error: error)
+        }
+    }
+
+    private static func waitForIdleThenRefresh(
+        command: String,
+        client: ControlChannelClient,
+        options: GlobalOptions
+    ) async throws -> ControlStatusResult {
+        let subscription = try await JobWaiter.subscribeSnapshot(client: client)
+        do {
+            let idle = try await ControlEventWaiter.wait(
+                initial: subscription.snapshot,
+                events: await client.events(),
+                condition: .idle,
+                timeout: 30
+            )
+            let response = try await CommandRunner.requestWithoutParams(
+                command: command,
+                method: "scanner.refresh",
+                options: options,
+                client: client
+            )
+            guard case .result = response else {
+                try await CommandRunner.finish(
+                    command: command, options: options, client: client, response: response
+                )
+                throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
+            }
+            return idle
+        } catch ControlEventWaitFailure.timeout {
+            await client.shutdown()
+            let payload = ControlErrorPayload(
+                code: ControlCLIErrorCode.waitTimeout.rawValue,
+                message: "\"scan.start\" timed out waiting for the scanner to become idle between repeated passes.",
+                recoverable: false,
+                guidance: "Inspect scanner status and completed pass receipts before starting any remaining pass."
+            )
+            let text = try ControlCLIOutput.renderError(
+                command: command,
+                payload: payload,
+                human: options.human,
+                context: await client.cliEnvelopeContext
+            )
+            print(text, terminator: "")
+            throw ExitCode(ControlCLIExitCode.waitTimedOut.rawValue)
+        } catch ControlEventWaitFailure.hostExited {
+            await client.shutdown()
+            throw ExitCode(ControlCLIExitCode.hostExited.rawValue)
+        } catch ControlEventWaitFailure.streamEnded {
+            await client.shutdown()
+            throw ExitCode(ControlCLIExitCode.hostExited.rawValue)
+        }
+
+    }
+
+    private static func renderRepeatedScanResult(
+        frames: [Int]?,
+        passTokens: [String],
+        jobs: [[String: Any]],
+        options: GlobalOptions,
+        client: ControlChannelClient
+    ) async throws {
+        var result: [String: Any] = [
+            "repeatCount": passTokens.count,
+            "completedRepeatCount": jobs.count,
+            "passTokens": passTokens,
+            "jobs": jobs,
+        ]
+        if let frames { result["frames"] = frames }
+        let text = try ControlCLIOutput.renderResult(
+            command: "scan.start",
+            resultJSON: result,
+            human: options.human,
+            context: await client.cliEnvelopeContext
+        )
+        print(text, terminator: "")
+        await client.shutdown()
+    }
+
     static func run<Params: Encodable & Sendable>(
         command: String,
         method: String,
         params: Params,
         options: GlobalOptions,
         wait: Bool,
-        quiet: Bool
+        quiet: Bool,
+        presetName: String? = nil,
+        onFrame: String? = nil,
+        onFail: String? = nil
     ) async throws {
         let client = try await CommandRunner.openConnection(command: command, options: options)
+        let usesMarker = method == "scan.start" || method == "scan.resume"
 
         var preStartJobId: String?
+        var subscribedSnapshot: ControlStatusResult?
         if wait {
             do {
-                preStartJobId = try await JobWaiter.subscribe(client: client)
+                let subscription = try await JobWaiter.subscribeSnapshot(client: client)
+                preStartJobId = subscription.snapshot.jobId
+                subscribedSnapshot = subscription.snapshot
             } catch {
                 try await CommandRunner.fail(command: command, options: options, client: client, error: error)
             }
         }
 
-        let startResponse = try await CommandRunner.request(
-            command: command, method: method, params: params, options: options, client: client
-        )
-        guard case .result(let startData) = startResponse else {
-            try await CommandRunner.finish(command: command, options: options, client: client, response: startResponse)
-            return
+        var markerContext: ActiveJobMarker.Context?
+        var marker: ActiveJobMarker?
+        if usesMarker {
+            switch try await resolveMarker(command: command, options: options, client: client) {
+            case .none(let context):
+                markerContext = context
+            case .refusal(let response):
+                try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                return
+            case .active(let existing, let context, let response):
+                marker = existing
+                markerContext = context
+                if !wait {
+                    try await CommandRunner.finish(command: command, options: options, client: client, response: response)
+                    return
+                }
+            }
         }
 
-        // D-23/HEAD-12 (the 2026-09-07 batch abort): a paused-for-review
-        // outcome is not "the job started" -- print it and stop here,
-        // whether or not --wait was given, rather than falling through to
-        // a job.get snapshot for a job that never started (the 19:25Z
-        // case: `resume` printed the *previous* job's failed snapshot with
-        // exit 0) or waiting on an event stream nothing will ever signal.
-        let startObject = ((try? JSONSerialization.jsonObject(with: startData)) as? [String: Any]) ?? [:]
-        if startObject["outcome"] as? String == "manualReviewPending" {
-            try await CommandRunner.finish(command: command, options: options, client: client, response: startResponse)
-            return
-        }
+        if marker == nil {
+            if let presetName {
+                try await PresetCommandSupport.apply(name: presetName, options: options, command: command, emitResult: false, existingClient: client)
+            }
+            if usesMarker {
+                try await preflight(command: command, client: client, frames: (params as? ControlScanStartParams)?.frames,
+                                    resume: method == "scan.resume", options: options)
+            }
 
-        guard wait else {
-            let jobResponse = try await CommandRunner.requestWithoutParams(
-                command: command, method: "job.get", options: options, client: client
+            let startResponse = try await CommandRunner.request(
+                command: command, method: method, params: params, options: options, client: client
             )
+            guard case .result(let startData) = startResponse else {
+                try await CommandRunner.finish(command: command, options: options, client: client, response: startResponse)
+                return
+            }
+
+            let startObject = ((try? JSONSerialization.jsonObject(with: startData)) as? [String: Any]) ?? [:]
+            if startObject["outcome"] as? String == "manualReviewPending" {
+                try await CommandRunner.finish(command: command, options: options, client: client, response: startResponse)
+                return
+            }
+
+            if usesMarker {
+                guard let outcome = try? JSONDecoder().decode(ControlScanOutcomeResult.self, from: startData),
+                      let jobId = outcome.jobId,
+                      let context = markerContext else {
+                    try await CommandRunner.fail(
+                        command: command, options: options, client: client,
+                        error: ControlChannelClientError.malformedResponse
+                    )
+                }
+                let correlationToken = await client.lastCorrelationToken(for: method)
+                do {
+                    marker = try ActiveJobMarker.write(
+                        jobId: jobId,
+                        context: context,
+                        correlationToken: correlationToken
+                    )
+                }
+                catch { try await CommandRunner.fail(command: command, options: options, client: client, error: error) }
+            }
+        }
+
+        let targetJobId = marker?.jobId
+        let hooks = HookDeliveryCoordinator(
+            onFrame: onFrame,
+            onFail: onFail,
+            marker: marker,
+            context: markerContext
+        )
+        if let subscribedSnapshot { hooks?.observe(subscribedSnapshot) }
+        guard wait else {
+            let jobResponse = try await CommandRunner.request(
+                command: command, method: "job.get",
+                params: ControlJobGetParams(jobId: targetJobId),
+                options: options, client: client
+            )
+            if let marker, let markerContext,
+               case .result(let data) = jobResponse,
+               (try? JSONDecoder().decode(ControlJobResult.self, from: data).jobState?.isTerminal) == true {
+                try? ActiveJobMarker.retire(marker, from: markerContext)
+            }
             try await CommandRunner.finish(command: command, options: options, client: client, response: jobResponse)
             return
         }
@@ -369,7 +888,10 @@ enum MotionStartRunner {
             guard let terminalResponse = try await JobWaiter.waitForTerminalOutcome(
                 client: client,
                 preStartJobId: preStartJobId,
-                onProgress: onProgress
+                targetJobId: targetJobId,
+                initialSnapshot: subscribedSnapshot,
+                onProgress: onProgress,
+                onSnapshot: { hooks?.observe($0) }
             ) else {
                 await client.shutdown()
                 let payload = ControlErrorPayload(
@@ -385,11 +907,16 @@ enum MotionStartRunner {
                 try await CommandRunner.finish(command: command, options: options, client: client, response: terminalResponse)
                 return
             }
+            let finalJob = try? JSONDecoder().decode(ControlJobResult.self, from: data)
+            if let finalJob { hooks?.observeFailure(finalJob) }
+            if let marker, let markerContext {
+                try ActiveJobMarker.retire(marker, from: markerContext)
+            }
             let object = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
             let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human, context: await client.cliEnvelopeContext)
             print(text, terminator: "")
             await client.shutdown()
-            let finalState = (try? JSONDecoder().decode(ControlJobResult.self, from: data))?.jobState
+            let finalState = finalJob?.jobState
             if finalState == .failed {
                 throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
             }
@@ -397,6 +924,70 @@ enum MotionStartRunner {
             throw exitCode
         } catch {
             try await CommandRunner.fail(command: command, options: options, client: client, error: error)
+        }
+    }
+
+    private enum MarkerResolution {
+        case none(ActiveJobMarker.Context?)
+        case active(ActiveJobMarker, ActiveJobMarker.Context, ControlClientResponse)
+        case refusal(ControlClientResponse)
+    }
+
+    private static func resolveMarker(
+        command: String,
+        options: GlobalOptions,
+        client: ControlChannelClient
+    ) async throws -> MarkerResolution {
+        do {
+            guard let context = try await ActiveJobMarker.context(
+                client: client,
+                socketPath: CommandRunner.socketPath(options)
+            ) else { return .none(nil) }
+            guard let marker = try ActiveJobMarker.load(from: context) else { return .none(context) }
+            guard marker.matches(context) else {
+                return .refusal(.failure(ControlErrorPayload(
+                    .gateRefused,
+                    message: "The active-job marker belongs to a different socket, host session, or project.",
+                    guidance: "Inspect the recorded job and host identity before retiring the marker or starting new motion."
+                )))
+            }
+            let response = try await CommandRunner.request(
+                command: command,
+                method: "job.get",
+                params: ControlJobGetParams(jobId: marker.jobId),
+                options: options,
+                client: client
+            )
+            switch response {
+            case .failure(let payload) where payload.code == "JOB_NOT_FOUND":
+                try ActiveJobMarker.retire(marker, from: context)
+                return .none(context)
+            case .failure:
+                return .refusal(response)
+            case .result(let data):
+                guard let job = try? JSONDecoder().decode(ControlJobResult.self, from: data),
+                      job.jobId == marker.jobId,
+                      let state = job.jobState else {
+                    return .refusal(.failure(ControlErrorPayload(
+                        .gateRefused,
+                        message: "The host could not attribute the active-job marker to an exact live job.",
+                        guidance: "Inspect job and host evidence before starting new motion."
+                    )))
+                }
+                if state.isTerminal {
+                    try ActiveJobMarker.retire(marker, from: context)
+                    return .none(context)
+                }
+                return .active(marker, context, response)
+            }
+        } catch let exitCode as ExitCode {
+            throw exitCode
+        } catch {
+            return .refusal(.failure(ControlErrorPayload(
+                .gateRefused,
+                message: "The active-job marker could not be validated: \(error.localizedDescription)",
+                guidance: "Inspect the marker and host evidence before starting new motion."
+            )))
         }
     }
 }

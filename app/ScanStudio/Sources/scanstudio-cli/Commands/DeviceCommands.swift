@@ -69,8 +69,11 @@ struct Status: AsyncParsableCommand {
 
     @OptionGroup var options: GlobalOptions
 
-    @Option(name: .customLong("job"), help: "Report this job id's status instead of the full session snapshot.")
-    var job: String?
+    @Flag(name: .customLong("job"), help: "Report a job. Omit JOB_ID to use this project's active-job marker.")
+    var reportJob = false
+
+    @Argument(help: "Job id used with --job. Omit it to use the active-job marker.")
+    var jobId: String?
 
     /// D-11: the one read-only-shaped flag that is not side-effect-free --
     /// it asks the scanner for its current state (`scanner.refresh`) before
@@ -79,22 +82,214 @@ struct Status: AsyncParsableCommand {
     @Flag(name: .customLong("refresh"), help: "Ask the scanner for its live state (scanner.refresh) before reporting status. Not side-effect-free: it probes the scanner over the wire rather than reading only in-memory state. Moves nothing.")
     var refresh = false
 
+    @Flag(name: .customLong("watch"), help: "Stream film and registration changes from events.subscribe. The host monitors an idle real scanner while observed.")
+    var watch = false
+
+    mutating func validate() throws {
+        if watch, reportJob {
+            throw ValidationError("\"status --watch\" cannot be combined with --job.")
+        }
+        if watch, refresh {
+            throw ValidationError("\"status --watch\" cannot be combined with --refresh.")
+        }
+        if jobId != nil, !reportJob {
+            throw ValidationError("A status JOB_ID requires --job.")
+        }
+    }
+
     func run() async throws {
         let client = try await CommandRunner.openConnection(command: "status", options: options)
+        if watch {
+            do {
+                try await watchStatus(client: client)
+            } catch {
+                await client.shutdown()
+                throw error
+            }
+            return
+        }
         var reconnected = false
         if refresh {
             reconnected = try await refreshOrReconnect(client: client)
         }
-        guard let job else {
+        guard reportJob else {
             let response = try await CommandRunner.requestWithoutParams(command: "status", method: "status", options: options, client: client)
             try await finishStatus(client: client, response: response, reconnected: reconnected)
             return
         }
 
+        var marker: ActiveJobMarker?
+        var markerContext: ActiveJobMarker.Context?
+        let requestedJobId: String
+        if let jobId {
+            requestedJobId = jobId
+        } else {
+            do {
+                guard let context = try await ActiveJobMarker.context(
+                    client: client,
+                    socketPath: CommandRunner.socketPath(options)
+                ), let loaded = try ActiveJobMarker.load(from: context) else {
+                    let response = ControlClientResponse.failure(ControlErrorPayload(
+                        code: ControlCLIErrorCode.jobNotFound.rawValue,
+                        message: "This project has no active-job marker.",
+                        recoverable: false
+                    ))
+                    try await finishStatus(client: client, response: response, reconnected: reconnected)
+                    return
+                }
+                guard loaded.matches(context) else {
+                    let response = ControlClientResponse.failure(ControlErrorPayload(
+                        .gateRefused,
+                        message: "The active-job marker belongs to a different socket, host session, or project."
+                    ))
+                    try await finishStatus(client: client, response: response, reconnected: reconnected)
+                    return
+                }
+                marker = loaded
+                markerContext = context
+                requestedJobId = loaded.jobId
+            } catch let exitCode as ExitCode {
+                // `finishStatus` intentionally throws the mapped CLI exit
+                // after rendering a typed refusal. Do not turn that already
+                // rendered JOB_NOT_FOUND/GATE_REFUSED into a second INTERNAL
+                // envelope in this marker-validation catch.
+                throw exitCode
+            } catch {
+                try await CommandRunner.fail(command: "status", options: options, client: client, error: error)
+            }
+        }
         let response = try await CommandRunner.request(
-            command: "status", method: "job.get", params: ControlJobGetParams(jobId: job), options: options, client: client
+            command: "status", method: "job.get", params: ControlJobGetParams(jobId: requestedJobId), options: options, client: client
         )
+        if let marker, let markerContext {
+            switch response {
+            case .failure(let payload) where payload.code == "JOB_NOT_FOUND":
+                try? ActiveJobMarker.retire(marker, from: markerContext)
+            case .result(let data) where (try? JSONDecoder().decode(ControlJobResult.self, from: data).jobState?.isTerminal) == true:
+                try? ActiveJobMarker.retire(marker, from: markerContext)
+            default:
+                break
+            }
+        }
         try await finishStatus(client: client, response: response, reconnected: reconnected)
+    }
+
+    /// Watches the aggregate event stream without client-side polling. The
+    /// host owns one shared idle-status monitor while any observer exists.
+    /// The subscribe result is the baseline; later snapshots are emitted only
+    /// when the typed film or registration identity changes. Other control events remain available
+    /// through `events --follow`, which deliberately has no filtering.
+    private func watchStatus(client: ControlChannelClient) async throws {
+        let response = try await CommandRunner.request(
+            command: "status",
+            method: "events.subscribe",
+            params: EmptyParams(),
+            options: options,
+            client: client
+        )
+        guard case .result(let data) = response else {
+            try await CommandRunner.finish(command: "status", options: options, client: client, response: response)
+            return
+        }
+        let subscribed = try JSONDecoder().decode(ControlEventsSubscribeResult.self, from: data)
+        var previous = subscribed.snapshot
+        try await printWatchedSnapshot(subscribed.snapshot, eventName: "control.snapshot", client: client)
+
+        for await line in await client.events() {
+            guard let snapshot = ControlChannelClient.decodeStatusSnapshot(fromEventLine: line) else {
+                guard let eventName = Self.eventName(from: line),
+                      eventName == "control.dropped" || eventName == "control.hostExited"
+                else { continue }
+                try await printWatchEvent(line, client: client)
+                if eventName == "control.hostExited" {
+                    await client.shutdown()
+                    throw ExitCode(ControlCLIExitCode.hostExited.rawValue)
+                }
+                continue
+            }
+            guard Self.watchIdentity(for: snapshot) != Self.watchIdentity(for: previous) else {
+                continue
+            }
+            previous = snapshot
+            let eventObject = ((try? JSONSerialization.jsonObject(with: line)) as? [String: Any]) ?? [:]
+            let text = try ControlCLIOutput.renderEvent(
+                command: "status",
+                eventJSON: eventObject,
+                human: options.human,
+                context: await client.cliEnvelopeContext
+            )
+            print(text, terminator: "")
+            fflush(stdout)
+        }
+        await client.shutdown()
+    }
+
+    private static func eventName(from line: Data) -> String? {
+        guard let event = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+        return event["event"] as? String
+    }
+
+    private func printWatchEvent(_ line: Data, client: ControlChannelClient) async throws {
+        guard let eventJSON = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return }
+        let text = try ControlCLIOutput.renderEvent(
+            command: "status",
+            eventJSON: eventJSON,
+            human: options.human,
+            context: await client.cliEnvelopeContext
+        )
+        print(text, terminator: "")
+        fflush(stdout)
+    }
+
+    /// The watch contract concerns physical presence and the logical
+    /// registration, rather than job progress or diagnostic text. Keeping
+    /// this key local means a scan-progress update cannot turn a status watch
+    /// into an unbounded duplicate stream.
+    private static func watchIdentity(for status: ControlStatusResult) -> WatchIdentity {
+        WatchIdentity(
+            filmPresent: status.scanner?.filmPresent,
+            mediaLoaded: status.scanner?.mediaLoaded,
+            carrier: status.scanner?.carrier,
+            frameCount: status.scanner?.frameCount,
+            previewComplete: status.previewComplete,
+            previewOperationId: status.previewOperationId,
+            projectName: status.projectName,
+            projectDirectory: status.projectDirectory,
+            selectedFrames: status.selectedFrames,
+            scanReadiness: status.scanReadiness,
+            scanReadinessReason: status.scanReadinessReason,
+            pendingFrames: status.pendingFrames,
+            refeedRequired: status.refeedRequired
+        )
+    }
+
+    private func printWatchedSnapshot(_ snapshot: ControlStatusResult, eventName: String, client: ControlChannelClient) async throws {
+        let data = try JSONEncoder().encode(snapshot)
+        guard let payload = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        let text = try ControlCLIOutput.renderEvent(
+            command: "status",
+            eventJSON: ["event": eventName, "payload": payload],
+            human: options.human,
+            context: await client.cliEnvelopeContext
+        )
+        print(text, terminator: "")
+        fflush(stdout)
+    }
+
+    private struct WatchIdentity: Equatable {
+        let filmPresent: Bool?
+        let mediaLoaded: Bool?
+        let carrier: String?
+        let frameCount: Int?
+        let previewComplete: Bool
+        let previewOperationId: String?
+        let projectName: String?
+        let projectDirectory: String?
+        let selectedFrames: [Int]
+        let scanReadiness: String
+        let scanReadinessReason: String?
+        let pendingFrames: [Int]
+        let refeedRequired: Bool
     }
 
     /// D-16: the one permitted automatic reconnection in this whole tool.

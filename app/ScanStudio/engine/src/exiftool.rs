@@ -2044,7 +2044,10 @@ pub(crate) fn ensure_supported_metadata_filesystem(file: &File) -> std::io::Resu
     };
     if result == 0 {
         let error = std::io::Error::last_os_error();
-        return Err(std::io::Error::new(error.kind(), format!("GetVolumeInformationByHandleW: {error}")));
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("GetVolumeInformationByHandleW: {error}"),
+        ));
     }
     if !windows_metadata_filesystem_name_is_supported(&filesystem_name) {
         let name = String::from_utf16_lossy(&filesystem_name)
@@ -3167,7 +3170,10 @@ pub(crate) mod metadata_publish_sys {
         if status < 0 {
             let windows_error = unsafe { RtlNtStatusToDosError(status) };
             let error = io::Error::from_raw_os_error(windows_error as i32);
-            return Err(io::Error::new(error.kind(), format!("NtCreateFile metadata entry: {error}")));
+            return Err(io::Error::new(
+                error.kind(),
+                format!("NtCreateFile metadata entry: {error}"),
+            ));
         }
         if handle.is_null() || handle as isize == -1 {
             return Err(io::Error::other(
@@ -3224,12 +3230,14 @@ pub(crate) mod metadata_publish_sys {
                 "Windows rename name is too long",
             )
         })?;
-        let total = size_of::<FileRenameInformation>().checked_add(byte_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Windows rename buffer overflow",
-            )
-        })?;
+        let total = size_of::<FileRenameInformation>()
+            .checked_add(byte_len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows rename buffer overflow",
+                )
+            })?;
         let words = total.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; words];
         let info = storage.as_mut_ptr().cast::<FileRenameInformation>();
@@ -3246,7 +3254,10 @@ pub(crate) mod metadata_publish_sys {
         // Use the native handle-relative operation, matching NtCreateFile above.
         // The Win32 rename wrapper rejects this directory-relative request with
         // ERROR_INVALID_PARAMETER on supported Windows hosts.
-        let mut status_block = IoStatusBlock { status_or_pointer: 0, information: 0 };
+        let mut status_block = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
         let status = unsafe {
             NtSetInformationFile(
                 source.as_raw_handle(),
@@ -3257,8 +3268,12 @@ pub(crate) mod metadata_publish_sys {
             )
         };
         if status < 0 {
-            let error = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
-            Err(io::Error::new(error.kind(), format!("NtSetInformationFile rename: {error}")))
+            let error =
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+            Err(io::Error::new(
+                error.kind(),
+                format!("NtSetInformationFile rename: {error}"),
+            ))
         } else {
             Ok(())
         }
@@ -3821,7 +3836,7 @@ fn relative_publication_path_at(
     )
 }
 
-fn open_regular_beneath(root: &File, relative: &Path) -> Result<File, EngineError> {
+pub(crate) fn open_regular_beneath(root: &File, relative: &Path) -> Result<File, EngineError> {
     let components = relative
         .components()
         .map(|component| match component {
@@ -4113,6 +4128,36 @@ pub(crate) fn bind_metadata_output_publications(
     };
     reject_publication_aliases(&bindings)?;
     Ok(bindings)
+}
+
+/// Mint read-only capture bindings from the files held at publication.
+/// These fields never enter the metadata target set.
+pub(crate) fn bind_capture_output_publications_at(
+    root: &File,
+    requested_root: &Path,
+    canonical_root: &Path,
+    proofs: &crate::render::MetadataPublicationProofs,
+) -> Result<crate::domain::CaptureOutputBindings, EngineError> {
+    let bind = |proof: &crate::render::PublishedFileProof| {
+        // Independent raw destinations remain supported, but cannot grant a
+        // project-relative collection capability.
+        if !proof.final_path().starts_with(requested_root)
+            && !proof.final_path().starts_with(canonical_root)
+        {
+            return Ok(None);
+        }
+        bind_publication_proof_at(root, requested_root, canonical_root, proof).map(Some)
+    };
+    Ok(crate::domain::CaptureOutputBindings {
+        raw_negative: proofs.raw.as_ref().map(bind).transpose()?.flatten(),
+        raw_negative_ir: proofs.raw_ir.as_ref().map(bind).transpose()?.flatten(),
+        meter: proofs
+            .archive_meter
+            .as_ref()
+            .map(bind)
+            .transpose()?
+            .flatten(),
+    })
 }
 
 /// Proof-aware receipt binder beneath a project directory capability captured
@@ -4937,6 +4982,102 @@ fn copy_bound_source_to_stage(
         ));
     }
     Ok(())
+}
+
+/// Run ExifTool against an engine-private copy of one already-bound source.
+/// Pathname-based tools never receive a project or destination path. The
+/// callback runs while the private workspace and its verified output file are
+/// held; callers can publish through their own held destination capability.
+pub(crate) fn with_private_exiftool_copy<T>(
+    mut source: File,
+    source_path: &Path,
+    expected: &WrittenFileBinding,
+    detection: &ExifToolDetection,
+    metadata_arguments: &[String],
+    callback: impl FnOnce(&File, &Path, &WrittenFileBinding) -> Result<T, String>,
+) -> Result<T, String> {
+    let executable = verify_executable_binding(detection).map_err(|error| error.message)?;
+    let workspace = PrivateMetadataWorkspace::create().map_err(|error| error.message)?;
+    let extension = Path::new(&expected.relative_path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("bin");
+    let staged_name = OsString::from(format!("metadata-target.{extension}"));
+    let staged_path = workspace.path.join(&staged_name);
+    let result = (|| {
+        let observed = binding_from_open_file(&mut source, &expected.relative_path)
+            .map_err(|error| error.message)?;
+        if &observed != expected {
+            return Err(format!(
+                "metadata source identity changed before private staging: {}",
+                source_path.display()
+            ));
+        }
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("cannot rewind metadata source: {error}"))?;
+        let mut staged = metadata_publish_sys::create_new_regular(
+            &workspace.directory,
+            &staged_name,
+        )
+        .map_err(|error| format!("cannot create private metadata staging file: {error}"))?;
+        copy_exact_bounded(&mut source, &mut staged, expected.byte_length)
+            .map_err(|error| format!("cannot copy metadata source into private staging: {error}"))?;
+        staged
+            .sync_all()
+            .map_err(|error| format!("cannot sync private metadata staging file: {error}"))?;
+        let staged_binding = binding_from_open_file(&mut staged, &expected.relative_path)
+            .map_err(|error| error.message)?;
+        if staged_binding.sha256 != expected.sha256
+            || staged_binding.byte_length != expected.byte_length
+        {
+            return Err("private metadata staging copy differs from the exact bound source bytes".into());
+        }
+        drop(staged);
+
+        workspace.verify_namespace().map_err(|error| error.message)?;
+        let mut arguments = metadata_arguments.to_vec();
+        arguments.push("-overwrite_original".into());
+        arguments.push(staged_path.display().to_string());
+        let output = run_bounded_exiftool_command(
+            executable,
+            &arguments,
+            EXIFTOOL_APPLY_TIMEOUT,
+            EXIFTOOL_OUTPUT_LIMIT,
+        )
+        .map_err(|error| error.message)?;
+        workspace.verify_namespace().map_err(|error| error.message)?;
+        if !output.status.success() {
+            return Err(format!(
+                "ExifTool metadata apply failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let mut transformed = metadata_publish_sys::open_regular(
+            &workspace.directory,
+            &staged_name,
+        )
+        .map_err(|error| format!("cannot open private ExifTool output: {error}"))?;
+        let transformed_binding = binding_from_open_file(&mut transformed, &expected.relative_path)
+            .map_err(|error| error.message)?;
+        if transformed_binding.byte_length == 0 {
+            return Err("ExifTool produced an empty metadata output".into());
+        }
+        let result = callback(&transformed, &staged_path, &transformed_binding)?;
+        drop(transformed);
+        workspace.verify_namespace().map_err(|error| error.message)?;
+        Ok(result)
+    })();
+    let retired = workspace.retire(&[staged_name]);
+    match (result, retired) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.message),
+        (Err(error), Err(cleanup)) => Err(format!(
+            "{error}; private metadata cleanup failed: {}",
+            cleanup.message
+        )),
+    }
 }
 
 fn copy_verified_private_output_to_attempt(
@@ -6704,6 +6845,7 @@ mod tests {
             film_process: FilmProcess::Positive,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-24T00:00:00Z".to_string(),
             frames: vec![ProjectFrame {
                 index: 1,
@@ -6713,6 +6855,7 @@ mod tests {
                 output_override: None,
                 alignment: None,
                 metadata_override: None,
+                skip_records: vec![],
                 receipts: vec![],
             }],
         }
@@ -6729,8 +6872,10 @@ mod tests {
             .expect("bind test outputs");
         project.frames[0].receipts.push(ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-bound-output".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-27T00:00:00Z".into(),
             duration_ms: 0,
@@ -6747,6 +6892,7 @@ mod tests {
             processing: None,
             output: None,
             outputs: Some(WrittenOutputs {
+                capture_bindings: None,
                 archive_path: archive.map(|path| path.display().to_string()),
                 positive_path: positive.map(|path| path.display().to_string()),
                 preview_path: preview.map(|path| path.display().to_string()),
@@ -7476,6 +7622,7 @@ mod tests {
         let bindings =
             bind_metadata_outputs(&root, Some(&archive), None, Some(&positive), None).unwrap();
         let outputs = WrittenOutputs {
+            capture_bindings: None,
             archive_path: Some(archive.display().to_string()),
             positive_path: Some(positive.display().to_string()),
             preview_path: None,
@@ -7531,6 +7678,7 @@ mod tests {
         std::fs::write(&outside_target, b"outside-sentinel").unwrap();
         let bindings = bind_metadata_outputs(&root, None, None, Some(&positive), None).unwrap();
         let outputs = WrittenOutputs {
+            capture_bindings: None,
             archive_path: None,
             positive_path: Some(positive.display().to_string()),
             preview_path: None,
@@ -7589,6 +7737,7 @@ mod tests {
         std::fs::write(&archive, b"immutable-archive").unwrap();
         let bindings = bind_metadata_outputs(&root, Some(&archive), None, None, None).unwrap();
         let outputs = WrittenOutputs {
+            capture_bindings: None,
             archive_path: Some(archive.display().to_string()),
             positive_path: None,
             preview_path: None,

@@ -411,6 +411,7 @@ struct State {
     /// `run_scan_job` the moment it actually fires -- one-shot, never
     /// surviving into a later scan on the same connection.
     batch_abort: Option<(u32, String)>,
+    stall_at_frame: Option<u32>,
 }
 
 impl Default for State {
@@ -432,6 +433,7 @@ impl Default for State {
             manual_approval_binding: None,
             preview_fixture: None,
             batch_abort: None,
+            stall_at_frame: None,
         }
     }
 }
@@ -788,9 +790,12 @@ impl SimulatedLs5000 {
             ));
         }
         let state = self.state.lock().unwrap();
-        let approvable = state.manual_approval_binding.as_ref().is_some_and(|binding| {
-            binding.operation_id == operation_id && binding.frame_indices.contains(&frame_index)
-        });
+        let approvable = state
+            .manual_approval_binding
+            .as_ref()
+            .is_some_and(|binding| {
+                binding.operation_id == operation_id && binding.frame_indices.contains(&frame_index)
+            });
         if approvable {
             return Ok(());
         }
@@ -824,6 +829,10 @@ impl SimulatedLs5000 {
     /// called.
     pub fn arm_batch_abort(&self, abort: Option<(u32, String)>) {
         self.state.lock().unwrap().batch_abort = abort;
+    }
+
+    pub fn arm_stall(&self, frame: Option<u32>) {
+        self.state.lock().unwrap().stall_at_frame = frame;
     }
 }
 
@@ -973,6 +982,7 @@ impl ScannerBackend for SimulatedLs5000 {
         // `arm_batch_abort` when that same `sim.loadMedia` request named
         // one.
         state.batch_abort = None;
+        state.stall_at_frame = None;
         Ok(status_snapshot(&state))
     }
 
@@ -1150,6 +1160,8 @@ impl ScannerBackend for SimulatedLs5000 {
     fn scan_start_with_output_authorities(
         backend: &Arc<Self>,
         frames: Vec<u32>,
+        _allowed_meter_refusal_slots: Vec<u32>,
+        pass_token: Option<String>,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe,
         output: OutputRecipe,
@@ -1264,6 +1276,7 @@ impl ScannerBackend for SimulatedLs5000 {
                 backend_for_thread,
                 thread_job_id,
                 frames,
+                pass_token,
                 recipe,
                 processing,
                 output,
@@ -1462,6 +1475,7 @@ fn pass_number_for(elapsed_ms: u64, overhead_ms: u64, pass_ms: u64, total_passes
 #[allow(clippy::too_many_arguments)]
 fn build_receipt(
     job_id: &str,
+    pass_token: Option<&str>,
     frame_index: u32,
     duration_ms: u64,
     recipe: &CaptureRecipe,
@@ -1483,10 +1497,22 @@ fn build_receipt(
             )
         })
         .transpose()?;
+    let capture_bindings = project_root
+        .map(|root| {
+            crate::exiftool::bind_capture_output_publications_at(
+                root.directory_handle(),
+                root.requested_path(),
+                root.canonical_path(),
+                &written.metadata_publications,
+            )
+        })
+        .transpose()?;
     Ok(ScanReceipt {
         exposure_authority: None,
+        preview_exposure_adjustment: recipe.preview_exposure_adjustment.clone(),
         auto_crop: written.auto_crop.clone(),
         job_id: job_id.to_string(),
+        pass_token: pass_token.map(str::to_string),
         frame_index,
         started_at: format_iso8601(started_at_secs),
         duration_ms,
@@ -1524,14 +1550,19 @@ fn build_receipt(
                 .as_ref()
                 .map(|p| p.display().to_string()),
             metadata_bindings,
+            capture_bindings,
             derivative_transform: written.derivative_transform,
         }),
-        // Bridge-only concepts — the simulator has no bridge subprocess to
-        // source a capture-file location or hardware telemetry from.
+        // The meter is an explicit synthetic raster; hardware telemetry
+        // remains absent and simulated remains true.
         rgb_path: None,
         ir_path: None,
         storage_transform: None,
-        meter_rgbi_path: None,
+        meter_rgbi_path: written
+            .metadata_publications
+            .archive_meter
+            .as_ref()
+            .map(|proof| proof.final_path().display().to_string()),
         hardware_telemetry: None,
         nikonlook: written.nikonlook.clone(),
     })
@@ -1561,6 +1592,15 @@ fn run_one_attempt(
     event_tx: &mpsc::Sender<String>,
 ) -> AttemptOutcome {
     let mut elapsed_ms: u64 = 0;
+    let stalled = {
+        let mut state = backend.state.lock().unwrap();
+        if state.stall_at_frame == Some(frame_index) {
+            state.stall_at_frame = None;
+            true
+        } else {
+            false
+        }
+    };
 
     if frame_total_ms == 0 {
         return AttemptOutcome::Completed;
@@ -1574,6 +1614,13 @@ fn run_one_attempt(
 
         if take_skip_current_request(backend, job_id) {
             return AttemptOutcome::SkippedByUser;
+        }
+
+        // One observable progress tick, then a simulator-only stall. The
+        // existing immediate-stop path remains responsive; no automatic retry.
+        if stalled && elapsed_ms > 0 {
+            thread::sleep(Duration::from_millis(10));
+            continue;
         }
 
         let step = tick_ms.min(frame_total_ms - elapsed_ms);
@@ -1644,6 +1691,7 @@ fn run_scan_job(
     backend: Arc<SimulatedLs5000>,
     job_id: String,
     frames: Vec<u32>,
+    pass_token: Option<String>,
     recipe: CaptureRecipe,
     processing: ProcessingRecipe,
     output: OutputRecipe,
@@ -1787,14 +1835,15 @@ fn run_scan_job(
         // survives into a later scan on this connection.
         if let Some((abort_frame, abort_code)) = batch_abort.as_ref() {
             if *abort_frame == frame_index {
-                let mapped_code = crate::real_backend::map_bridge_error_code_str(abort_code);
+                let mapped_code = if abort_code == "FEED_JAM" { ErrorCode::FeedJam }
+                    else { crate::real_backend::map_bridge_error_code_str(abort_code) };
                 let error = EngineError::new(
                     mapped_code,
                     format!(
                         "bridge scan.frameFailed ({abort_code}): simulated batch abort armed via sim.loadMedia"
                     ),
                 )
-                .with_recoverable(crate::real_backend::map_bridge_error_code_recoverable(
+                .with_recoverable(abort_code == "FEED_JAM" || crate::real_backend::map_bridge_error_code_recoverable(
                     abort_code,
                 ));
                 let error_payload = ErrorPayload::from(&error);
@@ -1975,12 +2024,8 @@ fn run_scan_job(
                     match output_authorities.frame(frame_index) {
                         Ok(authority) => authority,
                         Err(error) => {
-                            let _ = set_frame_state(
-                                &backend,
-                                &job_id,
-                                frame_index,
-                                FrameState::Failed,
-                            );
+                            let _ =
+                                set_frame_state(&backend, &job_id, frame_index, FrameState::Failed);
                             emit(
                                 &event_tx,
                                 "scan.frameState",
@@ -2005,6 +2050,7 @@ fn run_scan_job(
                     // refusal and is never silently dropped.
                     build_receipt(
                         &job_id,
+                        pass_token.as_deref(),
                         frame_index,
                         frame_total_ms,
                         &effective_recipe,
@@ -2218,6 +2264,8 @@ mod tests {
             bit_depth: 16,
             multisample_passes: 2,
             channels: Channels::Rgbi,
+            exposure_override_10ns: None,
+            preview_exposure_adjustment: None,
         };
         assert_eq!(settings_fingerprint(&recipe), "1a3d265e0b54bbd2");
     }
@@ -2256,6 +2304,7 @@ mod tests {
 
         let receipt = build_receipt(
             "job-1",
+            None,
             1,
             1000,
             &recipe,
@@ -2267,8 +2316,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt.nikonlook, Some(provenance));
-        let outputs = receipt.outputs.as_ref().expect("simulated receipt has outputs");
-        assert_eq!(outputs.raw_negative_path.as_deref(), Some("/tmp/negative.dng"));
+        let outputs = receipt
+            .outputs
+            .as_ref()
+            .expect("simulated receipt has outputs");
+        assert_eq!(
+            outputs.raw_negative_path.as_deref(),
+            Some("/tmp/negative.dng")
+        );
         assert_eq!(
             outputs.raw_negative_ir_path.as_deref(),
             Some("/tmp/negative-ir.tif")
@@ -2283,6 +2338,7 @@ mod tests {
         };
         let receipt_none = build_receipt(
             "job-1",
+            None,
             1,
             1000,
             &recipe,
@@ -2331,11 +2387,23 @@ mod tests {
         let positive = written.positive_path.as_ref().unwrap();
         let renamed = std::fs::rename(positive, root.join("engine-positive.tif"));
         if cfg!(windows) {
-            assert!(renamed.is_err(), "held Windows output must deny replacement");
+            assert!(
+                renamed.is_err(),
+                "held Windows output must deny replacement"
+            );
             build_receipt(
-                "job-binding-replacement", 1, 1000, &recipe, &processing, &output,
-                &SimulatedLs5000::new().device_info(), &written, Some(&project_root),
-            ).expect("denied replacement retains valid receipt evidence");
+                "job-binding-replacement",
+                None,
+                1,
+                1000,
+                &recipe,
+                &processing,
+                &output,
+                &SimulatedLs5000::new().device_info(),
+                &written,
+                Some(&project_root),
+            )
+            .expect("denied replacement retains valid receipt evidence");
             drop((written, project_root));
             let _ = std::fs::remove_dir_all(root);
             return;
@@ -2345,6 +2413,7 @@ mod tests {
 
         let error = build_receipt(
             "job-binding-replacement",
+            None,
             1,
             1000,
             &recipe,
@@ -2682,8 +2751,7 @@ mod tests {
             }
         }
         let mean = values.iter().sum::<f64>() / values.len() as f64;
-        let variance =
-            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
         variance.sqrt()
     }
 
@@ -2758,14 +2826,12 @@ mod tests {
                 .expect("timed out waiting for a thumbnail");
             let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
             assert_eq!(event["event"], "scanner.thumbnail");
-            let frame_index = event["payload"]["frameIndex"]
-                .as_u64()
-                .expect("frameIndex");
+            let frame_index = event["payload"]["frameIndex"].as_u64().expect("frameIndex");
             let thumbnail = &event["payload"]["thumbnail"];
 
-            let image_path = thumbnail["imagePath"]
-                .as_str()
-                .unwrap_or_else(|| panic!("frame {frame_index} must carry a fixture tile's imagePath"));
+            let image_path = thumbnail["imagePath"].as_str().unwrap_or_else(|| {
+                panic!("frame {frame_index} must carry a fixture tile's imagePath")
+            });
             assert!(
                 std::path::Path::new(image_path).is_file(),
                 "imagePath must name an existing, readable file, frame {frame_index}"
@@ -2925,6 +2991,18 @@ mod tests {
             FrameOverrides {
                 capture: Some(CaptureRecipe {
                     resolution_dpi: 1000,
+                    exposure_override_10ns: Some([200_000, 220_000, 240_000]),
+                    preview_exposure_adjustment: Some(crate::domain::PreviewExposureAdjustment {
+                        source: "previewThumbnailMean".into(),
+                        reference_frame_index: 1,
+                        reference_thumbnail_mean: 100.0,
+                        frame_thumbnail_mean: 50.0,
+                        requested_positive_ev: 1.0,
+                        applied_positive_ev: 1.0,
+                        reference_rgb_exposures_raw_10ns: [100_000, 110_000, 120_000],
+                        applied_rgb_exposures_raw_10ns: [200_000, 220_000, 240_000],
+                        device_bound_clamped_channels: vec![],
+                    }),
                     ..CaptureRecipe::default()
                 }),
                 processing: None,
@@ -2947,6 +3025,8 @@ mod tests {
         .expect("scan start");
 
         let mut receipt_resolutions: HashMap<u32, u32> = HashMap::new();
+        let mut receipt_adjustments = HashMap::new();
+        let mut settings_fingerprints = HashMap::new();
         while receipt_resolutions.len() < 2 {
             let line = rx
                 .recv_timeout(Duration::from_secs(30))
@@ -2958,6 +3038,19 @@ mod tests {
                     .as_u64()
                     .unwrap() as u32;
                 receipt_resolutions.insert(frame_index, resolution_dpi);
+                receipt_adjustments.insert(
+                    frame_index,
+                    value["payload"]["receipt"]["previewExposureAdjustment"]
+                        ["appliedRgbExposuresRaw10ns"]
+                        .clone(),
+                );
+                settings_fingerprints.insert(
+                    frame_index,
+                    value["payload"]["receipt"]["settingsFingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
             }
         }
 
@@ -2966,6 +3059,12 @@ mod tests {
             Some(&4000),
             "frame 1 has no override -- its receipt must reflect the roll-wide default"
         );
+        assert_eq!(receipt_adjustments[&1], serde_json::Value::Null);
+        assert_eq!(
+            receipt_adjustments[&2],
+            serde_json::json!([200_000, 220_000, 240_000])
+        );
+        assert_ne!(settings_fingerprints[&1], settings_fingerprints[&2]);
         assert_eq!(
             receipt_resolutions.get(&2),
             Some(&1000),
@@ -3146,6 +3245,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn stalled_frame_stops_without_capture_or_retry() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(DEVICE_ID, &ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
+        }).unwrap();
+        sim.load_media(MediaCarrier::Strip6).unwrap();
+        sim.arm_stall(Some(1));
+        let (tx, rx) = mpsc::channel();
+        let (output, directory) = isolated_output_recipe("stalled-frame");
+        let job = SimulatedLs5000::scan_start(
+            &sim, vec![1], CaptureRecipe { resolution_dpi: 40, ..CaptureRecipe::default() },
+            ProcessingRecipe::default(), output, HashMap::new(), None, tx.clone(),
+        ).unwrap();
+        loop {
+            let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "scan.progress" { break; }
+        }
+        assert!(matches!(rx.recv_timeout(Duration::from_millis(150)), Err(mpsc::RecvTimeoutError::Timeout)));
+        sim.scan_stop(&job, StopMode::Immediate, tx).unwrap();
+        loop {
+            let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_ne!(event["event"], "scan.frameCompleted");
+            if event["event"] == "scan.completed" {
+                assert_eq!(event["payload"]["summary"]["stopped"], true);
+                break;
+            }
+        }
+        assert_eq!(sim.state.lock().unwrap().stall_at_frame, None);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     /// D-20/HEAD-12 (1d, the 2026-09-07 batch abort): with a batch abort
@@ -3403,6 +3538,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
+    #[test]
+    fn repeated_scan_passes_keep_unique_outputs_and_append_receipts() {
+        let dir = std::env::temp_dir().join(format!(
+            "scanstudio-sim-repeat-test-{}",
+            crate::manifest::generate_project_id()
+        ));
+        let (_project, project_dir) = crate::manifest::create_project(
+            "Repeat Test",
+            MediaCarrier::Mounted,
+            1,
+            FilmProcess::Positive,
+            Some(&dir),
+        )
+        .expect("create project");
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Mounted).expect("load media");
+
+        for pass in ["Arep01", "Arep02"] {
+            let mut output = OutputRecipe::default();
+            output.archive.destination = project_dir.join("Archive").display().to_string();
+            output.positive.enabled = false;
+            output.preview.enabled = false;
+            output.archive.filename_template = "{stock}_$Frame_{pass}".into();
+            crate::render::materialize_output_filename_tokens_with_pass(
+                &mut output,
+                &crate::domain::MetadataSet::default(),
+                Some(pass),
+            );
+            let (tx, rx) = mpsc::channel();
+            SimulatedLs5000::scan_start_with_output_authorities(
+                &sim,
+                vec![1],
+                vec![],
+                Some(pass.into()),
+                CaptureRecipe {
+                    resolution_dpi: 40,
+                    ..CaptureRecipe::default()
+                },
+                ProcessingRecipe::default(),
+                output,
+                HashMap::new(),
+                Some(project_dir.clone()),
+                None,
+                tx,
+            )
+            .expect("start repeat");
+            loop {
+                let value: serde_json::Value = serde_json::from_str(
+                    &rx.recv_timeout(Duration::from_secs(30))
+                        .expect("terminal event"),
+                )
+                .expect("event json");
+                if value["event"] == "scan.completed" {
+                    break;
+                }
+            }
+        }
+
+        let project = crate::manifest::read_manifest(&project_dir).expect("read manifest");
+        let receipts = &project.frames[0].receipts;
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].pass_token.as_deref(), Some("Arep01"));
+        assert_eq!(receipts[1].pass_token.as_deref(), Some("Arep02"));
+        let paths = receipts
+            .iter()
+            .map(|receipt| {
+                receipt
+                    .outputs
+                    .as_ref()
+                    .and_then(|outputs| outputs.archive_path.clone())
+                    .expect("archive path")
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths[0].ends_with("UnknownFilm_0001_Arep01.tif"));
+        assert!(paths[1].ends_with("UnknownFilm_0001_Arep02.tif"));
+        assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
     /// A master without provenance must not be silent (mirrors
     /// real_backend.rs's identical fix). Seeds a project directory whose
     /// `manifest.json` is already a directory instead of a file -- the
@@ -3595,8 +3820,7 @@ mod tests {
         let first = sim.manual_frames(vec![0, 135, 270]).expect("first call");
         let second = sim.manual_frames(vec![0, 135, 270]).expect("second call");
         assert_eq!(
-            first.thumbnails[0].thumbnail.brightness,
-            second.thumbnails[0].thumbnail.brightness,
+            first.thumbnails[0].thumbnail.brightness, second.thumbnails[0].thumbnail.brightness,
             "D-08/SIM-03 determinism: identical rows must hash to identical simulated tiles"
         );
         assert_ne!(
@@ -3716,7 +3940,9 @@ mod tests {
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
         sim.roll_approve(1, &result.operation_id, false)
             .expect("a frame this placement returned must be approvable");
         sim.roll_approve(2, &result.operation_id, false)
@@ -3745,8 +3971,12 @@ mod tests {
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("2-frame placement");
-        let err = sim.roll_approve(99, &result.operation_id, false).unwrap_err();
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("2-frame placement");
+        let err = sim
+            .roll_approve(99, &result.operation_id, false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -3757,8 +3987,11 @@ mod tests {
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
 
-        sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
-        let err = sim.roll_approve(1, "not-the-real-operation-id", false).unwrap_err();
+        sim.manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
+        let err = sim
+            .roll_approve(1, "not-the-real-operation-id", false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -3768,14 +4001,18 @@ mod tests {
         sim.connect(DEVICE_ID, &ConnectOptions::default())
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
 
         // A different carrier loaded afterward invalidates the old binding
         // (S2's own "stale frame-indexed state must never survive a
         // materially different registration" principle, applied here to
         // the simulator's session-scoped approval binding).
         sim.load_media(MediaCarrier::Strip6).expect("reload media");
-        let err = sim.roll_approve(1, &result.operation_id, false).unwrap_err();
+        let err = sim
+            .roll_approve(1, &result.operation_id, false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -3785,13 +4022,17 @@ mod tests {
         sim.connect(DEVICE_ID, &ConnectOptions::default())
             .expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
-        let result = sim.manual_frames(vec![0, 135, 270]).expect("valid placement");
+        let result = sim
+            .manual_frames(vec![0, 135, 270])
+            .expect("valid placement");
 
         sim.disconnect().expect("disconnect");
         sim.connect(DEVICE_ID, &ConnectOptions::default())
             .expect("reconnect");
         sim.load_media(MediaCarrier::Roll36).expect("reload media");
-        let err = sim.roll_approve(1, &result.operation_id, false).unwrap_err();
+        let err = sim
+            .roll_approve(1, &result.operation_id, false)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 }

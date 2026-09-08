@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import secrets
 import subprocess
 import sys
@@ -962,6 +963,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
     assert "--frame" not in prepared.argv
     assert job["session_id"] == prepared.session_id
     assert job == {
+        "allowed_meter_refusal_slots": [],
         "apply_all_boundary_offsets_before_first_frame": True,
         "capture_plan_sha256": CANONICAL_PLAN_SHA256,
         "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
@@ -995,7 +997,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "parent_ack_required_after_every_frame": True,
         "release_once_after_last_frame": True,
         "reviewed_roll_fingerprint": fingerprint.to_payload(),
-        "schema_version": 3,
+        "schema_version": 4,
         "session_id": prepared.session_id,
         "session_contract": "one-process-one-reservation",
     }
@@ -3362,6 +3364,7 @@ def _held_adapter(
     held_after_batch_journal_overrides: dict[str, Any] | None = None,
     child_class: type[FakeHeldBatchProcess] = FakeHeldBatchProcess,
     held_teardown_wait_seconds: float = 5.0,
+    held_status_wait_seconds: float = 20.0,
 ) -> capture.CaptureProcessAdapter:
     return capture.CaptureProcessAdapter(
         worker_path=binding.worker,
@@ -3380,7 +3383,23 @@ def _held_adapter(
         ),
         batch_poll_seconds=0,
         held_teardown_wait_seconds=held_teardown_wait_seconds,
+        held_status_wait_seconds=held_status_wait_seconds,
     )
+
+
+@pytest.mark.parametrize("value", (0, -1, math.nan, math.inf, -math.inf))
+def test_held_status_wait_must_be_finite_and_positive(
+    tmp_path: Path,
+    binding: Binding,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        _held_adapter(
+            tmp_path,
+            binding,
+            [],
+            held_status_wait_seconds=value,
+        )
 
 
 def test_begin_held_preview_never_releases(tmp_path: Path, binding: Binding) -> None:

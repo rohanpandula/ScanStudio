@@ -495,6 +495,26 @@ fn write_manifest_atomically_at_locked(
                         ),
                     ));
                 }
+                let incoming_skips = project
+                    .frames
+                    .iter()
+                    .find(|frame| frame.index == on_disk_frame.index)
+                    .map(|frame| frame.skip_records.as_slice())
+                    .unwrap_or(&[]);
+                if on_disk_frame
+                    .skip_records
+                    .iter()
+                    .any(|record| !incoming_skips.contains(record))
+                {
+                    return Err(EngineError::new(
+                        ErrorCode::ManifestInvalid,
+                        format!(
+                            "refusing to write manifest at {}: frame {} would lose an on-disk skip record",
+                            display_directory.display(),
+                            on_disk_frame.index,
+                        ),
+                    ));
+                }
             }
         }
         Err(err) if err.code == ErrorCode::ProjectNotFound => {}
@@ -839,6 +859,7 @@ pub fn create_project_with_excluded_frames(
             output_override: None,
             alignment: None,
             metadata_override: None,
+            skip_records: vec![],
             receipts: vec![],
         })
         .collect();
@@ -880,6 +901,7 @@ pub fn create_project_with_excluded_frames(
         film_process,
         recipes,
         roll_metadata: MetadataSet::default(),
+        roll_exposure_lock: None,
         created_at,
         frames,
     };
@@ -1229,6 +1251,40 @@ pub(crate) fn persist_project_update_at(
     Ok(merged)
 }
 
+/// Reads the current manifest through an already-held project capability.
+/// Used at motion boundaries so stale in-memory state cannot select capture
+/// authority and a pathname replacement cannot redirect the read.
+pub(crate) fn read_project_at(
+    directory: &File,
+    display_directory: &Path,
+) -> Result<ScanProject, EngineError> {
+    let guard = lock_manifest_transaction_at(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(
+        display_directory,
+        &guard.directory,
+    )?;
+    read_manifest_from_directory_handle(&guard.directory, display_directory)
+}
+
+/// Replaces only the roll-wide exposure authority under the manifest lock.
+/// Receipts and concurrent project edits are preserved because the mutation
+/// starts from the current on-disk project.
+pub(crate) fn persist_roll_exposure_lock_at(
+    directory: &File,
+    display_directory: &Path,
+    exposure_lock: crate::domain::RollExposureLock,
+) -> Result<ScanProject, EngineError> {
+    let guard = lock_manifest_transaction_at(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(
+        display_directory,
+        &guard.directory,
+    )?;
+    let mut project = read_manifest_from_directory_handle(&guard.directory, display_directory)?;
+    project.roll_exposure_lock = Some(exposure_lock);
+    write_manifest_atomically_at_locked(&guard.directory, display_directory, &project)?;
+    Ok(project)
+}
+
 /// Replaces only the latest receipt's metadata-write capabilities under the
 /// same lock used by scan-worker receipt appends. The exact expected receipt
 /// must still be latest; if a scan completed while ExifTool was working, this
@@ -1307,6 +1363,9 @@ pub(crate) fn persist_latest_receipt_metadata_bindings_locked(
 /// own `write_manifest_atomically` guard still catches that case and
 /// refuses the write, rather than this function silently dropping it.
 fn merge_receipts(on_disk: ScanProject, mut into: ScanProject) -> ScanProject {
+    if on_disk.roll_exposure_lock.is_some() {
+        into.roll_exposure_lock = on_disk.roll_exposure_lock.clone();
+    }
     for on_disk_frame in on_disk.frames {
         let Some(target) = into
             .frames
@@ -1322,6 +1381,13 @@ fn merge_receipts(on_disk: ScanProject, mut into: ScanProject) -> ScanProject {
             }
         }
         target.receipts = merged_receipts;
+        let mut merged_skips = on_disk_frame.skip_records;
+        for record in target.skip_records.drain(..) {
+            if !merged_skips.contains(&record) {
+                merged_skips.push(record);
+            }
+        }
+        target.skip_records = merged_skips;
     }
     into
 }
@@ -1374,6 +1440,26 @@ pub(crate) fn persist_frame_receipt_at(
     write_manifest_atomically_at_locked(&guard.directory, display_directory, &project)
 }
 
+pub(crate) fn persist_frame_skip_at(
+    directory: &File,
+    display_directory: &Path,
+    frame_index: u32,
+    record: &crate::domain::ScanSkipRecord,
+) -> Result<(), EngineError> {
+    let guard = lock_manifest_transaction_at(directory)?;
+    crate::exiftool::recover_pending_metadata_transactions_locked(
+        display_directory,
+        &guard.directory,
+    )?;
+    let mut project = read_manifest_from_directory_handle(&guard.directory, display_directory)?;
+    mutate_frame(&mut project, frame_index, |frame| {
+        if !frame.skip_records.contains(record) {
+            frame.skip_records.push(record.clone());
+        }
+    })?;
+    write_manifest_atomically_at_locked(&guard.directory, display_directory, &project)
+}
+
 /// Pure, disk-free derivation of the resume set: every frame that is not
 /// excluded and has no receipts yet, in ascending index order. A frame
 /// with no receipt is pending whether it was never attempted, was skipped,
@@ -1409,6 +1495,37 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!("scanstudio-test-{}-{n}", generate_project_id()))
+    }
+
+    #[test]
+    fn exposure_lock_survives_reopen_and_a_stale_project_update() {
+        let directory = temp_project_dir();
+        let (mut stale, _) = create_project(
+            "Exposure Lock",
+            MediaCarrier::Mounted,
+            1,
+            FilmProcess::C41ColorNegative,
+            Some(&directory),
+        )
+        .unwrap();
+        let authority = File::open(&directory).unwrap();
+        let exposure_lock = crate::domain::RollExposureLock {
+            slot: 1,
+            rgb_exposures_raw_10ns: [120_000, 130_000, 140_000],
+            ir_metered_exposure_raw_10ns: 150_000,
+            meter_evidence_path: "/tmp/meter.tif".into(),
+            meter_evidence_sha256: "a".repeat(64),
+            journal_path: "/tmp/journal.json".into(),
+            journal_sha256: "b".repeat(64),
+            source: None,
+        };
+        persist_roll_exposure_lock_at(&authority, &directory, exposure_lock.clone()).unwrap();
+
+        stale.name = "Edited from stale settings state".into();
+        let merged = persist_project_update_at(&authority, &directory, &stale).unwrap();
+        assert_eq!(merged.roll_exposure_lock, Some(exposure_lock.clone()));
+        assert_eq!(open_project(&directory).unwrap().roll_exposure_lock, Some(exposure_lock));
+        cleanup(&directory);
     }
 
     fn cleanup(dir: &Path) {
@@ -1784,8 +1901,10 @@ mod tests {
             1,
             &ScanReceipt {
                 exposure_authority: None,
+            preview_exposure_adjustment: None,
                 auto_crop: None,
                 job_id: "job-issue99".into(),
+                pass_token: None,
                 frame_index: 1,
                 started_at: "2026-08-01T09:00:00Z".into(),
                 duration_ms: 1200,
@@ -1914,6 +2033,7 @@ mod tests {
             film_process: FilmProcess::Positive,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-08-22T00:00:00Z".into(),
             frames: vec![],
         };
@@ -2065,8 +2185,10 @@ mod tests {
         let dir = temp_project_dir();
         let receipt = ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: "job-1".into(),
+            pass_token: None,
             frame_index: 1,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1900,
@@ -2099,6 +2221,7 @@ mod tests {
             film_process: FilmProcess::C41ColorNegative,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-22T09:00:00Z".into(),
             frames: vec![
                 ProjectFrame {
@@ -2109,6 +2232,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![receipt],
                 },
                 ProjectFrame {
@@ -2119,6 +2243,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
             ],
@@ -2331,6 +2456,7 @@ mod tests {
             film_process: FilmProcess::Positive,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             frames: vec![],
         };
@@ -2345,6 +2471,7 @@ mod tests {
             film_process: FilmProcess::BwNegative,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-06-01T00:00:00Z".into(),
             frames: vec![],
         };
@@ -2537,6 +2664,7 @@ mod tests {
             film_process: FilmProcess::Positive,
             recipes: OutputRecipe::default(),
             roll_metadata: MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-23T00:00:00Z".into(),
             frames: (1..=n)
                 .map(|index| ProjectFrame {
@@ -2547,6 +2675,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 })
                 .collect(),
@@ -2579,8 +2708,10 @@ mod tests {
     fn sample_receipt(job_id: &str, frame_index: u32) -> ScanReceipt {
         ScanReceipt {
             exposure_authority: None,
+            preview_exposure_adjustment: None,
             auto_crop: None,
             job_id: job_id.into(),
+            pass_token: None,
             frame_index,
             started_at: "2026-07-22T09:00:00Z".into(),
             duration_ms: 1000,
@@ -2615,6 +2746,7 @@ mod tests {
                 raw_negative_path: None,
                 raw_negative_ir_path: None,
                 metadata_bindings: None,
+                capture_bindings: None,
                 derivative_transform: crate::domain::DerivativeTransform::default(),
             }),
             ..sample_receipt(job_id, frame_index)

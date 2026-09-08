@@ -242,7 +242,7 @@ def validate_request(request: object) -> dict:
 
     if type(request) is not dict:
         raise BridgeError(ErrorCode.INVALID_PARAMS, "request must be a JSON object")
-    unknown = sorted(set(request) - {"id", "method", "params"})
+    unknown = sorted(set(request) - {"id", "method", "params", "metadata"})
     if unknown:
         raise BridgeError(
             ErrorCode.INVALID_PARAMS,
@@ -261,6 +261,19 @@ def validate_request(request: object) -> dict:
         raise BridgeError(ErrorCode.INVALID_PARAMS, "method must be a non-empty string")
     if "params" in request and type(request["params"]) is not dict:
         raise BridgeError(ErrorCode.INVALID_PARAMS, "params must be a JSON object")
+    metadata = request.get("metadata")
+    if metadata is not None:
+        if type(metadata) is not dict or set(metadata) != {"correlationToken"}:
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "metadata must contain only correlationToken",
+            )
+        token = metadata["correlationToken"]
+        allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._:"
+        if type(token) is not str or not 1 <= len(token.encode("utf-8")) <= 128 or any(
+            character not in allowed for character in token
+        ):
+            raise BridgeError(ErrorCode.INVALID_PARAMS, "invalid metadata.correlationToken")
     return request
 
 

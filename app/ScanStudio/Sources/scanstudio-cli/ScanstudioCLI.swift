@@ -8,6 +8,7 @@
 // AsyncParsableCommand's own static entry-point method.
 
 import ArgumentParser
+import Foundation
 import ScanStudioKit
 
 @main
@@ -17,10 +18,11 @@ struct ScanstudioCLI: AsyncParsableCommand {
         abstract: "Drives a running ScanStudio app over its local control socket.",
         subcommands: [
             Connect.self, Disconnect.self, Rescan.self, Status.self,
-            Frames.self, Settings.self, Outputs.self, Roll.self, Diagnostics.self,
+            Frames.self, Settings.self, Outputs.self, Preset.self, Roll.self, Render.self, Export.self, Metadata.self, Diagnostics.self,
             Preview.self, Review.self, Eject.self,
             Scan.self, Stop.self, Resume.self,
-            Events.self, Sim.self, Host.self
+            RunJob.self, Schema.self, Doctor.self, Selftest.self,
+            Events.self, Sim.self, Session.self, Link.self, Wait.self, Host.self
         ]
     )
 }
@@ -39,13 +41,31 @@ struct GlobalOptions: ParsableArguments {
         name: .customLong("human"),
         help: "Render output as human-readable text instead of JSON."
     )
-    var human = false
+    private var humanOutput = false
+
+    @Flag(name: .customLong("json"), help: "Render one compact JSON object.")
+    private var jsonOutput = false
+
+    @Flag(name: .customLong("ndjson"), help: "Render compact newline-delimited JSON.")
+    private var ndjsonOutput = false
 
     @Option(
         name: .customLong("socket"),
         help: "Path to the control socket. Defaults to the app's standard control socket path."
     )
     var socketPath: String?
+
+    @Option(
+        name: .customLong("controller-name"),
+        help: "Informational controller label (maximum 128 UTF-8 bytes; grants no authorization)."
+    )
+    var controllerName: String?
+
+    @Option(
+        name: .customLong("key"),
+        help: "Idempotency key for mutations (host-memory scope; host restart clears recorded results)."
+    )
+    var idempotencyKey: String?
 
     /// D-17: suppresses `--wait`'s stderr progress lines (`scan`, `resume`,
     /// `roll save`). A global flag so a caller never has to remember which
@@ -63,9 +83,39 @@ struct GlobalOptions: ParsableArguments {
         headless ? .headlessOnly : (attach ? .attachOnly : .auto)
     }
 
+    var human: Bool {
+        if humanOutput { return true }
+        if jsonOutput || ndjsonOutput { return false }
+        return ProcessInfo.processInfo.environment["SCANSTUDIO_OUTPUT"] == "human"
+    }
+
+    var resolvedControllerName: String {
+        controllerName
+            ?? ProcessInfo.processInfo.environment["SCANSTUDIO_CONTROLLER"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? "scanstudio-cli"
+    }
+
     mutating func validate() throws {
         if attach && headless {
             throw ValidationError("--attach and --headless cannot be used together")
+        }
+        let explicitFormats = [humanOutput, jsonOutput, ndjsonOutput].count { $0 }
+        if explicitFormats > 1 {
+            throw ValidationError("--human, --json, and --ndjson are mutually exclusive")
+        }
+        if explicitFormats == 0,
+           let format = ProcessInfo.processInfo.environment["SCANSTUDIO_OUTPUT"],
+           !["json", "ndjson", "human"].contains(format) {
+            throw ValidationError("SCANSTUDIO_OUTPUT must be json, ndjson, or human")
+        }
+        if let error = ControlControllerName.validationError(resolvedControllerName) {
+            throw ValidationError("invalid controller name: \(error)")
+        }
+        if let key = idempotencyKey {
+            if key.isEmpty || key.utf8.count > 128
+                || key.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+                throw ValidationError("--key must be printable and no longer than 128 UTF-8 bytes")
+            }
         }
     }
 }

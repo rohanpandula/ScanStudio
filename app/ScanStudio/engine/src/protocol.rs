@@ -21,6 +21,19 @@ pub struct Request {
     pub params: serde_json::Value,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RequestMetadata {
+    pub correlation_token: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RequestMetadataSniff {
+    #[serde(default)]
+    pub metadata: Option<RequestMetadata>,
+}
+
 /// Outbound success shape (engine -> app): `{"id": .., "result": ..}`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Response<T> {
@@ -128,7 +141,6 @@ pub enum ErrorCode {
     /// already contains a project manifest (valid, zero-receipt, or corrupt).
     /// Creating a project must never replace an existing one; the operator
     /// opens the existing project or picks a different directory.
-
     ProjectAlreadyExists,
     ManifestInvalid,
     ArchiveCollision,
@@ -217,6 +229,31 @@ pub struct HelloResult {
     pub engine_version: String,
     pub protocol_version: u32,
     pub capabilities: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvidenceAuthority {
+    pub session_id: String,
+    pub path: String,
+    pub allowed_root: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvidenceFileAuthority {
+    pub entry_name: String,
+    pub path: String,
+    pub allowed_root: String,
+    pub sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInventoryResult {
+    pub bridge_telemetry: Option<SessionEvidenceAuthority>,
+    pub attempt_journals: Vec<SessionEvidenceFileAuthority>,
+    pub bridge_version: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -373,6 +410,10 @@ pub struct LoadMediaParams {
     /// is set and this is omitted. Ignored when `abortAtFrame` is absent.
     #[serde(default)]
     pub abort_code: Option<String>,
+    /// Simulator-only one-shot stall after the named frame's first progress
+    /// tick. Immediate stop remains available; a new media load clears it.
+    #[serde(default)]
+    pub stall_at_frame: Option<u32>,
 }
 
 // ---------------------------------------------------------------------
@@ -462,6 +503,75 @@ pub struct RollSetSpacingOffsetParams {
 #[serde(rename_all = "camelCase")]
 pub struct RollSetSpacingOffsetResult {
     pub thumbnail: Thumbnail,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollSolveExposureParams {
+    pub frame_index: u32,
+    pub operation_id: String,
+    #[serde(default)]
+    pub preview_derived_reference: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RollSolveExposureAck {
+    pub accepted: bool,
+}
+
+/// Offline re-render of retained, engine-bound masters. This operation never
+/// reaches a scanner backend and writes only create-only derivative files.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollRenderParams {
+    pub frames: Vec<u32>,
+    pub profile: String,
+    pub output: String,
+}
+
+/// Offline create-only export of one bound receipt artifact per selected frame.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollExportParams {
+    pub to: String,
+    pub template: String,
+    pub kind: String,
+    #[serde(default)]
+    pub frames: Option<Vec<u32>>,
+}
+
+/// Apply approved roll metadata to create-only copies of retained outputs.
+/// The authoritative manifest, receipts, and capture files are never targets.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollMetadataApplyParams {
+    pub frames: Vec<u32>,
+    pub to: String,
+    pub template: String,
+    pub kind: String,
+    pub metadata: domain::MetadataSet,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollExposureSolvedPayload {
+    pub operation_id: String,
+    pub solution: domain::RollExposureLock,
+    pub project: domain::ScanProject,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollExposureErrorPayload {
+    pub operation_id: String,
+    pub code: ErrorCode,
+    pub message: String,
+    pub recoverable: bool,
+    pub frame_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// Wire contract: exactly one of `imagePath` or the `{brightness, tint}`
@@ -586,6 +696,12 @@ pub struct PreviewStripResult {
 #[serde(rename_all = "camelCase")]
 pub struct ScanStartParams {
     pub frames: Vec<u32>,
+    #[serde(default)]
+    pub on_frame_failure: ScanFrameFailurePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_meter_refusal_slots: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_token: Option<String>,
     pub recipe: domain::CaptureRecipe,
     #[serde(default)]
     pub processing: domain::ProcessingRecipe,
@@ -597,6 +713,14 @@ pub struct ScanStartParams {
     /// ignores unknown fields per PROTOCOL.md forward compatibility.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub frame_alignments: std::collections::HashMap<u32, domain::FrameAlignment>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ScanFrameFailurePolicy {
+    #[default]
+    Stop,
+    Skip,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1135,6 +1259,7 @@ mod tests {
             film_process: domain::FilmProcess::C41ColorNegative,
             recipes: domain::OutputRecipe::default(),
             roll_metadata: domain::MetadataSet::default(),
+            roll_exposure_lock: None,
             created_at: "2026-07-22T09:00:00Z".into(),
             frames: vec![
                 domain::ProjectFrame {
@@ -1145,6 +1270,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
                 domain::ProjectFrame {
@@ -1155,6 +1281,7 @@ mod tests {
                     output_override: None,
                     alignment: None,
                     metadata_override: None,
+                    skip_records: vec![],
                     receipts: vec![],
                 },
             ],
