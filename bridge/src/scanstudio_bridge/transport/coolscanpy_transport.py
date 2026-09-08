@@ -469,7 +469,9 @@ def _scan_receipt_from_coolscanpy(
     raw_export_path: str | None = None,
     raw_export_ir_path: str | None = None,
 ) -> domain.ScanReceipt:
-    exposure_authority = build_exposure_authority(attempts_root=attempts_root, slot=receipt.slot)
+    exposure_authority = build_exposure_authority(
+        attempts_root=attempts_root, slot=receipt.slot, started_at=receipt.started_at
+    )
     exposure = receipt.exposure
     clipping = receipt.clipping
     focus_detail = receipt.focus_detail
@@ -1556,8 +1558,9 @@ class CoolscanPyTransport:
         *,
         allowed_meter_refusal_slots: tuple[int, ...] = (),
         on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
+        frame_exposure_overrides_10ns: dict[int, tuple[int, int, int]] | None = None,
     ) -> domain.ScanSummary:
-        """Fine-scan the requested slots using one ``Roll.scan_many`` batch.
+        """Fine-scan requested slots under one output reservation.
 
         ``on_retry`` is retained for ``Transport`` contract compatibility
         but is no longer invoked: the bridge now delegates the whole slot
@@ -1573,6 +1576,9 @@ class CoolscanPyTransport:
         samples_supported = supported_samples_per_scan()
         domain.validate_capture_recipe(
             recipe, self._material, supported_multisample_passes=samples_supported
+        )
+        domain.validate_frame_exposure_overrides_10ns(
+            slots, recipe, frame_exposure_overrides_10ns
         )
         allowed_skips = tuple(allowed_meter_refusal_slots)
         if (
@@ -1695,11 +1701,16 @@ class CoolscanPyTransport:
                                 raise coolscanpy.SafeStopRequested("scan job stopped before batch reservation")
                             batch_slots = (
                                 remaining[:1]
-                                if hold_exposure and held_ticks is None
+                                if frame_exposure_overrides_10ns is not None
+                                or (hold_exposure and held_ticks is None)
                                 else remaining
                             )
                             batch_kwargs = dict(scan_kwargs)
-                            if held_ticks is not None:
+                            if frame_exposure_overrides_10ns is not None:
+                                batch_kwargs["exposure_override_10ns"] = (
+                                    frame_exposure_overrides_10ns[batch_slots[0]]
+                                )
+                            elif held_ticks is not None:
                                 batch_kwargs["exposure_override_10ns"] = held_ticks
                             if allowed_skips:
                                 batch_kwargs["allowed_meter_refusal_slots"] = tuple(
@@ -1812,7 +1823,11 @@ class CoolscanPyTransport:
                                 on_frame(slot, receipt)
                                 completed.append(slot)
                                 remaining.remove(slot)
-                                if hold_exposure and held_ticks is None:
+                                if (
+                                    frame_exposure_overrides_10ns is None
+                                    and hold_exposure
+                                    and held_ticks is None
+                                ):
                                     held_ticks = _held_exposure_ticks(frame.receipt.exposure)
                         except coolscanpy.TransportSmearDetected as exc:
                             # scan_many processes slots in order; the first

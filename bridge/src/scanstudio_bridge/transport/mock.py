@@ -526,8 +526,17 @@ class MockTransport:
         *,
         allowed_meter_refusal_slots: tuple[int, ...] = (),
         on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
+        frame_exposure_overrides_10ns: dict[int, tuple[int, int, int]] | None = None,
     ) -> domain.ScanSummary:
         del on_meter_refusal_skipped
+        if frame_exposure_overrides_10ns is not None:
+            domain.validate_frame_exposure_overrides_10ns(
+                slots, recipe, frame_exposure_overrides_10ns
+            )
+            raise BridgeError(
+                ErrorCode.NOT_IMPLEMENTED,
+                "the simulator cannot apply per-frame hardware exposure overrides",
+            )
         if allowed_meter_refusal_slots:
             raise BridgeError(
                 ErrorCode.NOT_IMPLEMENTED,

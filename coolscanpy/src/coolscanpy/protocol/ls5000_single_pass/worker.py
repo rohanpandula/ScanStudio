@@ -5607,6 +5607,9 @@ def _run_live_continuation_frame(
                                 journal["active_exposure_authority"][
                                     "commanded_channels_raw_10ns"
                                 ] = dict(fine_controller_exposures)
+                                journal["active_exposure_authority"][
+                                    "rgb_source"
+                                ] = "explicit-rgb-override"
                             final_controller_accepted = True
                             _write_journal(journal_path, journal)
 
@@ -7624,6 +7627,9 @@ def run_live_capture(
                                 journal["active_exposure_authority"][
                                     "commanded_channels_raw_10ns"
                                 ] = dict(fine_controller_exposures)
+                                journal["active_exposure_authority"][
+                                    "rgb_source"
+                                ] = "explicit-rgb-override"
                             final_controller_accepted = True
                             _write_journal(journal_path, journal)
                 entry_index += 1

@@ -72,7 +72,7 @@ _METHOD_PARAM_SCHEMAS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "roll.previewStrip": ((), ()),
     "scan.start": (
         ("slots", "recipe", "output"),
-        ("jobId", "allowedMeterRefusalSlots"),
+        ("jobId", "allowedMeterRefusalSlots", "frameExposureOverrides10ns"),
     ),
     "scan.stop": (("jobId",), ()),
     "device.eject": ((), ()),
@@ -251,6 +251,34 @@ def _require_int_list(
     if unique and len(set(result)) != len(result):
         raise BridgeError(ErrorCode.INVALID_PARAMS, f"{name} may not contain duplicates")
     return result
+
+
+def _require_frame_exposure_overrides_10ns(
+    value: object,
+) -> dict[int, tuple[int, int, int]]:
+    if type(value) is not dict:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns must be a JSON object keyed by slot",
+        )
+    slot_keys = {str(slot): slot for slot in range(1, 41)}
+    parsed: dict[int, tuple[int, int, int]] = {}
+    for raw_slot, raw_ticks in value.items():
+        if type(raw_slot) is not str or raw_slot not in slot_keys:
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "frameExposureOverrides10ns keys must be canonical slot numbers 1..40",
+            )
+        ticks = _require_int_list(
+            raw_ticks,
+            f"frameExposureOverrides10ns.{raw_slot}",
+            minimum_length=3,
+            maximum_length=3,
+            item_minimum=50_000,
+            item_maximum=400_000,
+        )
+        parsed[slot_keys[raw_slot]] = (ticks[0], ticks[1], ticks[2])
+    return parsed
 
 
 # Plan 10-09 (durable per-frame failure reasons): scan.frameFailed's own
@@ -1052,6 +1080,16 @@ class BridgeService:
                 else tuple(self._opened_capabilities.supported_multisample_passes)
             ),
         )
+        frame_exposure_overrides_10ns = (
+            _require_frame_exposure_overrides_10ns(
+                params["frameExposureOverrides10ns"]
+            )
+            if "frameExposureOverrides10ns" in params
+            else None
+        )
+        domain.validate_frame_exposure_overrides_10ns(
+            slots, recipe, frame_exposure_overrides_10ns
+        )
 
         requested_job_id = params.get("jobId")
         if "jobId" not in params:
@@ -1419,6 +1457,11 @@ class BridgeService:
                             ),
                             "on_meter_refusal_skipped": on_meter_refusal_skipped,
                         }
+                    exposure_options: dict[str, object] = {}
+                    if frame_exposure_overrides_10ns is not None:
+                        exposure_options["frame_exposure_overrides_10ns"] = (
+                            frame_exposure_overrides_10ns
+                        )
                     result = transport.start_scan(
                         slots,
                         recipe,
@@ -1431,6 +1474,7 @@ class BridgeService:
                         on_frame=on_frame,
                         on_call=on_call,
                         **skip_options,
+                        **exposure_options,
                     )
                     if (
                         not isinstance(result, domain.ScanSummary)

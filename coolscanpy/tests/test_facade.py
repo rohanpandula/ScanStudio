@@ -5367,6 +5367,40 @@ class TestRollMultiBatchHold:
             roll.close()
             dev.close()
 
+    def test_repeated_same_slot_uses_fresh_held_round_artifacts(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_success_spawner(events),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(2):
+                roll.approve(2)
+
+            assert [frame.slot for frame in roll.scan_many([2])] == [2]
+            held = roll._held_session
+            assert held is not None
+            first_journals = sorted(held.directory.glob("frame-002-*/journal.json"))
+            assert len(first_journals) == 1
+            first_bytes = first_journals[0].read_bytes()
+            first_ack = first_journals[0].with_name("parent-ack.json")
+            first_ack_bytes = first_ack.read_bytes()
+
+            assert [frame.slot for frame in roll.scan_many([2])] == [2]
+            journals = sorted(held.directory.glob("frame-002-*/journal.json"))
+            assert len(journals) == 2
+            assert first_journals[0].read_bytes() == first_bytes
+            assert first_ack.read_bytes() == first_ack_bytes
+            assert len(list(held.directory.glob("frame-002-*/parent-ack.json"))) == 2
+        finally:
+            roll.close()
+            dev.close()
+
     def test_three_batches_then_eject_after_on_the_third(
         self, fake_service_factory, tmp_path: Path
     ) -> None:

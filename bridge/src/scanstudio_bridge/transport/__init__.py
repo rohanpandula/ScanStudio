@@ -141,6 +141,7 @@ class Transport(Protocol):
         *,
         allowed_meter_refusal_slots: tuple[int, ...] = (),
         on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
+        frame_exposure_overrides_10ns: dict[int, tuple[int, int, int]] | None = None,
     ) -> domain.ScanSummary: ...
 
     def request_stop(self) -> None: ...  # stop between transfers, per BRIDGE.md scan.stop

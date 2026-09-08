@@ -45,6 +45,7 @@ __all__ = [
     "DEBUG_RECIPE_ENV_VAR",
     "DEBUG_COLOR_NEGATIVE_RECIPE",
     "validate_capture_recipe",
+    "validate_frame_exposure_overrides_10ns",
 ]
 
 
@@ -530,3 +531,47 @@ def validate_capture_recipe(
             )
         return None
     raise BridgeError(ErrorCode.INVALID_PARAMS, f"unknown material: {material!r}")
+
+
+def validate_frame_exposure_overrides_10ns(
+    slots: list[int],
+    recipe: CaptureRecipe,
+    overrides: dict[int, tuple[int, int, int]] | None,
+) -> None:
+    """Validate one complete per-slot RGB exposure authority before motion."""
+    if overrides is None:
+        return
+    if type(overrides) is not dict or any(type(slot) is not int for slot in overrides):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns must map integer slots to RGB tick arrays",
+        )
+    if set(overrides) != set(slots):
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns keys must exactly match scan slots",
+        )
+    if recipe.auto_exposure is not False:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns requires recipe.autoExposure=false",
+        )
+    if recipe.exposure_override_10ns is not None:
+        raise BridgeError(
+            ErrorCode.INVALID_PARAMS,
+            "frameExposureOverrides10ns conflicts with recipe.exposureOverride10ns",
+        )
+    for slot, ticks in overrides.items():
+        if (
+            type(ticks) is not tuple
+            or len(ticks) != 3
+            or any(
+                type(tick) is not int or not 50_000 <= tick <= 400_000
+                for tick in ticks
+            )
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                f"frameExposureOverrides10ns[{slot}] requires three integer RGB values "
+                "in 50000..400000 (10ns ticks); IR stays metered",
+            )

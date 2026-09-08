@@ -241,7 +241,13 @@ def _validated_density_calibration(
     return calibration
 
 
-def _batch_frame_output(batch_directory: Path, selected_slot: object) -> Path:
+def _batch_frame_output(
+    batch_directory: Path,
+    selected_slot: object,
+    *,
+    frame_directory_prefix: str = "frame",
+    frame_directory_suffix: str | None = None,
+) -> Path:
     """Return one batch frame's own capture output, as the job names it.
 
     The single source of truth for the ``frame-NNN/capture.bin`` layout the
@@ -252,7 +258,10 @@ def _batch_frame_output(batch_directory: Path, selected_slot: object) -> Path:
 
     if type(selected_slot) is not int:
         raise AssertionError("validated batch frame has no selected slot")
-    return batch_directory / f"frame-{selected_slot:03d}" / "capture.bin"
+    directory_name = f"{frame_directory_prefix}-{selected_slot:03d}"
+    if frame_directory_suffix is not None:
+        directory_name += f"-{frame_directory_suffix}"
+    return batch_directory / directory_name / "capture.bin"
 
 
 def _density_source_path(output_path: Path) -> Path:
@@ -1473,6 +1482,7 @@ class PreparedCaptureBatch:
     session_id: str
     calibration_session_id: str
     density_source_path: Path
+    frame_directory_suffix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3384,7 +3394,11 @@ class CaptureProcessAdapter:
                 )
             job_path = held.hold_job_path
             session_journal_path = held.directory / "session-journal.json"
-            payload = self._batch_job_bytes(request, session_id=held.hold_session_id)
+            payload = self._batch_job_bytes(
+                request,
+                session_id=held.hold_session_id,
+                frame_directory_suffix=held.hold_session_id,
+            )
             # held.hold_session_id is this round's own (fresh, per-round)
             # identity, not the reservation-wide one this held preview's
             # density calibration is actually bound to -- see
@@ -3442,6 +3456,7 @@ class CaptureProcessAdapter:
                 # this validator looked before (live failure 2026-08-06,
                 # attempt 11: "Nikon density source artifact is missing").
                 density_source_path=held.reservation_density_source_path,
+                frame_directory_suffix=held.hold_session_id,
             )
             try:
                 self._publish_hold_ack(held, action="scan")
@@ -4459,29 +4474,30 @@ class CaptureProcessAdapter:
         *,
         session_id: str,
         frame_directory_prefix: str = "frame",
+        frame_directory_suffix: str | None = None,
     ) -> bytes:
-        frames = [
-            {
-                "ack": (
-                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/"
-                    "parent-ack.json"
-                ),
+        frames = []
+        for frame in request.frames:
+            directory_name = _batch_frame_output(
+                Path("."),
+                frame.selected_slot,
+                frame_directory_prefix=frame_directory_prefix,
+                frame_directory_suffix=frame_directory_suffix,
+            ).parent.as_posix()
+            frames.append({
+                "ack": f"{directory_name}/parent-ack.json",
                 "boundary_offset_rows": frame.boundary_offset_rows,
                 "journal": (
-                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/journal.json"
+                    f"{directory_name}/journal.json"
                 ),
                 "manual_review_approval": (
                     None
                     if frame.manual_review_approval is None
                     else frame.manual_review_approval.to_payload()
                 ),
-                "output": (
-                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/capture.bin"
-                ),
+                "output": f"{directory_name}/capture.bin",
                 "slot": frame.selected_slot,
-            }
-            for frame in request.frames
-        ]
+            })
         job = {
             "apply_all_boundary_offsets_before_first_frame": True,
             "capture_plan_sha256": CANONICAL_PLAN_SHA256,
@@ -4563,7 +4579,9 @@ class CaptureProcessAdapter:
         request: CaptureRequest,
     ) -> AttemptPaths:
         output = _batch_frame_output(
-            prepared.paths.directory, request.selected_slot
+            prepared.paths.directory,
+            request.selected_slot,
+            frame_directory_suffix=prepared.frame_directory_suffix,
         )
         directory = output.parent
         return AttemptPaths(

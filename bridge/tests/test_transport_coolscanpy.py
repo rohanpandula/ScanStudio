@@ -2936,10 +2936,10 @@ def test_start_scan_receipt_forwards_best_effort_exposure_authority(
         device_bound_clamped_channels_raw_10ns={},
         device_exposure_bounds_raw_10ns=(50_000, 400_000),
     )
-    seen: list[tuple[Path | None, int]] = []
+    seen: list[tuple[Path | None, int, str | None]] = []
 
-    def fake_build(*, attempts_root: Path | None, slot: int):
-        seen.append((attempts_root, slot))
+    def fake_build(*, attempts_root: Path | None, slot: int, started_at: str | None):
+        seen.append((attempts_root, slot, started_at))
         return authority
 
     monkeypatch.setattr(coolscanpy_transport_module, "build_exposure_authority", fake_build)
@@ -2957,7 +2957,7 @@ def test_start_scan_receipt_forwards_best_effort_exposure_authority(
         on_frame=lambda _slot, receipt: frames.append(receipt),
     )
 
-    assert seen == [(device.roll_calls[0], 1)]
+    assert seen == [(device.roll_calls[0], 1, None)]
     assert frames[0].exposure_authority == authority
 
 
@@ -4370,6 +4370,70 @@ def test_explicit_rgb_exposure_survives_separate_scan_calls(tmp_path, monkeypatc
     for pass_name in ("A1", "A2"):
         assert _scan(transport, [1], recipe, tmp_path / pass_name).completed == (1,)
     assert roll.scan_many_kwargs == [{"exposure_override_10ns": ticks}] * 2
+
+
+def test_job_scoped_per_frame_exposure_uses_ordered_singleton_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1), _fake_thumbnail(2), _fake_thumbnail(3)],
+        scan_results={1: [_fake_frame(1)], 2: [_fake_frame(2)], 3: [_fake_frame(3)]},
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    recipe = dataclasses.replace(domain.FIXED_COLOR_NEGATIVE_RECIPE, auto_exposure=False)
+    overrides = {
+        1: (100_000, 110_000, 120_000),
+        2: (130_000, 140_000, 150_000),
+        3: (160_000, 170_000, 180_000),
+    }
+    summary = transport.start_scan(
+        slots=[3, 1, 2], recipe=recipe, output=_output(tmp_path / "ordered"),
+        on_progress=lambda _p: None, on_retry=lambda *_a: None,
+        on_frame=lambda *_a: None, frame_exposure_overrides_10ns=overrides,
+    )
+    assert summary.completed == (1, 2, 3)
+    assert roll.scan_many_calls == [(1,), (2,), (3,)]
+    assert roll.scan_many_kwargs == [
+        {"exposure_override_10ns": overrides[1]},
+        {"exposure_override_10ns": overrides[2]},
+        {"exposure_override_10ns": overrides[3]},
+    ]
+
+
+def test_job_scoped_per_frame_exposure_failure_releases_later_reservations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coolscanpy_transport_module, "SINGLE_SAMPLE_VALIDATED_RUN", None)
+    roll = _FakeRoll(
+        thumbnails=[_fake_thumbnail(1), _fake_thumbnail(2), _fake_thumbnail(3)],
+        scan_results={
+            1: [_fake_frame(1)],
+            2: [coolscanpy.BatchIntegrityError("injected second-slot failure")],
+            3: [_fake_frame(3)],
+        },
+    )
+    transport, _device = _opened_transport(monkeypatch, roll)
+    transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+    recipe = dataclasses.replace(domain.FIXED_COLOR_NEGATIVE_RECIPE, auto_exposure=False)
+    overrides = {
+        1: (100_000, 110_000, 120_000),
+        2: (130_000, 140_000, 150_000),
+        3: (160_000, 170_000, 180_000),
+    }
+    output_root = tmp_path / "failed"
+    with pytest.raises(BridgeError) as excinfo:
+        transport.start_scan(
+            slots=[1, 2, 3], recipe=recipe, output=_output(output_root),
+            on_progress=lambda _p: None, on_retry=lambda *_a: None,
+            on_frame=lambda *_a: None, frame_exposure_overrides_10ns=overrides,
+        )
+    assert excinfo.value.code == ErrorCode.BATCH_INTEGRITY_ERROR
+    assert roll.scan_many_calls == [(1,), (2,)]
+    assert sorted(path.name for path in output_root.iterdir()) == [
+        "frame-0001.tif", "frame-0001_IR.tif",
+    ]
 
 
 def test_exposure_solve_refuses_old_driver_without_capture(tmp_path, monkeypatch) -> None:

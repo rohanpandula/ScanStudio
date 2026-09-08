@@ -62,8 +62,8 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
     # Resealed 2026-08-11: capture descendants remain in the bridge-owned
     # process group and inherit its exclusive process-ownership fence.
-    "capture_process.py": "2316fc391d360683732510bcb6c5e46cebff3097921d3cfdc9fa57972f49c40c",
-    "worker.py": "38b4cc7590a65c6dbe3cc9fb65e5c1d36eea52f6824769db976d637ab7d51721",
+    "capture_process.py": "e66a50d07a4704a10f38f3d477432e0e2b3853c23c43a70e740950bd2dccb2ea",
+    "worker.py": "d42ec7a564e16b53aa388969bda81a6dd536bbbc5332aa9440f729349701752e",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",

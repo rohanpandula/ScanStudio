@@ -5923,6 +5923,7 @@ def test_continuation_executor_substitutes_forced_ticks_at_fine_plan_build(
     # the true metered answer, never the override.
     assert journal["meter_controller_final_result"] == {"accepted": True}
     authority = journal["active_exposure_authority"]
+    assert authority["rgb_source"] == "explicit-rgb-override"
     assert authority["commanded_channels_raw_10ns"] == {
         "R": 97_482,
         "G": 195_597,
@@ -6055,6 +6056,7 @@ def test_continuation_executor_without_override_matches_pre_override_fine_contra
         },
     }
     authority = journal["active_exposure_authority"]
+    assert authority["rgb_source"] == "nikon-parity-guarded-v2"
     assert authority["commanded_channels_raw_10ns"] == guarded
     assert authority["active_controller_channels_raw_10ns"] == metered
     observed_fine = {

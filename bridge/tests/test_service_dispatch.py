@@ -158,6 +158,7 @@ class _StubTransport:
         self.manual_frames_calls: list[tuple[int, ...]] = []
         self.preview_strip_calls = 0
         self._manual_frames_raises = manual_frames_raises
+        self.frame_exposure_overrides_10ns = None
 
     def list_devices(self) -> list[domain.DeviceInfo]:
         return [_device_info()]
@@ -244,7 +245,11 @@ class _StubTransport:
             image_path="/tmp/stub-preview/strip.tif", row_count=4800, pixels_per_row=1
         )
 
-    def start_scan(self, slots, recipe, output, on_progress, on_retry, on_frame, on_call=None):
+    def start_scan(
+        self, slots, recipe, output, on_progress, on_retry, on_frame, on_call=None,
+        *, frame_exposure_overrides_10ns=None,
+    ):
+        self.frame_exposure_overrides_10ns = frame_exposure_overrides_10ns
         if self._start_scan_raises is not None:
             raise self._start_scan_raises
         return domain.ScanSummary(completed=tuple(slots), failed=(), stopped=False)
@@ -1364,6 +1369,40 @@ def test_scan_start_echoes_engine_operation_token_and_refuses_reuse(
     assert "already used" in excinfo.value.message
 
 
+def test_scan_start_forwards_exact_per_frame_exposure_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm(monkeypatch, tmp_path)
+    transport = _StubTransport()
+    svc = _opened_service(tmp_path, transport)
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    emit = _RecordingEmit()
+    svc.dispatch(
+        {
+            "id": 3,
+            "method": "scan.start",
+            "params": {
+                "slots": [1, 2],
+                "recipe": {**_wire_recipe(), "autoExposure": False},
+                "output": {
+                    "destination": str(tmp_path / "out"),
+                    "filenameTemplate": "frame-####.tif",
+                },
+                "frameExposureOverrides10ns": {
+                    "1": [100_000, 110_000, 120_000],
+                    "2": [130_000, 140_000, 150_000],
+                },
+            },
+        },
+        emit,
+    )
+    _wait_for(lambda: emit.has("scan.completed"))
+    assert transport.frame_exposure_overrides_10ns == {
+        1: (100_000, 110_000, 120_000),
+        2: (130_000, 140_000, 150_000),
+    }
+
+
 def test_scan_start_ingress_rejects_coercible_nonfinite_missing_and_unknown_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1376,6 +1415,8 @@ def test_scan_start_ingress_rejects_coercible_nonfinite_missing_and_unknown_valu
     }
     missing_recipe_field = _wire_recipe()
     del missing_recipe_field["bitDepth"]
+    per_frame_recipe = {**_wire_recipe(), "autoExposure": False}
+    ticks = [100_000, 110_000, 120_000]
     bad_params = [
         {"slots": [True], "recipe": _wire_recipe(), "output": output},
         {"slots": ["1"], "recipe": _wire_recipe(), "output": output},
@@ -1405,6 +1446,32 @@ def test_scan_start_ingress_rejects_coercible_nonfinite_missing_and_unknown_valu
             "recipe": _wire_recipe(),
             "output": output,
             "unexpected": 1,
+        },
+        {
+            "slots": [1], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"01": ticks},
+        },
+        {
+            "slots": [1], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"1": [True, 110_000, 120_000]},
+        },
+        {
+            "slots": [1], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"1": [49_999, 110_000, 120_000]},
+        },
+        {
+            "slots": [1, 2], "recipe": per_frame_recipe, "output": output,
+            "frameExposureOverrides10ns": {"1": ticks},
+        },
+        {
+            "slots": [1], "recipe": _wire_recipe(), "output": output,
+            "frameExposureOverrides10ns": {"1": ticks},
+        },
+        {
+            "slots": [1],
+            "recipe": {**per_frame_recipe, "exposureOverride10ns": ticks},
+            "output": output,
+            "frameExposureOverrides10ns": {"1": ticks},
         },
         {"slots": [1], "recipe": _wire_recipe()},
     ]
