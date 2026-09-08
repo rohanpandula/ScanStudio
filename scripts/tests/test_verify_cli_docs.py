@@ -53,8 +53,8 @@ class CLIDocsTests(unittest.TestCase):
     def test_extra_exit_code_names_number(self) -> None:
         root = self.fixture()
         path = root / VERIFIER.CLI_DOC
-        path.write_text(path.read_text().replace("| 78 |", "| 76 |", 1))
-        with self.assertRaisesRegex(VERIFIER.CLIDocsError, "76"):
+        path.write_text(path.read_text().replace("| 78 |", "| 99 |", 1))
+        with self.assertRaisesRegex(VERIFIER.CLIDocsError, "99"):
             VERIFIER.verify_cli_docs(root)
 
     def test_meaning_mismatch_names_code(self) -> None:
