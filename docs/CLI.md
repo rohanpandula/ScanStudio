@@ -54,7 +54,7 @@ never mixes progress text into JSON.
 The complete wire surface covered by this guide is: `hello`, `status`,
 `scanner.list`, `scanner.rescan`, `scanner.refresh`, `scanner.connect`,
 `scanner.disconnect`, `preview.acquire`, `frames.list`, `frames.select`,
-`frames.include`, `frames.exclude`, `review.approve`, `review.cancel`,
+`frames.place`, `frames.include`, `frames.exclude`, `review.approve`, `review.cancel`,
 `settings.get`, `settings.set`, `outputs.get`, `outputs.set`, `roll.save`,
 `roll.open`, `roll.list`, `scan.start`, `scan.stop`, `scan.resume`,
 `scanner.eject`, `diagnostics.export`, `events.subscribe`, and `job.get`.
@@ -127,6 +127,9 @@ frames list                                      → frames.list
 frames select RANGE|--all|--none                 → frames.select
 frames select --skip-blank [--blank-threshold 0..1]
                                                   → frames.list, frames.select
+frames place SLOT --row-offset ROWS               → frames.place
+frames place --from placement.json                → frames.place
+frames place --replay                             → frames.place
 frames include RANGE                             → frames.include
 frames exclude RANGE                             → frames.exclude
 ```
@@ -136,6 +139,27 @@ range, `--all`, `--none`, or `--skip-blank`; `--blank-threshold` only applies
 with `--skip-blank`. Include/exclude apply a range one index at a time and
 report partial application; a range that stops at a refusal exits 65. These
 commands have no motion flag. The normal exits are `0, 64, 65, 69, 70, 75`.
+
+`frames place` requires an open project. `ROWS` is an absolute offset in native
+preview rows: slot 1 accepts `0...144`; later slots accept `-144...144`.
+`placement.json` has this shape; either `rows` or `placements` may be omitted:
+
+```json
+{
+  "rows": [0, 100, 200],
+  "placements": [
+    {"slot": 2, "rowOffset": -4}
+  ]
+}
+```
+
+Boundary rows are nonnegative, unique, strictly increasing native preview-row
+positions. They are sent through `roll.manualFrames` before offsets are applied.
+Offsets then run sequentially in ascending slot order through
+`roll.setSpacingOffset` and `project.setFrameAlignment`. `--replay` reapplies the
+open project's saved nonzero offsets to the exact current completed preview; it
+refuses a stale or partial preview before making a spacing request. Placement
+stops on its first refusal and does not retry. It causes no scanner motion.
 
 ### `review`
 

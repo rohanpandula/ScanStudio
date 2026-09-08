@@ -149,6 +149,21 @@ struct ControlWireProtocolTests {
         #expect(try roundTrip(original) == original)
     }
 
+    @Test("ControlFramesPlaceParams round-trips and defaults replay closed")
+    func framesPlaceParamsRoundTrips() throws {
+        let original = ControlFramesPlaceParams(
+            rows: [0, 100, 200],
+            placements: [ControlFramePlacement(slot: 2, rowOffset: -4)]
+        )
+        #expect(try roundTrip(original) == original)
+
+        let legacyShape = try JSONDecoder().decode(
+            ControlFramesPlaceParams.self,
+            from: Data(#"{"placements":[{"slot":1,"rowOffset":4}]}"#.utf8)
+        )
+        #expect(legacyShape.replay == false)
+    }
+
     @Test("ControlScanStopParams round-trips")
     func scanStopParamsRoundTrips() throws {
         let original = ControlScanStopParams(mode: "immediate")

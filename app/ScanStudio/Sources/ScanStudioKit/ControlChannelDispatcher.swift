@@ -47,6 +47,7 @@ public enum ControlRequest: Sendable {
     case previewAcquire(id: UInt64, params: ControlPreviewAcquireParams)
     case framesList(id: UInt64)
     case framesSelect(id: UInt64, params: ControlFramesSelectParams)
+    case framesPlace(id: UInt64, params: ControlFramesPlaceParams)
     case framesInclude(id: UInt64, params: ControlFrameSelectionParams)
     case framesExclude(id: UInt64, params: ControlFrameSelectionParams)
     case reviewApprove(id: UInt64, params: ControlReviewApproveParams)
@@ -86,6 +87,7 @@ extension ControlRequest {
         case .previewAcquire(let id, _): id
         case .framesList(let id): id
         case .framesSelect(let id, _): id
+        case .framesPlace(let id, _): id
         case .framesInclude(let id, _): id
         case .framesExclude(let id, _): id
         case .reviewApprove(let id, _): id
@@ -121,6 +123,7 @@ extension ControlRequest {
         case .previewAcquire: "preview.acquire"
         case .framesList: "frames.list"
         case .framesSelect: "frames.select"
+        case .framesPlace: "frames.place"
         case .framesInclude: "frames.include"
         case .framesExclude: "frames.exclude"
         case .reviewApprove: "review.approve"
@@ -151,7 +154,7 @@ extension ControlRequest {
     public var isMutating: Bool {
         switch self {
         case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect, .simLoadMedia,
-             .previewAcquire, .framesSelect, .framesInclude, .framesExclude, .reviewApprove,
+             .previewAcquire, .framesSelect, .framesPlace, .framesInclude, .framesExclude, .reviewApprove,
              .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList,
              .scanStart, .scanStop, .scanResume, .scannerEject, .reviewCancel:
             true
@@ -173,6 +176,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case hello(ControlHelloResult)
     case status(ControlStatusResult)
     case framesList(ControlFramesListResult)
+    case framesPlace(ControlFramesPlaceResult)
     case job(ControlJobResult)
     case settings(ControlSettingsResult)
     case outputs(ControlOutputsResult)
@@ -193,6 +197,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .hello(let value): try container.encode(value)
         case .status(let value): try container.encode(value)
         case .framesList(let value): try container.encode(value)
+        case .framesPlace(let value): try container.encode(value)
         case .job(let value): try container.encode(value)
         case .settings(let value): try container.encode(value)
         case .outputs(let value): try container.encode(value)
@@ -320,6 +325,7 @@ public final class ControlChannelDispatcher {
         case "preview.acquire": return decoded(ControlPreviewAcquireParams.self) { .previewAcquire(id: $0, params: $1) }
         case "frames.list": return decoded(EmptyParams.self) { id, _ in .framesList(id: id) }
         case "frames.select": return decoded(ControlFramesSelectParams.self) { .framesSelect(id: $0, params: $1) }
+        case "frames.place": return decoded(ControlFramesPlaceParams.self) { .framesPlace(id: $0, params: $1) }
         case "frames.include": return decoded(ControlFrameSelectionParams.self) { .framesInclude(id: $0, params: $1) }
         case "frames.exclude": return decoded(ControlFrameSelectionParams.self) { .framesExclude(id: $0, params: $1) }
         case "review.approve": return decoded(ControlReviewApproveParams.self) { .reviewApprove(id: $0, params: $1) }
@@ -670,6 +676,98 @@ public final class ControlChannelDispatcher {
                 sessionModel.clearFrameSelection()
             }
             return .success(id: id, result: .empty(ControlEmptyResult()))
+        case .framesPlace(let id, let params):
+            let placements = params.placements ?? []
+            let hasPayload = params.rows != nil || !placements.isEmpty
+            guard params.replay != hasPayload else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "\"frames.place\" requires either replay: true or boundary rows/placements."
+                ))
+            }
+            if let rows = params.rows {
+                guard rows == ManualFramePlacementValidation.normalize(rows),
+                      rows.allSatisfy({ $0 >= 0 })
+                else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "Boundary rows must be nonnegative, unique, and strictly increasing."
+                    ))
+                }
+                if let reason = ManualFramePlacementValidation.blockingReason(for: rows) {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: reason
+                    ))
+                }
+            }
+            let slots = placements.map(\.slot)
+            guard Set(slots).count == slots.count,
+                  placements.allSatisfy({ placement in
+                      placement.slot > 0
+                          && (placement.slot == 1
+                              ? 0...144
+                              : -144...144).contains(placement.rowOffset)
+                  })
+            else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "Placements require unique positive slots; slot 1 accepts 0...144 rows and later slots accept -144...144 rows."
+                ))
+            }
+            if !params.replay {
+                guard let project = sessionModel.project else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .gateRefused,
+                        message: "Open a project before saving frame placement."
+                    ))
+                }
+                let projectSlots = Set(project.frames.map(\.index))
+                guard slots.allSatisfy(projectSlots.contains),
+                      params.rows.map({ rows in
+                          slots.allSatisfy { $0 < rows.count }
+                      }) ?? true
+                else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "Every placement slot must exist in both the open project and the submitted manual rows."
+                    ))
+                }
+            }
+
+            if params.replay {
+                guard let replayed = await sessionModel.replayPersistedFrameAlignments(),
+                      let operationId = sessionModel.latestCompletedPreviewOperationId
+                else {
+                    return outcome(id: id, errorMessageBefore: nil)
+                }
+                let applied = replayed.map {
+                    ControlFramePlacement(
+                        slot: $0,
+                        rowOffset: sessionModel.alignmentOffset(for: $0)
+                    )
+                }
+                return .success(id: id, result: .framesPlace(ControlFramesPlaceResult(
+                    operationId: operationId,
+                    placements: applied,
+                    replayed: true
+                )))
+            }
+
+            let offsets = Dictionary(
+                uniqueKeysWithValues: placements.map { ($0.slot, $0.rowOffset) }
+            )
+            guard await sessionModel.placeFrames(
+                rows: params.rows,
+                offsetsByFrameIndex: offsets
+            ), let operationId = sessionModel.latestCompletedPreviewOperationId else {
+                return outcome(id: id, errorMessageBefore: nil)
+            }
+            return .success(id: id, result: .framesPlace(ControlFramesPlaceResult(
+                operationId: operationId,
+                placements: placements.sorted { $0.slot < $1.slot },
+                replayed: false
+            )))
         case .framesInclude(let id, let params):
             if let error = validatedFrameIndex(params.frameIndex, method: request.methodName) {
                 return .failure(id: id, error: error)

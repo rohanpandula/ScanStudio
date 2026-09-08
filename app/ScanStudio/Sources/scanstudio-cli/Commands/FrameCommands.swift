@@ -1,4 +1,4 @@
-// `frames list|include|exclude` (D-08). `List` is one read-only request;
+// `frames list|select|place|include|exclude`. `List` is one read-only request;
 // `Include`/`Exclude` validate the CUPS range client-side in `validate()`
 // -- before any socket is opened (D-12) -- then send one
 // frames.include/frames.exclude per index in ascending order over a
@@ -12,8 +12,8 @@ import ScanStudioKit
 struct Frames: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "frames",
-        abstract: "List, select, include, or exclude project frames.",
-        subcommands: [List.self, Select.self, Include.self, Exclude.self]
+        abstract: "List, select, place, include, or exclude project frames.",
+        subcommands: [List.self, Select.self, Place.self, Include.self, Exclude.self]
     )
 
     /// `frames list` -> `frames.list`: one request, no state change.
@@ -123,6 +123,141 @@ struct Frames: AsyncParsableCommand {
         }
     }
 
+    struct Place: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "place",
+            abstract: "Place one frame by native preview rows, import a placement file, or replay the open project's saved placement."
+        )
+
+        @OptionGroup var options: GlobalOptions
+
+        @Argument(help: "One-based project frame slot. Requires --row-offset.")
+        var slot: Int?
+
+        @Option(
+            name: .customLong("row-offset"),
+            parsing: .unconditional,
+            help: "Absolute native preview-row offset for SLOT."
+        )
+        var rowOffset: Int?
+
+        @Option(name: .customLong("from"), help: "JSON file containing optional boundary rows and placements.")
+        var fromPath: String?
+
+        @Flag(help: "Replay the open project's saved offsets against the exact current completed preview.")
+        var replay = false
+
+        private var params = ControlFramesPlaceParams()
+
+        mutating func validate() throws {
+            do {
+                params = try resolvedParams()
+            } catch let error as FramePlacementArgumentError {
+                let payload = ControlErrorPayload(
+                    code: ControlCLIErrorCode.invalidRange.rawValue,
+                    message: error.message,
+                    recoverable: false
+                )
+                let text = try ControlCLIOutput.renderError(
+                    command: "frames.place",
+                    payload: payload,
+                    human: options.human
+                )
+                print(text, terminator: "")
+                throw ExitCode(64)
+            }
+        }
+
+        func run() async throws {
+            try await CommandRunner.run(
+                command: "frames.place",
+                method: "frames.place",
+                params: params,
+                options: options
+            )
+        }
+
+        private func resolvedParams() throws -> ControlFramesPlaceParams {
+            let directWasMentioned = slot != nil || rowOffset != nil
+            guard [directWasMentioned, fromPath != nil, replay].filter({ $0 }).count == 1 else {
+                throw FramePlacementArgumentError(
+                    "\"frames place\" requires exactly one of SLOT with --row-offset, --from, or --replay."
+                )
+            }
+            if replay {
+                return ControlFramesPlaceParams(replay: true)
+            }
+            if directWasMentioned {
+                guard let slot, let rowOffset else {
+                    throw FramePlacementArgumentError(
+                        "SLOT and --row-offset must be supplied together."
+                    )
+                }
+                let placement = ControlFramePlacement(slot: slot, rowOffset: rowOffset)
+                try validatePlacements([placement], rowCount: nil)
+                return ControlFramesPlaceParams(placements: [placement])
+            }
+
+            guard let fromPath else {
+                throw FramePlacementArgumentError("A placement source is required.")
+            }
+            let document: FramePlacementDocument
+            do {
+                document = try JSONDecoder().decode(
+                    FramePlacementDocument.self,
+                    from: Data(contentsOf: URL(fileURLWithPath: fromPath))
+                )
+            } catch {
+                throw FramePlacementArgumentError(
+                    "Could not read placement JSON at \"\(fromPath)\": \(error.localizedDescription)"
+                )
+            }
+            let placements = document.placements ?? []
+            guard document.rows != nil || !placements.isEmpty else {
+                throw FramePlacementArgumentError(
+                    "Placement JSON requires boundary rows or at least one placement."
+                )
+            }
+            if let rows = document.rows {
+                guard rows == ManualFramePlacementValidation.normalize(rows),
+                      rows.allSatisfy({ $0 >= 0 })
+                else {
+                    throw FramePlacementArgumentError(
+                        "Boundary rows must be nonnegative, unique, and strictly increasing."
+                    )
+                }
+                if let reason = ManualFramePlacementValidation.blockingReason(for: rows) {
+                    throw FramePlacementArgumentError(reason)
+                }
+            }
+            try validatePlacements(placements, rowCount: document.rows?.count)
+            return ControlFramesPlaceParams(
+                rows: document.rows,
+                placements: placements.sorted { $0.slot < $1.slot }
+            )
+        }
+
+        private func validatePlacements(
+            _ placements: [ControlFramePlacement],
+            rowCount: Int?
+        ) throws {
+            let slots = placements.map(\.slot)
+            guard Set(slots).count == slots.count,
+                  placements.allSatisfy({ placement in
+                      placement.slot > 0
+                          && (placement.slot == 1
+                              ? 0...144
+                              : -144...144).contains(placement.rowOffset)
+                  }),
+                  rowCount.map({ count in slots.allSatisfy { $0 < count } }) ?? true
+            else {
+                throw FramePlacementArgumentError(
+                    "Placements require unique positive slots; slot 1 accepts 0...144 rows, later slots accept -144...144 rows, and imported slots must exist in the submitted boundaries."
+                )
+            }
+        }
+    }
+
     struct Include: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "include", abstract: "Include frames by a CUPS-syntax range, e.g. 1-36,38.")
 
@@ -200,6 +335,19 @@ struct Frames: AsyncParsableCommand {
                 options: options
             )
         }
+    }
+}
+
+private struct FramePlacementDocument: Decodable {
+    let rows: [Int]?
+    let placements: [ControlFramePlacement]?
+}
+
+private struct FramePlacementArgumentError: Error {
+    let message: String
+
+    init(_ message: String) {
+        self.message = message
     }
 }
 

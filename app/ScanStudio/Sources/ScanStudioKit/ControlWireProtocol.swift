@@ -350,6 +350,51 @@ public struct ControlFramesSelectParams: Codable, Equatable, Sendable {
     }
 }
 
+/// One project frame's absolute placement in native preview rows. Slot 1
+/// cannot move above the first preview row, so its accepted range is
+/// `0...144`; later slots accept `-144...144`.
+public struct ControlFramePlacement: Codable, Equatable, Sendable {
+    public let slot: Int
+    public let rowOffset: Int
+
+    public init(slot: Int, rowOffset: Int) {
+        self.slot = slot
+        self.rowOffset = rowOffset
+    }
+}
+
+/// `frames.place`: exactly one of `replay == true` or a placement payload
+/// is accepted. `rows` are manual boundary rows for `roll.manualFrames`;
+/// `placements` are then applied in ascending slot order through the
+/// preview-bound spacing-offset and project-alignment paths.
+public struct ControlFramesPlaceParams: Codable, Equatable, Sendable {
+    public let rows: [Int]?
+    public let placements: [ControlFramePlacement]?
+    public let replay: Bool
+
+    public init(
+        rows: [Int]? = nil,
+        placements: [ControlFramePlacement]? = nil,
+        replay: Bool = false
+    ) {
+        self.rows = rows
+        self.placements = placements
+        self.replay = replay
+    }
+
+    private enum CodingKeys: String, CodingKey { case rows, placements, replay }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        rows = try container.decodeIfPresent([Int].self, forKey: .rows)
+        placements = try container.decodeIfPresent(
+            [ControlFramePlacement].self,
+            forKey: .placements
+        )
+        replay = try container.decodeIfPresent(Bool.self, forKey: .replay) ?? false
+    }
+}
+
 /// `mode` is `"afterCurrentFrame"` (the absent-key default) or
 /// `"immediate"` — no other value is accepted.
 public struct ControlScanStopParams: Codable, Equatable, Sendable {
@@ -733,6 +778,22 @@ public struct ControlFramesListResult: Codable, Equatable, Sendable {
     public init(frames: [ControlFrameSummary], selectedFrames: [Int]) {
         self.frames = frames
         self.selectedFrames = selectedFrames
+    }
+}
+
+public struct ControlFramesPlaceResult: Codable, Equatable, Sendable {
+    public let operationId: String
+    public let placements: [ControlFramePlacement]
+    public let replayed: Bool
+
+    public init(
+        operationId: String,
+        placements: [ControlFramePlacement],
+        replayed: Bool
+    ) {
+        self.operationId = operationId
+        self.placements = placements
+        self.replayed = replayed
     }
 }
 

@@ -34,7 +34,10 @@ private let cliProcessDevice = DeviceInfo(
 
 /// A minimal one-frame project fixture, modelled on
 /// `ControlChannelProjectRoutingTests.swift`'s `projectRoutingProject(...)`.
-private func cliProcessProject(frameIndex: Int = 1) -> ScanProject {
+private func cliProcessProject(
+    frameIndex: Int = 1,
+    alignment: FrameAlignment? = nil
+) -> ScanProject {
     ScanProject(
         schemaVersion: 1,
         id: "cli-process-project",
@@ -64,7 +67,12 @@ private func cliProcessProject(frameIndex: Int = 1) -> ScanProject {
         ),
         rollMetadata: MetadataSet(),
         createdAt: "2026-09-07T00:00:00Z",
-        frames: [ProjectFrame(index: frameIndex, excluded: false, receipts: [])]
+        frames: [ProjectFrame(
+            index: frameIndex,
+            excluded: false,
+            alignment: alignment,
+            receipts: []
+        )]
     )
 }
 
@@ -123,6 +131,52 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
                 recordedFrameExclusionFlags.append(excludedParams.excluded)
             }
             return try cast(SetFrameResult(project: cliProcessProject()), as: Result.self)
+        case "roll.manualFrames":
+            return try cast(
+                RollManualFramesResult(
+                    count: 1,
+                    fingerprint: "cli-placement",
+                    operationId: "cli-placement-operation",
+                    thumbnails: [ManualFrameThumbnail(
+                        frameIndex: 1,
+                        thumbnail: Thumbnail(
+                            brightness: nil,
+                            tint: nil,
+                            imagePath: "/tmp/cli-placement-frame-1.tif",
+                            boundaryRows: [0, 100],
+                            spacingOffset: 0,
+                            needsApproval: true,
+                            warnings: ["user-picked"]
+                        )
+                    )],
+                    snaps: []
+                ),
+                as: Result.self
+            )
+        case "roll.setSpacingOffset":
+            guard let placement = params as? RollSetSpacingOffsetParams else {
+                throw CLIProcessStubError.unexpectedMethod(method)
+            }
+            return try cast(
+                RollSetSpacingOffsetResult(thumbnail: Thumbnail(
+                    brightness: nil,
+                    tint: nil,
+                    imagePath: "/tmp/cli-placement-frame-1-offset.tif",
+                    boundaryRows: [0, 100],
+                    spacingOffset: placement.offsetRows,
+                    needsApproval: true,
+                    warnings: ["user-picked"]
+                )),
+                as: Result.self
+            )
+        case "project.setFrameAlignment":
+            guard let placement = params as? SetFrameAlignmentParams else {
+                throw CLIProcessStubError.unexpectedMethod(method)
+            }
+            return try cast(
+                SetFrameResult(project: cliProcessProject(alignment: placement.alignment)),
+                as: Result.self
+            )
         case "project.pendingFrames":
             // D-22/HEAD-12: setFrameExcluded now refreshes pendingFrames
             // before returning -- this fixture's single-frame project has
@@ -245,7 +299,11 @@ private struct CLIProcessResult {
 /// connection -- including the one this very call is waiting on -- stops
 /// making progress until the blocked call gives up. A hang reproduced
 /// directly during this suite's own development confirmed it.
-private func runCLI(_ arguments: [String], socketPath: String?) async throws -> CLIProcessResult {
+private func runCLI(
+    _ arguments: [String],
+    socketPath: String?,
+    homeDirectory: String? = nil
+) async throws -> CLIProcessResult {
     let binary = try CLIProcessLocator.resolve()
     let allArguments: [String] = if let socketPath {
         arguments + ["--socket", socketPath]
@@ -258,6 +316,12 @@ private func runCLI(_ arguments: [String], socketPath: String?) async throws -> 
                 let process = Process()
                 process.executableURL = binary
                 process.arguments = allArguments
+                if let homeDirectory {
+                    var environment = ProcessInfo.processInfo.environment
+                    environment["HOME"] = homeDirectory
+                    environment["CFFIXED_USER_HOME"] = homeDirectory
+                    process.environment = environment
+                }
 
                 let stdoutPipe = Pipe()
                 let stderrPipe = Pipe()
@@ -541,6 +605,83 @@ struct ScanstudioCLIProcessTests {
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         #expect(object["result"] != nil)
         #expect(await host.model.selectedFrames == [1])
+
+        await host.server.stop()
+    }
+
+    @Test("frames place --from applies manual rows and an absolute offset through the real CLI socket")
+    func framesPlaceFromFileAppliesRowsAndOffset() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-place-file")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.model.openProject(directory: cliProcessProjectDirectory)
+        await host.model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}"#.utf8
+            )
+        ))
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ss-cli-placement-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let placement = directory.appendingPathComponent("placement.json")
+        try Data(
+            #"{"rows":[0,100],"placements":[{"slot":1,"rowOffset":4}]}"#.utf8
+        ).write(to: placement)
+
+        let result = try await runCLI(
+            ["frames", "place", "--from", placement.path],
+            socketPath: host.socketPath,
+            homeDirectory: directory.path
+        )
+        #expect(result.exitCode == 0)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(result.stdout.utf8))
+                as? [String: Any]
+        )
+        let resultObject = try #require(object["result"] as? [String: Any])
+        #expect(resultObject["operationId"] as? String == "cli-placement-operation")
+        #expect(resultObject["replayed"] as? Bool == false)
+        #expect(await host.stub.requestCounts["roll.manualFrames"] == 1)
+        #expect(await host.stub.requestCounts["roll.setSpacingOffset"] == 1)
+        #expect(await host.stub.requestCounts["project.setFrameAlignment"] == 1)
+
+        await host.server.stop()
+    }
+
+    @Test("frames place rejects conflicting modes, invalid offsets, and malformed placement rows before opening the socket")
+    func framesPlaceValidationIsClientSide() async throws {
+        let host = try await CLIProcessHost.start(label: "frames-place-invalid")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ss-cli-placement-invalid-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let placement = directory.appendingPathComponent("placement.json")
+        try Data(#"{"rows":[0,100,90]}"#.utf8).write(to: placement)
+        let before = await host.stub.requestCounts
+
+        let cases = [
+            ["frames", "place", "1", "--row-offset", "-1"],
+            ["frames", "place", "1", "--row-offset", "4", "--replay"],
+            ["frames", "place", "--from", placement.path],
+        ]
+        for arguments in cases {
+            let result = try await runCLI(
+                arguments,
+                socketPath: host.socketPath,
+                homeDirectory: directory.path
+            )
+            #expect(result.exitCode == 64)
+            let object = try #require(
+                JSONSerialization.jsonObject(with: Data(result.stdout.utf8))
+                    as? [String: Any]
+            )
+            let error = try #require(object["error"] as? [String: Any])
+            #expect(error["code"] as? String == "INVALID_RANGE")
+        }
+        #expect(await host.stub.requestCounts == before)
 
         await host.server.stop()
     }

@@ -1773,7 +1773,11 @@ public final class SessionModel {
             return .rejected
         }
         let previous = beginMutatingOperation("preview.acquire")
-        defer { mutatingOperationInFlight = previous }
+        defer {
+            mutatingOperationInFlight = isRestoringFrameAlignments
+                ? "frame.alignment.restore"
+                : previous
+        }
         // Only an admitted traversal that passed its synchronous movement
         // preflight replaces the current preview evidence. A rejected
         // "Preview Again" must leave its still-visible Review buttons and
@@ -3580,7 +3584,30 @@ public final class SessionModel {
             finishCompletedPreview(frameCount: previewFrameCount)
             return
         }
-        let targets = project.frames.compactMap { frame -> PersistedFrameAlignmentTarget? in
+        let targets = persistedFrameAlignmentTargets(in: project)
+        guard !targets.isEmpty else {
+            finishCompletedPreview(frameCount: previewFrameCount)
+            return
+        }
+
+        let marker = startFrameAlignmentRestore(
+            previewOperationId: previewOperationId,
+            projectId: project.id
+        )
+
+        Task { [weak self] in
+            _ = await self?.restorePersistedFrameAlignments(
+                targets,
+                marker: marker,
+                previewFrameCount: previewFrameCount
+            )
+        }
+    }
+
+    private func persistedFrameAlignmentTargets(
+        in project: ScanProject
+    ) -> [PersistedFrameAlignmentTarget] {
+        project.frames.compactMap { frame -> PersistedFrameAlignmentTarget? in
             guard let alignment = frame.alignment,
                   alignment.offsetRows != 0
             else {
@@ -3591,15 +3618,17 @@ public final class SessionModel {
                 offsetRows: alignment.offsetRows
             )
         }.sorted { $0.frameIndex < $1.frameIndex }
-        guard !targets.isEmpty else {
-            finishCompletedPreview(frameCount: previewFrameCount)
-            return
-        }
+    }
 
+    private func startFrameAlignmentRestore(
+        previewOperationId: String,
+        projectId: String
+    ) -> PendingFrameAlignmentRestore {
+        _ = beginMutatingOperation("frame.alignment.restore")
         let marker = PendingFrameAlignmentRestore(
             id: UUID(),
             previewOperationId: previewOperationId,
-            projectId: project.id,
+            projectId: projectId,
             connectionEpoch: connectionEpoch
         )
         pendingFrameAlignmentRestore = marker
@@ -3608,25 +3637,18 @@ public final class SessionModel {
         // has a bridge-confirmed replacement tile. Scan readiness and another
         // preview request therefore remain closed during the restore.
         isAcquiringThumbnails = true
-
-        Task { [weak self] in
-            await self?.restorePersistedFrameAlignments(
-                targets,
-                marker: marker,
-                previewFrameCount: previewFrameCount
-            )
-        }
+        return marker
     }
 
     private func restorePersistedFrameAlignments(
         _ targets: [PersistedFrameAlignmentTarget],
         marker: PendingFrameAlignmentRestore,
         previewFrameCount: Int
-    ) async {
+    ) async -> Bool {
         for (position, target) in targets.enumerated() {
             guard frameAlignmentRestoreIsCurrent(marker) else {
                 abandonFrameAlignmentRestoreIfOwned(marker)
-                return
+                return false
             }
             let unresolvedFrameIndices = Set(
                 targets[position...].map(\.frameIndex)
@@ -3641,7 +3663,7 @@ public final class SessionModel {
                         "The saved alignment for frame \(target.frameIndex) "
                         + "is outside this scanner's supported range."
                 )
-                return
+                return false
             }
             do {
                 let params = RollSetSpacingOffsetParams(
@@ -3655,7 +3677,7 @@ public final class SessionModel {
                 )
                 guard frameAlignmentRestoreIsCurrent(marker) else {
                     abandonFrameAlignmentRestoreIfOwned(marker)
-                    return
+                    return false
                 }
                 guard result.thumbnail.spacingOffset == target.offsetRows else {
                     failFrameAlignmentRestore(
@@ -3665,7 +3687,7 @@ public final class SessionModel {
                             "The saved alignment for frame \(target.frameIndex) "
                             + "was not confirmed by the current preview. Preview the film again."
                     )
-                    return
+                    return false
                 }
                 thumbnails[target.frameIndex] = result.thumbnail
                 frameAlignmentDrafts[target.frameIndex] = FrameAlignment(
@@ -3680,7 +3702,7 @@ public final class SessionModel {
             } catch {
                 guard frameAlignmentRestoreIsCurrent(marker) else {
                     abandonFrameAlignmentRestoreIfOwned(marker)
-                    return
+                    return false
                 }
                 recordOperationFailure(error, operation: "frame.alignment.restore")
                 failFrameAlignmentRestore(
@@ -3690,17 +3712,19 @@ public final class SessionModel {
                         "Could not restore the saved alignment for frame "
                         + "\(target.frameIndex): \(Self.describe(error))"
                 )
-                return
+                return false
             }
         }
 
         guard frameAlignmentRestoreIsCurrent(marker) else {
             abandonFrameAlignmentRestoreIfOwned(marker)
-            return
+            return false
         }
         pendingFrameAlignmentRestore = nil
         isRestoringFrameAlignments = false
+        releaseFrameAlignmentRestoreMutation()
         finishCompletedPreview(frameCount: previewFrameCount)
+        return true
     }
 
     private func frameAlignmentRestoreIsCurrent(
@@ -3722,6 +3746,7 @@ public final class SessionModel {
         guard pendingFrameAlignmentRestore?.id == marker.id else { return }
         pendingFrameAlignmentRestore = nil
         isRestoringFrameAlignments = false
+        releaseFrameAlignmentRestoreMutation()
         isAcquiringThumbnails = false
         activeOperationStartedAt = nil
     }
@@ -3737,6 +3762,7 @@ public final class SessionModel {
         }
         pendingFrameAlignmentRestore = nil
         isRestoringFrameAlignments = false
+        releaseFrameAlignmentRestoreMutation()
         isAcquiringThumbnails = false
         activeOperationStartedAt = nil
         failedFrameAlignmentRestoreIndices.formUnion(unresolvedFrameIndices)
@@ -3761,6 +3787,13 @@ public final class SessionModel {
         )
     }
 
+    private func releaseFrameAlignmentRestoreMutation() {
+        guard mutatingOperationInFlight == "frame.alignment.restore" else {
+            return
+        }
+        mutatingOperationInFlight = nil
+    }
+
     /// Current native-row offset for the contact-sheet control. Only evidence
     /// applied to this live preview session is authoritative: a persisted
     /// project value must never masquerade as active before the bridge returns
@@ -3773,6 +3806,117 @@ public final class SessionModel {
 
     public func isAdjustingFrameAlignment(_ frameIndex: Int) -> Bool {
         adjustingFrameAlignmentIndices.contains(frameIndex)
+    }
+
+    /// Applies one CLI placement document as a single controller operation.
+    /// Manual rows establish a fresh registration first; absolute offsets are
+    /// then applied and persisted one slot at a time in ascending order.
+    @discardableResult
+    public func placeFrames(
+        rows: [Int]?,
+        offsetsByFrameIndex: [Int: Int]
+    ) async -> Bool {
+        lastErrorMessage = nil
+        guard rows != nil || !offsetsByFrameIndex.isEmpty else {
+            lastErrorMessage = "Frame placement requires boundary rows or at least one slot offset."
+            return false
+        }
+        guard project != nil else {
+            lastErrorMessage = "Open a project before saving frame placement."
+            return false
+        }
+        if let reason = projectChangeDisabledReason {
+            lastErrorMessage = reason
+            return false
+        }
+        let previous = beginMutatingOperation("frames.place")
+        defer { mutatingOperationInFlight = previous }
+
+        if let rows {
+            let submitted = await submitManualFrames(rows: rows)
+            guard submitted else {
+                lastErrorMessage = manualPlacementSubmitError
+                    ?? "The manual frame boundaries were refused."
+                return false
+            }
+        }
+        for frameIndex in offsetsByFrameIndex.keys.sorted() {
+            guard let offsetRows = offsetsByFrameIndex[frameIndex] else {
+                return false
+            }
+            let placed = await setFrameAlignmentOffset(
+                frameIndex: frameIndex,
+                offsetRows: offsetRows
+            )
+            guard placed else {
+                if lastErrorMessage == nil {
+                    lastErrorMessage =
+                        "The preview changed while frame \(frameIndex) placement was being applied."
+                }
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Rebinds project-persisted offsets to the exact current completed
+    /// preview. A missing or partial preview is refused before any bridge
+    /// call; restore remains sequential and leaves scan readiness blocked on
+    /// its first failed target.
+    public func replayPersistedFrameAlignments() async -> [Int]? {
+        lastErrorMessage = nil
+        guard let project else {
+            lastErrorMessage = "Open a project before replaying saved frame placement."
+            return nil
+        }
+        if let reason = projectChangeDisabledReason {
+            lastErrorMessage = reason
+            return nil
+        }
+        guard !projectMediaMismatch else {
+            lastErrorMessage =
+                "This saved project does not match the previewed holder or frame count. Create or open a matching project."
+            return nil
+        }
+        guard let previewOperationId = latestCompletedPreviewOperationId,
+              let previewFrameCount = status?.frameCount,
+              PreviewRegistrationPolicy.isComplete(
+                  mediaLoaded: status?.mediaLoaded == true,
+                  previewFrameIndices: thumbnails.keys,
+                  statusFrameCount: previewFrameCount,
+                  committedFilmProcess: previewFilmProcess
+              )
+        else {
+            lastErrorMessage =
+                "Acquire a fresh, completed preview before replaying saved frame placement."
+            return nil
+        }
+
+        let targets = persistedFrameAlignmentTargets(in: project)
+        guard !targets.isEmpty else { return [] }
+        let unresolvedTargets = targets.filter { target in
+            failedFrameAlignmentRestoreIndices.contains(target.frameIndex)
+                || thumbnails[target.frameIndex]?.spacingOffset
+                    != target.offsetRows
+        }
+        guard !unresolvedTargets.isEmpty else {
+            return targets.map(\.frameIndex)
+        }
+        let previous = beginMutatingOperation("frames.place")
+        defer { mutatingOperationInFlight = previous }
+        let marker = startFrameAlignmentRestore(
+            previewOperationId: previewOperationId,
+            projectId: project.id
+        )
+        let succeeded = await restorePersistedFrameAlignments(
+            unresolvedTargets,
+            marker: marker,
+            previewFrameCount: previewFrameCount
+        )
+        if !succeeded, lastErrorMessage == nil {
+            lastErrorMessage = "The preview changed while saved frame placement was being replayed."
+        }
+        return succeeded ? targets.map(\.frameIndex) : nil
     }
 
     /// Positive deltas are native +rows (the preview image moves left);
@@ -3805,12 +3949,63 @@ public final class SessionModel {
     /// Requests and installs one bridge-regenerated adjusted tile. The
     /// operator's old Review decision is invalid once the boundary changes.
     public func nudgeFrameAlignment(frameIndex: Int, by delta: Int) async {
-        guard canNudgeFrameAlignment(frameIndex, by: delta),
-              let previewOperationId = latestCompletedPreviewOperationId
-        else {
+        guard canNudgeFrameAlignment(frameIndex, by: delta) else {
             return
         }
         let targetOffset = alignmentOffset(for: frameIndex) + delta
+        _ = await applyFrameAlignmentOffset(
+            frameIndex: frameIndex,
+            targetOffset: targetOffset
+        )
+    }
+
+    private func setFrameAlignmentOffset(
+        frameIndex: Int,
+        offsetRows: Int
+    ) async -> Bool {
+        guard project != nil else {
+            lastErrorMessage = "Open a project before saving frame placement."
+            return false
+        }
+        guard !projectMediaMismatch else {
+            lastErrorMessage =
+                "This saved project does not match the previewed holder or frame count. Create or open a matching project."
+            return false
+        }
+        guard !isChangingProject,
+              !isRestoringFrameAlignments,
+              pendingScanStart == nil,
+              !isJobActive,
+              pendingFrameAlignmentAdjustment == nil,
+              latestCompletedPreviewOperationId != nil,
+              thumbnails[frameIndex] != nil,
+              validFrameIndices.contains(frameIndex)
+        else {
+            lastErrorMessage =
+                "Frame \(frameIndex) requires a fresh, completed preview before its placement can be saved."
+            return false
+        }
+        guard frameAlignmentOffsetBounds(for: frameIndex).contains(offsetRows) else {
+            lastErrorMessage =
+                "Frame \(frameIndex) row offset \(offsetRows) is outside the supported range "
+                + "\(frameAlignmentOffsetBounds(for: frameIndex))."
+            return false
+        }
+        return await applyFrameAlignmentOffset(
+            frameIndex: frameIndex,
+            targetOffset: offsetRows,
+            requireExactConfirmation: true
+        )
+    }
+
+    private func applyFrameAlignmentOffset(
+        frameIndex: Int,
+        targetOffset: Int,
+        requireExactConfirmation: Bool = false
+    ) async -> Bool {
+        guard let previewOperationId = latestCompletedPreviewOperationId else {
+            return false
+        }
         let marker = PendingFrameAlignmentAdjustment(
             id: UUID(),
             frameIndex: frameIndex,
@@ -3839,8 +4034,17 @@ public final class SessionModel {
                 "roll.setSpacingOffset",
                 params: params
             )
-            guard frameAlignmentAdjustmentIsCurrent(marker) else { return }
+            guard frameAlignmentAdjustmentIsCurrent(marker) else { return false }
 
+            if requireExactConfirmation,
+               result.thumbnail.spacingOffset != targetOffset
+            {
+                throw EngineRequestError(
+                    code: "ALIGNMENT_NOT_CONFIRMED",
+                    message: "the adjusted tile did not confirm row offset \(targetOffset)",
+                    recoverable: true
+                )
+            }
             thumbnails[frameIndex] = result.thumbnail
             let appliedOffset = result.thumbnail.spacingOffset ?? targetOffset
             frameAlignmentDrafts[frameIndex] = FrameAlignment(
@@ -3866,7 +4070,7 @@ public final class SessionModel {
                     "project.setFrameAlignment",
                     params: persistenceParams
                 )
-                guard frameAlignmentAdjustmentIsCurrent(marker) else { return }
+                guard frameAlignmentAdjustmentIsCurrent(marker) else { return false }
                 guard persistenceResult.project.id == marker.projectId else {
                     throw EngineRequestError(
                         code: "ALIGNMENT_PROJECT_CHANGED",
@@ -3881,8 +4085,9 @@ public final class SessionModel {
             if !failedFrameAlignmentRestoreIndices.isEmpty {
                 lastErrorMessage = frameAlignmentRestoreRecoveryGuidance()
             }
+            return true
         } catch {
-            guard frameAlignmentAdjustmentIsCurrent(marker) else { return }
+            guard frameAlignmentAdjustmentIsCurrent(marker) else { return false }
             recordOperationFailure(error, operation: "frame.alignment")
             if installedLiveAlignment, marker.projectId != nil {
                 failedFrameAlignmentRestoreIndices.insert(frameIndex)
@@ -3893,6 +4098,7 @@ public final class SessionModel {
             } else {
                 lastErrorMessage = Self.describe(error)
             }
+            return false
         }
     }
 
@@ -4021,6 +4227,7 @@ public final class SessionModel {
     }
 
     private func clearFrameAlignmentSessionState() {
+        let restore = pendingFrameAlignmentRestore
         let wasRestoring =
             pendingFrameAlignmentRestore != nil || isRestoringFrameAlignments
         pendingFrameAlignmentAdjustment = nil
@@ -4029,6 +4236,9 @@ public final class SessionModel {
         adjustingFrameAlignmentIndices.removeAll()
         isRestoringFrameAlignments = false
         failedFrameAlignmentRestoreIndices.removeAll()
+        if restore != nil {
+            releaseFrameAlignmentRestoreMutation()
+        }
         if wasRestoring {
             isAcquiringThumbnails = false
             activeOperationStartedAt = nil
