@@ -365,11 +365,11 @@ private final class E2EEventsFollower: @unchecked Sendable {
     private let process: Process
     private let buffer = E2ELineBuffer()
 
-    init(socketPath: String) throws {
+    init(socketPath: String, commandArguments: [String] = ["events", "--follow"]) throws {
         let binary = try EndToEndCLILocator.resolve()
         let process = Process()
         process.executableURL = binary
-        process.arguments = ["events", "--follow", "--socket", socketPath]
+        process.arguments = commandArguments + ["--socket", socketPath]
         let stdoutPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = Pipe()
@@ -403,14 +403,51 @@ private final class E2EEventsFollower: @unchecked Sendable {
     /// its whole budget without ever giving that thread a scheduling slice.
     @MainActor
     func waitForFirstLine() async -> [String: Any]? {
+        await waitForLine { _ in true }
+    }
+
+    /// Bounded matching-line wait for commands whose first event is only a
+    /// baseline. The same reader and timeout as `waitForFirstLine` keep the
+    /// process test deterministic without adding another harness.
+    @MainActor
+    func waitForLine(where predicate: ([String: Any]) -> Bool) async -> [String: Any]? {
         for _ in 0..<2_000 {
-            if let first = buffer.snapshot().first,
-               let object = try? JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any] {
-                return object
+            for line in buffer.snapshot() {
+                if let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                   predicate(object) {
+                    return object
+                }
             }
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
         return nil
+    }
+
+    /// Waits for the watcher process itself to observe the host-exit event
+    /// and terminate with its distinct OPS exit code. A separate background
+    /// waiter keeps the Swift cooperative pool free while `waitUntilExit()`
+    /// reaps the real subprocess.
+    func waitForExit(timeoutSeconds: Double = 15) async -> Int32? {
+        if !process.isRunning { return process.terminationStatus }
+        let process = self.process
+        return await withCheckedContinuation { continuation in
+            let guardBox = SingleResumeGuard()
+            DispatchQueue.global(qos: .userInitiated).async {
+                process.waitUntilExit()
+                guard guardBox.tryClaim() else { return }
+                continuation.resume(returning: process.terminationStatus)
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds) {
+                guard guardBox.tryClaim() else { return }
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+
+    func parsedLines() -> [[String: Any]] {
+        buffer.snapshot().compactMap { line in
+            try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        }
     }
 
     /// Bounded wait then give up, mirroring `AppDelegate
@@ -425,6 +462,7 @@ private final class E2EEventsFollower: @unchecked Sendable {
     /// subprocess to exit; this bound only prevents that from becoming an
     /// unbounded hang for the suite itself.
     func terminate() {
+        guard process.isRunning else { return }
         process.terminate()
         let finished = DispatchSemaphore(value: 0)
         let process = self.process
@@ -782,6 +820,65 @@ struct ControlSocketEndToEndTests {
             throw error
         }
 
+        await host.stop()
+    }
+
+    @Test("CLI creates a calibration roll without a scanner connection or motion confirmation")
+    func calibrationBootstrapWithoutScan() async throws {
+        let host = try await EndToEndHost.start()
+        let watcher = try E2EEventsFollower(
+            socketPath: host.socketPath,
+            commandArguments: ["status", "--watch", "--attach"]
+        )
+        do {
+            let baseline = await watcher.waitForFirstLine()
+            let baselineObject = try #require(baseline, "status --watch produced no baseline within the bound")
+            #expect(baselineObject["command"] as? String == "status")
+            let baselineEvent = try #require(baselineObject["event"] as? [String: Any])
+            #expect(baselineEvent["event"] as? String == "control.snapshot")
+
+            let saved = try await runE2ECLI([
+                "roll", "save", "--name", "calibration-bootstrap", "--carrier", "strip6",
+                "--frame-count", "6", "--film-process", "c41ColorNegative", "--no-scan"
+            ], socketPath: host.socketPath)
+            #expect(saved.exitCode == 0, Comment(rawValue: saved.context))
+            let body = try #require(JSONSerialization.jsonObject(with: Data(saved.stdout.utf8)) as? [String: Any])
+            let result = try #require(body["result"] as? [String: Any])
+            #expect(result["outcome"] as? String == "saved")
+            #expect(result["saved"] as? Bool == true)
+            let directory = try #require(result["projectDirectory"] as? String)
+            #expect(FileManager.default.fileExists(atPath: directory))
+            let changed = await watcher.waitForLine { object in
+                guard let event = object["event"] as? [String: Any],
+                      event["event"] as? String == "control.changed",
+                      let payload = event["payload"] as? [String: Any]
+                else { return false }
+                return payload["projectDirectory"] as? String == directory
+            }
+            #expect(changed != nil, "status --watch did not report the saved project identity")
+
+            let status = try await runE2ECLI(["status"], socketPath: host.socketPath)
+            #expect(status.exitCode == 0, Comment(rawValue: status.context))
+            let statusBody = try #require(JSONSerialization.jsonObject(with: Data(status.stdout.utf8)) as? [String: Any])
+            let state = try #require(statusBody["result"] as? [String: Any])
+            #expect(state["jobId"] == nil || state["jobId"] is NSNull)
+            #expect(state["device"] == nil || state["device"] is NSNull)
+            #expect(state["previewComplete"] as? Bool == false)
+
+            await host.stop()
+            let watcherExit = await watcher.waitForExit()
+            #expect(watcherExit == 76, "status --watch exited (String(describing: watcherExit)), expected host-exit 76")
+            let hostExitEvents = watcher.parsedLines().filter { object in
+                guard let event = object["event"] as? [String: Any] else { return false }
+                return event["event"] as? String == "control.hostExited"
+            }
+            #expect(hostExitEvents.count == 1, "expected exactly one control.hostExited event")
+        } catch {
+            watcher.terminate()
+            await host.stop()
+            throw error
+        }
+        watcher.terminate()
         await host.stop()
     }
 

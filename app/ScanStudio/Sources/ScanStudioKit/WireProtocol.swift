@@ -1125,8 +1125,15 @@ public struct OutputRecipe: Codable, Equatable, Sendable {
     }
 }
 
+public enum ScanFrameFailurePolicy: String, Codable, Equatable, Sendable {
+    case stop
+    case skip
+}
+
 public struct ScanStartParams: Codable, Sendable {
     public let frames: [Int]
+    public let onFrameFailure: ScanFrameFailurePolicy
+    public let allowedMeterRefusalSlots: [Int]
     public let passToken: String?
     public let recipe: CaptureRecipe
     public let processing: ProcessingRecipe?
@@ -1134,12 +1141,16 @@ public struct ScanStartParams: Codable, Sendable {
 
     public init(
         frames: [Int],
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = [],
         passToken: String? = nil,
         recipe: CaptureRecipe,
         processing: ProcessingRecipe? = nil,
         output: OutputRecipe? = nil
     ) {
         self.frames = frames
+        self.onFrameFailure = onFrameFailure
+        self.allowedMeterRefusalSlots = allowedMeterRefusalSlots
         self.passToken = passToken
         self.recipe = recipe
         self.processing = processing

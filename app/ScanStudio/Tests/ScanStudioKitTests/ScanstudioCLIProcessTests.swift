@@ -360,6 +360,14 @@ struct ScanstudioCLIProcessTests {
         let result = try await runCLI(["status", "--help"], socketPath: shortSocketPath("status-help"))
         #expect(result.exitCode == 0)
         #expect(result.stdout.contains("--job"))
+        #expect(result.stdout.contains("--watch"))
+    }
+
+    @Test("status --watch rejects refresh before opening the control socket")
+    func statusWatchRejectsRefreshBeforeConnecting() async throws {
+        let result = try await runCLI(["status", "--watch", "--refresh"], socketPath: shortSocketPath("status-watch-usage"))
+        #expect(result.exitCode == 64)
+        #expect(result.stderr.contains("cannot be combined with --refresh"))
     }
 
     @Test("status with --socket pointing at a path with no listener exits 69 with a HOST_UNREACHABLE JSON body")

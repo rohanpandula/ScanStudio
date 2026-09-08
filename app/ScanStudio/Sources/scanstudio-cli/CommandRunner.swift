@@ -41,7 +41,11 @@ enum CommandRunner {
             let resolution = try await ControlHostDecision.resolve(
                 command: command, socketPath: path, preference: options.hostPreference
             )
-            let client = try await ControlChannelClient.open(path: path, clientName: clientName)
+            let client = try await ControlChannelClient.open(
+                path: path,
+                clientName: clientName,
+                transcriptOptions: .cli()
+            )
             await client.setCLIEnvelopeContext(ControlCLIEnvelopeContext(
                 mode: resolution.mode,
                 hostStarted: resolution.hostStarted,

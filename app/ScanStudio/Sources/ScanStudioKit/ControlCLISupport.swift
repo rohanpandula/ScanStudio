@@ -26,6 +26,7 @@ public enum ControlCLIExitCode: Int32, Sendable {
     case noHostReachable = 69
     case internalError = 70
     case busy = 75
+    case hostExited = 76
     case confirmationRequired = 77
     case schemaVersionMismatch = 78
 

@@ -68,10 +68,17 @@ public enum ControlClientResponse: Sendable {
 /// `open(path:)` completes `hello` exactly once, up front, so every
 /// `ControlChannelClient` a caller holds has already been greeted.
 public actor ControlChannelClient {
+    private struct PendingRequest {
+        let method: String
+        let continuation: CheckedContinuation<ControlClientResponse, Error>
+    }
+
     private let handle: FileHandle
     private var framer = LineFramer()
     private var nextRequestId: UInt64 = 0
-    private var pendingRequests: [UInt64: CheckedContinuation<ControlClientResponse, Error>] = [:]
+    private var pendingRequests: [UInt64: PendingRequest] = [:]
+    private var transcript: ControlSessionTranscript?
+    private var transcriptCopyProjectDirectory: String?
 
     private var eventStream: AsyncStream<Data>?
     private var eventContinuation: AsyncStream<Data>.Continuation?
@@ -90,11 +97,16 @@ public actor ControlChannelClient {
     /// The negotiated `hello` result, retained so a caller (or a test) can
     /// read the app's schema version and name after `open(path:)` returns,
     /// without re-deriving it from a second request.
+    public nonisolated let invocationID: String?
     public private(set) var helloResult: ControlHelloResult?
     public private(set) var cliEnvelopeContext: ControlCLIEnvelopeContext = .unreached
+    public private(set) var transcriptPath: String?
+    public private(set) var transcriptError: String?
 
-    private init(handle: FileHandle) {
+    private init(handle: FileHandle, transcriptOptions: ControlSessionTranscriptOptions?) {
         self.handle = handle
+        self.invocationID = transcriptOptions?.invocationID
+        self.transcript = transcriptOptions.map(ControlSessionTranscript.init)
     }
 
     public func setCLIEnvelopeContext(_ context: ControlCLIEnvelopeContext) {
@@ -129,11 +141,12 @@ public actor ControlChannelClient {
         path: String,
         clientName: String,
         clientBuild: String? = nil,
-        helloTimeout: Duration = .seconds(2)
+        helloTimeout: Duration = .seconds(2),
+        transcriptOptions: ControlSessionTranscriptOptions? = nil
     ) async throws -> ControlChannelClient {
         let fd = try ControlSocketDialer.dial(path: path)
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-        let client = ControlChannelClient(handle: handle)
+        let client = ControlChannelClient(handle: handle, transcriptOptions: transcriptOptions)
         await client.installReadabilityHandler()
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -146,7 +159,7 @@ public actor ControlChannelClient {
                 try await group.next()
             }
         } catch {
-            await client.shutdown()
+            await client.shutdown(reason: "openFailed")
             throw error
         }
         return client
@@ -177,11 +190,11 @@ public actor ControlChannelClient {
         guard !isShutDown else { return }
         let batch = inbox.take()
         if batch.overflowed {
-            shutdown()
+            shutdown(reason: "inputOverflow")
             return
         }
         for chunk in batch.chunks { feed(chunk) }
-        if batch.closed { shutdown() }
+        if batch.closed { shutdown(reason: "peerEOF") }
     }
 
     private func sendHello(clientName: String, clientBuild: String?) async throws {
@@ -197,6 +210,16 @@ public actor ControlChannelClient {
                 throw ControlChannelClientError.malformedResponse
             }
             helloResult = hello
+            do {
+                try transcript?.activate(
+                    diagnosticSessionID: hello.diagnosticSessionId,
+                    projectDirectory: hello.projectDirectory
+                )
+            } catch {
+                reportTranscriptError(error)
+                throw error
+            }
+            transcriptPath = transcript?.fileURL?.path
         case .failure(let payload):
             throw ControlChannelClientError.helloRefused(payload)
         }
@@ -243,13 +266,27 @@ public actor ControlChannelClient {
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ControlClientResponse, Error>) in
-                pendingRequests[id] = continuation
+                pendingRequests[id] = PendingRequest(method: method, continuation: continuation)
                 do {
                     var line = try JSONEncoder().encode(envelope)
+                    do {
+                        try transcript?.record(
+                            direction: "request",
+                            requestID: id,
+                            method: method,
+                            hardwareVerification: cliEnvelopeContext.hardwareVerification,
+                            originalJSON: line
+                        )
+                    } catch {
+                        reportTranscriptError(error)
+                        pendingRequests.removeValue(forKey: id)?.continuation.resume(throwing: error)
+                        shutdown(reason: "transcriptWriteFailed")
+                        return
+                    }
                     line.append(0x0A)
                     try handle.write(contentsOf: line)
                 } catch {
-                    pendingRequests.removeValue(forKey: id)?.resume(throwing: error)
+                    pendingRequests.removeValue(forKey: id)?.continuation.resume(throwing: error)
                 }
             }
         } onCancel: {
@@ -260,7 +297,7 @@ public actor ControlChannelClient {
     /// Removes before resuming so a response, a cancellation, and
     /// `shutdown()` can race without ever double-resuming a continuation.
     private func cancelRequest(id: UInt64) {
-        pendingRequests.removeValue(forKey: id)?.resume(throwing: CancellationError())
+        pendingRequests.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
     }
 
     // MARK: - Incoming bytes
@@ -286,21 +323,44 @@ public actor ControlChannelClient {
         guard let id = sniff.id else {
             if let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
                 updateHardwareVerification(object["hardwareVerification"] as? String)
+                do {
+                    try transcript?.record(
+                        direction: "event",
+                        requestID: nil,
+                        method: object["event"] as? String ?? "event",
+                        hardwareVerification: cliEnvelopeContext.hardwareVerification,
+                        originalJSON: lineData
+                    )
+                } catch {
+                    reportTranscriptError(error)
+                }
             }
             routeEvent(lineData)
             return
         }
-        guard let continuation = pendingRequests.removeValue(forKey: id) else {
+        let pending = pendingRequests.removeValue(forKey: id)
+        if let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
+            updateHardwareVerification(object["hardwareVerification"] as? String)
+        }
+        do {
+            try transcript?.record(
+                direction: "response",
+                requestID: id,
+                method: pending?.method ?? "unknown",
+                hardwareVerification: cliEnvelopeContext.hardwareVerification,
+                originalJSON: lineData
+            )
+        } catch {
+            reportTranscriptError(error)
+        }
+        guard let pending else {
             try? FileHandle.standardError.write(
                 contentsOf: Data("ControlChannelClient: dropped a response for unknown request id \(id)\n".utf8)
             )
             return
         }
-        if let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
-            updateHardwareVerification(object["hardwareVerification"] as? String)
-        }
         if let errorEnvelope = try? JSONDecoder().decode(ControlResponseErrorEnvelope.self, from: lineData) {
-            continuation.resume(returning: .failure(errorEnvelope.error))
+            pending.continuation.resume(returning: .failure(errorEnvelope.error))
             return
         }
         guard
@@ -308,10 +368,18 @@ public actor ControlChannelClient {
             let resultValue = object["result"],
             let resultData = try? JSONSerialization.data(withJSONObject: resultValue)
         else {
-            continuation.resume(throwing: ControlChannelClientError.malformedResponse)
+            pending.continuation.resume(throwing: ControlChannelClientError.malformedResponse)
             return
         }
-        continuation.resume(returning: .result(resultData))
+        if pending.method == "roll.save",
+           transcriptCopyProjectDirectory == nil,
+           let result = try? JSONDecoder().decode(ControlRollSaveResult.self, from: resultData),
+           result.saved,
+           let directory = result.projectDirectory,
+           !directory.isEmpty {
+            transcriptCopyProjectDirectory = directory
+        }
+        pending.continuation.resume(returning: .result(resultData))
     }
 
     // MARK: - Events
@@ -390,16 +458,74 @@ public actor ControlChannelClient {
     /// more than once (peer EOF and an explicit caller `shutdown()` can
     /// both reach here) and safe to call from the readability handler
     /// itself.
-    public func shutdown() {
+    public func transcriptSnapshot() throws -> ControlSessionTranscriptSnapshot? {
+        try transcript?.snapshot()
+    }
+
+    public func shutdown(copyTranscriptToProjectDirectory projectDirectory: String? = nil) {
+        shutdown(reason: "localShutdown", copyTranscriptToProjectDirectory: projectDirectory)
+    }
+
+    private func shutdown(
+        reason: String,
+        copyTranscriptToProjectDirectory projectDirectory: String? = nil
+    ) {
         guard !isShutDown else { return }
         isShutDown = true
+        if reason == "peerEOF", let helloResult {
+            let terminal = ControlEventEnvelope(
+                event: "control.hostExited",
+                payload: ControlHostExitedPayload(hostPid: helloResult.hostPid),
+                hardwareVerification: cliEnvelopeContext.hardwareVerification
+            )
+            if let line = try? JSONEncoder().encode(terminal) {
+                routeEvent(line)
+                do {
+                    try transcript?.record(
+                        direction: "event", requestID: nil, method: "control.hostExited",
+                        hardwareVerification: cliEnvelopeContext.hardwareVerification,
+                        originalJSON: line
+                    )
+                } catch { reportTranscriptError(error) }
+            }
+        }
+        do {
+            if transcript?.fileURL == nil {
+                try transcript?.activate(diagnosticSessionID: nil, projectDirectory: nil)
+                transcriptPath = transcript?.fileURL?.path
+            }
+            if let original = try? JSONSerialization.data(withJSONObject: ["reason": reason]) {
+                try transcript?.record(
+                    direction: "transportTerminal",
+                    requestID: nil,
+                    method: "connection",
+                    hardwareVerification: cliEnvelopeContext.hardwareVerification,
+                    originalJSON: original
+                )
+            }
+            try transcript?.close(
+                copyToProjectDirectory: projectDirectory ?? transcriptCopyProjectDirectory
+            )
+        } catch {
+            reportTranscriptError(error)
+            try? transcript?.close()
+        }
         handle.readabilityHandler = nil
         try? handle.close()
         eventContinuation?.finish()
         let stillPending = pendingRequests
         pendingRequests.removeAll()
-        for continuation in stillPending.values {
-            continuation.resume(throwing: ControlChannelClientError.connectionClosed)
+        for pending in stillPending.values {
+            pending.continuation.resume(throwing: ControlChannelClientError.connectionClosed)
         }
+    }
+
+    private func reportTranscriptError(_ error: Error) {
+        guard transcript != nil, transcriptError == nil else { return }
+        let message = String(describing: error)
+        transcriptError = message
+        try? FileHandle.standardError.write(
+            contentsOf: Data("scanstudio-cli: transcript persistence failed: \(message)\n".utf8)
+        )
     }
 }

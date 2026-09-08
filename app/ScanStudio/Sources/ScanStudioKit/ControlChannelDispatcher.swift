@@ -435,7 +435,9 @@ public final class ControlChannelDispatcher {
             schemaVersion: ControlSchema.version,
             appName: "ScanStudio",
             host: hostKind,
-            hostPid: ProcessInfo.processInfo.processIdentifier
+            hostPid: ProcessInfo.processInfo.processIdentifier,
+            diagnosticSessionId: sessionModel.diagnosticSessionId,
+            projectDirectory: sessionModel.projectDirectory
         )))
     }
 
@@ -488,7 +490,7 @@ public final class ControlChannelDispatcher {
                 ))
             }
         case .rollSave(let id, let params):
-            guard params.motionConfirmed == true else {
+            guard params.startScan == false || params.motionConfirmed == true else {
                 return .failure(id: id, error: ControlErrorPayload(
                     .confirmationRequired,
                     message: "\"roll.save\" requires motionConfirmed: true (it creates the project and starts the scan).",
@@ -855,6 +857,27 @@ public final class ControlChannelDispatcher {
             sessionModel.applyOutputRecipe(params.outputs)
             return .success(id: id, result: .empty(ControlEmptyResult()))
         case .rollSave(let id, let params):
+            if params.startScan == false {
+                if let refusal = jobActiveBusyRefusal(method: "roll.save") {
+                    return .failure(id: id, error: refusal)
+                }
+                guard sessionModel.project == nil else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams, message: "This roll is already saved. Open or scan the existing project."
+                    ))
+                }
+                let errorMessageBefore = sessionModel.lastErrorMessage
+                await sessionModel.createProject(name: params.name, carrier: params.carrier, frameCount: params.frameCount, filmProcess: params.filmProcess)
+                guard sessionModel.project != nil, sessionModel.lastErrorMessage == nil else {
+                    return outcome(id: id, errorMessageBefore: errorMessageBefore)
+                }
+                return .success(id: id, result: .rollSave(ControlRollSaveResult(
+                    saved: true,
+                    projectName: sessionModel.project?.name,
+                    projectDirectory: sessionModel.projectDirectory,
+                    outcome: "saved"
+                )))
+            }
             // `saveRollAndScanSelectedFrames` sets `lastErrorMessage` on
             // both its synchronous refusal branches (`project != nil`,
             // `selectedFrames.isEmpty`) before its own busy flag would even
@@ -956,6 +979,25 @@ public final class ControlChannelDispatcher {
                     ))
                 }
             }
+            let onFrameFailure = params.onFrameFailure ?? .stop
+            let allowedMeterRefusalSlots = params.allowedMeterRefusalSlots ?? []
+            if onFrameFailure == .stop, !allowedMeterRefusalSlots.isEmpty {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .invalidParams,
+                    message: "allowedMeterRefusalSlots requires onFrameFailure=skip."
+                ))
+            }
+            if onFrameFailure == .skip {
+                guard !allowedMeterRefusalSlots.isEmpty,
+                      allowedMeterRefusalSlots == Array(Set(allowedMeterRefusalSlots)).sorted(),
+                      allowedMeterRefusalSlots.allSatisfy(requestedFrames.contains)
+                else {
+                    return .failure(id: id, error: ControlErrorPayload(
+                        .invalidParams,
+                        message: "onFrameFailure=skip requires allowedMeterRefusalSlots as a sorted unique subset of frames."
+                    ))
+                }
+            }
             // Confirmation already checked in the preamble. This is
             // verbatim the expression `ScanPanelView.swift` computes for
             // its own Scan button's `.disabled` binding.
@@ -971,7 +1013,9 @@ public final class ControlChannelDispatcher {
             // D-04 forbids.
             await sessionModel.startMockScan(
                 frames: requestedFrames,
-                passToken: params.passToken
+                passToken: params.passToken,
+                onFrameFailure: onFrameFailure,
+                allowedMeterRefusalSlots: allowedMeterRefusalSlots
             )
             return scanOutcomeResponse(id: id, errorMessageBefore: errorMessageBefore, requestedFrames: requestedFrames)
         case .scanStop(let id, let params):
@@ -1438,6 +1482,7 @@ public final class ControlChannelDispatcher {
             // pre-project branch and every preview-completion gate in this
             // file already read.
             previewComplete: sessionModel.latestCompletedPreviewOperationId != nil,
+            previewOperationId: sessionModel.latestCompletedPreviewOperationId,
             // D-17: reading sessionModel.progress here (not only in
             // buildJobResult() below) is what makes withObservationTracking
             // re-emit control.changed on a progress-only update, and what
@@ -1562,7 +1607,8 @@ public final class ControlChannelDispatcher {
             pendingFrameCount: sessionModel.pendingFrameCount,
             receiptCount: sessionModel.receipts.count,
             frameErrorCodes: frameErrorCodes,
-            frameErrorMessages: frameErrorMessages
+            frameErrorMessages: frameErrorMessages,
+            skippedFrames: sessionModel.scanSummary?.skipped ?? []
             // finishedAt/notAttemptedFrames stay at their nil/[] defaults:
             // by the time jobId is non-nil again for a *different* job,
             // applyCompleted has already archived and cleared the
@@ -1589,7 +1635,8 @@ public final class ControlChannelDispatcher {
                 uniqueKeysWithValues: record.frameErrorMessages.map { (String($0.key), $0.value) }
             ),
             finishedAt: record.finishedAt,
-            notAttemptedFrames: record.notAttemptedFrames
+            notAttemptedFrames: record.notAttemptedFrames,
+            skippedFrames: record.skippedFrames
         )
     }
 

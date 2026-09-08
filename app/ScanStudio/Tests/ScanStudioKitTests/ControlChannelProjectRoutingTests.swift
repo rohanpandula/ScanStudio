@@ -781,6 +781,31 @@ struct ControlChannelProjectRoutingTests {
         #expect(await stub.recordedMethods.isEmpty)
     }
 
+    @Test("roll.save startScan false creates a project without confirmation or scanner motion")
+    @MainActor
+    func rollSaveWithoutScanCreatesOnlyProject() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let params = ControlRollSaveParams(
+            name: "Calibration", carrier: .mounted, frameCount: 1,
+            filmProcess: .c41ColorNegative, motionConfirmed: nil, startScan: false
+        )
+        let response = await dispatcher.handle(.rollSave(id: 1, params: params))
+        guard case .success(_, .rollSave(let saved)) = response else {
+            Issue.record("expected saved project, got \(response)")
+            return
+        }
+        #expect(saved.saved && saved.outcome == "saved")
+        #expect(model.project != nil)
+        let methods = await stub.recordedMethods
+        #expect(methods.contains("project.create"))
+        #expect(!methods.contains("scan.start"))
+        #expect(!methods.contains("scanner.preview"))
+        await stub.clearLog()
+        expectFailure(await dispatcher.handle(.rollSave(id: 2, params: params)), id: 2, code: .invalidParams)
+        #expect(await stub.recordedMethods.isEmpty)
+    }
+
     @Test("roll.save with no selected frames is refused, carrying SessionModel's own message")
     @MainActor
     func rollSaveWithNoSelectedFramesIsRefused() async {

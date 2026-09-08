@@ -213,7 +213,18 @@ struct Scan: AsyncParsableCommand {
     @Option(name: .customLong("pass"), help: "Filename/receipt pass prefix. With repeats, TOKEN becomes TOKEN01, TOKEN02, and so on.")
     var passToken: String?
 
-    private var repeatPlan = ScanRepeatPlan(frames: nil, passTokens: [nil])
+    @Option(name: .customLong("on-frame-failure"), help: "Frame failure policy: stop (default) or skip for explicitly allowed meter refusals.")
+    var onFrameFailure = "stop"
+
+    @Option(name: .customLong("allow-meter-refusal-slots"), help: "Known blank frame indices or ranges eligible for a metering-refusal skip.")
+    var allowedMeterRefusalRanges: String?
+
+    private var repeatPlan = ScanRepeatPlan(
+        frames: nil,
+        passTokens: [nil],
+        onFrameFailure: .stop,
+        allowedMeterRefusalSlots: []
+    )
 
     mutating func validate() throws {
         guard confirmMotion else {
@@ -230,7 +241,9 @@ struct Scan: AsyncParsableCommand {
             repeatPlan = try ScanRepeatPlan.make(
                 frameRanges: frameRanges,
                 repeatCount: repeatCount,
-                passToken: passToken
+                passToken: passToken,
+                onFrameFailure: onFrameFailure,
+                allowedMeterRefusalRanges: allowedMeterRefusalRanges
             )
         } catch let error as ScanRepeatPlan.ValidationError {
             let payload = ControlErrorPayload(
@@ -258,6 +271,8 @@ struct Scan: AsyncParsableCommand {
             try await MotionStartRunner.runRepeatedScan(
                 frames: repeatPlan.frames,
                 passTokens: repeatPlan.passTokens.compactMap { $0 },
+                onFrameFailure: repeatPlan.onFrameFailure,
+                allowedMeterRefusalSlots: repeatPlan.allowedMeterRefusalSlots,
                 options: options,
                 quiet: options.quiet
             )
@@ -269,7 +284,9 @@ struct Scan: AsyncParsableCommand {
             params: ControlScanStartParams(
                 motionConfirmed: true,
                 frames: repeatPlan.frames,
-                passToken: repeatPlan.passTokens[0]
+                passToken: repeatPlan.passTokens[0],
+                onFrameFailure: repeatPlan.onFrameFailure,
+                allowedMeterRefusalSlots: repeatPlan.allowedMeterRefusalSlots
             ),
             options: options,
             wait: wait,
@@ -285,11 +302,15 @@ struct ScanRepeatPlan: Codable, Equatable {
 
     let frames: [Int]?
     let passTokens: [String?]
+    let onFrameFailure: ScanFrameFailurePolicy
+    let allowedMeterRefusalSlots: [Int]
 
     static func make(
         frameRanges: String?,
         repeatCount: Int,
-        passToken: String?
+        passToken: String?,
+        onFrameFailure: String,
+        allowedMeterRefusalRanges: String?
     ) throws -> Self {
         guard (1...100).contains(repeatCount) else {
             throw ValidationError(message: "--repeat must be within 1...100, got \(repeatCount).")
@@ -298,6 +319,21 @@ struct ScanRepeatPlan: Codable, Equatable {
             throw ValidationError(message: "--pass is required when --repeat is greater than 1.")
         }
         let frames = try frameRanges.map(ControlFrameRangeParser.parse)
+        guard let policy = ScanFrameFailurePolicy(rawValue: onFrameFailure) else {
+            throw ValidationError(message: "--on-frame-failure must be stop or skip.")
+        }
+        let allowedSlots = try allowedMeterRefusalRanges.map(ControlFrameRangeParser.parse) ?? []
+        if policy == .stop, !allowedSlots.isEmpty {
+            throw ValidationError(message: "--allow-meter-refusal-slots requires --on-frame-failure skip.")
+        }
+        if policy == .skip {
+            guard !allowedSlots.isEmpty else {
+                throw ValidationError(message: "--on-frame-failure skip requires --allow-meter-refusal-slots.")
+            }
+            if let frames, !allowedSlots.allSatisfy(frames.contains) {
+                throw ValidationError(message: "--allow-meter-refusal-slots must be a subset of --frames.")
+            }
+        }
         let tokens: [String?]
         if repeatCount == 1 {
             tokens = [passToken]
@@ -311,7 +347,12 @@ struct ScanRepeatPlan: Codable, Equatable {
                 )
             }
         }
-        return Self(frames: frames, passTokens: tokens)
+        return Self(
+            frames: frames,
+            passTokens: tokens,
+            onFrameFailure: policy,
+            allowedMeterRefusalSlots: allowedSlots
+        )
     }
 
     private static func validPassToken(_ token: String) -> Bool {
@@ -404,6 +445,8 @@ enum MotionStartRunner {
     static func runRepeatedScan(
         frames: [Int]?,
         passTokens: [String],
+        onFrameFailure: ScanFrameFailurePolicy,
+        allowedMeterRefusalSlots: [Int],
         options: GlobalOptions,
         quiet: Bool
     ) async throws {
@@ -447,7 +490,9 @@ enum MotionStartRunner {
                     params: ControlScanStartParams(
                         motionConfirmed: true,
                         frames: resolvedFrames,
-                        passToken: passToken
+                        passToken: passToken,
+                        onFrameFailure: onFrameFailure,
+                        allowedMeterRefusalSlots: allowedMeterRefusalSlots
                     ),
                     options: options,
                     client: client
@@ -489,7 +534,11 @@ enum MotionStartRunner {
                 jobs.append(object)
                 let result = try JSONDecoder().decode(ControlJobResult.self, from: data)
                 previousJobId = result.jobId
-                if result.jobState != .completed || !result.frameErrorCodes.isEmpty {
+                let skippedKeys = Set((result.skippedFrames ?? []).map(String.init))
+                let fatalFrameErrors = result.frameErrorCodes.keys.contains {
+                    !skippedKeys.contains($0)
+                }
+                if result.jobState != .completed || fatalFrameErrors {
                     try await renderRepeatedScanResult(
                         frames: resolvedFrames,
                         passTokens: passTokens,

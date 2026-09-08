@@ -34,10 +34,9 @@ struct Events: AsyncParsableCommand {
     /// pushed snapshot event), then prints one line per event afterward --
     /// including `control.dropped`, which passes through unmodified so a
     /// consumer can see it lost data rather than silently missing it. The
-    /// host's own typed host-exited event and a distinct exit code for it
-    /// are OPS-10 (Phase 5); this phase's contract is only that the stream
-    /// ends and this command exits 0. This is the only connection this
-    /// command ever opens.
+    /// local control.hostExited event reports established connection EOF
+    /// and exits 76 without claiming an in-flight scan outcome.
+    /// This command opens only one connection.
     func run() async throws {
         let client = try await CommandRunner.openConnection(command: "events", options: options)
         let subscribeResponse = try await CommandRunner.request(
@@ -51,13 +50,16 @@ struct Events: AsyncParsableCommand {
         let snapshot = subscribeObject["snapshot"] as? [String: Any] ?? [:]
         try await printEventLine(command: "events", eventName: "control.snapshot", payload: snapshot, human: options.human, context: await client.cliEnvelopeContext)
 
+        var hostExited = false
         for await line in await client.events() {
             let eventObject = ((try? JSONSerialization.jsonObject(with: line)) as? [String: Any]) ?? [:]
             let text = try ControlCLIOutput.renderEvent(command: "events", eventJSON: eventObject, human: options.human, context: await client.cliEnvelopeContext)
             print(text, terminator: "")
             fflush(stdout)
+            if eventObject["event"] as? String == "control.hostExited" { hostExited = true }
         }
         await client.shutdown()
+        if hostExited { throw ExitCode(ControlCLIExitCode.hostExited.rawValue) }
     }
 
     private func printEventLine(command: String, eventName: String, payload: [String: Any], human: Bool, context: ControlCLIEnvelopeContext) throws {

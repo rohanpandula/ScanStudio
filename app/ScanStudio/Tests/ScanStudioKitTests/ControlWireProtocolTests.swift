@@ -118,7 +118,9 @@ struct ControlWireProtocolTests {
         let original = ControlScanStartParams(
             motionConfirmed: true,
             frames: [2, 20],
-            passToken: "Arep01"
+            passToken: "Arep01",
+            onFrameFailure: .skip,
+            allowedMeterRefusalSlots: [20]
         )
         #expect(try roundTrip(original) == original)
     }
@@ -337,7 +339,8 @@ struct ControlWireProtocolTests {
             completedFrameCount: 2,
             pendingFrameCount: 34,
             receiptCount: 2,
-            frameErrorCodes: ["5": "FEED_JAM"]
+            frameErrorCodes: ["5": "FEED_JAM", "20": "METER_CONTROLLER_REFUSED"],
+            skippedFrames: [20]
         )
         #expect(try roundTrip(original) == original)
     }

@@ -157,6 +157,8 @@ private func filmPresenceChangedEvent(filmPresent: Bool) -> EngineEvent {
 
 @Suite("Control channel client", .timeLimit(.minutes(1)))
 struct ControlChannelClientTests {
+    private struct TranscriptWriteFailure: Error {}
+
     @Test("hello timeout closes a connection even when the listener never responds")
     func silentListenerHasBoundedHello() async throws {
         let path = shortSocketPath("silent")
@@ -249,6 +251,7 @@ struct ControlChannelClientTests {
         }
         let status = try JSONDecoder().decode(ControlStatusResult.self, from: data)
         #expect(status.hardwareMotionReadiness.isEmpty == false)
+        #expect(status.previewOperationId == nil)
 
         await client.shutdown()
         await server.stop()
@@ -549,5 +552,54 @@ struct ControlChannelClientTests {
 
         await client.shutdown()
         await server1.stop()
+    }
+
+    @Test("an admitted response and event remain observable when transcript persistence fails")
+    func admittedTrafficSurvivesTranscriptFailure() async throws {
+        let path = shortSocketPath("transcript-failure")
+        let transcriptRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("transcript-failure-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: transcriptRoot, withIntermediateDirectories: true)
+        defer {
+            removeSocketDirectory(for: path)
+            try? FileManager.default.removeItem(at: transcriptRoot)
+        }
+        let server = ControlChannelServer(sessionModel: await makeIdleModel(ControlClientEngineStub()))
+        try await server.start(path: path)
+        let options = ControlSessionTranscriptOptions(
+            invocationID: "failure-test",
+            fallbackDirectory: transcriptRoot.appendingPathComponent("sessions"),
+            lineWriter: { handle, data in
+                let line = String(decoding: data, as: UTF8.self)
+                if !line.contains(#""method":"hello""#),
+                   line.contains(#""direction":"response""#)
+                    || line.contains(#""direction":"event""#) {
+                    throw TranscriptWriteFailure()
+                }
+                try handle.write(contentsOf: data)
+            }
+        )
+        let client = try await ControlChannelClient.open(
+            path: path,
+            clientName: "transcript-failure-test",
+            transcriptOptions: options
+        )
+
+        guard case .result(let statusData) = try await client.requestWithoutParams(method: "status") else {
+            Issue.record("expected the admitted status response")
+            return
+        }
+        #expect((try? JSONDecoder().decode(ControlStatusResult.self, from: statusData)) != nil)
+        guard case .result = try await client.requestWithoutParams(method: "events.subscribe") else {
+            Issue.record("expected the admitted subscribe response")
+            return
+        }
+        var iterator = await client.events().makeAsyncIterator()
+        let event = await iterator.next()
+        #expect(event.flatMap(ControlChannelClient.decodeStatusSnapshot(fromEventLine:)) != nil)
+        #expect(await client.transcriptError != nil)
+
+        await client.shutdown()
+        await server.stop()
     }
 }

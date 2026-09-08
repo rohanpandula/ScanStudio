@@ -214,19 +214,25 @@ public struct ControlHelloResult: Codable, Equatable, Sendable {
     public let appVersion: String?
     public let host: ControlHostKind
     public let hostPid: Int32
+    public let diagnosticSessionId: String?
+    public let projectDirectory: String?
 
     public init(
         schemaVersion: Int,
         appName: String,
         appVersion: String? = nil,
         host: ControlHostKind = .gui,
-        hostPid: Int32 = ProcessInfo.processInfo.processIdentifier
+        hostPid: Int32 = ProcessInfo.processInfo.processIdentifier,
+        diagnosticSessionId: String? = nil,
+        projectDirectory: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.appName = appName
         self.appVersion = appVersion
         self.host = host
         self.hostPid = hostPid
+        self.diagnosticSessionId = diagnosticSessionId
+        self.projectDirectory = projectDirectory
     }
 }
 
@@ -269,11 +275,21 @@ public struct ControlScanStartParams: Codable, Equatable, Sendable {
     public let motionConfirmed: Bool?
     public let frames: [Int]?
     public let passToken: String?
+    public let onFrameFailure: ScanFrameFailurePolicy?
+    public let allowedMeterRefusalSlots: [Int]?
 
-    public init(motionConfirmed: Bool?, frames: [Int]? = nil, passToken: String? = nil) {
+    public init(
+        motionConfirmed: Bool?,
+        frames: [Int]? = nil,
+        passToken: String? = nil,
+        onFrameFailure: ScanFrameFailurePolicy? = nil,
+        allowedMeterRefusalSlots: [Int]? = nil
+    ) {
         self.motionConfirmed = motionConfirmed
         self.frames = frames
         self.passToken = passToken
+        self.onFrameFailure = onFrameFailure
+        self.allowedMeterRefusalSlots = allowedMeterRefusalSlots
     }
 }
 
@@ -434,12 +450,16 @@ public struct ControlRollSaveParams: Codable, Equatable, Sendable {
     public let filmProcess: FilmProcess
     public let motionConfirmed: Bool?
 
-    public init(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess, motionConfirmed: Bool?) {
+    /// Omitted preserves the original save-and-scan behavior.
+    public let startScan: Bool?
+
+    public init(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess, motionConfirmed: Bool?, startScan: Bool? = nil) {
         self.name = name
         self.carrier = carrier
         self.frameCount = frameCount
         self.filmProcess = filmProcess
         self.motionConfirmed = motionConfirmed
+        self.startScan = startScan
     }
 }
 
@@ -601,6 +621,10 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
     /// that point regardless, so it cannot stand in for this. Defaults to
     /// `false` so every existing construction site keeps compiling.
     public let previewComplete: Bool
+    /// Additive identity for the completed physical registration represented
+    /// by this snapshot. It is nil until a preview completes, and changes for
+    /// every replacement preview; legacy clients may omit it.
+    public let previewOperationId: String?
     /// D-17: additive. `control.changed`'s snapshot previously carried
     /// `jobId`/`jobState` but not live progress, leaving `--wait`'s stderr
     /// progress sink with no way to observe it without an extra `job.get`
@@ -642,6 +666,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         jobId: String? = nil,
         jobState: JobState? = nil,
         previewComplete: Bool = false,
+        previewOperationId: String? = nil,
         progress: ControlScanProgress? = nil,
         refeedRequired: Bool,
         hardwareMotionReadiness: String,
@@ -663,6 +688,7 @@ public struct ControlStatusResult: Codable, Equatable, Sendable {
         self.jobId = jobId
         self.jobState = jobState
         self.previewComplete = previewComplete
+        self.previewOperationId = previewOperationId
         self.progress = progress
         self.refeedRequired = refeedRequired
         self.hardwareMotionReadiness = hardwareMotionReadiness
@@ -833,6 +859,7 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
     /// D-20/HEAD-12: 1-based indices the batch never reached -- `[]` for a
     /// still-live job.
     public let notAttemptedFrames: [Int]
+    public let skippedFrames: [Int]?
 
     public init(
         jobId: String? = nil,
@@ -844,7 +871,8 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
         frameErrorCodes: [String: String] = [:],
         frameErrorMessages: [String: String] = [:],
         finishedAt: String? = nil,
-        notAttemptedFrames: [Int] = []
+        notAttemptedFrames: [Int] = [],
+        skippedFrames: [Int]? = nil
     ) {
         self.jobId = jobId
         self.jobState = jobState
@@ -856,6 +884,7 @@ public struct ControlJobResult: Codable, Equatable, Sendable {
         self.frameErrorMessages = frameErrorMessages
         self.finishedAt = finishedAt
         self.notAttemptedFrames = notAttemptedFrames
+        self.skippedFrames = skippedFrames
     }
 }
 
@@ -931,7 +960,8 @@ public struct ControlRollListResult: Codable, Equatable, Sendable {
     }
 }
 
-/// `outcome` (D-13/HEAD-07) names which of three things actually happened,
+/// `"saved"` means explicit `startScan: false` created the project without motion.
+/// Otherwise `outcome` (D-13/HEAD-07) names which of three things happened,
 /// since a `true` `saved` alone cannot distinguish them --
 /// `SessionModel.saveRollAndScanSelectedFrames`'s own `return started ||
 /// pendingManualReviewScan?.frames == requestedFrames` line is exactly why:
@@ -1013,5 +1043,17 @@ public struct ControlEventsSubscribeResult: Codable, Equatable, Sendable {
     public init(subscribed: Bool, snapshot: ControlStatusResult) {
         self.subscribed = subscribed
         self.snapshot = snapshot
+    }
+}
+
+/// Local observer terminal: the established host connection reached EOF.
+/// This reports loss of observation, not whether an in-flight scan succeeded.
+public struct ControlHostExitedPayload: Codable, Equatable, Sendable {
+    public let reason: String
+    public let hostPid: Int32?
+
+    public init(reason: String = "peerEOF", hostPid: Int32?) {
+        self.reason = reason
+        self.hostPid = hostPid
     }
 }

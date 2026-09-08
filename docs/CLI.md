@@ -200,12 +200,17 @@ They take no motion flag and exit `0, 65, 69, 70, 75`.
 roll save --name NAME --carrier mounted|strip6|roll36 --frame-count N
            --film-process PROCESS --confirm-motion [--wait] [--auto-approve]
            → roll.save, status, review.approve, job.get
+roll save --name NAME --carrier CARRIER --frame-count N
+           --film-process PROCESS --no-scan → roll.save
 roll open DIRECTORY          → roll.open
 roll list                    → roll.list
 ```
 
 `roll save` creates a project and starts scanning, so `--confirm-motion` is
-required. `--auto-approve` independently requires that flag and approves a
+required. With `--no-scan`, it only creates the project and returns
+`outcome: "saved"`; no motion confirmation is needed. `--no-scan` cannot be
+combined with `--wait` or `--auto-approve`.
+`--auto-approve` independently requires that flag and approves a
 paused review only when every flagged frame clears the confidence threshold.
 `--wait` returns the terminal job result; `--no-wait` returns after start.
 Save exits `0, 65, 69, 70, 75, 77`; open/list exit `0, 65, 69, 70, 75`.
@@ -314,7 +319,7 @@ sim load-media [--carrier strip6|roll36] [--preview-fixture NAME]
 Diagnostics requires an existing absolute directory with no `..` component.
 `events` requires `--follow` and streams event envelopes until the host closes
 the connection. `sim load-media` is simulator-only and never moves hardware.
-Diagnostics exits `0, 64, 69, 70`; events exits `0, 64, 69, 70`; simulator
+Diagnostics exits `0, 64, 69, 70`; events exits `0, 64, 69, 70, 76`; simulator
 setup uses `0, 65, 69, 70, 75`.
 
 ```json
@@ -331,6 +336,7 @@ setup uses `0, 65, 69, 70, 75`.
 | 69 | No host reachable | `HOST_UNREACHABLE` — the control socket could not be dialed at the given (or default) path |
 | 70 | Internal error | Channel `UNKNOWN_COMMAND`; CLI-originated `INTERNAL` (an unexpected condition after a request already succeeded, for example a response that failed to decode) |
 | 75 | Busy / conflict | `CONTROLLER_BUSY`, `HOST_ALREADY_RUNNING` |
+| 76 | Established host connection closed | `control.hostExited` for streaming observers |
 | 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
 | 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
 
@@ -414,3 +420,19 @@ The runbook's `strip6` simulator fixture produces six preview frames, so its
 bounded passing invocation uses `--frame-count 6`. `full_roll_cli.sh` preserves
 an explicitly requested count; a count that does not match the selected
 preview frames stops at `roll.save` and reports the failed receipt step.
+
+Calibration scans can explicitly permit known blank slots with
+`scan --on-frame-failure skip --allow-meter-refusal-slots RANGE`. The default
+is stop. Only synchronized typed meter-controller refusals may be skipped;
+other failures stop the job. Each skip is retained separately from capture
+receipts and included by `roll collect`; an all-skipped pass has no measured
+exposure/clipping result. Simulator scans refuse this hardware-only option.
+
+`status --watch` emits an initial snapshot and subsequent film/registration
+changes from one event subscription. It does not poll or refresh the scanner;
+`--job` and `--refresh` cannot be combined with it. A new `previewOperationId`
+distinguishes replacement previews. Both `status --watch` and `events --follow`
+retain `control.dropped` notices. Established connection EOF emits one local
+`control.hostExited` event and exits **76**. This means observation was lost;
+it does not claim that an in-flight scan succeeded or failed. Ordinary local
+shutdown after a finite command does not synthesize that event.

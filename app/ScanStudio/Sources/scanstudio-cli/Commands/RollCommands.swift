@@ -36,7 +36,7 @@ struct Roll: AsyncParsableCommand {
     struct Save: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "save",
-            abstract: "Create the project from the current preview and scan the selected frames. Requires --confirm-motion."
+            abstract: "Create a roll and scan selected frames, or use --no-scan to save without motion."
         )
 
         @OptionGroup var options: GlobalOptions
@@ -63,7 +63,10 @@ struct Roll: AsyncParsableCommand {
         })
         var filmProcess: FilmProcess
 
-        @Flag(name: .customLong("confirm-motion"), help: "Required: this command starts a scan.")
+        @Flag(name: .customLong("no-scan"), help: "Create the project without scanning, for calibration or later capture.")
+        var noScan = false
+
+        @Flag(name: .customLong("confirm-motion"), help: "Required unless --no-scan is used.")
         var confirmMotion = false
 
         @Flag(name: .customLong("wait"), help: "Block until the job reaches a terminal state, observed on the event stream -- never polled.")
@@ -94,6 +97,12 @@ struct Roll: AsyncParsableCommand {
         static let autoApproveMinimumContentConfidence: Double = 0.8
 
         mutating func validate() throws {
+            if noScan {
+                guard !wait && !autoApprove else {
+                    throw ValidationError("--no-scan cannot be combined with --wait or --auto-approve")
+                }
+                return
+            }
             guard confirmMotion else {
                 let payload = ControlErrorPayload(
                     .confirmationRequired,
@@ -143,7 +152,7 @@ struct Roll: AsyncParsableCommand {
         /// once their own single request resolves -- so it runs through
         /// `runAutoApprove` below instead, never through either of those.
         func run() async throws {
-            let params = ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: true)
+            let params = ControlRollSaveParams(name: name, carrier: carrier, frameCount: frameCount, filmProcess: filmProcess, motionConfirmed: noScan ? false : confirmMotion, startScan: noScan ? false : nil)
             guard autoApprove else {
                 guard wait else {
                     try await CommandRunner.run(command: "roll.save", method: "roll.save", params: params, options: options)

@@ -395,6 +395,7 @@ struct TerminalJobRecord: Equatable, Sendable {
     let frameErrorCodes: [Int: String]
     let frameErrorMessages: [Int: String]
     let notAttemptedFrames: [Int]
+    let skippedFrames: [Int]
     let finishedAt: String
 }
 
@@ -424,6 +425,8 @@ public final class SessionModel {
         let previewOperationId: String
         let frames: [Int]
         let passToken: String?
+        let onFrameFailure: ScanFrameFailurePolicy
+        let allowedMeterRefusalSlots: [Int]
     }
 
     /// Immutable authority for the accepted scan whose terminal summary may
@@ -479,6 +482,8 @@ public final class SessionModel {
         let requestId: UUID
         let frames: [Int]
         let passToken: String?
+        let onFrameFailure: ScanFrameFailurePolicy
+        let allowedMeterRefusalSlots: [Int]
         /// Every flagged frame the bridge must approve before scan.start.
         let requirements: [ManualReviewRequirement]
         /// The subset not already resolved with "Use Frame Anyway" when the
@@ -1985,10 +1990,20 @@ public final class SessionModel {
     /// Control-channel entry point for an explicit frame set and optional
     /// calibration pass token. It shares the GUI's complete readiness and
     /// manual-review path rather than issuing a second scan-start flow.
-    public func startMockScan(frames: [Int], passToken: String?) async {
+    public func startMockScan(
+        frames: [Int],
+        passToken: String?,
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = []
+    ) async {
         let previous = beginMutatingOperation("scan.start")
         defer { mutatingOperationInFlight = previous }
-        _ = await startScanOrRequestManualReview(frames: frames, passToken: passToken)
+        _ = await startScanOrRequestManualReview(
+            frames: frames,
+            passToken: passToken,
+            onFrameFailure: onFrameFailure,
+            allowedMeterRefusalSlots: allowedMeterRefusalSlots
+        )
     }
 
     /// Scans exactly one frame regardless of the grid's current selection —
@@ -2365,7 +2380,9 @@ public final class SessionModel {
         do {
             guard let result = try await dispatchScanStart(
                 frames: authorization.frames,
-                passToken: authorization.passToken
+                passToken: authorization.passToken,
+                onFrameFailure: authorization.onFrameFailure,
+                allowedMeterRefusalSlots: authorization.allowedMeterRefusalSlots
             ) else {
                 return false
             }
@@ -2399,7 +2416,11 @@ public final class SessionModel {
     /// forgotten or delayed UI confirmation cannot bypass it.
     @discardableResult
     private func startScanOrRequestManualReview(
-        frames: [Int], resumingBatch: Bool = false, passToken: String? = nil
+        frames: [Int],
+        resumingBatch: Bool = false,
+        passToken: String? = nil,
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = []
     ) async -> Bool {
         guard !isChangingProject, !isResumingBatch || resumingBatch else { return false }
         guard pendingAttendedScanApproval == nil else { return false }
@@ -2452,6 +2473,8 @@ public final class SessionModel {
             if let current = pendingManualReviewScanAuthorization,
                current.frames == frames,
                current.passToken == passToken,
+               current.onFrameFailure == onFrameFailure,
+               current.allowedMeterRefusalSlots == allowedMeterRefusalSlots,
                current.requirements == requirements,
                current.confirmationRequirements == confirmationRequirements,
                current.previewOperationId == previewOperationId,
@@ -2473,6 +2496,8 @@ public final class SessionModel {
                     requestId: request.id,
                     frames: request.frames,
                     passToken: passToken,
+                    onFrameFailure: onFrameFailure,
+                    allowedMeterRefusalSlots: allowedMeterRefusalSlots,
                     requirements: requirements,
                     confirmationRequirements: confirmationRequirements,
                     previewOperationId: previewOperationId,
@@ -2501,7 +2526,9 @@ public final class SessionModel {
         do {
             guard let result = try await dispatchScanStart(
                 frames: frames,
-                passToken: passToken
+                passToken: passToken,
+                onFrameFailure: onFrameFailure,
+                allowedMeterRefusalSlots: allowedMeterRefusalSlots
             ) else {
                 return false
             }
@@ -2915,6 +2942,8 @@ public final class SessionModel {
     public func createProject(name: String, carrier: SimulatedFilmCarrier, frameCount: Int, filmProcess: FilmProcess) async {
         guard beginProjectLifecycleChange() else { return }
         defer { isChangingProject = false }
+        let previous = beginMutatingOperation("project.create")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         // Save Roll attaches the preview already on screen to its first
         // project. Keep that preview's scan choices across this one boundary;
@@ -5186,7 +5215,9 @@ public final class SessionModel {
     /// outside it, unknown-job events are dropped.
     func dispatchScanStart(
         frames: [Int],
-        passToken: String? = nil
+        passToken: String? = nil,
+        onFrameFailure: ScanFrameFailurePolicy = .stop,
+        allowedMeterRefusalSlots: [Int] = []
     ) async throws -> ScanStartResult? {
         guard pendingScanStart == nil else {
             recordDiagnostic(
@@ -5205,7 +5236,9 @@ public final class SessionModel {
             connectionEpoch: connectionEpoch,
             previewOperationId: previewOperationId,
             frames: frames,
-            passToken: passToken
+            passToken: passToken,
+            onFrameFailure: onFrameFailure,
+            allowedMeterRefusalSlots: allowedMeterRefusalSlots
         )
         pendingScanStart = marker
         defer {
@@ -5228,6 +5261,8 @@ public final class SessionModel {
 
         let params = ScanStartParams(
             frames: frames,
+            onFrameFailure: onFrameFailure,
+            allowedMeterRefusalSlots: allowedMeterRefusalSlots,
             passToken: passToken,
             recipe: captureRecipe,
             processing: processingRecipe,
@@ -5270,6 +5305,8 @@ public final class SessionModel {
             && pendingScanStart.previewOperationId == marker.previewOperationId
             && pendingScanStart.frames == marker.frames
             && pendingScanStart.passToken == marker.passToken
+            && pendingScanStart.onFrameFailure == marker.onFrameFailure
+            && pendingScanStart.allowedMeterRefusalSlots == marker.allowedMeterRefusalSlots
             && marker.frames == frames
             && connectionEpoch == marker.connectionEpoch
             && diagnosticUIConnected
@@ -5375,6 +5412,8 @@ public final class SessionModel {
               pendingScanStart.previewOperationId == marker.previewOperationId,
               pendingScanStart.frames == marker.frames,
               pendingScanStart.passToken == marker.passToken,
+              pendingScanStart.onFrameFailure == marker.onFrameFailure,
+              pendingScanStart.allowedMeterRefusalSlots == marker.allowedMeterRefusalSlots,
               marker.frames == frames,
               connectionEpoch == marker.connectionEpoch,
               diagnosticUIConnected,
@@ -5529,6 +5568,7 @@ public final class SessionModel {
         jobState = ScanCompletionPolicy.resolveJobState(current: jobState, summary: payload.summary)
 
         if payload.summary.completed.isEmpty,
+           payload.summary.skipped.isEmpty,
            completedAuthorization?.frames.isEmpty == false {
             let failedErrors = payload.summary.failed.compactMap {
                 frameErrors[$0]
@@ -5631,6 +5671,7 @@ public final class SessionModel {
                 frameErrorCodes: frameErrorCodes,
                 frameErrorMessages: frameErrorMessages,
                 notAttemptedFrames: payload.summary.notAttempted,
+                skippedFrames: payload.summary.skipped,
                 finishedAt: ISO8601DateFormatter().string(from: Date())
             ))
             if terminalJobHistory.count > Self.maximumTerminalJobHistory {
@@ -5699,6 +5740,8 @@ public final class SessionModel {
             "transport=\(status?.transport ?? "unknown")",
         ].joined(separator: "; ")
     }
+
+    public var diagnosticSessionId: String { diagnosticTimeline.sessionID }
 
     private var diagnosticLogRelativePath: String? {
         guard let logURL = diagnosticTimeline.logURL else { return nil }

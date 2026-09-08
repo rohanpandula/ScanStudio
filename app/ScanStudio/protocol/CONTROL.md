@@ -278,6 +278,7 @@ The resident host probes the socket before constructing an engine. A live owner 
 | 69 | No host reachable | `HOST_UNREACHABLE` — the control socket could not be dialed at the given (or default) path |
 | 70 | Internal error | Channel `UNKNOWN_COMMAND`; CLI-originated `INTERNAL` (an unexpected condition after a request already succeeded, for example a response that failed to decode) |
 | 75 | Busy / conflict | `CONTROLLER_BUSY`, `HOST_ALREADY_RUNNING` |
+| 76 | Established host connection closed | `control.hostExited` for streaming observers |
 | 77 | Confirmation required | `CONFIRMATION_REQUIRED`, decided client-side at parse time — before any connection opens — for every motion-capable subcommand (D-11) |
 | 78 | Schema / version mismatch | `SCHEMA_VERSION_MISMATCH`, `HELLO_REQUIRED` |
 
@@ -321,3 +322,20 @@ Two facts about this table a reader will otherwise get wrong:
 Recorded here so both gaps stay visible in the spec, not only in a plan:
 
 - **Attended-scan-recovery approval** (`SessionModel.approveEveryFrameAndScan()`, the path behind `ContentView.swift`'s attended-retry banner) has no channel command yet. It approves every frame in the roll against a different confirmation contract than `review.approve`'s single-boundary approval and needs its own command; D-08's command tree does not include it, so this work is carried past Phase 2 to a later phase.
+
+### Calibration project bootstrap
+
+`roll.save` accepts optional `startScan: false` to create the project without
+starting a preview or capture. This form does not require `motionConfirmed`;
+it refuses an already saved roll or an active job and returns the normal save
+result with `outcome: "saved"`. An omitted or true `startScan` preserves the
+existing save-and-scan behavior and confirmation requirement.
+
+### Observer EOF
+
+`ControlChannelClient` synthesizes one `control.hostExited` event when an
+established host connection reaches EOF. Payload: `{reason: "peerEOF",
+hostPid: number}`. Ordinary local client shutdown emits no host-loss event.
+CLI streaming observers report exit 76 after forwarding this event; finite
+commands retain their actual response semantics. Status snapshots include
+nullable `previewOperationId` for registration change detection.

@@ -133,6 +133,7 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
     /// apart from this stub's point of view, since both call the identical
     /// `"scan.stop"` engine method (Task 3).
     private(set) var recordedScanStopModes: [String] = []
+    private(set) var recordedScanStarts: [ScanStartParams] = []
 
     private var heldMethods: Set<String> = []
     private var openGates: Set<String> = []
@@ -146,6 +147,7 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
         recordedMethods.removeAll()
         requestCounts.removeAll()
         recordedScanStopModes.removeAll()
+        recordedScanStarts.removeAll()
     }
 
     /// Gates every subsequent request for `method` until `release(_:)` is
@@ -227,6 +229,7 @@ private actor MotionRoutingEngineStub: EngineClientProtocol {
             eventsContinuation.yield(EngineEvent(name: "roll.exposureSolved", rawLine: data))
             return try cast(RollSolveExposureAck(accepted: true), as: Result.self)
         case "scan.start":
+            recordedScanStarts.append(params as! ScanStartParams)
             return try cast(ScanStartResult(jobId: "motion-routing-job"), as: Result.self)
         case "scan.stop":
             let stopMode = (params as? ScanStopParams)?.mode ?? "afterCurrentFrame"
@@ -847,6 +850,44 @@ struct ControlChannelMotionRoutingTests {
             return
         }
         #expect(model.mutatingOperationInFlight == nil)
+    }
+
+    @Test("scan.start forwards only an explicit exact meter-refusal skip allowlist")
+    @MainActor
+    func scanStartForwardsMeterRefusalSkipPolicy() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        #expect(await prepareMotionRoutingScanReadiness(model))
+        await stub.clearLog()
+
+        let invalid = await dispatcher.handle(.scanStart(
+            id: 5,
+            params: ControlScanStartParams(
+                motionConfirmed: true,
+                frames: [1],
+                allowedMeterRefusalSlots: [1]
+            )
+        ))
+        expectFailure(invalid, id: 5, code: .invalidParams)
+        #expect(await stub.recordedMethods.isEmpty)
+
+        let valid = await dispatcher.handle(.scanStart(
+            id: 6,
+            params: ControlScanStartParams(
+                motionConfirmed: true,
+                frames: [1],
+                onFrameFailure: .skip,
+                allowedMeterRefusalSlots: [1]
+            )
+        ))
+        guard case .success = valid else {
+            Issue.record("expected scan.start to accept the explicit blank-slot policy, got \(valid)")
+            return
+        }
+        let starts = await stub.recordedScanStarts
+        #expect(starts.count == 1)
+        #expect(starts.first?.onFrameFailure == .skip)
+        #expect(starts.first?.allowedMeterRefusalSlots == [1])
     }
 
     // MARK: scan.stop (Task 3)
