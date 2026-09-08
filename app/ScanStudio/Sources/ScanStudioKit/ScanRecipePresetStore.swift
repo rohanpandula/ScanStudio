@@ -209,7 +209,10 @@ public struct ScanRecipePresetStore: Sendable {
         guard preset.version == ScanRecipePresetDocument.currentVersion else {
             throw ScanRecipePresetStoreError.unsupportedVersion(preset.version)
         }
-        let capture = preset.capture
+        try validateRecipes(capture: preset.capture, output: preset.output)
+    }
+
+    public static func validateRecipes(capture: CaptureRecipe, output: OutputRecipe) throws {
         let exposureOverrideIsValid = capture.exposureOverride10ns.map {
             $0.count == 3 && $0.allSatisfy { (50_000...400_000).contains($0) }
         } ?? true
@@ -220,7 +223,7 @@ public struct ScanRecipePresetStore: Sendable {
               exposureOverrideIsValid else {
             throw ScanRecipePresetStoreError.invalidRecipe("capture")
         }
-        try validateOutput(preset.output)
+        try validateOutput(output)
     }
 
     private static func validateOutput(_ output: OutputRecipe) throws {

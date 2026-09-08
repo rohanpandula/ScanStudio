@@ -103,6 +103,19 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
 
     private(set) var requestCounts: [String: Int] = [:]
     private(set) var recordedFrameExclusionFlags: [Bool] = []
+    private var holdSessionInventory = false
+    private var sessionInventoryWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func holdSessionInventoryRequests() {
+        holdSessionInventory = true
+    }
+
+    func releaseSessionInventoryRequests() {
+        holdSessionInventory = false
+        let waiters = sessionInventoryWaiters
+        sessionInventoryWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
         _ method: String, params: Params
@@ -188,6 +201,11 @@ private actor CLIProcessEngineStub: EngineClientProtocol {
             )
         case "project.list":
             return try cast(ProjectListResult(projects: [cliProcessRecentProject]), as: Result.self)
+        case "session.inventory":
+            if holdSessionInventory {
+                await withCheckedContinuation { sessionInventoryWaiters.append($0) }
+            }
+            throw CLIProcessStubError.unexpectedMethod(method)
         default:
             throw CLIProcessStubError.unexpectedMethod(method)
         }
@@ -293,6 +311,16 @@ private struct CLIProcessResult {
     let stderr: String
 }
 
+private func decodeDoctorReport(_ output: String) throws -> DoctorReport {
+    let data = Data(output.utf8)
+    let envelope = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let result = try #require(envelope["result"] as? [String: Any])
+    return try JSONDecoder().decode(
+        DoctorReport.self,
+        from: JSONSerialization.data(withJSONObject: result)
+    )
+}
+
 /// Runs the real built binary with `arguments` plus `--socket socketPath`
 /// (when given), and returns its exit status, stdout, and stderr.
 ///
@@ -360,6 +388,42 @@ private func runCLI(
 @Suite("scanstudio-cli process", .timeLimit(.minutes(1)))
 struct ScanstudioCLIProcessTests {
     // MARK: Task 1 -- the shared runner, and connect/disconnect/rescan/status
+
+    @Test("doctor is repeatable against an absent isolated socket and creates no state")
+    func doctorAbsentSocketIsReadOnlyAndRepeatable() async throws {
+        let socket = shortSocketPath("doctor-absent")
+        let directory = (socket as NSString).deletingLastPathComponent
+        #expect(!FileManager.default.fileExists(atPath: directory))
+
+        let first = try await runCLI(["doctor"], socketPath: socket)
+        let second = try await runCLI(["doctor"], socketPath: socket)
+        #expect(first.exitCode == 0)
+        #expect(second.exitCode == 0)
+        #expect(try decodeDoctorReport(first.stdout).checks == decodeDoctorReport(second.stdout).checks)
+        #expect(!FileManager.default.fileExists(atPath: directory))
+    }
+
+    @Test("doctor closes a hello-success connection whose inventory never replies")
+    func doctorBoundsHostResponses() async throws {
+        let host = try await CLIProcessHost.start(label: "doctor-timeout")
+        defer { removeSocketDirectory(for: host.socketPath) }
+        await host.stub.holdSessionInventoryRequests()
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let result = try await runCLI(["doctor"], socketPath: host.socketPath)
+        let elapsed = started.duration(to: clock.now)
+        await host.stub.releaseSessionInventoryRequests()
+        await host.server.stop()
+
+        #expect(result.exitCode == 0)
+        #expect(elapsed < .seconds(6))
+        let report = try decodeDoctorReport(result.stdout)
+        let requestCounts = await host.stub.requestCounts
+        #expect(report.checks.first { $0.id == "socket.liveness" }?.status == .pass)
+        #expect(report.checks.first { $0.id == "bridge.liveVersion" }?.status == .warn)
+        #expect(requestCounts["session.inventory"] == 1)
+    }
 
     @Test("--help exits 0")
     func rootHelpExitsZero() async throws {

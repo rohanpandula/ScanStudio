@@ -254,6 +254,7 @@ pub struct SessionEvidenceFileAuthority {
 pub struct SessionInventoryResult {
     pub bridge_telemetry: Option<SessionEvidenceAuthority>,
     pub attempt_journals: Vec<SessionEvidenceFileAuthority>,
+    pub bridge_version: Option<String>,
 }
 
 // ---------------------------------------------------------------------

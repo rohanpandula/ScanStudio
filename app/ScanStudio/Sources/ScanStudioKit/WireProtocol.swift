@@ -322,6 +322,7 @@ public struct EngineSessionEvidenceFileAuthority: Decodable, Equatable, Sendable
 public struct EngineSessionInventoryResult: Decodable, Equatable, Sendable {
     public let bridgeTelemetry: EngineSessionEvidenceAuthority?
     public let attemptJournals: [EngineSessionEvidenceFileAuthority]?
+    public let bridgeVersion: String?
 }
 
 // MARK: - scanner.list

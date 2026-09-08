@@ -305,6 +305,10 @@ impl Backends {
             .unwrap_or_default()
     }
 
+    fn bridge_version(&self) -> Option<String> {
+        self.real.as_ref().map(|real| real.bridge_version())
+    }
+
     fn clear_session_evidence(&self) {
         if let Some(real) = &self.real {
             real.clear_session_evidence();
@@ -1263,6 +1267,7 @@ fn handle_request_with_correlation(
         "session.inventory" => to_json(&protocol::SessionInventoryResult {
             bridge_telemetry: backends.telemetry_evidence_identity(),
             attempt_journals: backends.attempt_journal_evidence(),
+            bridge_version: backends.bridge_version(),
         }),
         "scanner.list" => to_json(&protocol::ScannerListResult {
             devices: backends.list_devices()?,

@@ -449,7 +449,9 @@ public final class ControlChannelDispatcher {
             host: hostKind,
             hostPid: ProcessInfo.processInfo.processIdentifier,
             diagnosticSessionId: sessionModel.diagnosticSessionId,
-            projectDirectory: sessionModel.projectDirectory
+            projectDirectory: sessionModel.projectDirectory,
+            engineVersion: sessionModel.engineVersion,
+            availableDevices: sessionModel.availableDevices
         )))
     }
 
@@ -537,10 +539,15 @@ public final class ControlChannelDispatcher {
                   frames.count <= 10_000, frames.allSatisfy({ $0 > 0 }), Set(frames).count == frames.count else {
                 return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "Preflight frames must be unique positive indices; resume uses the cached pending set."))
             }
+            let capture = params.capture ?? sessionModel.captureRecipe
+            let outputs = params.outputs ?? sessionModel.outputRecipe
+            do { try ScanRecipePresetStore.validateRecipes(capture: capture, output: outputs) }
+            catch { return .failure(id: id, error: ControlErrorPayload(.invalidParams, message: "Invalid preflight recipe: \(error)")) }
             return .success(id: id, result: .scanPreflight(ScanPreflightReport.evaluate(
                 status: buildStatusResult(), frames: frames,
                 readiness: sessionModel.scanReadiness(for: frames),
-                capture: sessionModel.captureRecipe, outputs: sessionModel.outputRecipe
+                capture: capture, outputs: outputs,
+                expectedDeviceId: params.deviceId
             )))
         case .scannerList(let id):
             let errorMessageBefore = sessionModel.lastErrorMessage

@@ -4,9 +4,15 @@ import Darwin
 public struct ControlScanPreflightParams: Codable, Equatable, Sendable {
     public let frames: [Int]?
     public let resume: Bool?
-    public init(frames: [Int]? = nil, resume: Bool = false) {
+    public let capture: CaptureRecipe?
+    public let outputs: OutputRecipe?
+    public let deviceId: String?
+    public init(frames: [Int]? = nil, resume: Bool = false, capture: CaptureRecipe? = nil, outputs: OutputRecipe? = nil, deviceId: String? = nil) {
         self.frames = frames
         self.resume = resume
+        self.capture = capture
+        self.outputs = outputs
+        self.deviceId = deviceId
     }
 }
 
@@ -26,12 +32,18 @@ public struct ScanPreflightReport: Codable, Equatable, Sendable {
     public static func evaluate(
         status: ControlStatusResult, frames: [Int],
         readiness: ScanReadinessPolicy.Decision,
-        capture: CaptureRecipe, outputs: OutputRecipe
+        capture: CaptureRecipe, outputs: OutputRecipe,
+        expectedDeviceId: String? = nil
     ) -> Self {
         var checks: [Check] = []
         func check(_ code: String, _ passed: Bool, _ guidance: String) {
             checks.append(Check(code: code, passed: passed, guidance: guidance))
         }
+        check(
+            "DEVICE_MATCH",
+            expectedDeviceId == nil || status.device?.deviceId == expectedDeviceId,
+            "Connect the exact scanner named by the job before relying on this preflight."
+        )
         check("FRAMES_REQUIRED", !frames.isEmpty, "Select at least one frame.")
         let filmLoaded = status.device?.kind == "simulated"
             ? status.scanner?.mediaLoaded == true : status.scanner?.filmPresent == true

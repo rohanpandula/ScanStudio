@@ -95,7 +95,9 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
     private(set) var requestCounts: [String: Int] = [:]
     private(set) var recordedScanStopModes: [String] = []
     private(set) var recordedScanStarts: [ScanStartParams] = []
+    private(set) var previewOperationId: String?
     private var scriptedFailures: [String: EngineRequestError] = [:]
+    private var declarativeProjectDirectory: String?
     private var holdNextScanStart = false
     private var heldScanStartContinuation: CheckedContinuation<Void, Never>?
 
@@ -108,6 +110,10 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
 
     func requestCount(_ method: String) -> Int {
         requestCounts[method, default: 0]
+    }
+
+    func configureDeclarativeProject(directory: String) {
+        declarativeProjectDirectory = directory
     }
 
     func holdNextScanStartResponse() {
@@ -130,18 +136,48 @@ private actor ConfirmationEngineStub: EngineClientProtocol {
         case "scanner.list", "scanner.rescan":
             return try cast(ScannerListResult(devices: [confirmationDevice]), as: Result.self)
         case "scanner.connect":
+            let loaded = declarativeProjectDirectory != nil
             return try cast(ConnectResult(
                 device: confirmationDevice,
                 status: ScannerStatus(
-                    connected: true, adapter: "SA-21", mediaLoaded: false, carrier: nil,
-                    frameCount: nil, lamp: "unknown", transport: "idle", activeJobId: nil,
+                    connected: true, adapter: "SA-21", mediaLoaded: loaded,
+                    carrier: loaded ? "strip6" : nil, frameCount: loaded ? 1 : nil,
+                    lamp: loaded ? "stable" : "unknown", transport: "idle", activeJobId: nil,
                     filmPresent: nil, motionArmed: true
                 )
+            ), as: Result.self)
+        case "scanner.status":
+            return try cast(ScannerStatus(
+                connected: true, adapter: "SA-21", mediaLoaded: declarativeProjectDirectory != nil,
+                carrier: "strip6", frameCount: declarativeProjectDirectory == nil ? nil : 1,
+                lamp: "stable", transport: "idle", activeJobId: nil,
+                filmPresent: nil, motionArmed: true
             ), as: Result.self)
         case "scanner.disconnect", "scanner.eject":
             return try cast(EmptyResult(), as: Result.self)
         case "scanner.acquireThumbnails":
+            previewOperationId = (params as? AcquireThumbnailsParams)?.operationId
             return try cast(AcquireThumbnailsAck(accepted: true, frames: []), as: Result.self)
+        case "project.create":
+            guard let create = params as? ProjectCreateParams,
+                  let directory = declarativeProjectDirectory else {
+                throw ConfirmationStubError.unexpectedResultType
+            }
+            let project = ScanProject(
+                schemaVersion: 1,
+                id: "declarative-job-project",
+                name: create.name,
+                carrier: create.carrier,
+                frameCount: create.frameCount,
+                filmProcess: create.filmProcess,
+                recipes: confirmationProject().recipes,
+                rollMetadata: MetadataSet(),
+                createdAt: "2026-09-08T00:00:00Z",
+                frames: (1...create.frameCount).map {
+                    ProjectFrame(index: $0, excluded: create.excludedFrames?.contains($0) == true, receipts: [])
+                }
+            )
+            return try cast(ProjectCreateResult(project: project, directory: directory), as: Result.self)
         case "project.open":
             let directory = (params as? ProjectOpenParams)?.directory ?? confirmationProjectDirectory
             return try cast(
@@ -601,6 +637,89 @@ private final class ConfirmationEventsFollower: @unchecked Sendable {
 @Suite("scanstudio-cli confirmation", .timeLimit(.minutes(1)))
 struct ScanstudioCLIConfirmationTests {
     // MARK: Task 1 -- preview / review approve / eject confirmation gates (SAFE-01)
+
+    @Test("run JOB.json applies one validated mock workflow and retains the approved document")
+    func declarativeJobRunsThroughExistingRollWorkflow() async throws {
+        let host = try await ConfirmationHost.start(label: "declarative-job")
+        defer { removeConfirmationSocketDirectory(for: host.socketPath) }
+        await host.stub.configureDeclarativeProject(directory: host.projectDirectory)
+
+        let output = OutputRecipe(
+            archive: ArchiveRecipe(filenameTemplate: "Archive_####", destination: host.projectDirectory),
+            positive: PositiveRecipe(enabled: false, fileFormat: .tiff, colorProfile: .adobeRgb1998, filenameTemplate: "Positive_####", destination: host.projectDirectory),
+            preview: PreviewRecipe(enabled: false, fileFormat: .jpeg, maxLongEdgePx: 1_024, filenameTemplate: "Preview_####", destination: host.projectDirectory)
+        )
+        let job = ScanJobDocument(
+            schemaVersion: 1,
+            deviceId: confirmationDevice.deviceId,
+            roll: .init(name: "Declarative", carrier: .strip6, frameCount: 1, filmProcess: .positive),
+            frames: [1],
+            capture: CaptureRecipe(resolutionDpi: 4_000, bitDepth: 16, multisamplePasses: 4, channels: "rgbi"),
+            processing: ProcessingRecipe(filmProcess: .positive, autofocusEachFrame: true, autoExposureEachFrame: true, digitalIceEnabled: false, digitalIceMode: .legacy),
+            outputs: output,
+            confirmations: .init(filmLoaded: true, motion: true),
+            autoApprove: false,
+            wait: false
+        )
+        let jobPath = URL(fileURLWithPath: host.projectDirectory).appendingPathComponent("job.json")
+        try job.normalizedJSON().write(to: jobPath)
+
+        let requestsBeforeDryRun = await host.stub.requestCounts
+        let dryRun = try await runConfirmationCLI(["run", jobPath.path, "--dry-run"], socketPath: host.socketPath)
+        #expect(dryRun.exitCode == 65)
+        let dryEnvelope = try #require(JSONSerialization.jsonObject(with: Data(dryRun.stdout.utf8)) as? [String: Any])
+        let dryResult = try #require(dryEnvelope["result"] as? [String: Any])
+        #expect((dryResult["job"] as? [String: Any])?["schemaVersion"] as? Int == 1)
+        let dryPreflight = try #require(dryResult["preflight"] as? [String: Any])
+        #expect(dryPreflight["ready"] as? Bool == false)
+        let dryChecks = try #require(dryPreflight["checks"] as? [[String: Any]])
+        #expect(dryChecks.contains { $0["code"] as? String == "DEVICE_MATCH" && $0["passed"] as? Bool == false })
+        #expect(await host.stub.requestCounts == requestsBeforeDryRun)
+
+        var badJob = try #require(JSONSerialization.jsonObject(with: job.normalizedJSON()) as? [String: Any])
+        var badOutputs = try #require(badJob["outputs"] as? [String: Any])
+        var badArchive = try #require(badOutputs["archive"] as? [String: Any])
+        badArchive["destination"] = "/dev/null/not-a-directory"
+        badOutputs["archive"] = badArchive
+        badJob["outputs"] = badOutputs
+        let badPath = URL(fileURLWithPath: host.projectDirectory).appendingPathComponent("unwritable-job.json")
+        try JSONSerialization.data(withJSONObject: badJob).write(to: badPath)
+        let refused = try await runConfirmationCLI(
+            ["run", badPath.path, "--film-loaded", "--confirm-motion"], socketPath: host.socketPath
+        )
+        #expect(refused.exitCode == 65)
+        #expect(refused.stdout.contains("DESTINATION_NOT_WRITABLE"))
+        #expect(await host.stub.previewOperationId == nil)
+        #expect(await host.stub.requestCount("scan.start") == 0)
+
+        async let outcome = runConfirmationCLI(
+            ["run", jobPath.path, "--film-loaded", "--confirm-motion"],
+            socketPath: host.socketPath
+        )
+        for _ in 0..<11_000 where await host.stub.previewOperationId == nil {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let operationId = try #require(await host.stub.previewOperationId)
+        await host.model.handle(event: EngineEvent(
+            name: "scanner.thumbnail",
+            rawLine: Data(#"{"event":"scanner.thumbnail","payload":{"operationId":"\#(operationId)","frameIndex":1,"thumbnail":{"brightness":0.5,"tint":0.0}}}"#.utf8)
+        ))
+        await host.model.handle(event: EngineEvent(
+            name: "scanner.thumbnailsComplete",
+            rawLine: Data(#"{"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(operationId)","count":1}}"#.utf8)
+        ))
+
+        let result = try await outcome
+        #expect(result.exitCode == 0, Comment(rawValue: result.stderr))
+        let envelope = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        let receipt = try #require(envelope["result"] as? [String: Any])
+        let approvedPath = try #require(receipt["approvedJobPath"] as? String)
+        #expect(try ScanJobDocument.decode(Data(contentsOf: URL(fileURLWithPath: approvedPath))) == job)
+        #expect(await host.stub.requestCount("scan.start") == 1)
+        #expect(await host.stub.requestCount("project.create") == 1)
+
+        await host.server.stop()
+    }
 
     @Test("preview without --film-loaded exits 77 with CONFIRMATION_REQUIRED, and the host's fake engine recorded zero new requests")
     func previewWithoutFilmLoadedExitsConfirmationRequired() async throws {

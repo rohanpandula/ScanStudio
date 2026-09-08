@@ -450,6 +450,7 @@ public struct ControlRunReceipt: Codable, Equatable, Sendable {
     /// attempted or the write failed, so a caller can tell "no project
     /// directory yet" and "write failed" apart from "here is the file."
     public var receiptPath: String?
+    public var approvedJobPath: String?
 
     public init() {}
 

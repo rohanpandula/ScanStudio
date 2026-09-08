@@ -183,19 +183,26 @@ private enum RunCLILocator {
 /// continuation, never inline on Swift's cooperative thread pool --
 /// `ScanstudioCLIProcessTests.swift`'s own header explains why a direct
 /// inline call starves the suite under parallel execution.
-private func runRunCLI(_ arguments: [String]) async throws -> Int32 {
+private struct RunCLIResult {
+    let exitCode: Int32
+    let stdout: Data
+}
+
+private func runRunCLIResult(_ arguments: [String]) async throws -> RunCLIResult {
     let binary = try RunCLILocator.resolve()
-    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<RunCLIResult, Error>) in
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let process = Process()
                 process.executableURL = binary
                 process.arguments = arguments
-                process.standardOutput = Pipe()
-                process.standardError = Pipe()
+                let output = Pipe()
+                process.standardOutput = output
+                process.standardError = FileHandle.nullDevice
                 try process.run()
+                let stdout = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                continuation.resume(returning: process.terminationStatus)
+                continuation.resume(returning: RunCLIResult(exitCode: process.terminationStatus, stdout: stdout))
             } catch {
                 continuation.resume(throwing: error)
             }
@@ -203,8 +210,47 @@ private func runRunCLI(_ arguments: [String]) async throws -> Int32 {
     }
 }
 
+private func runRunCLI(_ arguments: [String]) async throws -> Int32 {
+    try await runRunCLIResult(arguments).exitCode
+}
+
 @Suite("roll run CLI smoke (no host)", .timeLimit(.minutes(1)))
 struct RollRunCLISmokeTests {
+    @Test("schema is offline and its job example and command inventory match the executable")
+    func schemaAndInvalidJobAreValidatedOffline() async throws {
+        let socket = "/tmp/gsd-no-host-schema-\(UUID().uuidString).sock"
+        let schema = try await runRunCLIResult(["schema", "--socket", socket])
+        #expect(schema.exitCode == 0)
+        let envelope = try #require(JSONSerialization.jsonObject(with: schema.stdout) as? [String: Any])
+        let result = try #require(envelope["result"] as? [String: Any])
+        let jobContract = try #require(result["job"] as? [String: Any])
+        let example = try #require(jobContract["example"] as? [String: Any])
+        _ = try ScanJobDocument.decode(JSONSerialization.data(withJSONObject: example))
+        let exits = try #require(result["exitCodes"] as? [String: Any])
+        #expect((exits["waitTimedOut"] as? NSNumber)?.intValue == 124)
+        let commands = try #require(result["commands"] as? [[String: Any]])
+        let names = Set(commands.compactMap { $0["command"] as? String })
+        #expect(names.isSuperset(of: ["run", "scan"]))
+
+        let validFile = FileManager.default.temporaryDirectory.appendingPathComponent("valid-job-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: validFile) }
+        try JSONSerialization.data(withJSONObject: example).write(to: validFile)
+        let dryRun = try await runRunCLIResult(["run", validFile.path, "--dry-run", "--socket", socket])
+        #expect(dryRun.exitCode == 69)
+        #expect(!FileManager.default.fileExists(atPath: socket))
+        #expect(!FileManager.default.fileExists(atPath: socket + ".host.log"))
+
+        var invalid = example
+        invalid["schemaVersion"] = 2
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("invalid-job-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try JSONSerialization.data(withJSONObject: invalid).write(to: file)
+        let rejected = try await runRunCLIResult([
+            "run", file.path, "--film-loaded", "--confirm-motion", "--socket", socket,
+        ])
+        #expect(rejected.exitCode == 64)
+    }
+
     /// Points at a socket path nothing is listening on: if either gate
     /// below failed to fire before a connection attempt, the exit code
     /// would be 69 (HOST_UNREACHABLE), not 77 -- so this also proves

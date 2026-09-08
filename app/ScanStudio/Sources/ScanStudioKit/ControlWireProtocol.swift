@@ -217,6 +217,8 @@ public struct ControlHelloResult: Codable, Equatable, Sendable {
     public let hostPid: Int32
     public let diagnosticSessionId: String?
     public let projectDirectory: String?
+    public let engineVersion: String?
+    public let availableDevices: [DeviceInfo]?
 
     public init(
         schemaVersion: Int,
@@ -225,7 +227,9 @@ public struct ControlHelloResult: Codable, Equatable, Sendable {
         host: ControlHostKind = .gui,
         hostPid: Int32 = ProcessInfo.processInfo.processIdentifier,
         diagnosticSessionId: String? = nil,
-        projectDirectory: String? = nil
+        projectDirectory: String? = nil,
+        engineVersion: String? = nil,
+        availableDevices: [DeviceInfo]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.appName = appName
@@ -234,6 +238,8 @@ public struct ControlHelloResult: Codable, Equatable, Sendable {
         self.hostPid = hostPid
         self.diagnosticSessionId = diagnosticSessionId
         self.projectDirectory = projectDirectory
+        self.engineVersion = engineVersion
+        self.availableDevices = availableDevices
     }
 }
 
@@ -1068,10 +1074,16 @@ public struct ControlSessionEvidenceEntry: Codable, Equatable, Sendable {
 public struct ControlSessionInventoryResult: Codable, Equatable, Sendable {
     public let diagnosticSessionId: String
     public let entries: [ControlSessionEvidenceEntry]
+    public let bridgeVersion: String?
 
-    public init(diagnosticSessionId: String, entries: [ControlSessionEvidenceEntry]) {
+    public init(
+        diagnosticSessionId: String,
+        entries: [ControlSessionEvidenceEntry],
+        bridgeVersion: String? = nil
+    ) {
         self.diagnosticSessionId = diagnosticSessionId
         self.entries = entries
+        self.bridgeVersion = bridgeVersion
     }
 }
 

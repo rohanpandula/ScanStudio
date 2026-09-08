@@ -5777,6 +5777,7 @@ public final class SessionModel {
         }
         let telemetry: ControlSessionEvidenceEntry
         let attemptJournals: [ControlSessionEvidenceEntry]
+        let bridgeVersion: String?
         do {
             let engineInventory: EngineSessionInventoryResult = try await engineClient.request(
                 "session.inventory",
@@ -5797,6 +5798,7 @@ public final class SessionModel {
                 )
             }
             let retainedJournals = engineInventory.attemptJournals ?? []
+            bridgeVersion = engineInventory.bridgeVersion
             if retainedJournals.isEmpty {
                 attemptJournals = [.init(
                     entryName: "attempt-journals",
@@ -5815,6 +5817,7 @@ public final class SessionModel {
                 }
             }
         } catch {
+            bridgeVersion = nil
             telemetry = .init(
                 entryName: "bridge-telemetry.jsonl",
                 sourceKind: "bridgeTelemetry",
@@ -5828,7 +5831,8 @@ public final class SessionModel {
         }
         return ControlSessionInventoryResult(
             diagnosticSessionId: diagnosticTimeline.sessionID,
-            entries: [diagnostics, telemetry] + attemptJournals
+            entries: [diagnostics, telemetry] + attemptJournals,
+            bridgeVersion: bridgeVersion
         )
     }
 

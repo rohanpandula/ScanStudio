@@ -526,3 +526,27 @@ that marked service. Existing plists are never overwritten. Failed launchctl
 operations retain the plist for inspection. The service starts the resident
 host at login and uses private logs; it does not restart failed hosts or run a
 scan job. Motion still requires an explicit CLI request and its confirmations.
+
+## Declarative jobs and diagnostics
+
+`schema` returns an offline command inventory, current help, exit codes, and a
+versioned job example. Use `schema | jq '.result.job.example' > job.json` as a
+starting point. Set the scanner ID, selected frames, recipes, and destinations
+before setting the document's film/motion confirmations to true.
+
+`run job.json --dry-run` validates the document and reads cached host gates
+without starting a host or changing settings. It includes the requested device
+identity and hypothetical output recipe. Registration can still be unavailable
+before preview; a dry-run is not a guarantee that a later scan will succeed.
+`run job.json --film-loaded --confirm-motion` connects the named scanner,
+checks readiness and output space, acquires a preview, creates the roll, and
+starts its selected frames through the existing scan path. It requires a host
+with no open project, rechecks the complete preflight before capture, and saves
+the approved normalized job beside the run receipt. Imported exposure locks
+are refused because they belong to an already identified scanner/project.
+
+`doctor` reports independent installation, socket, cached host/scanner, and
+IORegistry USB topology checks. It does not start a host, refresh a scanner,
+open USB, or remove stale files. Unknown facts are warnings; proven failures
+produce exit 65. A stalled host query stops after two seconds so the other
+diagnostic rows can still be returned.

@@ -20,6 +20,7 @@ struct ScanstudioCLI: AsyncParsableCommand {
             Frames.self, Settings.self, Outputs.self, Preset.self, Roll.self, Diagnostics.self,
             Preview.self, Review.self, Eject.self,
             Scan.self, Stop.self, Resume.self,
+            RunJob.self, Schema.self, Doctor.self,
             Events.self, Sim.self, Session.self, Link.self, Wait.self, Host.self
         ]
     )

@@ -2690,6 +2690,10 @@ impl RealLs5000 {
         })
     }
 
+    pub(crate) fn bridge_version(&self) -> String {
+        self.bridge.hello_info().bridge_version
+    }
+
     pub(crate) fn attempt_journal_evidence(
         &self,
     ) -> Vec<crate::protocol::SessionEvidenceFileAuthority> {
