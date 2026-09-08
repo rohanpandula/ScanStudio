@@ -82,7 +82,7 @@ struct Status: AsyncParsableCommand {
     @Flag(name: .customLong("refresh"), help: "Ask the scanner for its live state (scanner.refresh) before reporting status. Not side-effect-free: it probes the scanner over the wire rather than reading only in-memory state. Moves nothing.")
     var refresh = false
 
-    @Flag(name: .customLong("watch"), help: "Stream film and registration changes from events.subscribe. Does not refresh or poll the scanner.")
+    @Flag(name: .customLong("watch"), help: "Stream film and registration changes from events.subscribe. The host monitors an idle real scanner while observed.")
     var watch = false
 
     mutating func validate() throws {
@@ -168,10 +168,10 @@ struct Status: AsyncParsableCommand {
         try await finishStatus(client: client, response: response, reconnected: reconnected)
     }
 
-    /// Watches the aggregate event stream without opening a second status
-    /// request, refreshing the scanner, or polling. The subscribe result is
-    /// the baseline; later snapshots are emitted only when the typed film or
-    /// registration identity changes. Other control events remain available
+    /// Watches the aggregate event stream without client-side polling. The
+    /// host owns one shared idle-status monitor while any observer exists.
+    /// The subscribe result is the baseline; later snapshots are emitted only
+    /// when the typed film or registration identity changes. Other control events remain available
     /// through `events --follow`, which deliberately has no filtering.
     private func watchStatus(client: ControlChannelClient) async throws {
         let response = try await CommandRunner.request(

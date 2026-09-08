@@ -19,6 +19,7 @@
 // artifact of its own and never opens any of the project's existing ones.
 
 import ArgumentParser
+import CryptoKit
 import Foundation
 import ScanStudioKit
 
@@ -95,6 +96,9 @@ extension Roll {
         @Flag(name: .customLong("wait"), inversion: .prefixedNo, help: "Wait for the job to reach a terminal state before returning. On by default; pass --no-wait to return immediately once the scan starts (or once a review is left pending).")
         var wait = true
 
+        @Flag(name: .customLong("hopper"), help: "After each completed roll, eject and wait for freshly loaded film before running the next numbered roll.")
+        var hopper = false
+
         /// Two independent statements, exactly like `Roll.Save`'s own gate
         /// (RollCommands.swift) and `Preview`'s own gate
         /// (MotionCommands.swift) -- never one combined check, so a future
@@ -122,17 +126,33 @@ extension Roll {
                 print(text, terminator: "")
                 throw ExitCode(77)
             }
+            guard !hopper || wait else {
+                throw ValidationError("--hopper requires --wait; remove --no-wait")
+            }
         }
 
         func run() async throws {
-            try await RollRun.run(
+            guard hopper else {
+                _ = try await RollRun.run(
+                    name: name,
+                    carrier: carrier,
+                    requestedFrameCount: frameCount,
+                    filmProcess: filmProcess,
+                    skipBlank: skipBlank,
+                    autoApprove: autoApprove,
+                    wait: wait,
+                    allowUnverifiedHardware: allowUnverifiedHardware,
+                    options: options
+                )
+                return
+            }
+            try await HopperRun.run(
                 name: name,
                 carrier: carrier,
                 requestedFrameCount: frameCount,
                 filmProcess: filmProcess,
                 skipBlank: skipBlank,
                 autoApprove: autoApprove,
-                wait: wait,
                 allowUnverifiedHardware: allowUnverifiedHardware,
                 options: options
             )
@@ -157,7 +177,7 @@ enum RollRun {
         allowUnverifiedHardware: Bool,
         options: GlobalOptions,
         job: ScanJobDocument? = nil
-    ) async throws {
+    ) async throws -> ControlRunReceipt {
         let command = job == nil ? "roll.run" : "run"
         let client = try await CommandRunner.openConnection(command: command, options: options)
         var receipt = ControlRunReceipt()
@@ -168,8 +188,7 @@ enum RollRun {
                 command: command, options: options, client: client,
                 receipt: &receipt, exitCode: &exitCode
             ) else {
-                try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
-                return
+                return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
             }
             guard let initialStatus = try? JSONDecoder().decode(ControlStatusResult.self, from: initialData) else {
                 try await CommandRunner.fail(command: command, options: options, client: client, error: ControlChannelClientError.malformedResponse)
@@ -183,13 +202,11 @@ enum RollRun {
                     payload, step: "initialProject", command: "status",
                     startedAt: ControlRunReceipt.isoTimestamp(), receipt: &receipt
                 )
-                try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
-                return
+                return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
             }
             guard try await sendStep("connect", method: "scanner.connect", params: ControlScannerConnectParams(deviceId: job.deviceId, allowUnverifiedHardware: allowUnverifiedHardware),
                                     command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode) != nil else {
-                try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
-                return
+                return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
             }
         }
 
@@ -200,7 +217,7 @@ enum RollRun {
             command: command, options: options, client: client, receipt: &receipt, exitCode: &exitCode
         )
 
-        try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
+        return try await finish(receipt: receipt, exitCode: exitCode, command: command, options: options, client: client)
     }
 
     // MARK: - The walk itself (D-15's seven numbered steps)
@@ -667,7 +684,7 @@ enum RollRun {
         command: String,
         options: GlobalOptions,
         client: ControlChannelClient
-    ) async throws {
+    ) async throws -> ControlRunReceipt {
         var receipt = receipt
         if let directory = receipt.project?.directory {
             do {
@@ -679,11 +696,160 @@ enum RollRun {
 
         let object = (try? JSONSerialization.jsonObject(with: try receipt.encodedJSON())) as? [String: Any] ?? [:]
         let text = try ControlCLIOutput.renderResult(command: command, resultJSON: object, human: options.human, context: await client.cliEnvelopeContext)
-        print(text, terminator: "")
+        FileHandle.standardOutput.write(Data(text.utf8))
         await client.shutdown()
 
         guard exitCode == 0 else {
             throw ExitCode(exitCode)
         }
+        return receipt
+    }
+}
+
+enum HopperRun {
+    static func run(
+        name: String,
+        carrier: SimulatedFilmCarrier,
+        requestedFrameCount: Int?,
+        filmProcess: FilmProcess,
+        skipBlank: Bool,
+        autoApprove: Bool,
+        allowUnverifiedHardware: Bool,
+        options: GlobalOptions
+    ) async throws {
+        var sequence = 1
+        while true {
+            var rollOptions = options
+            rollOptions.idempotencyKey = sequenceKey(base: options.idempotencyKey, sequence: sequence)
+            let receipt = try await RollRun.run(
+                name: rollName(base: name, sequence: sequence),
+                carrier: carrier,
+                requestedFrameCount: requestedFrameCount,
+                filmProcess: filmProcess,
+                skipBlank: skipBlank,
+                autoApprove: autoApprove,
+                wait: true,
+                allowUnverifiedHardware: allowUnverifiedHardware,
+                options: rollOptions
+            )
+            guard receipt.jobState == String(describing: JobState.completed) else {
+                try await emitFailure(
+                    ControlErrorPayload(
+                        .gateRefused,
+                        message: "Hopper mode stopped because roll \(sequence) did not complete."
+                    ),
+                    options: rollOptions
+                )
+            }
+            try await awaitFreshFilm(options: rollOptions)
+            sequence += 1
+        }
+    }
+
+    static func rollName(base: String, sequence: Int) -> String {
+        "\(base)-\(String(format: "%03d", sequence))"
+    }
+
+    static func sequenceKey(base: String?, sequence: Int) -> String? {
+        guard let base else { return nil }
+        let suffix = ":hopper:\(sequence)"
+        if (base + suffix).utf8.count <= 128 { return base + suffix }
+        let digest = SHA256.hash(data: Data(base.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "hopper:\(digest):\(sequence)"
+    }
+
+    private static func awaitFreshFilm(options: GlobalOptions) async throws {
+        let command = "roll.run"
+        let client = try await CommandRunner.openConnection(command: command, options: options)
+        let subscribe = try await CommandRunner.request(
+            command: command,
+            method: "events.subscribe",
+            params: EmptyParams(),
+            options: options,
+            client: client
+        )
+        guard case .result(let data) = subscribe else {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: subscribe)
+            return
+        }
+        guard let subscribed = try? JSONDecoder().decode(ControlEventsSubscribeResult.self, from: data) else {
+            try await CommandRunner.fail(
+                command: command,
+                options: options,
+                client: client,
+                error: ControlChannelClientError.malformedResponse
+            )
+        }
+        let events = await client.events()
+        do {
+            let idle = try await ControlEventWaiter.wait(
+                initial: subscribed.snapshot,
+                events: events,
+                condition: .idle,
+                timeout: 86_400
+            )
+            let eject = try await CommandRunner.request(
+                command: command,
+                method: "scanner.eject",
+                params: ControlScannerEjectParams(motionConfirmed: true),
+                options: options,
+                client: client
+            )
+            guard case .result = eject else {
+                try await CommandRunner.finish(command: command, options: options, client: client, response: eject)
+                return
+            }
+            let absent = try await ControlEventWaiter.wait(
+                initial: idle,
+                events: events,
+                condition: .filmAbsent,
+                timeout: 86_400
+            )
+            let close = try await CommandRunner.request(
+                command: command,
+                method: "roll.closeCompleted",
+                params: EmptyParams(),
+                options: options,
+                client: client
+            )
+            guard case .result = close else {
+                try await CommandRunner.finish(command: command, options: options, client: client, response: close)
+                return
+            }
+            _ = try await ControlEventWaiter.wait(
+                initial: absent,
+                events: events,
+                condition: .filmPresent,
+                timeout: 86_400
+            )
+            await client.shutdown()
+        } catch ControlEventWaitFailure.timeout {
+            try await CommandRunner.finish(
+                command: command,
+                options: options,
+                client: client,
+                response: .failure(ControlErrorPayload(
+                    code: ControlCLIErrorCode.waitTimeout.rawValue,
+                    message: "Hopper mode timed out waiting for the scanner state to advance.",
+                    recoverable: false
+                ))
+            )
+        } catch ControlEventWaitFailure.hostExited, ControlEventWaitFailure.streamEnded {
+            await client.shutdown()
+            throw ExitCode(ControlCLIExitCode.hostExited.rawValue)
+        }
+    }
+
+    private static func emitFailure(_ payload: ControlErrorPayload, options: GlobalOptions) async throws -> Never {
+        let client = try await CommandRunner.openConnection(command: "roll.run", options: options)
+        try await CommandRunner.finish(
+            command: "roll.run",
+            options: options,
+            client: client,
+            response: .failure(payload)
+        )
+        fatalError("failure response unexpectedly returned")
     }
 }

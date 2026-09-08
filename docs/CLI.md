@@ -487,8 +487,9 @@ receipts and included by `roll collect`; an all-skipped pass has no measured
 exposure/clipping result. Simulator scans refuse this hardware-only option.
 
 `status --watch` emits an initial snapshot and subsequent film/registration
-changes from one event subscription. It does not poll or refresh the scanner;
-`--job` and `--refresh` cannot be combined with it. A new `previewOperationId`
+changes from one event subscription. The client sends no polling requests; the
+host performs one shared, non-motion status check while an idle real scanner is
+actively observed. `--job` and `--refresh` cannot be combined with it. A new `previewOperationId`
 distinguishes replacement previews. Both `status --watch` and `events --follow`
 retain `control.dropped` notices. Established connection EOF emits one local
 `control.hostExited` event and exits **76**. This means observation was lost;

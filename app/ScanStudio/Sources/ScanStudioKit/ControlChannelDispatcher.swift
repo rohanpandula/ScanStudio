@@ -57,6 +57,7 @@ public enum ControlRequest: Sendable {
     case outputsGet(id: UInt64)
     case outputsSet(id: UInt64, params: ControlOutputsSetParams)
     case rollSave(id: UInt64, params: ControlRollSaveParams)
+    case rollCloseCompleted(id: UInt64)
     case rollOpen(id: UInt64, params: ControlRollOpenParams)
     case rollList(id: UInt64)
     case rollSolveExposure(id: UInt64, params: ControlRollSolveExposureParams)
@@ -86,7 +87,7 @@ extension ControlRequest {
     public static let mutatingMethodNames: Set<String> = [
         "scanner.list", "scanner.rescan", "scanner.refresh", "scanner.connect", "scanner.disconnect",
         "sim.loadMedia", "preview.acquire", "frames.select", "frames.place", "frames.include",
-        "frames.exclude", "review.approve", "settings.set", "outputs.set", "roll.save", "roll.open",
+        "frames.exclude", "review.approve", "settings.set", "outputs.set", "roll.save", "roll.closeCompleted", "roll.open",
         "roll.list", "roll.solveExposure", "roll.render", "roll.export", "roll.metadataApply", "roll.collect", "scan.start",
         "scan.stop", "scan.resume", "scanner.eject", "review.cancel",
     ]
@@ -113,6 +114,7 @@ extension ControlRequest {
         case .outputsGet(let id): id
         case .outputsSet(let id, _): id
         case .rollSave(let id, _): id
+        case .rollCloseCompleted(let id): id
         case .rollOpen(let id, _): id
         case .rollList(let id): id
         case .rollSolveExposure(let id, _), .rollRender(let id, _), .rollExport(let id, _), .rollMetadataApply(let id, _): id
@@ -153,6 +155,7 @@ extension ControlRequest {
         case .outputsGet: "outputs.get"
         case .outputsSet: "outputs.set"
         case .rollSave: "roll.save"
+        case .rollCloseCompleted: "roll.closeCompleted"
         case .rollOpen: "roll.open"
         case .rollList: "roll.list"
         case .rollSolveExposure: "roll.solveExposure"
@@ -378,6 +381,7 @@ public final class ControlChannelDispatcher {
         case "outputs.get": return decoded(EmptyParams.self) { id, _ in .outputsGet(id: id) }
         case "outputs.set": return decoded(ControlOutputsSetParams.self) { .outputsSet(id: $0, params: $1) }
         case "roll.save": return decoded(ControlRollSaveParams.self) { .rollSave(id: $0, params: $1) }
+        case "roll.closeCompleted": return decoded(EmptyParams.self) { id, _ in .rollCloseCompleted(id: id) }
         case "roll.open": return decoded(ControlRollOpenParams.self) { .rollOpen(id: $0, params: $1) }
         case "roll.list": return decoded(EmptyParams.self) { id, _ in .rollList(id: id) }
         case "roll.solveExposure": return decoded(ControlRollSolveExposureParams.self) { .rollSolveExposure(id: $0, params: $1) }
@@ -443,6 +447,9 @@ public final class ControlChannelDispatcher {
         }
         if let refusal = confirmationRefusal(for: request) {
             return refusal
+        }
+        if request.isMutating {
+            await sessionModel.waitForPendingStatusRefresh()
         }
         if request.isMutating, let inFlight = sessionModel.mutatingOperationInFlight {
             let controller = sessionModel.mutatingOperationController ?? "unknown controller"
@@ -979,6 +986,10 @@ public final class ControlChannelDispatcher {
                 projectDirectory: sessionModel.projectDirectory,
                 outcome: isPendingReview ? "manualReviewPending" : "started"
             )))
+        case .rollCloseCompleted(let id):
+            let errorMessageBefore = sessionModel.lastErrorMessage
+            sessionModel.closeCompletedProjectAfterEject()
+            return outcome(id: id, errorMessageBefore: errorMessageBefore)
         case .rollOpen(let id, let params):
             let errorMessageBefore = sessionModel.lastErrorMessage
             await sessionModel.openProject(directory: params.directory)
@@ -1835,6 +1846,7 @@ public final class ControlChannelDispatcher {
     public func subscribeToEvents() -> AsyncStream<Data> {
         let subscriptionId = UUID()
         activeEventSubscriptions.insert(subscriptionId)
+        sessionModel.beginIdleScannerStatusObservation()
         return AsyncStream { continuation in
             if let data = Self.encodedEvent(name: Self.snapshotEventName, snapshot: buildStatusResult(), hardwareVerification: currentHardwareVerification) {
                 continuation.yield(data)
@@ -1842,7 +1854,10 @@ public final class ControlChannelDispatcher {
             armEventObservation(subscriptionId: subscriptionId, continuation: continuation)
             continuation.onTermination = { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.activeEventSubscriptions.remove(subscriptionId)
+                    guard let self,
+                          self.activeEventSubscriptions.remove(subscriptionId) != nil
+                    else { return }
+                    self.sessionModel.endIdleScannerStatusObservation()
                 }
             }
         }

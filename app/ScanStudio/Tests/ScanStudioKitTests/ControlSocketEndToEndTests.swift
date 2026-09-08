@@ -161,8 +161,8 @@ private struct EndToEndHost {
         (try? await waitForStatus { $0["jobId"] == nil || $0["jobId"] is NSNull }) ?? false
     }
 
-    func loadMedia(previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async throws {
-        var args = ["sim", "load-media", "--carrier", "strip6"]
+    func loadMedia(carrier: String = "strip6", previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async throws {
+        var args = ["sim", "load-media", "--carrier", carrier]
         if let previewFixture { args += ["--preview-fixture", previewFixture] }
         if let abortAtFrame { args += ["--abort-at-frame", String(abortAtFrame)] }
         if let abortCode { args += ["--abort-code", abortCode] }
@@ -410,8 +410,8 @@ private final class E2EEventsFollower: @unchecked Sendable {
     /// baseline. The same reader and timeout as `waitForFirstLine` keep the
     /// process test deterministic without adding another harness.
     @MainActor
-    func waitForLine(where predicate: ([String: Any]) -> Bool) async -> [String: Any]? {
-        for _ in 0..<2_000 {
+    func waitForLine(attempts: Int = 2_000, where predicate: ([String: Any]) -> Bool) async -> [String: Any]? {
+        for _ in 0..<attempts {
             for line in buffer.snapshot() {
                 if let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                    predicate(object) {
@@ -1482,6 +1482,83 @@ struct ControlSocketEndToEndTests {
             await host.stop()
             throw error
         }
+        await host.stop()
+    }
+
+    @Test("hopper waits for a newly loaded roll, creates distinct jobs, and stops on the first refusal")
+    func hopperFreshFilmSequence() async throws {
+        let host = try await EndToEndHost.start()
+        var hopper: E2EEventsFollower?
+        do {
+            let connected = try await runE2ECLI(
+                ["connect", "--device", "sim-ls5000-0"],
+                socketPath: host.socketPath
+            )
+            #expect(connected.exitCode == 0, Comment(rawValue: connected.context))
+            let settings = try await runE2ECLI(
+                ["settings", "set", "--resolution", "100"],
+                socketPath: host.socketPath
+            )
+            #expect(settings.exitCode == 0, Comment(rawValue: settings.context))
+            try await host.loadMedia(carrier: "mounted", previewFixture: "textured")
+
+            let process = try E2EEventsFollower(
+                socketPath: host.socketPath,
+                commandArguments: [
+                    "roll", "run", "--hopper", "--name", "hopper",
+                    "--carrier", "mounted", "--frame-count", "1",
+                    "--film-process", "positive", "--film-loaded",
+                    "--confirm-motion", "--quiet", "--key", "hopper-test"
+                ]
+            )
+            hopper = process
+
+            func receiptLine(named name: String) async -> [String: Any]? {
+                await process.waitForLine(attempts: 12_000) { envelope in
+                    guard let result = envelope["result"] as? [String: Any],
+                          let project = result["project"] as? [String: Any] else { return false }
+                    return project["name"] as? String == name
+                }
+            }
+
+            let first = try #require(
+                await receiptLine(named: "hopper-001"),
+                Comment(rawValue: "hopper output: \(process.parsedLines())")
+            )
+            #expect((first["result"] as? [String: Any])?["jobState"] as? String == "completed")
+            #expect(try await host.waitForStatus {
+                ($0["scanner"] as? [String: Any])?["mediaLoaded"] as? Bool == false
+            })
+            try await host.loadMedia(carrier: "mounted", previewFixture: "textured")
+
+            let second = try #require(await receiptLine(named: "hopper-002"))
+            #expect((second["result"] as? [String: Any])?["jobState"] as? String == "completed")
+            #expect(try await host.waitForStatus {
+                ($0["scanner"] as? [String: Any])?["mediaLoaded"] as? Bool == false
+            })
+            try await host.loadMedia(
+                carrier: "mounted",
+                previewFixture: "textured",
+                abortAtFrame: 1,
+                abortCode: "FEED_JAM"
+            )
+
+            let third = try #require(await receiptLine(named: "hopper-003"))
+            #expect((third["result"] as? [String: Any])?["jobState"] as? String == "failed")
+            let exit = await process.waitForExit()
+            #expect(exit != nil && exit != 0)
+
+            let receipts = process.parsedLines().compactMap { $0["result"] as? [String: Any] }
+                .filter { $0["project"] != nil }
+            #expect(receipts.count == 3)
+            #expect(Set(receipts.compactMap { $0["jobId"] as? String }).count == 3)
+            #expect(Set(receipts.compactMap { $0["receiptPath"] as? String }).count == 3)
+        } catch {
+            hopper?.terminate()
+            await host.stop()
+            throw error
+        }
+        hopper?.terminate()
         await host.stop()
     }
 }

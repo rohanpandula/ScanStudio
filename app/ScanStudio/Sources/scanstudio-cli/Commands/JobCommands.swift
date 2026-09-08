@@ -35,7 +35,7 @@ struct RunJob: AsyncParsableCommand {
         }
         try requireExecutionConfirmations(job)
         FileHandle.standardError.write(try job.normalizedJSON() + Data("\n".utf8))
-        try await RollRun.run(
+        _ = try await RollRun.run(
             name: job.roll.name,
             carrier: job.roll.carrier,
             requestedFrameCount: job.roll.frameCount,

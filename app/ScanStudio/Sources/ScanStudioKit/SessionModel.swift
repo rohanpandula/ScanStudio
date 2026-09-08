@@ -649,6 +649,10 @@ public final class SessionModel {
     /// state and to reject overlapping button presses.
     public private(set) var isConnectingDevice = false
     public private(set) var isRefreshingScannerStatus = false
+    private let idleStatusRefreshInterval: Duration
+    private var idleStatusObserverCount = 0
+    private var idleStatusMonitorTask: Task<Void, Never>?
+    private var pendingStatusRefreshWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
     /// The single explicit signal naming whichever mutating operation (if
     /// any) is currently in flight. `nil` when idle; otherwise the D-05
     /// command name of the operation currently running (for example
@@ -1535,10 +1539,12 @@ public final class SessionModel {
     public init(
         engineClient: any EngineClientProtocol,
         preferences: UserDefaults = .standard,
-        diagnosticsDirectory: URL? = nil
+        diagnosticsDirectory: URL? = nil,
+        idleStatusRefreshInterval: Duration = .seconds(1)
     ) {
         self.engineClient = engineClient
         self.preferences = preferences
+        self.idleStatusRefreshInterval = idleStatusRefreshInterval
         self.allowUnverifiedHardware = preferences.bool(forKey: Self.allowUnverifiedHardwareKey)
         self.diagnosticTimeline = SessionDiagnosticTimeline(
             sessionID: UUID().uuidString.lowercased(),
@@ -1618,10 +1624,7 @@ public final class SessionModel {
         pendingStatusRefresh = marker
         isRefreshingScannerStatus = true
         defer {
-            if pendingStatusRefresh?.id == marker.id {
-                pendingStatusRefresh = nil
-                isRefreshingScannerStatus = false
-            }
+            finishStatusRefresh(marker)
         }
 
         do {
@@ -1657,6 +1660,8 @@ public final class SessionModel {
             if !refeedRequired {
                 lastErrorMessage = nil
             }
+        } catch is CancellationError {
+            return
         } catch {
             guard pendingStatusRefresh?.id == marker.id,
                   connectionEpoch == marker.connectionEpoch
@@ -1666,6 +1671,67 @@ public final class SessionModel {
             recordOperationFailure(error, operation: "scanner.status")
             lastErrorMessage = Self.describe(error)
         }
+    }
+
+    /// One host-owned liveness probe serves every control event observer.
+    /// It is active only for an idle real scanner; simulator state already
+    /// arrives as events from explicit simulator operations.
+    func beginIdleScannerStatusObservation() {
+        idleStatusObserverCount += 1
+        scheduleIdleStatusRefreshIfNeeded()
+    }
+
+    func endIdleScannerStatusObservation() {
+        idleStatusObserverCount = max(0, idleStatusObserverCount - 1)
+        guard idleStatusObserverCount == 0 else { return }
+        // EngineClient cancellation stops waiting locally; it cannot retract
+        // a request the engine already received. Let an admitted probe finish
+        // so a following mutation cannot overlap it on the scanner.
+        guard !isRefreshingScannerStatus else { return }
+        idleStatusMonitorTask?.cancel()
+        idleStatusMonitorTask = nil
+    }
+
+    /// Mutating control requests wait for an already-admitted read-only
+    /// probe. This avoids both overlapping scanner requests and a transient
+    /// CONTROLLER_BUSY refusal caused solely by observation.
+    func waitForPendingStatusRefresh() async {
+        guard let marker = pendingStatusRefresh else { return }
+        await withCheckedContinuation { continuation in
+            pendingStatusRefreshWaiters[marker.id, default: []].append(continuation)
+        }
+    }
+
+    private func scheduleIdleStatusRefreshIfNeeded() {
+        guard idleStatusObserverCount > 0,
+              idleStatusMonitorTask == nil,
+              diagnosticUIConnected,
+              device?.kind == "real" else { return }
+        idleStatusMonitorTask = Task { @MainActor [weak self] in
+            guard let interval = self?.idleStatusRefreshInterval else { return }
+            do {
+                try await Task.sleep(for: interval)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            if self.mutatingOperationInFlight == nil,
+               self.status?.transport == "idle" {
+                await self.refreshScannerStatus()
+            }
+            guard !Task.isCancelled else { return }
+            self.idleStatusMonitorTask = nil
+            self.scheduleIdleStatusRefreshIfNeeded()
+        }
+    }
+
+    private func finishStatusRefresh(_ marker: PendingStatusRefresh) {
+        if pendingStatusRefresh?.id == marker.id {
+            pendingStatusRefresh = nil
+            isRefreshingScannerStatus = false
+        }
+        let waiters = pendingStatusRefreshWaiters.removeValue(forKey: marker.id) ?? []
+        for waiter in waiters { waiter.resume() }
     }
 
     /// Connects to a specific device by id. A nil target reuses the previous
@@ -1759,6 +1825,7 @@ public final class SessionModel {
                     "transport": result.status.transport,
                 ]
             )
+            scheduleIdleStatusRefreshIfNeeded()
         } catch is CancellationError {
             // A cancelled connect should silently restore the idle affordance.
             recordDiagnostic(event: "device.connect.cancelled")
@@ -1784,6 +1851,8 @@ public final class SessionModel {
             multisampleCoercionNote = nil
             refeedRequired = false
             clearMediaState()
+            idleStatusMonitorTask?.cancel()
+            idleStatusMonitorTask = nil
             recordDiagnostic(event: "device.disconnect.succeeded")
         } catch {
             recordOperationFailure(error, operation: "device.disconnect")
@@ -3229,6 +3298,31 @@ public final class SessionModel {
             frames: requestedFrames
         )
         return started || pendingManualReviewScan?.frames == requestedFrames
+    }
+
+    /// Releases only the in-memory project selection used by hopper mode.
+    /// The completed manifest and its evidence remain untouched on disk.
+    /// `project.create` replaces the engine's active project only after the
+    /// next manifest is created, so no separate engine mutation is needed.
+    public func closeCompletedProjectAfterEject() {
+        lastErrorMessage = nil
+        guard project != nil else {
+            lastErrorMessage = "There is no completed roll to close."
+            return
+        }
+        guard jobId == nil, !isJobActive,
+              status?.connected == true,
+              status?.transport == "idle",
+              status?.mediaLoaded == false,
+              device?.kind == "simulated" || status?.filmPresent == false else {
+            lastErrorMessage = "The completed roll can close only after its job is terminal, the scanner is idle, and eject has confirmed film absent."
+            return
+        }
+        guard beginProjectLifecycleChange() else { return }
+        defer { isChangingProject = false }
+        resetProjectScopedScanState()
+        project = nil
+        projectDirectory = nil
     }
 
     /// Moves contact-sheet crop and presentation geometry chosen before Save
@@ -6221,6 +6315,8 @@ public final class SessionModel {
                 + previousDetail
         }
         advanceConnectionEpoch()
+        idleStatusMonitorTask?.cancel()
+        idleStatusMonitorTask = nil
         device = nil
         status = nil
         multisampleCoercionNote = nil
@@ -6257,8 +6353,9 @@ public final class SessionModel {
         clearFrameAlignmentSessionState()
         pendingManualReviewApproval = nil
         approvingFrameIndex = nil
-        pendingStatusRefresh = nil
-        isRefreshingScannerStatus = false
+        if let marker = pendingStatusRefresh {
+            finishStatusRefresh(marker)
+        }
         bufferedJobEvents.removeAll()
     }
 
