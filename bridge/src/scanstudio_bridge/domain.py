@@ -362,6 +362,9 @@ class ScanSummary:
     completed: tuple[int, ...]
     failed: tuple[int, ...]
     stopped: bool
+    # Explicit meter refusals the caller allowed as known-blank skips.
+    # These slots were attempted, but produced no capture receipt.
+    skipped: tuple[int, ...] = ()
     # Plan 10-09 (per-frame failure reasons, coordinator scope addition):
     # slot -> {"reason_class": str, "reason_message": str, "code": str} for
     # any slot in `failed` whose cause is already known when this
@@ -374,9 +377,8 @@ class ScanSummary:
     # stopped=...)` call site (this codebase's own test suite included)
     # keeps working unchanged. Deliberately NOT included when this
     # ScanSummary crosses the wire (service.py builds `scan.completed`'s
-    # `summary` payload by hand rather than via `to_wire(summary)`) --
-    # BRIDGE.md's documented `{completed, failed, stopped}` shape is
-    # unchanged; this field is consumed only internally, translated into
+    # `summary` payload by hand rather than via `to_wire(summary)`) -- this
+    # field is consumed only internally, translated into
     # `scan.frameFailed` telemetry/wire events instead (see service.py).
     failure_reasons: dict[int, dict[str, str]] = field(default_factory=dict)
 

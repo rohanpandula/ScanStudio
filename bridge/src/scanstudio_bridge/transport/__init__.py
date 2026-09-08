@@ -138,6 +138,9 @@ class Transport(Protocol):
         on_retry: Callable[[int, int, str], None],  # slot, attempt, reason
         on_frame: Callable[[int, domain.ScanReceipt], None],
         on_call: OnCall | None = None,
+        *,
+        allowed_meter_refusal_slots: tuple[int, ...] = (),
+        on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
     ) -> domain.ScanSummary: ...
 
     def request_stop(self) -> None: ...  # stop between transfers, per BRIDGE.md scan.stop

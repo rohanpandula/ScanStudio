@@ -63,7 +63,7 @@ Errors that can occur on any request — `UNKNOWN_METHOD` (unrecognized method n
 | `roll.setSpacingOffset` | `{slot: number, offsetRows: number}` | `{thumbnail: Thumbnail}` | `NOT_CONNECTED`, `NO_PREVIEW`, `INVALID_PARAMS` |
 | `roll.manualFrames` | `{rows: [number]}` | `{count: number, fingerprint: string, thumbnails: [Thumbnail], snaps: [BoundarySnap]}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `METER_UNUSABLE` |
 | `roll.previewStrip` | `{}` | `PreviewStrip` | `NOT_CONNECTED`, `NO_PREVIEW`, `HARDWARE_LANE_BUSY`, `METER_UNUSABLE` |
-| `scan.start` | `{jobId?: string, slots: [number], recipe: CaptureRecipe, output: OutputSpec}` | `{jobId: string}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `REFEED_REQUIRED`; via `scan.error`/`scan.frameFailed`: `ROLL_MISMATCH` |
+| `scan.start` | `{jobId?: string, slots: [number], recipe: CaptureRecipe, output: OutputSpec, allowedMeterRefusalSlots?: [number]}` | `{jobId: string}` | `NOT_CONNECTED`, `NO_PREVIEW`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `INVALID_PARAMS`, `REFEED_REQUIRED`; via `scan.error`/`scan.frameFailed`: `ROLL_MISMATCH` |
 | `scan.stop` | `{jobId: string}` | `{acknowledged: bool}` | `UNKNOWN_JOB` |
 | `device.eject` | `{}` | `{}` | `NOT_CONNECTED`, `HW_MOTION_NOT_ARMED`, `HARDWARE_LANE_BUSY`, `EJECT_FAILED`, `FEEDER_PARKED` |
 
@@ -126,6 +126,8 @@ Renders the last completed preview attempt's whole captured raster to one image,
 ### `scan.start` (MOTION-CAPABLE)
 
 `slots` must be a subset of the last preview's detected slots. `recipe` is validated per "Recipe constraints" below — a mismatch is `INVALID_PARAMS` naming the first mismatched field, never silently substituted. `output` gives the destination directory plus a filename template. The app engine supplies `jobId` as a cryptographically random, 32-character lowercase hexadecimal operation token; the bridge echoes that exact token in the response and every job event and refuses reuse within one bridge generation. Legacy direct clients may omit it, in which case the bridge creates an equivalent random token. Once accepted, a worker thread reports progress and outcome purely through events: `scan.progress`, `scan.frameRetrying` (zero or more per slot), `scan.frameCompleted`, then `scan.completed`. Only one job runs at a time; a concurrent second `scan.start` gets `HARDWARE_LANE_BUSY`.
+
+`allowedMeterRefusalSlots` is an optional sorted, unique subset of this request's `slots`; omission means no skips. For an allowlisted slot only, CoolscanPy may continue after its validated `METER_CONTROLLER_REFUSED` known-blank handoff. The bridge emits `scan.frameSkipped` and includes the slot in `scan.completed.summary.skipped`; it emits no `scan.frameCompleted` or receipt for that slot. Generic `METER_UNUSABLE`, transport, feed, and recovery errors remain fatal. A driver without this exact continuation API returns `NOT_IMPLEMENTED` before output reservation or motion.
 
 The engine may supply a private, job-owned `output` route when the user has elected not to retain a master TIFF. It remains a normal bridge capture contract: the bridge must write RGB plus applicable IR/meter artifacts exactly at that route and report those exact paths. The private route is not a user destination and must never be inferred from a project manifest or receipt as a retained output.
 
@@ -403,8 +405,9 @@ CoolscanPy's `Frame.meter_rgbi` (a 285dpi auto-exposure prepass) is on `ScanRece
 - `scan.progress` `{jobId: string, slot: number, ordinal: number, totalSlots: number, fraction: number, message: string}` — periodic, while a slot is actively transferring.
 - `scan.frameRetrying` `{jobId: string, slot: number, attempt: number, reason: string}` — bridge-specific; fires once per bounded-retry attempt (see SAFE-02 guardrails).
 - `scan.frameCompleted` `{jobId: string, slot: number, receipt: ScanReceipt}`
+- `scan.frameSkipped` `{jobId: string, slot: number, code: "METER_CONTROLLER_REFUSED", details: {pass: number, reasons: [MeterControllerRefusalReason]}, journalPath?: string, journalSha256?: string}` — emitted only for an explicitly allowlisted, driver-validated known-blank refusal. It never carries a capture receipt.
 - `scan.frameFailed` `{jobId: string, slot: number, code: string, message: string}` — additive (2026-07-23); fires for any slot failure before `scan.completed`, alongside whatever job-level event that same failure already produces (`hardware.anomaly` or `scan.error`) — see "Durable per-frame failure reasons" under `scan.start` above. `code` is one of the Error codes above.
-- `scan.completed` `{jobId: string, summary: {completed: number[], failed: number[], stopped: bool}}` — emitted for every terminal job state. A slot present in the original `scan.start` `slots` list but absent from both `completed` and `failed` was never attempted (skipped after `scan.stop`); there is no separate "skipped" list.
+- `scan.completed` `{jobId: string, summary: {completed: number[], failed: number[], skipped?: number[], stopped: bool}}` — emitted for every terminal job state. `skipped` is omitted when empty. A slot absent from `completed`, `failed`, and `skipped` was never attempted after `scan.stop`.
 - `hardware.anomaly` `{jobId: string|null, slot: number|null, code: string, message: string, ejected: bool}` — fires whenever the anomaly-halt sequence runs (see SAFE-02 guardrails).
 
 ## SAFE-02 guardrails

@@ -70,7 +70,10 @@ _METHOD_PARAM_SCHEMAS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "roll.setSpacingOffset": (("slot", "offsetRows"), ()),
     "roll.manualFrames": (("rows",), ()),
     "roll.previewStrip": ((), ()),
-    "scan.start": (("slots", "recipe", "output"), ("jobId",)),
+    "scan.start": (
+        ("slots", "recipe", "output"),
+        ("jobId", "allowedMeterRefusalSlots"),
+    ),
     "scan.stop": (("jobId",), ()),
     "device.eject": ((), ()),
 }
@@ -991,6 +994,22 @@ class BridgeService:
             item_maximum=40,
             unique=True,
         )
+        allowed_meter_refusal_slots = _require_int_list(
+            params.get("allowedMeterRefusalSlots", []),
+            "allowedMeterRefusalSlots",
+            minimum_length=0,
+            maximum_length=40,
+            item_minimum=1,
+            item_maximum=40,
+            unique=True,
+        )
+        if allowed_meter_refusal_slots != sorted(allowed_meter_refusal_slots) or not set(
+            allowed_meter_refusal_slots
+        ).issubset(slots):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "allowedMeterRefusalSlots must be a sorted subset of slots",
+            )
         recipe = from_wire(params["recipe"], domain.CaptureRecipe)
         output = from_wire(params["output"], domain.OutputSpec)
         domain.validate_capture_recipe(
@@ -1114,6 +1133,7 @@ class BridgeService:
         # the honest answer once no frame in this batch has resolved at
         # all).
         resolved_slots: set[int] = set()
+        skipped_slots: set[int] = set()
         # slot -> reason_class, accumulated as scan.frameFailed events are
         # reported; folded into the "reasons" field of whichever scan.start
         # telemetry closure below actually fires for this job.
@@ -1271,6 +1291,32 @@ class BridgeService:
                 {"jobId": job_id, "slot": slot, "receipt": to_wire(receipt)},
             )
 
+        def on_meter_refusal_skipped(slot: int, details: dict[str, object]) -> None:
+            if slot not in allowed_meter_refusal_slots or slot in resolved_slots:
+                raise BridgeError(
+                    ErrorCode.INTERNAL,
+                    "transport reported an unbound meter-refusal skip",
+                )
+            resolved_slots.add(slot)
+            skipped_slots.add(slot)
+            telemetry.record(
+                "scan.frameSkipped",
+                "skipped",
+                job_id=job_id,
+                slot=slot,
+                code=ErrorCode.METER_CONTROLLER_REFUSED.value,
+                details=details,
+            )
+            emit(
+                "scan.frameSkipped",
+                {
+                    "jobId": job_id,
+                    "slot": slot,
+                    "code": ErrorCode.METER_CONTROLLER_REFUSED.value,
+                    "details": details,
+                },
+            )
+
         def first_pending_slot() -> tuple[int | None, bool]:
             """Earliest requested slot not yet confirmed complete via
             on_frame -- the honest replacement for the old
@@ -1335,6 +1381,14 @@ class BridgeService:
             scan_error_payload: dict[str, object] | None = None
             try:
                 try:
+                    skip_options: dict[str, object] = {}
+                    if allowed_meter_refusal_slots:
+                        skip_options = {
+                            "allowed_meter_refusal_slots": tuple(
+                                allowed_meter_refusal_slots
+                            ),
+                            "on_meter_refusal_skipped": on_meter_refusal_skipped,
+                        }
                     result = transport.start_scan(
                         slots,
                         recipe,
@@ -1346,12 +1400,19 @@ class BridgeService:
                         ),
                         on_frame=on_frame,
                         on_call=on_call,
+                        **skip_options,
                     )
-                    if not isinstance(result, domain.ScanSummary) or (
-                        slots
-                        and not result.completed
-                        and not result.failed
-                        and not result.stopped
+                    if (
+                        not isinstance(result, domain.ScanSummary)
+                        or tuple(result.skipped)
+                        != tuple(slot for slot in slots if slot in skipped_slots)
+                        or (
+                            slots
+                            and not result.completed
+                            and not result.failed
+                            and not result.skipped
+                            and not result.stopped
+                        )
                     ):
                         # A Transport is only ever supposed to fail by
                         # raising -- a None/wrong-shaped return, or a
@@ -1399,6 +1460,11 @@ class BridgeService:
                                 "job_id": job_id,
                                 "completed": list(summary.completed),
                                 "failed": list(summary.failed),
+                                **(
+                                    {"skipped": list(summary.skipped)}
+                                    if summary.skipped
+                                    else {}
+                                ),
                                 "stopped": summary.stopped,
                                 **scan_start_closure_fields(),
                             },
@@ -1536,9 +1602,14 @@ class BridgeService:
                         **evidence_fields,
                     }
                     summary = domain.ScanSummary(
-                        completed=tuple(slot for slot in slots if slot in resolved_slots),
+                        completed=tuple(
+                            slot
+                            for slot in slots
+                            if slot in resolved_slots and slot not in skipped_slots
+                        ),
                         failed=tuple(slot for slot in slots if slot not in resolved_slots),
                         stopped=False,
+                        skipped=tuple(slot for slot in slots if slot in skipped_slots),
                     )
                 except Exception as exc:  # noqa: BLE001 -- boundary: every failure must reach the wire
                     # Plan 10-09 deliverable 1: same first_pending_slot()
@@ -1570,7 +1641,10 @@ class BridgeService:
                         "message": f"{type(exc).__name__}: {exc}",
                     }
                     summary = domain.ScanSummary(
-                        completed=(), failed=tuple(slots), stopped=False
+                        completed=(),
+                        failed=tuple(slot for slot in slots if slot not in skipped_slots),
+                        stopped=False,
+                        skipped=tuple(slot for slot in slots if slot in skipped_slots),
                     )
             finally:
                 job_record["terminal"] = True
@@ -1592,8 +1666,7 @@ class BridgeService:
                     if scan_error_payload is not None:
                         emit("scan.error", scan_error_payload)
                     # Built by hand rather than `to_wire(summary)`: BRIDGE.md's
-                    # scan.completed documents exactly {completed, failed,
-                    # stopped} for `summary` -- ScanSummary's own
+                    # ScanSummary's own
                     # `failure_reasons` (Plan 10-09, internal-only; see its
                     # field docstring in domain.py) must never leak onto the
                     # wire through this event, even though `to_wire` would
@@ -1606,6 +1679,11 @@ class BridgeService:
                             "summary": {
                                 "completed": list(summary.completed),
                                 "failed": list(summary.failed),
+                                **(
+                                    {"skipped": list(summary.skipped)}
+                                    if summary.skipped
+                                    else {}
+                                ),
                                 "stopped": summary.stopped,
                             },
                         },

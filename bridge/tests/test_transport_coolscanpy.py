@@ -169,6 +169,8 @@ class _FakeRoll:
         slots,
         *,
         on_progress=None,
+        allowed_meter_refusal_slots=(),
+        on_meter_refusal_skipped=None,
         **kwargs,
     ):
         ordered = tuple(slots)
@@ -177,7 +179,13 @@ class _FakeRoll:
         if tuple(sorted(set(ordered))) != ordered:
             raise ValueError("batch scanner slots must be unique and strictly increasing")
         self.scan_many_calls.append(ordered)
-        self.scan_many_kwargs.append(dict(kwargs))
+        recorded_kwargs = dict(kwargs)
+        if allowed_meter_refusal_slots:
+            recorded_kwargs["allowed_meter_refusal_slots"] = tuple(
+                allowed_meter_refusal_slots
+            )
+            recorded_kwargs["on_meter_refusal_skipped"] = on_meter_refusal_skipped
+        self.scan_many_kwargs.append(recorded_kwargs)
         for index, slot in enumerate(ordered):
             if self._safe_stop_requested:
                 raise coolscanpy.SafeStopRequested(
@@ -190,6 +198,13 @@ class _FakeRoll:
                 )
             outcome = outcomes.pop(0)
             if isinstance(outcome, BaseException):
+                if (
+                    isinstance(outcome, coolscanpy.MeterControllerRefused)
+                    and slot in allowed_meter_refusal_slots
+                ):
+                    assert on_meter_refusal_skipped is not None
+                    on_meter_refusal_skipped(slot, outcome)
+                    continue
                 raise outcome
             if on_progress is not None:
                 on_progress(
@@ -3426,6 +3441,95 @@ def test_start_scan_manual_review_required_marks_slot_failed_and_continues(
             "code": "MANUAL_REVIEW_REQUIRED",
         }
     }
+
+
+def test_meter_refusal_skip_is_opt_in_continues_and_obeys_safe_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refusal() -> coolscanpy.MeterControllerRefused:
+        return coolscanpy.MeterControllerRefused(
+            pass_number=2,
+            reasons=(
+                coolscanpy.MeterControllerRefusalReason(
+                    code="all_channels_near_black",
+                    message="known blank frame has no usable RGB density",
+                ),
+            ),
+        )
+
+    def opened() -> tuple[CoolscanPyTransport, _FakeRoll]:
+        roll = _FakeRoll(
+            thumbnails=[_fake_thumbnail(1), _fake_thumbnail(2)],
+            scan_results={1: [refusal()], 2: [_fake_frame(2)]},
+        )
+        transport, _device = _opened_transport(monkeypatch, roll)
+        transport.preview(domain.Material.COLOR_NEGATIVE, None, lambda _t: None)
+        return transport, roll
+
+    callbacks = dict(
+        on_progress=lambda _p: None,
+        on_retry=lambda *a: None,
+        on_frame=lambda *_a: None,
+    )
+
+    transport, roll = opened()
+    with pytest.raises(BridgeError) as error:
+        transport.start_scan(
+            [1, 2],
+            domain.FIXED_COLOR_NEGATIVE_RECIPE,
+            _output(tmp_path / "closed"),
+            **callbacks,
+        )
+    assert error.value.code is ErrorCode.METER_CONTROLLER_REFUSED
+    assert roll.scan_many_calls == [(1, 2)]
+
+    transport, roll = opened()
+    skipped: list[tuple[int, dict[str, object]]] = []
+    frames: list[int] = []
+    summary = transport.start_scan(
+        [1, 2],
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        _output(tmp_path / "allowed"),
+        on_progress=lambda _p: None,
+        on_retry=lambda *a: None,
+        on_frame=lambda slot, _receipt: frames.append(slot),
+        allowed_meter_refusal_slots=(1,),
+        on_meter_refusal_skipped=lambda slot, details: skipped.append((slot, details)),
+    )
+    assert summary.completed == (2,)
+    assert summary.skipped == (1,)
+    assert summary.failed == ()
+    assert frames == [2]
+    assert skipped == [
+        (
+            1,
+            {
+                "pass": 2,
+                "reasons": [
+                    {
+                        "code": "all_channels_near_black",
+                        "message": "known blank frame has no usable RGB density",
+                    }
+                ],
+            },
+        )
+    ]
+
+    transport, roll = opened()
+    summary = transport.start_scan(
+        [1, 2],
+        domain.FIXED_COLOR_NEGATIVE_RECIPE,
+        _output(tmp_path / "stopped"),
+        on_progress=lambda _p: None,
+        on_retry=lambda *a: None,
+        on_frame=lambda *_a: None,
+        allowed_meter_refusal_slots=(1,),
+        on_meter_refusal_skipped=lambda _slot, _details: transport.request_stop(),
+    )
+    assert summary.skipped == (1,)
+    assert summary.completed == ()
+    assert summary.stopped is True
+    assert roll.safe_stop_calls == 1
 
 
 def test_start_scan_safe_stop_requested_stops_and_reports_summary(

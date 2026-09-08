@@ -272,6 +272,42 @@ class _BlockingStartScanTransport(_StubTransport):
         return domain.ScanSummary(completed=tuple(slots), failed=(), stopped=False)
 
 
+class _MeterSkipTransport(_StubTransport):
+    def start_scan(
+        self,
+        slots,
+        recipe,
+        output,
+        on_progress,
+        on_retry,
+        on_frame,
+        on_call=None,
+        *,
+        allowed_meter_refusal_slots=(),
+        on_meter_refusal_skipped=None,
+    ):
+        del recipe, output, on_progress, on_retry, on_call
+        assert slots == [1, 2]
+        assert allowed_meter_refusal_slots == (1,)
+        assert on_meter_refusal_skipped is not None
+        on_meter_refusal_skipped(
+            1,
+            {
+                "pass": 2,
+                "reasons": [
+                    {
+                        "code": "all_channels_near_black",
+                        "message": "known blank frame has no usable RGB density",
+                    }
+                ],
+            },
+        )
+        on_frame(2, _stub_receipt(2))
+        return domain.ScanSummary(
+            completed=(2,), failed=(), stopped=False, skipped=(1,)
+        )
+
+
 def _wire_recipe() -> dict:
     """The one fixed material=colorNegative recipe (domain.FIXED_COLOR_NEGATIVE_RECIPE)
     in wire (camelCase) shape."""
@@ -1865,6 +1901,55 @@ def test_scan_start_empty_summary_from_transport_emits_internal_scan_error_then_
     assert completed_summary["completed"] == []
     assert completed_summary["failed"] == [1]
     assert completed_summary["stopped"] is False
+
+
+def test_scan_start_emits_verified_meter_skip_without_a_frame_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm(monkeypatch, tmp_path)
+    svc = _opened_service(tmp_path, _MeterSkipTransport())
+    svc._preview_material = domain.Material.COLOR_NEGATIVE
+    emit = _RecordingEmit()
+
+    svc.dispatch(
+        {
+            "id": 3,
+            "method": "scan.start",
+            "params": {
+                "slots": [1, 2],
+                "allowedMeterRefusalSlots": [1],
+                "recipe": _wire_recipe(),
+                "output": {
+                    "destination": str(tmp_path / "out"),
+                    "filenameTemplate": "frame-####.tif",
+                },
+            },
+        },
+        emit,
+    )
+    _wait_for(lambda: emit.has("scan.completed"))
+
+    assert emit.payload_of("scan.frameSkipped") == {
+        "jobId": emit.payload_of("scan.completed")["jobId"],
+        "slot": 1,
+        "code": "METER_CONTROLLER_REFUSED",
+        "details": {
+            "pass": 2,
+            "reasons": [
+                {
+                    "code": "all_channels_near_black",
+                    "message": "known blank frame has no usable RGB density",
+                }
+            ],
+        },
+    }
+    assert [payload["slot"] for payload in emit.payloads_of("scan.frameCompleted")] == [2]
+    assert emit.payload_of("scan.completed")["summary"] == {
+        "completed": [2],
+        "failed": [],
+        "skipped": [1],
+        "stopped": False,
+    }
 
 
 # -- scan.start: lane released before the terminal event reaches anyone -------------

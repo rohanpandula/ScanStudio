@@ -1544,6 +1544,9 @@ class CoolscanPyTransport:
         on_retry: Callable[[int, int, str], None],
         on_frame: Callable[[int, domain.ScanReceipt], None],
         on_call: OnCall | None = None,
+        *,
+        allowed_meter_refusal_slots: tuple[int, ...] = (),
+        on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
     ) -> domain.ScanSummary:
         """Fine-scan the requested slots using one ``Roll.scan_many`` batch.
 
@@ -1562,6 +1565,27 @@ class CoolscanPyTransport:
         domain.validate_capture_recipe(
             recipe, self._material, supported_multisample_passes=samples_supported
         )
+        allowed_skips = tuple(allowed_meter_refusal_slots)
+        if (
+            any(type(slot) is not int for slot in allowed_skips)
+            or tuple(sorted(set(allowed_skips))) != allowed_skips
+            or not set(allowed_skips).issubset(slots)
+        ):
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "allowed meter-refusal slots must be a unique sorted subset of scan slots",
+            )
+        if allowed_skips:
+            try:
+                scan_many_parameters = inspect.signature(self._roll.scan_many).parameters
+            except (TypeError, ValueError):
+                scan_many_parameters = {}
+            required = {"allowed_meter_refusal_slots", "on_meter_refusal_skipped"}
+            if not required.issubset(scan_many_parameters):
+                raise BridgeError(
+                    ErrorCode.NOT_IMPLEMENTED,
+                    "the installed CoolscanPy does not support verified meter-refusal skips",
+                )
         scan_kwargs: dict[str, object] = {}
         if len(samples_supported) > 1:
             # Only a driver that declared single-sample support takes the
@@ -1576,6 +1600,7 @@ class CoolscanPyTransport:
         total = len(slots)
         completed: list[int] = []
         failed: list[int] = []
+        skipped: list[int] = []
         # Plan 10-09 (per-frame failure reasons, coordinator scope
         # addition): see ManualReviewRequired below and ScanSummary's own
         # docstring (domain.py).
@@ -1602,6 +1627,23 @@ class CoolscanPyTransport:
                     completed=(), failed=(), stopped=False, failure_reasons={}
                 )
             remaining: list[int] = list(sorted_slots)
+
+            def record_meter_refusal_skip(
+                slot: int, refusal: coolscanpy.MeterControllerRefused
+            ) -> None:
+                if slot not in allowed_skips or slot not in remaining:
+                    raise BridgeError(
+                        ErrorCode.INTERNAL,
+                        "CoolscanPy reported an unbound meter-refusal skip",
+                    )
+                details = {
+                    "pass": refusal.pass_number,
+                    "reasons": [reason.to_dict() for reason in refusal.reasons],
+                }
+                if on_meter_refusal_skipped is not None:
+                    on_meter_refusal_skipped(slot, details)
+                skipped.append(slot)
+                remaining.remove(slot)
 
             # Reserve every possible artifact before progress callbacks or
             # CoolscanPy motion.  This rejects RGB, IR, and potential meter
@@ -1650,6 +1692,13 @@ class CoolscanPyTransport:
                             batch_kwargs = dict(scan_kwargs)
                             if held_ticks is not None:
                                 batch_kwargs["exposure_override_10ns"] = held_ticks
+                            if allowed_skips:
+                                batch_kwargs["allowed_meter_refusal_slots"] = tuple(
+                                    slot for slot in batch_slots if slot in allowed_skips
+                                )
+                                batch_kwargs["on_meter_refusal_skipped"] = (
+                                    record_meter_refusal_skip
+                                )
                             batch_iterator = self._roll.scan_many(
                                 batch_slots, on_progress=None, **batch_kwargs
                             )
@@ -1894,6 +1943,7 @@ class CoolscanPyTransport:
                 completed=tuple(completed),
                 failed=tuple(failed),
                 stopped=stopped,
+                skipped=tuple(skipped),
                 failure_reasons=failure_reasons,
             )
         except BaseException:

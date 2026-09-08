@@ -523,7 +523,16 @@ class MockTransport:
         on_retry: Callable[[int, int, str], None],
         on_frame: Callable[[int, domain.ScanReceipt], None],
         on_call: OnCall | None = None,
+        *,
+        allowed_meter_refusal_slots: tuple[int, ...] = (),
+        on_meter_refusal_skipped: Callable[[int, dict[str, object]], None] | None = None,
     ) -> domain.ScanSummary:
+        del on_meter_refusal_skipped
+        if allowed_meter_refusal_slots:
+            raise BridgeError(
+                ErrorCode.NOT_IMPLEMENTED,
+                "the simulator cannot produce verified meter-refusal skip evidence",
+            )
         self._require_connected()
         if self._enforce_fixed_recipe:
             if self._last_preview_material is None:
