@@ -329,6 +329,48 @@ private func prepareMotionRoutingScanReadiness(
     return model.scanReadiness(for: [1]).isReady
 }
 
+/// D-23/HEAD-12 (`review.cancel`'s own test): identical to
+/// `prepareMotionRoutingScanReadiness`, except the one thumbnail carries
+/// `needsApproval: true` -- the minimal live path to a scan attempt that
+/// pauses on `pendingManualReviewScan` rather than reaching `scan.start`.
+/// Mirrors `ControlChannelDispatcherTests.swift`'s own
+/// `driveModelToPendingManualReview` (private to that file).
+@MainActor
+private func driveMotionRoutingToPendingManualReview(_ model: SessionModel) async -> Bool {
+    await model.connect(deviceId: motionRoutingDevice.deviceId)
+    await model.openProject(directory: motionRoutingProjectDirectory)
+    model.handle(event: EngineEvent(
+        name: "scanner.status",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"MA-21","mediaLoaded":true,"carrier":"mounted","frameCount":1,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}
+            """#.utf8
+        )
+    ))
+    let token = PreviewIntentToken()
+    guard await model.requestPreview(.refreshSavedProject(token: token)) == .started else { return false }
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnail",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnail","payload":{"operationId":"\#(token.id.uuidString)","frameIndex":1,"thumbnail":{"needsApproval":true,"warnings":["ambiguous-boundary"]}}}
+            """#.utf8
+        )
+    ))
+    model.handle(event: EngineEvent(
+        name: "scanner.thumbnailsComplete",
+        rawLine: Data(
+            #"""
+            {"event":"scanner.thumbnailsComplete","payload":{"operationId":"\#(token.id.uuidString)","count":1}}
+            """#.utf8
+        )
+    ))
+    model.toggleFrameSelection(1)
+    guard model.scanReadiness(for: [1]).isReady else { return false }
+    await model.startMockScan()
+    return model.pendingManualReviewScan != nil
+}
+
 /// Connects to the fake "real" device fixture, then injects a synthetic
 /// `scanner.status` event carrying `motionArmed: false` -- the live-state
 /// route `DeviceConnectionLifecycleTests.swift` drives throughout, never a
@@ -927,5 +969,44 @@ struct ControlChannelMotionRoutingTests {
 
         await stub.release("project.pendingFrames")
         _ = await first.value
+    }
+
+    // MARK: - D-23/HEAD-12: review.cancel (CF-10/CF-11)
+
+    @Test("review.cancel preserves the selection and starts nothing")
+    @MainActor
+    func reviewCancelPreservesTheSelectionAndStartsNothing() async {
+        let (model, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        #expect(await driveMotionRoutingToPendingManualReview(model))
+        let selectionBefore = model.selectedFrameIndices
+        #expect(model.jobId == nil)
+        await stub.clearLog()
+
+        let response = await dispatcher.handle(.reviewCancel(id: 9))
+        guard case .success = response else {
+            Issue.record("expected review.cancel to succeed, got \(response)")
+            return
+        }
+        #expect(model.pendingManualReviewScan == nil, "the pending review must be dismissed")
+        #expect(model.selectedFrameIndices == selectionBefore, "the operator's selection must be byte-identical before and after")
+        #expect(model.jobId == nil, "review.cancel must never start a scan")
+        #expect(await stub.recordedMethods.isEmpty, "review.cancel must issue no engine request beyond the cancel itself")
+    }
+
+    @Test("review.cancel with nothing pending is refused with GATE_REFUSED naming manualReviewPending")
+    @MainActor
+    func reviewCancelWithNothingPendingIsRefused() async {
+        let (_, stub, dispatcher) = await makeDispatcher()
+        await greet(dispatcher)
+        let response = await dispatcher.handle(.reviewCancel(id: 10))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected GATE_REFUSED, got \(response)")
+            return
+        }
+        #expect(id == 10)
+        #expect(error.code == "GATE_REFUSED")
+        #expect(error.gate == ControlGate.manualReviewPending.rawValue)
+        #expect(await stub.recordedMethods.isEmpty)
     }
 }

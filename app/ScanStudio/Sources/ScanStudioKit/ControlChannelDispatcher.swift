@@ -63,6 +63,12 @@ public enum ControlRequest: Sendable {
     case diagnosticsExport(id: UInt64, params: ControlDiagnosticsExportParams)
     case eventsSubscribe(id: UInt64)
     case jobGet(id: UInt64, params: ControlJobGetParams)
+    /// D-23/HEAD-12: dismisses a pending manual review without starting
+    /// motion, without approving anything, and without clearing
+    /// `selectedFrameIndices`. No confirmation field: it authorizes no
+    /// motion, so `confirmationRefusal(for:)` deliberately has no entry
+    /// for it (T-03-44).
+    case reviewCancel(id: UInt64)
 }
 
 extension ControlRequest {
@@ -95,6 +101,7 @@ extension ControlRequest {
         case .diagnosticsExport(let id, _): id
         case .eventsSubscribe(let id): id
         case .jobGet(let id, _): id
+        case .reviewCancel(let id): id
         }
     }
 
@@ -128,6 +135,7 @@ extension ControlRequest {
         case .diagnosticsExport: "diagnostics.export"
         case .eventsSubscribe: "events.subscribe"
         case .jobGet: "job.get"
+        case .reviewCancel: "review.cancel"
         }
     }
 
@@ -142,7 +150,7 @@ extension ControlRequest {
         case .scannerList, .scannerRescan, .scannerRefresh, .scannerConnect, .scannerDisconnect,
              .previewAcquire, .framesSelect, .framesInclude, .framesExclude, .reviewApprove,
              .settingsSet, .outputsSet, .rollSave, .rollOpen, .rollList,
-             .scanStart, .scanStop, .scanResume, .scannerEject:
+             .scanStart, .scanStop, .scanResume, .scannerEject, .reviewCancel:
             true
         case .hello, .status, .framesList, .settingsGet, .outputsGet,
              .diagnosticsExport, .eventsSubscribe, .jobGet:
@@ -173,6 +181,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
     case previewAcquire(ControlPreviewAcquireResult)
     case diagnosticsExport(ControlDiagnosticsExportResult)
     case eventsSubscribe(ControlEventsSubscribeResult)
+    case scanOutcome(ControlScanOutcomeResult)
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
@@ -192,6 +201,7 @@ public enum ControlResult: Encodable, Equatable, Sendable {
         case .previewAcquire(let value): try container.encode(value)
         case .diagnosticsExport(let value): try container.encode(value)
         case .eventsSubscribe(let value): try container.encode(value)
+        case .scanOutcome(let value): try container.encode(value)
         }
     }
 }
@@ -318,6 +328,7 @@ public final class ControlChannelDispatcher {
         case "diagnostics.export": return decoded(ControlDiagnosticsExportParams.self) { .diagnosticsExport(id: $0, params: $1) }
         case "events.subscribe": return decoded(EmptyParams.self) { id, _ in .eventsSubscribe(id: id) }
         case "job.get": return decoded(ControlJobGetParams.self) { .jobGet(id: $0, params: $1) }
+        case "review.cancel": return decoded(EmptyParams.self) { id, _ in .reviewCancel(id: id) }
         default:
             return .failure(ControlDecodeFailure(
                 id: sniff.id,
@@ -562,13 +573,59 @@ public final class ControlChannelDispatcher {
             if let refusal = jobActiveBusyRefusal(method: "frames.select") {
                 return .failure(id: id, error: refusal)
             }
-            guard sessionModel.project == nil else {
-                return .failure(id: id, error: ControlErrorPayload(
-                    .gateRefused,
-                    message: "\"frames.select\" was refused: a project already exists.",
-                    guidance: "Refine the selection per-frame with frames.include/frames.exclude once a project is open."
-                ))
+            // D-23/HEAD-12 (CF-12, the 2026-09-07 batch abort): lifting the
+            // blanket "a project already exists" refusal in favor of
+            // project-aware validation -- a project-mode caller could
+            // otherwise never re-select frames after a failed batch
+            // without `frames.include`/`frames.exclude`'s one-at-a-time
+            // shape. `ScanReadinessPolicy.allTargetsAreStructurallyValid`
+            // remains the independent second layer refusing a scan whose
+            // target set contains an excluded frame (T-03-45): neither
+            // layer substitutes for the other.
+            if let project = sessionModel.project {
+                let excludedSet = sessionModel.excludedFrameIndices
+                func isCompleted(_ index: Int) -> Bool {
+                    sessionModel.frameStates[index] == .completed
+                        || project.frames.first { $0.index == index }?.receipts.isEmpty == false
+                }
+                if let indices = params.indices {
+                    let projectIndices = Set(project.frames.map(\.index))
+                    let offending = indices.filter {
+                        !projectIndices.contains($0) || excludedSet.contains($0) || isCompleted($0)
+                    }
+                    guard offending.isEmpty else {
+                        return .failure(id: id, error: ControlErrorPayload(
+                            .invalidParams,
+                            message: "\"frames.select\" refuses out-of-range, excluded, or already-completed indices: \(offending.sorted())."
+                        ))
+                    }
+                    guard sessionModel.setFrameSelection(indices) else {
+                        return .failure(id: id, error: ControlErrorPayload(
+                            .invalidParams,
+                            message: "\"frames.select\" could not apply the requested selection."
+                        ))
+                    }
+                } else if params.all == true {
+                    // Every project frame that is neither excluded nor
+                    // already completed -- re-selecting durable work or an
+                    // operator-excluded frame into the next scan is never
+                    // what --all means.
+                    let targets = project.frames.map(\.index).filter {
+                        !excludedSet.contains($0) && !isCompleted($0)
+                    }
+                    guard sessionModel.setFrameSelection(targets) else {
+                        return .failure(id: id, error: ControlErrorPayload(
+                            .invalidParams,
+                            message: "\"frames.select\" could not apply --all."
+                        ))
+                    }
+                } else {
+                    sessionModel.clearFrameSelection()
+                }
+                return .success(id: id, result: .empty(ControlEmptyResult()))
             }
+            // Pre-project path (CR-02), unchanged: validated against the
+            // previewed frame count, since no project exists yet.
             if let indices = params.indices {
                 if let error = validatedFrameSelectionIndices(indices, method: "frames.select") {
                     return .failure(id: id, error: error)
@@ -706,13 +763,14 @@ public final class ControlChannelDispatcher {
                 return .failure(id: id, error: refusal)
             }
             let errorMessageBefore = sessionModel.lastErrorMessage
+            let requestedFrames = sessionModel.selectedFrames
             // RESEARCH Pitfall 4: `startMockScan()` is the real GUI Scan
             // button entry point for both real and simulated devices. Route
             // here and nowhere else -- a second "real" scan-start method
             // would duplicate its manual-review branching, exactly what
             // D-04 forbids.
             await sessionModel.startMockScan()
-            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+            return scanOutcomeResponse(id: id, errorMessageBefore: errorMessageBefore, requestedFrames: requestedFrames)
         case .scanStop(let id, let params):
             let mode: String
             switch params.mode ?? "afterCurrentFrame" {
@@ -769,8 +827,12 @@ public final class ControlChannelDispatcher {
             // reported as success, and the caller can distinguish it via
             // `job.get`.
             let errorMessageBefore = sessionModel.lastErrorMessage
+            // Captured before the call: `resumeBatch()` sets
+            // `selectedFrameIndices = Set(pendingFrames)` itself, so this
+            // is the frame set the operator's resume actually targets.
+            let requestedFrames = sessionModel.pendingFrames
             await sessionModel.resumeBatch()
-            return outcome(id: id, errorMessageBefore: errorMessageBefore)
+            return scanOutcomeResponse(id: id, errorMessageBefore: errorMessageBefore, requestedFrames: requestedFrames)
         case .scannerEject(let id, _):
             // The confirmation check already ran in the preamble above.
             guard sessionModel.hardwareMotionReadiness.allowsMotion else {
@@ -885,6 +947,24 @@ public final class ControlChannelDispatcher {
                 message: "No job with id \"\(requestedJobId)\" is tracked by this host.",
                 recoverable: false
             ))
+        case .reviewCancel(let id):
+            // D-23/HEAD-12 (CF-10/CF-11, the 2026-09-07 batch abort):
+            // mirrors `.reviewApprove`'s own silent-no-op-to-typed-refusal
+            // translation (RESEARCH Pitfall 1) -- `cancelPendingManualReviewScan()`
+            // returns silently when nothing is pending, so pre-checking
+            // here means "cancelled" can never be confused with "there was
+            // nothing to cancel". Routes only to that one method: no
+            // confirmation, no approval path, no selection mutation (T-03-44).
+            guard sessionModel.pendingManualReviewScan != nil else {
+                return .failure(id: id, error: ControlErrorPayload(
+                    .gateRefused,
+                    message: "\"review.cancel\" was refused: no manual review is awaiting approval.",
+                    guidance: "There is no pending manual review to cancel.",
+                    gate: .manualReviewPending
+                ))
+            }
+            sessionModel.cancelPendingManualReviewScan()
+            return .success(id: id, result: .empty(ControlEmptyResult()))
         }
     }
 
@@ -955,6 +1035,30 @@ public final class ControlChannelDispatcher {
             ))
         }
         return .failure(id: id, error: ControlErrorPayload(.gateRefused, message: message, guidance: message))
+    }
+
+    /// D-23/HEAD-12: shared by `.scanStart`/`.scanResume` after each has
+    /// already called the exact `SessionModel` method the GUI's own
+    /// Scan/Resume button calls. `outcome(id:errorMessageBefore:)`'s
+    /// `.success` covers both "the scan actually started" and "a flagged
+    /// boundary paused it for review" -- reading `pendingManualReviewScan`
+    /// back out (mirroring `roll.save`'s own D-13 precedent exactly)
+    /// recovers the distinction a bare success cannot. `requestedFrames`
+    /// is the frame set captured *before* the call, since `resumeBatch()`
+    /// mutates `selectedFrameIndices` itself. Never `"failed"`: a failure
+    /// is the `.failure` branch below, not a success carrying one.
+    private func scanOutcomeResponse(
+        id: UInt64, errorMessageBefore: String?, requestedFrames: [Int]
+    ) -> ControlResponse {
+        switch outcome(id: id, errorMessageBefore: errorMessageBefore) {
+        case .success:
+            let isPendingReview = sessionModel.pendingManualReviewScan?.frames == requestedFrames
+            return .success(id: id, result: .scanOutcome(ControlScanOutcomeResult(
+                outcome: isPendingReview ? "manualReviewPending" : "started"
+            )))
+        case .failure(let failureId, let error):
+            return .failure(id: failureId, error: error)
+        }
     }
 
     /// Recovers a leading `[A-Z][A-Z0-9_]*` run followed by `": "` -- the

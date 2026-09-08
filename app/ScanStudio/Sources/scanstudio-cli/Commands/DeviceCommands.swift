@@ -54,12 +54,13 @@ struct Rescan: AsyncParsableCommand {
     }
 }
 
-/// `status [--job <id>]` -> `status`, or `job.get` when `--job` is given.
-/// A `--job` id that does not match the currently tracked job is refused
-/// with a CLI-originated JOB_NOT_FOUND rather than printing a mismatched
-/// job -- `job.get` itself carries no job-id filter on the wire (CONTROL.md:
-/// it always reports the one aggregate the session is currently tracking),
-/// so this comparison is this command's own job to make.
+/// `status [--job <id>]` -> `status`, or `job.get {jobId}` when `--job` is
+/// given. D-19/HEAD-12 (the 2026-09-07 batch abort): `job.get` now carries
+/// an optional `jobId` on the wire and answers for the live job, one of the
+/// host's last `SessionModel.maximumTerminalJobHistory` archived jobs, or
+/// the host's own typed `JOB_NOT_FOUND` -- rendered verbatim here, never a
+/// client-side comparison against a job.get response that carries no
+/// filter of its own.
 struct Status: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "status", abstract: "Report session status, or one job's status with --job.")
 
@@ -87,31 +88,9 @@ struct Status: AsyncParsableCommand {
             return
         }
 
-        let response = try await CommandRunner.requestWithoutParams(command: "status", method: "job.get", options: options, client: client)
-        guard case .result(let data) = response else {
-            try await finishStatus(client: client, response: response, reconnected: reconnected)
-            return
-        }
-
-        let jobResult: ControlJobResult
-        do {
-            jobResult = try JSONDecoder().decode(ControlJobResult.self, from: data)
-        } catch {
-            try await CommandRunner.fail(command: "status", options: options, client: client, error: error)
-        }
-
-        guard jobResult.jobId == job else {
-            // CLI-originated JOB_NOT_FOUND (ControlCLIErrorCode), distinct
-            // from the channel's own vocabulary -- this comparison never
-            // reaches the wire.
-            let payload = ControlErrorPayload(
-                code: ControlCLIErrorCode.jobNotFound.rawValue,
-                message: "No job with id \"\(job)\" is currently tracked.",
-                recoverable: false
-            )
-            try await CommandRunner.finish(command: "status", options: options, client: client, response: .failure(payload))
-            return
-        }
+        let response = try await CommandRunner.request(
+            command: "status", method: "job.get", params: ControlJobGetParams(jobId: job), options: options, client: client
+        )
         try await finishStatus(client: client, response: response, reconnected: reconnected)
     }
 

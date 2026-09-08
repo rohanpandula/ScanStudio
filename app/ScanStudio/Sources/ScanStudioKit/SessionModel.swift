@@ -4086,24 +4086,29 @@ public final class SessionModel {
         selectedFrameIndices.removeAll()
     }
 
-    /// D-05 `frames.select`'s `indices` arm (CR-02): the one public
-    /// selection entry point that can run *before* a project exists, so a
-    /// pure CLI/attach-mode caller (no GUI ever driven) has a wire-level
-    /// path to a non-empty `selectedFrameIndices` -- `roll.save`'s own
-    /// precondition -- ahead of `roll.save` creating the project
-    /// `frames.include`/`frames.exclude` then require. Validates every
-    /// requested index against the *previewed* frame count
-    /// (`status.frameCount`), never a project's own frame list, since none
-    /// exists yet. Returns `false` (no mutation at all -- never a partial
-    /// selection) if a project already exists, no preview has completed, or
-    /// any index falls outside `1...frameCount`, so the dispatcher can
-    /// report one typed refusal without guessing which condition failed.
+    /// D-05 `frames.select`'s `indices` arm (CR-02, widened by D-23/HEAD-12
+    /// CF-12 to also run once a project exists): a wire-level path to a
+    /// selection the dispatcher has already validated by name (business
+    /// rules -- excluded, already-completed -- are the dispatcher's job,
+    /// per-index, so it can report exactly which index and why; this
+    /// method only re-confirms structural bounds). Before a project
+    /// exists, valid means the *previewed* frame range
+    /// (`1...status.frameCount`); once one exists, valid means the
+    /// project's own frame indices (`project.frames.map(\.index)`).
+    /// Returns `false` (no mutation at all -- never a partial selection) if
+    /// no preview has completed yet (pre-project) or any index falls
+    /// outside whichever range applies.
     @discardableResult
     public func setFrameSelection(_ indices: [Int]) -> Bool {
-        guard project == nil else { return false }
-        guard let frameCount = status?.frameCount, frameCount > 0 else { return false }
-        let validRange = 1...frameCount
-        guard indices.allSatisfy(validRange.contains) else { return false }
+        let validIndices: Set<Int>
+        if let project {
+            validIndices = Set(project.frames.map(\.index))
+        } else if let frameCount = status?.frameCount, frameCount > 0 {
+            validIndices = Set(1...frameCount)
+        } else {
+            return false
+        }
+        guard indices.allSatisfy(validIndices.contains) else { return false }
         let reviewSkippedFrames = Set(
             manualReviewDecisions.compactMap { frameIndex, decision in
                 decision == .dontScan ? frameIndex : nil

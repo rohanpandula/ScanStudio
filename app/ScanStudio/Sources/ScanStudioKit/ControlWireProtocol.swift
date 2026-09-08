@@ -847,6 +847,21 @@ public struct ControlRollSaveResult: Codable, Equatable, Sendable {
     }
 }
 
+/// D-23/HEAD-12: `scan.start`/`scan.resume`'s own result, matching
+/// `ControlRollSaveResult.outcome`'s vocabulary (`"started"` |
+/// `"manualReviewPending"`) so a paused resume is never reported as a bare
+/// success indistinguishable from "the scan actually started" (the
+/// 2026-09-07 case: `resume` printed the previous job's stale failed
+/// snapshot with exit 0). Never `"failed"` here -- a failure is a
+/// `.failure` response, not a success carrying a failure string.
+public struct ControlScanOutcomeResult: Codable, Equatable, Sendable {
+    public let outcome: String
+
+    public init(outcome: String) {
+        self.outcome = outcome
+    }
+}
+
 /// `outcome` is the `PreviewRequestOutcome` case name (`"started"` |
 /// `"rejected"` | `"failedToStart"`), computed by the dispatcher.
 public struct ControlPreviewAcquireResult: Codable, Equatable, Sendable {

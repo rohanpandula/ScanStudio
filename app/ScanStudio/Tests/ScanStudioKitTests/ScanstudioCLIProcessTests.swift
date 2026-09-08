@@ -413,14 +413,19 @@ struct ScanstudioCLIProcessTests {
         await host.server.stop()
     }
 
-    @Test("frames include spanning one valid and one out-of-range index reports the host's refusal verbatim with an applied array naming the valid index")
+    @Test("frames include spanning one valid and one out-of-range index reports the host's refusal verbatim with applied and failed")
     func framesIncludePartialRangeReportsAppliedIndices() async throws {
         let host = try await CLIProcessHost.start(label: "frames-partial")
         defer { removeSocketDirectory(for: host.socketPath) }
         await host.model.openProject(directory: cliProcessProjectDirectory)
 
         let result = try await runCLI(["frames", "include", "1-2"], socketPath: host.socketPath)
-        #expect(result.exitCode == 64)
+        // D-24/HEAD-12 (CF-14, the 2026-09-07 batch abort): a partial
+        // application always exits 65, regardless of the refused index's
+        // own code -- the caller's whole range did not apply, which is a
+        // different fact than what a single INVALID_PARAMS refusal
+        // normally maps to (64).
+        #expect(result.exitCode == 65)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
         let error = try #require(object["error"] as? [String: Any])
         #expect(error["code"] as? String == "INVALID_PARAMS")
@@ -428,6 +433,10 @@ struct ScanstudioCLIProcessTests {
         #expect(error["recoverable"] as? Bool == false)
         let applied = try #require(object["applied"] as? [Int])
         #expect(applied == [1])
+        let failed = try #require(object["failed"] as? [[String: Any]])
+        #expect(failed.count == 1)
+        #expect(failed.first?["index"] as? Int == 2)
+        #expect(failed.first?["code"] as? String == "INVALID_PARAMS")
 
         await host.server.stop()
     }
@@ -516,17 +525,22 @@ struct ScanstudioCLIProcessTests {
         await host.server.stop()
     }
 
-    @Test("CR-02: frames select --all after a project already exists is refused with the host's own GATE_REFUSED")
-    func framesSelectAfterProjectExistsIsGateRefused() async throws {
+    @Test("CR-02: frames select --all after a project already exists selects the project's own frames")
+    func framesSelectAllAfterProjectExistsSelectsProjectFrames() async throws {
+        // D-23/HEAD-12 (CF-12, the 2026-09-07 batch abort): the blanket
+        // "a project already exists" GATE_REFUSED is lifted in favor of
+        // project-aware validation -- see ControlChannelDispatcher.swift's
+        // .framesSelect arm and ControlChannelProjectRoutingTests.swift's
+        // dispatcher-level coverage of the excluded/completed refusals.
         let host = try await CLIProcessHost.start(label: "frames-select-post-project")
         defer { removeSocketDirectory(for: host.socketPath) }
         await host.model.openProject(directory: cliProcessProjectDirectory)
 
         let result = try await runCLI(["frames", "select", "--all"], socketPath: host.socketPath)
-        #expect(result.exitCode == 65)
+        #expect(result.exitCode == 0)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
-        let error = try #require(object["error"] as? [String: Any])
-        #expect(error["code"] as? String == "GATE_REFUSED")
+        #expect(object["result"] != nil)
+        #expect(await host.model.selectedFrames == [1])
 
         await host.server.stop()
     }

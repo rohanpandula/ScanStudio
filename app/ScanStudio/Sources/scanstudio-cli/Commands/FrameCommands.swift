@@ -234,10 +234,20 @@ private func applyFrameSelection(
         case .result:
             applied.append(index)
         case .failure(let payload):
-            let text = try renderFrameSelectionRefusal(command: command, payload: payload, applied: applied, human: options.human)
+            // D-24/HEAD-12 (CF-14, the 2026-09-07 batch abort): the loop
+            // stops dead at the first refusal (SAFE-02, never continued,
+            // never retried) -- `failed` therefore holds exactly this one
+            // index and its code. Exit 65 regardless of that code's own
+            // usual mapping: the caller's *range* as a whole did not
+            // apply, which is a different fact than what a single-request
+            // refusal of that code would normally mean.
+            let text = try renderFrameSelectionRefusal(
+                command: command, payload: payload, applied: applied,
+                failedIndex: index, human: options.human
+            )
             print(text, terminator: "")
             await client.shutdown()
-            throw ExitCode(ControlCLIExitCode.forErrorCode(payload.code).rawValue)
+            throw ExitCode(ControlCLIExitCode.engineOrGateError.rawValue)
         }
     }
     let resultData = try JSONSerialization.data(withJSONObject: ["action": action, "applied": applied])
@@ -257,17 +267,23 @@ private func renderFrameSelectionRefusal(
     command: String,
     payload: ControlErrorPayload,
     applied: [Int],
+    failedIndex: Int,
     human: Bool
 ) throws -> String {
     let base = try ControlCLIOutput.renderError(command: command, payload: payload, human: human)
     guard !human else {
         let appliedLines = applied.map { "  - \($0)" }.joined(separator: "\n")
-        return base + "applied:\n" + appliedLines + "\n"
+        return base
+            + "applied:\n" + appliedLines + "\n"
+            + "failed:\n" + "  - index: \(failedIndex)\n" + "    code: \(payload.code)\n"
     }
     guard var object = try JSONSerialization.jsonObject(with: Data(base.utf8)) as? [String: Any] else {
         return base
     }
     object["applied"] = applied
+    // D-24/HEAD-12: exactly the one refused index and its code -- the
+    // loop stops there (SAFE-02), so `failed` is never more than one entry.
+    object["failed"] = [["index": failedIndex, "code": payload.code]]
     let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     return (String(data: data, encoding: .utf8) ?? base) + "\n"
 }

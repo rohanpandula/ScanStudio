@@ -118,13 +118,34 @@ struct ReviewApprove: AsyncParsableCommand {
     }
 }
 
-/// The `review` command group -- one subcommand today (`approve`), grouped
-/// so the invocation reads `review approve`, matching D-08's tree.
+/// `review cancel` -> `review.cancel` (D-23/HEAD-12). No confirmation flag:
+/// it authorizes no motion, approves nothing, and leaves the operator's
+/// current frame selection untouched -- the fix for the 2026-09-07 case
+/// where dismissing the review sheet silently cleared it.
+struct ReviewCancel: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cancel",
+        abstract: "Dismiss the pending manual review without starting a scan or losing the current selection."
+    )
+
+    @OptionGroup var options: GlobalOptions
+
+    func run() async throws {
+        try await CommandRunner.runWithoutParams(
+            command: "review.cancel",
+            method: "review.cancel",
+            options: options
+        )
+    }
+}
+
+/// The `review` command group -- `approve` and `cancel`, grouped so the
+/// invocation reads `review approve`/`review cancel`, matching D-08's tree.
 struct Review: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "review",
         abstract: "Manual-review actions.",
-        subcommands: [ReviewApprove.self]
+        subcommands: [ReviewApprove.self, ReviewCancel.self]
     )
 }
 
@@ -308,7 +329,19 @@ enum MotionStartRunner {
         let startResponse = try await CommandRunner.request(
             command: command, method: method, params: params, options: options, client: client
         )
-        guard case .result = startResponse else {
+        guard case .result(let startData) = startResponse else {
+            try await CommandRunner.finish(command: command, options: options, client: client, response: startResponse)
+            return
+        }
+
+        // D-23/HEAD-12 (the 2026-09-07 batch abort): a paused-for-review
+        // outcome is not "the job started" -- print it and stop here,
+        // whether or not --wait was given, rather than falling through to
+        // a job.get snapshot for a job that never started (the 19:25Z
+        // case: `resume` printed the *previous* job's failed snapshot with
+        // exit 0) or waiting on an event stream nothing will ever signal.
+        let startObject = ((try? JSONSerialization.jsonObject(with: startData)) as? [String: Any]) ?? [:]
+        if startObject["outcome"] as? String == "manualReviewPending" {
             try await CommandRunner.finish(command: command, options: options, client: client, response: startResponse)
             return
         }

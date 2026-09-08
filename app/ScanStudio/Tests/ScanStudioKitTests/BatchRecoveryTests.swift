@@ -360,6 +360,50 @@ struct BatchRecoveryTests {
         #expect(model.lastErrorMessage == "ROLL_MISMATCH: meter pass 2 controller refused: low_correlation")
     }
 
+    // MARK: - D-23: frames.select in project mode (CF-12)
+
+    @Test("frames.select with an excluded index and a project open is refused INVALID_PARAMS naming that index")
+    @MainActor
+    func framesSelectExcludedIndexInProjectModeIsRefused() async {
+        let (model, stub) = await preparedModel()
+        let dispatcher = ControlChannelDispatcher(sessionModel: model)
+        await greet(dispatcher)
+        _ = await dispatcher.handle(.framesExclude(id: 1, params: ControlFrameSelectionParams(frameIndex: 4)))
+        #expect(model.excludedFrameIndices.contains(4))
+        await stub.clearLogForTesting()
+
+        let response = await dispatcher.handle(.framesSelect(id: 2, params: ControlFramesSelectParams(indices: [3, 4, 5])))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected INVALID_PARAMS naming the excluded index, got \(response)")
+            return
+        }
+        #expect(id == 2)
+        #expect(error.code == "INVALID_PARAMS")
+        #expect(error.message.contains("4"))
+        #expect(
+            model.selectedFrames == Array(1...10),
+            "a refused selection must never partially apply -- the prior (preparedModel's own selectAllFrames) selection must be untouched"
+        )
+        #expect(await stub.recordedMethods.isEmpty, "frames.select never reaches the engine")
+    }
+
+    @Test("a valid project-mode frames.select selection is applied")
+    @MainActor
+    func framesSelectValidIndicesInProjectModeAreApplied() async {
+        let (model, stub) = await preparedModel()
+        let dispatcher = ControlChannelDispatcher(sessionModel: model)
+        await greet(dispatcher)
+        _ = await dispatcher.handle(.framesExclude(id: 1, params: ControlFrameSelectionParams(frameIndex: 4)))
+        await stub.clearLogForTesting()
+
+        let response = await dispatcher.handle(.framesSelect(id: 2, params: ControlFramesSelectParams(indices: [1, 2, 3])))
+        guard case .success = response else {
+            Issue.record("expected frames.select to succeed for non-excluded indices, got \(response)")
+            return
+        }
+        #expect(model.selectedFrames == [1, 2, 3])
+    }
+
     // MARK: - D-22: pendingFrames refresh
 
     @Test("excluding a frame refreshes pendingFrames without reopening the roll")

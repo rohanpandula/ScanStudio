@@ -677,20 +677,25 @@ struct ControlChannelProjectRoutingTests {
         #expect(model.selectedFrames.isEmpty, "a partially-valid indices array must never be partially applied")
     }
 
-    @Test("frames.select is refused with GATE_REFUSED (no gate) once a project already exists")
+    @Test("frames.select --all succeeds once a project already exists, selecting its non-excluded, non-completed frames")
     @MainActor
-    func framesSelectAfterProjectExistsIsGateRefused() async {
+    func framesSelectAllAfterProjectExistsSelectsProjectFrames() async {
         let (model, stub, dispatcher) = await makeDispatcher()
         await greet(dispatcher)
         await model.openProject(directory: projectRoutingProjectDirectory)
         await stub.clearLog()
 
+        // D-23/HEAD-12 (CF-12, the 2026-09-07 batch abort): the blanket
+        // "a project already exists" GATE_REFUSED is lifted -- a
+        // project-mode caller can now re-select frames without
+        // `frames.include`/`frames.exclude`'s one-at-a-time shape.
         let response = await dispatcher.handle(.framesSelect(id: 1, params: ControlFramesSelectParams(all: true)))
-        expectFailure(response, id: 1, code: .gateRefused)
-        if case .failure(_, let error) = response {
-            #expect(error.gate == nil, "a project-already-exists refusal is an app-level precondition, not a physical gate")
+        guard case .success = response else {
+            Issue.record("expected frames.select --all to succeed with a project open, got \(response)")
+            return
         }
-        #expect(await stub.recordedMethods.isEmpty)
+        #expect(model.selectedFrames == [1])
+        #expect(await stub.recordedMethods.isEmpty, "frames.select never reaches the engine")
     }
 
     // MARK: review.approve
