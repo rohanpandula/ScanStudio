@@ -688,7 +688,14 @@ def test_one_reservation_feed_to_eject_survives_two_batches(
         ownership = journal["nikon_density_frame_ownership"]
         assert ownership["reservation_id"] == calibration_session_id
         assert ownership["batch_session_id"] == calibration_session_id
-        assert ownership["frame_capture_attempt_id"] == f"frame-{slot:03d}"
+        round_session_id = (
+            first.session_journal["session_id"]
+            if slot in batch_one
+            else second.session_journal["session_id"]
+        )
+        assert ownership["frame_capture_attempt_id"] == (
+            f"frame-{slot:03d}-{round_session_id}"
+        )
         assert journal["session_reservation_retained"] is True
         assert journal["unit_released"] is False
         # Every frame publishes the revision this feed's own INQUIRY read,

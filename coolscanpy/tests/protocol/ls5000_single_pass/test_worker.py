@@ -6987,19 +6987,25 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     hold_job_path = root / "hold-job.json"
     reviewed_fingerprint = _reviewed_fingerprint()
 
-    def _frame_spec(slot: int, offset: int) -> worker_module.BatchFrameSpec:
+    def _frame_spec(
+        slot: int, offset: int, session_id: str | None = None
+    ) -> worker_module.BatchFrameSpec:
+        directory = f"frame-{slot:03d}"
+        if session_id is not None:
+            directory += f"-{session_id}"
         return worker_module.BatchFrameSpec(
             slot,
             offset,
-            root / f"frame-{slot:03d}" / "capture.bin",
-            root / f"frame-{slot:03d}" / "journal.json",
-            root / f"frame-{slot:03d}" / "parent-ack.json",
+            root / directory / "capture.bin",
+            root / directory / "journal.json",
+            root / directory / "parent-ack.json",
         )
 
     frame_7 = _frame_spec(7, 9)
     frame_18 = _frame_spec(18, -11)
 
     def _job_bytes(*, session_id: str, frame: worker_module.BatchFrameSpec) -> bytes:
+        directory = frame.output.parent.name
         payload = {
             "apply_all_boundary_offsets_before_first_frame": True,
             "capture_plan_sha256": CANONICAL_PLAN_SHA256,
@@ -7015,11 +7021,11 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
             "samples_per_scan": samples_per_scan[0 if frame.slot == 7 else 1],
             "frames": [
                 {
-                    "ack": f"frame-{frame.slot:03d}/parent-ack.json",
+                    "ack": f"{directory}/parent-ack.json",
                     "boundary_offset_rows": frame.boundary_offset_rows,
-                    "journal": f"frame-{frame.slot:03d}/journal.json",
+                    "journal": f"{directory}/journal.json",
                     "manual_review_approval": None,
-                    "output": f"frame-{frame.slot:03d}/capture.bin",
+                    "output": f"{directory}/capture.bin",
                     "slot": frame.slot,
                 },
             ],
@@ -7197,12 +7203,14 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
         timeout_seconds: float = 1_800.0,
         poll_seconds: float = 0.1,
     ) -> str:
+        nonlocal frame_7, frame_18
         del timeout_seconds, poll_seconds
         hold_decisions.append(str(path))
         if len(hold_decisions) == 1:
             # Round 1's own hold-wait: the fixed hold_job_path this
             # attempt was launched with. Publish slot 7's one-frame job
             # and resume.
+            frame_7 = _frame_spec(7, 9, hold_session_id)
             hold_job_path.write_text(
                 _job_bytes(session_id=hold_session_id, frame=frame_7).decode("utf-8"),
                 encoding="utf-8",
@@ -7214,6 +7222,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
         # Derive it the same way rather than hard-coding it, so this test
         # breaks loudly if that naming ever changes instead of silently
         # writing to the wrong file.
+        frame_18 = _frame_spec(18, -11, hold_session_id)
         round_job_path = path.parent / f"hold-job-{hold_session_id}.json"
         round_job_path.write_text(
             _job_bytes(session_id=hold_session_id, frame=frame_18).decode("utf-8"),
@@ -7520,18 +7529,24 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     hold_job_path = root / "hold-job.json"
     reviewed_fingerprint = _reviewed_fingerprint()
 
-    def _frame_spec(slot: int, offset: int) -> worker_module.BatchFrameSpec:
+    def _frame_spec(
+        slot: int, offset: int, session_id: str | None = None
+    ) -> worker_module.BatchFrameSpec:
+        directory = f"frame-{slot:03d}"
+        if session_id is not None:
+            directory += f"-{session_id}"
         return worker_module.BatchFrameSpec(
             slot,
             offset,
-            root / f"frame-{slot:03d}" / "capture.bin",
-            root / f"frame-{slot:03d}" / "journal.json",
-            root / f"frame-{slot:03d}" / "parent-ack.json",
+            root / directory / "capture.bin",
+            root / directory / "journal.json",
+            root / directory / "parent-ack.json",
         )
 
     frame_7 = _frame_spec(7, 9)
 
     def _job_bytes(*, session_id: str, frame: worker_module.BatchFrameSpec) -> bytes:
+        directory = frame.output.parent.name
         payload = {
             "apply_all_boundary_offsets_before_first_frame": True,
             "capture_plan_sha256": CANONICAL_PLAN_SHA256,
@@ -7547,11 +7562,11 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
             "samples_per_scan": 4,
             "frames": [
                 {
-                    "ack": f"frame-{frame.slot:03d}/parent-ack.json",
+                    "ack": f"{directory}/parent-ack.json",
                     "boundary_offset_rows": frame.boundary_offset_rows,
-                    "journal": f"frame-{frame.slot:03d}/journal.json",
+                    "journal": f"{directory}/journal.json",
                     "manual_review_approval": None,
-                    "output": f"frame-{frame.slot:03d}/capture.bin",
+                    "output": f"{directory}/capture.bin",
                     "slot": frame.slot,
                 },
             ],
@@ -7732,6 +7747,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         timeout_seconds: float = 1_800.0,
         poll_seconds: float = 0.1,
     ) -> str:
+        nonlocal frame_7
         del timeout_seconds, poll_seconds
         hold_decisions.append(str(path))
         captured["hold_session_id"] = hold_session_id
@@ -7739,6 +7755,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         # was launched with. Publish slot 7's one-frame job, echoing back
         # the hold_session_id this held preview minted -- exactly what a
         # real Roll.scan_many() resume does -- and resume.
+        frame_7 = _frame_spec(7, 9, hold_session_id)
         hold_job_path.write_text(
             _job_bytes(session_id=hold_session_id, frame=frame_7).decode("utf-8"),
             encoding="utf-8",
@@ -7926,9 +7943,10 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     # frame_capture_attempt_id changed at capture boundary" -- while every
     # continuation frame of the same batch, which sources this from its own
     # frame_spec.output, is accepted.
-    assert ownership["frame_capture_attempt_id"] == "frame-007"
-    assert frame_7.output.parent.name == "frame-007"
-    assert (root / "preview-placeholder.bin").parent.name != "frame-007"
+    expected_frame_directory = f"frame-007-{captured['hold_session_id']}"
+    assert ownership["frame_capture_attempt_id"] == expected_frame_directory
+    assert frame_7.output.parent.name == expected_frame_directory
+    assert (root / "preview-placeholder.bin").parent.name != expected_frame_directory
 
     # --- the resumed frame's journal says what actually happened ---
     # The revision this attempt's own INQUIRY reported, not the literal the
@@ -8022,6 +8040,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         job_sha256=hashlib.sha256(hold_job_path.read_bytes()).hexdigest(),
         session_id=captured["hold_session_id"],
         calibration_session_id=captured["calibration_session_id"],
+        frame_directory_suffix=captured["hold_session_id"],
         # Beside the held preview attempt's own output, exactly where
         # resume_held_session resolves it from -- never beside a frame of
         # this resumed batch. Unused by
