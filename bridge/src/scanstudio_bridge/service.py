@@ -61,7 +61,7 @@ _METHOD_PARAM_SCHEMAS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "bridge.hello": (("clientName", "protocolVersion"), ()),
     "bridge.shutdown": ((), ()),
     "device.list": ((), ()),
-    "device.open": (("deviceId",), ()),
+    "device.open": (("deviceId",), ("allowUnverifiedHardware",)),
     "device.status": ((), ()),
     "device.close": ((), ()),
     "roll.preview": (("material",), ("slots",)),
@@ -388,6 +388,15 @@ class BridgeService:
                 preview_established=False,
                 slot_count=None,
             )
+        if not status.connected:
+            # D-16: the transport's own motion-free liveness inquiry
+            # already classified this session as lost (see
+            # CoolscanPyTransport.status()). A lost session is a stronger
+            # reason to retire preview material than a mere film-absence
+            # reading -- there is no device left to trust any cached
+            # registration against.
+            self._preview_material = None
+            self._telemetry.hardware_verification = "notConnected"
         return dataclasses.replace(
             status,
             active_job_id=(
@@ -558,6 +567,7 @@ class BridgeService:
             self._transport.close_device()
             self._device_open = False
             self._preview_material = None
+        self._telemetry.hardware_verification = "notConnected"
         return {}
 
     def wait_for_owned_work_before_exit(self) -> None:
@@ -578,9 +588,17 @@ class BridgeService:
             raise BridgeError(ErrorCode.ALREADY_CONNECTED, "a device is already open")
         params = request["params"]
         device_id = _require_string(params["deviceId"], "deviceId", maximum_length=256)
-        device = self._transport.open_device(device_id)
+        allow_unverified_hardware = _require_bool(
+            params.get("allowUnverifiedHardware", False), "allowUnverifiedHardware"
+        )
+        device = (
+            self._transport.open_device(device_id, allow_unverified_hardware=True)
+            if allow_unverified_hardware
+            else self._transport.open_device(device_id)
+        )
         self._device_open = True
         self._opened_capabilities = device.capabilities
+        self._telemetry.hardware_verification = device.hardware_verification.value
         status = self._status_snapshot()
         emit("device.status", {"status": to_wire(status)})
         return {"device": to_wire(device), "status": to_wire(status)}
@@ -604,6 +622,7 @@ class BridgeService:
         self._transport.close_device()
         self._device_open = False
         self._preview_material = None
+        self._telemetry.hardware_verification = "notConnected"
         status = self._closed_status_snapshot()
         emit("device.status", {"status": to_wire(status)})
         return {}

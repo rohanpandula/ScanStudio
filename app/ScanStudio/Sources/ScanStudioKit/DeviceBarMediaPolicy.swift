@@ -24,6 +24,11 @@ public enum DeviceBarMediaPolicy {
 /// while FILM_FEED_INTERRUPTED proves the scanner no longer detects film and
 /// must never expose an eject action based on stale preview state. A fresh
 /// hardware no-film reading is authoritative even after the error is dismissed.
+/// A live `filmPresent == true` sensor reading is on its own sufficient to
+/// offer Eject — a roll the scanner physically holds but has never previewed
+/// (so `mediaLoaded` is still `false`) must still be releasable. Incident
+/// 2026-09-07: `roll.preview` failed after the SA-30 pulled film in, leaving
+/// `filmPresent: true, mediaLoaded: false` with no Eject affordance offered.
 public enum DeviceBarEjectPolicy {
     public static func canOffer(
         isConnected: Bool,
@@ -41,6 +46,6 @@ public enum DeviceBarEjectPolicy {
         ) {
             return false
         }
-        return mediaLoaded || refeedRequired
+        return mediaLoaded || refeedRequired || filmPresent == true
     }
 }

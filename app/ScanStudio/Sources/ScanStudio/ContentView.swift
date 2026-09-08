@@ -447,6 +447,7 @@ private struct WorkspaceErrorBanner: View {
     @State private var didSaveDiagnosticBundle = false
     @State private var diagnosticBundleSaveError: String?
     @State private var diagnosticPreviewConsent: DiagnosticPreviewConsent?
+    @State private var didOfferUnverifiedDiagnosticBundle = false
 
     private var isLoadingManualPlacement: Bool {
         sessionModel.manualPlacementStripState == .loading
@@ -469,6 +470,14 @@ private struct WorkspaceErrorBanner: View {
 
     private var isApprovingEveryFrame: Bool {
         sessionModel.approvingFrameIndex != nil
+    }
+
+    private var offersUnverifiedDiagnosticBundle: Bool {
+        UnverifiedHardwarePolicy.shouldOfferDiagnosticBundle(
+            errorCode: sessionModel.lastEngineError?.code,
+            verification: sessionModel.diagnosticHardwareVerification,
+            alreadyOffered: didOfferUnverifiedDiagnosticBundle
+        )
     }
 
     var body: some View {
@@ -602,6 +611,19 @@ private struct WorkspaceErrorBanner: View {
                                 ? "Approving every frame yourself is available"
                                 : "Manual frame placement is available")
                     )
+                }
+
+                if offersUnverifiedDiagnosticBundle {
+                    Button {
+                        didOfferUnverifiedDiagnosticBundle = true
+                        saveDiagnosticBundle()
+                    } label: {
+                        Label("Save diagnostic bundle for this unverified refusal", systemImage: "shippingbox")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.scanStudioAmber)
+                    .font(.system(size: 11, weight: .medium))
+                    .help("Save a share-redacted diagnostic bundle with the live hardware verification tier.")
                 }
 
                 HStack(spacing: 12) {
@@ -881,7 +903,8 @@ private struct DeviceConnectionWorkspaceView: View {
             switch DeviceSelectionPolicy.state(
                 isDiscovering: sessionModel.isDiscoveringDevices,
                 isConnecting: sessionModel.isConnectingDevice,
-                devices: sessionModel.availableDevices
+                devices: sessionModel.availableDevices,
+                allowUnverified: sessionModel.allowUnverifiedHardware
             ) {
             case .discovering:
                 connectionProgress(.discovering)

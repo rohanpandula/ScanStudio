@@ -8,6 +8,8 @@ import pytest
 from coolscanpy.protocol.ls5000_single_pass.meter import (
     CHANNELS,
     DEFAULT_EXPOSURES,
+    LINEARITY_CORRELATION_MIN,
+    LINEARITY_CORRELATION_MIN_IR,
     LINEARITY_MIN_AGGREGATES,
     LINEARITY_MIN_SAMPLES,
     METER_PASS_BYTES,
@@ -126,6 +128,49 @@ def _observations_with_bounded_linearity_pairs() -> tuple[
             channel_statistics=dict(second.channel_statistics),
         ),
     )
+
+
+def _channel_noise_pair(
+    channel: str,
+    *,
+    noise_std: float,
+    seed: int = 20260907,
+    row_std: float = 1050.0,
+    col_amp: float = 180.0,
+    exposure_gain: float = 1.1,
+) -> tuple[MeterObservation, MeterObservation]:
+    """Pass pair with pixel-scale noise eroding only one channel's correlation.
+
+    Mirrors HW-08 (2026-09-07 LS-5000 ED frame 10): row-to-row and
+    column-periodic structure survives an exposure-gain rescale, but added
+    per-pixel noise degrades the width-aggregated pass-to-pass correlation
+    the linearity gate checks, same as a dark frame's low-texture IR plane.
+    """
+
+    channel_index = CHANNELS.index(channel)
+    rng = np.random.default_rng(seed)
+    _yy, xx = np.mgrid[0:METER_ROWS, 0:METER_WIDTH]
+    row_structure = rng.normal(0.0, row_std, size=(METER_ROWS, 1))
+    column_structure = col_amp * np.sin(xx * 2.0 * np.pi / 37.0)
+    underlying = 32_000.0 + row_structure + column_structure
+    first_noisy = 1_000.0 + underlying + rng.normal(0.0, noise_std, size=underlying.shape)
+    second_noisy = (
+        1_000.0
+        + underlying * exposure_gain
+        + rng.normal(0.0, noise_std, size=underlying.shape)
+    )
+
+    first_image = _textured((30_000,) * 4)
+    first_image[:, :, channel_index] = np.clip(first_noisy, 0, 65_535).astype(np.uint16)
+    second_exposures = {
+        ch: int(exposure * exposure_gain) for ch, exposure in DEFAULT_EXPOSURES.items()
+    }
+    second_image = _rescale(first_image, DEFAULT_EXPOSURES, second_exposures)
+    second_image[:, :, channel_index] = np.clip(second_noisy, 0, 65_535).astype(np.uint16)
+
+    first = observe_meter_pass(_payload(first_image), DEFAULT_EXPOSURES)
+    second = observe_meter_pass(_payload(second_image), second_exposures)
+    return first, second
 
 
 def test_meter_decode_preserves_channel_order_and_opaque_row_tail() -> None:
@@ -273,6 +318,64 @@ def test_width_only_ir_correlation_accepts_noise_but_refuses_one_transport_row_s
         previous=first,
     )
     assert ("low_correlation", "IR") in {(item.code, item.channel) for item in shifted.refusals}
+
+
+def test_hw08_ir_correlation_matching_dark_frame_evidence_is_not_refused() -> None:
+    """HW-08: a real LS-5000 ED batch aborted at frame 10 on IR 0.9727 alone.
+
+    R/G/B were 0.9995/0.9999/0.9999. IR is not an exposure-driving channel
+    for C-41 negatives, so its own floor (0.95) must accept this frame.
+    """
+
+    first, second = _channel_noise_pair("IR", noise_std=500.0)
+
+    proposal = propose_next_exposures(second, previous=first)
+
+    ir_linearity = proposal.channel_diagnostics["IR"]["linearity"]
+    assert LINEARITY_CORRELATION_MIN_IR <= ir_linearity["correlation"] < LINEARITY_CORRELATION_MIN
+    for channel in ("R", "G", "B"):
+        assert proposal.channel_diagnostics[channel]["linearity"]["correlation"] >= 0.999
+    assert ("low_correlation", "IR") not in {(item.code, item.channel) for item in proposal.refusals}
+    assert proposal.accepted, proposal.to_dict()
+
+
+def test_rgb_correlation_below_shared_floor_still_refuses() -> None:
+    """The 0.98 floor is untouched for R/G/B -- only IR got a looser gate."""
+
+    first, second = _channel_noise_pair("R", noise_std=700.0)
+
+    proposal = propose_next_exposures(second, previous=first)
+
+    assert proposal.channel_diagnostics["R"]["linearity"]["correlation"] < LINEARITY_CORRELATION_MIN
+    assert not proposal.accepted
+    assert ("low_correlation", "R") in {(item.code, item.channel) for item in proposal.refusals}
+
+
+def test_ir_correlation_below_its_own_floor_still_refuses() -> None:
+    """IR keeps a hard floor -- it is relaxed, not removed."""
+
+    first, second = _channel_noise_pair("IR", noise_std=900.0)
+
+    proposal = propose_next_exposures(second, previous=first)
+
+    assert proposal.channel_diagnostics["IR"]["linearity"]["correlation"] < LINEARITY_CORRELATION_MIN_IR
+    assert not proposal.accepted
+    assert ("low_correlation", "IR") in {(item.code, item.channel) for item in proposal.refusals}
+
+
+def test_linearity_diagnostic_records_the_applied_correlation_floor_per_channel() -> None:
+    """The journal must keep recording the correlation and which floor decided it."""
+
+    first, second = _channel_noise_pair("IR", noise_std=500.0)
+
+    proposal = propose_next_exposures(second, previous=first)
+    record = proposal.to_dict()
+
+    assert record["channels"]["IR"]["linearity"]["correlation_min"] == LINEARITY_CORRELATION_MIN_IR
+    assert record["channels"]["IR"]["linearity"]["correlation"] == pytest.approx(0.9723, abs=5e-3)
+    for channel in ("R", "G", "B"):
+        assert record["channels"][channel]["linearity"]["correlation_min"] == LINEARITY_CORRELATION_MIN
+    json.dumps(record, allow_nan=False)  # journal payload must stay serializable
 
 
 def test_three_pass_sequence_converges_and_requires_exact_exposure_history() -> None:

@@ -322,7 +322,8 @@ class FakeRunner:
         else:
             mode = "full"
             expected_reads = CANONICAL_FINE_READ_COUNT
-            expected_bytes = CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
+            samples_per_scan = int(_argument(command, "--samples-per-scan"))
+            expected_bytes = capture._fine_capture_bytes(samples_per_scan)
 
         if self.returncode == 0:
             with output.open("xb") as stream:
@@ -625,6 +626,21 @@ def test_batch_request_accepts_single_sample_mode() -> None:
 def test_batch_request_refuses_unsupported_samples_per_scan(bad: object) -> None:
     with pytest.raises(ValueError, match="samples_per_scan"):
         _one_frame_batch_request(samples_per_scan=bad)
+
+
+def test_capture_request_requires_opt_in_for_unverified_identity() -> None:
+    identity = {
+        "expected_usb_product_id": 0x4001,
+        "expected_scanner_model": "LS-50 ED",
+    }
+    with pytest.raises(ValueError, match="allow_unverified"):
+        capture.CaptureRequest(capture.CaptureMode.PREVIEW, **identity)
+    request = capture.CaptureRequest(
+        capture.CaptureMode.PREVIEW,
+        allow_unverified=True,
+        **identity,
+    )
+    assert request.allow_unverified is True
 
 
 def test_batch_request_exposure_override_defaults_to_none_and_is_byte_identical() -> None:
@@ -951,6 +967,10 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
         "expected_usb_address": 2,
         "expected_usb_bus": 1,
+        "expected_usb_vendor_id": capture.NIKON_USB_VENDOR_ID,
+        "expected_usb_product_id": capture.CANONICAL_SCANNER_PRODUCT_ID,
+        "expected_scanner_model": capture.CANONICAL_SCANNER_MODEL,
+        "allow_unverified": False,
         "exposure_override_10ns": None,
         "manual_boundary_rows": None,
         "samples_per_scan": 4,
@@ -1961,6 +1981,44 @@ def test_preview_uses_preview_only_without_slot_or_exposure_count(
     assert "--confirm-full-capture" not in result.argv
     assert "--expected-frame-count" not in result.argv
     assert result.paths.output.stat().st_size == 0
+
+
+def test_parent_accepts_single_sample_full_capture(
+    tmp_path: Path, binding: Binding
+) -> None:
+    result = _adapter(
+        tmp_path, binding, FakeRunner(binding.worker_sha256)
+    ).run_attempt(
+        capture.CaptureRequest(
+            capture.CaptureMode.FULL,
+            selected_slot=1,
+            samples_per_scan=1,
+        )
+    )
+
+    assert result.outcome is capture.CaptureOutcome.COMPLETE
+    assert result.paths.output.stat().st_size == capture._fine_capture_bytes(1)
+
+
+def test_parent_refuses_four_sample_byte_claim_for_single_sample_request(
+    tmp_path: Path, binding: Binding
+) -> None:
+    four_sample_bytes = CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
+    runner = FakeRunner(
+        binding.worker_sha256,
+        mutate_journal=lambda journal: journal.update(expected_bytes=four_sample_bytes),
+    )
+    result = _adapter(tmp_path, binding, runner).run_attempt(
+        capture.CaptureRequest(
+            capture.CaptureMode.FULL,
+            selected_slot=1,
+            samples_per_scan=1,
+        )
+    )
+
+    assert result.outcome is capture.CaptureOutcome.RECOVERY_REQUIRED
+    assert result.journal_error is not None
+    assert "expected_bytes" in result.journal_error
 
 
 def test_preview_binds_fresh_usb_fingerprint_to_exact_sane_topology(

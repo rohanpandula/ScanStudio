@@ -16,7 +16,9 @@ Contract between the SwiftUI app and the `scanstudio-engine` subprocess. This fi
 
 ## Error codes
 
-`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `PROJECT_ALREADY_EXISTS`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`.
+`UNKNOWN_METHOD`, `INVALID_PARAMS`, `UNKNOWN_DEVICE`, `NOT_CONNECTED`, `ALREADY_CONNECTED`, `NO_MEDIA`, `SCANNER_BUSY`, `UNKNOWN_JOB`, `FEED_JAM` (recoverable: true), `FILM_FEED_INTERRUPTED`, `INTERNAL`, `PROJECT_NOT_FOUND`, `PROJECT_ALREADY_EXISTS`, `MANIFEST_INVALID`, `ARCHIVE_COLLISION`, `MANUAL_REVIEW_REQUIRED`, `HW_MOTION_NOT_ARMED`, `EJECT_FAILED`, `FEEDER_PARKED`, `NO_PREVIEW`, `ADAPTER_UNSUPPORTED`, `FINGERPRINT_REFUSED`, `REFEED_REQUIRED`, `ROLL_MISMATCH`, `TRANSPORT_SMEAR_DETECTED`, `GEOMETRY_VALIDATION_ERROR`, `SPLIT_ALIGNMENT_ERROR`, `BATCH_INTEGRITY_ERROR`, `NOT_IMPLEMENTED`.
+
+> **D-20/HEAD-12 (additive, 2026-09-07):** the ten codes above from `NO_PREVIEW` through `NOT_IMPLEMENTED` are a direct, same-named passthrough of the bridge's own `ErrorCode` vocabulary (`bridge/src/scanstudio_bridge/protocol.py`) for a bridge-sourced scan-time failure (`scan.error`/`scan.frameFailed`/`hardware.anomaly`). Previously every one of these flattened to `INTERNAL` client-side — the exact defect that turned a real-hardware `ROLL_MISMATCH` batch abort into an undiagnosable `INTERNAL` on 27 frames on 2026-09-07. `map_bridge_error_code_str` keeps `_ => INTERNAL` only as the fallback for a bridge string outside this closed vocabulary.
 
 `recoverable` is `true` only for faults where retrying the same operation can succeed (`FEED_JAM`). All others are `false`.
 
@@ -50,7 +52,7 @@ current list unchanged. A failed re-attempt returns the same recoverable
 (rescan never replaces a connected session's backend).
 
 ### `scanner.connect`
-`{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo"}}` → `{device: DeviceInfo, status: ScannerStatus}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED`.
+`{deviceId: string, options?: {timeScale?: number, faultInjection?: "none"|"demo", allowUnverifiedHardware?: bool}}` → `{device: DeviceInfo, status: ScannerStatus, alreadyConnected: boolean}` and emits a `scanner.status` event. `timeScale` (default `1.0`) multiplies every simulated delay — tests use ~`0.01`. **D-16:** re-connecting the device that is already connected is a success, reports `alreadyConnected: true`, and reaches no backend (no `sim.connect`/`real.connect` call, so no `ConnectOptions` is ever re-applied to the already-open session); a fresh connect reports `alreadyConnected: false`. Errors: `UNKNOWN_DEVICE`, `ALREADY_CONNECTED` (a *different* device while one is already connected).
 
 ### `scanner.disconnect`
 `{}` → `{}` and emits `scanner.status` with `connected: false`. Errors: `NOT_CONNECTED`, `SCANNER_BUSY` (transport operation active).
@@ -58,8 +60,13 @@ current list unchanged. A failed re-attempt returns the same recoverable
 ### `scanner.status`
 `{}` → `ScannerStatus`. Error: `NOT_CONNECTED`.
 
+### `scanner.eject`
+`{}` → `{}` and emits `scanner.status` with `filmPresent` and `mediaLoaded` cleared. There is no preview or roll-session precondition — a device that has only been opened (never previewed) can still be ejected; this is the contract that keeps a scanner-held roll releasable even when a preview never registered it (2026-09-07 incident: `roll.preview` failed with the film already pulled in, and the only way out was ejecting a device that had never completed a preview). The operation requires hardware motion to be armed. Errors: `NOT_CONNECTED`, `SCANNER_BUSY` (transport operation active), `HW_MOTION_NOT_ARMED`, `EJECT_FAILED` (the eject could not complete), `FEEDER_PARKED` (eject accepted without confirmed clear; power cycle required).
+
 ### `sim.loadMedia`
-`{carrier: "roll36"|"strip6"|"mounted"}` → `ScannerStatus`, and emits `scanner.status`. Simulator-only affordance (a real backend detects media; that is why the method lives under `sim.`). Frame counts: roll36 → 36, strip6 → 6, mounted → 1. Errors: `NOT_CONNECTED`, `SCANNER_BUSY`.
+`{carrier: "roll36"|"strip6"|"mounted", previewFixture?: "textured" | "boundaryAndBlank", abortAtFrame?: u32, abortCode?: string}` → `ScannerStatus`, and emits `scanner.status`. Simulator-only affordance (a real backend detects media; that is why the method lives under `sim.`). Frame counts: roll36 → 36, strip6 → 6, mounted → 1. `previewFixture` is itself a **simulator-only test affordance** existing so the manual-review and blank-frame paths (D-18) are exercisable without hardware: `"textured"` gives every subsequently-previewed frame a real, textured raster tile; `"boundaryAndBlank"` additionally flags the second-to-last frame for manual review and gives the last frame a uniform blank tile. Omitting it (or omitting it after a fresh load) leaves the simulator's output exactly as it has always been -- no `imagePath`, no flagged frame. Arming persists until the next `sim.loadMedia` call. Errors: `NOT_CONNECTED`, `SCANNER_BUSY`, `INVALID_PARAMS` (an unrecognized `previewFixture` value).
+
+`abortAtFrame`/`abortCode` (additive, D-20/HEAD-12, 2026-09-07) are a second **simulator-only test affordance** that reproduces a real-hardware batch abort without hardware, for the failed-batch-recovery paths (D-19..D-24): the next scan job to reach 1-based frame index `abortAtFrame` fails that frame with `code = abortCode` (default `"ROLL_MISMATCH"` when `abortAtFrame` is set and `abortCode` is omitted) in the bridge's own message shape, then marks every later requested frame `notAttempted` and the job `failed`. `abortCode` must be a member of the bridge's own closed vocabulary (the `## Error codes` list above, `"INTERNAL"` included) or the request is refused `INVALID_PARAMS` before the simulator itself ever sees it; `abortCode` without `abortAtFrame` is likewise refused. The arm is one-shot — consumed by the job it aborts, and reset (like `previewFixture`) on every fresh `sim.loadMedia` call — so a later scan on the same connection is unaffected. The real backend refuses `sim.loadMedia` outright regardless of these fields (`RealLs5000::load_media`), unchanged by this addition, and omitting them leaves the simulator's default output exactly as it has always been.
 
 ### `scanner.acquireThumbnails`
 `{frames?: [u32], filmProcess?: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome", operationId?: string}` (omitted `frames` = all loaded frames) → immediate ack `{accepted: true, frames: [u32]}`, then one `scanner.thumbnail` event per frame (~80 ms × timeScale apart), then `scanner.thumbnailsComplete`, then a post-preview `scanner.status`. Before a project exists, `filmProcess` selects the material used for preview (omission uses the deterministic C-41 default). With an active project, its persisted `filmProcess` is authoritative: omission or an equal supplied value is accepted, while a different supplied value is rejected with `INVALID_PARAMS`.
@@ -145,7 +152,9 @@ fresh `imagePath`; changing the offset invalidates prior manual approval.
 The engine's project-mutating handlers (`project.setFrameExcluded`, `project.setFrameCaptureOverride`, `project.setFrameProcessingOverride`, `project.setFrameOutputOverride`, `project.setFrameAlignment`, `project.setFrameMetadataOverride`, and `project.setRollMetadata`) re-reads the fresh manifest while holding the project lock and persist through `manifest.rs::persist_project_update` / `persist_project_update_at`: the write reads the manifest fresh from disk, merges the incoming mutation into whatever receipts the scan worker thread has durably attached since the project was loaded, and folds the merged result back into `server.rs`'s in-memory `ProjectState.active` so memory converges toward disk truth on every call. A write that would cost any frame its on-disk receipt -- i.e. one not derived from the manifest currently on disk -- refuses rather than publish if fresh-disk receipt coverage would be lost and is otherwise refused fail-closed ("would lose its on-disk receipt ... read, merge, and retry through persist_project_update") instead of overwriting, so a stale in-memory copy can no longer clobber scan results. The authoritative write runs under the manifest transaction boundary (process mutex + OS held-directory lock), and since #99 a brand-new `project.create` publishes create-only, refusing any directory that already holds a manifest.
 
 ### `project.create`
-`{name: string, carrier: "roll36"|"strip6"|"mounted", frameCount: u32, filmProcess: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome", directory?: string}` → `{project: ScanProject, directory: string}`. `roll36` is the legacy wire token for SA-30 35 mm roll film; its preview-established `frameCount` must be 1-40. `mounted` must be exactly 1, and `strip6` must be 1-6 (else `INVALID_PARAMS`). `directory` overrides the default `~/ScanStudio Projects/<slug>-<id>` location. Creation is create-only: any existing ScanStudio manifest at the target, including an unreadable or wrong-kind manifest, is refused with `PROJECT_ALREADY_EXISTS` and its bytes are left untouched. Unrelated pre-existing files do not by themselves make a directory a project. The initial manifest is published atomically under the project lock and only then becomes the engine's active project.
+`{name: string, carrier: "roll36"|"strip6"|"mounted", frameCount: u32, filmProcess: "positive"|"c41ColorNegative"|"bwNegative"|"kodachrome", directory?: string, excludedFrames?: [u32]}` → `{project: ScanProject, directory: string}`. `roll36` is the legacy wire token for SA-30 35 mm roll film; its preview-established `frameCount` must be 1-40. `mounted` must be exactly 1, and `strip6` must be 1-6 (else `INVALID_PARAMS`). `directory` overrides the default `~/ScanStudio Projects/<slug>-<id>` location. Creation is create-only: any existing ScanStudio manifest at the target, including an unreadable or wrong-kind manifest, is refused with `PROJECT_ALREADY_EXISTS` and its bytes are left untouched. Unrelated pre-existing files do not by themselves make a directory a project. The initial manifest is published atomically under the project lock and only then becomes the engine's active project.
+
+`excludedFrames` (additive, D-21/HEAD-12, 2026-09-07) is a set of 1-based frame indices created `excluded: true` — the mechanism `roll.save` uses to persist a pre-project (unselected-frame) operator choice as real project exclusions the moment the manifest is first written, rather than a post-create exclusion loop that would leave a window in which the project disagrees with the operator's own selection. Every index must be within `1..=frameCount`, and at least one frame must remain unexcluded — either violation is refused `INVALID_PARAMS` (naming the offending indices, or stating that every frame would be excluded) before any manifest is written. Omitting `excludedFrames` creates every frame unexcluded, exactly like before this addition.
 
 Creating never replaces an existing project (#99): if the target directory already contains any `manifest.json` — a fully populated project, a valid zero-receipt one, or an unreadable/corrupt file — the engine refuses atomically with `PROJECT_ALREADY_EXISTS` before modifying anything: the existing project's bytes are unchanged and the active in-memory project is not switched. The refusal is enforced by create-only publication inside the project manifest lock, so concurrent creates into one directory allow at most one success. A directory without a `manifest.json` may contain unrelated files and remains creatable; to work with an existing project, use `project.open`.
 
@@ -193,13 +202,33 @@ Creating never replaces an existing project (#99): if the target directory alrea
 ### `project.applyMetadata`
 `{frameIndex: u32}` → `{success: bool, exitCode: i32, stdout: string, stderr: string, targets: [string]}`. Rebuilds the exact same argument array `previewMetadataCommand` would show for this frame — server-side, from the active project's own resolved metadata and receipts; it never accepts or executes a client-supplied argument list — and spawns it directly via an argument-array subprocess (never a shell). Errors: `PROJECT_NOT_FOUND` (no project open), `INVALID_PARAMS` (frame index does not exist in this project; ExifTool is not available; or the frame has no scanned outputs yet).
 
+## Hardware verification provenance
+
+`options.allowUnverifiedHardware` is a boolean defaulting to `false`, independent
+of environment or GUI preferences. A recognized candidate also needs
+`DeviceInfo.unverifiedAllowed == true`; unknown and name-only identities retain
+their refusal. `supported` continues to describe verified support, not whether
+an operator has accepted an unverified attempt. Advertised recipe limits describe
+the implemented protocol path; they do not establish an unverified model’s native
+capabilities.
+
+The exact opened device supplies `ScannerStatus.deviceModel` and
+`hardwareVerification`; disconnected/unknown status omits them. Every new scan
+receipt records model and tier, including simulated unverified captures. Legacy
+receipts decode absent verification as `verified` and absent model as unknown,
+without rewriting stored data. New derivative TIFFs carry the actual receipt
+model and `ScanStudio; hardwareVerification=<tier>` software metadata; original
+capture artifacts are never relabelled. A simulated tier is policy-test
+provenance, never physical validation.
+
 ## Types
 
 ```
 DeviceInfo      {deviceId: "sim-ls5000-0", model: "SUPER COOLSCAN 5000 ED",
                  kind: "simulated", firmware: "1.03-sim", connection: "USB (simulated)",
-                 supported: bool, supportedMultisamplePasses?: [u32]}
-ScannerStatus   {connected: bool, adapter: string|null,      // simulator: "SA-30 (simulated)" | "SA-21 (simulated)" | "MA-21 (simulated)"; real: "SA-30" | "SA-21" | "MA-21"
+                 supported: bool, supportedMultisamplePasses?: [u32],
+                 unverifiedAllowed?: bool, hardwareVerification?: "verified"|"unverified"}
+ScannerStatus   {connected: bool, deviceModel?: string, hardwareVerification?: "verified"|"unverified", adapter: string|null,      // simulator: "SA-30 (simulated)" | "SA-21 (simulated)" | "MA-21 (simulated)"; real: "SA-30" | "SA-21" | "MA-21"
                  mediaLoaded: bool, carrier: "roll36"|"strip6"|"mounted"|null,
                  frameCount: u32|null, lamp: "off"|"warming"|"stable",
                  transport: "idle"|"busy"|"locked", activeJobId: string|null,
@@ -251,7 +280,7 @@ ExposureAuthority    {rgbSource: string, irSource: string,
                       activeControllerChannelsRaw10ns: {R,G,B,IR: u32},
                       deviceBoundClampedChannelsRaw10ns: {R?,G?,B?: u32},
                       deviceExposureBoundsRaw10ns: [u32, u32]}
-ScanReceipt     {jobId, frameIndex, startedAt: ISO-8601 UTC string, durationMs: u64,
+ScanReceipt     {jobId, frameIndex, deviceModel?: string, hardwareVerification: "verified"|"unverified", startedAt: ISO-8601 UTC string, durationMs: u64,
                  passes: u32, resolutionDpi: u32, bitDepth: u32, channels: string,
                  engineVersion: string, deviceId: string, simulated: true,
                  settingsFingerprint: 16-hex-char string,
@@ -331,15 +360,15 @@ ExifTool never writes to an archive path. When a master exists, `previewMetadata
 - `scanner.thumbnailsComplete` `{count: u32, operationId?: string}`
 - `scan.jobState` `{jobId, state: JobState}` — on every job-state transition.
 - `scan.progress` `{jobId, frameIndex, frameOrdinal, totalFrames, pass, totalPasses, framePercent: 0–100, jobPercent: 0–100, etaSeconds: number}` — every ~150 ms × timeScale while scanning.
-- `scan.frameState` `{jobId, frameIndex, state: FrameState, attempt: u32, error?: {code, message, recoverable}}`
+- `scan.frameState` `{jobId, frameIndex, state: FrameState, attempt: u32, error?: {code, message, recoverable}}`. A `notAttempted` frame always omits `error` — it names a frame the batch never reached, not a failure.
 - `scan.frameCompleted` `{jobId, frameIndex, receipt: ScanReceipt}`
-- `scan.completed` `{jobId, summary: {completed: [u32], failed: [u32], skipped: [u32], stopped: bool, dutyCycle?: DutyCycleReport}}` — emitted for every terminal state (also after stops/failures). `dutyCycle` is present only for real-backend jobs with at least one observed frame-to-frame transition; it is omitted (not `null`) otherwise, and for all simulated jobs. It is a passive measurement — it reports per-frame idle milliseconds, mean, and max — and does not gate or fail anything; comparing it against timing targets is a separate, owner-attended live concern, not a judgment made by the engine.
+- `scan.completed` `{jobId, summary: {completed: [u32], failed: [u32], skipped: [u32], notAttempted: [u32], stopped: bool, dutyCycle?: DutyCycleReport}}` — emitted for every terminal state (also after stops/failures). `dutyCycle` is present only for real-backend jobs with at least one observed frame-to-frame transition; it is omitted (not `null`) otherwise, and for all simulated jobs. It is a passive measurement — it reports per-frame idle milliseconds, mean, and max — and does not gate or fail anything; comparing it against timing targets is a separate, owner-attended live concern, not a judgment made by the engine. **`notAttempted` (additive, D-20/HEAD-12, 2026-09-07):** frames a batch abort never reached — the frame that actually raised a terminal failure is named in `failed` (with its own typed `error`) by whichever event attributed it (`scan.frameFailed`, a single-slot `hardware.anomaly`) before the terminal closure ran; everything still unresolved at that point is `notAttempted`, never `failed`, so `failed` names exactly the frames the scanner actually tried. `#[serde(default)]` on the wire: an older engine's summary (which never sent this key) decodes with an empty list, i.e. today's behavior.
 
 ## State machines
 
 **JobState** `queued → scanning → {completed | failed | stoppingAfterCurrentFrame | stoppingImmediately}`; `stoppingAfterCurrentFrame → {stopped | completed}` (completed when the stopped frame was the last one anyway); `stoppingImmediately → stopped`; `queued → stopped` (stop before first frame). Terminal: `completed`, `stopped`, `failed`. No other transitions are legal — the engine has a transition table and tests assert illegal transitions are rejected.
 
-**FrameState** `waiting → active → {completed | failed | skipped}`; `failed → active` (retry, attempt+1). Project-level "excluded" frames never enter a job at all — exclusion is not a job state.
+**FrameState** `waiting → active → {completed | failed | skipped}`; `failed → active` (retry, attempt+1); `waiting → notAttempted` (D-20/HEAD-12: the batch's terminal closure ran before this frame was ever dispatched). Project-level "excluded" frames never enter a job at all — exclusion is not a job state. No transition ever reaches `notAttempted` from `active`, `completed`, `failed`, or `skipped` — a frame that was ever dispatched is never relabelled as never having been attempted.
 
 ## Determinism
 

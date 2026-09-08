@@ -250,6 +250,11 @@ public actor EngineClient {
         nextRequestId += 1
         let id = nextRequestId
         let envelope = RequestEnvelope(id: id, method: method, params: params)
+        // D-24/HEAD-12 (CF-14): stamped here, not inside `timeoutRequest`,
+        // so the journaled duration is this exact request's own real
+        // elapsed time rather than a re-derivation of the configured
+        // timeout (which a slow scheduler could make subtly wrong).
+        let startedAt = ContinuousClock.now
 
         let responseData: Data = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -261,7 +266,7 @@ public actor EngineClient {
                         return
                     }
                     guard !Task.isCancelled else { return }
-                    await self?.timeoutRequest(id: id, method: method)
+                    await self?.timeoutRequest(id: id, method: method, startedAt: startedAt)
                 }
                 pendingRequests[id] = PendingRequest(
                     continuation: continuation,
@@ -288,9 +293,34 @@ public actor EngineClient {
 
     /// Removes before resuming so a response, timeout, cancellation, and
     /// process exit can race without ever double-resuming a continuation.
-    private func timeoutRequest(id: UInt64, method: String) {
+    /// D-24/HEAD-12 (CF-14, the 2026-09-07 case where a `project.
+    /// setFrameExcluded` timeout left nothing in diagnostics): journals
+    /// `method`/`id`/`elapsedSeconds` onto the same events stream
+    /// `SessionModel` already consumes -- the method name and id only,
+    /// never this request's own `params`, which can carry a project path
+    /// or a caller-supplied directory (T-03-52). Yielded before the
+    /// continuation resumes so the journal entry is never lost to a
+    /// process exit racing this same event loop turn.
+    private static let requestTimeoutEventName = "engine.request.timeout"
+
+    private func timeoutRequest(id: UInt64, method: String, startedAt: ContinuousClock.Instant) {
         guard let pending = pendingRequests.removeValue(forKey: id) else { return }
         pending.timeoutTask.cancel()
+        let elapsed = startedAt.duration(to: .now)
+        let elapsedSeconds = Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) / 1_000_000_000_000_000_000
+        if let rawLine = try? JSONEncoder().encode(
+            EncodableEventEnvelope(
+                event: Self.requestTimeoutEventName,
+                payload: EngineRequestTimeoutPayload(
+                    method: method,
+                    id: id,
+                    elapsedSeconds: elapsedSeconds
+                )
+            )
+        ) {
+            eventsContinuation.yield(EngineEvent(name: Self.requestTimeoutEventName, rawLine: rawLine))
+        }
         pending.continuation.resume(throwing: EngineRequestError(
             code: "ENGINE_REQUEST_TIMEOUT",
             message: "Engine request \"\(method)\" (id \(id)) exceeded its response deadline.",

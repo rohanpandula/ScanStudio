@@ -27,6 +27,7 @@ use crate::protocol::{
 };
 
 const DEVICE_ID: &str = "sim-ls5000-0";
+const UNVERIFIED_DEVICE_ID: &str = "sim-ls50-0";
 
 // ---------------------------------------------------------------------
 // Determinism (D-08, SIM-03)
@@ -177,6 +178,119 @@ fn synthesize_preview_strip(
     Ok(path)
 }
 
+// ---------------------------------------------------------------------
+// Preview fixtures (D-18, additive) -- a simulator-only test affordance so
+// the manual-review and skip-blank paths are exercisable without hardware.
+// Opt-in via `sim.loadMedia`'s own `previewFixture` param
+// (`protocol::LoadMediaParams`); the real backend rejects `sim.loadMedia`
+// outright (`RealLs5000::load_media`), unchanged by this addition. With no
+// fixture ever armed, `thumbnail_for`/`acquire_thumbnails` are byte-
+// identical to before this section existed -- `thumbnail_for` itself is
+// never modified, and every write below lives on a wholly separate branch.
+// ---------------------------------------------------------------------
+
+/// `sim.loadMedia`'s own two `previewFixture` values. Stored on `State`
+/// alongside the carrier -- a property of the loaded media, reset to
+/// `None` on every `load_media` call exactly like `carrier`/`frame_count`/
+/// `adapter` already are, and re-armed by `SimulatedLs5000
+/// ::arm_preview_fixture` only when that same `sim.loadMedia` request
+/// named one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewFixture {
+    /// Every previewed frame's thumbnail carries a `Textured` tile.
+    Textured,
+    /// Every previewed frame carries a `Textured` tile except the last
+    /// two (by position in the accepted-frames list): the second-to-last
+    /// is flagged for manual review with a `Textured` tile, and the last
+    /// carries a `Blank` tile -- the leader's own position on a real roll.
+    BoundaryAndBlank,
+}
+
+impl PreviewFixture {
+    /// Recognizes `sim.loadMedia`'s two wire strings. Returns `None` for
+    /// anything else -- the caller (the dispatch arm, `server.rs`) is the
+    /// one that turns an unrecognized value into `ErrorCode::InvalidParams`,
+    /// naming the actual offending string; this function only recognizes.
+    pub fn parse(value: &str) -> Option<PreviewFixture> {
+        match value {
+            "textured" => Some(PreviewFixture::Textured),
+            "boundaryAndBlank" => Some(PreviewFixture::BoundaryAndBlank),
+            _ => None,
+        }
+    }
+}
+
+/// The two tiles a preview fixture can write. Never consulted by
+/// `thumbnail_for` -- only by the fixture branch inside `acquire_thumbnails`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureTileShape {
+    Textured,
+    Blank,
+}
+
+/// 03-BLANK-HINT.md's own fixture dimensions -- matching them means a
+/// decoded tile's central-80%-crop statistics land where that document's
+/// calibration table already describes.
+const FIXTURE_TILE_WIDTH_PX: u32 = 143;
+const FIXTURE_TILE_HEIGHT_PX: u32 = 96;
+/// The calibration roll's own clear-base value (03-BLANK-HINT.md: frames
+/// 37/38 measured mean ~202.8) -- `Blank`'s uniform gray, chosen so a
+/// decoded tile's mean lands where the calibration table's own blank rows
+/// do, not merely so its stddev is zero.
+const FIXTURE_BLANK_GRAY: u8 = 203;
+
+/// Writes one `FIXTURE_TILE_WIDTH_PX x FIXTURE_TILE_HEIGHT_PX` PNG tile for
+/// one fixture frame, reusing `synthesize_preview_strip`'s own directory-
+/// naming and error-mapping shape verbatim: a fresh
+/// `scanstudio-sim-previews/tiles-<nanos hex>/` directory per call, holding
+/// `frame-<index>.png`. `Blank` is uniform `FIXTURE_BLANK_GRAY` with zero
+/// variation (central-crop stddev 0, `blankConfidence` 1.00); `Textured` is
+/// a deterministic gradient (coarse structure) plus `fnv1a64`-driven
+/// per-pixel noise (fine structure), tuned so the central-crop stddev sits
+/// comfortably above `BlankFrameHint`'s own flatness ceiling -- measured,
+/// not assumed, by this module's own
+/// `textured_tile_stddev_is_comfortably_above_the_flatness_window` test.
+fn synthesize_frame_tile(
+    device_id: &str,
+    frame_index: u32,
+    shape: FixtureTileShape,
+) -> Result<std::path::PathBuf, EngineError> {
+    let image = image::RgbImage::from_fn(FIXTURE_TILE_WIDTH_PX, FIXTURE_TILE_HEIGHT_PX, |x, y| {
+        match shape {
+            FixtureTileShape::Blank => image::Rgb([FIXTURE_BLANK_GRAY; 3]),
+            FixtureTileShape::Textured => {
+                let h = fnv1a64(&format!("{device_id}:tile:{frame_index}:{x}:{y}"));
+                let gradient = (x * 255 / FIXTURE_TILE_WIDTH_PX.max(1)) as i32;
+                let noise = ((h % 121) as i32) - 60; // -60..=60, deterministic per pixel
+                let value = (gradient + noise).clamp(0, 255) as u8;
+                image::Rgb([value, value, value])
+            }
+        }
+    });
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir()
+        .join("scanstudio-sim-previews")
+        .join(format!("tiles-{nanos:x}"));
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to create simulator preview tile directory: {err}"),
+        )
+    })?;
+    let path = dir.join(format!("frame-{frame_index}.png"));
+    image.save(&path).map_err(|err| {
+        EngineError::new(
+            ErrorCode::Internal,
+            format!("failed to write simulator preview tile image: {err}"),
+        )
+    })?;
+    Ok(path)
+}
+
 /// Lowercase 16-hex-char FNV-1a 64 of
 /// `"{resolutionDpi}:{bitDepth}:{multisamplePasses}:{channels}"`.
 pub fn settings_fingerprint(recipe: &CaptureRecipe) -> String {
@@ -254,11 +368,16 @@ fn is_job_terminal(state: JobState) -> bool {
     )
 }
 
-/// The most recent successful `manual_frames()` call's operator-approval
-/// binding (adversarial review S7a, 2026-08-08). The simulator otherwise
-/// has no manual-review gate at all; this exists solely so a simulated
-/// manual placement -- which always arrives `needsApproval: true` -- is
-/// not a permanent dead end with nothing that could ever clear it.
+/// The most recent operator-approval binding, from either of two sources:
+/// a successful `manual_frames()` call (adversarial review S7a,
+/// 2026-08-08), or `acquire_thumbnails`'s own D-18 preview fixture
+/// flagging a frame (`boundaryAndBlank`). The simulator otherwise has no
+/// manual-review gate at all; this exists solely so a simulated flagged
+/// frame -- which always arrives `needsApproval: true` from either source
+/// -- is not a permanent dead end with nothing that could ever clear it.
+/// Whichever source armed it most recently wins; the two never need to
+/// coexist; a source that reflags after the other still overwrites,
+/// matching `manual_frames()`'s own precedent of one binding at a time.
 #[derive(Debug, Clone)]
 struct ManualApprovalBinding {
     operation_id: String,
@@ -267,6 +386,7 @@ struct ManualApprovalBinding {
 
 struct State {
     connected: bool,
+    selected_device_id: &'static str,
     adapter: Option<String>,
     media_loaded: bool,
     carrier: Option<MediaCarrier>,
@@ -279,12 +399,25 @@ struct State {
     job_seq: u64,
     thumbnail_operation_active: bool,
     manual_approval_binding: Option<ManualApprovalBinding>,
+    /// D-18: `None` by default and after every fresh `load_media` -- the
+    /// default (unarmed) path this field can produce is what
+    /// `fnv1a64_matches_golden_thumbnails` pins.
+    preview_fixture: Option<PreviewFixture>,
+    /// D-20/HEAD-12: a **simulator-only test affordance** (1-based frame
+    /// index, bridge error code string) that fails the named frame and
+    /// marks every later frame `NotAttempted` the next time a scan reaches
+    /// it. `None` by default and after every fresh `load_media`, exactly
+    /// like `preview_fixture`. Consumed (reset to `None`) by
+    /// `run_scan_job` the moment it actually fires -- one-shot, never
+    /// surviving into a later scan on the same connection.
+    batch_abort: Option<(u32, String)>,
 }
 
 impl Default for State {
     fn default() -> Self {
         State {
             connected: false,
+            selected_device_id: DEVICE_ID,
             adapter: None,
             media_loaded: false,
             carrier: None,
@@ -297,6 +430,8 @@ impl Default for State {
             job_seq: 0,
             thumbnail_operation_active: false,
             manual_approval_binding: None,
+            preview_fixture: None,
+            batch_abort: None,
         }
     }
 }
@@ -330,6 +465,21 @@ fn status_snapshot(state: &State) -> ScannerStatus {
         lamp: state.lamp,
         transport: state.transport,
         active_job_id,
+        device_model: state.connected.then(|| {
+            if state.selected_device_id == UNVERIFIED_DEVICE_ID {
+                "LS-50 ED"
+            } else {
+                "SUPER COOLSCAN 5000 ED"
+            }
+            .to_string()
+        }),
+        hardware_verification: state.connected.then_some(
+            if state.selected_device_id == UNVERIFIED_DEVICE_ID {
+                crate::domain::HardwareVerification::Unverified
+            } else {
+                crate::domain::HardwareVerification::Verified
+            },
+        ),
         // The simulator has no bridge-side SAFE-02 latch to inspect.
         motion_armed: None,
         // The simulator has no bridge to source a real film-presence read
@@ -344,6 +494,7 @@ fn status_snapshot(state: &State) -> ScannerStatus {
 
 pub struct SimulatedLs5000 {
     device: DeviceInfo,
+    unverified_device: DeviceInfo,
     state: Mutex<State>,
     cancelled: AtomicBool,
 }
@@ -358,6 +509,8 @@ impl SimulatedLs5000 {
                 firmware: "1.03-sim".to_string(),
                 connection: "USB (simulated)".to_string(),
                 supported: true,
+                unverified_allowed: false,
+                hardware_verification: crate::domain::HardwareVerification::Verified,
                 // No bridge to source a capability list from, and
                 // skip_serializing_if keeps this key off the wire entirely
                 // (byte-identical scanner.list/scanner.connect JSON to
@@ -373,16 +526,38 @@ impl SimulatedLs5000 {
                 // None is simply the smaller, zero-new-fixtures change.
                 supported_multisample_passes: None,
             },
+            unverified_device: DeviceInfo {
+                device_id: UNVERIFIED_DEVICE_ID.to_string(),
+                model: "LS-50 ED".to_string(),
+                kind: "simulated".to_string(),
+                firmware: "1.00-sim".to_string(),
+                connection: "USB (simulated)".to_string(),
+                supported: false,
+                unverified_allowed: true,
+                hardware_verification: crate::domain::HardwareVerification::Unverified,
+                supported_multisample_passes: None,
+            },
             state: Mutex::new(State::default()),
             cancelled: AtomicBool::new(false),
         }
     }
 
-    /// `scanner.list` is device discovery, independent of connection state
-    /// — always exactly one simulated device in M1. Not part of
-    /// `ScannerBackend` since it doesn't touch backend connection state.
+    /// The selected simulator identity, or the verified default while
+    /// disconnected. Not part of `ScannerBackend` because it is read-only.
     pub fn device_info(&self) -> DeviceInfo {
-        self.device.clone()
+        if self.state.lock().unwrap().selected_device_id == UNVERIFIED_DEVICE_ID {
+            self.unverified_device.clone()
+        } else {
+            self.device.clone()
+        }
+    }
+
+    pub fn device_infos(&self) -> Vec<DeviceInfo> {
+        vec![self.device.clone(), self.unverified_device.clone()]
+    }
+
+    pub fn recognizes(&self, device_id: &str) -> bool {
+        matches!(device_id, DEVICE_ID | UNVERIFIED_DEVICE_ID)
     }
 
     /// Pure in-process activity snapshot used by metadata publication. It
@@ -584,18 +759,17 @@ impl SimulatedLs5000 {
         })
     }
 
-    /// `roll.approve` sim parity for manually-placed frames (adversarial
-    /// review S7a, 2026-08-08). The simulator otherwise has NO
-    /// manual-review gate -- every other case is refused with the same
-    /// message as before this change. Only a frame this backend's own
-    /// last successful `manual_frames()` call actually returned, under
-    /// that exact `operation_id`, can be approved; the binding is cleared
-    /// on connect/disconnect/load_media/eject so a stale approval can
-    /// never survive a session or media change (mirrors the S2 fix's own
-    /// "never let frame-indexed state silently outlive the placement that
-    /// produced it" principle). Not part of `ScannerBackend`: dispatched
-    /// directly from `Backends::roll_approve`, exactly like every other
-    /// roll.* method that is real-only or sim-only.
+    /// `roll.approve` sim parity for a flagged frame, from either
+    /// `manual_frames()` (adversarial review S7a, 2026-08-08) or D-18's
+    /// preview fixture. Only a frame `manual_approval_binding` actually
+    /// names, under that exact `operation_id`, can be approved; the
+    /// binding is cleared on connect/disconnect/load_media/eject so a
+    /// stale approval can never survive a session or media change (mirrors
+    /// the S2 fix's own "never let frame-indexed state silently outlive
+    /// the placement that produced it" principle). Not part of
+    /// `ScannerBackend`: dispatched directly from `Backends::roll_approve`,
+    /// exactly like every other roll.* method that is real-only or
+    /// sim-only.
     pub fn roll_approve(
         &self,
         frame_index: u32,
@@ -622,9 +796,34 @@ impl SimulatedLs5000 {
         }
         Err(EngineError::new(
             ErrorCode::InvalidParams,
-            "roll.approve is available on the simulator only for a frame returned by this \
-             session's own manual frame placement; the simulator has no other manual-review gate",
+            "roll.approve is available on the simulator only for a frame this session's own \
+             manual frame placement or preview fixture actually flagged; the simulator has no \
+             other manual-review gate",
         ))
+    }
+
+    /// D-18: arms (`Some`) or clears (`None`) the opt-in preview fixture
+    /// for the currently-loaded media. Not part of `ScannerBackend` --
+    /// dispatched directly by the `sim.loadMedia` arm (`server.rs`),
+    /// exactly like `manual_frames`/`roll_approve` above are for their own
+    /// sim-only affordances -- called only after `load_media` has already
+    /// succeeded, which is only reachable when this backend is the active
+    /// one (`RealLs5000::load_media` unconditionally refuses).
+    pub fn arm_preview_fixture(&self, fixture: Option<PreviewFixture>) {
+        self.state.lock().unwrap().preview_fixture = fixture;
+    }
+
+    /// D-20/HEAD-12: arms (`Some((frame_index, bridge_code))`) or clears
+    /// (`None`) the one-shot batch-abort test affordance. Not part of
+    /// `ScannerBackend` -- dispatched directly by the `sim.loadMedia` arm
+    /// (`server.rs`), exactly like `arm_preview_fixture` above, and only
+    /// after `load_media` has already succeeded, which is only reachable
+    /// when this backend is the active one (`RealLs5000::load_media`
+    /// unconditionally refuses). `bridge_code` is validated against the
+    /// bridge's own vocabulary by the dispatch arm before this is ever
+    /// called.
+    pub fn arm_batch_abort(&self, abort: Option<(u32, String)>) {
+        self.state.lock().unwrap().batch_abort = abort;
     }
 }
 
@@ -640,12 +839,23 @@ impl ScannerBackend for SimulatedLs5000 {
         device_id: &str,
         options: &ConnectOptions,
     ) -> Result<ConnectResult, EngineError> {
-        if device_id != DEVICE_ID {
+        if !self.recognizes(device_id) {
             return Err(EngineError::new(
                 ErrorCode::UnknownDevice,
                 format!("unknown device id '{device_id}'"),
             ));
         }
+        if device_id == UNVERIFIED_DEVICE_ID && !options.allow_unverified_hardware {
+            return Err(EngineError::new(
+                ErrorCode::NotSupported,
+                "LS-50 ED is recognized but not supported; only the LS-5000 is supported. Turn on \"Allow unverified scanners\" (or pass --allow-unverified-hardware) to open it anyway; every output will be tagged unverified.",
+            ));
+        }
+        let connected_device = if device_id == UNVERIFIED_DEVICE_ID {
+            self.unverified_device.clone()
+        } else {
+            self.device.clone()
+        };
         let mut state = self.state.lock().unwrap();
         if state.connected {
             return Err(EngineError::new(
@@ -654,6 +864,11 @@ impl ScannerBackend for SimulatedLs5000 {
             ));
         }
         state.connected = true;
+        state.selected_device_id = if device_id == UNVERIFIED_DEVICE_ID {
+            UNVERIFIED_DEVICE_ID
+        } else {
+            DEVICE_ID
+        };
         state.adapter = None;
         state.media_loaded = false;
         state.carrier = None;
@@ -677,8 +892,9 @@ impl ScannerBackend for SimulatedLs5000 {
 
         let status = status_snapshot(&state);
         Ok(ConnectResult {
-            device: self.device.clone(),
+            device: connected_device,
             status,
+            already_connected: false,
         })
     }
 
@@ -697,6 +913,7 @@ impl ScannerBackend for SimulatedLs5000 {
             ));
         }
         state.connected = false;
+        state.selected_device_id = DEVICE_ID;
         state.adapter = None;
         state.media_loaded = false;
         state.carrier = None;
@@ -744,6 +961,18 @@ impl ScannerBackend for SimulatedLs5000 {
         // Newly loaded media invalidates any manual placement made against
         // whatever was loaded before.
         state.manual_approval_binding = None;
+        // D-18: a fixture is a property of the loaded media, reset here
+        // exactly like carrier/frame_count/adapter above -- a fresh load
+        // with no explicit fixture request leaves acquire_thumbnails
+        // byte-identical to today. `arm_preview_fixture` (called by the
+        // sim.loadMedia dispatch arm immediately after this succeeds)
+        // re-arms it only when that same request named one.
+        state.preview_fixture = None;
+        // D-20/HEAD-12: same reset for the batch-abort affordance --
+        // property of the loaded media, cleared here, re-armed only by
+        // `arm_batch_abort` when that same `sim.loadMedia` request named
+        // one.
+        state.batch_abort = None;
         Ok(status_snapshot(&state))
     }
 
@@ -786,7 +1015,7 @@ impl ScannerBackend for SimulatedLs5000 {
         operation_id: Option<String>,
         event_tx: mpsc::Sender<String>,
     ) -> Result<Vec<u32>, EngineError> {
-        let (accepted_frames, time_scale, device_id) = {
+        let (accepted_frames, time_scale, device_id, preview_fixture) = {
             let mut state = backend.state.lock().unwrap();
             if !state.connected {
                 return Err(EngineError::new(
@@ -807,18 +1036,70 @@ impl ScannerBackend for SimulatedLs5000 {
             let accepted = frames.unwrap_or_else(|| (1..=frame_count).collect());
             state.transport = Transport::Busy;
             state.thumbnail_operation_active = true;
-            (accepted, state.time_scale, backend.device.device_id.clone())
+            (
+                accepted,
+                state.time_scale,
+                backend.device.device_id.clone(),
+                state.preview_fixture,
+            )
         };
 
         let thread_frames = accepted_frames.clone();
         let backend_for_thread = Arc::clone(backend);
+        let acquire_operation_id = operation_id.clone();
         thread::spawn(move || {
             let tick_ms = scale_ms(80, time_scale).max(1);
-            for &frame_index in &thread_frames {
+            let last_position = thread_frames.len().saturating_sub(1);
+            // D-18: every frame this preview flags for manual review must
+            // actually be approvable afterward -- `roll_approve`'s own gate
+            // (below) checks `manual_approval_binding`, which until now was
+            // armed only by `manual_frames()`. Accumulated here and armed
+            // once, in the same final lock scope this closure already
+            // takes, keyed by this preview's own operation id so a LATER,
+            // different preview's approval can never reuse a stale binding.
+            let mut fixture_flagged_frames: Vec<u32> = Vec::new();
+            for (position, &frame_index) in thread_frames.iter().enumerate() {
                 if !sleep_until_or_cancelled(&backend_for_thread, tick_ms) {
                     return;
                 }
-                let thumbnail = thumbnail_for(&device_id, frame_index);
+                let mut thumbnail = thumbnail_for(&device_id, frame_index);
+                // D-18: a wholly separate branch from thumbnail_for's own
+                // default path above -- with no fixture armed
+                // (`preview_fixture == None`, the default), `thumbnail` is
+                // untouched from here on, byte-identical to before this
+                // fixture support existed.
+                if let Some(fixture) = preview_fixture {
+                    let is_last = position == last_position;
+                    let is_second_to_last = last_position > 0 && position + 1 == last_position;
+                    let shape = match fixture {
+                        PreviewFixture::Textured => FixtureTileShape::Textured,
+                        PreviewFixture::BoundaryAndBlank if is_last => FixtureTileShape::Blank,
+                        PreviewFixture::BoundaryAndBlank => FixtureTileShape::Textured,
+                    };
+                    // A fixture tile failing to write (disk full, etc.)
+                    // must not crash the preview thread -- fall back to
+                    // this frame's own default, unfixtured thumbnail
+                    // exactly as if no fixture had been armed.
+                    if let Ok(path) = synthesize_frame_tile(&device_id, frame_index, shape) {
+                        thumbnail.image_path = Some(path.display().to_string());
+                        // T-10-07 (protocol.rs's own documented wire
+                        // contract): exactly one of imagePath or
+                        // {brightness, tint} is ever populated, never
+                        // both. thumbnail_for() above always sets
+                        // brightness/tint; a fixture tile is this
+                        // module's own stand-in for a real backend's
+                        // raster, so it must clear them exactly like a
+                        // real backend's own Thumbnail would.
+                        thumbnail.brightness = None;
+                        thumbnail.tint = None;
+                        if fixture == PreviewFixture::BoundaryAndBlank && is_second_to_last {
+                            thumbnail.needs_approval = true;
+                            thumbnail.warnings =
+                                vec!["boundary ambiguous (simulated fixture)".to_string()];
+                            fixture_flagged_frames.push(frame_index);
+                        }
+                    }
+                }
                 emit(
                     &event_tx,
                     "scanner.thumbnail",
@@ -844,6 +1125,12 @@ impl ScannerBackend for SimulatedLs5000 {
             state.thumbnail_operation_active = false;
             if !job_is_active(&state) {
                 state.transport = Transport::Idle;
+            }
+            if !fixture_flagged_frames.is_empty() {
+                state.manual_approval_binding = Some(ManualApprovalBinding {
+                    operation_id: acquire_operation_id.clone().unwrap_or_default(),
+                    frame_indices: fixture_flagged_frames.into_iter().collect(),
+                });
             }
             let status = status_snapshot(&state);
             drop(state);
@@ -871,7 +1158,7 @@ impl ScannerBackend for SimulatedLs5000 {
         output_authorities: Option<crate::render::JobOutputAuthorities>,
         event_tx: mpsc::Sender<String>,
     ) -> Result<String, EngineError> {
-        let (job_id, time_scale, fault_injection, output_authorities) = {
+        let (job_id, time_scale, fault_injection, batch_abort, output_authorities) = {
             let mut state = backend.state.lock().unwrap();
             if !state.connected {
                 return Err(EngineError::new(
@@ -965,6 +1252,7 @@ impl ScannerBackend for SimulatedLs5000 {
                 job_id,
                 state.time_scale,
                 state.fault_injection.clone(),
+                state.batch_abort.clone(),
                 output_authorities,
             )
         };
@@ -983,6 +1271,7 @@ impl ScannerBackend for SimulatedLs5000 {
                 output_authorities,
                 time_scale,
                 fault_injection,
+                batch_abort,
                 event_tx,
             );
         });
@@ -1178,7 +1467,7 @@ fn build_receipt(
     recipe: &CaptureRecipe,
     processing: &ProcessingRecipe,
     output: &OutputRecipe,
-    device_id: &str,
+    device: &DeviceInfo,
     written: &crate::render::WrittenPaths,
     project_root: Option<&crate::render::ProjectOutputRootAuthority>,
 ) -> Result<ScanReceipt, crate::domain::EngineError> {
@@ -1206,7 +1495,9 @@ fn build_receipt(
         bit_depth: recipe.bit_depth,
         channels: channels_str(recipe.channels).to_string(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        device_id: device_id.to_string(),
+        device_id: device.device_id.clone(),
+        device_model: Some(device.model.clone()),
+        hardware_verification: device.hardware_verification,
         simulated: true,
         settings_fingerprint: settings_fingerprint(recipe),
         processing: Some(processing.clone()),
@@ -1360,9 +1651,11 @@ fn run_scan_job(
     output_authorities: crate::render::JobOutputAuthorities,
     time_scale: f64,
     fault_injection: FaultInjection,
+    batch_abort: Option<(u32, String)>,
     event_tx: mpsc::Sender<String>,
 ) {
-    let device_id = backend.device.device_id.clone();
+    let device = backend.device_info();
+    let device_id = device.device_id.clone();
     let carrier = backend
         .state
         .lock()
@@ -1392,6 +1685,7 @@ fn run_scan_job(
                     completed: vec![],
                     failed: vec![],
                     skipped: vec![],
+                    not_attempted: vec![],
                     stopped: true,
                     duty_cycle: None,
                     evidence_package_status: None,
@@ -1423,6 +1717,7 @@ fn run_scan_job(
 
     let mut summary = ScanSummary::default();
     let mut stop_seen: Option<StopMode> = None;
+    let mut batch_abort_triggered = false;
 
     'frames: for (i, &frame_index) in frames.iter().enumerate() {
         let frame_ordinal = i as u32 + 1;
@@ -1483,6 +1778,60 @@ fn run_scan_job(
                 error: None,
             },
         );
+
+        // D-20/HEAD-12 (1d, the 2026-09-07 batch abort): a simulator-only
+        // test affordance that fails this exact frame with the armed
+        // bridge code, in the bridge's own message shape, then marks every
+        // later frame NotAttempted -- reproducing a failed-batch-recovery
+        // scenario without hardware. One-shot: consumed here so it never
+        // survives into a later scan on this connection.
+        if let Some((abort_frame, abort_code)) = batch_abort.as_ref() {
+            if *abort_frame == frame_index {
+                let mapped_code = crate::real_backend::map_bridge_error_code_str(abort_code);
+                let error = EngineError::new(
+                    mapped_code,
+                    format!(
+                        "bridge scan.frameFailed ({abort_code}): simulated batch abort armed via sim.loadMedia"
+                    ),
+                )
+                .with_recoverable(crate::real_backend::map_bridge_error_code_recoverable(
+                    abort_code,
+                ));
+                let error_payload = ErrorPayload::from(&error);
+                let _ = set_frame_state(&backend, &job_id, frame_index, FrameState::Failed);
+                emit(
+                    &event_tx,
+                    "scan.frameState",
+                    FrameStatePayload {
+                        job_id: job_id.clone(),
+                        frame_index,
+                        state: FrameState::Failed,
+                        attempt: 1,
+                        error: Some(error_payload),
+                    },
+                );
+                summary.failed.push(frame_index);
+                for &later_frame in &frames[i + 1..] {
+                    let _ =
+                        set_frame_state(&backend, &job_id, later_frame, FrameState::NotAttempted);
+                    emit(
+                        &event_tx,
+                        "scan.frameState",
+                        FrameStatePayload {
+                            job_id: job_id.clone(),
+                            frame_index: later_frame,
+                            state: FrameState::NotAttempted,
+                            attempt: 1,
+                            error: None,
+                        },
+                    );
+                    summary.not_attempted.push(later_frame);
+                }
+                backend.state.lock().unwrap().batch_abort = None;
+                batch_abort_triggered = true;
+                break 'frames;
+            }
+        }
 
         let inject_fault = matches!(fault_injection, FaultInjection::Demo) && frame_index == 13;
         let mut attempt: u32 = 1;
@@ -1621,6 +1970,8 @@ fn run_scan_job(
                     &effective_output,
                     Some(detected_boundary),
                     effective_alignment,
+                    device.hardware_verification,
+                    Some(device.model.as_str()),
                     match output_authorities.frame(frame_index) {
                         Ok(authority) => authority,
                         Err(error) => {
@@ -1659,7 +2010,7 @@ fn run_scan_job(
                         &effective_recipe,
                         &effective_processing,
                         &effective_output,
-                        &device_id,
+                        &device,
                         &written,
                         output_authorities.project_root(),
                     )
@@ -1780,7 +2131,9 @@ fn run_scan_job(
         );
     }
 
-    let final_state = if stop_seen.is_some() {
+    let final_state = if batch_abort_triggered {
+        JobState::Failed
+    } else if stop_seen.is_some() {
         JobState::Stopped
     } else {
         JobState::Completed
@@ -1908,7 +2261,7 @@ mod tests {
             &recipe,
             &processing,
             &output,
-            DEVICE_ID,
+            &SimulatedLs5000::new().device_info(),
             &written,
             None,
         )
@@ -1935,7 +2288,7 @@ mod tests {
             &recipe,
             &processing,
             &output,
-            DEVICE_ID,
+            &SimulatedLs5000::new().device_info(),
             &written_none,
             None,
         )
@@ -1981,7 +2334,7 @@ mod tests {
             assert!(renamed.is_err(), "held Windows output must deny replacement");
             build_receipt(
                 "job-binding-replacement", 1, 1000, &recipe, &processing, &output,
-                DEVICE_ID, &written, Some(&project_root),
+                &SimulatedLs5000::new().device_info(), &written, Some(&project_root),
             ).expect("denied replacement retains valid receipt evidence");
             drop((written, project_root));
             let _ = std::fs::remove_dir_all(root);
@@ -1997,7 +2350,7 @@ mod tests {
             &recipe,
             &processing,
             &output,
-            DEVICE_ID,
+            &SimulatedLs5000::new().device_info(),
             &written,
             Some(&project_root),
         )
@@ -2032,6 +2385,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 1.0,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         let status = sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2188,6 +2542,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2235,6 +2590,7 @@ mod tests {
             &ConnectOptions {
                 time_scale: 1.0,
                 fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
             },
         )
         .expect("connect");
@@ -2273,6 +2629,7 @@ mod tests {
             &ConnectOptions {
                 time_scale: 0.01,
                 fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
             },
         )
         .expect("connect");
@@ -2303,6 +2660,225 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------
+    // Preview fixtures (D-18)
+    // -------------------------------------------------------------
+
+    /// Central-80%-crop population stddev of a fixture tile's luma
+    /// channel -- the same crop rule `BlankFrameHint` (Swift) and
+    /// 03-BLANK-HINT.md use: drop 10% on every side so sprocket/edge
+    /// bleed never counts.
+    fn central_crop_population_stddev(path: &std::path::Path) -> f64 {
+        let decoded = image::open(path).expect("decode fixture tile").into_luma8();
+        let (width, height) = decoded.dimensions();
+        let x0 = width / 10;
+        let x1 = width - x0;
+        let y0 = height / 10;
+        let y1 = height - y0;
+        let mut values = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                values.push(f64::from(decoded.get_pixel(x, y).0[0]));
+            }
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance =
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        variance.sqrt()
+    }
+
+    #[test]
+    fn acquire_thumbnails_with_no_preview_fixture_is_unchanged() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Strip6).expect("load media");
+        // No sim.arm_preview_fixture call at all -- the default, unarmed
+        // path this test pins.
+
+        let (tx, rx) = mpsc::channel();
+        SimulatedLs5000::acquire_thumbnails(
+            &sim,
+            Some(vec![1, 2, 3]),
+            FilmProcess::default(),
+            None,
+            tx,
+        )
+        .expect("acquire");
+
+        for _ in 0..3 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timed out waiting for a thumbnail");
+            let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            assert_eq!(event["event"], "scanner.thumbnail");
+            let thumbnail = &event["payload"]["thumbnail"];
+            assert!(
+                thumbnail["imagePath"].is_null(),
+                "no fixture armed must never populate imagePath"
+            );
+            assert!(
+                thumbnail["needsApproval"].is_null(),
+                "no fixture armed must never flag a frame for approval (needsApproval omitted when false)"
+            );
+        }
+    }
+
+    #[test]
+    fn acquire_thumbnails_with_boundary_and_blank_preview_fixture_flags_the_right_frames() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Strip6).expect("load media"); // 6 frames
+        sim.arm_preview_fixture(Some(PreviewFixture::BoundaryAndBlank));
+
+        let (tx, rx) = mpsc::channel();
+        SimulatedLs5000::acquire_thumbnails(&sim, None, FilmProcess::default(), None, tx)
+            .expect("acquire");
+
+        let mut flagged_count = 0;
+        let mut last_frame_image_path: Option<String> = None;
+        for _ in 0..6 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timed out waiting for a thumbnail");
+            let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            assert_eq!(event["event"], "scanner.thumbnail");
+            let frame_index = event["payload"]["frameIndex"]
+                .as_u64()
+                .expect("frameIndex");
+            let thumbnail = &event["payload"]["thumbnail"];
+
+            let image_path = thumbnail["imagePath"]
+                .as_str()
+                .unwrap_or_else(|| panic!("frame {frame_index} must carry a fixture tile's imagePath"));
+            assert!(
+                std::path::Path::new(image_path).is_file(),
+                "imagePath must name an existing, readable file, frame {frame_index}"
+            );
+            assert!(
+                thumbnail["brightness"].is_null() && thumbnail["tint"].is_null(),
+                "T-10-07: a fixtured thumbnail must not also carry brightness/tint, frame {frame_index}"
+            );
+
+            if thumbnail["needsApproval"].as_bool() == Some(true) {
+                flagged_count += 1;
+                assert_eq!(
+                    frame_index, 5,
+                    "only the second-to-last of 6 frames should be flagged"
+                );
+                let warnings = thumbnail["warnings"]
+                    .as_array()
+                    .expect("a flagged frame must carry non-empty warnings");
+                assert!(!warnings.is_empty());
+            }
+            if frame_index == 6 {
+                last_frame_image_path = Some(image_path.to_string());
+            }
+        }
+        assert_eq!(
+            flagged_count, 1,
+            "exactly one frame must be flagged for manual review"
+        );
+        let last_path = last_frame_image_path.expect("frame 6 must have been observed");
+        assert!(std::path::Path::new(&last_path).is_file());
+    }
+
+    #[test]
+    fn preview_fixture_tile_stddevs_sit_on_opposite_sides_of_the_flatness_window() {
+        let blank_path =
+            synthesize_frame_tile(DEVICE_ID, 1, FixtureTileShape::Blank).expect("blank tile");
+        let blank_stddev = central_crop_population_stddev(&blank_path);
+        assert!(
+            blank_stddev < 4.0,
+            "blank tile central-crop stddev {blank_stddev} should be < 4.0"
+        );
+        let _ = std::fs::remove_dir_all(blank_path.parent().expect("tile has a parent directory"));
+
+        let textured_path =
+            synthesize_frame_tile(DEVICE_ID, 1, FixtureTileShape::Textured).expect("textured tile");
+        let textured_stddev = central_crop_population_stddev(&textured_path);
+        assert!(
+            textured_stddev > 16.0,
+            "textured tile central-crop stddev {textured_stddev} should be > 16.0"
+        );
+        let _ =
+            std::fs::remove_dir_all(textured_path.parent().expect("tile has a parent directory"));
+    }
+
+    /// [Rule 1 - Bug] Found executing plan 03-07 Task 3: `roll_approve`'s
+    /// own gate previously recognized only `manual_frames()`'s binding, so
+    /// a frame the D-18 preview fixture flagged (`needsApproval: true`,
+    /// visible in `status.manualReviewPending`) could never actually be
+    /// approved -- `review.approve`/`roll save --auto-approve` refused
+    /// every such frame with `INVALID_PARAMS`, defeating D-18's own stated
+    /// purpose ("so the review ... paths are exercisable with no
+    /// hardware"). `acquire_thumbnails` now arms `manual_approval_binding`
+    /// for its own flagged frame(s) too.
+    #[test]
+    fn preview_fixture_flagged_frame_is_approvable_via_roll_approve() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        sim.connect(
+            DEVICE_ID,
+            &ConnectOptions {
+                time_scale: 0.01,
+                fault_injection: FaultInjection::NoFault,
+                allow_unverified_hardware: false,
+            },
+        )
+        .expect("connect");
+        sim.load_media(MediaCarrier::Strip6).expect("load media"); // 6 frames
+        sim.arm_preview_fixture(Some(PreviewFixture::BoundaryAndBlank));
+
+        let operation_id = "d18-approve-op";
+        let (tx, rx) = mpsc::channel();
+        SimulatedLs5000::acquire_thumbnails(
+            &sim,
+            None,
+            FilmProcess::default(),
+            Some(operation_id.to_string()),
+            tx,
+        )
+        .expect("acquire");
+
+        // Drain through scanner.status -- the binding is armed in the same
+        // final lock scope that precedes it, so seeing this event means
+        // the binding (if any) is already set.
+        loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timed out waiting for scanner.status");
+            let event: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if event["event"] == "scanner.status" {
+                break;
+            }
+        }
+
+        sim.roll_approve(5, operation_id, false).expect(
+            "the fixture-flagged frame (5 of 6) must be approvable, not just visible as needsApproval",
+        );
+        let err = sim.roll_approve(1, operation_id, false).unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::InvalidParams,
+            "an unflagged frame must still be refused"
+        );
+    }
+
     #[test]
     fn disconnect_returns_the_offline_status_snapshot() {
         let sim = SimulatedLs5000::new();
@@ -2331,6 +2907,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2411,6 +2988,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2463,6 +3041,7 @@ mod tests {
             // the race against the frame's own (scaled) duration.
             time_scale: 0.2,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Roll36).expect("load media");
@@ -2569,6 +3148,187 @@ mod tests {
         let _ = std::fs::remove_dir_all(&output_dir);
     }
 
+    /// D-20/HEAD-12 (1d, the 2026-09-07 batch abort): with a batch abort
+    /// armed at frame 3, frames 1-2 complete normally, frame 3 fails with
+    /// the armed bridge code and a bridge-shaped message, and frames 4-5
+    /// (the batch never reaches them) are `notAttempted` with no error.
+    /// `summary.failed == [3]`, `summary.notAttempted == [4, 5]` -- never
+    /// the reverse.
+    #[test]
+    fn armed_batch_abort_fails_the_named_frame_and_marks_the_rest_not_attempted() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        let options = ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
+        };
+        sim.connect(DEVICE_ID, &options).expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+        sim.arm_batch_abort(Some((3, "ROLL_MISMATCH".to_string())));
+
+        let (tx, rx) = mpsc::channel();
+        let recipe = CaptureRecipe {
+            resolution_dpi: 40,
+            ..CaptureRecipe::default()
+        };
+        let (output, output_dir) = isolated_output_recipe("batch-abort");
+        SimulatedLs5000::scan_start(
+            &sim,
+            vec![1, 2, 3, 4, 5],
+            recipe,
+            ProcessingRecipe::default(),
+            output,
+            HashMap::new(),
+            None,
+            tx,
+        )
+        .expect("scan start");
+
+        let mut frame_states: HashMap<u32, (String, Option<serde_json::Value>)> = HashMap::new();
+        let mut final_job_state: Option<String> = None;
+        let summary: serde_json::Value;
+        loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("scan.completed event");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if value["event"] == "scan.frameState" {
+                let index = value["payload"]["frameIndex"].as_u64().unwrap() as u32;
+                let state = value["payload"]["state"].as_str().unwrap().to_string();
+                let error = value["payload"]["error"]
+                    .as_object()
+                    .map(|_| value["payload"]["error"].clone());
+                frame_states.insert(index, (state, error));
+            }
+            if value["event"] == "scan.jobState" {
+                final_job_state = value["payload"]["state"].as_str().map(|s| s.to_string());
+            }
+            if value["event"] == "scan.completed" {
+                summary = value["payload"]["summary"].clone();
+                break;
+            }
+        }
+
+        assert_eq!(frame_states.get(&1).unwrap().0, "completed");
+        assert_eq!(frame_states.get(&2).unwrap().0, "completed");
+        let (frame3_state, frame3_error) = frame_states.get(&3).unwrap();
+        assert_eq!(frame3_state, "failed");
+        let frame3_error = frame3_error.as_ref().expect("frame 3 must carry an error");
+        assert_eq!(frame3_error["code"], serde_json::json!("ROLL_MISMATCH"));
+        assert!(
+            frame3_error["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("bridge scan.frameFailed (ROLL_MISMATCH):"),
+            "message must be the bridge's own shape: {}",
+            frame3_error["message"]
+        );
+        for frame in [4u32, 5] {
+            let (state, error) = frame_states.get(&frame).unwrap();
+            assert_eq!(state, "notAttempted", "frame {frame} must be notAttempted");
+            assert!(error.is_none(), "frame {frame} must carry no error");
+        }
+        assert_eq!(final_job_state.as_deref(), Some("failed"));
+        assert_eq!(summary["completed"], serde_json::json!([1, 2]));
+        assert_eq!(summary["failed"], serde_json::json!([3]));
+        assert_eq!(summary["notAttempted"], serde_json::json!([4, 5]));
+
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    /// The arm is one-shot: consumed by the job it aborts, never surviving
+    /// into a later scan on the same connection -- otherwise a `resume`
+    /// after excluding the armed frame would abort all over again.
+    #[test]
+    fn armed_batch_abort_does_not_survive_into_a_second_scan() {
+        let sim = Arc::new(SimulatedLs5000::new());
+        let options = ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
+        };
+        sim.connect(DEVICE_ID, &options).expect("connect");
+        sim.load_media(MediaCarrier::Roll36).expect("load media");
+        sim.arm_batch_abort(Some((2, "ROLL_MISMATCH".to_string())));
+
+        let recipe = CaptureRecipe {
+            resolution_dpi: 40,
+            ..CaptureRecipe::default()
+        };
+
+        // First scan: consumes the arm.
+        let (tx1, rx1) = mpsc::channel();
+        let (output1, output_dir1) = isolated_output_recipe("batch-abort-one-shot-1");
+        SimulatedLs5000::scan_start(
+            &sim,
+            vec![1, 2, 3],
+            recipe.clone(),
+            ProcessingRecipe::default(),
+            output1,
+            HashMap::new(),
+            None,
+            tx1,
+        )
+        .expect("scan start");
+        loop {
+            let line = rx1.recv_timeout(Duration::from_secs(30)).expect("event");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if value["event"] == "scan.completed" {
+                break;
+            }
+        }
+
+        // Second scan over the same (now excluded-in-practice) frame 2 must
+        // complete normally -- the arm must not still be live.
+        let (tx2, rx2) = mpsc::channel();
+        let (output2, output_dir2) = isolated_output_recipe("batch-abort-one-shot-2");
+        SimulatedLs5000::scan_start(
+            &sim,
+            vec![2],
+            recipe,
+            ProcessingRecipe::default(),
+            output2,
+            HashMap::new(),
+            None,
+            tx2,
+        )
+        .expect("scan start");
+        let summary: serde_json::Value;
+        loop {
+            let line = rx2.recv_timeout(Duration::from_secs(30)).expect("event");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("event json");
+            if value["event"] == "scan.completed" {
+                summary = value["payload"]["summary"].clone();
+                break;
+            }
+        }
+        assert_eq!(
+            summary["completed"],
+            serde_json::json!([2]),
+            "the one-shot arm must not re-fire on a second scan"
+        );
+        assert_eq!(summary["failed"], serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(&output_dir1);
+        let _ = std::fs::remove_dir_all(&output_dir2);
+    }
+
+    /// With nothing armed, a fresh `load_media` leaves `batch_abort` unset
+    /// -- the simulator's default output is unchanged by this plan.
+    #[test]
+    fn unarmed_batch_abort_leaves_load_media_output_unchanged() {
+        let sim = SimulatedLs5000::new();
+        let options = ConnectOptions {
+            time_scale: 0.01,
+            fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
+        };
+        sim.connect(DEVICE_ID, &options).expect("connect");
+        let status = sim.load_media(MediaCarrier::Roll36).expect("load media");
+        assert_eq!(status.frame_count, Some(36));
+        assert_eq!(sim.state.lock().unwrap().batch_abort, None);
+    }
+
     #[test]
     fn scan_start_persists_frame_receipts_to_manifest_for_resume() {
         let dir = std::env::temp_dir().join(format!(
@@ -2588,6 +3348,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Strip6).expect("load media");
@@ -2667,6 +3428,7 @@ mod tests {
         let options = ConnectOptions {
             time_scale: 0.01,
             fault_injection: FaultInjection::NoFault,
+            allow_unverified_hardware: false,
         };
         sim.connect(DEVICE_ID, &options).expect("connect");
         sim.load_media(MediaCarrier::Mounted).expect("load media");

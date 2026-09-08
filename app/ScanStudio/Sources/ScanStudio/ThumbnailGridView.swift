@@ -1557,6 +1557,10 @@ struct FrameStateBadge: View {
     private var label: String {
         switch state {
         case .waiting: "Waiting"
+        // D-20/HEAD-12: the batch never reached this frame -- visually
+        // identical to a frame that was never scanned at all, which is
+        // exactly what it is.
+        case .notAttempted: "Waiting"
         case .active: "Scanning"
         case .completed: "Completed"
         case .failed: FrameFailureLabel.label(forErrorCode: errorCode)
@@ -1566,7 +1570,7 @@ struct FrameStateBadge: View {
 
     private var symbol: String {
         switch state {
-        case .waiting: "clock"
+        case .waiting, .notAttempted: "clock"
         case .active: "dot.radiowaves.left.and.right"
         case .completed: "checkmark"
         case .failed: "exclamationmark"
@@ -1579,7 +1583,7 @@ struct FrameStateBadge: View {
         case .active: .scanStudioAmber
         case .completed: .scanStudioGreen
         case .failed: isManualReview ? .scanStudioAmber : .scanStudioRed
-        case .waiting, .skipped: .scanStudioSecondaryText
+        case .waiting, .notAttempted, .skipped: .scanStudioSecondaryText
         }
     }
 
@@ -1746,7 +1750,7 @@ struct FilmStripScrubberView: View {
         case .completed: return Color.scanStudioGreen.opacity(0.24)
         case .failed: return Color.scanStudioRed.opacity(0.32)
         case .skipped: return Color.black.opacity(0.30)
-        case .waiting, .none: return Color.clear
+        case .waiting, .notAttempted, .none: return Color.clear
         }
     }
 

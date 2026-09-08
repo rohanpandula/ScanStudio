@@ -379,6 +379,25 @@ public enum ScanSizeEstimator {
     }
 }
 
+/// D-19/HEAD-12: one finished job's aggregate, archived by `SessionModel`
+/// just before `jobId`/`jobState` are cleared -- `job.get`/`status --job`'s
+/// only source for a job that finished seconds ago. Retains only what
+/// `ControlJobResult` already exposes for a live job (T-03-46): scalars,
+/// two small per-frame code/message maps, and `notAttemptedFrames` --
+/// never `details`/`evidence`/`diagnosticEvidence`, and never a receipt or
+/// output path.
+struct TerminalJobRecord: Equatable, Sendable {
+    let jobId: String
+    let jobState: JobState
+    let completedFrameCount: Int
+    let pendingFrameCount: Int
+    let receiptCount: Int
+    let frameErrorCodes: [Int: String]
+    let frameErrorMessages: [Int: String]
+    let notAttemptedFrames: [Int]
+    let finishedAt: String
+}
+
 @MainActor
 @Observable
 public final class SessionModel {
@@ -561,6 +580,44 @@ public final class SessionModel {
     }
 
     public private(set) var device: DeviceInfo?
+    /// Diagnostic provenance for the most recent explicit unverified open
+    /// attempt. This survives a failed open or disconnect for refusal
+    /// reporting, while live status continues to return nil when disconnected.
+    public private(set) var lastUnverifiedHardwareAttemptModel: String?
+    public var allowUnverifiedHardware: Bool {
+        didSet { preferences.set(allowUnverifiedHardware, forKey: Self.allowUnverifiedHardwareKey) }
+    }
+    /// Tier from the currently connected response. Disconnected sessions have no verdict.
+    public var connectedHardwareVerification: String? {
+        guard status?.connected == true else { return nil }
+        return status?.hardwareVerification ?? device?.hardwareVerification ?? "verified"
+    }
+    public var connectedHardwareDeviceModel: String? {
+        guard status?.connected == true else { return nil }
+        return status?.deviceModel ?? device?.model
+    }
+    public var diagnosticHardwareVerification: String? {
+        connectedHardwareVerification ?? (lastUnverifiedHardwareAttemptModel == nil ? nil : "unverified")
+    }
+    public var diagnosticHardwareDeviceModel: String? {
+        connectedHardwareDeviceModel ?? lastUnverifiedHardwareAttemptModel
+    }
+    public var envelopeHardwareVerification: String {
+        connectedHardwareVerification ?? "notConnected"
+    }
+    /// D-16: the last device id a successful `connect(deviceId:)` resolved
+    /// to, kept even after `disconnect()`/`invalidateConnection` clear
+    /// `device`/`status` -- its whole purpose is to survive a lost session
+    /// so `status --refresh`'s one permitted automatic reconnection knows
+    /// where to go. Never cleared by this model; only ever overwritten by
+    /// a later successful connect.
+    public private(set) var lastConnectedDeviceId: String?
+    /// D-16: `true` only for the connect that just completed, when the
+    /// engine reported `alreadyConnected: true` (a same-device reconnect
+    /// that reached no backend). Cleared at the top of every
+    /// `connect(deviceId:)` call so a stale `true` never survives past the
+    /// connect it described.
+    public private(set) var lastConnectAlreadyConnected = false
     /// The full device list from the engine's last `scanner.list` response
     /// (simulator plus, when a bridge is configured, the real LS-5000) —
     /// what `SessionSidebarView`'s device picker renders. Refreshed once
@@ -575,9 +632,66 @@ public final class SessionModel {
     /// state and to reject overlapping button presses.
     public private(set) var isConnectingDevice = false
     public private(set) var isRefreshingScannerStatus = false
+    /// The single explicit signal naming whichever mutating operation (if
+    /// any) is currently in flight. `nil` when idle; otherwise the D-05
+    /// command name of the operation currently running (for example
+    /// `"scanner.eject"`). This is the one signal the control channel's
+    /// dispatcher checks before routing a new mutating request, translating
+    /// a non-nil value into `CONTROLLER_BUSY`; the GUI reads this exact same
+    /// property, so there is no separate lock subsystem. It deliberately
+    /// duplicates none of the per-operation flags above (`isConnectingDevice`,
+    /// `isResumingBatch`, etc.) -- those stay because each drives its own
+    /// progress affordance; this one only answers "is any mutation in
+    /// flight right now."
+    public private(set) var mutatingOperationInFlight: String?
+    /// Saves and returns the previous value of `mutatingOperationInFlight`,
+    /// then assigns `name` -- but only when no mutating operation is already
+    /// in flight. `connect()` calls `await refreshAvailableDevices()`
+    /// internally (below): if the nested call's own name unconditionally
+    /// overwrote this property, `mutatingOperationInFlight` would read
+    /// `"scanner.list"` instead of `"scanner.connect"` for the whole
+    /// duration of that nested await, hiding the outer operation's identity
+    /// while it is still very much in flight. Restoring `previous` via
+    /// `defer` at every call site regardless keeps all 14 call sites
+    /// identical and keeps a genuinely standalone call (no outer operation
+    /// running) reporting its own name correctly. Do not "simplify" the
+    /// `if previous == nil` check away.
+    private func beginMutatingOperation(_ name: String) -> String? {
+        let previous = mutatingOperationInFlight
+        if previous == nil {
+            mutatingOperationInFlight = name
+        }
+        return previous
+    }
     public private(set) var status: ScannerStatus?
     public private(set) var engineVersion: String?
     public private(set) var thumbnails: [Int: Thumbnail] = [:]
+    /// `BlankFrameHint.Score` per frame index, computed once per arriving
+    /// thumbnail (`"scanner.thumbnail"`) and once more when the whole preview
+    /// completes (`"scanner.thumbnailsComplete"`, so the final frame count is
+    /// authoritative for the positional prior) -- never on a repeated
+    /// `frames.list`, which only reads this cache. An absent key is the
+    /// honest answer for a frame whose thumbnail carried no decodable raster
+    /// (every simulator frame, or a real frame whose tile failed to decode):
+    /// `ControlFrameSummary` reports its five hint fields as `null` together,
+    /// never a fabricated score (D-12/HEAD-06, T-03-31).
+    ///
+    /// `blankFrameHints` must be cleared everywhere `thumbnails` itself is
+    /// reset to `[:]`, so the two dictionaries can never disagree about which
+    /// frames exist -- today that is exactly three sites: this property's own
+    /// declaration is the fourth mention below only to keep that count
+    /// honest. The three reset sites are `acquirePreview()`'s pre-request
+    /// reset, `invalidatePreviewRegistrationForProjectOpen()`, and
+    /// `clearMediaState()`. A site that resets `thumbnails` without a
+    /// matching `blankFrameHints = [:]` alongside it is a bug -- grep for
+    /// `thumbnails = [:]` before adding a new one.
+    public private(set) var blankFrameHints: [Int: BlankFrameHint.Score] = [:]
+    /// Raw `(mean, stddev)` per frame index backing `blankFrameHints` --
+    /// kept separately so a whole-roll re-score (`BlankFrameHint.score`,
+    /// which needs every frame's flatness to evaluate the positional prior)
+    /// never has to re-decode a raster it already read once. Cleared
+    /// alongside `blankFrameHints` at the same three sites.
+    private var thumbnailStatistics: [Int: (mean: Double, stddev: Double)] = [:]
     /// Exact operation identity of the latest successfully completed preview.
     /// Manual boundary approval is valid only while this same identity remains
     /// current.
@@ -595,6 +709,32 @@ public final class SessionModel {
     public private(set) var frameStates: [Int: FrameState] = [:]
     public private(set) var receipts: [ScanReceipt] = []
     public private(set) var frameErrors: [Int: ErrorPayload] = [:]
+    /// D-19/HEAD-12: the last `maximumTerminalJobHistory` jobs this process
+    /// has seen finish, oldest evicted first. Archived in `applyCompleted`
+    /// before `jobId`/`jobState` are cleared, so `job.get`/`status --job`
+    /// can still answer for a job that finished seconds ago -- the
+    /// 2026-09-07 case where the finished job became `JOB_NOT_FOUND` almost
+    /// immediately. Deliberately never cleared by `resetProjectScopedScanState`
+    /// (called on both disconnect and project change): D-19 frames this as
+    /// "the last 8 jobs of the process," not of the current project or
+    /// connection, so it survives both -- only the 8-entry bound evicts
+    /// anything, and a genuinely new process starts with an empty ring for
+    /// free (it is plain instance state).
+    private(set) var terminalJobHistory: [TerminalJobRecord] = []
+    static let maximumTerminalJobHistory = 8
+
+    /// The ring's own job ids, oldest first -- the live job (if any) is
+    /// deliberately excluded, matching `terminalJobHistory`'s "already
+    /// finished" contract.
+    var trackedJobIds: [String] { terminalJobHistory.map(\.jobId) }
+
+    /// `ControlChannelDispatcher`'s `.jobGet` arm calls this only after its
+    /// own "no id, or id matches the live job" cases have already been
+    /// handled -- this looks at the ring alone.
+    func terminalJob(id: String) -> TerminalJobRecord? {
+        terminalJobHistory.first { $0.jobId == id }
+    }
+
     /// A fine-scan request paused before `scan.start` because one or more
     /// current preview boundaries need an explicit operator confirmation.
     public private(set) var pendingManualReviewScan: ManualReviewScanRequest?
@@ -622,6 +762,30 @@ public final class SessionModel {
     public private(set) var frameTransportSmearReasons: [Int: String] = [:]
     public private(set) var scanSummary: ScanSummary?
     public private(set) var lastErrorMessage: String?
+    /// Retains the most recent engine failure's typed payload, set only by
+    /// `recordOperationFailure`, so the control channel can pass the
+    /// engine's own `code`/`recoverable` flag through verbatim (OUT-03).
+    /// Consumers must read only `.code` and `.recoverable` from this value —
+    /// `.details`, `.evidence`, `.diagnosticEvidence`, and
+    /// `.diagnosticEvidenceUnavailableReason` are hardware-diagnostic detail
+    /// the control channel must never forward (T-01-05).
+    public private(set) var lastEngineError: EngineRequestError?
+    /// SAFE-04 (Gap 2 fix): the most recent wire-level refusal
+    /// `ControlChannelDispatcher` produced -- set only by
+    /// `recordControlRefusal(command:code:gate:)`, never by any workflow
+    /// method in this file. Because this is an `@Observable` write, every
+    /// refusal (`CONFIRMATION_REQUIRED`, `GATE_REFUSED`, `CONTROLLER_BUSY`,
+    /// `INVALID_PARAMS`, `UNKNOWN_COMMAND`, `SCHEMA_VERSION_MISMATCH`,
+    /// `HELLO_REQUIRED`) now reaches `buildStatusResult()`'s tracked read
+    /// and therefore every subscriber's `control.changed`, not only the
+    /// refused connection's own direct RPC response -- closing the gap
+    /// where `confirmationRefusal(for:)`/`gateRefusal(...)` returned a
+    /// value without ever writing to `SessionModel`.
+    public private(set) var lastControlRefusal: ControlRefusalRecord?
+    /// Monotonically increasing, never reset -- lets a follower distinguish
+    /// two otherwise-identical refusals (same command/code/gate) as
+    /// separate occurrences.
+    private var controlRefusalSequence: UInt64 = 0
     /// Strictly validated witness (or an explicit reason it was unavailable)
     /// from the exact terminal attempt currently represented in diagnostics.
     public private(set) var diagnosticEvidenceAvailability:
@@ -882,6 +1046,7 @@ public final class SessionModel {
     public private(set) var recentGearHistory = RecentGearHistory()
     private static let recentGearHistoryKey = "ScanStudio.recentGearHistory.v1"
     private static let filenameTemplateDefaultKey = "ScanStudio.filenameTemplateDefault.v1"
+    private static let allowUnverifiedHardwareKey = "ScanStudio.allowUnverifiedHardware.v1"
 
     // MARK: - Roll metadata (META-01/02) + ExifTool (META-03) + resume (PERSIST-02)
 
@@ -1098,6 +1263,48 @@ public final class SessionModel {
         )
     }
 
+    /// Applies both settings recipes at once -- the D-04 fallback entry
+    /// point `settings.set` routes to; no single `SessionModel` setter
+    /// existed for these ten plain properties before this method existed.
+    ///
+    /// A get-then-set round trip through this method is **not** the
+    /// identity for every field: `processingRecipe`'s getter above reports
+    /// `digitalIceEnabled` gated on `scanChannels == "rgbi" &&
+    /// scanFilmProcess != .bwNegative`, and `softwareDustRemovalBw` gated on
+    /// `scanFilmProcess == .bwNegative`. This method writes the raw stored
+    /// intent the caller asked for; the getter continues to report the
+    /// effective value given whatever channels/process are current when it
+    /// is next read. That asymmetry is this class's existing behaviour,
+    /// unchanged by this plan -- it is documented here, not "fixed."
+    public func applySettingsRecipes(capture: CaptureRecipe, processing: ProcessingRecipe) {
+        scanResolutionDpi = capture.resolutionDpi
+        scanBitDepth = capture.bitDepth
+        scanMultisamplePasses = capture.multisamplePasses
+        scanChannels = capture.channels
+        scanFilmProcess = processing.filmProcess
+        autofocusEachFrame = processing.autofocusEachFrame
+        autoExposureEachFrame = processing.autoExposureEachFrame
+        digitalIceEnabled = processing.digitalIceEnabled
+        digitalIceMode = processing.digitalIceMode
+        softwareDustRemovalBw = processing.softwareDustRemovalBw
+    }
+
+    /// Applies a full output recipe via the exact path the GUI already
+    /// takes when opening a project (`openProject(directory:)` calls the
+    /// private `applyRecipes(_:)` below). This is the D-04 fallback entry
+    /// point `outputs.set` routes to -- it delegates rather than
+    /// duplicating `applyRecipes`'s ~30 assignments, so `outputs.set` can
+    /// never drift from what "open a project" already does.
+    ///
+    /// `applyRecipes` deliberately resets the per-session organization
+    /// fields (`saveLocation`, `saveEachOutputInOwnFolder`, and the four
+    /// folder-name fields) before applying the recipe. That is existing
+    /// behaviour a control caller inherits here, not a new side effect this
+    /// method introduces.
+    public func applyOutputRecipe(_ recipe: OutputRecipe) {
+        applyRecipes(recipe)
+    }
+
     public var scanRecipePreset: ScanRecipePreset {
         let values = ScanRecipeValues(
             resolutionDpi: scanResolutionDpi,
@@ -1244,6 +1451,7 @@ public final class SessionModel {
     ) {
         self.engineClient = engineClient
         self.preferences = preferences
+        self.allowUnverifiedHardware = preferences.bool(forKey: Self.allowUnverifiedHardwareKey)
         self.diagnosticTimeline = SessionDiagnosticTimeline(
             sessionID: UUID().uuidString.lowercased(),
             directory: diagnosticsDirectory
@@ -1281,6 +1489,8 @@ public final class SessionModel {
     /// `connect(deviceId:)` if `availableDevices` is still empty when a
     /// specific device is requested.
     public func refreshAvailableDevices(rescan: Bool = false) async {
+        let previous = beginMutatingOperation(rescan ? "scanner.rescan" : "scanner.list")
+        defer { mutatingOperationInFlight = previous }
         deviceDiscoveryRequestsInFlight += 1
         isDiscoveringDevices = true
         defer {
@@ -1370,14 +1580,20 @@ public final class SessionModel {
         }
     }
 
-    /// Connects to a specific device by id. A nil target fails closed unless
-    /// discovery finds exactly one device; engine result ordering is never
+    /// Connects to a specific device by id. A nil target reuses the previous
+    /// selected id, or requires exactly one device on first use; ordering is never
     /// treated as permission to choose between real hardware and simulator.
-    public func connect(deviceId: String? = nil) async {
+    public func connect(deviceId: String? = nil, allowUnverifiedHardware: Bool? = nil) async {
         guard !Task.isCancelled, !isConnectingDevice else { return }
         isConnectingDevice = true
         defer { isConnectingDevice = false }
+        let previous = beginMutatingOperation("scanner.connect")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
+        // D-16: cleared at the top of every connect so a stale `true` from
+        // a previous, unrelated connect never survives past the call it
+        // described -- only this call's own outcome may set it again.
+        lastConnectAlreadyConnected = false
         do {
             let targetDeviceId: String
             if let deviceId {
@@ -1396,7 +1612,7 @@ public final class SessionModel {
                 }
                 try Task.checkCancellation()
                 guard let resolvedDeviceId = DeviceSelectionPolicy.resolveNilTarget(
-                    devices: availableDevices
+                    devices: availableDevices, previousDeviceId: lastConnectedDeviceId
                 ) else {
                     lastErrorMessage = availableDevices.isEmpty
                         ? "No scanner is available. Refresh the device list and try again."
@@ -1407,7 +1623,20 @@ public final class SessionModel {
             }
             let timeScale = ProcessInfo.processInfo.environment["SCANSTUDIO_TIMESCALE"]
                 .flatMap(Double.init) ?? 1.0
-            let options = ConnectOptions(timeScale: timeScale, faultInjection: "none")
+            let effectiveAllowUnverified = allowUnverifiedHardware ?? self.allowUnverifiedHardware
+            if effectiveAllowUnverified,
+               let target = availableDevices.first(where: { $0.deviceId == targetDeviceId }),
+               target.unverifiedAllowed
+            {
+                lastUnverifiedHardwareAttemptModel = target.model
+            } else {
+                lastUnverifiedHardwareAttemptModel = nil
+            }
+            let options = ConnectOptions(
+                timeScale: timeScale,
+                faultInjection: "none",
+                allowUnverifiedHardware: effectiveAllowUnverified
+            )
             let params = ConnectParams(deviceId: targetDeviceId, options: options)
             recordDiagnostic(
                 event: "device.connect.requested",
@@ -1427,6 +1656,10 @@ public final class SessionModel {
             device = result.device
             status = result.status
             refeedRequired = false
+            // D-16: survives disconnect/invalidateConnection by design --
+            // see the property's own doc comment.
+            lastConnectedDeviceId = targetDeviceId
+            lastConnectAlreadyConnected = result.alreadyConnected
             engineVersion = await engineClient.engineVersion
             coerceMultisamplePassesForConnectedDevice()
             recordDiagnostic(
@@ -1448,6 +1681,8 @@ public final class SessionModel {
     }
 
     public func disconnect() async {
+        let previous = beginMutatingOperation("scanner.disconnect")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         recordDiagnostic(
             event: "device.disconnect.requested",
@@ -1490,10 +1725,10 @@ public final class SessionModel {
 
     /// Loads a simulated carrier. Previewing remains an explicit next action
     /// after a roll project exists, matching the real scanner's honest flow.
-    public func loadCarrier(_ carrier: SimulatedFilmCarrier) async {
+    public func loadCarrier(_ carrier: SimulatedFilmCarrier, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) async {
         lastErrorMessage = nil
         do {
-            let params = LoadMediaParams(carrier: carrier.rawValue)
+            let params = LoadMediaParams(carrier: carrier.rawValue, previewFixture: previewFixture, abortAtFrame: abortAtFrame, abortCode: abortCode)
             let newStatus: ScannerStatus = try await engineClient.request("sim.loadMedia", params: params)
             status = newStatus
             clearMediaState()
@@ -1537,6 +1772,12 @@ public final class SessionModel {
             lastErrorMessage = hardwareMotionReadiness.guidance
             return .rejected
         }
+        let previous = beginMutatingOperation("preview.acquire")
+        defer {
+            mutatingOperationInFlight = isRestoringFrameAlignments
+                ? "frame.alignment.restore"
+                : previous
+        }
         // Only an admitted traversal that passed its synchronous movement
         // preflight replaces the current preview evidence. A rejected
         // "Preview Again" must leave its still-visible Review buttons and
@@ -1554,6 +1795,8 @@ public final class SessionModel {
         // if this one also refuses, `scanner.thumbnailsFailed` re-sets it.
         refeedRequired = false
         thumbnails = [:]
+        blankFrameHints = [:]
+        thumbnailStatistics = [:]
         isAcquiringThumbnails = true
         activeOperationStartedAt = Date()
 
@@ -1630,6 +1873,8 @@ public final class SessionModel {
     /// Starts a batch for the selected frames using the editable capture
     /// recipe currently shown in the Batch Settings inspector.
     public func startMockScan() async {
+        let previous = beginMutatingOperation("scan.start")
+        defer { mutatingOperationInFlight = previous }
         _ = await startScanOrRequestManualReview(frames: selectedFrames)
     }
 
@@ -1801,6 +2046,8 @@ public final class SessionModel {
         else {
             return
         }
+        let previous = beginMutatingOperation("review.approve")
+        defer { mutatingOperationInFlight = previous }
         _ = await approveManualReviewAndStart(authorization)
     }
 
@@ -1846,6 +2093,16 @@ public final class SessionModel {
                 approvingFrameIndex = nil
             }
         }
+        // CR-01: this attended-recovery approval was the one D-07 mutating
+        // flow that never set the busy indicator, so a dispatcher-routed
+        // `scan.start` arriving while it ran saw no change and reported a
+        // typed success for a request that started nothing. Same two-line
+        // set/defer-restore pattern as the other 14 call sites: once this is
+        // in flight, `handle(_:)`'s own generic busy preamble now refuses
+        // every mutating command -- `scan.start` included -- with
+        // `CONTROLLER_BUSY` before ever routing to a `SessionModel` call.
+        let previous = beginMutatingOperation("review.approve.attended")
+        defer { mutatingOperationInFlight = previous }
 
         for frameIndex in authorization.frames {
             approvingFrameIndex = frameIndex
@@ -2250,6 +2507,8 @@ public final class SessionModel {
     public func stopAfterCurrentFrame() async {
         lastErrorMessage = nil
         guard let jobId else { return }
+        let previous = beginMutatingOperation("scan.stop")
+        defer { mutatingOperationInFlight = previous }
         do {
             let params = ScanStopParams(jobId: jobId, mode: "afterCurrentFrame")
             let _: ScanStopResult = try await engineClient.request("scan.stop", params: params)
@@ -2264,6 +2523,8 @@ public final class SessionModel {
     public func stopImmediately() async {
         lastErrorMessage = nil
         guard let jobId else { return }
+        let previous = beginMutatingOperation("scan.stop")
+        defer { mutatingOperationInFlight = previous }
         do {
             let params = ScanStopParams(jobId: jobId, mode: "immediate")
             let _: ScanStopResult = try await engineClient.request("scan.stop", params: params)
@@ -2294,11 +2555,35 @@ public final class SessionModel {
     /// banner via `describe`). Never retried from the app — the incident
     /// contract puts retry decisions with the operator at the machine.
     public func eject() async {
+        let lastErrorMessageBeforeEject = lastErrorMessage
         lastErrorMessage = nil
         guard hardwareMotionReadiness.allowsMotion else {
             lastErrorMessage = hardwareMotionReadiness.guidance
             return
         }
+        // CR-02: mirrors `DeviceBarView.canOfferEject` verbatim -- the exact
+        // `DeviceBarEjectPolicy.canOffer` call the GUI's own Eject button
+        // gates on, fed this method's own live state. D-08 defence in
+        // depth: `ControlChannelDispatcher`'s `.scannerEject` arm runs the
+        // identical check first, but this guard is what makes the gate
+        // impossible to bypass from any caller, dispatcher or otherwise.
+        // Previously this method only re-checked `hardwareMotionReadiness`,
+        // so a disconnected, mid-job, or mid-transport-activity eject
+        // reached the engine unchallenged.
+        guard DeviceBarEjectPolicy.canOffer(
+            isConnected: status?.connected == true,
+            transportIsIdle: (status?.transport ?? "idle") == "idle" && !isAcquiringThumbnails,
+            isJobActive: isJobActive,
+            mediaLoaded: status?.mediaLoaded == true,
+            filmPresent: status?.filmPresent,
+            refeedRequired: refeedRequired,
+            lastErrorMessage: lastErrorMessageBeforeEject
+        ) else {
+            lastErrorMessage = "Eject is not available: the scanner must be connected, idle, and not mid-job, with film to release."
+            return
+        }
+        let previous = beginMutatingOperation("scanner.eject")
+        defer { mutatingOperationInFlight = previous }
         do {
             let _: EmptyResult = try await engineClient.request("scanner.eject", params: EmptyParams())
             refeedRequired = false
@@ -2518,6 +2803,21 @@ public final class SessionModel {
         let preProjectSelection = project == nil
             ? selectedFrameIndices
             : []
+        // D-21/HEAD-12 (the 2026-09-07 batch abort): every previewed frame
+        // the operator did NOT select is created excluded on the fresh
+        // manifest, in this same project.create call -- never a post-create
+        // exclusion loop, which would leave a window in which the project
+        // disagrees with the operator's choice while a scan is starting
+        // (and the 19:38Z evidence shows a single setFrameExcluded can hit
+        // the 60s request timeout on its own). `validFrameIndices` is read
+        // here, before `project` is reassigned below, so it reflects the
+        // previewed (not yet project-scoped) frame set exactly like
+        // `preProjectSelection` does. `nil` (an existing project is being
+        // replaced) mirrors `preProjectSelection`'s own conditional: no
+        // "previewed but unselected" concept applies there.
+        let excludedFrames: [Int]? = project == nil
+            ? Set(validFrameIndices).subtracting(preProjectSelection).sorted()
+            : nil
         let preProjectSelectionAnchor = project == nil
             ? selectionAnchorFrameIndex
             : nil
@@ -2543,7 +2843,8 @@ public final class SessionModel {
                 name: name,
                 carrier: carrier,
                 frameCount: frameCount,
-                filmProcess: filmProcess
+                filmProcess: filmProcess,
+                excludedFrames: excludedFrames
             )
             let result: ProjectCreateResult = try await engineClient.request("project.create", params: params)
             resetProjectScopedScanState()
@@ -2626,6 +2927,7 @@ public final class SessionModel {
             }
             await persistFrameAlignmentDrafts()
         } catch {
+            recordOperationFailure(error, operation: "project.create")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -2655,6 +2957,8 @@ public final class SessionModel {
             return false
         }
 
+        let previous = beginMutatingOperation("roll.save")
+        defer { mutatingOperationInFlight = previous }
         await createProject(
             name: name,
             carrier: carrier,
@@ -2735,6 +3039,8 @@ public final class SessionModel {
     public func openProject(directory: String) async {
         guard beginProjectLifecycleChange() else { return }
         defer { isChangingProject = false }
+        let previous = beginMutatingOperation("roll.open")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         do {
             let params = ProjectOpenParams(directory: directory)
@@ -2756,6 +3062,7 @@ public final class SessionModel {
             applyRecipes(result.project.recipes)
             restoreDerivativeTransforms(from: result.project.frames)
         } catch {
+            recordOperationFailure(error, operation: "project.open")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -2765,6 +3072,8 @@ public final class SessionModel {
         previewFilmProcess = nil
         pendingPreviewFilmProcess = nil
         thumbnails = [:]
+        blankFrameHints = [:]
+        thumbnailStatistics = [:]
         latestCompletedPreviewOperationId = nil
         clearPendingManualReviewScan()
         clearAttendedScanRecovery()
@@ -2820,12 +3129,15 @@ public final class SessionModel {
     /// projects root. An empty list on success is still a valid,
     /// displayable state.
     public func refreshRecentProjects() async {
+        let previous = beginMutatingOperation("roll.list")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         do {
             let params = ProjectListParams(directory: nil)
             let result: ProjectListResult = try await engineClient.request("project.list", params: params)
             recentProjects = result.projects
         } catch {
+            recordOperationFailure(error, operation: "project.list")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -2834,12 +3146,24 @@ public final class SessionModel {
     /// Every dependent computed property (`excludedFrameIndices`,
     /// `isFrameExcluded`) re-derives from the fresh `project` this sets.
     public func setFrameExcluded(_ frameIndex: Int, excluded: Bool) async {
+        let previous = beginMutatingOperation(excluded ? "frames.exclude" : "frames.include")
+        defer { mutatingOperationInFlight = previous }
         lastErrorMessage = nil
         do {
             let params = SetFrameExcludedParams(frameIndex: frameIndex, excluded: excluded)
             let result: SetFrameResult = try await engineClient.request("project.setFrameExcluded", params: params)
             project = result.project
+            // D-22/HEAD-12 (CF-12/CF-13, the 2026-09-07 batch abort): the
+            // engine's own pendingFrames is refreshed here, before this
+            // method returns, so the dispatcher's next readiness read (and
+            // the GUI's own Resume button) is never stale -- excluding a
+            // frame after a failed batch must not brick Resume until
+            // something else happens to refresh the cache. Skipped when the
+            // mutation itself failed, so a failure is not masked by a
+            // second, unrelated error from this read.
+            await refreshPendingFrames()
         } catch {
+            recordOperationFailure(error, operation: "project.setFrameExcluded")
             lastErrorMessage = Self.describe(error)
         }
     }
@@ -3066,10 +3390,42 @@ public final class SessionModel {
     /// One explicit resume owns both the authoritative read and scan startup.
     /// A rejected/cancelled action cannot acquire permission from later state.
     public func resumeBatch() async {
-        guard !Task.isCancelled, !isResumingBatch, !isChangingProject,
-              pendingScanStart == nil, jobId == nil, !isJobActive,
-              pendingManualReviewScan == nil, pendingManualReviewApproval == nil,
-              pendingAttendedScanApproval == nil else { return }
+        guard !Task.isCancelled, !isChangingProject,
+              jobId == nil, !isJobActive else { return }
+        // WR-01: each of these four used to share the bare `return` above,
+        // so a dispatcher-routed `scan.resume` arriving in any of these
+        // states saw `lastErrorMessage` unchanged and reported a typed
+        // success for a resume that never ran (RESEARCH Pitfall 1, the same
+        // failure mode CR-01 closes for `scan.start`). Same fix, applied to
+        // every reason the dispatcher's own `.scanResume` arm cannot see
+        // directly: a resume already in flight, a scan already starting, an
+        // attended-recovery approval in progress, or a manual review
+        // approval in progress.
+        guard !isResumingBatch else {
+            lastErrorMessage = "A resume is already in progress."
+            return
+        }
+        guard pendingScanStart == nil else {
+            lastErrorMessage = "A scan is already starting."
+            return
+        }
+        guard pendingAttendedScanApproval == nil else {
+            lastErrorMessage = "An attended-scan-recovery approval is already in progress."
+            return
+        }
+        guard pendingManualReviewApproval == nil else {
+            lastErrorMessage = "A manual review approval is already in progress."
+            return
+        }
+        // Bundled and left silent, unlike the four guards above: a
+        // dispatcher-routed `scan.resume` already gets a typed
+        // `GATE_REFUSED` (`gate: .manualReviewPending`) for this exact
+        // condition from `gateRefusal(scanReadiness:)` before `resumeBatch()`
+        // is ever called (see `ControlChannelDispatcher.swift`'s
+        // `.scanResume` arm) -- this is defence in depth for a direct
+        // `SessionModel` caller, not a second, differently-worded copy of
+        // that same refusal.
+        guard pendingManualReviewScan == nil else { return }
         guard project != nil else {
             lastErrorMessage = ScanReadinessPolicy.Decision.projectRequired.reason
             return
@@ -3080,6 +3436,8 @@ public final class SessionModel {
         }
         isResumingBatch = true
         defer { isResumingBatch = false }
+        let previous = beginMutatingOperation("scan.resume")
+        defer { mutatingOperationInFlight = previous }
         let epoch = connectionEpoch
         guard await refreshPendingFrames(), !Task.isCancelled,
               connectionEpoch == epoch,
@@ -3226,7 +3584,30 @@ public final class SessionModel {
             finishCompletedPreview(frameCount: previewFrameCount)
             return
         }
-        let targets = project.frames.compactMap { frame -> PersistedFrameAlignmentTarget? in
+        let targets = persistedFrameAlignmentTargets(in: project)
+        guard !targets.isEmpty else {
+            finishCompletedPreview(frameCount: previewFrameCount)
+            return
+        }
+
+        let marker = startFrameAlignmentRestore(
+            previewOperationId: previewOperationId,
+            projectId: project.id
+        )
+
+        Task { [weak self] in
+            _ = await self?.restorePersistedFrameAlignments(
+                targets,
+                marker: marker,
+                previewFrameCount: previewFrameCount
+            )
+        }
+    }
+
+    private func persistedFrameAlignmentTargets(
+        in project: ScanProject
+    ) -> [PersistedFrameAlignmentTarget] {
+        project.frames.compactMap { frame -> PersistedFrameAlignmentTarget? in
             guard let alignment = frame.alignment,
                   alignment.offsetRows != 0
             else {
@@ -3237,15 +3618,17 @@ public final class SessionModel {
                 offsetRows: alignment.offsetRows
             )
         }.sorted { $0.frameIndex < $1.frameIndex }
-        guard !targets.isEmpty else {
-            finishCompletedPreview(frameCount: previewFrameCount)
-            return
-        }
+    }
 
+    private func startFrameAlignmentRestore(
+        previewOperationId: String,
+        projectId: String
+    ) -> PendingFrameAlignmentRestore {
+        _ = beginMutatingOperation("frame.alignment.restore")
         let marker = PendingFrameAlignmentRestore(
             id: UUID(),
             previewOperationId: previewOperationId,
-            projectId: project.id,
+            projectId: projectId,
             connectionEpoch: connectionEpoch
         )
         pendingFrameAlignmentRestore = marker
@@ -3254,25 +3637,18 @@ public final class SessionModel {
         // has a bridge-confirmed replacement tile. Scan readiness and another
         // preview request therefore remain closed during the restore.
         isAcquiringThumbnails = true
-
-        Task { [weak self] in
-            await self?.restorePersistedFrameAlignments(
-                targets,
-                marker: marker,
-                previewFrameCount: previewFrameCount
-            )
-        }
+        return marker
     }
 
     private func restorePersistedFrameAlignments(
         _ targets: [PersistedFrameAlignmentTarget],
         marker: PendingFrameAlignmentRestore,
         previewFrameCount: Int
-    ) async {
+    ) async -> Bool {
         for (position, target) in targets.enumerated() {
             guard frameAlignmentRestoreIsCurrent(marker) else {
                 abandonFrameAlignmentRestoreIfOwned(marker)
-                return
+                return false
             }
             let unresolvedFrameIndices = Set(
                 targets[position...].map(\.frameIndex)
@@ -3287,7 +3663,7 @@ public final class SessionModel {
                         "The saved alignment for frame \(target.frameIndex) "
                         + "is outside this scanner's supported range."
                 )
-                return
+                return false
             }
             do {
                 let params = RollSetSpacingOffsetParams(
@@ -3301,7 +3677,7 @@ public final class SessionModel {
                 )
                 guard frameAlignmentRestoreIsCurrent(marker) else {
                     abandonFrameAlignmentRestoreIfOwned(marker)
-                    return
+                    return false
                 }
                 guard result.thumbnail.spacingOffset == target.offsetRows else {
                     failFrameAlignmentRestore(
@@ -3311,7 +3687,7 @@ public final class SessionModel {
                             "The saved alignment for frame \(target.frameIndex) "
                             + "was not confirmed by the current preview. Preview the film again."
                     )
-                    return
+                    return false
                 }
                 thumbnails[target.frameIndex] = result.thumbnail
                 frameAlignmentDrafts[target.frameIndex] = FrameAlignment(
@@ -3326,7 +3702,7 @@ public final class SessionModel {
             } catch {
                 guard frameAlignmentRestoreIsCurrent(marker) else {
                     abandonFrameAlignmentRestoreIfOwned(marker)
-                    return
+                    return false
                 }
                 recordOperationFailure(error, operation: "frame.alignment.restore")
                 failFrameAlignmentRestore(
@@ -3336,17 +3712,19 @@ public final class SessionModel {
                         "Could not restore the saved alignment for frame "
                         + "\(target.frameIndex): \(Self.describe(error))"
                 )
-                return
+                return false
             }
         }
 
         guard frameAlignmentRestoreIsCurrent(marker) else {
             abandonFrameAlignmentRestoreIfOwned(marker)
-            return
+            return false
         }
         pendingFrameAlignmentRestore = nil
         isRestoringFrameAlignments = false
+        releaseFrameAlignmentRestoreMutation()
         finishCompletedPreview(frameCount: previewFrameCount)
+        return true
     }
 
     private func frameAlignmentRestoreIsCurrent(
@@ -3368,6 +3746,7 @@ public final class SessionModel {
         guard pendingFrameAlignmentRestore?.id == marker.id else { return }
         pendingFrameAlignmentRestore = nil
         isRestoringFrameAlignments = false
+        releaseFrameAlignmentRestoreMutation()
         isAcquiringThumbnails = false
         activeOperationStartedAt = nil
     }
@@ -3383,6 +3762,7 @@ public final class SessionModel {
         }
         pendingFrameAlignmentRestore = nil
         isRestoringFrameAlignments = false
+        releaseFrameAlignmentRestoreMutation()
         isAcquiringThumbnails = false
         activeOperationStartedAt = nil
         failedFrameAlignmentRestoreIndices.formUnion(unresolvedFrameIndices)
@@ -3407,6 +3787,13 @@ public final class SessionModel {
         )
     }
 
+    private func releaseFrameAlignmentRestoreMutation() {
+        guard mutatingOperationInFlight == "frame.alignment.restore" else {
+            return
+        }
+        mutatingOperationInFlight = nil
+    }
+
     /// Current native-row offset for the contact-sheet control. Only evidence
     /// applied to this live preview session is authoritative: a persisted
     /// project value must never masquerade as active before the bridge returns
@@ -3419,6 +3806,117 @@ public final class SessionModel {
 
     public func isAdjustingFrameAlignment(_ frameIndex: Int) -> Bool {
         adjustingFrameAlignmentIndices.contains(frameIndex)
+    }
+
+    /// Applies one CLI placement document as a single controller operation.
+    /// Manual rows establish a fresh registration first; absolute offsets are
+    /// then applied and persisted one slot at a time in ascending order.
+    @discardableResult
+    public func placeFrames(
+        rows: [Int]?,
+        offsetsByFrameIndex: [Int: Int]
+    ) async -> Bool {
+        lastErrorMessage = nil
+        guard rows != nil || !offsetsByFrameIndex.isEmpty else {
+            lastErrorMessage = "Frame placement requires boundary rows or at least one slot offset."
+            return false
+        }
+        guard project != nil else {
+            lastErrorMessage = "Open a project before saving frame placement."
+            return false
+        }
+        if let reason = projectChangeDisabledReason {
+            lastErrorMessage = reason
+            return false
+        }
+        let previous = beginMutatingOperation("frames.place")
+        defer { mutatingOperationInFlight = previous }
+
+        if let rows {
+            let submitted = await submitManualFrames(rows: rows)
+            guard submitted else {
+                lastErrorMessage = manualPlacementSubmitError
+                    ?? "The manual frame boundaries were refused."
+                return false
+            }
+        }
+        for frameIndex in offsetsByFrameIndex.keys.sorted() {
+            guard let offsetRows = offsetsByFrameIndex[frameIndex] else {
+                return false
+            }
+            let placed = await setFrameAlignmentOffset(
+                frameIndex: frameIndex,
+                offsetRows: offsetRows
+            )
+            guard placed else {
+                if lastErrorMessage == nil {
+                    lastErrorMessage =
+                        "The preview changed while frame \(frameIndex) placement was being applied."
+                }
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Rebinds project-persisted offsets to the exact current completed
+    /// preview. A missing or partial preview is refused before any bridge
+    /// call; restore remains sequential and leaves scan readiness blocked on
+    /// its first failed target.
+    public func replayPersistedFrameAlignments() async -> [Int]? {
+        lastErrorMessage = nil
+        guard let project else {
+            lastErrorMessage = "Open a project before replaying saved frame placement."
+            return nil
+        }
+        if let reason = projectChangeDisabledReason {
+            lastErrorMessage = reason
+            return nil
+        }
+        guard !projectMediaMismatch else {
+            lastErrorMessage =
+                "This saved project does not match the previewed holder or frame count. Create or open a matching project."
+            return nil
+        }
+        guard let previewOperationId = latestCompletedPreviewOperationId,
+              let previewFrameCount = status?.frameCount,
+              PreviewRegistrationPolicy.isComplete(
+                  mediaLoaded: status?.mediaLoaded == true,
+                  previewFrameIndices: thumbnails.keys,
+                  statusFrameCount: previewFrameCount,
+                  committedFilmProcess: previewFilmProcess
+              )
+        else {
+            lastErrorMessage =
+                "Acquire a fresh, completed preview before replaying saved frame placement."
+            return nil
+        }
+
+        let targets = persistedFrameAlignmentTargets(in: project)
+        guard !targets.isEmpty else { return [] }
+        let unresolvedTargets = targets.filter { target in
+            failedFrameAlignmentRestoreIndices.contains(target.frameIndex)
+                || thumbnails[target.frameIndex]?.spacingOffset
+                    != target.offsetRows
+        }
+        guard !unresolvedTargets.isEmpty else {
+            return targets.map(\.frameIndex)
+        }
+        let previous = beginMutatingOperation("frames.place")
+        defer { mutatingOperationInFlight = previous }
+        let marker = startFrameAlignmentRestore(
+            previewOperationId: previewOperationId,
+            projectId: project.id
+        )
+        let succeeded = await restorePersistedFrameAlignments(
+            unresolvedTargets,
+            marker: marker,
+            previewFrameCount: previewFrameCount
+        )
+        if !succeeded, lastErrorMessage == nil {
+            lastErrorMessage = "The preview changed while saved frame placement was being replayed."
+        }
+        return succeeded ? targets.map(\.frameIndex) : nil
     }
 
     /// Positive deltas are native +rows (the preview image moves left);
@@ -3451,12 +3949,63 @@ public final class SessionModel {
     /// Requests and installs one bridge-regenerated adjusted tile. The
     /// operator's old Review decision is invalid once the boundary changes.
     public func nudgeFrameAlignment(frameIndex: Int, by delta: Int) async {
-        guard canNudgeFrameAlignment(frameIndex, by: delta),
-              let previewOperationId = latestCompletedPreviewOperationId
-        else {
+        guard canNudgeFrameAlignment(frameIndex, by: delta) else {
             return
         }
         let targetOffset = alignmentOffset(for: frameIndex) + delta
+        _ = await applyFrameAlignmentOffset(
+            frameIndex: frameIndex,
+            targetOffset: targetOffset
+        )
+    }
+
+    private func setFrameAlignmentOffset(
+        frameIndex: Int,
+        offsetRows: Int
+    ) async -> Bool {
+        guard project != nil else {
+            lastErrorMessage = "Open a project before saving frame placement."
+            return false
+        }
+        guard !projectMediaMismatch else {
+            lastErrorMessage =
+                "This saved project does not match the previewed holder or frame count. Create or open a matching project."
+            return false
+        }
+        guard !isChangingProject,
+              !isRestoringFrameAlignments,
+              pendingScanStart == nil,
+              !isJobActive,
+              pendingFrameAlignmentAdjustment == nil,
+              latestCompletedPreviewOperationId != nil,
+              thumbnails[frameIndex] != nil,
+              validFrameIndices.contains(frameIndex)
+        else {
+            lastErrorMessage =
+                "Frame \(frameIndex) requires a fresh, completed preview before its placement can be saved."
+            return false
+        }
+        guard frameAlignmentOffsetBounds(for: frameIndex).contains(offsetRows) else {
+            lastErrorMessage =
+                "Frame \(frameIndex) row offset \(offsetRows) is outside the supported range "
+                + "\(frameAlignmentOffsetBounds(for: frameIndex))."
+            return false
+        }
+        return await applyFrameAlignmentOffset(
+            frameIndex: frameIndex,
+            targetOffset: offsetRows,
+            requireExactConfirmation: true
+        )
+    }
+
+    private func applyFrameAlignmentOffset(
+        frameIndex: Int,
+        targetOffset: Int,
+        requireExactConfirmation: Bool = false
+    ) async -> Bool {
+        guard let previewOperationId = latestCompletedPreviewOperationId else {
+            return false
+        }
         let marker = PendingFrameAlignmentAdjustment(
             id: UUID(),
             frameIndex: frameIndex,
@@ -3485,8 +4034,17 @@ public final class SessionModel {
                 "roll.setSpacingOffset",
                 params: params
             )
-            guard frameAlignmentAdjustmentIsCurrent(marker) else { return }
+            guard frameAlignmentAdjustmentIsCurrent(marker) else { return false }
 
+            if requireExactConfirmation,
+               result.thumbnail.spacingOffset != targetOffset
+            {
+                throw EngineRequestError(
+                    code: "ALIGNMENT_NOT_CONFIRMED",
+                    message: "the adjusted tile did not confirm row offset \(targetOffset)",
+                    recoverable: true
+                )
+            }
             thumbnails[frameIndex] = result.thumbnail
             let appliedOffset = result.thumbnail.spacingOffset ?? targetOffset
             frameAlignmentDrafts[frameIndex] = FrameAlignment(
@@ -3512,7 +4070,7 @@ public final class SessionModel {
                     "project.setFrameAlignment",
                     params: persistenceParams
                 )
-                guard frameAlignmentAdjustmentIsCurrent(marker) else { return }
+                guard frameAlignmentAdjustmentIsCurrent(marker) else { return false }
                 guard persistenceResult.project.id == marker.projectId else {
                     throw EngineRequestError(
                         code: "ALIGNMENT_PROJECT_CHANGED",
@@ -3527,8 +4085,9 @@ public final class SessionModel {
             if !failedFrameAlignmentRestoreIndices.isEmpty {
                 lastErrorMessage = frameAlignmentRestoreRecoveryGuidance()
             }
+            return true
         } catch {
-            guard frameAlignmentAdjustmentIsCurrent(marker) else { return }
+            guard frameAlignmentAdjustmentIsCurrent(marker) else { return false }
             recordOperationFailure(error, operation: "frame.alignment")
             if installedLiveAlignment, marker.projectId != nil {
                 failedFrameAlignmentRestoreIndices.insert(frameIndex)
@@ -3539,6 +4098,7 @@ public final class SessionModel {
             } else {
                 lastErrorMessage = Self.describe(error)
             }
+            return false
         }
     }
 
@@ -3667,6 +4227,7 @@ public final class SessionModel {
     }
 
     private func clearFrameAlignmentSessionState() {
+        let restore = pendingFrameAlignmentRestore
         let wasRestoring =
             pendingFrameAlignmentRestore != nil || isRestoringFrameAlignments
         pendingFrameAlignmentAdjustment = nil
@@ -3675,6 +4236,9 @@ public final class SessionModel {
         adjustingFrameAlignmentIndices.removeAll()
         isRestoringFrameAlignments = false
         failedFrameAlignmentRestoreIndices.removeAll()
+        if restore != nil {
+            releaseFrameAlignmentRestoreMutation()
+        }
         if wasRestoring {
             isAcquiringThumbnails = false
             activeOperationStartedAt = nil
@@ -3786,6 +4350,41 @@ public final class SessionModel {
 
     public func clearFrameSelection() {
         selectedFrameIndices.removeAll()
+    }
+
+    /// D-05 `frames.select`'s `indices` arm (CR-02, widened by D-23/HEAD-12
+    /// CF-12 to also run once a project exists): a wire-level path to a
+    /// selection the dispatcher has already validated by name (business
+    /// rules -- excluded, already-completed -- are the dispatcher's job,
+    /// per-index, so it can report exactly which index and why; this
+    /// method only re-confirms structural bounds). Before a project
+    /// exists, valid means the *previewed* frame range
+    /// (`1...status.frameCount`); once one exists, valid means the
+    /// project's own frame indices (`project.frames.map(\.index)`).
+    /// Returns `false` (no mutation at all -- never a partial selection) if
+    /// no preview has completed yet (pre-project) or any index falls
+    /// outside whichever range applies.
+    @discardableResult
+    public func setFrameSelection(_ indices: [Int]) -> Bool {
+        let validIndices: Set<Int>
+        if let project {
+            validIndices = Set(project.frames.map(\.index))
+        } else if let frameCount = status?.frameCount, frameCount > 0 {
+            validIndices = Set(1...frameCount)
+        } else {
+            return false
+        }
+        guard indices.allSatisfy(validIndices.contains) else { return false }
+        let reviewSkippedFrames = Set(
+            manualReviewDecisions.compactMap { frameIndex, decision in
+                decision == .dontScan ? frameIndex : nil
+            }
+        )
+        selectedFrameIndices = Set(indices).subtracting(reviewSkippedFrames)
+        if focusedFrameIndex == nil || !validFrameIndices.contains(focusedFrameIndex ?? -1) {
+            focusedFrameIndex = selectedFrameIndices.min()
+        }
+        return true
     }
 
     /// Inverting flips every non-excluded frame's selection state; an
@@ -4109,6 +4708,29 @@ public final class SessionModel {
                     projectFrameCount: self.project?.frameCount
                 ) else { return }
                 self.thumbnails[$0.frameIndex] = $0.thumbnail
+                // One decode per arriving thumbnail, cached in
+                // `thumbnailStatistics` -- a repeated `frames.list` reads
+                // `blankFrameHints` and decodes nothing (T-03-32). A
+                // simulator frame has no `imagePath` (sim.rs never sets one)
+                // and therefore gets no statistics entry at all -- the
+                // honest "no raster" answer, not a fabricated one.
+                if let imagePath = $0.thumbnail.imagePath,
+                   let raster = ThumbnailLuminance.decodeLuminance(atPath: imagePath),
+                   let stats = ThumbnailLuminance.statistics(
+                       centralCropOf: raster.pixels,
+                       width: raster.width,
+                       height: raster.height
+                   ) {
+                    self.thumbnailStatistics[$0.frameIndex] = stats
+                }
+                // The positional prior needs every frame's neighbours, so
+                // the cheap correct thing is to re-score the whole (small,
+                // tile-count-sized) map on each arrival rather than try to
+                // patch one entry incrementally. `thumbnails.count` is a
+                // running tally, not yet the roll's true total -- the
+                // `"scanner.thumbnailsComplete"` arm below re-scores once
+                // more with the authoritative final count.
+                self.recomputeBlankFrameHints(previewedFrameCount: self.thumbnails.count)
             }
         case "scanner.thumbnailsComplete":
             decodeAndApply(event, as: ThumbnailsCompletePayload.self) {
@@ -4134,6 +4756,10 @@ public final class SessionModel {
                     previewOperationId: operationId,
                     previewFrameCount: $0.count
                 )
+                // Re-score with the now-authoritative final frame count
+                // (`$0.count`), not the running tally the arrival-time
+                // recompute above used.
+                self.recomputeBlankFrameHints(previewedFrameCount: $0.count)
             }
         case "scanner.thumbnailsFailed":
             // Previously dropped by `default:` — live 2026-07-26 a
@@ -4193,6 +4819,21 @@ public final class SessionModel {
             decodeAndApply(event, as: FrameCompletedPayload.self) { self.applyReceipt($0, source: event) }
         case "scan.completed":
             decodeAndApply(event, as: ScanCompletedPayload.self) { self.applyCompleted($0, source: event) }
+        case "engine.request.timeout":
+            // D-24/HEAD-12 (CF-14): a synthetic event `EngineClient` yields
+            // on its own stream when a request times out -- no `jobId` to
+            // filter on, unlike every other case here. Method and id only,
+            // never this request's own params.
+            decodeAndApply(event, as: EngineRequestTimeoutPayload.self) {
+                self.recordDiagnostic(
+                    event: "engine.request.timeout",
+                    fields: [
+                        "method": $0.method,
+                        "id": String($0.id),
+                        "elapsedSeconds": String($0.elapsedSeconds),
+                    ]
+                )
+            }
         case "engine.terminated":
             handleUnexpectedEngineTermination()
         default:
@@ -4206,6 +4847,16 @@ public final class SessionModel {
         guard let project else { return previewedIndices }
         let projectIndices = Set(project.frames.map(\.index))
         return previewedIndices.filter(projectIndices.contains)
+    }
+
+    /// Re-scores `blankFrameHints` from `thumbnailStatistics` in full --
+    /// see `blankFrameHints`'s own doc comment for why a full re-score
+    /// (rather than an incremental patch) is the cheap correct choice here.
+    private func recomputeBlankFrameHints(previewedFrameCount: Int) {
+        blankFrameHints = BlankFrameHint.score(
+            statistics: thumbnailStatistics,
+            previewedFrameCount: previewedFrameCount
+        )
     }
 
     private func clearMediaState(
@@ -4229,6 +4880,8 @@ public final class SessionModel {
             pendingPreviewFilmProcess = nil
         }
         thumbnails = [:]
+        blankFrameHints = [:]
+        thumbnailStatistics = [:]
         latestCompletedPreviewOperationId = nil
         clearPendingManualReviewScan()
         clearAttendedScanRecovery()
@@ -4785,6 +5438,19 @@ public final class SessionModel {
             }
         } else {
             attendedScanRecoveryAuthorization = nil
+            // D-20/HEAD-12 (the 2026-09-07 batch abort): a partially-
+            // completed batch abort (e.g. 9 frames done, frame 10 raised
+            // ROLL_MISMATCH, 11-36 never attempted) previously left
+            // lastErrorMessage untouched here -- this branch only ever ran
+            // the line above. The bridge's own text, taken from the
+            // frameErrors entry of the failed frame; never synthesized.
+            // Post-Task-1's notAttempted split, a batch-abort summary
+            // names exactly one frame under `failed` (the frame the batch
+            // actually attributed), so "the failed frame" is unambiguous.
+            if let failedFrame = payload.summary.failed.first,
+               let error = frameErrors[failedFrame] {
+                lastErrorMessage = "\(error.code): \(error.message)"
+            }
         }
         if let transportFailure {
             requirePhysicalRefeed(
@@ -4792,6 +5458,27 @@ public final class SessionModel {
                 message: transportFailure.message,
                 preservingActiveJob: true
             )
+        }
+        // D-19/HEAD-12: archive this job's aggregate before jobId/jobState
+        // are cleared below -- job.get/status --job's only source for a job
+        // that finished seconds ago.
+        if let currentJobId = jobId {
+            let frameErrorCodes = Dictionary(uniqueKeysWithValues: frameErrors.map { ($0.key, $0.value.code) })
+            let frameErrorMessages = Dictionary(uniqueKeysWithValues: frameErrors.map { ($0.key, $0.value.message) })
+            terminalJobHistory.append(TerminalJobRecord(
+                jobId: currentJobId,
+                jobState: jobState ?? .failed,
+                completedFrameCount: completedFrameCount,
+                pendingFrameCount: pendingFrames.count,
+                receiptCount: receipts.count,
+                frameErrorCodes: frameErrorCodes,
+                frameErrorMessages: frameErrorMessages,
+                notAttemptedFrames: payload.summary.notAttempted,
+                finishedAt: ISO8601DateFormatter().string(from: Date())
+            ))
+            if terminalJobHistory.count > Self.maximumTerminalJobHistory {
+                terminalJobHistory.removeFirst(terminalJobHistory.count - Self.maximumTerminalJobHistory)
+            }
         }
         activeScanAuthorization = nil
         jobId = nil
@@ -4941,7 +5628,9 @@ public final class SessionModel {
             reportText: reportText,
             redactionContext: errorPresentationContext,
             preview: previewContent,
-            evidence: evidenceContent
+            evidence: evidenceContent,
+            hardwareVerification: diagnosticHardwareVerification,
+            deviceModel: diagnosticHardwareDeviceModel
         )
         return StoredZipWriter.write(entries)
     }
@@ -4973,6 +5662,34 @@ public final class SessionModel {
         diagnosticTimeline.record(event: event, fields: fields.mapValues { .string($0) })
     }
 
+    /// SAFE-04 (Gap 2 fix): the one entry point `ControlChannelDispatcher`
+    /// calls at every refusal choke point (`handle(_:)`,
+    /// `handleLine(_:)`'s decode-failure branch) -- never called from any
+    /// workflow method in this file. Recorded on the diagnostics timeline
+    /// the same way every other session event is (`recordDiagnostic`), and
+    /// retained on `lastControlRefusal` so the next `buildStatusResult()`
+    /// (an `@Observable`-tracked read) picks it up and every subscriber's
+    /// `control.changed` carries it -- not only the refused connection's
+    /// own direct RPC response.
+    public func recordControlRefusal(command: String?, code: String, gate: String?) {
+        controlRefusalSequence += 1
+        lastControlRefusal = ControlRefusalRecord(
+            command: command,
+            code: code,
+            gate: gate,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            sequence: controlRefusalSequence
+        )
+        recordDiagnostic(
+            event: "control.refused",
+            fields: [
+                "command": command ?? "unknown",
+                "code": code,
+                "gate": gate ?? "none"
+            ]
+        )
+    }
+
     /// A scanner operation can prove that the bridge has no live device
     /// owner even while the app still holds an older successful connection
     /// result. That refusal is authoritative: clear the stale READY state and
@@ -4985,6 +5702,10 @@ public final class SessionModel {
     ) {
         let wasConnected = diagnosticUIConnected
         let code = Self.diagnosticErrorCode(error)
+        // OUT-03: retained unconditionally so a non-engine error clears any
+        // stale payload rather than leaving one behind for the dispatcher's
+        // code-match guard to find.
+        lastEngineError = error as? EngineRequestError
         if let requestError = error as? EngineRequestError {
             captureDiagnosticEvidence(
                 artifact: resolveDiagnosticEvidence(
@@ -5211,10 +5932,12 @@ enum SessionEventPolicy {
     static func allowsFrameTransition(from current: FrameState, to next: FrameState) -> Bool {
         if current == next { return true }
         switch current {
-        case .waiting: return next == .active || next == .completed || next == .failed || next == .skipped
+        case .waiting:
+            return next == .active || next == .completed || next == .failed || next == .skipped
+                || next == .notAttempted
         case .active: return next == .completed || next == .failed || next == .skipped
         case .failed: return next == .active
-        case .completed, .skipped: return false
+        case .completed, .skipped, .notAttempted: return false
         }
     }
 }

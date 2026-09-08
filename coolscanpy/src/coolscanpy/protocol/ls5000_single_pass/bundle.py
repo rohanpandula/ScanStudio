@@ -28,6 +28,13 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-07 (CoolscanPy 0.7.8): worker.py derives the 1-sample
+    # fine READ and binds the selected USB identity; capture_process.py
+    # validates the derived byte total and carries that identity; packed.py
+    # validates the derived record geometry and trailing pad. The vendored
+    # worker retains ScanStudio's timing and adapter-conditional replay.
+    # meter.py gives IR its measured 0.95 correlation floor while R/G/B keep
+    # 0.98. No wire resource, plan, or continuation template changed.
     # Resealed 2026-09-06 (samples_per_scan): capture_process.py and
     # worker.py gained the 1|4 samples-per-scan batch parameter that patches
     # the fine SET_WINDOW multi-read byte and its GET_WINDOW echo before
@@ -52,17 +59,17 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # additive manual_boundary_rows field plus its batch-job.json plumbing.
     # Resealed 2026-08-11: capture descendants remain in the bridge-owned
     # process group and inherit its exclusive process-ownership fence.
-    "capture_process.py": "1d81b94ed76e3a1e3704f60915d21b3bad2d510fe124cd0033de81fde4101b26",
-    "worker.py": "5d2317465e78cb99ed460169601879491829579b34337a2d625dd5d7c3bdefb1",
+    "capture_process.py": "5861212d175a4869699a0385e11237582f1eb1fd34556e2f6f165b1c28db4539",
+    "worker.py": "eadc1e86e25b9d759dfb4c9787943bb9f54ce35d558961b33b0436fa2340d08d",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
     # Resealed 2026-08-12 after a complete 2,980-record LS-5000 capture
     # established the strict EBDE-prefixed padding-counter dialect.
-    "packed.py": "abff893d6ec5ff36aa33be86ef401a28ffbd6054e2279129e8fb88d7f650b435",
+    "packed.py": "4388e6667ccdb8a1fba9ee4325a2913eee8b3965de13f81f0975afd1eacaadba",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
-    "meter.py": "b03b3212d1ff1f8e3ad8ca7b512765ad6a115d4766e3f3eb5a86de3573076d4e",
+    "meter.py": "35adb86c43ccae29584768d929c253d595d0547b33dd0d0b784d2601b1ded9d6",
     "roll_index.py": "c99c54a434d0d53e94e51ed503f0289709b5f20365e16606f365264a617c8b17",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,

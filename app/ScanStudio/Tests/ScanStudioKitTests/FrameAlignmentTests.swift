@@ -27,6 +27,7 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
     private let spacingErrorAtRequestIndex: Int?
     private let alignmentPersistenceErrorAtRequestIndex: Int?
     private var spacingRequests: [RollSetSpacingOffsetParams] = []
+    private var manualFrameRequests: [[Int]] = []
     private var alignmentPersistenceRequests: [SetFrameAlignmentParams] = []
     private var scanStartRequests: [ScanStartParams] = []
     private var spacingContinuations: [CheckedContinuation<Void, Never>] = []
@@ -148,6 +149,29 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
                     warnings: ["adjusted-boundary"]
                 )
             )
+        case "roll.manualFrames":
+            guard let params = params as? RollManualFramesParams else {
+                throw FrameAlignmentStubError.unexpectedParams(method)
+            }
+            manualFrameRequests.append(params.rows)
+            value = RollManualFramesResult(
+                count: 1,
+                fingerprint: "manual-placement-test",
+                operationId: "manual-placement-operation",
+                thumbnails: [ManualFrameThumbnail(
+                    frameIndex: 1,
+                    thumbnail: Thumbnail(
+                        brightness: nil,
+                        tint: nil,
+                        imagePath: "/tmp/manual-placement-frame-1.tif",
+                        boundaryRows: [0, 100],
+                        spacingOffset: 0,
+                        needsApproval: true,
+                        warnings: ["user-picked"]
+                    )
+                )],
+                snaps: []
+            )
         case "project.create":
             projectRequestCount += 1
             resumeSatisfiedProjectWaiters()
@@ -214,6 +238,10 @@ private actor FrameAlignmentEngineStub: EngineClientProtocol {
 
     func recordedSpacingRequests() -> [RollSetSpacingOffsetParams] {
         spacingRequests
+    }
+
+    func recordedManualFrameRequests() -> [[Int]] {
+        manualFrameRequests
     }
 
     func recordedAlignmentPersistenceRequests() -> [SetFrameAlignmentParams] {
@@ -1034,6 +1062,62 @@ struct FrameAlignmentTests {
         #expect(model.scanReadiness(for: [2]).isReady)
     }
 
+    @Test("Automatic saved-alignment restore owns the mutation lane and refuses manual rows before a bridge call")
+    @MainActor
+    func automaticRestoreBlocksManualPlacementBeforeRequest() async {
+        let client = FrameAlignmentEngineStub(holdSpacingResponses: true)
+        let (model, _, _) = await preparedSavedProjectModel(
+            client: client,
+            alignments: [
+                2: FrameAlignment(offsetRows: 5, approved: false)
+            ]
+        )
+        await client.waitForSpacingRequestCount(1)
+
+        #expect(model.mutatingOperationInFlight == "frame.alignment.restore")
+        let placed = await model.placeFrames(
+            rows: [0, 100],
+            offsetsByFrameIndex: [:]
+        )
+        #expect(!placed)
+        #expect(await client.recordedManualFrameRequests().isEmpty)
+
+        await client.resumeSpacingResponses()
+        for _ in 0..<100 {
+            if !model.isRestoringFrameAlignments { break }
+            await Task.yield()
+        }
+        #expect(model.mutatingOperationInFlight == nil)
+    }
+
+    @Test("Explicit replay refuses a project-media mismatch before another spacing request")
+    @MainActor
+    func replayRefusesProjectMediaMismatch() async {
+        let client = FrameAlignmentEngineStub(spacingErrorAtRequestIndex: 1)
+        let (model, _, _) = await preparedSavedProjectModel(
+            client: client,
+            alignments: [
+                2: FrameAlignment(offsetRows: 5, approved: false)
+            ]
+        )
+        for _ in 0..<100 {
+            if model.failedFrameAlignmentRestoreIndices == [2] { break }
+            await Task.yield()
+        }
+        model.handle(event: EngineEvent(
+            name: "scanner.status",
+            rawLine: Data(
+                #"{"event":"scanner.status","payload":{"status":{"connected":true,"adapter":"SA-30","mediaLoaded":true,"carrier":"strip6","frameCount":4,"lamp":"stable","transport":"idle","activeJobId":null,"filmPresent":true,"motionArmed":true}}}"#.utf8
+            )
+        ))
+
+        #expect(model.projectMediaMismatch)
+        let replayed = await model.replayPersistedFrameAlignments()
+        #expect(replayed == nil)
+        #expect(await client.recordedSpacingRequests().count == 1)
+        #expect(model.lastErrorMessage?.contains("does not match") == true)
+    }
+
     @Test("A late saved-alignment response cannot wedge state after a session reset")
     @MainActor
     func staleRestoreResponseCannotWedgeBusyState() async {
@@ -1239,6 +1323,35 @@ struct FrameAlignmentTests {
         )
         #expect(!model.isRestoringFrameAlignments)
         #expect(model.scanReadiness(for: [2, 3]).isReady)
+    }
+
+    @Test("Explicit placement replay refuses a stale preview before another spacing request")
+    @MainActor
+    func explicitReplayRefusesStalePreview() async {
+        let (model, client, _) = await preparedSavedProjectModel(
+            alignments: [
+                2: FrameAlignment(offsetRows: 5, approved: false)
+            ]
+        )
+        for _ in 0..<100 {
+            if !model.isRestoringFrameAlignments,
+               await client.recordedSpacingRequests().count == 1 {
+                break
+            }
+            await Task.yield()
+        }
+
+        let replacement = PreviewIntentToken()
+        let outcome = await model.requestPreview(
+            .refreshSavedProject(token: replacement)
+        )
+        let replayed = await model.replayPersistedFrameAlignments()
+
+        #expect(outcome == .started)
+        #expect(replayed == nil)
+        #expect(await client.recordedSpacingRequests().count == 1)
+        #expect(model.lastErrorMessage?.contains("current preview") == true)
+        #expect(!model.scanReadiness(for: [2]).isReady)
     }
 
     @Test("A fresh preview retries and can recover a failed saved offset")

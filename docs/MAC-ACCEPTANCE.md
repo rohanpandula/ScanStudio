@@ -26,14 +26,14 @@ fully decode images, with no host Python imaging dependency.
 
 The central `app/ScanStudio/scripts/test_packaged_bridge.sh` gate invokes this
 script with its relocated app and bundled runtime, before the final codesign
-verification. Thus `make package` (root or app directory),
-`make -C app/ScanStudio package-check`, packaged CI, the macOS 14 floor check,
+verification. Thus `make package` and `make package-check` from `app/ScanStudio`,
+packaged CI, the macOS 14 floor check,
 and signed-package verification automatically include acceptance. DMG packaging
 also calls that gate against the mounted app, so the same test covers the DMG
 contents. Separate workflow invocations are unnecessary. Retain the JSON stdout
 in the gate logs, or use the standalone command's `--report` for a separate
 record alongside that run's artifact hashes, provenance and updater evidence.
-This test does not replace signature,
+This test and its packaged CLI leg do not replace signature,
 notarization, supported-OS binary load-command, same-run provenance, exact-tag,
 or updater verification. It checks the declared macOS floor is 14.0 and the app,
 engine, and Python executables are arm64 only; a pass on newer macOS does not
@@ -41,7 +41,9 @@ establish execution on macOS 14.
 
 The gate creates a disposable roll under a unique path containing spaces and
 `#`. HOME, TMPDIR, and child environment are isolated. No bridge command or
-hardware-arming settings are inherited; only `sim-ls5000-0` is selected. It never
+hardware-arming settings are inherited. The engine leg selects `sim-ls5000-0`;
+the CLI leg selects `sim-ls50-0`, proves default refusal and explicit opt-in,
+and checks live verification, receipt model/tier, and derivative TIFF tags. It never
 launches the native app or commands scanner movement.
 
 1. Create a three-frame C-41 project and explicitly request preview for frames
@@ -71,6 +73,14 @@ launches the native app or commands scanner movement.
    byte length, inode, and volume identity. Frame 1 must retain its original
    receipt, hashes, sizes, inode, and nanosecond modification times; each frame
    must have exactly one receipt. Identical-byte rewrites cannot silently pass.
+8. Run the packaged `Contents/MacOS/scanstudio-cli` with `host --simulator`
+   against a short gate-created private socket and detached headless host. The
+   simulator host bypasses the real hardware bootstrap and scrubs bridge state.
+   The CLI performs the same
+   simulator discovery, connect, preview, selection, save, scan, receipt, and
+   decode checks through `roll run`; its CLI envelope, run receipt, and decoded
+   outputs are checked alongside the engine leg. The simulator device is
+   `sim-ls5000-0`; this step does not move a scanner.
 
 Only three small completed captures are produced; archive capture-package copies
 are disabled. Each output is capped by a 2 MB verification check. The process has
@@ -171,6 +181,26 @@ this checklist.
    roll, then perform the focus/frame/color/dust checks above. Save the hardware
    record and any diagnostic bundle. A finished batch is not itself a visual
    image-quality pass.
+
+### CLI-driven variant
+
+When an operator chooses shell control, run `scripts/full_roll_cli.sh` after
+the same readiness and physical-state checks. It records the app identity,
+adapter, scanner status, command JSON, `roll run` receipt, manifest copy,
+diagnostics export, and `SHA256SUMS` under `~/ScanStudio-QA/<UTC timestamp>/`.
+With `--simulator`, the script starts `host --simulator` on a short private
+socket with isolated HOME/bridge state and stops that owned host on exit. A
+hardware run attaches the existing default GUI/headless host and selects a
+discovered non-simulator device, so it never starts a competing hardware host.
+The operator must supply `--film-loaded` and `--confirm-motion` themselves;
+the script forwards those flags and never retries or performs an automatic
+stop/eject/recovery action. The runbook has been exercised against the
+stop/eject/recovery action. The simulator's `strip6` fixture produces six
+preview frames, so the bounded passing invocation uses `--frame-count 6`; an
+explicit mismatched count is preserved and fails at `roll.save` with the
+receipt step details. The runbook has been exercised against the simulator
+only. No attended hardware full-roll run has been performed through
+`scripts/full_roll_cli.sh`; hardware acceptance remains **NOT RUN**.
 
 ### Existing evidence the assistant can watch (read-only)
 

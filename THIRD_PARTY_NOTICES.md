@@ -74,6 +74,13 @@ from the macOS SDK headers.
 
 ## Rust engine dependencies
 
+## Swift CLI dependency
+
+The bundled `scanstudio-cli` uses Apple's `swift-argument-parser` 1.8.2,
+resolved at revision `6a52f3251125d74daf04fcbd5e6f08a75d074382`, under the
+Apache-2.0 license. The package copies its license and a revision-pinned notice
+to `Contents/Resources/Licenses`.
+
 The macOS app package includes the Rust engine, and its compiled binary includes Rust dependency code. The current locked dependency set uses the licenses shown below. `Cargo.lock` is the source of the version set; these SPDX expressions come from the resolved package metadata.
 
 | Package | Version | SPDX license expression |

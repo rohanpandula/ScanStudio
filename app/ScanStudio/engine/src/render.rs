@@ -6039,6 +6039,8 @@ pub fn render_derivative_from_archive_with_processing(
         alignment,
         exposure_10ns,
         resolution_dpi,
+        domain::HardwareVerification::Verified,
+        None,
         fallback_authorities.frame(frame_index)?,
     )
 }
@@ -6057,6 +6059,8 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
     alignment: Option<&domain::FrameAlignment>,
     exposure_10ns: Option<[f64; 3]>,
     resolution_dpi: u32,
+    hardware_verification: domain::HardwareVerification,
+    device_model: Option<&str>,
     authorities: &FrameOutputAuthorities,
 ) -> Result<WrittenPaths, domain::EngineError> {
     let derivative_transform = alignment
@@ -6382,8 +6386,17 @@ pub(crate) fn render_derivative_from_archive_with_processing_authorized(
     // The color-profile contract (ICC) and physical scale (DPI) differ per
     // output: the full-resolution positive is at `resolution_dpi`; the
     // downsampled preview must not claim that DPI. ICC attaches only for C41.
-    let positive_metadata = DerivativeMetadata::positive(processing.film_process, resolution_dpi);
-    let preview_metadata = DerivativeMetadata::preview(processing.film_process);
+    let positive_metadata = DerivativeMetadata::positive_with_hardware(
+        processing.film_process,
+        resolution_dpi,
+        hardware_verification,
+        device_model,
+    );
+    let preview_metadata = DerivativeMetadata::preview_with_hardware(
+        processing.film_process,
+        hardware_verification,
+        device_model,
+    );
 
     if recipes.positive.enabled {
         let output = authorities.positive.as_ref().ok_or_else(|| {
@@ -8667,7 +8680,7 @@ fn write_raw_export_create_only(
 /// * the physical DPI scale — only the full-resolution positive is at the
 ///   capture recipe's DPI; the downsampled preview is not, so it must never
 ///   claim the capture DPI as its own.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DerivativeMetadata {
     /// Capture recipe's DPI, written as the Positive TIFF's
     /// XResolution/YResolution in pixels/inch. `None` for the downsampled
@@ -8675,6 +8688,8 @@ struct DerivativeMetadata {
     resolution_dpi: Option<u32>,
     /// Whether to embed ScanStudio's Adobe RGB (1998)-compatible ICC profile.
     attach_icc: bool,
+    hardware_verification: domain::HardwareVerification,
+    device_model: Option<String>,
 }
 
 impl DerivativeMetadata {
@@ -8686,19 +8701,40 @@ impl DerivativeMetadata {
     }
 
     /// Full-resolution positive output at the capture recipe's DPI.
+    #[cfg(test)]
     fn positive(film_process: domain::FilmProcess, resolution_dpi: u32) -> Self {
+        Self::positive_with_hardware(
+            film_process,
+            resolution_dpi,
+            domain::HardwareVerification::Verified,
+            None,
+        )
+    }
+
+    fn positive_with_hardware(
+        film_process: domain::FilmProcess,
+        resolution_dpi: u32,
+        hardware_verification: domain::HardwareVerification,
+        device_model: Option<&str>,
+    ) -> Self {
         Self {
             resolution_dpi: Some(resolution_dpi),
             attach_icc: Self::attach_icc(film_process),
+            hardware_verification,
+            device_model: device_model.map(str::to_owned),
         }
     }
 
-    /// Downsampled preview output: same color contract as the positive, but
-    /// never tagged at the capture DPI it was scaled down from.
-    fn preview(film_process: domain::FilmProcess) -> Self {
+    fn preview_with_hardware(
+        film_process: domain::FilmProcess,
+        hardware_verification: domain::HardwareVerification,
+        device_model: Option<&str>,
+    ) -> Self {
         Self {
             resolution_dpi: None,
             attach_icc: Self::attach_icc(film_process),
+            hardware_verification,
+            device_model: device_model.map(str::to_owned),
         }
     }
 }
@@ -8784,6 +8820,19 @@ fn emit_tiff_metadata<W: std::io::Write + std::io::Seek>(
         ifd.write_tag(Tag::IccProfile, IccProfileValue(&profile[..]))
             .map_err(metadata_encode_error)?;
     }
+    if let Some(device_model) = metadata.device_model.as_deref() {
+        ifd.write_tag(Tag::Model, device_model)
+            .map_err(metadata_encode_error)?;
+    }
+    ifd.write_tag(
+        Tag::Software,
+        format!(
+            "ScanStudio; hardwareVerification={}",
+            metadata.hardware_verification.as_str()
+        )
+        .as_str(),
+    )
+    .map_err(metadata_encode_error)?;
     if let Some(resolution_dpi) = metadata.resolution_dpi {
         if resolution_dpi == 0 {
             return Err(domain::EngineError::new(
@@ -9276,6 +9325,8 @@ pub fn render_and_write_frame_with_processing(
         recipes,
         detected_boundary,
         alignment,
+        domain::HardwareVerification::Verified,
+        None,
         fallback_authorities.frame(frame_index)?,
     )
 }
@@ -9293,6 +9344,8 @@ pub(crate) fn render_and_write_frame_with_processing_authorized(
     recipes: &domain::OutputRecipe,
     detected_boundary: Option<(u32, u32)>,
     alignment: Option<&domain::FrameAlignment>,
+    hardware_verification: domain::HardwareVerification,
+    device_model: Option<&str>,
     authorities: &FrameOutputAuthorities,
 ) -> Result<WrittenPaths, domain::EngineError> {
     let derivative_transform = alignment
@@ -9391,9 +9444,17 @@ pub(crate) fn render_and_write_frame_with_processing_authorized(
             derivative_transform,
         )?;
 
-        let positive_metadata =
-            DerivativeMetadata::positive(processing.film_process, resolution_dpi);
-        let preview_metadata = DerivativeMetadata::preview(processing.film_process);
+        let positive_metadata = DerivativeMetadata::positive_with_hardware(
+            processing.film_process,
+            resolution_dpi,
+            hardware_verification,
+            device_model,
+        );
+        let preview_metadata = DerivativeMetadata::preview_with_hardware(
+            processing.film_process,
+            hardware_verification,
+            device_model,
+        );
 
         if recipes.positive.enabled {
             let output = authorities.positive.as_ref().ok_or_else(|| {
@@ -11564,6 +11625,42 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unverified_tiff_derivative_names_model_and_verification_tier() {
+        let dir = unique_test_dir();
+        let derivative = dir.join("positive.tif");
+        let raw = generate_sim_frame("sim-ls50-0", 1, 4, 3);
+        write_derivative(
+            &derivative,
+            &raw,
+            4,
+            3,
+            domain::OutputFileFormat::Tiff,
+            true,
+            &DerivativeMetadata::positive_with_hardware(
+                domain::FilmProcess::Positive,
+                4_000,
+                domain::HardwareVerification::Unverified,
+                Some("LS-50 ED"),
+            ),
+        )
+        .unwrap();
+
+        let mut decoder =
+            tiff::decoder::Decoder::new(std::fs::File::open(&derivative).unwrap()).unwrap();
+        assert_eq!(
+            decoder.get_tag_ascii_string(tiff::tags::Tag::Model).unwrap(),
+            "LS-50 ED"
+        );
+        assert_eq!(
+            decoder
+                .get_tag_ascii_string(tiff::tags::Tag::Software)
+                .unwrap(),
+            "ScanStudio; hardwareVerification=unverified"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

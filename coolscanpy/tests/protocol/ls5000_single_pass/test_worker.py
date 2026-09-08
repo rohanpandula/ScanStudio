@@ -16,6 +16,7 @@ import pytest
 
 from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
 from coolscanpy.protocol.ls5000_single_pass import manual_frames
+from coolscanpy.protocol.ls5000_single_pass import packed as packed_module
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     ATTENDED_ROLL_BINDING_REASON,
     ManualFrameApproval,
@@ -1262,8 +1263,8 @@ def test_frozen_worker_uses_pinned_meter_identity_without_loose_source(
 
 
 def test_usb_device_selection_requires_exact_reviewed_sane_topology() -> None:
-    wrong = SimpleNamespace(bus=1, address=9)
-    exact = SimpleNamespace(bus=1, address=2)
+    wrong = SimpleNamespace(bus=1, address=9, idProduct=0x4002)
+    exact = SimpleNamespace(bus=1, address=2, idProduct=0x4002)
     calls: list[dict[str, object]] = []
 
     def find(**kwargs: object) -> tuple[object, ...]:
@@ -1287,12 +1288,26 @@ def test_usb_device_selection_requires_exact_reviewed_sane_topology() -> None:
     ]
 
 
+def test_usb_device_selection_can_target_a_recognized_ls50() -> None:
+    expected = SimpleNamespace(bus=1, address=2, idProduct=0x4001)
+    calls: list[dict[str, object]] = []
+
+    def find(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return expected
+
+    assert worker_module._find_ls5000_usb_device(
+        SimpleNamespace(find=find), expected_product="LS-50 ED"
+    ) is expected
+    assert calls[0]["idProduct"] == 0x4001
+
+
 def test_usb_device_selection_refuses_missing_or_ambiguous_exact_topology() -> None:
     for devices in (
         (SimpleNamespace(bus=1, address=9),),
         (
-            SimpleNamespace(bus=1, address=2),
-            SimpleNamespace(bus=1, address=2),
+            SimpleNamespace(bus=1, address=2, idProduct=0x4002),
+            SimpleNamespace(bus=1, address=2, idProduct=0x4002),
         ),
     ):
         core = SimpleNamespace(find=lambda **_kwargs: devices)
@@ -1478,6 +1493,10 @@ def test_batch_job_loader_binds_ordered_frame_paths_and_parent_ack_contract(
                 "capture_plan_sha256": "a" * 64,
                 "continuation_plan_sha256": "b" * 64,
                 "expected_usb_address": 2,
+                "expected_usb_vendor_id": worker_module.NIKON_USB_VENDOR_ID,
+                "expected_usb_product_id": worker_module.CANONICAL_SCANNER_PRODUCT_ID,
+                "expected_scanner_model": worker_module.CANONICAL_SCANNER_PRODUCT,
+                "allow_unverified": False,
                 "expected_usb_bus": 1,
                 "exposure_override_10ns": None,
                 "manual_boundary_rows": None,
@@ -1537,6 +1556,9 @@ def _one_frame_job_payload(
     exposure_override_10ns: object,
     manual_boundary_rows: object = None,
     samples_per_scan: object = 4,
+    expected_usb_product_id: object = worker_module.CANONICAL_SCANNER_PRODUCT_ID,
+    expected_scanner_model: object = worker_module.CANONICAL_SCANNER_PRODUCT,
+    allow_unverified: object = False,
 ) -> dict[str, object]:
     return {
         "apply_all_boundary_offsets_before_first_frame": True,
@@ -1544,6 +1566,10 @@ def _one_frame_job_payload(
         "continuation_plan_sha256": "b" * 64,
         "expected_usb_bus": 1,
         "expected_usb_address": 2,
+        "expected_usb_vendor_id": worker_module.NIKON_USB_VENDOR_ID,
+        "expected_usb_product_id": expected_usb_product_id,
+        "expected_scanner_model": expected_scanner_model,
+        "allow_unverified": allow_unverified,
         "exposure_override_10ns": exposure_override_10ns,
         "manual_boundary_rows": manual_boundary_rows,
         "samples_per_scan": samples_per_scan,
@@ -1612,6 +1638,42 @@ def test_batch_job_loader_parses_samples_per_scan(tmp_path: Path) -> None:
             expected_continuation_sha256="b" * 64,
         )
         assert job.samples_per_scan == requested
+
+
+def test_batch_job_binds_unverified_opt_in_to_exact_product_identity(
+    tmp_path: Path,
+) -> None:
+    fingerprint = _reviewed_fingerprint()
+    payload = _one_frame_job_payload(
+        fingerprint,
+        exposure_override_10ns=None,
+        expected_usb_product_id=0x4001,
+        expected_scanner_model="LS-50 ED",
+        allow_unverified=True,
+    )
+    path = tmp_path / "batch-job.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    job = load_validated_batch_job(
+        path,
+        expected_job_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        expected_plan_sha256="a" * 64,
+        expected_continuation_sha256="b" * 64,
+    )
+    assert (job.expected_usb_product_id, job.expected_scanner_model) == (
+        0x4001,
+        "LS-50 ED",
+    )
+    assert job.allow_unverified is True
+
+    payload["allow_unverified"] = False
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ProtocolError, match="allow_unverified"):
+        load_validated_batch_job(
+            path,
+            expected_job_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            expected_plan_sha256="a" * 64,
+            expected_continuation_sha256="b" * 64,
+        )
 
 
 @pytest.mark.parametrize("bad", [0, 2, 8, True, "4", 4.0, None])
@@ -1725,6 +1787,61 @@ def test_patch_samples_contract_refuses_unsupported_values(bad: int) -> None:
             worker_module.FINE_GET_WINDOW_SEQUENCES,
             bad,
         )
+
+
+def test_patch_fine_read_contract_uses_derived_single_sample_record() -> None:
+    unit = packed_module.UNIT_BYTES
+    assert packed_module.FULL_RGB_SAMPLE_BYTE_OFFSETS[0] == (0, unit, 2 * unit)
+    assert packed_module.FULL_IR_BYTE_OFFSET == 3 * unit
+    assert packed_module.FULL_PADDING_BYTE_RANGES[0][0] == 4 * unit
+    derived = packed_module.FULL_PADDING_BYTE_RANGES[0][1]
+
+    plan = [dict(entry) for entry in load_canonical_plan()]
+    worker_module._patch_fine_read_contract(plan, 1)
+    target = plan[-1]
+    assert target["request_len"] == derived
+    assert target["request_parts"] == [derived]
+    assert bytes.fromhex(target["cdb"])[6:9] == derived.to_bytes(3, "big")
+    assert worker_module.EXPECTED_FINE_READS * target["request_len"] == 189_194_240
+
+
+def test_patch_fine_read_contract_preserves_four_sample_golden() -> None:
+    plan = [dict(entry) for entry in load_canonical_plan()]
+    before = dict(plan[-1])
+    worker_module._patch_fine_read_contract(plan, 4)
+    assert plan[-1] == before
+
+
+def test_patch_fine_read_contract_refuses_unsupported_values() -> None:
+    with pytest.raises(worker_module.ProtocolError, match="samples_per_scan"):
+        worker_module._patch_fine_read_contract(load_canonical_plan(), 2)
+
+
+def test_patch_fine_read_contract_agrees_with_window_contract() -> None:
+    for samples_per_scan in worker_module.SUPPORTED_SAMPLES_PER_SCAN:
+        plan = [dict(entry) for entry in load_canonical_plan()]
+        worker_module._patch_samples_contract(
+            plan,
+            worker_module.DYNAMIC_WINDOW_GROUPS[-1],
+            worker_module.FINE_GET_WINDOW_SEQUENCES,
+            samples_per_scan,
+        )
+        worker_module._patch_fine_read_contract(plan, samples_per_scan)
+        window = decode_window_block(
+            bytes.fromhex(
+                worker_module._entry(
+                    plan, worker_module.DYNAMIC_WINDOW_GROUPS[-1][0]
+                )["data_out"]
+            )
+        )
+        assert window is not None
+        assert window["samples_per_scan_minus1_nibble"] + 1 == samples_per_scan
+        expected = (
+            worker_module.EXPECTED_FINE_REQUEST
+            if samples_per_scan == worker_module.TRACED_SAMPLES_PER_SCAN
+            else packed_module.SINGLE_SAMPLE_RECORD_BYTES
+        )
+        assert plan[-1]["request_len"] == expected
 
 
 def test_batch_job_loader_parses_valid_manual_boundary_rows(tmp_path: Path) -> None:
@@ -1899,7 +2016,7 @@ def test_parent_ack_is_bound_to_session_frame_slot_and_fresh_nonce(
     assert action == "continue"
 
     assert _meter_controller_sha256() == (
-        "b03b3212d1ff1f8e3ad8ca7b512765ad6a115d4766e3f3eb5a86de3573076d4e"
+        "35adb86c43ccae29584768d929c253d595d0547b33dd0d0b784d2601b1ded9d6"
     )
 
 
@@ -2375,7 +2492,7 @@ def _preview_and_hold_fakes() -> dict[str, object]:
 def _apply_preview_and_hold_fakes(
     monkeypatch: pytest.MonkeyPatch, fakes: dict[str, object]
 ) -> None:
-    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: None)
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: fakes["preview_windows"]
     )
@@ -2388,7 +2505,13 @@ def _apply_preview_and_hold_fakes(
     monkeypatch.setattr(
         worker_module,
         "_connect_device",
-        lambda: (object(), fakes["interface"], fakes["ep_out"], fakes["ep_in"], fakes["USBUtil"]),
+        lambda **_kwargs: (
+            SimpleNamespace(idProduct=0x4002),
+            fakes["interface"],
+            fakes["ep_out"],
+            fakes["ep_in"],
+            fakes["USBUtil"],
+        ),
     )
     # This fixture family is about the preview-and-hold eject/release state
     # machine, not density evaluation, and its all-zero synthetic preview
@@ -2608,6 +2731,10 @@ def test_batch_cli_dry_run_validates_one_session_without_single_frame_flags(
                 ).hexdigest(),
                 "expected_usb_address": 2,
                 "expected_usb_bus": 1,
+                "expected_usb_vendor_id": worker_module.NIKON_USB_VENDOR_ID,
+                "expected_usb_product_id": worker_module.CANONICAL_SCANNER_PRODUCT_ID,
+                "expected_scanner_model": worker_module.CANONICAL_SCANNER_PRODUCT,
+                "allow_unverified": False,
                 "exposure_override_10ns": None,
                 "manual_boundary_rows": None,
                 "samples_per_scan": 4,
@@ -2767,6 +2894,10 @@ def test_batch_cli_refuses_a_topology_rewrite_before_any_usb_access(
         ).hexdigest(),
         "expected_usb_address": 2,
         "expected_usb_bus": 1,
+        "expected_usb_vendor_id": worker_module.NIKON_USB_VENDOR_ID,
+        "expected_usb_product_id": worker_module.CANONICAL_SCANNER_PRODUCT_ID,
+        "expected_scanner_model": worker_module.CANONICAL_SCANNER_PRODUCT,
+        "allow_unverified": False,
         "frames": [
             {
                 "ack": "frame-017/parent-ack.json",
@@ -2906,7 +3037,13 @@ def test_live_batch_connect_failure_records_no_reservation_and_no_recovery(
         )
 
     receipt = json.loads(session_journal.read_text(encoding="utf-8"))
-    assert connect_calls == [{"expected_usb_bus": 1, "expected_usb_address": 2}]
+    assert connect_calls == [
+        {
+            "expected_usb_bus": 1,
+            "expected_usb_address": 2,
+            "expected_scanner_product": worker_module.CANONICAL_SCANNER_PRODUCT,
+        }
+    ]
     assert receipt["status"] == "failed"
     assert receipt["reservation_acquired"] is False
     assert receipt["unit_release_attempts"] == 0
@@ -2954,7 +3091,7 @@ def test_live_batch_refuses_a_connected_scanner_that_changed_topology(
     def connect(**kwargs: int | None) -> tuple[object, object, object, object, object]:
         connect_calls.append(kwargs)
         return (
-            SimpleNamespace(bus=1, address=9),
+            SimpleNamespace(bus=1, address=9, idProduct=0x4002),
             SimpleNamespace(bInterfaceNumber=0),
             object(),
             object(),
@@ -2980,7 +3117,13 @@ def test_live_batch_refuses_a_connected_scanner_that_changed_topology(
             session_journal_path=session_journal,
         )
 
-    assert connect_calls == [{"expected_usb_bus": 1, "expected_usb_address": 2}]
+    assert connect_calls == [
+        {
+            "expected_usb_bus": 1,
+            "expected_usb_address": 2,
+            "expected_scanner_product": worker_module.CANONICAL_SCANNER_PRODUCT,
+        }
+    ]
     receipt = json.loads(session_journal.read_text(encoding="utf-8"))
     assert receipt["expected_usb_bus"] == 1
     assert receipt["expected_usb_address"] == 2
@@ -5348,6 +5491,7 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
     ready_groups: list[tuple[int, ...]] = []
     transactions: list[int] = []
 
@@ -5602,6 +5746,7 @@ def _run_fake_continuation_frame(
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
 
     def ready(
         _ep_out: object,
@@ -5926,18 +6071,39 @@ def test_continuation_executor_without_override_matches_pre_override_fine_contra
     assert journal["frame_complete"] is True
 
 
+def _expected_fine_read(samples_per_scan: int) -> tuple[str, int]:
+    if samples_per_scan == 1:
+        return "28000000000100f80080", worker_module.SINGLE_SAMPLE_RECORD_BYTES
+    return worker_module.EXPECTED_FINE_CDB, worker_module.EXPECTED_FINE_REQUEST
+
+
+def _install_one_read_plan_validator(
+    monkeypatch: pytest.MonkeyPatch, canonical_target: dict
+) -> None:
+    real_validate_plan = worker_module.validate_plan
+    one_read_target = {**canonical_target, "repeat": 1}
+
+    def validate_canonical(candidate: list[dict]) -> dict:
+        expected_reads = worker_module.EXPECTED_FINE_READS
+        if candidate[-1]["repeat"] == 2_980:
+            worker_module.EXPECTED_FINE_READS = 2_980
+        try:
+            real_validate_plan(candidate)
+        finally:
+            worker_module.EXPECTED_FINE_READS = expected_reads
+        return one_read_target
+
+    monkeypatch.setattr(worker_module, "validate_plan", validate_canonical)
+
+
+@pytest.mark.parametrize("samples_per_scan", [1, 4])
 def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    samples_per_scan: int,
 ) -> None:
     plan = load_canonical_plan()
     canonical_target = worker_module.validate_plan(plan)
-    tiny_target = {
-        **canonical_target,
-        "repeat": 1,
-        "request_len": 1,
-        "request_parts": [1],
-    }
     for sequence in worker_module.PREVIEW_READ_SEQUENCES:
         entry = plan[sequence - 1]
         entry["request_len"] = 1
@@ -6057,6 +6223,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         CANONICAL_PLAN_SHA256,
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
+        samples_per_scan=samples_per_scan,
     )
     nonce = "offline-batch-nonce"
     first.ack.write_text(
@@ -6079,7 +6246,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     reserves: list[int] = []
     sent_tables: list[bytes] = []
     transactions: list[int] = []
-    fine_reads: list[int] = []
+    fine_reads: list[tuple[str, int]] = []
     ready_groups: list[tuple[int, ...]] = []
     ack_boundaries: list[tuple[int, int, int, int]] = []
     releases: list[tuple[object, object]] = []
@@ -6144,8 +6311,8 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         elif sequence in worker_module.METER_READ_SEQUENCES:
             payload = b"m"
         elif sequence == 607:
-            fine_reads.append(sequence)
-            payload = b"f"
+            fine_reads.append((entry["cdb"], entry["request_len"]))
+            payload = b"f" * entry["request_len"]
         else:
             payload = bytes.fromhex(entry.get("expected_data_in", ""))
         return TransactionResult(
@@ -6256,10 +6423,10 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     )
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
-    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    _install_one_read_plan_validator(monkeypatch, canonical_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     monkeypatch.setattr(
-        worker_module, "_validate_scanner_identity", lambda _payload: "Nikon LS-5000 ED 1.03"
+        worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: "Nikon LS-5000 ED 1.03"
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
@@ -6314,7 +6481,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         worker_module,
         "_connect_device",
         lambda **_kwargs: (
-            SimpleNamespace(bus=1, address=2),
+            SimpleNamespace(bus=1, address=2, idProduct=0x4002),
             interface,
             ep_out,
             ep_in,
@@ -6332,6 +6499,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         1,
         frame=first.slot,
         boundary_offset_rows=first.boundary_offset_rows,
+        samples_per_scan=samples_per_scan,
         batch_job=batch,
         continuation_plan=load_canonical_continuation_plan(),
         continuation_plan_sha256=(worker_module.CANONICAL_CONTINUATION_PLAN_SHA256),
@@ -6348,7 +6516,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
             origin.selector,
             origin.code,
         )
-    assert fine_reads == [607, 607]
+    assert fine_reads == [_expected_fine_read(samples_per_scan)] * 2
     assert [(frame, slot) for frame, slot, _tx, _ready in ack_boundaries] == [
         (1, 7),
         (2, 18),
@@ -6362,6 +6530,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     assert releases == [(ep_out, ep_in)]
     first_receipt = json.loads(first.journal.read_text(encoding="utf-8"))
     assert first_receipt["status"] == "frame-complete"
+    assert first_receipt["allow_unverified"] is False
     assert first_receipt["live_startup_0x8f"]["count"] == 40
     assert first_receipt["live_startup_0x8f_status"] == "0000000000000000"
     assert first_receipt["live_startup_0x8f_short_underrun_accepted"] is False
@@ -6439,9 +6608,10 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
             3: commanded["B"],
             9: worker_module.DEFAULT_EXPOSURES["IR"],
         }
-    assert second.output.read_bytes() == b"f"
+    assert second.output.read_bytes() == b"f" * _expected_fine_read(samples_per_scan)[1]
     session = json.loads(session_journal_path.read_text(encoding="utf-8"))
     assert session["status"] == "complete"
+    assert session["allow_unverified"] is False
     assert session["completed_slots"] == [7, 18]
     assert session["reservation_acquired"] is True
     assert session["unit_release_attempts"] == 1
@@ -6632,9 +6802,11 @@ def test_guarded_candidate_outside_scanner_bounds_is_clamped_and_journaled(
     ]
 
 
+@pytest.mark.parametrize("samples_per_scan", [(1, 1), (4, 4), (1, 4)])
 def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    samples_per_scan: tuple[int, int],
 ) -> None:
     """(a)/(b) task requirement, at the wire level -- the only layer in
     this suite that actually speaks SCSI: preview-and-hold, then two
@@ -6650,12 +6822,6 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
 
     plan = load_canonical_plan()
     canonical_target = worker_module.validate_plan(plan)
-    tiny_target = {
-        **canonical_target,
-        "repeat": 1,
-        "request_len": 1,
-        "request_parts": [1],
-    }
     for sequence in worker_module.PREVIEW_READ_SEQUENCES:
         entry = plan[sequence - 1]
         entry["request_len"] = 1
@@ -6771,9 +6937,13 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
             "continuation_plan_sha256": worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
             "expected_usb_bus": 1,
             "expected_usb_address": 2,
+            "expected_usb_vendor_id": worker_module.NIKON_USB_VENDOR_ID,
+            "expected_usb_product_id": worker_module.CANONICAL_SCANNER_PRODUCT_ID,
+            "expected_scanner_model": worker_module.CANONICAL_SCANNER_PRODUCT,
+            "allow_unverified": False,
             "exposure_override_10ns": None,
             "manual_boundary_rows": None,
-            "samples_per_scan": 4,
+            "samples_per_scan": samples_per_scan[0 if frame.slot == 7 else 1],
             "frames": [
                 {
                     "ack": f"frame-{frame.slot:03d}/parent-ack.json",
@@ -6797,7 +6967,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     header_8e = b"\0\x8e\0\0\0\x06"
     reserves: list[int] = []
     variable_frame_table_calls: list[int] = []
-    fine_reads: list[int] = []
+    fine_reads: list[tuple[str, int]] = []
     ready_groups: list[tuple[int, ...]] = []
     releases: list[tuple[object, object]] = []
     ejects: list[str] = []
@@ -6855,8 +7025,8 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
         elif sequence in worker_module.METER_READ_SEQUENCES:
             payload = b"m"
         elif sequence == 607:
-            fine_reads.append(sequence)
-            payload = b"f"
+            fine_reads.append((entry["cdb"], entry["request_len"]))
+            payload = b"f" * entry["request_len"]
         else:
             payload = bytes.fromhex(entry.get("expected_data_in", ""))
         return TransactionResult(
@@ -7016,9 +7186,9 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     )
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
-    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    _install_one_read_plan_validator(monkeypatch, canonical_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
-    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: None)
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
     )
@@ -7074,7 +7244,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
         worker_module,
         "_connect_device",
         lambda **_kwargs: (
-            SimpleNamespace(bus=1, address=2),
+            SimpleNamespace(bus=1, address=2, idProduct=0x4002),
             interface,
             ep_out,
             ep_in,
@@ -7100,7 +7270,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     assert len(variable_frame_table_calls) == 1, (
         "exactly one command-64 frame-table transaction across both rounds"
     )
-    assert fine_reads == [607, 607], "one fine READ per round, two rounds"
+    assert fine_reads == [_expected_fine_read(samples) for samples in samples_per_scan]
     assert releases == [(ep_out, ep_in)], "exactly one RELEASE_UNIT, at the very end"
     assert ejects == ["eject"], "exactly one eject, at the very end"
 
@@ -7299,6 +7469,10 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
             "continuation_plan_sha256": worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
             "expected_usb_bus": 1,
             "expected_usb_address": 2,
+            "expected_usb_vendor_id": worker_module.NIKON_USB_VENDOR_ID,
+            "expected_usb_product_id": 0x4001,
+            "expected_scanner_model": "LS-50 ED",
+            "allow_unverified": True,
             "exposure_override_10ns": None,
             "manual_boundary_rows": None,
             "samples_per_scan": 4,
@@ -7537,15 +7711,14 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
-    # A revision deliberately unlike the "Nikon LS-5000 ED 1.03" literal
-    # the resumed-batch journal block used to hard-code over it: Lane A
-    # accepts any LS-5000 ED revision, and what the resumed frame
-    # publishes must be the one read off this attempt's own INQUIRY.
+    # Exercise the opted-in USB identity while preserving the revision
+    # threading this test was written to cover.
     monkeypatch.setattr(
         worker_module,
         "_validate_scanner_identity",
-        lambda _payload: "Nikon LS-5000 ED 2.07",
+        lambda _payload, **kwargs: f"Nikon {kwargs['expected_product']} 2.07",
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
@@ -7636,7 +7809,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         worker_module,
         "_connect_device",
         lambda **_kwargs: (
-            SimpleNamespace(bus=1, address=2),
+            SimpleNamespace(bus=1, address=2, idProduct=0x4001),
             interface,
             ep_out,
             ep_in,
@@ -7653,6 +7826,9 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         1,
         preview_and_hold=True,
         hold_job_path=hold_job_path,
+        expected_usb_product_id=0x4001,
+        expected_scanner_model="LS-50 ED",
+        allow_unverified=True,
         continuation_plan=load_canonical_continuation_plan(),
         continuation_plan_sha256=worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
     )
@@ -7689,7 +7865,8 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     # The revision this attempt's own INQUIRY reported, not the literal the
     # resumed-batch journal block used to overwrite it with -- that value
     # reaches the public Receipt.device_model.
-    assert frame_7_journal["scanner_identity"] == "Nikon LS-5000 ED 2.07"
+    assert frame_7_journal["scanner_identity"] == "Nikon LS-50 ED 2.07"
+    assert frame_7_journal["allow_unverified"] is True
     # The preview raster and transport table stay in the held attempt's own
     # directory (the resume never re-captures them); only the frame map
     # follows the rebound artifact paths into this frame's directory.
@@ -7704,6 +7881,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     session_journal_path = root / "session-journal.json"
     session_journal = json.loads(session_journal_path.read_text(encoding="utf-8"))
     assert session_journal["status"] == "ejected"
+    assert session_journal["allow_unverified"] is True
     assert session_journal["completed_slots"] == [7]
     assert session_journal["density_calibration_session_id"] is not None
     # A cold batch's session journal gets this block the moment its preview

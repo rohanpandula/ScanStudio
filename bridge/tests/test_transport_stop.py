@@ -20,7 +20,7 @@ from tests.test_service_dispatch import _arm
 @pytest.fixture
 def real_transport(tmp_path, monkeypatch):
     monkeypatch.setattr("usb.core.find", lambda **_: pytest.fail("physical USB access"))
-    device = coolscanpy.Device(_fake_device_info(), object())
+    device = coolscanpy.Device(_fake_device_info(model="LS-5000 ED"), object())
     transport = CoolscanPyTransport()
     transport._device = device
     roll = device.roll(attempts_root=tmp_path / "attempts")

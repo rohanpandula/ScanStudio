@@ -328,7 +328,12 @@ struct AttendedScanRecoveryTests {
         )
         emitCompletion(model, completed: [1], failed: [2])
 
-        #expect(model.lastErrorMessage == nil)
+        // D-20/HEAD-12 (the 2026-09-07 batch abort): a partial success must
+        // still surface the bridge's own text -- this is the exact bug
+        // (9 frames completed, lastErrorMessage stayed null) D-20 exists to
+        // fix. It must never, however, be treated as the zero-completed
+        // attended-recovery case (the very next assertion).
+        #expect(model.lastErrorMessage == "ATTENDED_BINDING_REQUIRED: typed but only one frame failed")
         #expect(!model.canApproveEveryFrameAndScan)
     }
 
@@ -429,5 +434,92 @@ struct AttendedScanRecoveryTests {
             .approve(frameIndex: 2, attended: true),
             .scanStart(frames: [1, 2]),
         ])
+    }
+
+    @Test("CR-01: scan.start is refused CONTROLLER_BUSY, not a silent typed success, while an attended-scan-recovery approval is in flight")
+    @MainActor
+    func scanStartIsRefusedWhileAttendedApprovalInFlight() async {
+        let client = AttendedRecoveryEngineStub(holdFirstApproval: true)
+        let (model, _) = await preparedModel(client: client)
+        let dispatcher = ControlChannelDispatcher(sessionModel: model)
+        _ = await dispatcher.handle(.hello(
+            id: 0,
+            params: ControlHelloParams(schemaVersion: ControlSchema.version, clientName: "attended-recovery-tests")
+        ))
+
+        await model.startMockScan()
+        for frameIndex in 1...2 {
+            emitFailure(
+                model,
+                frameIndex: frameIndex,
+                code: ScanFailureCode.attendedBindingRequired,
+                message: "typed refusal"
+            )
+        }
+        emitCompletion(model, completed: [], failed: [1, 2])
+        #expect(model.canApproveEveryFrameAndScan)
+
+        // `approveEveryFrameAndScan()` now sets the D-07 busy indicator, so
+        // the dispatcher's own generic preamble refuses `scan.start` before
+        // ever routing to `SessionModel` -- not a typed success for a
+        // request that started nothing (the exact bug CR-01 reports).
+        let approval = Task { @MainActor in
+            await model.approveEveryFrameAndScan()
+        }
+        await client.waitForApproval()
+        #expect(model.mutatingOperationInFlight == "review.approve.attended")
+
+        let response = await dispatcher.handle(.scanStart(id: 99, params: ControlScanStartParams(motionConfirmed: true)))
+        guard case .failure(let id, let error) = response else {
+            Issue.record("expected CONTROLLER_BUSY, got \(response)")
+            await client.resumeApproval()
+            _ = await approval.value
+            return
+        }
+        #expect(id == 99)
+        #expect(error.code == ControlErrorCode.controllerBusy.rawValue)
+        // Zero engine requests beyond the two already recorded before this
+        // dispatch (the original scan.start and the held first approval) --
+        // the refusal never reached `SessionModel`, let alone the engine.
+        #expect(await client.calls() == [
+            .scanStart(frames: [1, 2]),
+            .approve(frameIndex: 1, attended: true),
+        ])
+
+        await client.resumeApproval()
+        #expect(await approval.value)
+    }
+
+    @Test("WR-01: resumeBatch reports a typed refusal instead of a silent no-op while an attended-scan-recovery approval is in flight")
+    @MainActor
+    func resumeBatchRefusesWhileAttendedApprovalInFlight() async {
+        let client = AttendedRecoveryEngineStub(holdFirstApproval: true)
+        let (model, _) = await preparedModel(client: client)
+
+        await model.startMockScan()
+        for frameIndex in 1...2 {
+            emitFailure(
+                model,
+                frameIndex: frameIndex,
+                code: ScanFailureCode.attendedBindingRequired,
+                message: "typed refusal"
+            )
+        }
+        emitCompletion(model, completed: [], failed: [1, 2])
+        #expect(model.canApproveEveryFrameAndScan)
+
+        let approval = Task { @MainActor in
+            await model.approveEveryFrameAndScan()
+        }
+        await client.waitForApproval()
+
+        // A direct `SessionModel` call (IN-01: not gated by the dispatcher's
+        // own busy preamble) used to return silently here with
+        // `lastErrorMessage` untouched.
+        await model.resumeBatch()
+        #expect(model.lastErrorMessage == "An attended-scan-recovery approval is already in progress.")
+
+        await client.resumeApproval()
+        #expect(await approval.value)
     }
 }

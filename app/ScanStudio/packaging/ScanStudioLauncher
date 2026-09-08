@@ -108,4 +108,10 @@ else
     print -u2 "ScanStudio: no hardware bridge found; launching simulator-only. Set SCANSTUDIO_BRIDGE_CMD, add a command to $config_hint, install scanstudio-bridge on PATH, or use an app bundle with its helper included."
 fi
 
+if [[ "${1:-}" == "--cli" ]]; then
+    shift
+    export SCANSTUDIO_CLI_BOOTSTRAPPED=1
+    exec "$launcher_dir/scanstudio-cli" "$@"
+fi
+
 exec "$launcher_dir/ScanStudio"

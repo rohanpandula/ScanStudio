@@ -577,6 +577,9 @@ struct BatchInspectorView: View {
                     InspectorRow(label: "Passes", value: "\(receipt.passes)")
                     InspectorRow(label: "Engine", value: receipt.engineVersion)
                     InspectorRow(label: "Proof", value: String(receipt.settingsFingerprint.prefix(8)))
+                    if let badge = UnverifiedHardwarePolicy.badge(model: receipt.deviceModel ?? receipt.deviceId, verification: receipt.hardwareVerification) {
+                        InspectorRow(label: "Hardware", value: badge)
+                    }
                 }
             }
 

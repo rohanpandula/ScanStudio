@@ -62,6 +62,7 @@ from .density import (
     build_nikon_density_evidence,
 )
 from .meter import EXPOSURE_MAX, EXPOSURE_MIN
+from .packed import SINGLE_SAMPLE_RECORD_BYTES
 from .plan import (
     CANONICAL_FINE_READ_BYTES,
     CANONICAL_FINE_READ_COUNT,
@@ -506,6 +507,38 @@ class _BatchTerminalReceiptObserved(Exception):
 # The fine-scan samples-per-line values a batch may command. 4 is the traced
 # default; 1 is the single-sample mode (see CaptureBatchRequest.samples_per_scan).
 SUPPORTED_SAMPLES_PER_SCAN: tuple[int, ...] = (1, 4)
+NIKON_USB_VENDOR_ID = 0x04B0
+NIKON_COOLSCAN_USB_PRODUCTS = {
+    0x4000: "LS-40 ED",
+    0x4001: "LS-50 ED",
+    0x4002: "LS-5000 ED",
+}
+CANONICAL_SCANNER_PRODUCT_ID = 0x4002
+CANONICAL_SCANNER_MODEL = NIKON_COOLSCAN_USB_PRODUCTS[CANONICAL_SCANNER_PRODUCT_ID]
+
+
+def _validate_usb_identity(
+    vendor_id: int,
+    product_id: int,
+    model: str,
+    allow_unverified: bool,
+) -> None:
+    if vendor_id != NIKON_USB_VENDOR_ID:
+        raise ValueError("expected USB vendor must be Nikon 04b0")
+    if NIKON_COOLSCAN_USB_PRODUCTS.get(product_id) != model:
+        raise ValueError("expected USB product id and scanner model disagree")
+    expected_opt_in = product_id != CANONICAL_SCANNER_PRODUCT_ID
+    if allow_unverified is not expected_opt_in:
+        raise ValueError("allow_unverified does not match the selected scanner identity")
+
+
+def _fine_capture_bytes(samples_per_scan: int) -> int:
+    record_bytes = (
+        CANONICAL_FINE_READ_BYTES
+        if samples_per_scan == 4
+        else SINGLE_SAMPLE_RECORD_BYTES
+    )
+    return CANONICAL_FINE_READ_COUNT * record_bytes
 
 @dataclass(frozen=True)
 class ReviewedRollFingerprint:
@@ -1128,6 +1161,11 @@ class CaptureRequest:
     manual_review_approval: ManualFrameApproval | None = None
     expected_usb_bus: int | None = None
     expected_usb_address: int | None = None
+    samples_per_scan: int = 4
+    expected_usb_vendor_id: int = NIKON_USB_VENDOR_ID
+    expected_usb_product_id: int = CANONICAL_SCANNER_PRODUCT_ID
+    expected_scanner_model: str = CANONICAL_SCANNER_MODEL
+    allow_unverified: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, CaptureMode):
@@ -1152,6 +1190,19 @@ class CaptureRequest:
                 or not 1 <= topology[1] <= 127
             ):
                 raise ValueError("expected USB address must be an integer in 1..127")
+        if self.samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN or isinstance(
+            self.samples_per_scan, bool
+        ):
+            raise ValueError(
+                "samples_per_scan must be one of "
+                f"{SUPPORTED_SAMPLES_PER_SCAN}, got {self.samples_per_scan!r}"
+            )
+        _validate_usb_identity(
+            self.expected_usb_vendor_id,
+            self.expected_usb_product_id,
+            self.expected_scanner_model,
+            self.allow_unverified,
+        )
         if self.mode is CaptureMode.PREVIEW:
             if self.selected_slot is not None:
                 raise ValueError("preview-only requests do not select a scanner slot")
@@ -1213,6 +1264,10 @@ class CaptureBatchRequest:
     # Validated against SUPPORTED_SAMPLES_PER_SCAN; carried to the batch child
     # through the batch job exactly like exposure_override_10ns.
     samples_per_scan: int = 4
+    expected_usb_vendor_id: int = NIKON_USB_VENDOR_ID
+    expected_usb_product_id: int = CANONICAL_SCANNER_PRODUCT_ID
+    expected_scanner_model: str = CANONICAL_SCANNER_MODEL
+    allow_unverified: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.frames, tuple):
@@ -1246,6 +1301,12 @@ class CaptureBatchRequest:
                 "samples_per_scan must be one of "
                 f"{SUPPORTED_SAMPLES_PER_SCAN}, got {self.samples_per_scan!r}"
             )
+        _validate_usb_identity(
+            self.expected_usb_vendor_id,
+            self.expected_usb_product_id,
+            self.expected_scanner_model,
+            self.allow_unverified,
+        )
         for frame in self.frames:
             approval = frame.manual_review_approval
             if (
@@ -3674,6 +3735,8 @@ class CaptureProcessAdapter:
             str(paths.journal),
             "--boundary-offset-rows",
             str(request.boundary_offset_rows),
+            "--samples-per-scan",
+            str(request.samples_per_scan),
             "--live",
         ]
         if request.mode is CaptureMode.PREVIEW:
@@ -3694,6 +3757,18 @@ class CaptureProcessAdapter:
             assert request.expected_usb_address is not None
             worker_argv.extend(("--expected-usb-bus", str(request.expected_usb_bus)))
             worker_argv.extend(("--expected-usb-address", str(request.expected_usb_address)))
+        worker_argv.extend(
+            (
+                "--expected-usb-vendor-id",
+                str(request.expected_usb_vendor_id),
+                "--expected-usb-product-id",
+                str(request.expected_usb_product_id),
+                "--expected-scanner-model",
+                request.expected_scanner_model,
+            )
+        )
+        if request.allow_unverified:
+            worker_argv.append("--allow-unverified")
         if self._expected_bundle_sha256 is not None:
             worker_argv.extend(
                 ("--expected-capture-bundle-sha256", self._expected_bundle_sha256)
@@ -3740,6 +3815,10 @@ class CaptureProcessAdapter:
             "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
             "expected_usb_address": request.expected_usb_address,
             "expected_usb_bus": request.expected_usb_bus,
+            "expected_usb_vendor_id": request.expected_usb_vendor_id,
+            "expected_usb_product_id": request.expected_usb_product_id,
+            "expected_scanner_model": request.expected_scanner_model,
+            "allow_unverified": request.allow_unverified,
             "exposure_override_10ns": (
                 None
                 if request.exposure_override_10ns is None
@@ -3913,7 +3992,7 @@ class CaptureProcessAdapter:
         *,
         frame_index: int,
     ) -> CaptureAttemptResult:
-        expected_bytes = CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
+        expected_bytes = _fine_capture_bytes(prepared.request.samples_per_scan)
         selected_slots = prepared.request.selected_slots
         expected_batch = {
             "frame_index": frame_index,
@@ -4485,7 +4564,7 @@ class CaptureProcessAdapter:
         expected_bytes = {
             CaptureMode.PREVIEW: 0,
             CaptureMode.METER_ONLY: METER_CAPTURE_BYTES,
-            CaptureMode.FULL: CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES,
+            CaptureMode.FULL: _fine_capture_bytes(request.samples_per_scan),
         }[request.mode]
         invariants: dict[str, object] = {
             "plan_sha256": CANONICAL_PLAN_SHA256,

@@ -10,6 +10,7 @@ import platform
 import plistlib
 import queue
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,7 @@ def digest(path):
 
 def isolated_environment(root):
     # Never inherit bridge commands, arming, Python hooks, or developer output paths.
-    return {"HOME": str(root), "TMPDIR": str(root), "PATH": "/usr/bin:/bin",
+    return {"HOME": str(root), "CFFIXED_USER_HOME": str(root), "TMPDIR": str(root), "PATH": "/usr/bin:/bin",
             "LANG": "C", "LC_ALL": "C"}
 
 
@@ -133,7 +134,7 @@ def scan_params(root, frames):
     return {"frames": frames, "recipe": RECIPE, "output": output}
 
 
-def verify_receipts(root, expected):
+def verify_receipts(root, expected, device_id='sim-ls5000-0'):
     project = json.loads((root / 'manifest.json').read_text())
     completed = [f['index'] for f in project['frames'] if f['receipts']]
     require(completed == expected, f"persisted completion mismatch: {completed} != {expected}")
@@ -143,8 +144,12 @@ def verify_receipts(root, expected):
             continue
         require(len(frame['receipts']) == 1, f"frame was rescanned: {frame['index']}")
         receipt = frame['receipts'][0]
-        require(receipt['simulated'] is True and receipt['deviceId'] == 'sim-ls5000-0',
+        require(receipt['simulated'] is True and receipt['deviceId'] == device_id,
                 'receipt must identify simulated capture')
+        if device_id == 'sim-ls50-0':
+            require(receipt.get('hardwareVerification') == 'unverified'
+                    and 'LS-50' in receipt.get('deviceModel', ''),
+                    'unverified receipt lost model or verification provenance')
         require(receipt['frameIndex'] == frame['index'] and receipt['resolutionDpi'] == 100
                 and receipt['bitDepth'] == 16, 'receipt capture settings mismatch')
         outputs = receipt['outputs']
@@ -166,6 +171,8 @@ def verify_receipts(root, expected):
             snapshots[str(path)] = [sha, stat.st_size, stat.st_ino, stat.st_mtime_ns]
             images.append({"path": str(path), "width": 99, "height": 149,
                            "dtype": "uint8" if role == 'preview' else 'uint16'})
+            if role == 'positive' and device_id == 'sim-ls50-0':
+                images[-1]['deviceModel'] = receipt['deviceModel']
     return project, snapshots, images
 
 
@@ -182,6 +189,14 @@ for item in json.load(sys.stdin):
         raise SystemExit('unreadable image or wrong dimensions: ' + item['path'])
     if str(image.dtype) != item['dtype']:
         raise SystemExit('wrong image bit depth: ' + item['path'])
+    if 'deviceModel' in item:
+        import tifffile
+        with tifffile.TiffFile(item['path']) as tiff:
+            tags = tiff.pages[0].tags
+            if tags.get('Model') is None or tags['Model'].value != item['deviceModel']:
+                raise SystemExit('TIFF lost device model: ' + item['path'])
+            if tags.get('Software') is None or 'hardwareVerification=unverified' not in tags['Software'].value:
+                raise SystemExit('TIFF lost unverified provenance: ' + item['path'])
 '''
     subprocess.run([str(runtime), '-I', '-B', '-c', code,
                     str(runtime.parents[2] / 'site-packages')],
@@ -193,8 +208,9 @@ def verify_app(app):
     require(platform.system() == 'Darwin' and platform.machine() == 'arm64',
             'Acceptance requires native Apple Silicon (M-series) macOS; Rosetta is not supported')
     engine = app / 'Contents/MacOS/scanstudio-engine'
+    cli = app / 'Contents/MacOS/scanstudio-cli'
     runtime = app / 'Contents/Resources/BridgeRuntime/python/bin/python3.13'
-    for executable in (app / 'Contents/MacOS/ScanStudio', engine, runtime):
+    for executable in (app / 'Contents/MacOS/ScanStudio', engine, cli, runtime):
         require(executable.is_file(), f"missing packaged executable: {executable}")
         result = subprocess.run(['/usr/bin/lipo', '-archs', str(executable)],
                                 text=True, capture_output=True, check=True, timeout=10)
@@ -202,11 +218,179 @@ def verify_app(app):
     with (app / 'Contents/Info.plist').open('rb') as stream:
         info = plistlib.load(stream)
     require(info.get('LSMinimumSystemVersion') == '14.0', 'expected supported macOS floor 14.0')
-    return engine, runtime, info
+    return engine, cli, runtime, info
+
+
+def _cli_json(cli, socket_path, root, *arguments, expect_exit=0):
+    argv = [str(cli), *arguments, '--socket', str(socket_path)]
+    # A six-frame job wait needs an aggregate budget, unlike a single reply.
+    timeout = TIMEOUT * 6 if '--wait' in arguments else TIMEOUT
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                               env=isolated_environment(root), cwd=root)
+    if completed.returncode != expect_exit:
+        raise RuntimeError(f"CLI {' '.join(argv)} exited {completed.returncode}, expected {expect_exit}; stdout={completed.stdout!r}; stderr={completed.stderr!r}")
+    text = completed.stdout.strip()
+    try:
+        decoder = json.JSONDecoder()
+        value, end = decoder.raw_decode(text)
+        require(not text[end:].strip(), f"CLI {' '.join(argv)} did not print exactly one JSON object: {text!r}")
+        require(isinstance(value, dict), f"CLI {' '.join(argv)} printed non-object JSON: {text!r}")
+        return value
+    except (ValueError, RuntimeError) as error:
+        raise RuntimeError(f"CLI {' '.join(argv)} output was not exactly one JSON object: {error}; stdout={completed.stdout!r}; stderr={completed.stderr!r}") from None
+
+
+def _require_simulator_devices(envelope):
+    devices = (envelope.get('result') or {}).get('devices', [])
+    ids = [device.get('deviceId', '') for device in devices]
+    require(devices and all(device_id.startswith('sim-') for device_id in ids),
+            f"non-simulator backend exposed: {ids}")
+
+
+def _gate_socket_directory():
+    directory = Path(tempfile.mkdtemp(prefix='ss-pkg-', dir='/tmp'))
+    socket_path = directory / 's.sock'
+    require(len(str(socket_path).encode()) < 104, f"socket path is too long: {socket_path}")
+    return directory, socket_path
+
+
+def _bundle_engine_pids(engine_path):
+    result = subprocess.run(['/bin/ps', '-axo', 'pid=,command='], text=True,
+                            capture_output=True, check=True, timeout=10)
+    pids = set()
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) == 2 and str(engine_path) in fields[1]:
+            pids.add(int(fields[0]))
+    return pids
+
+
+def cli_acceptance(cli, runtime, root, device_id='sim-ls5000-0'):
+    started = time.monotonic()
+    socket_directory, socket_path = _gate_socket_directory()
+    host_log = socket_directory / 'host.log'
+    engine_path = (cli.parent / 'scanstudio-engine').resolve()
+    engine_pids_before = _bundle_engine_pids(engine_path)
+    host_pid = None
+    remove_socket_directory = True
+    steps = []
+    modes = []
+    roll = None
+
+    def step(*arguments, expect_exit=0):
+        envelope = _cli_json(cli, socket_path, root, *arguments, expect_exit=expect_exit)
+        steps.append({'name': ' '.join(arguments), 'exitCode': expect_exit})
+        if envelope.get('mode') is not None:
+            modes.append(envelope['mode'])
+        return envelope
+
+    def wait_for_status(predicate, description):
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            status = step('status')
+            result = status.get('result') or {}
+            if predicate(result):
+                return result
+            require(time.monotonic() < deadline,
+                    f"{description} did not complete within {TIMEOUT}s: {status}")
+            time.sleep(0.1)
+
+    try:
+        host = step('host', '--detach', '--simulator', '--log', str(host_log))
+        remove_socket_directory = False
+        host_pid = (host.get('result') or {}).get('hostPid')
+        require(isinstance(host_pid, int) and host_pid > 0, f"detached host did not report a pid: {host}")
+        require((host.get('result') or {}).get('logPath') == str(host_log),
+                f"detached host log escaped the gate directory: {host}")
+        require(host_log.is_file() and Path(f'{socket_path}.pid').is_file(),
+                'detached host did not create its private log and pidfile')
+        status = step('status')
+        require(status.get('mode') == 'attach-headless', f"packaged CLI did not attach headlessly: {status}")
+        require(status.get('hostPid') == host_pid, f"attached host pid mismatch: {status}")
+
+        _require_simulator_devices(step('rescan'))
+        if device_id == 'sim-ls50-0':
+            refusal = step('connect', '--device', device_id, expect_exit=65)
+            require((refusal.get('error') or {}).get('code') == 'NOT_SUPPORTED',
+                    f"unverified device opened without opt-in: {refusal}")
+            connected = step('connect', '--device', device_id, '--allow-unverified-hardware')
+            require(connected.get('hardwareVerification') == 'unverified',
+                    f"connect lost live unverified provenance: {connected}")
+            current = step('status')
+            require(current.get('hardwareVerification') == 'unverified',
+                    f"status lost live unverified provenance: {current}")
+        else:
+            step('connect', '--device', device_id)
+        step('sim', 'load-media', '--carrier', 'strip6')
+        step('preview', '--film-loaded')
+        wait_for_status(lambda result: result.get('previewComplete') is True, 'preview')
+        frames = step('frames', 'list')
+        require(len((frames.get('result') or {}).get('frames', [])) == 6,
+                f"previewed strip did not list six frames: {frames}")
+        step('frames', 'select', '--all')
+        step('settings', 'set', '--resolution', '100')
+        saved = step('roll', 'save', '--name', 'packaged-acceptance', '--carrier', 'strip6',
+                     '--frame-count', '6', '--film-process', 'c41ColorNegative',
+                     '--confirm-motion', '--auto-approve')
+        project_directory = (saved.get('result') or {}).get('projectDirectory')
+        require(project_directory, f"roll save did not report projectDirectory: {saved}")
+        roll = Path(project_directory).resolve()
+        require(roll.is_relative_to(root.resolve()), f"CLI project escaped gate root: {roll}")
+        wait_for_status(
+            lambda result: result.get('jobId') is not None
+            and 0 < len(result.get('pendingFrames', [])) < 6,
+            'first durable frame')
+        step('stop')
+        stopped = wait_for_status(
+            lambda result: result.get('jobId') is None and result.get('jobState') == 'stopped',
+            'partial stop')
+        pending = stopped.get('pendingFrames', [])
+        require(pending and len(pending) < 6,
+                f"stop did not preserve a partial batch for resume: {stopped}")
+        completed = [index for index in range(1, 7) if index not in pending]
+        _, preserved, images = verify_receipts(roll, completed, device_id)
+        decode_images(runtime, images, root)
+        step('frames', 'exclude', '6')
+        step('frames', 'include', '6')
+        step('preview', '--film-loaded', '--intent', 'refreshSavedProject')
+        wait_for_status(lambda result: result.get('scanReadiness') == 'ready', 'refreshed scan readiness')
+        resumed = step('resume', '--confirm-motion', '--wait')
+        require((resumed.get('result') or {}).get('jobState') == 'completed',
+                f"resume did not complete the partial batch: {resumed}")
+        refusal = step('eject', expect_exit=77)
+        require((refusal.get('error') or {}).get('code') == 'CONFIRMATION_REQUIRED',
+                f"missing confirmation was not refused: {refusal}")
+        step('eject', '--confirm-motion')
+        require(roll is not None, 'CLI roll path was not captured')
+        _, snapshots, images = verify_receipts(roll, list(range(1, 7)), device_id)
+        require(all(snapshots[path] == snapshot for path, snapshot in preserved.items()),
+                'resume overwrote completed output')
+        decode_images(runtime, images, root)
+        return {
+            'cliSha256': digest(cli), 'socketPath': str(socket_path), 'modes': modes,
+            'steps': steps, 'hostPid': host_pid, 'elapsedSeconds': time.monotonic() - started,
+            'outputs': {str(Path(path).relative_to(roll)): {'sha256': item[0], 'byteLength': item[1], 'fileId': item[2], 'mtimeNs': item[3]} for path, item in snapshots.items()}
+        }
+    finally:
+        try:
+            if host_pid is not None:
+                _cli_json(cli, socket_path, root, 'host', 'stop')
+                deadline = time.monotonic() + 5
+                while True:
+                    survivors = _bundle_engine_pids(engine_path) - engine_pids_before
+                    if not survivors:
+                        break
+                    require(time.monotonic() < deadline,
+                            f"packaged engine survived CLI gate: {engine_path} pids={sorted(survivors)}")
+                    time.sleep(0.1)
+                remove_socket_directory = True
+        finally:
+            if remove_socket_directory:
+                shutil.rmtree(socket_directory, ignore_errors=False)
 
 
 def acceptance(app, root):
-    engine_path, runtime, info = verify_app(app)
+    engine_path, cli_path, runtime, info = verify_app(app)
     roll = root / 'Saved roll # 1'
     client = None
     try:
@@ -279,6 +463,7 @@ def acceptance(app, root):
         decode_images(runtime, images, root)
         client.close(graceful=True)
         client = None
+        cli_report = cli_acceptance(cli_path, runtime, root, device_id='sim-ls50-0')
         return {"status": "passed", "scope": "simulator software only", "architecture": "arm64",
                 "appVersion": info.get('CFBundleShortVersionString'), "macOS": platform.mac_ver()[0],
                 "minimumMacOS": info['LSMinimumSystemVersion'], "engineSha256": digest(engine_path),
@@ -289,7 +474,8 @@ def acceptance(app, root):
                     for path, snapshot in snapshots.items()},
                 "checks": ["explicit preview and decoded synthetic strip", "partial batch stop", "reopen", "SIGKILL recovery",
                            "unusable destination refusal", "resume preserves completed output",
-                           "decoded dimensions and bit depth", "receipt hashes and file identities"],
+                           "decoded dimensions and bit depth", "receipt hashes and file identities",
+                           "packaged CLI simulator acceptance"], "cli": cli_report,
                 "hardwareAcceptance": "NOT RUN"}
     finally:
         if client is not None:
@@ -297,7 +483,7 @@ def acceptance(app, root):
 
 
 def deadline_expired(signum, frame):
-    raise RuntimeError('acceptance exceeded its 180-second wall-clock budget')
+    raise RuntimeError('acceptance exceeded its 180-second wall-clock budget, including packaged CLI leg')
 
 
 def main():

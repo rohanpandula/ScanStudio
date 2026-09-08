@@ -64,6 +64,17 @@ struct DeviceBarView: View {
                         .font(.system(size: 12))
                         .foregroundStyle(Color.scanStudioSecondaryText)
                 }
+                if let badge = UnverifiedHardwarePolicy.badge(
+                    model: sessionModel.connectedHardwareDeviceModel,
+                    verification: sessionModel.connectedHardwareVerification
+                ) {
+                    Text(badge)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.scanStudioAmber)
+                        .lineLimit(1)
+                        .help("This scanner is recognized but not hardware verified.")
+                        .accessibilityLabel(badge)
+                }
             } else {
                 Text("No scanner selected")
                     .font(.system(size: 13, weight: .semibold))

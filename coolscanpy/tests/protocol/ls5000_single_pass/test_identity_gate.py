@@ -78,6 +78,18 @@ def test_identity_rejects_wrong_product_ls50_ed() -> None:
         worker_module._validate_scanner_identity(payload)
 
 
+def test_identity_accepts_expected_ls50_but_still_requires_nikon() -> None:
+    payload = _inquiry("Nikon", "LS-50 ED", "1.03")
+    assert worker_module._validate_scanner_identity(
+        payload, expected_product="LS-50 ED"
+    ) == "Nikon LS-50 ED 1.03"
+    with pytest.raises(worker_module.SynchronizedProtocolError):
+        worker_module._validate_scanner_identity(
+            _inquiry("ACME", "LS-50 ED", "1.03"),
+            expected_product="LS-50 ED",
+        )
+
+
 def test_identity_rejects_unknown_vendor() -> None:
     """A non-Nikon vendor must fail closed with the typed error."""
     payload = _inquiry("ACME", "LS-5000 ED", "1.03")

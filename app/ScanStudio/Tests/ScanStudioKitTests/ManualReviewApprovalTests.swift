@@ -810,3 +810,124 @@ struct ManualReviewApprovalTests {
         await firstScan.value
     }
 }
+
+
+// MARK: - Task 3: roll save --auto-approve (D-14/HEAD-08)
+//
+// `ManualReviewAutoApproval.shouldAutoApprove(_:)` (`ControlCLISupport.swift`)
+// is the pure decision behind `roll save --auto-approve`, factored out of
+// the `scanstudio-cli` executable target specifically so it lands here,
+// directly testable, rather than only reachable via a subprocess.
+
+@Suite("Roll save auto-approve")
+struct RollSaveAutoApproveTests {
+    @Test("an empty flagged-frame list refuses -- nothing to approve")
+    func emptyListRefuses() {
+        #expect(ManualReviewAutoApproval.shouldAutoApprove([]) == false)
+    }
+
+    @Test("every flagged frame at or above 0.8 approves")
+    func allHighConfidenceApproves() {
+        let frames = [
+            ControlManualReviewFrame(index: 1, reason: "boundaryAmbiguous", contentConfidence: 0.9),
+            ControlManualReviewFrame(index: 2, reason: "boundaryAmbiguous", contentConfidence: 0.95),
+        ]
+        #expect(ManualReviewAutoApproval.shouldAutoApprove(frames) == true)
+    }
+
+    @Test("one frame at 0.79 refuses the whole batch -- no partial auto-approval")
+    func oneFrameBelowThresholdRefusesTheWholeBatch() {
+        let frames = [
+            ControlManualReviewFrame(index: 1, reason: "boundaryAmbiguous", contentConfidence: 0.9),
+            ControlManualReviewFrame(index: 2, reason: "boundaryAmbiguous", contentConfidence: 0.79),
+        ]
+        #expect(ManualReviewAutoApproval.shouldAutoApprove(frames) == false)
+    }
+
+    @Test("one frame with contentConfidence: nil refuses the whole batch")
+    func oneFrameWithNilConfidenceRefusesTheWholeBatch() {
+        let frames = [
+            ControlManualReviewFrame(index: 1, reason: "boundaryAmbiguous", contentConfidence: 0.9),
+            ControlManualReviewFrame(index: 2, reason: "boundaryAmbiguous", contentConfidence: nil),
+        ]
+        #expect(ManualReviewAutoApproval.shouldAutoApprove(frames) == false)
+    }
+
+    @Test("exactly 0.8 approves -- the threshold is inclusive")
+    func exactlyAtThresholdApproves() {
+        let frames = [ControlManualReviewFrame(index: 1, reason: "boundaryAmbiguous", contentConfidence: 0.8)]
+        #expect(ManualReviewAutoApproval.shouldAutoApprove(frames) == true)
+    }
+
+    // MARK: CLI smoke -- both parse-time refusals, neither opens a socket
+
+    @Test("frames select --skip-blank --blank-threshold outside 0...1 exits 64 before any connection")
+    func blankThresholdOutOfRangeExitsUsage() async throws {
+        let result = try await runManualReviewApprovalCLI(["frames", "select", "--skip-blank", "--blank-threshold", "1.5"])
+        #expect(result.exitCode == 64)
+    }
+
+    @Test("roll save --auto-approve without --confirm-motion exits 77 before any connection")
+    func autoApproveWithoutConfirmMotionExitsConfirmationRequired() async throws {
+        let result = try await runManualReviewApprovalCLI([
+            "roll", "save", "--name", "r", "--carrier", "strip6", "--frame-count", "6",
+            "--film-process", "c41ColorNegative", "--auto-approve",
+        ])
+        #expect(result.exitCode == 77)
+    }
+}
+
+// MARK: - Minimal built-binary runner (per-file duplication of
+// `ScanstudioCLIProcessTests.swift`'s own `CLIProcessLocator`/`runCLI`,
+// matching this suite's established convention of no shared test-utility
+// module). Both tests above are parse-time refusals -- neither reaches a
+// socket -- but `--socket` still points at a scratch path never opened,
+// as defense in depth against a `validate()` regression that would.
+
+private enum ManualReviewApprovalCLILocateError: Error, CustomStringConvertible {
+    case notFound(String)
+    var description: String {
+        switch self {
+        case .notFound(let path):
+            "scanstudio-cli binary not found at \(path). Run `swift build --product scanstudio-cli` first."
+        }
+    }
+}
+
+private struct ManualReviewApprovalCLIResult {
+    let exitCode: Int32
+}
+
+/// The blocking `Process` spawn/wait sequence runs on a dedicated
+/// background queue via a continuation, never inline on Swift's
+/// cooperative thread pool -- the same fix `ScanstudioCLIProcessTests.swift`
+/// needed for the identical reason (see that file's own `runCLI` doc
+/// comment).
+private func runManualReviewApprovalCLI(_ arguments: [String]) async throws -> ManualReviewApprovalCLIResult {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // ManualReviewApprovalTests.swift -> ScanStudioKitTests/
+        .deletingLastPathComponent() // ScanStudioKitTests/ -> Tests/
+        .deletingLastPathComponent() // Tests/ -> package root
+    let binary = packageRoot.appendingPathComponent(".build/debug/scanstudio-cli")
+    guard FileManager.default.fileExists(atPath: binary.path) else {
+        throw ManualReviewApprovalCLILocateError.notFound(binary.path)
+    }
+    let scratchSocket = "/tmp/ss-manual-review-\(UInt32.random(in: 0..<UInt32.max))/s.sock"
+    let allArguments = arguments + ["--socket", scratchSocket]
+    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ManualReviewApprovalCLIResult, Error>) in
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let process = Process()
+                process.executableURL = binary
+                process.arguments = allArguments
+                process.standardOutput = Pipe()
+                process.standardError = Pipe()
+                try process.run()
+                process.waitUntilExit()
+                continuation.resume(returning: ManualReviewApprovalCLIResult(exitCode: process.terminationStatus))
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+}

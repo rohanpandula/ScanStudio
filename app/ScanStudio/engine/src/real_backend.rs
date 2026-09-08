@@ -878,19 +878,6 @@ use crate::protocol::{
 };
 use serde::Serialize;
 
-/// One bridge-reported device's identity/support flag as of the last
-/// `device.list` this engine instance saw, keyed by device id in
-/// `RealLs5000::known_devices`. `connect()` looks up the REQUESTED device id
-/// here (Lane D, #14-C) so a dual-attach -- e.g. an unsupported LS-50
-/// alongside a supported LS-5000 -- refuses only the specific unsupported
-/// unit that was actually asked for, not every id regardless of which
-/// device this engine happened to see first.
-#[derive(Debug, Clone)]
-struct KnownDevice {
-    model: String,
-    supported: bool,
-}
-
 /// Backend for the real Nikon LS-5000, speaking to it through the
 /// `scanstudio-bridge` subprocess over `BridgeClient`. Every
 /// `ScannerBackend` method translates the engine's PROTOCOL.md-shaped call
@@ -943,20 +930,19 @@ pub struct RealLs5000 {
     /// for this process. It is metadata only: never used for hardware policy,
     /// and absent/invalid values merely make #106 evidence unavailable.
     client_build: Mutex<Option<String>>,
+    /// Exact identity returned by the successful device.open for this session.
+    active_device: Mutex<Option<domain::DeviceInfo>>,
     device_id: String,
     model: String,
     /// False when the bridge discovered a recognized-but-unsupported Nikon
     /// model (Lane D, #14). The backend still starts so ``scanner.list`` can
-    /// show the unit by name, but ``connect`` refuses it.
+    /// show the unit and its explicit opt-in eligibility.
     supported: bool,
-    /// Every device this engine instance's construction-time `device.list`
-    /// reported, keyed by id (Lane D, #14-C). `device_id`/`model`/`supported`
-    /// above stay the single FIRST-seen device (unchanged -- `device_info()`
-    /// still reports only one device, matching `scanner.list`'s existing
-    /// one-real-device shape); this map exists so `connect(device_id)` can
-    /// decide per REQUESTED device instead of trusting whichever device was
-    /// first in the original list.
-    known_devices: HashMap<String, KnownDevice>,
+    unverified_allowed: bool,
+    hardware_verification: domain::HardwareVerification,
+    /// Every identity from the bridge's construction-time `device.list`, in
+    /// discovery order. `connect(device_id)` selects from this exact set.
+    known_devices: Vec<domain::DeviceInfo>,
     /// The holder classification derived from the bridge's authoritative
     /// `DeviceInfo.capabilities`. `device.list` supplies the initial value,
     /// and every successful `device.open` refreshes it because a holder may
@@ -2691,20 +2677,26 @@ impl RealLs5000 {
         // Lane D, #14-C: snapshot every device this device.list reported,
         // not just the first -- connect() needs the REQUESTED device's own
         // supported flag, not whichever device this engine happened to see
-        // first. device_id/model/supported below deliberately stay the
-        // first-seen device unchanged (device_info()/scanner.list still
-        // report exactly one real device).
-        let known_devices: HashMap<String, KnownDevice> = devices_result
+        // first. The scalar fields below remain the first-seen disconnected
+        // default; scanner.list uses the complete ordered snapshot.
+        let firmware_label = format!("bridge {}", bridge.hello_info().bridge_version);
+        let known_devices: Vec<domain::DeviceInfo> = devices_result
             .devices
             .iter()
             .map(|device| {
-                (
-                    device.device_id.clone(),
-                    KnownDevice {
-                        model: device.model.clone(),
-                        supported: device.supported,
-                    },
-                )
+                domain::DeviceInfo {
+                    device_id: device.device_id.clone(),
+                    model: device.model.clone(),
+                    kind: "real".to_string(),
+                    firmware: firmware_label.clone(),
+                    connection: "USB (bridge)".to_string(),
+                    supported: device.supported,
+                    unverified_allowed: device.unverified_allowed,
+                    hardware_verification: device.hardware_verification,
+                    supported_multisample_passes: Some(
+                        derive_supported_multisample_passes(&device.capabilities),
+                    ),
+                }
             })
             .collect();
         let bridge_device =
@@ -2715,8 +2707,6 @@ impl RealLs5000 {
         let supported_multisample_passes =
             derive_supported_multisample_passes(&bridge_device.capabilities);
         let detected_holder = derive_detected_holder(&bridge_device.capabilities);
-        let firmware_label = format!("bridge {}", bridge.hello_info().bridge_version);
-
         Ok(RealLs5000 {
             bridge,
             next_session_epoch: AtomicU64::new(0),
@@ -2729,9 +2719,12 @@ impl RealLs5000 {
             preview_terminal_session_loss_test_hook: false,
             active_scan_job_id: Arc::new(Mutex::new(None)),
             client_build: Mutex::new(None),
+            active_device: Mutex::new(None),
             device_id: bridge_device.device_id,
             model: bridge_device.model,
             supported: bridge_device.supported,
+            unverified_allowed: bridge_device.unverified_allowed,
+            hardware_verification: bridge_device.hardware_verification,
             known_devices,
             detected_holder: Mutex::new(detected_holder),
             firmware_label,
@@ -2806,6 +2799,9 @@ impl RealLs5000 {
     /// `SimulatedLs5000::device_info`. Not part of `ScannerBackend` since it
     /// doesn't touch backend connection state.
     pub fn device_info(&self) -> domain::DeviceInfo {
+        if let Some(device) = self.active_device.lock().unwrap().clone() {
+            return device;
+        }
         domain::DeviceInfo {
             device_id: self.device_id.clone(),
             model: self.model.clone(),
@@ -2813,6 +2809,8 @@ impl RealLs5000 {
             firmware: self.firmware_label.clone(),
             connection: "USB (bridge)".to_string(),
             supported: self.supported,
+            unverified_allowed: self.unverified_allowed,
+            hardware_verification: self.hardware_verification,
             // The same device-sourced set scan_start's own INVALID_PARAMS
             // gate already validates multisamplePasses against (see the
             // "multisamplePasses must be one of {:?} for this device"
@@ -2822,6 +2820,25 @@ impl RealLs5000 {
             // Capabilities, never absent data.
             supported_multisample_passes: Some(self.supported_multisample_passes.clone()),
         }
+    }
+
+    pub fn device_infos(&self) -> Vec<domain::DeviceInfo> {
+        let mut devices = self.known_devices.clone();
+        if let Some(active) = self.active_device.lock().unwrap().clone() {
+            if let Some(device) = devices
+                .iter_mut()
+                .find(|device| device.device_id == active.device_id)
+            {
+                *device = active;
+            }
+        }
+        devices
+    }
+
+    pub(crate) fn recognizes(&self, device_id: &str) -> bool {
+        self.known_devices
+            .iter()
+            .any(|device| device.device_id == device_id)
     }
 
     pub(crate) fn set_client_build(&self, client_build: Option<String>) {
@@ -2844,6 +2861,7 @@ impl RealLs5000 {
         let epoch = self.active_session_epoch.swap(0, Ordering::AcqRel);
         let invalidated = epoch != 0;
         if invalidated {
+            *self.active_device.lock().unwrap() = None;
             // A request-side session loss cannot prove that a preview worker
             // has stopped reading the process-global event queue. Retire
             // completed approval immediately, but leave the exact active or
@@ -2866,6 +2884,8 @@ impl RealLs5000 {
             lamp: Lamp::Off,
             transport: Transport::Idle,
             active_job_id: None,
+            device_model: None,
+            hardware_verification: None,
             motion_armed: None,
             film_present: None,
         }
@@ -3400,6 +3420,7 @@ impl RealLs5000 {
         {
             return false;
         }
+        *self.active_device.lock().unwrap() = None;
 
         Self::invalidate_preview_state_for_epoch_locked(&mut preview_state, expected_epoch);
         drop(preview_state);
@@ -3879,11 +3900,17 @@ impl ScannerBackend for RealLs5000 {
     fn connect(
         &self,
         device_id: &str,
-        _options: &ConnectOptions,
+        options: &ConnectOptions,
     ) -> Result<ConnectResult, EngineError> {
         self.ensure_preview_stream_allows_connect_or_eject()?;
-        if let Some(requested) = self.known_devices.get(device_id) {
-            if !requested.supported {
+        if let Some(requested) = self
+            .known_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+        {
+            if !requested.supported
+                && !(options.allow_unverified_hardware && requested.unverified_allowed)
+            {
                 // Recognize-and-refuse (Lane D, #14 / #14-C): refuse the
                 // SPECIFIC requested device when it is a recognized-but-
                 // unsupported Nikon model, decided from THIS id's own
@@ -3893,21 +3920,26 @@ impl ScannerBackend for RealLs5000 {
                 // supported LS-5000) must not block connecting to the
                 // LS-5000 just because the LS-50 happened to enumerate
                 // first.
-                return Err(EngineError::new(
-                    ErrorCode::NotSupported,
+                let message = if requested.unverified_allowed {
                     format!(
-                        "{} is recognized but not supported; only the LS-5000 is supported",
+                        "{} is recognized but not supported; only the LS-5000 is supported. Turn on \"Allow unverified scanners\" (or pass --allow-unverified-hardware) to open it anyway; every output will be tagged unverified.",
                         requested.model
-                    ),
-                ));
+                    )
+                } else {
+                    format!(
+                        "{} is recognized but not supported; no unverified capture path is available for this device",
+                        requested.model
+                    )
+                };
+                return Err(EngineError::new(ErrorCode::NotSupported, message));
             }
         }
         // An id this engine's device.list snapshot did not recognize falls
         // through to device.open below, which surfaces the bridge's own
         // not-found response -- unchanged from before known_devices existed.
         // BRIDGE.md has no equivalent of the simulator's `timeScale` /
-        // `faultInjection` concepts — both are simulator-only, so
-        // `options` is intentionally ignored here.
+        // `faultInjection` concepts. The unverified flag is forwarded only
+        // for a recognized device whose discovery record explicitly permits it.
         self.bridge
             .ensure_running_for_explicit_connect()
             .map_err(|err| {
@@ -3916,11 +3948,28 @@ impl ScannerBackend for RealLs5000 {
                     format!("bridge is unavailable for explicit reconnect: {err}"),
                 )
             })?;
+        let allow_unverified_hardware = self
+            .known_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .is_some_and(|device| {
+                !device.supported
+                    && device.unverified_allowed
+                    && options.allow_unverified_hardware
+            });
+        let open_params = if allow_unverified_hardware {
+            serde_json::json!({
+                "deviceId": device_id,
+                "allowUnverifiedHardware": true,
+            })
+        } else {
+            serde_json::json!({ "deviceId": device_id })
+        };
         let result_value = self
             .bridge
             .call_with_deadline(
                 "device.open",
-                serde_json::json!({ "deviceId": device_id }),
+                open_params,
                 DEVICE_OPEN_CALL_DEADLINE,
             )
             .map_err(|error| match error {
@@ -3944,10 +3993,25 @@ impl ScannerBackend for RealLs5000 {
         // `device.open` is newer than the construction-time `device.list`
         // result: the physical holder can change while disconnected.
         self.refresh_detected_holder(&result.device.capabilities);
+        let opened_device = domain::DeviceInfo {
+            device_id: result.device.device_id.clone(),
+            model: result.device.model.clone(),
+            kind: "real".to_string(),
+            firmware: self.firmware_label.clone(),
+            connection: "USB (bridge)".to_string(),
+            supported: result.device.supported,
+            unverified_allowed: result.device.unverified_allowed,
+            hardware_verification: result.device.hardware_verification,
+            supported_multisample_passes: Some(derive_supported_multisample_passes(
+                &result.device.capabilities,
+            )),
+        };
+        *self.active_device.lock().unwrap() = Some(opened_device.clone());
         self.mark_session_connected();
         Ok(ConnectResult {
-            device: self.device_info(),
+            device: opened_device,
             status: map_status(&result.status, self.detected_holder()),
+            already_connected: false,
         })
     }
 
@@ -4899,15 +4963,59 @@ fn map_bridge_error(err: BridgeCallError) -> EngineError {
     }
 }
 
+/// The bridge's own closed `ErrorCode` vocabulary
+/// (`bridge/src/scanstudio_bridge/protocol.py:24-51`), read verbatim as
+/// wire string literals. The authoritative membership test for "is this a
+/// real bridge code" — used by `map_bridge_error_code_never_flattens_a_
+/// known_bridge_code_to_internal` below and by the `sim.loadMedia`
+/// dispatch arm (`server.rs`) to validate the D-20 batch-abort test
+/// affordance's `abortCode` before the simulator ever sees it.
+pub(crate) const BRIDGE_ERROR_CODES: &[&str] = &[
+    "UNKNOWN_METHOD",
+    "INVALID_PARAMS",
+    "NOT_CONNECTED",
+    "ALREADY_CONNECTED",
+    "DEVICE_NOT_FOUND",
+    "DEVICE_BUSY",
+    "NO_PREVIEW",
+    "UNKNOWN_JOB",
+    "HW_MOTION_NOT_ARMED",
+    "HARDWARE_LANE_BUSY",
+    "EJECT_FAILED",
+    "FEEDER_PARKED",
+    "ADAPTER_UNSUPPORTED",
+    "FINGERPRINT_REFUSED",
+    "MANUAL_REVIEW_REQUIRED",
+    "REFEED_REQUIRED",
+    "FILM_FEED_INTERRUPTED",
+    "ROLL_MISMATCH",
+    "TRANSPORT_SMEAR_DETECTED",
+    "GEOMETRY_VALIDATION_ERROR",
+    "SPLIT_ALIGNMENT_ERROR",
+    "BATCH_INTEGRITY_ERROR",
+    "METER_UNUSABLE",
+    "METER_CONTROLLER_REFUSED",
+    "NOT_IMPLEMENTED",
+    "INTERNAL",
+];
+
 /// Maps a raw bridge error-code wire string onto PROTOCOL.md's closed
 /// `ErrorCode` vocabulary — factored out of `map_bridge_error` (10-08) so
 /// every call site that receives a bridge code as plain text (a
 /// `BridgeCallError::BridgeError`'s own `code`, `scan.error`'s `code`,
 /// `hardware.anomaly`'s `code`) shares exactly one mapping table. Same
 /// "never silently drop, always Internal with the real code in the
-/// message text" policy as `map_bridge_error`'s own doc comment.
-fn map_bridge_error_code_str(code: &str) -> ErrorCode {
+/// message text" policy as `map_bridge_error`'s own doc comment. `pub(crate)`
+/// so `sim.rs`'s D-20 batch-abort test affordance resolves the same bridge
+/// string the real backend would, rather than duplicating this table.
+pub(crate) fn map_bridge_error_code_str(code: &str) -> ErrorCode {
     match code {
+        // D-20/HEAD-12: UNKNOWN_METHOD was flattening to Internal like any
+        // other unrecognized string even though it is one of the bridge's
+        // own vocabulary members (`bridge/src/scanstudio_bridge/
+        // protocol.py`) -- ErrorCode::UnknownMethod already exists on this
+        // side for exactly this condition, it was simply never wired here.
+        "UNKNOWN_METHOD" => ErrorCode::UnknownMethod,
         "INVALID_PARAMS" => ErrorCode::InvalidParams,
         "NOT_CONNECTED" => ErrorCode::NotConnected,
         "ALREADY_CONNECTED" => ErrorCode::AlreadyConnected,
@@ -4922,6 +5030,21 @@ fn map_bridge_error_code_str(code: &str) -> ErrorCode {
         "FEEDER_PARKED" => ErrorCode::FeederParked,
         "METER_CONTROLLER_REFUSED" => ErrorCode::MeterControllerRefused,
         "METER_UNUSABLE" => ErrorCode::MeterUnusable,
+        // D-20/HEAD-12 (1a): the ten bridge codes this plan exists to stop
+        // flattening -- most critically ROLL_MISMATCH, the exact code that
+        // reached the 2026-09-07 batch abort as INTERNAL on 27 frames.
+        "NO_PREVIEW" => ErrorCode::NoPreview,
+        "ADAPTER_UNSUPPORTED" => ErrorCode::AdapterUnsupported,
+        "FINGERPRINT_REFUSED" => ErrorCode::FingerprintRefused,
+        "REFEED_REQUIRED" => ErrorCode::RefeedRequired,
+        "ROLL_MISMATCH" => ErrorCode::RollMismatch,
+        "TRANSPORT_SMEAR_DETECTED" => ErrorCode::TransportSmearDetected,
+        "GEOMETRY_VALIDATION_ERROR" => ErrorCode::GeometryValidationError,
+        "SPLIT_ALIGNMENT_ERROR" => ErrorCode::SplitAlignmentError,
+        "BATCH_INTEGRITY_ERROR" => ErrorCode::BatchIntegrityError,
+        "NOT_IMPLEMENTED" => ErrorCode::NotImplemented,
+        // Final fallback for a genuinely unknown string, and the intended
+        // destination for the literal "INTERNAL" itself.
         _ => ErrorCode::Internal,
     }
 }
@@ -4933,7 +5056,7 @@ fn map_bridge_error_code_str(code: &str) -> ErrorCode {
 /// trust-the-wire-bool policy, so the three async event arms (`scan.error`,
 /// `hardware.anomaly`, `scan.frameFailed`) and the synchronous RPC error
 /// path all share exactly one source of truth.
-fn map_bridge_error_code_recoverable(code: &str) -> bool {
+pub(crate) fn map_bridge_error_code_recoverable(code: &str) -> bool {
     code == "HARDWARE_LANE_BUSY"
 }
 
@@ -5070,6 +5193,8 @@ fn map_status(
             Transport::Idle
         },
         active_job_id: bridge.active_job_id.clone(),
+        device_model: bridge.device_model.clone(),
+        hardware_verification: bridge.hardware_verification,
         motion_armed: Some(bridge.motion_armed),
         film_present: bridge.film_present,
     }
@@ -5579,6 +5704,8 @@ fn build_real_receipt(
         channels: channels_str(recipe.channels).to_string(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         device_id: bridge_receipt.device_id.clone(),
+        device_model: Some(bridge_receipt.device_model.clone()),
+        hardware_verification: bridge_receipt.hardware_verification,
         simulated: false,
         settings_fingerprint: crate::sim::settings_fingerprint(recipe),
         processing: Some(processing.clone()),
@@ -5736,6 +5863,20 @@ fn compute_frame_ordinal(completed: &[u32], failed: &[u32], total_frames: u32) -
     (resolved + 1).min(total_frames.max(1))
 }
 
+/// D-17: a measured `etaSeconds` -- the mean of this job's own completed
+/// frame durations (`durations_ms`, one sample per resolved frame, pushed
+/// by every `emit_frame_progress` call site) times the number of frames
+/// still remaining. `0.0` before the first frame resolves (no samples
+/// yet) or once nothing remains -- never a fabricated estimate, and never
+/// extrapolated from another job's timing.
+fn eta_seconds_from_samples(durations_ms: &[u64], frames_remaining: usize) -> f64 {
+    if durations_ms.is_empty() || frames_remaining == 0 {
+        return 0.0;
+    }
+    let mean_ms = durations_ms.iter().sum::<u64>() as f64 / durations_ms.len() as f64;
+    mean_ms / 1000.0 * frames_remaining as f64
+}
+
 fn reconcile_derivative_failures(
     mut completed: Vec<u32>,
     mut failed: Vec<u32>,
@@ -5760,30 +5901,47 @@ fn reconcile_derivative_failures(
 /// `remaining` is drained into `failed` (mirrors the pre-10-08 inline code
 /// exactly); `completed` is read-only here since a frame already reported
 /// `scan.frameCompleted` must never be re-labeled.
+/// D-20/HEAD-12 (the 2026-09-07 batch abort): whatever is still in
+/// `remaining` when this runs is, by construction, everything the batch
+/// never reached -- the frame that actually raised the failure was already
+/// removed from `remaining` and already recorded in `failed` by whichever
+/// arm attributed it (`scan.frameFailed`, a single-slot `hardware.anomaly`,
+/// ...) before this terminal function is ever called. Emitting `Failed`
+/// with the *same* `error_payload` for all of `remaining` used to claim
+/// every one of those untouched frames raised the identical bridge error
+/// the one attributed frame raised -- dishonest in both directions: the
+/// untouched frames never ran, and only one of them (if any) actually
+/// carries this cause. `NotAttempted` with no error is the honest shape;
+/// `failed` afterward names exactly the frames the scanner actually tried.
 fn emit_terminal_job_failure(
     event_tx: &mpsc::Sender<String>,
     job_id: &str,
     remaining: &mut Vec<u32>,
     completed: &[u32],
     failed: &mut Vec<u32>,
-    error_payload: &ErrorPayload,
+    // Kept for call-site/signature stability even though the new
+    // NotAttempted shape below no longer attaches it to anything: the
+    // frame this error actually describes was already reported by the
+    // caller (scan.frameFailed / a single-slot hardware.anomaly / the
+    // panic-safety net's own synthesized error) before this runs.
+    _error_payload: &ErrorPayload,
     duty_cycle: Option<DutyCycleReport>,
     evidence_package_status: Option<String>,
 ) {
-    for &frame in remaining.iter() {
+    let untouched = std::mem::take(remaining);
+    for &frame in &untouched {
         emit(
             event_tx,
             "scan.frameState",
             FrameStatePayload {
                 job_id: job_id.to_string(),
                 frame_index: frame,
-                state: FrameState::Failed,
+                state: FrameState::NotAttempted,
                 attempt: 1,
-                error: Some(error_payload.clone()),
+                error: None,
             },
         );
     }
-    failed.append(remaining);
     emit(
         event_tx,
         "scan.jobState",
@@ -5801,6 +5959,7 @@ fn emit_terminal_job_failure(
                 completed: completed.to_vec(),
                 failed: failed.clone(),
                 skipped: vec![],
+                not_attempted: untouched,
                 stopped: false,
                 duty_cycle,
                 evidence_package_status,
@@ -7039,7 +7198,11 @@ fn run_real_scan_job_inner(
     // scan.progress, which never comes. `frame_index` names whichever
     // slot is now the newest one in flight (falling back to the
     // most-recently-resolved slot once nothing remains).
-    let emit_frame_progress = |completed: &[u32], failed: &[u32], remaining: &[u32]| {
+    // `durations_ms` is a parameter, not a captured variable, precisely so
+    // this closure need not borrow the enclosing loop's own
+    // `frame_durations_ms` (declared below, alongside `idle_samples`) —
+    // every call site passes its own up-to-date slice explicitly.
+    let emit_frame_progress = |completed: &[u32], failed: &[u32], remaining: &[u32], durations_ms: &[u64]| {
         let frame_index = remaining
             .first()
             .copied()
@@ -7058,12 +7221,15 @@ fn run_real_scan_job_inner(
                 total_passes: recipe.multisample_passes,
                 // The frame this event now names just started (or, at
                 // job end, nothing remains) — never a fabricated
-                // sub-frame fraction. Mirrors eta_seconds' own "honest
-                // unknown" convention elsewhere in this function.
+                // sub-frame fraction.
                 frame_percent: 0.0,
                 job_percent: (completed.len() + failed.len()) as f64 * 100.0
                     / total_frames.max(1) as f64,
-                eta_seconds: 0.0,
+                // D-17: measured from this job's own resolved-frame
+                // durations (mean × frames remaining); 0.0 only before the
+                // first frame resolves, never extrapolated from another
+                // job.
+                eta_seconds: eta_seconds_from_samples(durations_ms, remaining.len()),
             },
         );
     };
@@ -7082,6 +7248,14 @@ fn run_real_scan_job_inner(
     let mut idle_samples: Vec<FrameIdleSample> = Vec::new();
     let mut last_resolved_at: Option<Instant> = None;
     let mut last_progress_slot: Option<u32> = None;
+    // D-17: one duration sample per resolved frame (pushed at each of the
+    // four frame-resolution sites below, immediately before
+    // `last_resolved_at` is reassigned), feeding `eta_seconds_from_samples`.
+    // `job_started_at` stands in for `last_resolved_at` only for the very
+    // first frame, so it contributes a real sample too instead of being
+    // silently skipped.
+    let mut frame_durations_ms: Vec<u64> = Vec::new();
+    let job_started_at = Instant::now();
 
     loop {
         // Never wait past the still-open silence window in one poll — this
@@ -7158,14 +7332,18 @@ fn run_real_scan_job_inner(
                                 total_passes: recipe.multisample_passes,
                                 frame_percent: progress.fraction * 100.0,
                                 // BRIDGE.md's ScanProgress has no per-pass
-                                // or ETA telemetry — pass/total_passes
-                                // echo the request's own recipe rather
-                                // than a real per-pass count, and
-                                // eta_seconds: 0.0 below is an honest
-                                // "unknown", never a fabricated estimate.
+                                // telemetry -- pass/total_passes echo the
+                                // request's own recipe rather than a real
+                                // per-pass count. eta_seconds (D-17) is
+                                // measured from this job's own
+                                // already-resolved frame durations, the
+                                // same as emit_frame_progress computes --
+                                // this event does not itself resolve a
+                                // frame, so it reads the samples gathered
+                                // so far rather than pushing a new one.
                                 job_percent: (completed.len() + failed.len()) as f64 * 100.0
                                     / total_frames.max(1) as f64,
-                                eta_seconds: 0.0,
+                                eta_seconds: eta_seconds_from_samples(&frame_durations_ms, remaining.len()),
                             },
                         );
                     }
@@ -7322,7 +7500,16 @@ fn run_real_scan_job_inner(
                                 derivative_failed.push(frame_completed.slot);
                             }
                             sync_progress(&completed, &failed);
-                            emit_frame_progress(&completed, &failed, &remaining);
+                            // D-17: pushed BEFORE last_resolved_at is
+                            // reassigned below, so this frame's own
+                            // duration is included in the ETA
+                            // emit_frame_progress computes for it.
+                            frame_durations_ms.push(
+                                event_arrived_at
+                                    .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                    .as_millis() as u64,
+                            );
+                            emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                             last_resolved_at = Some(event_arrived_at);
                             continue;
                         }
@@ -7419,6 +7606,8 @@ fn run_real_scan_job_inner(
                                         derivative_geometry.as_ref(),
                                         nikonlook_exposure_10ns_from_receipt(&frame_completed.receipt.exposure),
                                         frame_completed.receipt.dpi,
+                                        frame_completed.receipt.hardware_verification,
+                                        Some(frame_completed.receipt.device_model.as_str()),
                                         authorities,
                                     )
                                     .and_then(|written| {
@@ -7678,7 +7867,16 @@ fn run_real_scan_job_inner(
                             }
                         }
                         sync_progress(&completed, &failed);
-                        emit_frame_progress(&completed, &failed, &remaining);
+                        // D-17: pushed BEFORE last_resolved_at is
+                        // reassigned below, so this frame's own duration
+                        // is included in the ETA emit_frame_progress
+                        // computes for it.
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "hardware.anomaly" => {
@@ -7755,7 +7953,16 @@ fn run_real_scan_job_inner(
                             }
                         }
                         sync_progress(&completed, &failed);
-                        emit_frame_progress(&completed, &failed, &remaining);
+                        // D-17: pushed BEFORE last_resolved_at is
+                        // reassigned below, so this frame's own duration
+                        // is included in the ETA emit_frame_progress
+                        // computes for it.
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.frameFailed" => {
@@ -7814,7 +8021,16 @@ fn run_real_scan_job_inner(
                             }
                         }
                         sync_progress(&completed, &failed);
-                        emit_frame_progress(&completed, &failed, &remaining);
+                        // D-17: pushed BEFORE last_resolved_at is
+                        // reassigned below, so this frame's own duration
+                        // is included in the ETA emit_frame_progress
+                        // computes for it.
+                        frame_durations_ms.push(
+                            event_arrived_at
+                                .saturating_duration_since(last_resolved_at.unwrap_or(job_started_at))
+                                .as_millis() as u64,
+                        );
+                        emit_frame_progress(&completed, &failed, &remaining, &frame_durations_ms);
                         last_resolved_at = Some(event_arrived_at);
                     }
                     "scan.error" => {
@@ -8021,6 +8237,7 @@ fn run_real_scan_job_inner(
                                 summary: ScanSummary {
                                     completed: completed_after_derivatives,
                                     failed: failed_after_derivatives,
+                                    not_attempted: vec![],
                                     // BRIDGE.md's scan.completed summary
                                     // has no "skipped" list at all — a
                                     // requested-but-unattempted slot is
@@ -8141,6 +8358,27 @@ mod tests {
             engine_receipt: json!({"frameIndex": frame_index}),
             attempts_root: None,
         }
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_is_zero_with_no_samples() {
+        assert_eq!(eta_seconds_from_samples(&[], 5), 0.0);
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_one_sample_times_frames_remaining() {
+        assert_eq!(eta_seconds_from_samples(&[10_000], 3), 30.0);
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_averages_mixed_samples() {
+        // mean(10_000, 20_000, 30_000) = 20_000ms = 20s; 2 remaining -> 40.0
+        assert_eq!(eta_seconds_from_samples(&[10_000, 20_000, 30_000], 2), 40.0);
+    }
+
+    #[test]
+    fn eta_seconds_from_samples_is_zero_when_nothing_remains() {
+        assert_eq!(eta_seconds_from_samples(&[10_000], 0), 0.0);
     }
 
     /// `SCANSTUDIO_EJECT_DEADLINE_SECS` is the operator's escape hatch for
@@ -9041,6 +9279,8 @@ mod tests {
             motion_armed: false,
             film_present: Some(true),
             adapter: Some("Mount".to_string()),
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
         let heuristic_holder = derive_detected_holder(&capabilities(Some(40), true));
         let status = map_status(&bridge_status, heuristic_holder);
@@ -9063,6 +9303,8 @@ mod tests {
             motion_armed: false,
             film_present: None,
             adapter: Some("Feeder".to_string()),
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
         let status = map_status(&bridge_status, None);
         assert_eq!(status.adapter.as_deref(), Some("Feeder"));
@@ -9099,6 +9341,8 @@ mod tests {
             motion_armed: false,
             film_present: Some(true),
             adapter: None,
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
         let holder = derive_detected_holder(&capabilities(Some(40), true));
         let status = map_status(&bridge_status, holder);
@@ -9150,6 +9394,8 @@ mod tests {
             motion_armed: true,
             film_present: None,
             adapter: None,
+            device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+            hardware_verification: Some(domain::HardwareVerification::Verified),
         };
 
         let status = map_status(&bridge_status, None);
@@ -9225,6 +9471,8 @@ mod tests {
                     motion_armed: false,
                     film_present: Some(true),
                     adapter: None,
+                    device_model: Some("SUPER COOLSCAN 5000 ED".to_string()),
+                    hardware_verification: Some(domain::HardwareVerification::Verified),
                 },
                 derive_detected_holder(&capabilities(capacity, frame_control)),
             );
@@ -9315,6 +9563,37 @@ mod tests {
                 "{code} must not be recoverable"
             );
         }
+    }
+
+    /// D-20/HEAD-12 (1a): the full bridge `ErrorCode` vocabulary
+    /// (`bridge/src/scanstudio_bridge/protocol.py:24-51`), read verbatim as
+    /// wire string literals. Asserts none of them maps to
+    /// `ErrorCode::Internal` except the literal `"INTERNAL"` itself, so a
+    /// future bridge code addition is caught here rather than on a roll
+    /// (the exact 2026-09-07 failure mode: `ROLL_MISMATCH` flattened to
+    /// `INTERNAL` on 27 frames).
+    #[test]
+    fn map_bridge_error_code_never_flattens_a_known_bridge_code_to_internal() {
+        for code in BRIDGE_ERROR_CODES {
+            let mapped = map_bridge_error_code_str(code);
+            if *code == "INTERNAL" {
+                assert_eq!(mapped, ErrorCode::Internal, "INTERNAL must map to Internal");
+            } else {
+                assert_ne!(
+                    mapped,
+                    ErrorCode::Internal,
+                    "bridge code {code} must not flatten to Internal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn map_bridge_error_code_roll_mismatch_is_typed_not_internal() {
+        assert_eq!(
+            map_bridge_error_code_str("ROLL_MISMATCH"),
+            ErrorCode::RollMismatch
+        );
     }
 
     #[test]
@@ -9561,6 +9840,94 @@ mod tests {
         assert_ne!(first_bridge_path, second_bridge_path);
     }
 
+    /// D-20/HEAD-12 (1b, the 2026-09-07 batch abort): frames 1-3 complete,
+    /// frame 4 raises `scan.frameFailed` `ROLL_MISMATCH` (the
+    /// `scan.frameFailed` arm's own real shape -- removes 4 from
+    /// `remaining`, appends it to `failed`), then the batch's terminal
+    /// closure runs with frames 5-8 still in `remaining`. Asserts frame 4
+    /// alone is `Failed` with the bridge's own code, frames 5-8 are
+    /// `NotAttempted` with no error, `summary.failed == [4]`, and
+    /// `summary.notAttempted == [5, 6, 7, 8]` -- never the reverse.
+    #[test]
+    fn emit_terminal_job_failure_marks_untouched_frames_not_attempted_not_failed() {
+        let (event_tx, event_rx) = mpsc::channel::<String>();
+        let job_id = "batch-abort-test-job".to_string();
+        let completed = vec![1u32, 2, 3];
+        // Mirrors the "scan.frameFailed" arm's own bookkeeping: frame 4
+        // already removed from `remaining` and already pushed onto
+        // `failed` before the terminal arm ever runs.
+        let mut remaining: Vec<u32> = vec![5, 6, 7, 8];
+        let mut failed: Vec<u32> = vec![4];
+        let error = EngineError::new(
+            ErrorCode::RollMismatch,
+            "bridge scan.frameFailed (ROLL_MISMATCH): meter pass 2 controller refused: low_correlation",
+        )
+        .with_recoverable(map_bridge_error_code_recoverable("ROLL_MISMATCH"));
+        let error_payload = ErrorPayload::from(&error);
+
+        emit_terminal_job_failure(
+            &event_tx,
+            &job_id,
+            &mut remaining,
+            &completed,
+            &mut failed,
+            &error_payload,
+            None,
+            None,
+        );
+        drop(event_tx);
+
+        let events: Vec<Value> = event_rx
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("valid JSON"))
+            .collect();
+
+        for frame in [5u32, 6, 7, 8] {
+            let event = events
+                .iter()
+                .find(|event| {
+                    event["event"] == "scan.frameState"
+                        && event["payload"]["frameIndex"] == json!(frame)
+                })
+                .unwrap_or_else(|| panic!("expected a scan.frameState event for frame {frame}"));
+            assert_eq!(
+                event["payload"]["state"],
+                json!("notAttempted"),
+                "frame {frame} must be notAttempted, not failed"
+            );
+            assert!(
+                event["payload"]["error"].is_null(),
+                "a notAttempted frame must carry no error, got {:?}",
+                event["payload"]["error"]
+            );
+        }
+        // Frame 4 itself is never re-emitted by emit_terminal_job_failure
+        // -- it was already reported Failed by the scan.frameFailed arm,
+        // which ran before this function was ever called.
+        assert!(
+            !events.iter().any(|event| event["event"] == "scan.frameState"
+                && event["payload"]["frameIndex"] == json!(4)),
+            "emit_terminal_job_failure must not re-emit a frame the scan.frameFailed arm already reported"
+        );
+
+        let completed_event = events
+            .iter()
+            .find(|event| event["event"] == "scan.completed")
+            .expect("expected scan.completed");
+        let summary = &completed_event["payload"]["summary"];
+        assert_eq!(summary["completed"], json!([1, 2, 3]));
+        assert_eq!(
+            summary["failed"],
+            json!([4]),
+            "failed must name exactly the frame the scanner actually tried"
+        );
+        assert_eq!(
+            summary["notAttempted"],
+            json!([5, 6, 7, 8]),
+            "notAttempted must name exactly the frames the batch never reached"
+        );
+    }
+
     /// 11-01: directly exercises the same panic-safety pattern the worker
     /// thread uses — a caught panic must still emit an honest terminal
     /// `scan.jobState{Failed}` + `scan.completed` reflecting the progress
@@ -9613,13 +9980,25 @@ mod tests {
             .map(|line| serde_json::from_str(&line).expect("valid JSON"))
             .collect();
 
-        let frame_state_failed = events
+        // D-20/HEAD-12: frame 2's own outcome when the worker panicked is
+        // unknown (it may have been mid-attempt) -- emit_terminal_job_failure
+        // now reports every slot still in `remaining` as notAttempted, never
+        // a fabricated `failed` sharing the panic's own Internal error. This
+        // is at least as honest as the old behavior: "reported failed with a
+        // message admitting the outcome is unknown" was already an
+        // approximation, and "reported not attempted" no longer invents a
+        // false attribution for a slot that was never confirmed to have run.
+        let frame_state_not_attempted = events
             .iter()
             .find(|event| {
-                event["event"] == "scan.frameState" && event["payload"]["state"] == "failed"
+                event["event"] == "scan.frameState" && event["payload"]["state"] == "notAttempted"
             })
-            .expect("expected scan.frameState(failed) for the unknown slot");
-        assert_eq!(frame_state_failed["payload"]["frameIndex"], json!(2));
+            .expect("expected scan.frameState(notAttempted) for the unknown slot");
+        assert_eq!(frame_state_not_attempted["payload"]["frameIndex"], json!(2));
+        assert!(
+            frame_state_not_attempted["payload"]["error"].is_null(),
+            "a notAttempted frame must carry no error"
+        );
 
         let job_state_failed = events
             .iter()
@@ -9640,7 +10019,11 @@ mod tests {
             completed_event["payload"]["summary"]["completed"],
             json!([1])
         );
-        assert_eq!(completed_event["payload"]["summary"]["failed"], json!([2]));
+        assert_eq!(completed_event["payload"]["summary"]["failed"], json!([]));
+        assert_eq!(
+            completed_event["payload"]["summary"]["notAttempted"],
+            json!([2])
+        );
     }
 
     #[test]

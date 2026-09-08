@@ -178,6 +178,25 @@ public struct EventEnvelope<Payload: Decodable>: Decodable {
     public let payload: Payload
 }
 
+/// The `Encodable` direction of the same `{"event": .., "payload": ..}`
+/// shape -- used only for `EngineClient`'s own synthetic events (D-24/
+/// HEAD-12's `engine.request.timeout`), which it constructs itself rather
+/// than receiving over a wire.
+struct EncodableEventEnvelope<Payload: Encodable>: Encodable {
+    let event: String
+    let payload: Payload
+}
+
+/// D-24/HEAD-12 (CF-14): `EngineClient.timeoutRequest`'s own synthetic
+/// event payload -- the method name, request id, and elapsed seconds only,
+/// never this request's own `params` (T-03-52: a project path or
+/// caller-supplied directory could be in scope there).
+struct EngineRequestTimeoutPayload: Codable, Sendable {
+    let method: String
+    let id: UInt64
+    let elapsedSeconds: Double
+}
+
 /// Typed error thrown out of `EngineClient.request` for both engine-reported
 /// errors (`{"id", "error": {...}}`) and local failures (e.g. the engine
 /// process exiting unexpectedly).
@@ -289,6 +308,36 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
     /// change required. Never encoded by this app (`DeviceInfo` is only
     /// ever decoded, never constructed here to send outbound).
     public let supportedMultisamplePasses: [Int]?
+    public let unverifiedAllowed: Bool
+    public let hardwareVerification: String?
+
+    public init(
+        deviceId: String, model: String, kind: String, firmware: String,
+        connection: String, supported: Bool, supportedMultisamplePasses: [Int]? = nil,
+        unverifiedAllowed: Bool = false, hardwareVerification: String? = nil
+    ) {
+        self.deviceId = deviceId; self.model = model; self.kind = kind
+        self.firmware = firmware; self.connection = connection; self.supported = supported
+        self.supportedMultisamplePasses = supportedMultisamplePasses
+        self.unverifiedAllowed = unverifiedAllowed; self.hardwareVerification = hardwareVerification
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case deviceId, model, kind, firmware, connection, supported, supportedMultisamplePasses
+        case unverifiedAllowed, hardwareVerification
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        deviceId = try c.decode(String.self, forKey: .deviceId)
+        model = try c.decode(String.self, forKey: .model)
+        kind = try c.decode(String.self, forKey: .kind)
+        firmware = try c.decode(String.self, forKey: .firmware)
+        connection = try c.decode(String.self, forKey: .connection)
+        supported = try c.decode(Bool.self, forKey: .supported)
+        supportedMultisamplePasses = try c.decodeIfPresent([Int].self, forKey: .supportedMultisamplePasses)
+        unverifiedAllowed = try c.decodeIfPresent(Bool.self, forKey: .unverifiedAllowed) ?? false
+        hardwareVerification = try c.decodeIfPresent(String.self, forKey: .hardwareVerification)
+    }
 }
 
 // MARK: - scanner.connect
@@ -296,10 +345,20 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
 public struct ConnectOptions: Codable, Equatable, Sendable {
     public let timeScale: Double
     public let faultInjection: String
+    public let allowUnverifiedHardware: Bool
 
-    public init(timeScale: Double, faultInjection: String) {
+    public init(timeScale: Double, faultInjection: String, allowUnverifiedHardware: Bool = false) {
         self.timeScale = timeScale
         self.faultInjection = faultInjection
+        self.allowUnverifiedHardware = allowUnverifiedHardware
+    }
+
+    private enum CodingKeys: String, CodingKey { case timeScale, faultInjection, allowUnverifiedHardware }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        timeScale = try c.decode(Double.self, forKey: .timeScale)
+        faultInjection = try c.decode(String.self, forKey: .faultInjection)
+        allowUnverifiedHardware = try c.decodeIfPresent(Bool.self, forKey: .allowUnverifiedHardware) ?? false
     }
 }
 
@@ -336,6 +395,8 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
     /// readiness check. Optional keeps older engine/status payloads
     /// decodable; `nil` means unknown/not checked, never ready.
     public let motionArmed: Bool?
+    public let hardwareVerification: String?
+    public let deviceModel: String?
 
     public init(
         connected: Bool,
@@ -347,7 +408,9 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
         transport: String,
         activeJobId: String?,
         filmPresent: Bool? = nil,
-        motionArmed: Bool? = nil
+        motionArmed: Bool? = nil,
+        hardwareVerification: String? = nil,
+        deviceModel: String? = nil
     ) {
         self.connected = connected
         self.adapter = adapter
@@ -359,6 +422,8 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
         self.activeJobId = activeJobId
         self.filmPresent = filmPresent
         self.motionArmed = motionArmed
+        self.hardwareVerification = hardwareVerification
+        self.deviceModel = deviceModel
     }
 
     /// Reconciles a legacy/stale preview flag with the stronger live sensor
@@ -376,7 +441,9 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
             transport: transport,
             activeJobId: activeJobId,
             filmPresent: false,
-            motionArmed: motionArmed
+            motionArmed: motionArmed,
+            hardwareVerification: hardwareVerification,
+            deviceModel: deviceModel
         )
     }
 }
@@ -384,15 +451,50 @@ public struct ScannerStatus: Codable, Equatable, Sendable {
 public struct ConnectResult: Decodable, Sendable {
     public let device: DeviceInfo
     public let status: ScannerStatus
+    /// D-16: `true` only when the engine's same-device short circuit
+    /// answered a re-issued connect without calling either backend's own
+    /// `connect` -- device/status are then read from the already-active
+    /// backend, never a fresh bridge round trip. A custom `init(from:)`
+    /// defaults this to `false` so an older engine's payload (which never
+    /// sent this key) still decodes.
+    public let alreadyConnected: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case device, status, alreadyConnected
+    }
+
+    /// A default of `false` (not a second, forced-unwrap-avoiding branch)
+    /// keeps every existing two-argument `ConnectResult(device:status:)`
+    /// call site in this test suite compiling unchanged -- adding
+    /// `init(from:)` below suppresses Swift's synthesized memberwise init,
+    /// so this explicit one takes its place.
+    public init(device: DeviceInfo, status: ScannerStatus, alreadyConnected: Bool = false) {
+        self.device = device
+        self.status = status
+        self.alreadyConnected = alreadyConnected
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        device = try container.decode(DeviceInfo.self, forKey: .device)
+        status = try container.decode(ScannerStatus.self, forKey: .status)
+        alreadyConnected = try container.decodeIfPresent(Bool.self, forKey: .alreadyConnected) ?? false
+    }
 }
 
 // MARK: - sim.loadMedia
 
 public struct LoadMediaParams: Codable, Sendable {
     public let carrier: String
+    public let previewFixture: String?
+    public let abortAtFrame: Int?
+    public let abortCode: String?
 
-    public init(carrier: String) {
+    public init(carrier: String, previewFixture: String? = nil, abortAtFrame: Int? = nil, abortCode: String? = nil) {
         self.carrier = carrier
+        self.previewFixture = previewFixture
+        self.abortAtFrame = abortAtFrame
+        self.abortCode = abortCode
     }
 }
 
@@ -1081,6 +1183,9 @@ public enum FrameState: String, Codable, Equatable, Sendable {
     case completed
     case failed
     case skipped
+    /// D-20/HEAD-12: the batch never reached this frame. Reachable only
+    /// from `waiting` (`SessionEventPolicy.allowsFrameTransition`).
+    case notAttempted
 }
 
 // MARK: - ScanReceipt
@@ -1194,6 +1299,26 @@ public struct ScanReceipt: Codable, Equatable, Identifiable, Sendable {
     public let irPath: String?
     public let meterRgbiPath: String?
     public let hardwareTelemetry: HardwareTelemetry?
+    public let deviceModel: String?
+    public let hardwareVerification: String?
+
+    public init(
+        jobId: String, frameIndex: Int, startedAt: String, durationMs: Int, passes: Int,
+        resolutionDpi: Int, bitDepth: Int, channels: String, engineVersion: String,
+        deviceId: String, simulated: Bool, settingsFingerprint: String,
+        processing: ProcessingRecipe?, output: OutputRecipe?, outputs: WrittenOutputs?,
+        rgbPath: String?, irPath: String?, meterRgbiPath: String?, hardwareTelemetry: HardwareTelemetry?,
+        deviceModel: String? = nil, hardwareVerification: String? = nil
+    ) {
+        self.jobId = jobId; self.frameIndex = frameIndex; self.startedAt = startedAt
+        self.durationMs = durationMs; self.passes = passes; self.resolutionDpi = resolutionDpi
+        self.bitDepth = bitDepth; self.channels = channels; self.engineVersion = engineVersion
+        self.deviceId = deviceId; self.simulated = simulated; self.settingsFingerprint = settingsFingerprint
+        self.processing = processing; self.output = output; self.outputs = outputs
+        self.rgbPath = rgbPath; self.irPath = irPath; self.meterRgbiPath = meterRgbiPath
+        self.hardwareTelemetry = hardwareTelemetry; self.deviceModel = deviceModel
+        self.hardwareVerification = hardwareVerification
+    }
 
     public var id: String { "\(jobId)#\(frameIndex)@\(startedAt)" }
 }
@@ -1487,19 +1612,26 @@ public struct ProjectCreateParams: Codable, Sendable {
     // entirely (matching `AcquireThumbnailsParams.frames`'s established
     // omit-on-nil behavior), rather than encoding a literal JSON `null`.
     public let directory: String?
+    /// D-21/HEAD-12: 1-based frame indices to create excluded --
+    /// `SessionModel.createProject`'s own previewed-indices-minus-
+    /// selection computation, sent once at create time. `nil` omits the
+    /// key, creating every frame unexcluded (today's behavior unchanged).
+    public let excludedFrames: [Int]?
 
     public init(
         name: String,
         carrier: SimulatedFilmCarrier,
         frameCount: Int,
         filmProcess: FilmProcess,
-        directory: String? = nil
+        directory: String? = nil,
+        excludedFrames: [Int]? = nil
     ) {
         self.name = name
         self.carrier = carrier
         self.frameCount = frameCount
         self.filmProcess = filmProcess
         self.directory = directory
+        self.excludedFrames = excludedFrames
     }
 }
 
@@ -1872,21 +2004,43 @@ public struct ScanSummary: Decodable, Equatable, Sendable {
     public let completed: [Int]
     public let failed: [Int]
     public let skipped: [Int]
+    /// D-20/HEAD-12: frames the batch never reached -- distinct from
+    /// `failed`, which names only the frame(s) the engine actually
+    /// attributed a typed failure to. A custom `init(from:)` defaults this
+    /// to `[]` so an older engine's summary (which never sent this key)
+    /// still decodes.
+    public let notAttempted: [Int]
     public let stopped: Bool
     public let evidencePackageStatus: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case completed, failed, skipped, notAttempted, stopped, evidencePackageStatus
+    }
 
     public init(
         completed: [Int],
         failed: [Int],
         skipped: [Int],
+        notAttempted: [Int] = [],
         stopped: Bool,
         evidencePackageStatus: String? = nil
     ) {
         self.completed = completed
         self.failed = failed
         self.skipped = skipped
+        self.notAttempted = notAttempted
         self.stopped = stopped
         self.evidencePackageStatus = evidencePackageStatus
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        completed = try container.decode([Int].self, forKey: .completed)
+        failed = try container.decode([Int].self, forKey: .failed)
+        skipped = try container.decode([Int].self, forKey: .skipped)
+        notAttempted = try container.decodeIfPresent([Int].self, forKey: .notAttempted) ?? []
+        stopped = try container.decode(Bool.self, forKey: .stopped)
+        evidencePackageStatus = try container.decodeIfPresent(String.self, forKey: .evidencePackageStatus)
     }
 }
 

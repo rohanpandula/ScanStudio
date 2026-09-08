@@ -30,6 +30,7 @@ from scanstudio_bridge.transport.output_reservation import (
 )
 
 _DEVICE_ID = "mock-ls5000-0"
+_UNVERIFIED_DEVICE_ID = "mock-ls50-0"
 _SYNTHETIC_FRAME_SIDE = 64
 _SYNTHETIC_PREVIEW_HEIGHT = 48
 _SYNTHETIC_PREVIEW_WIDTH = 64
@@ -101,6 +102,7 @@ def _synthetic_receipt(
     meter_rgbi_path: str | None,
     raw_export_path: str | None,
     raw_export_ir_path: str | None,
+    device: domain.DeviceInfo,
 ) -> domain.ScanReceipt:
     return domain.ScanReceipt(
         version=1,
@@ -108,8 +110,8 @@ def _synthetic_receipt(
         spacing_offset=spacing_offset,
         dpi=recipe.resolution_dpi,
         depth=recipe.bit_depth,
-        device_id=_DEVICE_ID,
-        device_model="SUPER COOLSCAN 5000 ED (mock)",
+        device_id=device.device_id,
+        device_model=device.model,
         reviewed_fingerprint_sha256="0" * 64,
         fresh_fingerprint_sha256="0" * 64,
         manual_approval=None,
@@ -153,6 +155,7 @@ def _synthetic_receipt(
         attempts_root=None,
         raw_export_path=raw_export_path,
         raw_export_ir_path=raw_export_ir_path,
+        hardware_verification=device.hardware_verification,
     )
 
 
@@ -203,13 +206,22 @@ class MockTransport:
     # -- device lifecycle -----------------------------------------------------
 
     def list_devices(self) -> list[domain.DeviceInfo]:
-        return [self._device_info()]
+        return [self._device_info(), self._device_info(_UNVERIFIED_DEVICE_ID)]
 
-    def open_device(self, device_id: str) -> domain.DeviceInfo:
+    def open_device(
+        self, device_id: str, *, allow_unverified_hardware: bool = False
+    ) -> domain.DeviceInfo:
         if self._connected:
             raise BridgeError(ErrorCode.ALREADY_CONNECTED, "a device is already open")
-        if device_id != _DEVICE_ID:
+        if device_id not in {_DEVICE_ID, _UNVERIFIED_DEVICE_ID}:
             raise BridgeError(ErrorCode.DEVICE_NOT_FOUND, f"no such device: {device_id!r}")
+        if device_id == _UNVERIFIED_DEVICE_ID and not allow_unverified_hardware:
+            raise BridgeError(
+                ErrorCode.DEVICE_NOT_FOUND,
+                'LS-50 ED is recognized but not supported; only the LS-5000 is supported. '
+                'Turn on "Allow unverified scanners" (or pass '
+                "--allow-unverified-hardware) to open it anyway; every output will be tagged unverified.",
+            )
         self._connected = True
         self._device_id = device_id
         self._preview_established = False
@@ -218,7 +230,7 @@ class MockTransport:
         self._needs_approval_slots.clear()
         self._spacing_offsets.clear()
         self._fingerprint = None
-        return self._device_info()
+        return self._device_info(device_id)
 
     def status(self) -> domain.DeviceStatus:
         self._require_connected()
@@ -237,6 +249,10 @@ class MockTransport:
             # The mock simulates the SA-30 strip feeder the real traces
             # were captured behind.
             adapter="36Strip",
+            device_model=self._device_info(self._device_id).model,
+            hardware_verification=self._device_info(
+                self._device_id
+            ).hardware_verification,
         )
 
     def close_device(self) -> None:
@@ -682,7 +698,7 @@ class MockTransport:
                     rgb=rgb_frame,
                     ir=ir_frame,
                     dpi=recipe.resolution_dpi,
-                    device_model="SUPER COOLSCAN 5000 ED (mock)",
+                    device_model=self._device_info(self._device_id).model,
                 ),
             )
             raw_export_path_str = str(raw_export_path)
@@ -708,6 +724,7 @@ class MockTransport:
             meter_rgbi_path=meter_rgbi_path_str,
             raw_export_path=raw_export_path_str,
             raw_export_ir_path=raw_export_ir_path_str,
+            device=self._device_info(self._device_id),
         )
         on_frame(slot, receipt)
 
@@ -726,11 +743,12 @@ class MockTransport:
 
     # -- internals ------------------------------------------------------------
 
-    def _device_info(self) -> domain.DeviceInfo:
+    def _device_info(self, device_id: str = _DEVICE_ID) -> domain.DeviceInfo:
+        unverified = device_id == _UNVERIFIED_DEVICE_ID
         return domain.DeviceInfo(
-            device_id=_DEVICE_ID,
+            device_id=device_id,
             vendor="Nikon",
-            model="SUPER COOLSCAN 5000 ED (mock)",
+            model="LS-50 ED" if unverified else "SUPER COOLSCAN 5000 ED (mock)",
             capabilities=domain.Capabilities(
                 ir_channel=True,
                 supported_dpi=(4000,),
@@ -745,6 +763,13 @@ class MockTransport:
                 # wired recipe's multisample_passes, not a second hardcoded
                 # "4" (see coolscanpy_transport.py's identical comment).
                 supported_multisample_passes=(domain.FIXED_COLOR_NEGATIVE_RECIPE.multisample_passes,),
+            ),
+            supported=not unverified,
+            unverified_allowed=unverified,
+            hardware_verification=(
+                domain.HardwareVerification.UNVERIFIED
+                if unverified
+                else domain.HardwareVerification.VERIFIED
             ),
         )
 

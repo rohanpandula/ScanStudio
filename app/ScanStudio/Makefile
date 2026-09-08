@@ -58,6 +58,10 @@ dmg: package
 # state raw-value mapping).
 test: check-tools
 	cd engine && $(CARGO) test
+	# `swift test` alone does not build executable products that no test
+	# target depends on; process-level CLI tests exec .build/debug/scanstudio-cli
+	# directly, so it must be built explicitly here.
+	$(SWIFT) build --product scanstudio-cli
 	$(SWIFT) test
 
 run: engine

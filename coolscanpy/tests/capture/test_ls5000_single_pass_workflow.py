@@ -35,6 +35,10 @@ from coolscanpy.protocol.ls5000_single_pass.streaming_sidecar import (
     STREAM_RECEIPT_SUFFIX,
     STREAM_RECEIPT_VERSION,
 )
+from coolscanpy.protocol.ls5000_single_pass.packed import (
+    SINGLE_SAMPLE_RECORD_BYTES,
+    WIDTH,
+)
 from coolscanpy.receipts.quality import (
     FocusDetailTelemetry,
     ScanClippingTelemetry,
@@ -332,6 +336,62 @@ def test_finalizes_explicit_tail_slot_without_treating_roll_count_as_a_gate(
     assert smear_qc["coordinate_space"] == "scanner-native RGB before storage rotation"
     assert smear_qc["required_verdict"] == "clean"
     assert smear_qc["assessment"]["verdict"] == "clean"
+
+
+def test_single_sample_finalization_uses_real_strict_decoder(tmp_path: Path) -> None:
+    attempt, stream = _attempt(tmp_path)
+    record = np.zeros(SINGLE_SAMPLE_RECORD_BYTES // 2, dtype=np.uint16)
+    padding = record[63_136 // 2 : 63_488 // 2]
+    padding[0::2] = 0xAA55
+    padding[1::2] = (
+        0xE7FD + np.arange(padding.size // 2, dtype=np.uint32)
+    ) & 0xFFFF
+    payload = record.astype(">u2").tobytes()
+    stream.write_bytes(payload)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal.update(
+        expected_reads=1,
+        completed_reads=1,
+        expected_bytes=len(payload),
+        completed_bytes=len(payload),
+        disk_bytes=len(payload),
+        output_sha256=_sha256(payload),
+    )
+    for key in ("fine_set_windows_preflight", "fine_windows"):
+        for window in journal[key]:
+            window["size"] = [WIDTH, 2]
+            window["samples"] = 1
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    contract = PackedCaptureContract(
+        records=1,
+        record_bytes=SINGLE_SAMPLE_RECORD_BYTES,
+        width=WIDTH,
+        height=2,
+        samples_per_scan=1,
+    )
+    workflow = LS5000SinglePassWorkflow(
+        contract=contract,
+        smear_assessor=lambda _rgb, *, dpi: _smear_assessment(),
+        clipping_measurer=lambda _rgb: ScanClippingTelemetry(
+            fractions=(0.0, 0.0, 0.0),
+            clip_level=0.99,
+            warning_fraction=0.01,
+            warning=False,
+        ),
+        focus_measurer=lambda _rgb: FocusDetailTelemetry(
+            method="normalized-gradient-v1",
+            verdict="measured",
+            score=0.0,
+            texture_span=0.0,
+        ),
+    )
+
+    completed = workflow.finalize_attempt(attempt, delete_scratch=False)
+
+    layout = completed.manifest["decode_layout"]
+    assert layout["padding_validated_records"] == 1
+    assert layout["rgb_samples_decoded"] == 1
+    assert completed.manifest["record_geometry"]["samples_per_scan"] == 1
 
 
 def test_finalization_records_capture_clipping_and_focus_telemetry(

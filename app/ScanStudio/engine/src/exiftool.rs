@@ -6740,6 +6740,8 @@ mod tests {
             channels: "rgb".into(),
             engine_version: "test".into(),
             device_id: "test".into(),
+            device_model: None,
+            hardware_verification: crate::domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "0000000000000000".into(),
             processing: None,

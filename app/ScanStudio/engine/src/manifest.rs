@@ -787,6 +787,33 @@ pub fn create_project(
     film_process: FilmProcess,
     directory_override: Option<&Path>,
 ) -> Result<(ScanProject, PathBuf), EngineError> {
+    create_project_with_excluded_frames(
+        name,
+        carrier,
+        frame_count,
+        film_process,
+        directory_override,
+        &[],
+    )
+}
+
+/// D-21/HEAD-12 (the 2026-09-07 batch abort): identical to `create_project`,
+/// except each frame's `excluded` flag is set from `excluded_frames` (a
+/// 1-based index set) at creation time -- the manifest is correct the
+/// moment it is first written, with no window in which the project
+/// disagrees with the operator's pre-project selection, and no second
+/// write. Range and at-least-one-unexcluded validation is the
+/// `project.create` dispatch arm's job (`server.rs`); this function trusts
+/// its caller and only sets the flag. An empty slice leaves every frame
+/// unexcluded, exactly like `create_project`.
+pub fn create_project_with_excluded_frames(
+    name: &str,
+    carrier: MediaCarrier,
+    frame_count: u32,
+    film_process: FilmProcess,
+    directory_override: Option<&Path>,
+    excluded_frames: &[u32],
+) -> Result<(ScanProject, PathBuf), EngineError> {
     validate_frame_count(carrier, frame_count)?;
 
     // One id, reused verbatim (including its "proj-" prefix) as the
@@ -806,7 +833,7 @@ pub fn create_project(
     let frames = (1..=frame_count)
         .map(|index| ProjectFrame {
             index,
-            excluded: false,
+            excluded: excluded_frames.contains(&index),
             capture_override: None,
             processing_override: None,
             output_override: None,
@@ -1570,6 +1597,57 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
+    /// D-21/HEAD-12 (1c, the 2026-09-07 batch abort): `roll.save` persists
+    /// the pre-project selection as exclusions at creation time, not a
+    /// post-create exclusion loop. Asserts the created manifest's
+    /// `excluded` flags match the request exactly and that `pending_frames`
+    /// omits those indices -- no window in which the two disagree.
+    #[test]
+    fn create_project_with_excluded_frames_sets_excluded_flags_and_pending_frames_omits_them() {
+        let dir = temp_project_dir();
+        let (project, _dir) = create_project_with_excluded_frames(
+            "Roll With Exclusions",
+            MediaCarrier::Roll36,
+            10,
+            FilmProcess::C41ColorNegative,
+            Some(&dir),
+            &[8, 9, 10],
+        )
+        .expect("create_project_with_excluded_frames should succeed");
+
+        for frame in &project.frames {
+            let expected_excluded = [8, 9, 10].contains(&frame.index);
+            assert_eq!(
+                frame.excluded, expected_excluded,
+                "frame {} excluded flag mismatch",
+                frame.index
+            );
+        }
+        assert_eq!(pending_frames(&project), vec![1, 2, 3, 4, 5, 6, 7]);
+
+        cleanup(&dir);
+    }
+
+    /// An empty (or omitted) exclusion set must leave `create_project`'s
+    /// own historical behavior byte-for-byte -- every frame unexcluded.
+    #[test]
+    fn create_project_with_excluded_frames_empty_set_excludes_nothing() {
+        let dir = temp_project_dir();
+        let (project, _dir) = create_project_with_excluded_frames(
+            "Roll With No Exclusions",
+            MediaCarrier::Roll36,
+            4,
+            FilmProcess::Positive,
+            Some(&dir),
+            &[],
+        )
+        .expect("create_project_with_excluded_frames should succeed");
+
+        assert!(project.frames.iter().all(|f| !f.excluded));
+
+        cleanup(&dir);
+    }
+
     /// Defect 8 (2026-07-25): a live 2-frame/361MB batch landed in the
     /// OS temporary directory
     /// because `create_project` used to build recipes via a
@@ -1717,6 +1795,8 @@ mod tests {
                 channels: "rgbi".into(),
                 engine_version: "test".into(),
                 device_id: "sim".into(),
+                device_model: None,
+                hardware_verification: crate::domain::HardwareVerification::Verified,
                 simulated: true,
                 settings_fingerprint: "fingerprint".into(),
                 processing: None,
@@ -1996,6 +2076,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: crate::domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -2508,6 +2590,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: crate::domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,

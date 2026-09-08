@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::domain::{self, EngineError, ScannerBackend};
 use crate::protocol::{self, ErrorCode, ErrorPayload, Request};
 use crate::real_backend::RealLs5000;
-use crate::sim::SimulatedLs5000;
+use crate::sim::{PreviewFixture, SimulatedLs5000};
 
 /// Default request timeout for the real backend's `BridgeClient`, applied
 /// whenever `SCANSTUDIO_BRIDGE_CMD` is configured (`Backends::from_env` is
@@ -262,15 +262,15 @@ impl Backends {
         self.list_devices()
     }
 
-    /// `scanner.list`: the simulator always, plus the real device only if
+    /// `scanner.list`: the simulator always, plus real devices only if
     /// `SCANSTUDIO_BRIDGE_CMD` was configured and started successfully.
     fn list_devices(&self) -> Result<Vec<domain::DeviceInfo>, EngineError> {
         if let Some(error) = &self.startup_error {
             return Err(error.clone());
         }
-        let mut v = vec![self.sim.device_info()];
+        let mut v = self.sim.device_infos();
         if let Some(real) = &self.real {
-            v.push(real.device_info());
+            v.extend(real.device_infos());
         }
         Ok(v)
     }
@@ -285,30 +285,60 @@ impl Backends {
     /// backend without an intervening `scanner.disconnect` (T-09-12) —
     /// closing the state-confusion risk of one engine session appearing
     /// simultaneously "connected" to both sim and real.
+    ///
+    /// D-16: a same-device reconnect is idempotent. It returns the current
+    /// `device_info()`/`status()` from the already-active backend with
+    /// `already_connected: true`, **without calling either backend's own
+    /// `connect`** -- the safety property this exists for: a re-issued
+    /// connect performs no bridge round trip, so it can never re-arm,
+    /// re-open, or move anything, and no `ConnectOptions` (including
+    /// `faultInjection`/`timeScale`) is ever re-applied to an
+    /// already-open session. A *different* device id while one is active
+    /// still refuses `AlreadyConnected`, unchanged from before this plan.
     fn connect(
         &mut self,
         device_id: &str,
         options: &protocol::ConnectOptions,
     ) -> Result<protocol::ConnectResult, EngineError> {
         if let Some(active) = self.active {
-            let active_device_id = match active {
-                ActiveDevice::Sim => self.sim.device_info().device_id,
-                ActiveDevice::Real => self.real.as_ref().unwrap().device_info().device_id,
+            let active_device = match active {
+                ActiveDevice::Sim => self.sim.device_info(),
+                ActiveDevice::Real => self.real.as_ref().unwrap().device_info(),
             };
-            if device_id != active_device_id {
+            if device_id != active_device.device_id {
                 return Err(EngineError::new(
                     ErrorCode::AlreadyConnected,
                     "another device is already connected; disconnect first",
                 ));
             }
+            if active_device.hardware_verification
+                == domain::HardwareVerification::Unverified
+                && !options.allow_unverified_hardware
+            {
+                return Err(EngineError::new(
+                    ErrorCode::NotSupported,
+                    format!(
+                        "{} is recognized but not supported; only the LS-5000 is supported. Turn on \"Allow unverified scanners\" (or pass --allow-unverified-hardware) to open it anyway; every output will be tagged unverified.",
+                        active_device.model
+                    ),
+                ));
+            }
+            let status = self.status()?;
+            return Ok(protocol::ConnectResult {
+                device: active_device,
+                status,
+                already_connected: true,
+            });
         }
 
-        if device_id == self.sim.device_info().device_id {
+        if self.sim.recognizes(device_id) {
             let result = self.sim.connect(device_id, options)?;
             self.active = Some(ActiveDevice::Sim);
             Ok(result)
-        } else if self.real.is_some()
-            && device_id == self.real.as_ref().unwrap().device_info().device_id
+        } else if self
+            .real
+            .as_ref()
+            .is_some_and(|real| real.recognizes(device_id))
         {
             let result = self.real.as_ref().unwrap().connect(device_id, options)?;
             self.active = Some(ActiveDevice::Real);
@@ -426,6 +456,30 @@ impl Backends {
                 ErrorCode::NotConnected,
                 "scanner is not connected",
             )),
+        }
+    }
+
+    /// D-18: arms `fixture` on the simulator only. A no-op unless the
+    /// simulator is the active device -- the `sim.loadMedia` dispatch arm
+    /// only calls this after `load_media` above has already succeeded,
+    /// which never happens with a real device active
+    /// (`RealLs5000::load_media` unconditionally refuses), so the `Real`/
+    /// `None` cases are unreachable in practice, not merely unhandled.
+    fn arm_sim_preview_fixture(&self, fixture: Option<PreviewFixture>) {
+        if self.active == Some(ActiveDevice::Sim) {
+            self.sim.arm_preview_fixture(fixture);
+        }
+    }
+
+    /// D-20/HEAD-12: arms `abort` on the simulator only -- a no-op unless
+    /// the simulator is the active device, mirroring
+    /// `arm_sim_preview_fixture` exactly (the `Real`/`None` cases are
+    /// unreachable in practice: `RealLs5000::load_media` unconditionally
+    /// refuses, so `load_media` above never succeeds with a real device
+    /// active).
+    fn arm_sim_batch_abort(&self, abort: Option<(u32, String)>) {
+        if self.active == Some(ActiveDevice::Sim) {
+            self.sim.arm_batch_abort(abort);
         }
     }
 
@@ -1094,7 +1148,26 @@ fn handle_request(
         }
         "sim.loadMedia" => {
             let params: protocol::LoadMediaParams = parse_params(&request.params)?;
+            // D-18: validated before `load_media` runs, so an unrecognized
+            // value never reaches the simulator at all.
+            let fixture = match params.preview_fixture.as_deref() {
+                None => None,
+                Some(value) => Some(PreviewFixture::parse(value).ok_or_else(|| {
+                    EngineError::new(
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "previewFixture \"{value}\" is not recognized; expected \"textured\" or \"boundaryAndBlank\""
+                        ),
+                    )
+                })?),
+            };
+            // D-20/HEAD-12 (1d): validated before `load_media` runs, so an
+            // unrecognized `abortCode` never reaches the simulator either.
+            let batch_abort =
+                resolve_sim_batch_abort(params.abort_at_frame, params.abort_code.as_deref())?;
             let status = backends.load_media(params.carrier)?;
+            backends.arm_sim_preview_fixture(fixture);
+            backends.arm_sim_batch_abort(batch_abort);
             emit_event(
                 tx,
                 "scanner.status",
@@ -1487,12 +1560,39 @@ fn handle_request(
         }
         "project.create" => {
             let params: protocol::ProjectCreateParams = parse_params(&request.params)?;
-            let (project, directory) = crate::manifest::create_project(
+            let excluded_frames = params.excluded_frames.clone().unwrap_or_default();
+            // D-21/HEAD-12 (1c): validated here, before a single byte of a
+            // manifest is written -- create_project_with_excluded_frames
+            // trusts this caller and only sets the flag.
+            let out_of_range: Vec<u32> = excluded_frames
+                .iter()
+                .copied()
+                .filter(|&index| index < 1 || index > params.frame_count)
+                .collect();
+            if !out_of_range.is_empty() {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "excludedFrames contains indices out of range 1..={}: {out_of_range:?}",
+                        params.frame_count
+                    ),
+                ));
+            }
+            let unique_excluded: std::collections::HashSet<u32> =
+                excluded_frames.iter().copied().collect();
+            if params.frame_count > 0 && unique_excluded.len() as u32 >= params.frame_count {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    "excludedFrames excludes every frame; at least one frame must remain unexcluded",
+                ));
+            }
+            let (project, directory) = crate::manifest::create_project_with_excluded_frames(
                 &params.name,
                 params.carrier,
                 params.frame_count,
                 params.film_process,
                 params.directory.as_deref().map(std::path::Path::new),
+                &excluded_frames,
             )?;
             let project = project_state.set(project, directory)?;
             let directory = project_state
@@ -1954,6 +2054,39 @@ fn handle_request(
     }
 }
 
+/// D-20/HEAD-12 (1d): validates and resolves `sim.loadMedia`'s batch-abort
+/// test affordance before the simulator ever sees it. `Ok(None)` when
+/// neither field is present (the overwhelmingly common case: nothing
+/// armed) -- `abortCode` alone (naming no frame) is refused, and an
+/// `abortCode` outside the bridge's own vocabulary
+/// (`real_backend::BRIDGE_ERROR_CODES`) is refused, naming the offending
+/// value. Omitting `abortCode` while naming `abortAtFrame` defaults to
+/// `"ROLL_MISMATCH"` -- the exact 2026-09-07 batch-abort cause. Pure and
+/// directly unit-tested so the defaulting/validation rule doesn't require
+/// reaching into the simulator's own private state.
+fn resolve_sim_batch_abort(
+    abort_at_frame: Option<u32>,
+    abort_code: Option<&str>,
+) -> Result<Option<(u32, String)>, EngineError> {
+    match (abort_at_frame, abort_code) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(EngineError::new(
+            ErrorCode::InvalidParams,
+            "abortCode requires abortAtFrame",
+        )),
+        (Some(frame_index), code) => {
+            let code = code.unwrap_or("ROLL_MISMATCH");
+            if !crate::real_backend::BRIDGE_ERROR_CODES.contains(&code) {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidParams,
+                    format!("abortCode \"{code}\" is not a recognized bridge error code"),
+                ));
+            }
+            Ok(Some((frame_index, code.to_string())))
+        }
+    }
+}
+
 fn parse_params<T: serde::de::DeserializeOwned>(
     params: &serde_json::Value,
 ) -> Result<T, EngineError> {
@@ -2158,7 +2291,14 @@ mod tests {
         let devices = backends
             .rescan(None)
             .expect("rescan without a bridge cmd is a no-op");
-        assert_eq!(devices.len(), 1, "sim-only list stays sim-only: {devices:#?}");
+        assert_eq!(
+            devices
+                .iter()
+                .map(|device| device.device_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sim-ls5000-0", "sim-ls50-0"],
+            "sim-only list stays sim-only: {devices:#?}"
+        );
         assert!(backends.real.is_none());
     }
 
@@ -2193,6 +2333,60 @@ mod tests {
             .rescan(None)
             .expect_err("rescan must refuse while connected");
         assert_eq!(error.code, ErrorCode::AlreadyConnected);
+    }
+
+    #[test]
+    fn connect_to_the_already_connected_device_is_idempotent_and_reaches_no_backend() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let device_id = backends.sim.device_info().device_id.clone();
+        let options = protocol::ConnectOptions::default();
+
+        let first = backends
+            .connect(&device_id, &options)
+            .expect("first connect");
+        assert!(!first.already_connected);
+        assert_eq!(backends.active, Some(ActiveDevice::Sim));
+
+        // D-16: a second connect to the same, already-active device
+        // succeeds with `already_connected: true` and leaves `active`
+        // unchanged -- it must not fall through to `sim.connect`, which
+        // would otherwise refuse with `AlreadyConnected` (sim.rs's own
+        // `double_connect_is_rejected` test proves that refusal is still
+        // reachable when `sim.connect` is called directly).
+        let second = backends
+            .connect(&device_id, &options)
+            .expect("re-issued connect to the same device must succeed");
+        assert!(second.already_connected);
+        assert_eq!(backends.active, Some(ActiveDevice::Sim));
+        assert_eq!(second.device, first.device);
+    }
+
+    #[test]
+    fn connect_to_a_different_device_while_connected_still_refuses_already_connected() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let device_id = backends.sim.device_info().device_id.clone();
+        let options = protocol::ConnectOptions::default();
+        backends
+            .connect(&device_id, &options)
+            .expect("first connect");
+
+        let error = backends
+            .connect("not-the-connected-device", &options)
+            .expect_err("a different device id must still be refused while one is active");
+        assert_eq!(error.code, ErrorCode::AlreadyConnected);
+        assert_eq!(backends.active, Some(ActiveDevice::Sim));
     }
 
     #[test]
@@ -2443,6 +2637,143 @@ mod tests {
         assert_eq!(open_result["project"], create_result["project"]);
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// D-21/HEAD-12 (1c, the 2026-09-07 batch abort): `excludedFrames` on
+    /// `project.create` flows all the way to the manifest's own
+    /// `pendingFrames` -- no post-create exclusion call is needed, and
+    /// `scan.resume` (which reads `project.pendingFrames`) can never see
+    /// one of these frames.
+    #[test]
+    fn project_create_excluded_frames_flows_to_pending_frames() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let directory = temp_test_dir("create-excluded");
+
+        let create_request = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Test",
+                "carrier": "roll36",
+                "frameCount": 10,
+                "filmProcess": "positive",
+                "directory": directory.display().to_string(),
+                "excludedFrames": [8, 9, 10],
+            }),
+        };
+        let create_result = handle_request(&mut backends, &tx, &create_request, &mut project_state)
+            .expect("project.create");
+        let frames = create_result["project"]["frames"].as_array().unwrap();
+        for frame in frames {
+            let index = frame["index"].as_u64().unwrap();
+            let expected_excluded = (8..=10).contains(&index);
+            assert_eq!(
+                frame["excluded"].as_bool().unwrap(),
+                expected_excluded,
+                "frame {index} excluded flag mismatch"
+            );
+        }
+
+        let pending_request = Request {
+            id: 2,
+            method: "project.pendingFrames".into(),
+            params: serde_json::json!({}),
+        };
+        let pending_result =
+            handle_request(&mut backends, &tx, &pending_request, &mut project_state)
+                .expect("project.pendingFrames");
+        assert_eq!(
+            pending_result["frames"],
+            serde_json::json!([1, 2, 3, 4, 5, 6, 7])
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An out-of-range `excludedFrames` index must refuse `INVALID_PARAMS`
+    /// before any manifest is written, naming the offending index.
+    #[test]
+    fn project_create_excluded_frames_out_of_range_is_refused() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let directory = temp_test_dir("create-excluded-out-of-range");
+
+        let create_request = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Test",
+                "carrier": "roll36",
+                "frameCount": 10,
+                "filmProcess": "positive",
+                "directory": directory.display().to_string(),
+                "excludedFrames": [0, 11],
+            }),
+        };
+        let err = handle_request(&mut backends, &tx, &create_request, &mut project_state)
+            .expect_err("an out-of-range excludedFrames index must be refused");
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains('0') && err.message.contains("11"),
+            "message must name the offending indices: {}",
+            err.message
+        );
+        assert!(
+            !directory.exists(),
+            "a refused create must not write a manifest"
+        );
+    }
+
+    /// Excluding every frame would produce an empty `pendingFrames` and a
+    /// permanently unresumable roll -- refused before any manifest write,
+    /// never silently accepted.
+    #[test]
+    fn project_create_all_frames_excluded_is_refused() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+        let directory = temp_test_dir("create-all-excluded");
+
+        let create_request = Request {
+            id: 1,
+            method: "project.create".into(),
+            params: serde_json::json!({
+                "name": "Test",
+                "carrier": "roll36",
+                "frameCount": 3,
+                "filmProcess": "positive",
+                "directory": directory.display().to_string(),
+                "excludedFrames": [1, 2, 3],
+            }),
+        };
+        let err = handle_request(&mut backends, &tx, &create_request, &mut project_state)
+            .expect_err("excluding every frame must be refused");
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            !directory.exists(),
+            "a refused create must not write a manifest"
+        );
     }
 
     /// Issue #99: `project.create` aimed at a directory that already holds
@@ -3519,6 +3850,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -3676,6 +4009,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "usb-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: false,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -4173,6 +4508,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -4243,6 +4580,8 @@ mod tests {
             channels: "rgbi".into(),
             engine_version: "0.1.0".into(),
             device_id: "sim-ls5000-0".into(),
+            device_model: Some("SUPER COOLSCAN 5000 ED".into()),
+            hardware_verification: domain::HardwareVerification::Verified,
             simulated: true,
             settings_fingerprint: "1a3d265e0b54bbd2".into(),
             processing: None,
@@ -5167,5 +5506,129 @@ mod tests {
         let err =
             handle_request(&mut backends, &tx, &strip_request, &mut project_state).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotConnected);
+    }
+
+    #[test]
+    fn sim_load_media_preview_fixture_rejects_unknown_and_accepts_known_values() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+
+        let connect_request = Request {
+            id: 1,
+            method: "scanner.connect".into(),
+            params: serde_json::json!({ "deviceId": "sim-ls5000-0" }),
+        };
+        handle_request(&mut backends, &tx, &connect_request, &mut project_state)
+            .expect("scanner.connect");
+
+        // D-18: an unrecognized previewFixture is refused before the
+        // simulator ever sees it -- carrier is otherwise valid, so a
+        // success here would mean the value was silently ignored rather
+        // than validated.
+        let nonsense_request = Request {
+            id: 2,
+            method: "sim.loadMedia".into(),
+            params: serde_json::json!({ "carrier": "strip6", "previewFixture": "nonsense" }),
+        };
+        let err =
+            handle_request(&mut backends, &tx, &nonsense_request, &mut project_state).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+
+        let valid_request = Request {
+            id: 3,
+            method: "sim.loadMedia".into(),
+            params: serde_json::json!({ "carrier": "strip6", "previewFixture": "boundaryAndBlank" }),
+        };
+        let result = handle_request(&mut backends, &tx, &valid_request, &mut project_state)
+            .expect("sim.loadMedia with a recognized previewFixture must succeed");
+        assert_eq!(result["mediaLoaded"], true);
+    }
+
+    /// D-20/HEAD-12 (1d): an `abortCode` outside the bridge's own
+    /// vocabulary is refused `INVALID_PARAMS` at the `sim.loadMedia`
+    /// dispatch arm, before the simulator ever sees it -- carrier and
+    /// `abortAtFrame` are otherwise valid, so a success here would mean
+    /// the bad code was silently accepted.
+    #[test]
+    fn sim_load_media_abort_code_rejects_unknown_and_accepts_known_values() {
+        let mut backends = Backends {
+            sim: Arc::new(SimulatedLs5000::new()),
+            real: None,
+            active: None,
+            bridge_cmd: None,
+            startup_error: None,
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut project_state = ProjectState::default();
+
+        let connect_request = Request {
+            id: 1,
+            method: "scanner.connect".into(),
+            params: serde_json::json!({ "deviceId": "sim-ls5000-0" }),
+        };
+        handle_request(&mut backends, &tx, &connect_request, &mut project_state)
+            .expect("scanner.connect");
+
+        let nonsense_request = Request {
+            id: 2,
+            method: "sim.loadMedia".into(),
+            params: serde_json::json!({
+                "carrier": "roll36",
+                "abortAtFrame": 3,
+                "abortCode": "TOTALLY_MADE_UP",
+            }),
+        };
+        let err =
+            handle_request(&mut backends, &tx, &nonsense_request, &mut project_state).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+
+        let valid_request = Request {
+            id: 3,
+            method: "sim.loadMedia".into(),
+            params: serde_json::json!({
+                "carrier": "roll36",
+                "abortAtFrame": 3,
+                "abortCode": "ROLL_MISMATCH",
+            }),
+        };
+        let result = handle_request(&mut backends, &tx, &valid_request, &mut project_state)
+            .expect("sim.loadMedia with a recognized abortCode must succeed");
+        assert_eq!(result["mediaLoaded"], true);
+    }
+
+    /// `resolve_sim_batch_abort` is the pure validation+defaulting helper
+    /// behind the `sim.loadMedia` dispatch arm's abort fields -- tested
+    /// directly so the defaulting rule doesn't require reaching into the
+    /// simulator's own private state from this module.
+    #[test]
+    fn resolve_sim_batch_abort_defaults_missing_abort_code_to_roll_mismatch() {
+        assert_eq!(
+            resolve_sim_batch_abort(Some(3), None).unwrap(),
+            Some((3, "ROLL_MISMATCH".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_sim_batch_abort_is_none_when_nothing_is_armed() {
+        assert_eq!(resolve_sim_batch_abort(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_sim_batch_abort_rejects_a_code_outside_the_bridge_vocabulary() {
+        let err = resolve_sim_batch_abort(Some(3), Some("TOTALLY_MADE_UP")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn resolve_sim_batch_abort_rejects_abort_code_without_abort_at_frame() {
+        let err = resolve_sim_batch_abort(None, Some("ROLL_MISMATCH")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 }

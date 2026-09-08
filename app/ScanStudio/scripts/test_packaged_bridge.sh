@@ -22,12 +22,30 @@ fi
 
 for binary in "$source_app/Contents/MacOS/ScanStudio" \
     "$source_app/Contents/MacOS/scanstudio-engine" \
+    "$source_app/Contents/MacOS/scanstudio-cli" \
     "$source_app/Contents/Resources/BridgeRuntime/python/bin/python3.13"; do
     if [[ "$(lipo -archs "$binary")" != "arm64" ]]; then
         print -u2 "Packaged bridge check requires arm64 binaries: $binary"
         exit 1
     fi
 done
+if ! codesign --verify --strict "$source_app/Contents/MacOS/scanstudio-cli"; then
+    print -u2 "Packaged bridge check failed: scanstudio-cli signature is invalid"
+    exit 1
+fi
+app_signature="$(codesign -d --verbose=2 "$source_app/Contents/MacOS/ScanStudio" 2>&1 || true)"
+cli_signature="$(codesign -d --verbose=2 "$source_app/Contents/MacOS/scanstudio-cli" 2>&1 || true)"
+app_team="$(print -r -- "$app_signature" | awk -F= '$1 ~ /TeamIdentifier$/ { print $2; exit }')"
+cli_team="$(print -r -- "$cli_signature" | awk -F= '$1 ~ /TeamIdentifier$/ { print $2; exit }')"
+if [[ -z "$app_team" || "$cli_team" != "$app_team" ]]; then
+    print -u2 "Packaged bridge check failed: scanstudio-cli and app TeamIdentifier values differ"
+    exit 1
+fi
+if [[ "$app_team" != "not set" && "$cli_signature" != *"flags="*runtime* ]]; then
+    print -u2 "Packaged bridge check failed: Developer ID scanstudio-cli lacks hardened runtime"
+    exit 1
+fi
+print "packaged scanstudio-cli architecture, signature, and team checked"
 
 workdir="$(mktemp -d)"
 cleanup() { rm -rf "$workdir"; }

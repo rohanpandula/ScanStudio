@@ -6,7 +6,7 @@
 # debugging confusion the instrumented-refusal work exists to prevent
 # (owner policy, 2026-08-08: "keep them in sync so there's no delta").
 #
-# Mechanics: download the exact authenticated coolscanpy 0.7.7 sdist and compare its
+# Mechanics: download the exact authenticated coolscanpy 0.7.8 sdist and compare its
 # src/coolscanpy tree byte-for-byte against this repo's vendored
 # coolscanpy/src/coolscanpy. Version strings are NOT trusted as the primary
 # signal (an unbumped version with changed code is precisely the failure
@@ -30,33 +30,33 @@ VENDORED_DIR="coolscanpy/src/coolscanpy"
 # Re-pin: shasum -a 256 <both files>, update the entry in the same change
 # that alters the file.
 KNOWN_VENDORED_DIVERGENCE=(
-  # required scanner_identity + capture-timing feature; re-pinned for 0.7.7
-  # (samples_per_scan landed upstream)
-  "protocol/ls5000_single_pass/worker.py|5d2317465e78cb99ed460169601879491829579b34337a2d625dd5d7c3bdefb1|7a204abf4b97231a44f55ebb04c2eff784e2aa737480c5acd946022339c29ff0"
-  # LeadingFrameClippedError + confident-clear-film gate; re-pinned for 0.7.7
-  # (samples_per_scan landed upstream)
+  # required scanner_identity + capture-timing feature; re-pinned for 0.7.8
+  # (identity opt-in and single-sample framing landed upstream)
+  "protocol/ls5000_single_pass/worker.py|eadc1e86e25b9d759dfb4c9787943bb9f54ce35d558961b33b0436fa2340d08d|710be2217b11112e1f0f9c1af7c2b144feed8c7be0bb222553507fea51c12cfc"
+  # LeadingFrameClippedError + confident-clear-film gate; re-pinned for 0.7.8
+  # (identity opt-in and single-sample framing landed upstream)
   "protocol/ls5000_single_pass/roll_index.py|c99c54a434d0d53e94e51ed503f0289709b5f20365e16606f365264a617c8b17|38013a1e942c3d1d1798ca0e718fb7ccdc3bc605277ca729e9891fa53bcde311"
   # its export surface for the class above
   "protocol/ls5000_single_pass/__init__.py|ce8aa97b707f5ef83f96128b378722191f7280bd41c1f3acbb04c75e3ea7523e|1f0f324034a95e2c8ca772ce52a78a800b0bf215d3ae4ec77422b08b1376856c"
-  # pins differ because the two files above differ; re-pinned for 0.7.7
-  "protocol/ls5000_single_pass/bundle.py|524912bd1853fea30950491eb590456732bbd1b6d5211f28d055e6e9a487c270|513f03933c629753fb0d09594c7c54fcc6f577797fbf0169a972e54048d3ef47"
+  # pins differ because the two files above differ; re-pinned for 0.7.8
+  "protocol/ls5000_single_pass/bundle.py|d366dd983a52c8b61e483bc01fc9f3933d5771afbbbddc5e7c0f796259962188|35a0d9d5461d0c6519308311d9244495f527bc1a0040c2a850f048efa1c862dd"
   # packaged-app libusb resolution (app bundles its own signed binary)
   "protocol/ls5000_single_pass/usb_backend.py|afb5b3cbb57404b758f4f8d8795f4307c07c8f6d01bbeccb3ced38026787fd62|666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1"
-  # capture-timing receipt fields (started_at/duration); re-pinned for 0.7.7
-  "_roll.py|a9f56a90929eaa696f170c4ae50f30a362de8dc8250a87536d97032a977f6b93|f9c869f6002983b3c966f25c27ac9a71df72a35f2c187ef3d188b8d80a218382"
-  "capture/single_pass_workflow.py|a5a01b15ff50df9a6f78d1c2c4f39d10548e7651cf3365e8698d479b633b5914|c8d93dce3c7de3b585c2d051b7d09054802a130797c590c97b36b78889def15c"
+  # capture-timing receipt fields (started_at/duration); re-pinned for 0.7.8
+  "_roll.py|eac444ca2c7d2a0fbd044f74f0268faa2204d8c12d43da9158dc588e1f3c224e|4275a32699163d63030bd96e09a2dc77d58b6c75bb31fa52d1466519ccfb4d4d"
+  "capture/single_pass_workflow.py|f1e6921197f10bf3210a7ad673074e0bd1327ab7332f4330019b1426f3f35748|2522b3ef4f12c04de2dcd41fe73dc650b754375d91be8654b162bde599f3c6a7"
   "types.py|1343c93c03ade64f0927602fe8e8e25353bada6b1b8a919ce9084c5cbcb321de|f853b8dde9c4a6c3b7ce96195d320c7ba9c88839019bed9ce55fe444ea08e54a"
 )
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-echo "fetching authenticated coolscanpy 0.7.7 source from PyPI..."
+echo "fetching authenticated coolscanpy 0.7.8 source from PyPI..."
 published_root="$(python3 -I -S -B scripts/fetch_pinned_coolscanpy_sdist.py \
   --destination "$workdir/published")"
 published_src="$published_root/src/coolscanpy"
 test -d "$published_src"
-pypi_version="0.7.7"
+pypi_version="0.7.8"
 
 printf '%s\n' "${KNOWN_VENDORED_DIVERGENCE[@]}" > "$workdir/exemptions"
 if PUBLISHED_SRC="$published_src" VENDORED_DIR="$VENDORED_DIR" \

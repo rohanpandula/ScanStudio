@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import re
 import sys
@@ -27,6 +28,66 @@ REQUIRED_COLUMNS = (
 
 class HardwareSupportDocsError(ValueError):
     """The live hardware guidance is stale or internally inconsistent."""
+
+
+def _driver_model_names(root: Path) -> tuple[set[str], str]:
+    path = root / "coolscanpy/src/coolscanpy/_device.py"
+    try:
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        values = {}
+        for statement in module.body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target = statement.targets[0]
+            elif isinstance(statement, ast.AnnAssign):
+                target = statement.target
+            else:
+                continue
+            if isinstance(target, ast.Name):
+                values[target.id] = statement.value
+        required = ("_NIKON_COOLSCAN_USB_MODELS", "_SANE_COOLSCAN_MODEL_MARKERS")
+
+        class Constants(ast.NodeTransformer):
+            def visit_Name(self, node):
+                replacement = values.get(node.id)
+                if not isinstance(replacement, ast.Constant):
+                    raise ValueError(f"unresolved constant {node.id}")
+                return replacement
+
+        tables = []
+        for name in required:
+            tables.append(ast.literal_eval(Constants().visit(values[name])))
+        usb, sane = tables
+        models = {model for products in usb.values() for model in products.values()}
+        models.update(model for _, model in sane)
+        verified = ast.literal_eval(values["_CANONICAL_LS5000_MODEL"])
+        if not all(isinstance(model, str) for model in models) or verified not in models:
+            raise ValueError("invalid model names")
+        return models, verified
+    except (OSError, SyntaxError, ValueError, TypeError, KeyError, AttributeError) as error:
+        raise HardwareSupportDocsError(
+            f"driver identity tables missing or no longer a literal structure: {error}"
+        ) from error
+
+
+def _verify_model_table(root: Path, matrix: str) -> None:
+    for heading in ("## Model compatibility", "## Testing an unverified scanner"):
+        if heading not in matrix:
+            raise HardwareSupportDocsError(f"missing {heading}")
+    section = matrix.split("## Model compatibility", 1)[1].split("\n## ", 1)[0]
+    rows = {}
+    for line in section.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) == 5 and cells[0] not in ("Model", "---"):
+            rows[cells[0]] = cells[-1].replace("**", "")
+    models, verified = _driver_model_names(root)
+    if set(rows) != models:
+        raise HardwareSupportDocsError(f"model table differs from driver: {sorted(set(rows) ^ models)}")
+    for model, status in rows.items():
+        valid = status.startswith("Verified") if model == verified else (
+            "unverified" in status or status.startswith("Recognized by name only")
+        )
+        if not valid:
+            raise HardwareSupportDocsError(f"incorrect verification claim for {model}: {status}")
 
 
 def _latest_release_note(root: Path) -> str:
@@ -69,6 +130,8 @@ def verify_hardware_support_docs(root: Path = REPOSITORY_ROOT) -> None:
             "the canonical matrix must link the meter and release-verification follow-ups"
         )
 
+    _verify_model_table(root, matrix)
+
     for relative_path in LIVE_GUIDES:
         try:
             text = (root / relative_path).read_text(encoding="utf-8")
@@ -97,4 +160,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -22,6 +22,7 @@ Only ``Material.COLOR_NEGATIVE``'s single-pass RGBI4 capture route
 
 from __future__ import annotations
 
+import copy
 import datetime
 import hashlib
 import hmac
@@ -35,6 +36,7 @@ import tempfile
 import threading
 import time
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 from uuid import uuid4
@@ -97,6 +99,7 @@ from coolscanpy.protocol.ls5000_single_pass.meter import (
     EXPOSURE_MAX,
     EXPOSURE_MIN,
 )
+from coolscanpy.protocol.ls5000_single_pass.packed import SINGLE_SAMPLE_RECORD_BYTES
 from coolscanpy.protocol.ls5000_single_pass.roll_index import (
     replay_transport_failure_witness,
 )
@@ -680,10 +683,17 @@ class Roll:
                         message="reading whole-roll transport index",
                     ),
                 )
+            vendor_id, product_id, model, allow_unverified = (
+                self._device._capture_identity()
+            )
             request = CaptureRequest(
                 mode=CaptureMode.PREVIEW,
                 expected_usb_bus=(topology[0] if topology is not None else None),
                 expected_usb_address=(topology[1] if topology is not None else None),
+                expected_usb_vendor_id=vendor_id,
+                expected_usb_product_id=product_id,
+                expected_scanner_model=model,
+                allow_unverified=allow_unverified,
             )
             try:
                 held = adapter.begin_held_preview(request)
@@ -1201,12 +1211,20 @@ class Roll:
                 raise BatchIntegrityError(
                     "color batch has no exact USB topology from its reviewed preview"
                 )
+            vendor_id, product_id, model, allow_unverified = (
+                self._device._capture_identity()
+            )
             requests = tuple(
                 CaptureRequest(
                     mode=CaptureMode.FULL,
                     selected_slot=slot,
                     boundary_offset_rows=session.slots[slot - 1].boundary_offset_rows,
                     manual_review_approval=approvals.get(slot),
+                    samples_per_scan=samples_per_scan,
+                    expected_usb_vendor_id=vendor_id,
+                    expected_usb_product_id=product_id,
+                    expected_scanner_model=model,
+                    allow_unverified=allow_unverified,
                 )
                 for slot in ordered_slots
             )
@@ -1217,6 +1235,10 @@ class Roll:
                 expected_usb_address=topology[1],
                 exposure_override_10ns=exposure_override_10ns,
                 samples_per_scan=samples_per_scan,
+                expected_usb_vendor_id=vendor_id,
+                expected_usb_product_id=product_id,
+                expected_scanner_model=model,
+                allow_unverified=allow_unverified,
                 # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the same
                 # computation RollPreviewSession.to_json() already uses to
                 # decide whether ITS OWN provenance is a manual session's
@@ -1282,6 +1304,13 @@ class Roll:
             session_id=f"scan-{uuid4().hex}",
         )
         workflow = self._workflow
+        if batch_request.samples_per_scan == 1:
+            workflow = copy.copy(workflow)
+            workflow._contract = replace(
+                workflow._contract,
+                record_bytes=SINGLE_SAMPLE_RECORD_BYTES,
+                samples_per_scan=1,
+            )
         device_id = self._device._info.id
         produced_count = 0
         density_preview_evidence: NikonDensityEvidence | None = None

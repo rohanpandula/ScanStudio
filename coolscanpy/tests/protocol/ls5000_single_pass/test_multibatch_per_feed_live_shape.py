@@ -329,6 +329,9 @@ class _DeviceDouble:
     def _release_roll_lock(self) -> None:
         pass
 
+    def _capture_identity(self) -> tuple[int, int, str, bool]:
+        return 0x04B0, 0x4002, "LS-5000 ED", False
+
     def _mark_fault_if_cleanup_error(self, error: BaseException) -> None:
         del error
 
@@ -379,6 +382,7 @@ def _install_fake_hardware(
     monkeypatch.setattr(
         worker_module, "validate_plan", lambda _plan, *_manifest: tiny_target
     )
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
     # ... and the identical shrink on the parent side, so its own
     # frame-completion invariants describe the same capture. Faking only one
     # side is the failure mode this whole file is about.
@@ -390,7 +394,7 @@ def _install_fake_hardware(
     monkeypatch.setattr(
         worker_module,
         "_validate_scanner_identity",
-        lambda _payload: "Nikon LS-5000 ED 2.07",
+        lambda _payload, **_kwargs: "Nikon LS-5000 ED 2.07",
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
@@ -422,7 +426,7 @@ def _install_fake_hardware(
         worker_module,
         "_connect_device",
         lambda **_kwargs: (
-            SimpleNamespace(bus=2, address=11),
+            SimpleNamespace(bus=2, address=11, idProduct=0x4002),
             SimpleNamespace(bInterfaceNumber=0),
             SimpleNamespace(bEndpointAddress=0x01),
             SimpleNamespace(bEndpointAddress=0x82),

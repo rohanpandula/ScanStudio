@@ -83,6 +83,7 @@ fn mock_refeed_evidence(evidence_id: &str) -> BridgeDiagnosticEvidence {
 
 struct MockState {
     device_open: bool,
+    opened_device: Option<BridgeDeviceInfo>,
     job_counter: u64,
     /// Monotonic path component for adjusted preview tiles. The app image
     /// cache is keyed by file URL, so every successful alignment response
@@ -416,6 +417,7 @@ fn main() {
 
     let mut state = MockState {
         device_open: false,
+        opened_device: None,
         job_counter: 0,
         thumbnail_counter: 0,
         motion_armed,
@@ -620,10 +622,22 @@ fn handle_request(
         }
         "device.open" => {
             let params: BridgeDeviceOpenParams = parse_params(&request.params)?;
-            if params.device_id != DEVICE_ID {
+            let device = if params.device_id == DEVICE_ID {
+                open_device_info()
+            } else if params.device_id == UNSUPPORTED_DEVICE_ID
+                && std::env::var("MOCK_BRIDGE_DEVICE_DUAL_ATTACH").is_ok_and(|v| !v.is_empty())
+            {
+                dual_attach_secondary_device_info()
+            } else {
                 return Err((
                     BridgeErrorCode::DeviceNotFound,
                     format!("no such device: {}", params.device_id),
+                ));
+            };
+            if !device.supported && !params.allow_unverified_hardware {
+                return Err((
+                    BridgeErrorCode::DeviceNotFound,
+                    format!("{} requires explicit unverified-hardware opt-in", device.model),
                 ));
             }
             if state.device_open {
@@ -633,6 +647,7 @@ fn handle_request(
                 ));
             }
             state.device_open = true;
+            state.opened_device = Some(device.clone());
             let status = current_status(state, false);
             emit_event(
                 tx,
@@ -645,7 +660,7 @@ fn handle_request(
                 // Deliberately independently configurable from device.list
                 // so real-backend tests can prove that a holder changed
                 // while disconnected is refreshed at open time.
-                device: open_device_info(),
+                device,
                 status,
             })
         }
@@ -656,6 +671,7 @@ fn handle_request(
         "device.close" => {
             require_open(state)?;
             state.device_open = false;
+            state.opened_device = None;
             state.preview_established.store(false, Ordering::Release);
             state.preview_requested.store(false, Ordering::Release);
             state.preview_slot_count.store(0, Ordering::Release);
@@ -789,6 +805,7 @@ fn handle_request(
             require_open(state)?;
             if not_connected_on_scan_start {
                 state.device_open = false;
+                state.opened_device = None;
                 return Err((
                     BridgeErrorCode::NotConnected,
                     "no device is open".to_string(),
@@ -810,6 +827,10 @@ fn handle_request(
                     params.slots,
                     params.recipe.channels,
                     params.output,
+                    state
+                        .opened_device
+                        .clone()
+                        .expect("an accepted scan has an opened device"),
                     scan_error_code.clone(),
                     scan_failed_slots.to_vec(),
                     scan_anomaly_slot,
@@ -889,6 +910,12 @@ fn fixed_device_info() -> BridgeDeviceInfo {
             "SUPER COOLSCAN 5000 ED".to_string()
         },
         supported: !unsupported,
+        unverified_allowed: unsupported,
+        hardware_verification: if unsupported {
+            scanstudio_engine::domain::HardwareVerification::Unverified
+        } else {
+            scanstudio_engine::domain::HardwareVerification::Verified
+        },
         capabilities: BridgeCapabilities {
             ir_channel: true,
             supported_dpi: vec![4000],
@@ -913,6 +940,9 @@ fn dual_attach_secondary_device_info() -> BridgeDeviceInfo {
     device.device_id = UNSUPPORTED_DEVICE_ID.to_string();
     device.model = "LS-50 ED".to_string();
     device.supported = false;
+    device.unverified_allowed = true;
+    device.hardware_verification =
+        scanstudio_engine::domain::HardwareVerification::Unverified;
     device
 }
 
@@ -932,13 +962,10 @@ fn open_device_info() -> BridgeDeviceInfo {
 
 fn current_status(state: &MockState, fresh_status_read: bool) -> BridgeDeviceStatus {
     let preview_established = state.preview_established.load(Ordering::Acquire);
+    let device = state.opened_device.as_ref();
     BridgeDeviceStatus {
         connected: state.device_open,
-        device_id: if state.device_open {
-            Some(DEVICE_ID.to_string())
-        } else {
-            None
-        },
+        device_id: device.map(|device| device.device_id.clone()),
         preview_established,
         slot_count: preview_established.then_some(
             state.preview_slot_count.load(Ordering::Acquire),
@@ -952,6 +979,8 @@ fn current_status(state: &MockState, fresh_status_read: bool) -> BridgeDeviceSta
         },
         film_present: state.film_present,
         adapter: None,
+        device_model: device.map(|device| device.model.clone()),
+        hardware_verification: device.map(|device| device.hardware_verification),
     }
 }
 
@@ -1056,6 +1085,7 @@ fn spawn_scan_worker(
     slots: Vec<u32>,
     channels: BridgeChannels,
     output: BridgeOutputSpec,
+    device: BridgeDeviceInfo,
     scan_error_code: Option<String>,
     scan_failed_slots: Vec<u32>,
     scan_anomaly_slot: Option<u32>,
@@ -1102,7 +1132,7 @@ fn spawn_scan_worker(
                     BridgeFrameCompletedPayload {
                         job_id: job_id.clone(),
                         slot,
-                        receipt: fixed_scan_receipt(slot, channels, &output),
+                        receipt: fixed_scan_receipt(slot, channels, &output, &device),
                     },
                 );
                 completed_slots.push(slot);
@@ -1244,7 +1274,7 @@ fn spawn_scan_worker(
                 BridgeFrameCompletedPayload {
                     job_id: job_id.clone(),
                     slot,
-                    receipt: fixed_scan_receipt(slot, channels, &output),
+                    receipt: fixed_scan_receipt(slot, channels, &output, &device),
                 },
             );
             completed_slots.push(slot);
@@ -1277,6 +1307,7 @@ fn fixed_scan_receipt(
     slot: u32,
     channels: BridgeChannels,
     output: &BridgeOutputSpec,
+    device: &BridgeDeviceInfo,
 ) -> BridgeScanReceipt {
     let (destination, filename_template) = output
         .slot_outputs
@@ -1361,8 +1392,9 @@ fn fixed_scan_receipt(
         spacing_offset: 3,
         dpi: 4000,
         depth: 16,
-        device_id: DEVICE_ID.to_string(),
-        device_model: "SUPER COOLSCAN 5000 ED".to_string(),
+        device_id: device.device_id.clone(),
+        device_model: device.model.clone(),
+        hardware_verification: device.hardware_verification,
         reviewed_fingerprint_sha256: "mock-fingerprint-0001".to_string(),
         fresh_fingerprint_sha256: "mock-fingerprint-0001".to_string(),
         manual_approval: None,

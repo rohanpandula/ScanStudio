@@ -205,6 +205,7 @@ fn sim_batch_scan_peak_memory_stays_within_a_few_frames_worth_not_the_whole_roll
 
     let sim = Arc::new(SimulatedLs5000::new());
     let options = ConnectOptions {
+        allow_unverified_hardware: false,
         time_scale: 0.01,
         fault_injection: FaultInjection::NoFault,
     };
