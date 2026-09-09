@@ -403,15 +403,8 @@ def test_continuation_loop_wires_hook_and_binds_finish_to_raw_sha(
     assert log["finish_calls"] == [(0, hashlib.sha256(b"x").hexdigest(), 1)]
 
 
-def test_continuation_meter_evidence_is_accepted_by_publication_consumer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    journal, second = _drive_continuation(
-        tmp_path,
-        monkeypatch,
-        open_session=lambda *_a: None,
-        full_meter_payload=True,
-    )
+def _publication_consumer_inputs(tmp_path: Path, journal, second):
+    second.journal.write_text(json.dumps(journal), encoding="utf-8")
     journal_payload = second.journal.read_bytes()
     attempt = SinglePassAttempt(
         session=SinglePassSession(root=tmp_path, session_id="continuation-consumer"),
@@ -441,6 +434,19 @@ def test_continuation_meter_evidence_is_accepted_by_publication_consumer(
         resumed=False,
         scratch_deleted=False,
     )
+    return attempt, finalization
+
+
+def test_continuation_meter_evidence_is_accepted_by_publication_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal, second = _drive_continuation(
+        tmp_path,
+        monkeypatch,
+        open_session=lambda *_a: None,
+        full_meter_payload=True,
+    )
+    attempt, finalization = _publication_consumer_inputs(tmp_path, journal, second)
 
     meter_rgbi, final_rgb = roll_module._read_exact_analyzer_source(
         attempt, finalization
@@ -458,6 +464,63 @@ def test_continuation_meter_evidence_is_accepted_by_publication_consumer(
         worker_module.DEFAULT_EXPOSURES["G"],
         worker_module.DEFAULT_EXPOSURES["B"],
     )
+
+
+def test_publication_consumer_accepts_bound_explicit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal, second = _drive_continuation(
+        tmp_path,
+        monkeypatch,
+        open_session=lambda *_a: None,
+        full_meter_payload=True,
+    )
+    commanded = journal["active_exposure_authority"][
+        "commanded_channels_raw_10ns"
+    ]
+    journal["active_exposure_authority"]["rgb_source"] = "explicit-rgb-override"
+    journal["exposure_override"] = {
+        "applied": True,
+        "forced_10ns": {
+            "red": commanded["R"],
+            "green": commanded["G"],
+            "blue": commanded["B"],
+        },
+    }
+    attempt, finalization = _publication_consumer_inputs(tmp_path, journal, second)
+
+    _meter_rgbi, final_rgb = roll_module._read_exact_analyzer_source(
+        attempt, finalization
+    )
+
+    assert final_rgb == (commanded["R"], commanded["G"], commanded["B"])
+
+
+def test_publication_consumer_refuses_tampered_explicit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal, second = _drive_continuation(
+        tmp_path,
+        monkeypatch,
+        open_session=lambda *_a: None,
+        full_meter_payload=True,
+    )
+    commanded = journal["active_exposure_authority"][
+        "commanded_channels_raw_10ns"
+    ]
+    journal["active_exposure_authority"]["rgb_source"] = "explicit-rgb-override"
+    journal["exposure_override"] = {
+        "applied": True,
+        "forced_10ns": {
+            "red": commanded["R"] + 1,
+            "green": commanded["G"],
+            "blue": commanded["B"],
+        },
+    }
+    attempt, finalization = _publication_consumer_inputs(tmp_path, journal, second)
+
+    with pytest.raises(roll_module.BatchIntegrityError, match="authority"):
+        roll_module._read_exact_analyzer_source(attempt, finalization)
 
 
 def test_synchronous_decoder_exception_never_aborts_continuation_capture(

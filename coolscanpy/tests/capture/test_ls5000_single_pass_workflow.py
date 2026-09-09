@@ -888,25 +888,25 @@ def test_smear_qc_receives_scanner_native_rgb_before_rotation(tmp_path: Path) ->
         ),
         (
             lambda journal: journal.__delitem__("active_exposure_authority"),
-            "parity authority",
+            "declared authority",
         ),
         (
             lambda journal: journal["active_exposure_authority"][
                 "commanded_channels_raw_10ns"
             ].__setitem__("G", 1),
-            "parity authority",
+            "declared authority",
         ),
         (
             lambda journal: journal["active_exposure_authority"][
                 "active_controller_channels_raw_10ns"
             ].__setitem__("R", 1),
-            "parity authority",
+            "declared authority",
         ),
         (
             lambda journal: journal["meter_controller_final_result"][
                 "final_exposures_raw_10ns"
             ].__setitem__("IR", 1),
-            "parity authority",
+            "declared authority",
         ),
     ],
 )
@@ -971,6 +971,67 @@ def test_parity_commanded_exposures_differing_from_active_solve_finalize(
     authority = manifest["exposure_evidence"]["active_exposure_authority"]
     assert authority["commanded_channels_raw_10ns"] == commanded
     assert authority["active_controller_channels_raw_10ns"] == active
+
+
+def _record_explicit_override(journal: dict[str, Any]) -> None:
+    commanded = journal["active_exposure_authority"][
+        "commanded_channels_raw_10ns"
+    ]
+    journal["active_exposure_authority"]["rgb_source"] = "explicit-rgb-override"
+    journal["exposure_override"] = {
+        "applied": True,
+        "forced_10ns": {
+            "red": commanded["R"],
+            "green": commanded["G"],
+            "blue": commanded["B"],
+        },
+        "metered_10ns": {
+            "red": commanded["R"],
+            "green": commanded["G"],
+            "blue": commanded["B"],
+        },
+    }
+
+
+def test_explicit_override_authority_finalizes_when_exactly_bound(
+    tmp_path: Path,
+) -> None:
+    attempt, _stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    _record_explicit_override(journal)
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    result = _workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    authority = result.manifest["exposure_evidence"]["active_exposure_authority"]
+    assert authority["rgb_source"] == "explicit-rgb-override"
+
+
+def test_explicit_override_authority_refuses_tampered_forced_ticks(
+    tmp_path: Path,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    _record_explicit_override(journal)
+    journal["exposure_override"]["forced_10ns"]["red"] += 1
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(SinglePassIntegrityError, match="authority"):
+        _workflow().finalize_attempt(attempt)
+
+    assert stream.is_file()
+
+
+def test_legacy_parity_labeled_override_still_finalizes(tmp_path: Path) -> None:
+    attempt, _stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    _record_explicit_override(journal)
+    journal["active_exposure_authority"]["rgb_source"] = (
+        "nikon-parity-guarded-v2"
+    )
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    _workflow().finalize_attempt(attempt, delete_scratch=False)
 
 
 def test_stream_hash_mismatch_retains_scratch_before_decode(tmp_path: Path) -> None:
