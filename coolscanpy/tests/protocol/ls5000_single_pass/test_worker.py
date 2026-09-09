@@ -7062,7 +7062,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
             pass
 
     def derive_batch(
-        _plan: list[dict],
+        selection_plan: list[dict],
         preview: bytes,
         table: bytes,
         frames: tuple,
@@ -7070,6 +7070,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
         reviewed_fingerprint: ReviewedRollFingerprint,
         manual_boundary_rows: tuple[int, ...] | None = None,
     ) -> tuple:
+        worker_module.validate_plan(selection_plan)
         assert len(preview) == len(worker_module.PREVIEW_READ_SEQUENCES)
         assert table == header_8e
         assert len(frames) == 1

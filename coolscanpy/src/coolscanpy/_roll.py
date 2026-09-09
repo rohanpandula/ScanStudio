@@ -51,6 +51,7 @@ from coolscanpy.capture.single_pass_workflow import (
     SinglePassFinalizationResult,
     SinglePassSession,
     SinglePassWorkflowError,
+    _exposure_authority_is_bound,
 )
 from coolscanpy.exceptions import (
     AdapterUnsupported,
@@ -2651,24 +2652,13 @@ def _read_exact_analyzer_source(
         raise BatchIntegrityError(
             "settled third meter pass is not bound to the accepted controller result"
         )
-    # Since the guarded nikon-parity solve became the RGB command authority,
-    # the commanded contract is bound to the active controller's accepted
-    # solve THROUGH the journaled authority record: active solve -> authority
-    # -> commanded contract, with infrared passing through unchanged.
-    authority = journal.get("active_exposure_authority")
-    if (
-        type(authority) is not dict
-        or authority.get("rgb_source") != "nikon-parity-guarded-v2"
-        or authority.get("ir_source") != "active-controller"
-        or authority.get("commanded_channels_raw_10ns") != final_controller
-        or authority.get("active_controller_channels_raw_10ns")
-        != controller.get("final_exposures_raw_10ns")
-        or type(controller.get("final_exposures_raw_10ns")) is not dict
-        or final_controller.get("IR")
-        != controller["final_exposures_raw_10ns"].get("IR")
+    if not _exposure_authority_is_bound(
+        journal,
+        final_controller,
+        controller.get("final_exposures_raw_10ns"),
     ):
         raise BatchIntegrityError(
-            "commanded exposure contract is not bound to the parity authority "
+            "commanded exposure contract is not bound to the declared authority "
             "and the accepted controller result"
         )
 

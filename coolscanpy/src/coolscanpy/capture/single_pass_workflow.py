@@ -60,6 +60,7 @@ from coolscanpy.protocol.ls5000_single_pass.packed import (
     decode_full_records,
     decode_records,
 )
+from coolscanpy.protocol.ls5000_single_pass.meter import EXPOSURE_MAX, EXPOSURE_MIN
 from coolscanpy.protocol.ls5000_single_pass.streaming_sidecar import (
     CANONICAL_RGB_AVERAGE,
     STREAM_DATA_SUFFIX,
@@ -119,6 +120,48 @@ _STREAMING_OK_KEYS = frozenset(
         "bound_raw_bytes",
     }
 )
+
+
+def _exposure_authority_is_bound(
+    journal: Mapping[str, Any],
+    commanded: Mapping[str, int],
+    active_solve: object,
+) -> bool:
+    authority = journal.get("active_exposure_authority")
+    if (
+        type(authority) is not dict
+        or authority.get("ir_source") != "active-controller"
+        or authority.get("commanded_channels_raw_10ns") != commanded
+        or type(active_solve) is not dict
+        or authority.get("active_controller_channels_raw_10ns") != active_solve
+        or commanded.get("IR") != active_solve.get("IR")
+    ):
+        return False
+    source = authority.get("rgb_source")
+    if source == "nikon-parity-guarded-v2":
+        return True
+    if source != "explicit-rgb-override":
+        return False
+    override = journal.get("exposure_override")
+    forced = override.get("forced_10ns") if type(override) is dict else None
+    if (
+        type(override) is not dict
+        or override.get("applied") is not True
+        or type(forced) is not dict
+        or set(forced) != {"red", "green", "blue"}
+        or authority.get("device_exposure_bounds_raw_10ns")
+        != [EXPOSURE_MIN, EXPOSURE_MAX]
+    ):
+        return False
+    for name, channel in (("red", "R"), ("green", "G"), ("blue", "B")):
+        value = forced[name]
+        if (
+            type(value) is not int
+            or not EXPOSURE_MIN <= value <= EXPOSURE_MAX
+            or value != commanded.get(channel)
+        ):
+            return False
+    return True
 
 
 class SinglePassWorkflowError(RuntimeError):
@@ -1476,24 +1519,15 @@ class LS5000SinglePassWorkflow:
         }
         if controller_exposures != expected_controller:
             raise SinglePassIntegrityError("meter controller exposure echo is inconsistent")
-        # Guarded nikon-parity is the RGB command authority: the commanded
-        # contract is bound to the active controller's accepted solve THROUGH
-        # the journaled authority record (active solve -> authority ->
-        # commanded wire echo), with infrared passing through unchanged.
-        # Mirrors the roll publication consumer's binding check.
         authority = journal.get("active_exposure_authority")
         active_solve = controller.get("final_exposures_raw_10ns")
-        if (
-            not isinstance(authority, dict)
-            or authority.get("rgb_source") != "nikon-parity-guarded-v2"
-            or authority.get("ir_source") != "active-controller"
-            or authority.get("commanded_channels_raw_10ns") != expected_controller
-            or not isinstance(active_solve, dict)
-            or authority.get("active_controller_channels_raw_10ns") != active_solve
-            or expected_controller.get("IR") != active_solve.get("IR")
+        if not _exposure_authority_is_bound(
+            journal,
+            expected_controller,
+            active_solve,
         ):
             raise SinglePassIntegrityError(
-                "commanded exposure contract is not bound to the parity authority "
+                "commanded exposure contract is not bound to the declared authority "
                 "and the accepted controller result"
             )
 

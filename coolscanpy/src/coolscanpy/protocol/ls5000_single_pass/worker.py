@@ -8148,7 +8148,7 @@ def run_live_capture(
                 derive_equivalent_continuation_blocks(continuation_plan)
                 batch_job = next_batch_job
                 batch_selections = _derive_live_batch_selections(
-                    active_plan,
+                    plan,
                     preview_bytes,
                     live_sub_8e_table,
                     batch_job.frames,
