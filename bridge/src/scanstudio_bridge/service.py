@@ -69,6 +69,7 @@ _METHOD_PARAM_SCHEMAS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "roll.setSpacingOffset": (("slot", "offsetRows"), ()),
     "roll.manualFrames": (("rows",), ()),
     "roll.previewStrip": ((), ()),
+    "roll.previewStop": ((), ()),
     "scan.start": (("slots", "recipe", "output"), ("jobId",)),
     "scan.stop": (("jobId",), ()),
     "device.eject": ((), ()),
@@ -526,6 +527,15 @@ class BridgeService:
                     "a motion operation is still active; retry after it finishes",
                 )
             return to_wire(self._transport.preview_strip())
+        if method == "roll.previewStop":
+            if not self._device_open:
+                raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
+            # Do NOT gate on _motion_op_active: the whole point is to stop
+            # an in-progress preview. This is a fire-and-forget signal; the
+            # in-flight preview worker emits roll.previewComplete when it
+            # observes the stop.
+            self._transport.preview_stop()
+            return {"accepted": True}
         if method == "scan.start":
             return self._handle_scan_start(request, emit)
         if method == "scan.stop":

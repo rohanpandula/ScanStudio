@@ -1248,6 +1248,15 @@ private struct PreviewGateWorkspaceView: View {
             .help(sessionModel.hardwareMotionReadiness.allowsMotion
                 ? "Open the explicit preview confirmation"
                 : sessionModel.hardwareMotionReadiness.guidance)
+
+            if sessionModel.isAcquiringThumbnails {
+                Button("Done Previews") {
+                    sessionModel.finishPreviewsEarly()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!sessionModel.isAcquiringThumbnails)
+                .help("Stop previewing now and keep the frames captured so far.")
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.scanStudioWorkspace)

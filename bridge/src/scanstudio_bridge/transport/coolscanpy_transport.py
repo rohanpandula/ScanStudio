@@ -1868,6 +1868,20 @@ class CoolscanPyTransport:
                 if self._roll is not None:
                     self._roll.safe_stop()
 
+    def preview_stop(self) -> None:
+        """Operator clicked 'Done Previews'.
+
+        Sets the LS-50 roll's stop flag so the in-progress preview loop
+        ends early and emits previewComplete with the frames captured so
+        far. Safe to call any time; a preview that is not running is a
+        no-op.
+        """
+        roll = self._roll
+        if roll is not None and _is_ls50_roll(roll):
+            preview_stop = getattr(roll, "preview_stop", None)
+            if callable(preview_stop):
+                preview_stop()
+
     def eject(self) -> bool:
         if self._device is None:
             raise BridgeError(ErrorCode.NOT_CONNECTED, "no device is open")
