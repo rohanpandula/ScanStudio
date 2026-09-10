@@ -109,3 +109,91 @@ def test_ls50_preview_honors_stop_signal() -> None:
     else:
         ran = True
     assert ran is False
+
+
+def _encode_slot(img: np.ndarray) -> bytes:
+    """Encode a (H, W, 3) uint8 slot image as a padded 8-bit RGBI stream.
+
+    Mirrors the driver's decode path in ``Ls50Roll.preview``: the unit
+    returns ``logical_height * line_bytes_padded`` bytes whose first
+    ``line_bytes_raw`` bytes per row are ``(H, 4ch, W)`` interleaved RGBI.
+    """
+    from coolscanpy.protocol.ls50.capture import Ls50ScanOptions
+
+    opt = Ls50ScanOptions(dpi=400, depth=8, rgbi=True, y_min=0, y_max=5958)
+    h, w, _ = img.shape
+    rgbaoi = np.zeros((h, 4, w), np.uint8)
+    rgbaoi[:, :3, :] = np.moveaxis(img, -1, 1)
+    raw = np.zeros((h, opt.line_bytes_padded), np.uint8)
+    raw[:, : opt.line_bytes_raw] = rgbaoi.reshape(h, opt.line_bytes_raw)
+    return raw.tobytes()
+
+
+def test_ls50_preview_stops_on_transport_home_loop() -> None:
+    """Past the last real frame the LS-50 re-scans frame 1 (a "home loop");
+    the preview must detect the near-identical repeat and stop instead of
+    looping 1..N, N..1 forever."""
+    import threading
+
+    from coolscanpy.protocol.ls50.workflow import Ls50Roll
+
+    rng = np.random.default_rng(7)
+    slots = {}
+    for s in range(1, 6):
+        img = (150 + rng.normal(0, 40, (595, 394, 3))).clip(0, 255).astype(np.uint8)
+        slots[s] = img
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def capture(self, opt, boundary_best_effort=True):
+            slot = len(self.calls) + 1
+            if slot <= 5:
+                data = _encode_slot(slots[slot])
+            else:
+                # The transport looped back to frame 1 (re-scan of slot 1
+                # with a little sensor noise, indistinguishable from the
+                # original at the 8-bit preview level).
+                data = _encode_slot(
+                    (slots[1].astype(np.int16) + rng.normal(0, 2, slots[1].shape))
+                    .clip(0, 255).astype(np.uint8)
+                )
+            self.calls.append(slot)
+            return data
+
+    roll = Ls50Roll.__new__(Ls50Roll)
+    session = FakeSession()
+    roll.session = session
+    roll._stop_event = threading.Event()
+    roll._preview = None
+    roll._preview_ready = False
+    roll._approvals = set()
+    roll._output_root = __import__("pathlib").Path(".")
+
+    thumbnails = roll.preview()
+
+    assert [t.slot for t in thumbnails] == [1, 2, 3, 4, 5]
+    # One extra capture (the looped re-scan of frame 1) was served before the
+    # detector stopped the pass; it must never run out the whole 40-slot list.
+    assert session.calls == [1, 2, 3, 4, 5, 6]
+
+
+def test_ls50_strip_regions_match() -> None:
+    """The home-loop comparator accepts real re-scans and rejects different
+    frames and featureless (low-variance) images."""
+    from coolscanpy.protocol.ls50.workflow import _strip_regions_match
+
+    rng = np.random.default_rng(3)
+    a = (150 + rng.normal(0, 40, (595, 394, 3))).clip(0, 255).astype(np.uint8)
+    b = (150 + rng.normal(0, 40, (595, 394, 3))).clip(0, 255).astype(np.uint8)
+    # Identical capture -> match.
+    assert _strip_regions_match(a, a)
+    # Re-scan with tiny sensor noise -> still the same region.
+    noisy = (a.astype(np.int16) + rng.normal(0, 2, a.shape)).clip(0, 255).astype(np.uint8)
+    assert _strip_regions_match(a, noisy)
+    # Two different frames are never "the same region".
+    assert not _strip_regions_match(a, b)
+    # Featureless frames defer to the near-black detector (no false positive).
+    flat = np.full((595, 394, 3), 128, np.uint8)
+    assert not _strip_regions_match(flat, flat.copy())

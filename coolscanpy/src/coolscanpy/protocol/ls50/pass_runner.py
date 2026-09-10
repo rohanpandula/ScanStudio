@@ -28,7 +28,9 @@ import os
 import time
 from pathlib import Path
 
-from . import Ls50ScanOptions, Ls50Session
+import numpy as np
+
+from . import Ls50Session
 from .workflow import Ls50Roll
 
 
@@ -40,11 +42,6 @@ def _load_slot_map(path: str | None) -> dict[int, int]:
     if not isinstance(raw, dict):
         raise ValueError("slot map must be a JSON object {slot: frame}")
     return {int(k): int(v) for k, v in raw.items()}
-
-
-def _synthetic_frame(frame: int):
-    from .workflow import Ls50Frame
-    return Ls50Frame(index=frame, native_origin=(frame - 1) * 5959)
 
 
 def _write_proof(path: Path, text: str) -> None:
@@ -85,16 +82,22 @@ def main() -> None:
 
         if args.preview:
             t0 = time.monotonic()
-            res = roll.preview(dpi=400, depth=8)
+            thumbs = roll.preview(dpi=400, depth=8)
             prev_dir = cool_dir / "preview"
             prev_dir.mkdir(parents=True, exist_ok=True)
             import tifffile
+            # Preview returns a list of per-slot Thumbnails; stack their
+            # images into one whole-roll raster for the preview TIFF.
+            if thumbs:
+                raster = np.concatenate([t.image for t in thumbs], axis=0)
+            else:
+                raster = np.zeros((1, 1, 3), np.uint8)
             tifffile.imwrite(prev_dir / f"{args.stock}_preview.tif",
-                             res.rgb, photometric="rgb")
+                             raster, photometric="rgb")
             print(f"preview {time.monotonic()-t0:.0f}s -> {prev_dir / f'{args.stock}_preview.tif'}",
-                  f"({res.rgb.shape}) frames={res.slot_count}")
+                  f"({raster.shape}) frames={len(thumbs)}")
             _write_proof(cool_dir / "pass-summary.txt",
-                         f"preview {args.stock}: {res.rgb.shape} frames={res.slot_count}")
+                         f"preview {args.stock}: {raster.shape} frames={len(thumbs)}")
 
         # Determine the list of (slot, frame) to capture this pass.
         if args.pass_token.startswith("Arep") and args.pass_token != "A":
@@ -110,21 +113,33 @@ def main() -> None:
             frame = int(frame_s)
             stem = f"{args.stock}_{int(slot_s):02d}_{args.pass_token}"
             t0 = time.monotonic()
-            paths = roll.capture_frame(
-                roll.preview.frames[frame - 1] if roll.preview is not None
-                else _synthetic_frame(frame),
-                stem=stem,
-                directory=cool_dir,
+            # scan_many yields one captured frame per slot, writing the raw
+            # artifacts (RGB tif + -ir.tif + receipt) via the driver.
+            captured = list(roll.scan_many(
+                [frame],
+                output_directory=cool_dir,
                 pass_token=args.pass_token,
-                exposure_r=args.exp_r_us * 100,
-                exposure_g=args.exp_g_us * 100,
-                exposure_b=args.exp_b_us * 100,
+                exposure_override_10ns=(args.exp_r_us * 100,
+                                        args.exp_g_us * 100,
+                                        args.exp_b_us * 100),
+            ))
+            if not captured:
+                raise RuntimeError(f"slot {frame} produced no capture")
+            cap = captured[0]
+            # Write the driver's decoded arrays to the calibration artifacts.
+            import tifffile
+            rgb_path = cool_dir / f"{stem}.tif"
+            ir_path = cool_dir / f"{stem}-ir.tif"
+            tifffile.imwrite(rgb_path, cap.rgb)
+            if cap.ir is not None:
+                tifffile.imwrite(ir_path, cap.ir)
+            _write_proof(
+                cool_dir / "pass-summary.txt",
+                f"{stem}: slot={cap.slot} rgb={rgb_path.name} ir={ir_path.name}",
             )
             dt = time.monotonic() - t0
             print(f"[{i}/{len(frames_list)}] {stem}: {dt:.0f}s "
-                  f"({os.path.getsize(paths.rgb)>>20}MB tif)")
-            _write_proof(cool_dir / "pass-summary.txt",
-                         f"{stem}: {dt:.0f}s {os.path.getsize(paths.rgb)} {os.path.getsize(paths.ir)}")
+                  f"({os.path.getsize(rgb_path)>>20}MB tif)")
         total = time.monotonic() - start
         print(f"\npass {args.pass_token}: {len(frames_list)} frames in {total:.0f}s "
               f"({total/len(frames_list):.0f}s/frame)" if frames_list else "")

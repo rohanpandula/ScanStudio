@@ -702,7 +702,41 @@ class Device:
         preview, transport-table, journal, and capture evidence. Caller-owned
         evidence survives :meth:`Roll.close`; omitting it keeps the temporary,
         self-cleaning default.
+
+        For a recognized-but-unverified model (LS-50 ED) this returns the
+        LS-50 roll workflow, which drives the unit over direct USB with the
+        LS-50 protocol (no LS-5000 replay engine). It satisfies the same
+        bridge-facing surface (preview/approve/set_spacing_offset/scan_many).
         """
+
+        # LS-50 (recognized-but-unverified): use the LS-50 roll workflow so
+        # the ScanStudio UI drives the physical unit directly.
+        if self._info.model in _UNVERIFIED_DIRECT_USB_MODELS:
+            from coolscanpy.protocol.ls50.workflow import Ls50Roll
+            from coolscanpy.protocol.ls50.capture import Ls50Session
+
+            with self._state_lock:
+                self._require_usable_locked()
+                if not self._roll_lock.acquire(blocking=False):
+                    raise DeviceBusy(f"a Roll is already open on device {self._info.id}")
+            try:
+                session = Ls50Session(
+                    bus=(
+                        int(self._info.id.split(":")[1])
+                        if self._info.id.startswith("usb:")
+                        else None
+                    ),
+                    address=(
+                        int(self._info.id.split(":")[2])
+                        if self._info.id.startswith("usb:")
+                        else None
+                    ),
+                )
+                session.open()
+                return Ls50Roll(session=session, material=material, _device=self)
+            except BaseException:
+                self._roll_lock.release()
+                raise
 
         with self._state_lock:
             self._require_usable_locked()

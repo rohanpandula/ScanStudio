@@ -48,6 +48,37 @@ _PREVIEW_DEPTH = 8
 _FRAME_PITCH = 5959
 
 
+def _strip_regions_match(a: np.ndarray, b: np.ndarray, *,
+                        corr_threshold: float = 0.99, mae_threshold: float = 6.0) -> bool:
+    """True when two preview slot images are the same physical film region.
+
+    The transport homes back to frame 1 when asked to seek past the last real
+    frame (the strip ended), so the slot re-scans a window this pass has
+    already captured.  Such a pair is near pixel-identical (same optical path,
+    same exposure), while two genuinely different frames -- even adjacent
+    frames of one roll -- differ far more.
+
+    Both a normalized cross-correlation floor AND a mean-absolute-difference
+    ceiling must pass so that featureless (low-variance) frames, which are
+    unreliable under correlation alone, cannot false-positive here; those are
+    handled by the preview's near-black end-of-strip detector instead.
+    """
+    if a.shape != b.shape:
+        return False
+    a = np.asarray(a, dtype=np.float32)[::5, ::5]
+    b = np.asarray(b, dtype=np.float32)[::5, ::5]
+    a = a.reshape(-1)
+    b = b.reshape(-1)
+    if float(a.std()) < 5.0 or float(b.std()) < 5.0:
+        return False
+    a_c = a - a.mean()
+    b_c = b - b.mean()
+    denom = float(np.sqrt((a_c * a_c).sum()) * np.sqrt((b_c * b_c).sum()))
+    corr = float((a_c * b_c).sum() / denom) if denom > 0 else 0.0
+    mae = float(np.abs(a - b).mean())
+    return corr >= corr_threshold and mae <= mae_threshold
+
+
 @dataclass(frozen=True)
 class Ls50Frame:
     """One detected / placed frame on the strip."""
@@ -308,6 +339,26 @@ class Ls50Roll:
             img = a.reshape(fopt.logical_height, fopt.n_colors, fopt.logical_width)[:, :3, :]
             img = np.moveaxis(img, 1, -1)
             slot_images[frame.index] = img
+            # Home-loop detection: past the last real frame the LS-50 homes
+            # back to frame 1 and RESCANS it (no blank/error slot), so the
+            # near-black end-of-strip detector below never fires and the
+            # preview loops 1..N, N..1 forever.  A slot that is near
+            # pixel-identical to one this pass already captured means the
+            # transport looped -- discard the duplicate and stop the pass.
+            looped_into = next(
+                (s for s, prev in slot_images.items()
+                 if s != frame.index and _strip_regions_match(img, prev)),
+                None,
+            )
+            if looped_into is not None:
+                print(
+                    f"[ls50] slot {frame.index} matches already-captured slot "
+                    f"{looped_into}; transport looped past end of strip; stopping",
+                    flush=True,
+                )
+                del slot_images[frame.index]
+                end_of_strip_reached = True
+                break
             # End-of-strip detection: film run-out slots are near-black
             # (mean <20, std <5) vs a real blank frame (std ~40-90 from
             # grain). Require TWO consecutive near-black slots before
@@ -429,7 +480,13 @@ class Ls50Roll:
             end = max(min(new_start + min_rows, h), min_rows)
             crop = img[end - min_rows : end]
         new_rec = (new_start, new_start + crop.shape[0] - 1)
-        frames[slot] = frames[slot].with_offset(offset_rows)
+        # Persist the offset into the preview's stored frame list so the
+        # subsequent scan_many() capture window carries the operator's
+        # adjustment (Rohan review: previously only a local dict changed).
+        self._preview.frames = [
+            frame.with_offset(offset_rows) if frame.index == slot else frame
+            for frame in self._preview.frames
+        ]
         return Thumbnail(
             slot=slot,
             image=crop,
@@ -472,18 +529,35 @@ class Ls50Roll:
         root = Path(output_directory) if output_directory else self._output_root
         root.mkdir(parents=True, exist_ok=True)
         slots = sorted(set(slots))
+        # A fresh scan after "Done Previews" must not inherit the stale stop
+        # flag: preview_stop() set it to end the preview early.  Clear it so
+        # the subsequent capture can run; safe_stop() during the batch still
+        # stops the loop.
+        self._stop_event.clear()
         for ordinal, slot in enumerate(slots, 1):
             if self._stop_event.is_set():
                 raise SafeStopRequested("scan job stopped")
             frame = self._preview.frames[slot - 1] if self._preview and slot - 1 < len(self._preview.frames) else None
             if frame is None:
                 continue
+            # Apply the operator's spacing offset (set via set_spacing_offset,
+            # stored in preview rows) to the capture window.  The offset is in
+            # 400-dpi preview rows; convert to native units at capture dpi.
+            offset_native = 0
+            if self._preview is not None:
+                stored = next(
+                    (f for f in self._preview.frames if f.index == slot), None
+                )
+                if stored is not None and stored.spacing_offset_rows:
+                    offset_native = int(
+                        round(stored.spacing_offset_rows * self.scan_options.dpi / _PREVIEW_DPI)
+                    )
             opt = Ls50ScanOptions(
                 dpi=self.scan_options.dpi,
                 depth=self.scan_options.depth,
                 rgbi=True,
-                y_min=frame.native_origin,
-                y_max=frame.native_origin + _FRAME_PITCH - 1,
+                y_min=frame.native_origin + offset_native,
+                y_max=frame.native_origin + offset_native + _FRAME_PITCH - 1,
                 x_min=0,
                 x_max=3944,
                 negative=True,

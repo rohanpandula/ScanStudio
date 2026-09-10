@@ -722,6 +722,11 @@ def _validated_preview_from_attempt(
     )
 
 
+def _is_ls50_roll(roll: object) -> bool:
+    """True when the roll is the LS-50 driver's streaming roll."""
+    return type(roll).__name__ == "Ls50Roll"
+
+
 class CoolscanPyTransport:
     """Thin real adapter over CoolscanPy's `Device`/`Roll` API. Satisfies
     `transport.Transport` structurally -- no explicit inheritance needed,
