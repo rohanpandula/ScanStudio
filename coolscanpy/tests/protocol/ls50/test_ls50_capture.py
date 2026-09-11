@@ -197,3 +197,94 @@ def test_ls50_strip_regions_match() -> None:
     # Featureless frames defer to the near-black detector (no false positive).
     flat = np.full((595, 394, 3), 128, np.uint8)
     assert not _strip_regions_match(flat, flat.copy())
+
+
+def _build_preview_state() -> tuple:
+    """A 2-slot preview whose stacked raster and slot records are consistent
+    with ``Ls50Roll.preview`` output: slot 1 = rows 0..10 (a ramp), slot 2 =
+    rows 11..21 (its mirror), so boundary shifts are observable."""
+    from coolscanpy.protocol.ls50.workflow import Ls50PreviewResult, Ls50Frame
+
+    raster = np.zeros((22, 4, 3), np.uint8)
+    for r in range(11):
+        raster[r] = r
+        raster[21 - r] = 200 + r
+    slot_images = {1: raster[:11], 2: raster[11:]}
+    records = {1: (0, 10), 2: (11, 21)}
+    frames = [Ls50Frame(index=1, native_origin=0), Ls50Frame(index=2, native_origin=5959)]
+    return Ls50PreviewResult(rgb=raster, frames=frames, slot_images=slot_images, slot_records=records)
+
+
+def test_set_spacing_offset_returns_full_slot_height() -> None:
+    """The align step's re-crop must return the FULL slot height, shifted,
+    never a half-height zoomed sliver (bug: returned h//2 rows)."""
+    import threading
+    from coolscanpy.protocol.ls50.workflow import Ls50Roll
+
+    roll = Ls50Roll.__new__(Ls50Roll)
+    roll.session = object()
+    roll._stop_event = threading.Event()
+    roll._preview = _build_preview_state()
+    roll._preview_ready = True
+    roll._approvals = set()
+    roll._output_root = __import__("pathlib").Path(".")
+
+    base = roll._preview.slot_images[1]
+    thumb = roll.set_spacing_offset(1, 3)
+
+    assert thumb.image.shape == base.shape, \
+        f"re-crop must stay full slot size, got {thumb.image.shape} vs {base.shape}"
+    # Offset +3 shifts the window down 3 rows in the strip raster: crop row i
+    # is strip row (slot_start + 3 + i), exactly the LS-5000 re-crop rule.
+    raster = roll._preview.rgb
+    for i in range(thumb.image.shape[0]):
+        assert np.array_equal(thumb.image[i], raster[3 + i]), \
+            f"crop row {i} must equal strip row {3 + i}"
+
+
+def test_set_spacing_offset_negative_and_persist() -> None:
+    """Negative offsets shift up, and the offset persists into the frame list
+    so scan_many applies it."""
+    from coolscanpy.protocol.ls50.workflow import Ls50Roll
+
+    roll = Ls50Roll.__new__(Ls50Roll)
+    roll.session = object()
+    roll._stop_event = __import__("threading").Event()
+    roll._preview = _build_preview_state()
+    roll._preview_ready = True
+    roll._approvals = set()
+    roll._output_root = __import__("pathlib").Path(".")
+
+    thumb = roll.set_spacing_offset(2, -2)
+    assert thumb.image.shape == roll._preview.slot_images[2].shape
+    # Slot 2 starts at strip row 11; offset -2 -> crop row i is strip row 9+i.
+    raster = roll._preview.rgb
+    for i in range(thumb.image.shape[0]):
+        assert np.array_equal(thumb.image[i], raster[9 + i]), \
+            f"crop row {i} must equal strip row {9 + i}"
+    persisted = next(f for f in roll._preview.frames if f.index == 2)
+    assert persisted.spacing_offset_rows == -2
+
+
+def test_set_spacing_offset_pads_off_raster() -> None:
+    """Rows whose source falls off the captured raster are blank padding."""
+    import threading
+    from coolscanpy.protocol.ls50.workflow import Ls50Roll
+
+    roll = Ls50Roll.__new__(Ls50Roll)
+    roll.session = object()
+    roll._stop_event = threading.Event()
+    roll._preview = _build_preview_state()
+    roll._preview_ready = True
+    roll._approvals = set()
+    roll._output_root = __import__("pathlib").Path(".")
+
+    thumb = roll.set_spacing_offset(1, -4)
+    assert thumb.image.shape == roll._preview.slot_images[1].shape
+    # Slot 1 starts at strip row 0; offset -4 pushes the first 4 rows off the
+    # top -> blank, the rest is strip rows 0..6.
+    assert np.all(thumb.image[:4] == 0), "rows off the top must be blank"
+    raster = roll._preview.rgb
+    for i in range(4, thumb.image.shape[0]):
+        assert np.array_equal(thumb.image[i], raster[i - 4]), \
+            f"crop row {i} must equal strip row {i - 4}"

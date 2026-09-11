@@ -354,6 +354,15 @@ pub struct BridgePreviewStripResult {
     pub pixels_per_row: u32,
 }
 
+/// `roll.previewStop`'s result. The bridge returns `{"accepted": true}` as a
+/// fire-and-forget acknowledgement; the in-flight preview worker emits its
+/// own completion event when it observes the stop.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgePreviewStopResult {
+    pub accepted: bool,
+}
+
 // ---------------------------------------------------------------------
 // Scan progress + telemetry vocabulary (BRIDGE.md "Types": ScanProgress,
 // ExposureVector, ClippingTelemetry, FocusDetailTelemetry,

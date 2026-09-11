@@ -573,3 +573,89 @@ fn record_job_state(event: &Value, job_states: &mut Vec<String>) {
         }
     }
 }
+
+#[test]
+fn connect_preview_stop_is_accepted_noop_when_not_previewing() {
+    // `scanner.previewStop` must round-trip against the connected backend
+    // and acknowledge as a no-op even when no preview is in flight (the
+    // simulator's thumbnail acquisition is synchronous and never iterates).
+    let base = unique_test_output_root("preview-stop");
+    drop(base);
+
+    let bin = env!("CARGO_BIN_EXE_scanstudio-engine");
+    let mut child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn engine binary");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader_handle = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    send(
+        &mut stdin,
+        1,
+        "engine.hello",
+        json!({"clientName": "e2e-test", "protocolVersion": 1}),
+    );
+    assert!(
+        recv_response_for(&rx, 1, |_| {}).get("error").is_none(),
+        "hello failed"
+    );
+
+    send(&mut stdin, 2, "scanner.list", json!({}));
+    assert!(
+        recv_response_for(&rx, 2, |_| {}).get("error").is_none(),
+        "scanner.list failed"
+    );
+
+    send(
+        &mut stdin,
+        3,
+        "scanner.connect",
+        json!({"deviceId": "sim-ls5000-0", "options": {"timeScale": 0.01}}),
+    );
+    assert!(
+        recv_response_for(&rx, 3, |_| {}).get("error").is_none(),
+        "connect failed"
+    );
+
+    // No preview is running; the backend must still acknowledge the stop.
+    send(&mut stdin, 4, "scanner.previewStop", json!({}));
+    let resp = recv_response_for(&rx, 4, |_| {});
+    assert!(
+        resp.get("error").is_none(),
+        "scanner.previewStop failed: {resp:?}"
+    );
+    assert_eq!(resp["result"]["accepted"].as_bool(), Some(true));
+
+    drop(stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll engine") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("engine did not exit within one second after stdin closed");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "engine did not exit 0 after EOF: {status:?}");
+    let _ = reader_handle.join();
+}

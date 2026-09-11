@@ -2549,6 +2549,22 @@ public final class SessionModel {
         }
     }
 
+    /// Operator clicked "Done Previews": asks an in-progress preview
+    /// traversal to finish early with the frames captured so far (the
+    /// LS-50 roll's streaming preview). Fire-and-forget — the engine's
+    /// `scanner.previewStop` acknowledges immediately and the preview
+    /// worker emits `scanner.thumbnailsComplete` when it observes the stop,
+    /// which is what actually ends `isAcquiringThumbnails`. Safe to call
+    /// any time; a preview that is not running is a no-op.
+    public func finishPreviewsEarly() async {
+        do {
+            let _: EmptyResult = try await engineClient.request("scanner.previewStop", params: EmptyParams())
+        } catch {
+            recordOperationFailure(error, operation: "preview.stop")
+            lastErrorMessage = Self.describe(error)
+        }
+    }
+
     /// Success here means the engine's backend confirmed the film is out
     /// (BRIDGE.md `device.eject`: `{}` is confirmed-ejected only; a stall
     /// or no-capability report arrives as a typed error and lands in the

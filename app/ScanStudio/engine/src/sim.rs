@@ -976,6 +976,14 @@ impl ScannerBackend for SimulatedLs5000 {
         Ok(status_snapshot(&state))
     }
 
+    fn preview_stop(&self) -> Result<(), EngineError> {
+        // The simulator's thumbnail acquisition is synchronous and bursts to
+        // completion, so there is nothing in flight to stop; acknowledge it
+        // as a no-op exactly like the real backend treats a preview that is
+        // not running.
+        Ok(())
+    }
+
     fn eject(&self) -> Result<ScannerStatus, EngineError> {
         let mut state = self.state.lock().unwrap();
         if !state.connected {

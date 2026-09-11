@@ -1251,7 +1251,7 @@ private struct PreviewGateWorkspaceView: View {
 
             if sessionModel.isAcquiringThumbnails {
                 Button("Done Previews") {
-                    sessionModel.finishPreviewsEarly()
+                    Task { await sessionModel.finishPreviewsEarly() }
                 }
                 .buttonStyle(.bordered)
                 .disabled(!sessionModel.isAcquiringThumbnails)

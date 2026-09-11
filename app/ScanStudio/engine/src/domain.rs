@@ -96,6 +96,13 @@ pub trait ScannerBackend: Send + Sync + Sized {
 
     fn eject(&self) -> Result<ScannerStatus, EngineError>;
 
+    /// Asks an in-progress thumbnail/preview traversal to finish early with
+    /// the frames captured so far (BRIDGE.md `roll.previewStop`, additive for
+    /// the LS-50 roll workflow). Fire-and-forget: the preview worker emits
+    /// `scanner.thumbnailsComplete` when it observes the stop. A preview that
+    /// is not running is a no-op.
+    fn preview_stop(&self) -> Result<(), EngineError>;
+
     /// Kicks off thumbnail acquisition on a worker thread. `event_tx`
     /// receives fully-serialized NDJSON event lines (`scanner.thumbnail` per
     /// frame, then `scanner.thumbnailsComplete`). Returns the accepted frame

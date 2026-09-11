@@ -4075,6 +4075,35 @@ impl ScannerBackend for RealLs5000 {
         self.fresh_status_for_session(session_epoch, bridge_generation)
     }
 
+    fn preview_stop(&self) -> Result<(), EngineError> {
+        // Fire-and-forget to the bridge's roll.previewStop, which is
+        // deliberately NOT gated on motion: it signals the in-flight
+        // LS-50 preview worker to finish with the frames captured so far.
+        // The worker emits scanner.thumbnailsComplete when it observes the
+        // stop. Requires an active session (a preview may be running under
+        // it); a preview that is not running is a no-op on the bridge side.
+        let (session_epoch, bridge_generation) = self.active_session_identity()?;
+        let value = self.call_session_scoped(
+            session_epoch,
+            bridge_generation,
+            "roll.previewStop",
+            serde_json::json!({}),
+        )?;
+        let result: BridgePreviewStopResult = serde_json::from_value(value).map_err(|error| {
+            EngineError::new(
+                ErrorCode::Internal,
+                format!("malformed roll.previewStop result: {error}"),
+            )
+        })?;
+        if !result.accepted {
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                "bridge did not accept roll.previewStop",
+            ));
+        }
+        Ok(())
+    }
+
     fn acquire_thumbnails(
         backend: &Arc<Self>,
         frames: Option<Vec<u32>>,

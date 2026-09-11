@@ -710,6 +710,17 @@ impl Backends {
         }
     }
 
+    fn preview_stop(&self) -> Result<(), EngineError> {
+        match self.active {
+            Some(ActiveDevice::Sim) => self.sim.preview_stop(),
+            Some(ActiveDevice::Real) => self.real.as_ref().unwrap().preview_stop(),
+            None => Err(EngineError::new(
+                ErrorCode::NotConnected,
+                "scanner is not connected",
+            )),
+        }
+    }
+
     /// Simulator-only: the real backend has no bridge primitive capable of
     /// abandoning an in-flight frame (BRIDGE.md's `scan.stop` always lets the
     /// current slot finish). The real-hardware equivalent of "skip an upcoming
@@ -1545,6 +1556,10 @@ fn handle_request(
             let params: protocol::ScanSkipCurrentFrameParams = parse_params(&request.params)?;
             let acknowledged = backends.scan_skip_current_frame(&params.job_id)?;
             to_json(&protocol::ScanSkipCurrentFrameResult { acknowledged })
+        }
+        "scanner.previewStop" => {
+            backends.preview_stop()?;
+            Ok(serde_json::json!({ "accepted": true }))
         }
         "scanner.eject" => {
             let status = backends.eject()?;

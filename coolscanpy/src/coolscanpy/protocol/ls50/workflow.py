@@ -451,38 +451,39 @@ class Ls50Roll:
     # -- alignment / approval ----------------------------------------------
 
     def set_spacing_offset(self, slot: int, offset_rows: int) -> Thumbnail:
-        """Re-crop one preview slot by ``offset_rows`` (the UI frame-adjust).
+        """Nudge `slot`'s frame window by ``offset_rows`` preview rows.
 
-        Does not move the scanner; it shifts the slot's reported boundary
-        and re-renders the crop for the operator. The crop is clamped so it
-        never degenerates to a sliver: at least half the slot height is
-        always returned, anchored top or bottom depending on the shift sign.
+        Does not move the scanner; it shifts the slot's reported boundary and
+        re-renders the FULL-height crop shifted by the offset for the
+        operator, mirroring the LS-5000 ``Roll.set_spacing_offset`` (which
+        returns the whole re-cropped slot, never a sub-slot sliver). The crop
+        is read from the strip raster at the shifted row span; rows shifted
+        past the captured raster are blank padding, never a zoomed sliver.
         """
         if self._preview is None:
             raise ValueError("no preview session is established")
         frames = {f.index: f for f in self._preview.frames}
         if slot not in frames:
             raise ValueError(f"slot {slot} is not in the preview")
-        img = self._preview.slot_images[slot]
-        h = img.shape[0]
+        raster = self._preview.rgb
+        h = raster.shape[0]
         if h <= 1:
             raise ValueError(f"slot {slot} preview image is degenerate")
-        base = self._preview.slot_records.get(slot, (0, h - 1))
-        # Apply the offset to the top boundary, clamped to a sane window.
-        min_rows = max(h // 2, 1)
-        new_start = base[0] + offset_rows
-        # Keep at least min_rows from the top OR bottom depending on the
-        # shift direction; never return a degenerate sliver.
-        if offset_rows >= 0:
-            new_start = min(max(new_start, 0), h - min_rows)
-            crop = img[new_start : new_start + min_rows]
-        else:
-            end = max(min(new_start + min_rows, h), min_rows)
-            crop = img[end - min_rows : end]
-        new_rec = (new_start, new_start + crop.shape[0] - 1)
-        # Persist the offset into the preview's stored frame list so the
-        # subsequent scan_many() capture window carries the operator's
-        # adjustment (Rohan review: previously only a local dict changed).
+        base = self._preview.slot_records.get(slot)
+        if base is None:
+            raise ValueError(f"slot {slot} has no recorded boundary")
+        slot_start, slot_end = base
+        slot_h = slot_end - slot_start + 1
+        # Read the full-height window at the shifted span. Row ``i`` of the
+        # crop comes from strip row ``slot_start + offset_rows + i``; rows
+        # whose source falls off the captured raster are blank (zero)
+        # padding, matching the LS-5000's whole-raster re-crop behavior.
+        window_start = slot_start + offset_rows
+        crop = np.zeros((slot_h, *raster.shape[1:]), dtype=raster.dtype)
+        src_start = max(window_start, 0)
+        src_end = min(window_start + slot_h, h)
+        if src_end > src_start:
+            crop[src_start - window_start : src_end - window_start] = raster[src_start:src_end]
         self._preview.frames = [
             frame.with_offset(offset_rows) if frame.index == slot else frame
             for frame in self._preview.frames
