@@ -85,6 +85,22 @@ struct CarrierLoadingWorkspaceView: View {
                         .foregroundStyle(Color.scanStudioSecondaryText)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    // The LS-50 driver still walks a hardcoded 40-slot list
+                    // (it has no way to read the real frame count without
+                    // risking a wedge on the 0x8f probe -- see the 2026-09-11
+                    // handoff), so seeking past the true last frame can
+                    // auto-eject the strip. This is the operator's only way
+                    // to stop that seek before it happens: this view is the
+                    // one actually shown while `isAcquiringThumbnails` is
+                    // true (ContentView routes here, never to
+                    // `PreviewGateWorkspaceView`, during acquisition), so the
+                    // button belongs here, not on the pre-acquisition gate.
+                    Button("Done Previews") {
+                        Task { await sessionModel.finishPreviewsEarly() }
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Stop previewing now and keep the frames captured so far.")
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 18)

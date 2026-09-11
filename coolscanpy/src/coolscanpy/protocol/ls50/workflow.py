@@ -47,6 +47,16 @@ _PREVIEW_DPI = 400
 _PREVIEW_DEPTH = 8
 _FRAME_PITCH = 5959
 
+# Fallback ceiling ONLY when the caller doesn't supply `slots` (i.e. the
+# operator didn't say how many frames are loaded): the driver has no way to
+# read the LS-50's real frame count without risking a wedge (see the 0x8f
+# table note in capture.py's module docstring), so it has to blindly walk
+# slots one at a time up to this ceiling. An operator-supplied `slots` (see
+# preview()'s docstring) is the real fix -- it bounds the walk to exactly
+# what's loaded, so the transport never sees a seek past the true last
+# frame at all.
+_MAX_PREVIEW_SLOTS_UNKNOWN_COUNT = 40
+
 
 def _strip_regions_match(a: np.ndarray, b: np.ndarray, *,
                         corr_threshold: float = 0.99, mae_threshold: float = 6.0) -> bool:
@@ -154,7 +164,16 @@ class Ls50FrameReceiptMinimal:
     device_id: str = "usb:0:0"
     spacing_offset: int = 0
     reviewed_fingerprint_sha256: str = "0" * 64
-    fresh_fingerprint_sha256: str = None
+    # The engine's BridgeScanReceipt.fresh_fingerprint_sha256 is a required
+    # String, not Optional -- a Python None here serializes to JSON null,
+    # which fails Rust deserialization with "invalid type: null, expected a
+    # string". That failure is silent (real_backend.rs treats an
+    # undeserializable scan.frameCompleted payload as an event to skip, not
+    # an error to surface), so every LS-50 frame just vanished from the
+    # engine's evidence tracking regardless of how the batch ended --
+    # confirmed live 2026-09-11 via a temporary debug log placed at the
+    # exact deserialization call site.
+    fresh_fingerprint_sha256: str = "0" * 64
     manual_approval: object = None
     started_at: object = None
     capture_duration_ms: int = 0
@@ -178,7 +197,14 @@ class Ls50FrameReceiptMinimal:
     @property
     def clipping(self) -> object:
         class _Clipping:
-            fractions = ()
+            # The engine's BridgeClippingTelemetry requires exactly a
+            # (f64, f64, f64) tuple here. An empty tuple made every LS-50
+            # frame's scan.frameCompleted payload fail Rust deserialization
+            # -- silently, with no error anywhere -- so the frame never
+            # reached the evidence accumulator and every real scan reported
+            # "missing eligible frame receipts" for every slot, no matter
+            # how the batch ended (live 2026-09-11).
+            fractions = (0.0, 0.0, 0.0)
             clip_level = 0
             warning_fraction = 1.0
             warning = False
@@ -287,7 +313,16 @@ class Ls50Roll:
         the stream on long strips.
         """
         slots = sorted(set(slots)) if slots is not None else None
-        frames = [Ls50Frame(index=i + 1, native_origin=i * _FRAME_PITCH) for i in range(40)]
+        # An operator-supplied `slots` (e.g. "this strip has 5 frames") is the
+        # real fix: it bounds the walk to exactly what's loaded, so slot 6 is
+        # never attempted and the transport never sees a seek past the true
+        # last frame. Only fall back to the temporary blind-walk cap when the
+        # caller doesn't know the count.
+        max_slot = max(slots) if slots else _MAX_PREVIEW_SLOTS_UNKNOWN_COUNT
+        frames = [
+            Ls50Frame(index=i + 1, native_origin=i * _FRAME_PITCH)
+            for i in range(max_slot)
+        ]
         opt = Ls50ScanOptions(
             dpi=dpi, depth=depth, rgbi=True, y_min=0, y_max=60 * _FRAME_PITCH,
             x_min=0, x_max=3944, negative=True,
@@ -334,6 +369,24 @@ class Ls50Roll:
                     end_of_strip_reached = True
                     break
             line = fopt.line_bytes_padded
+            # A transport that comes back with no film under the head (an
+            # eject mid-seek, or a reload that landed short) can return a
+            # clean, error-free but EMPTY read (sense 000000, zero bytes) --
+            # `_read_lines` treats an immediate short/zero read as a normal
+            # end-of-stream, not a fault. Reshaping that empty buffer into
+            # the fixed frame shape below raises a raw ValueError that is
+            # NOT an Ls50CaptureError, so it used to escape every retry/stop
+            # guard in this loop and crash the whole preview instead of
+            # ending it gracefully (2026-09-11 live: "cannot reshape array
+            # of size 0 into shape (595,2048)" right after an eject).
+            if len(data) < fopt.logical_height * line:
+                print(
+                    f"[ls50] slot {frame.index} returned {len(data)} bytes, "
+                    f"expected {fopt.logical_height * line}; assuming end of strip",
+                    flush=True,
+                )
+                end_of_strip_reached = True
+                break
             a = np.frombuffer(data, dtype=np.uint8)[: fopt.logical_height * line]
             a = a.reshape(fopt.logical_height, line)[:, : fopt.line_bytes_raw]
             img = a.reshape(fopt.logical_height, fopt.n_colors, fopt.logical_width)[:, :3, :]
@@ -571,7 +624,34 @@ class Ls50Roll:
                     exposure_b_raw_10ns=exposure_override_10ns[2],
                 )
             data = self.session.capture(opt, boundary_best_effort=True)
+            # Same empty-read hazard as preview() above: a clean but
+            # zero/short read (e.g. film ejected mid-seek) must fail with a
+            # typed, catchable error, not a raw ValueError out of
+            # _decode_rgbi's reshape.
+            expected = opt.logical_height * opt.line_bytes_padded
+            if len(data) < expected:
+                raise Ls50CaptureError(
+                    f"slot {slot} returned {len(data)} bytes, expected {expected} "
+                    "(film may have ejected or the transport lost the frame)"
+                )
             rgb, ir = self._decode_rgbi(data, opt)
+            # The engine's derivative renderer refuses to render an archive
+            # master at all without a recognized storageTransform (it never
+            # guesses an orientation) -- LS-50 receipts previously left this
+            # None, which is why a real scan's Positive/Preview never
+            # rendered regardless of how the batch ended. Declaring the
+            # LS-5000's existing "swapaxes01" transform here (rather than
+            # inventing a new one) means the engine applies the SAME single
+            # swap to this raw capture that the preview path already applies
+            # via `_normalize_preview_tile`.
+            #
+            # 2026-09-11: multiple extra flips/rotations were tried here and
+            # rejected by the operator against real end-to-end renders --
+            # the operator's own read: the LS-50's optical path has no
+            # mirror in it, so the wire-native capture should not need one
+            # added back in software. No extra transform here at all; the
+            # engine's own single swapaxes01 (applied identically to the
+            # preview path) is the only transform in play.
             receipt = Ls50FrameReceiptMinimal(
                 slot=slot,
                 device_model="LS-50 ED",
@@ -581,6 +661,7 @@ class Ls50Roll:
                 green_10ns=opt.exposure_g_raw_10ns,
                 blue_10ns=opt.exposure_b_raw_10ns,
                 capture_duration_ms=0,
+                storage_transform="swapaxes01-scanner-native-to-nikon-render-parity-v2",
             )
             if on_progress is not None:
                 on_progress(object(), ordinal)

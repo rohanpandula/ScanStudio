@@ -965,6 +965,13 @@ public final class SessionModel {
     public var scanMultisamplePasses = 4
     public var scanChannels = "rgbi"
     public var scanFilmProcess: FilmProcess = .c41ColorNegative
+    /// Operator-supplied frame count for the next `requestPreview` call, set
+    /// from the Acquire Previews confirmation sheet. Some real scanners (the
+    /// LS-50 direct-USB path) have no safe way to read their own real frame
+    /// count and otherwise walk slots blindly, which can seek the transport
+    /// past the true last frame and auto-eject the strip. `nil` (left blank)
+    /// preserves the scanner's own default (full-roll) behavior.
+    public var knownFrameCount: Int?
     /// Process used by the currently previewed real film. A project created
     /// from that registration must preserve this choice unless the operator
     /// deliberately runs a new preview.
@@ -1833,7 +1840,7 @@ public final class SessionModel {
         )
         do {
             let params = AcquireThumbnailsParams(
-                frames: nil,
+                frames: knownFrameCount.flatMap { $0 > 0 ? Array(1...$0) : nil },
                 filmProcess: process,
                 operationId: intent.operationID
             )

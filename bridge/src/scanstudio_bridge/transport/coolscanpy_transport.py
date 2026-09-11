@@ -421,7 +421,7 @@ def _device_info_from_coolscanpy(info: coolscanpy.DeviceInfo) -> domain.DeviceIn
     )
 
 
-def _normalize_preview_tile(image: np.ndarray) -> np.ndarray:
+def _normalize_preview_tile(image: np.ndarray, *, mirror: bool = False) -> np.ndarray:
     """Transpose an HxWx3 scanner-native crop into Nikon-render orientation,
     then stretch it to an 8-bit display tile.
 
@@ -429,8 +429,21 @@ def _normalize_preview_tile(image: np.ndarray) -> np.ndarray:
     it never rotates or flips an axis. A 0.5th/99.5th percentile clip across
     the whole array is linearly rescaled onto 0-255. No resize -- CoolscanPy's
     preview crops are already thumbnail-sized.
+
+    ``mirror=True`` (the LS-50 preview path only): direct pixel comparison
+    2026-09-11 -- the operator confirmed the plain swap is correct for the
+    LS-50's real (4000dpi) capture (`scan_many`, which passes no mirror),
+    but that SAME plain swap on the 400dpi preview crop came out a mirror
+    image of that confirmed-correct orientation (silo/watch billboard on
+    the opposite side). Verified directly: `flipud` on the actual on-disk
+    preview tile reproduces the confirmed-correct layout exactly. The two
+    decode paths are not interchangeable despite structurally similar code
+    -- do not assume a fix on one path applies to the other without
+    checking the actual file from THAT path again.
     """
     upright = np.swapaxes(image, 0, 1)
+    if mirror:
+        upright = np.flipud(upright)
     low, high = np.percentile(upright, (0.5, 99.5))
     span = max(high - low, 1.0)
     stretched = (np.clip(upright, low, high).astype(np.float64) - low) * (255.0 / span)
@@ -1044,7 +1057,7 @@ class CoolscanPyTransport:
                         tile_path = preview_dir / f"slot-{thumbnail.slot:04d}.tif"
                         tifffile.imwrite(
                             tile_path,
-                            _normalize_preview_tile(thumbnail.image),
+                            _normalize_preview_tile(thumbnail.image, mirror=True),
                             photometric="rgb",
                         )
                         on_thumbnail(_thumbnail_from_coolscanpy(thumbnail, image_path=str(tile_path)))
@@ -1273,7 +1286,10 @@ class CoolscanPyTransport:
             tile_path = preview_dir / f"slot-{thumbnail.slot:04d}.tif"
             tifffile.imwrite(
                 tile_path,
-                _normalize_preview_tile(thumbnail.image),
+                # Must match the initial preview tile's mirror exactly, or
+                # the operator drags "left"/"right" against a display
+                # that's mirrored relative to what they just saw.
+                _normalize_preview_tile(thumbnail.image, mirror=_is_ls50_roll(self._roll)),
                 photometric="rgb",
             )
         except Exception as exc:

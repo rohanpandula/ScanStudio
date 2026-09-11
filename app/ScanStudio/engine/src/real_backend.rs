@@ -4157,12 +4157,25 @@ impl ScannerBackend for RealLs5000 {
         // "Reject before accepting": validate/round-trip synchronously,
         // exactly like every other ScannerBackend method; the actual
         // preview stream is reported purely through events afterward.
+        //
+        // An operator-supplied `frames` count (BRIDGE.md's roll.preview
+        // `slots`) bounds which slots the transport is ever asked to seek
+        // to. This matters most for the LS-50, which has no way to read its
+        // own real frame count without risking a wedge: without a bound,
+        // it blindly walks up to 40 slots and can seek past the true last
+        // frame, which the transport itself can answer by auto-ejecting the
+        // strip. Passed straight through as 1..=N; the caller (Swift) is
+        // responsible for turning an operator's frame count into that list.
+        let mut preview_params = serde_json::json!({ "material": map_material(film_process) });
+        if let Some(requested_frames) = frames.as_ref() {
+            preview_params["slots"] = serde_json::json!(requested_frames);
+        }
         backend
             .call_session_scoped(
                 session_epoch,
                 bridge_generation,
                 "roll.preview",
-                serde_json::json!({ "material": map_material(film_process) }),
+                preview_params,
             )
             .map_err(|error| {
                 backend.retire_preview_approval_window(
@@ -7007,6 +7020,29 @@ fn bridge_event_belongs_to_scan_job(value: &serde_json::Value, job_id: &str) -> 
 /// second timeout around it — the exact "zero further bridge calls"
 /// principle 10-04 already applied to this function's OWN terminal-failure
 /// branch, just missed at the function's entry.
+// TEMPORARY (2026-09-11): tracing the LS-50 real-scan evidence-recording
+// bug (every completed frame ends up "missing" from the evidence package
+// regardless of how the batch ends). This process's own stderr goes to
+// /dev/null under the packaged app, so this writes straight to a file
+// instead. Remove once the bug is found and fixed.
+fn debug_log(message: &str) {
+    use std::io::Write;
+    let path = dirs_next_home().join(".scanstudio").join("engine-debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn dirs_next_home() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+}
+
 fn run_real_scan_job(
     backend: Arc<RealLs5000>,
     job_id: String,
@@ -7304,8 +7340,12 @@ fn run_real_scan_job_inner(
                 // that engine-side work runs.
                 let event_arrived_at = Instant::now();
                 if !bridge_event_belongs_to_scan_job(&value, &job_id) {
+                    debug_log(&format!(
+                        "job={job_id}: event did NOT belong to this scan job, skipping: {value}"
+                    ));
                     continue;
                 }
+                debug_log(&format!("job={job_id}: event belongs to this job: {value}"));
                 // Only a recognized event carrying this job's exact token
                 // proves that this operation is actively communicating.
                 silence_deadline = event_arrived_at + backend.scan_silence_deadline;
@@ -7401,21 +7441,43 @@ fn run_real_scan_job_inner(
                     }
                     "scan.frameCompleted" => {
                         let Some(payload) = value.get("payload").cloned() else {
+                            debug_log(&format!(
+                                "scan.frameCompleted job={job_id}: no /payload in event: {value}"
+                            ));
                             continue;
                         };
                         let Ok(frame_completed) =
-                            serde_json::from_value::<BridgeFrameCompletedPayload>(payload)
+                            serde_json::from_value::<BridgeFrameCompletedPayload>(payload.clone())
                         else {
+                            let parse_error = serde_json::from_value::<BridgeFrameCompletedPayload>(
+                                payload.clone(),
+                            )
+                            .unwrap_err();
+                            debug_log(&format!(
+                                "scan.frameCompleted job={job_id}: DESERIALIZE FAILED: {parse_error}\npayload={payload}"
+                            ));
                             continue;
                         };
+                        debug_log(&format!(
+                            "scan.frameCompleted job={job_id} slot={} deserialized ok",
+                            frame_completed.slot
+                        ));
                         if !admit_evidence_frame_slot(
                             &requested_slots,
                             &remaining,
                             frame_completed.slot,
                             &mut evidence_admission_error,
                         ) {
+                            debug_log(&format!(
+                                "scan.frameCompleted job={job_id} slot={}: admit_evidence_frame_slot REJECTED (requested_slots={:?}, remaining={:?})",
+                                frame_completed.slot, requested_slots, remaining
+                            ));
                             continue;
                         }
+                        debug_log(&format!(
+                            "scan.frameCompleted job={job_id} slot={}: admitted, about to push evidence",
+                            frame_completed.slot
+                        ));
                         let frame_overrides = overrides.get(&frame_completed.slot);
                         let effective_output = frame_overrides
                             .and_then(|value| value.output.as_ref())
@@ -7591,6 +7653,16 @@ fn run_real_scan_job_inner(
                                     .as_ref()
                                     .map(std::path::PathBuf::from),
                             });
+                            debug_log(&format!(
+                                "job={job_id} slot={}: evidence.push DONE, evidence.len() now {}",
+                                frame_completed.slot,
+                                evidence.len()
+                            ));
+                        } else {
+                            debug_log(&format!(
+                                "job={job_id} slot={}: shared_evidence.lock() FAILED (poisoned)",
+                                frame_completed.slot
+                            ));
                         }
                         let mut stable_snapshot_paths = Vec::new();
                         let derivative = (|| {

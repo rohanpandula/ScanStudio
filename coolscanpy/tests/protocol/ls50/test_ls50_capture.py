@@ -288,3 +288,95 @@ def test_set_spacing_offset_pads_off_raster() -> None:
     for i in range(4, thumb.image.shape[0]):
         assert np.array_equal(thumb.image[i], raster[i - 4]), \
             f"crop row {i} must equal strip row {i - 4}"
+
+
+def test_preview_survives_a_clean_empty_read_mid_strip() -> None:
+    """A film-ejected-mid-seek slot can come back with sense 000000 but ZERO
+    bytes (``_read_lines`` treats an immediate short read as a normal
+    end-of-stream, not a fault). Reshaping that empty buffer into the fixed
+    frame shape used to raise a raw, uncaught ValueError that crashed the
+    whole preview instead of ending it gracefully -- live 2026-09-11:
+    "cannot reshape array of size 0 into shape (595,2048)" right after an
+    eject. The frames captured before the empty read must still come back."""
+    import threading
+    from coolscanpy.protocol.ls50.workflow import Ls50Roll
+
+    rng = np.random.default_rng(11)
+    slots = {
+        s: (150 + rng.normal(0, 40, (595, 394, 3))).clip(0, 255).astype(np.uint8)
+        for s in range(1, 4)
+    }
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        def capture(self, opt, boundary_best_effort=True):
+            self.calls += 1
+            if self.calls <= 3:
+                return _encode_slot(slots[self.calls])
+            return b""  # eject mid-seek: clean, but empty
+
+    roll = Ls50Roll.__new__(Ls50Roll)
+    roll.session = FakeSession()
+    roll._stop_event = threading.Event()
+    roll._preview = None
+    roll._preview_ready = False
+    roll._approvals = set()
+    roll._output_root = __import__("pathlib").Path(".")
+
+    thumbnails = roll.preview()  # must not raise
+
+    assert [t.slot for t in thumbnails] == [1, 2, 3]
+
+
+def test_scan_many_pre_flips_and_tags_storage_transform() -> None:
+    """The engine's derivative renderer unconditionally applies the LS-5000's
+    "swapaxes01" storage transform to any archive master, and refuses to
+    render at all without a recognized storageTransform tag -- LS-50 receipts
+    previously left this None, so a real scan's Positive/Preview never
+    rendered at all. Settled by normalized cross-correlation (not eyeballing,
+    after several wrong visual calls both ways) between the confirmed-correct
+    preview tile and 4 transformed candidates of a real full-res capture of
+    the same frame: flipud(swap(x)) scored clearly highest. The preview path
+    gets that via `_normalize_preview_tile(mirror=True)`; the engine has no
+    second flip, so `scan_many` must store a pre-flipped master:
+    swap(fliplr(x)) == flipud(swap(x)) for any x, so storing fliplr(x) here
+    reproduces the same confirmed-correct result once the engine's own swap
+    runs on it."""
+    import threading
+    from dataclasses import replace as dc_replace
+
+    from coolscanpy.protocol.ls50.capture import Ls50ScanOptions
+    from coolscanpy.protocol.ls50.workflow import Ls50Frame, Ls50PreviewResult, Ls50Roll
+
+    rng = np.random.default_rng(5)
+    img = (150 + rng.normal(0, 40, (595, 394, 3))).clip(0, 255).astype(np.uint8)
+
+    class FakeSession:
+        def capture(self, opt, boundary_best_effort=True):
+            return _encode_slot(img)
+
+    roll = Ls50Roll.__new__(Ls50Roll)
+    roll.session = FakeSession()
+    roll._stop_event = threading.Event()
+    roll._output_root = __import__("pathlib").Path(".")
+    roll.scan_options = Ls50ScanOptions(dpi=400, depth=8, rgbi=True)
+    roll._preview = Ls50PreviewResult(
+        rgb=np.zeros((1, 1, 3), np.uint8),
+        frames=[Ls50Frame(index=1, native_origin=0)],
+        slot_images={},
+        slot_records={},
+    )
+
+    (frame,) = list(roll.scan_many([1]))
+
+    assert frame.receipt.storage_transform == (
+        "swapaxes01-scanner-native-to-nikon-render-parity-v2"
+    )
+    opt = dc_replace(
+        Ls50ScanOptions(dpi=400, depth=8, rgbi=True),
+        y_min=0, y_max=5958,
+    )
+    naive_rgb, _ = Ls50Roll._decode_rgbi(_encode_slot(img), opt)
+    assert np.array_equal(frame.rgb, naive_rgb)

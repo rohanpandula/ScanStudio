@@ -1248,15 +1248,6 @@ private struct PreviewGateWorkspaceView: View {
             .help(sessionModel.hardwareMotionReadiness.allowsMotion
                 ? "Open the explicit preview confirmation"
                 : sessionModel.hardwareMotionReadiness.guidance)
-
-            if sessionModel.isAcquiringThumbnails {
-                Button("Done Previews") {
-                    Task { await sessionModel.finishPreviewsEarly() }
-                }
-                .buttonStyle(.bordered)
-                .disabled(!sessionModel.isAcquiringThumbnails)
-                .help("Stop previewing now and keep the frames captured so far.")
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.scanStudioWorkspace)
@@ -1297,6 +1288,7 @@ private struct AcquirePreviewConfirmationSheet: View {
     @Bindable var session: SessionModel
     let intent: PreviewIntent
     @Environment(\.dismiss) private var dismiss
+    @State private var frameCountText: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -1306,11 +1298,29 @@ private struct AcquirePreviewConfirmationSheet: View {
                 .font(.footnote)
                 .foregroundStyle(Color.scanStudioSecondaryText)
             HardwareMotionReadinessView()
+            // Some real scanners (the LS-50 direct-USB path) have no safe way
+            // to read their own real frame count and otherwise have to walk
+            // slots blindly -- a seek past the true last frame can auto-eject
+            // the strip. Telling it up front bounds that walk to exactly
+            // what's loaded, so it's never attempted. Left blank, the
+            // scanner's own default (full-roll) behavior is unchanged.
+            VStack(alignment: .leading, spacing: 4) {
+                LabeledContent("Frames on this roll/strip") {
+                    TextField("e.g. 5 (leave blank if unsure)", text: $frameCountText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                }
+                Text("Only needed if the scanner can't detect the real count itself. Leave blank for a full roll.")
+                    .font(.caption)
+                    .foregroundStyle(Color.scanStudioSecondaryText)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Acquire Previews") {
                     let admittedIntent = intent
+                    let trimmed = frameCountText.trimmingCharacters(in: .whitespaces)
+                    session.knownFrameCount = trimmed.isEmpty ? nil : Int(trimmed)
                     Task {
                         _ = await session.requestPreview(admittedIntent)
                         dismiss()
