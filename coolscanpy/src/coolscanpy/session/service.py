@@ -13,12 +13,13 @@ logger = get_logger(__name__)
 class ScannerService:
     """Orchestrates device enumeration, scan execution, and file writing."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_unverified: bool = False) -> None:
         self._backend: ScannerBackend | None = None
+        self._allow_unverified = allow_unverified
 
     def _get_backend(self) -> ScannerBackend:
         if self._backend is None:
-            self._backend = SaneBackend()
+            self._backend = SaneBackend(allow_unverified=self._allow_unverified)
         return self._backend
 
     def list_devices(self) -> list[ScannerDevice]:

@@ -1412,7 +1412,7 @@ def _progress_segment(
 class SaneBackend:
     """python-sane implementation of ScannerBackend. Only module that imports `sane`."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_unverified: bool = False) -> None:
         if sys.platform.startswith("linux"):
             _preload_libsane()
         try:
@@ -1422,6 +1422,7 @@ class SaneBackend:
         self._sane = sane
         self._sane_initialized = False
         self._devices_cache: list[ScannerDevice] | None = None
+        self._allow_unverified = allow_unverified
 
     def _ensure_initialized(self) -> None:
         if self._sane_initialized:
@@ -1462,7 +1463,14 @@ class SaneBackend:
                 "enumeration; refusing to move an unverified scanner"
             )
         raw_model = match[2] if len(match) > 2 else ""
-        _model, supported = _sane_model_string_and_supported(raw_model)
+        # `getattr` (not `self._allow_unverified`) so a backend built through
+        # `__new__` by a test/fixture -- which deliberately skips __init__ and
+        # therefore never sets the flag -- still behaves as the strict
+        # pre-opt-in default (False) instead of raising AttributeError.
+        _model, supported = _sane_model_string_and_supported(
+            raw_model,
+            allow_unverified=getattr(self, "_allow_unverified", False),
+        )
         if not supported:
             raise RuntimeError(
                 f"{raw_model or device_id} is recognized but not supported; "

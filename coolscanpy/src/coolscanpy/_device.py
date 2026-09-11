@@ -149,7 +149,11 @@ _SANE_COOLSCAN_MODEL_MARKERS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _sane_model_string_and_supported(raw_model: str | None) -> tuple[str, bool]:
+def _sane_model_string_and_supported(
+    raw_model: str | None,
+    *,
+    allow_unverified: bool = False,
+) -> tuple[str, bool]:
     """Classify one SANE-enumerated coolscan3 model STRING (#103).
 
     String-level core of :func:`_sane_model_and_supported`, split out so the
@@ -174,6 +178,16 @@ def _sane_model_string_and_supported(raw_model: str | None) -> tuple[str, bool]:
     synthesize an LS-5000 identity for it. Fail-closed loses nothing real:
     genuine LS-5000 units report the exact byte-for-byte trimmed string this
     table is sourced from.
+
+    With ``allow_unverified=True`` a recognized-but-unverified Coolscan (an
+    LS-50 ED or other direct-USB sibling in
+    :data:`_UNVERIFIED_DIRECT_USB_MODELS`) is promoted to supported so the
+    opted-in SANE lane can drive it end to end -- the same opt-in the
+    direct-USB lane honors, mirrored here so the SANE capture gate
+    (``SaneBackend._require_supported_coolscan_identity``) cannot refuse a
+    unit the operator explicitly allowed.  Unknown/near-match strings stay
+    refused either way: an opt-in may widen the recognized family, never
+    invent one.
     """
 
     normalized = " ".join((raw_model or "").split())
@@ -189,6 +203,8 @@ def _sane_model_string_and_supported(raw_model: str | None) -> tuple[str, bool]:
         if marker == "LS-5000":
             continue
         if re.search(rf"{re.escape(marker)}(?![0-9A-Za-z])", normalized):
+            if allow_unverified and canonical_name in _UNVERIFIED_DIRECT_USB_MODELS:
+                return canonical_name, True
             return canonical_name, False
     # A blank/whitespace-only string reports no identity at all; keep that
     # emptiness instead of echoing opaque padding back as a "name".
@@ -205,15 +221,15 @@ def _sane_model_and_supported(device: ScannerDevice) -> tuple[str, bool]:
     return _sane_model_string_and_supported(device.model)
 
 
-def _default_service_factory() -> "ScannerService":
+def _default_service_factory(allow_unverified: bool = False) -> "ScannerService":
     from coolscanpy.session.service import ScannerService
 
-    return ScannerService()
+    return ScannerService(allow_unverified=allow_unverified)
 
 
 # Rebindable so tests can substitute a service that wraps a fake backend
 # without touching hardware or python-sane. See tests/test_facade.py.
-_service_factory: Callable[[], "ScannerService"] = _default_service_factory
+_service_factory: Callable[..., "ScannerService"] = _default_service_factory
 
 _open_devices: set[str] = set()
 _open_devices_lock = threading.Lock()
@@ -368,36 +384,54 @@ def get_devices(local_only: bool = False) -> list[DeviceInfo]:
     ``supported=False`` so it is visible rather than silently missing -- see
     :func:`_usb_fallback_device_infos`.
 
-    Tries the SANE route first. When SANE is unavailable, its enumeration
-    fails, or it finds no Coolscan, falls back to direct USB enumeration -- see
-    :func:`_usb_fallback_device_infos`.
+    2026-09-09: tries coolscanpy's own direct USB enumeration FIRST now, not
+    SANE. Every real capture/preview/scan always talks to the device over
+    raw pyusb (see ``protocol.ls5000_single_pass.worker``), never through
+    SANE -- ``Device._service`` (the SANE-backed one) is only ever used by
+    the separate, roll-independent ``Device.scan()`` convenience method,
+    nothing in the roll/preview/capture pipeline. Handing that pipeline a
+    "coolscan3:..." id sourced from SANE's own enumeration was the root
+    cause of every preview/scan failing instantly with a spurious "0
+    recognized Nikon Coolscan devices" error on at least one real Mac + LS-50
+    pairing: SANE's and pyusb's bus/address numbers for the same physical
+    port did not reliably agree, so the later raw-USB open, done by pyusb
+    completely independently, could never find a device at the address SANE
+    had reported. Enumerating directly over pyusb from the start means the
+    id handed back is already in the same numbering the capture pipeline
+    will independently re-derive later. SANE remains a fallback only for
+    whatever direct USB enumeration itself cannot see.
     """
 
     del local_only
-    sane_error: Exception | None = None
+    usb_error: Exception | None = None
+    try:
+        infos = _usb_fallback_device_infos()
+    except Exception as error:
+        usb_error = error
+        infos = []
+    if infos:
+        return infos
     try:
         service = _service_factory()
         devices = service.list_devices()
-    except Exception as error:
-        sane_error = error
-        devices = []
-    infos = [
+    except Exception as sane_error:
+        # Nothing on either lane. If USB itself raised (backend broken, not
+        # simply absent), surface that as the diagnosis; if USB simply found
+        # no unit and SANE could not enumerate, there is nothing to report
+        # -- return an empty list exactly like a SANE-only build with no
+        # scanner attached.
+        if usb_error is None:
+            return []
+        raise RuntimeError(
+            "neither direct USB nor SANE could enumerate a Coolscan LS-5000 "
+            f"(USB: {type(usb_error).__name__}: {usb_error}; "
+            f"SANE: {type(sane_error).__name__}: {sane_error})"
+        ) from sane_error
+    return [
         _device_info_from(device)
         for device in devices
         if _is_coolscan_device_id(device.id)
     ]
-    if infos:
-        return infos
-    try:
-        return _usb_fallback_device_infos()
-    except Exception as usb_error:
-        if sane_error is None:
-            raise
-        raise RuntimeError(
-            "neither SANE nor direct USB could enumerate a Coolscan LS-5000 "
-            f"(SANE: {type(sane_error).__name__}: {sane_error}; "
-            f"USB: {type(usb_error).__name__}: {usb_error})"
-        ) from usb_error
 
 
 def open(devname: str, *, allow_unverified: bool = False) -> "Device":
@@ -455,12 +489,22 @@ def open(devname: str, *, allow_unverified: bool = False) -> "Device":
 
     _register_open_device(info.id)
     try:
+        unverified = (
+            allow_unverified and info.model in _UNVERIFIED_DIRECT_USB_MODELS
+        )
+        try:
+            service = _service_factory(allow_unverified=unverified)
+        except TypeError:
+            # A test or embedding supplies a service factory (or `Service`)
+            # predating unverified-hardware threading; fall back to the
+            # no-argument form so those fakes keep working. The device-level
+            # `allow_unverified` flag still gates the direct-USB capture path
+            # below regardless of whether the SANE lane learned the opt-in.
+            service = _service_factory()
         return Device(
             info,
-            _service_factory(),
-            allow_unverified=(
-                allow_unverified and info.model in _UNVERIFIED_DIRECT_USB_MODELS
-            ),
+            service,
+            allow_unverified=unverified,
         )
     except BaseException:
         _unregister_open_device(info.id)
@@ -642,6 +686,37 @@ class Device:
 
         self._acquire_io_lock("scan")
         try:
+            # LS-50 (recognized-but-unverified model): drive it over the
+            # direct-USB LS-50 driver rather than the SANE lane, which the
+            # shipped coolscan3 backend cannot RGBI-capable (compiled without
+            # SANE_FRAME_RGBI). Returns the raw linear RGB plane.
+            if self._info.model in _UNVERIFIED_DIRECT_USB_MODELS:
+                from coolscanpy.protocol.ls50 import Ls50ScanOptions, Ls50Session
+                import numpy as _np
+
+                opt = Ls50ScanOptions(
+                    dpi=self.resolution if self.resolution in (400, 2000, 4000) else 4000,
+                    depth=self.depth if self.depth in (8, 14) else 14,
+                    rgbi=False,  # plain scan returns RGB only
+                    samples_per_scan=self.samples,
+                )
+                with Ls50Session() as session:
+                    data = session.capture(opt, boundary_best_effort=True)
+                line = opt.line_bytes_padded
+                raw = _np.frombuffer(data, dtype=_np.uint8)
+                raw = raw[: opt.logical_height * line].reshape(opt.logical_height, line)
+                raw = raw[:, : opt.line_bytes_raw]
+                if opt.bytes_per_sample == 2:
+                    # 14-bit ADC, big-endian pairs (hi, lo) -> uint16
+                    raw = raw.reshape(opt.logical_height, 3, opt.logical_width, 2)
+                    rgb = ((raw[:, :, :, 0].astype(_np.uint32) << 8)
+                           | raw[:, :, :, 1].astype(_np.uint32))
+                    rgb = (rgb << 2).clip(0, 65535).astype(_np.uint16)
+                else:
+                    raw = raw.reshape(opt.logical_height, 3, opt.logical_width)
+                    rgb = (raw.astype(_np.uint32) << 8).astype(_np.uint16)
+                return _np.moveaxis(rgb, 1, -1)
+
             cancel_event = threading.Event()
             with self._state_lock:
                 self._cancel_event = cancel_event

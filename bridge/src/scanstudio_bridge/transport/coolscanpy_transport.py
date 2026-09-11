@@ -388,9 +388,22 @@ def _device_info_from_coolscanpy(info: coolscanpy.DeviceInfo) -> domain.DeviceIn
         for product_id, model in product_table.items()
         if product_id != coolscanpy_device._LS5000_USB_PRODUCT_ID
     }
+    # 2026-09-09: the id-prefix check below originally covered only the
+    # direct-USB lane's "usb:"-prefixed ids. A real LS-50 ED discovered
+    # through the SANE coolscan3 backend reports an id shaped like
+    # "coolscan3:usb:libusb:000:005" instead, so it fell through this
+    # check and unverified_allowed stayed False even though _device.py's
+    # _sane_model_and_supported already classified it, conservatively and
+    # correctly, as a recognized-but-unsupported "LS-50 ED". This adds the
+    # SANE lane's own id prefix so that already-correct classification is
+    # actually honored here; it does not loosen how a model gets
+    # recognized in the first place.
     unverified_allowed = (
         not info.supported
-        and info.id.startswith("usb:")
+        and (
+            info.id.startswith("usb:")
+            or info.id.startswith(coolscanpy_device._COOLSCAN3_PREFIX)
+        )
         and info.model in unverified_usb_models
     )
     return domain.DeviceInfo(
@@ -1020,12 +1033,30 @@ class CoolscanPyTransport:
         )
         try:
             try:
-                # A SINGLE blocking CoolscanPy call that returns the complete
-                # list once the whole-roll transport read finishes -- there is
-                # no per-thumbnail streaming under the hood. `on_thumbnail` is
-                # invoked once per item below, simulating the bridge's own
-                # one-event-per-slot wire behavior on top of this atomic call.
-                thumbnails = self._roll.preview(slots=slots)
+                # LS-50 roll: stream each thumbnail as it is captured so the
+                # engine's 600s stream-silence deadline is never hit on a long
+                # strip (the LS-50 previews slot-by-slot at ~50s each).
+                if _is_ls50_roll(self._roll):
+                    preview_dir = safety.DEFAULT_BASE_DIR / "previews" / uuid.uuid4().hex
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+
+                    def _ls50_thumbnail(thumbnail: coolscanpy.Thumbnail) -> None:
+                        tile_path = preview_dir / f"slot-{thumbnail.slot:04d}.tif"
+                        tifffile.imwrite(
+                            tile_path,
+                            _normalize_preview_tile(thumbnail.image),
+                            photometric="rgb",
+                        )
+                        on_thumbnail(_thumbnail_from_coolscanpy(thumbnail, image_path=str(tile_path)))
+
+                    thumbnails = self._roll.preview(slots=slots, on_thumbnail=_ls50_thumbnail)
+                else:
+                    # A SINGLE blocking CoolscanPy call that returns the complete
+                    # list once the whole-roll transport read finishes -- there is
+                    # no per-thumbnail streaming under the hood. `on_thumbnail` is
+                    # invoked once per item below, simulating the bridge's own
+                    # one-event-per-slot wire behavior on top of this atomic call.
+                    thumbnails = self._roll.preview(slots=slots)
             except coolscanpy.CaptureWorkerBootstrapFailed as exc:
                 raise BridgeError(ErrorCode.INTERNAL, str(exc)) from exc
             except coolscanpy.AdapterUnsupported as exc:
@@ -1106,17 +1137,17 @@ class CoolscanPyTransport:
                 self.attempts_root, attempt_journals_before
             )
 
-        # Fresh UUID directory per roll.preview call, mirroring the
-        # existing hw-telemetry/{session_id}.jsonl convention (see
-        # BRIDGE.md's Thumbnail.imagePath prose).
+        # LS-50 roll: thumbnails were already streamed per-slot above via
+        # `on_thumbnail`, so only the non-LS-50 path writes them here.
         preview_dir = safety.DEFAULT_BASE_DIR / "previews" / uuid.uuid4().hex
         preview_dir.mkdir(parents=True, exist_ok=True)
-        for thumbnail in thumbnails:
-            tile_path = preview_dir / f"slot-{thumbnail.slot:04d}.tif"
-            tifffile.imwrite(
-                tile_path, _normalize_preview_tile(thumbnail.image), photometric="rgb"
-            )
-            on_thumbnail(_thumbnail_from_coolscanpy(thumbnail, image_path=str(tile_path)))
+        if not _is_ls50_roll(self._roll):
+            for thumbnail in thumbnails:
+                tile_path = preview_dir / f"slot-{thumbnail.slot:04d}.tif"
+                tifffile.imwrite(
+                    tile_path, _normalize_preview_tile(thumbnail.image), photometric="rgb"
+                )
+                on_thumbnail(_thumbnail_from_coolscanpy(thumbnail, image_path=str(tile_path)))
 
         self._material = material
         self._preview_established = True
